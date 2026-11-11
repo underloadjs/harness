@@ -380,6 +380,28 @@ surface, so consumers only ever import from `@underload/harness`.
 Model, instruction, message history, and the model-request retry sequence for one
 turn. It owns no other policy: no tool execution, no compaction, no planning.
 
+**What it does about context size.** It measures, and it refuses; it never trims or
+summarises. `estimateContextTokens(messages, instructions?)` is on the published
+surface and answers "will this transcript fit?" with the same `ceil(chars / 4)` the
+UI's context bar shows — message content, an assistant turn's tool-call names and raw
+arguments, and instruction text. Two exclusions matter when picking a limit: attachment
+**bytes** are not counted (a provider charges media per image, not per base64 character)
+and neither are the request's **tool schemas**, so the real prompt is a little larger
+than the estimate; `reasoning` is excluded because it is never resent. Set `provider.contextWindow` or `agent({ maxPromptTokens })` — a limit on
+what may be sent, not a policy about what to send, and the agent setting wins when
+both are set — and a transcript estimated above it fails **before the request
+leaves**, as a `context-overflow` failure naming the estimate and the window. A
+provider's own 400/413 "input too long" answer is reported under that same code
+instead of as a generic transport error, and neither is ever retried: re-sending the
+same oversized bytes answers the same way. What replaces an oversized transcript stays
+the host's decision, on the plugin bus — `turn.before` is the one hook that may
+rewrite the transcript the provider is about to see, and the shipped
+`context-compaction` plugin (`src/plugins/context-compaction.plugin.ts`) is the
+reference implementation — it owns the `contextLimit` setting that decides when it
+acts. No tokenizer ships (a dependency, and a false promise across gateways), so
+every number here is an estimate, and a provider's real count arrives one request
+too late to prevent the next one.
+
 ```ts
 import { agent } from '@underload/harness';
 
@@ -455,6 +477,46 @@ budget, the backoff and the failed attempt's error, which is what a UI/CLI rende
 agent({ model: 'x', provider: { baseURL }, retry: { maxRetries: 3, baseDelayMs: 500 } });
 agent({ model: 'x', provider: { baseURL }, retry: false });   // one attempt, fail fast
 ```
+
+#### Structured output
+
+`structured: schema` means "send the schema **and** hand me a validated value"
+(issue 0001). One field covers both halves, and the schema is judged by the same
+runtime gate a created tool's arguments pass — there is no second JSON-Schema
+implementation.
+
+```ts
+const brain = agent({
+    model: 'x',
+    provider: { baseURL },
+    instruction: 'Answer with JSON only.',
+    structured: {
+        type: 'object',
+        properties: { title: { type: 'string' }, tags: { type: 'array', items: { type: 'string' } } },
+        required: ['title']
+    }
+});
+
+for await (const event of brain.stream('Summarise this.')) {
+    if (event.type !== 'done') continue;
+
+    event.message.structured;   // { title: '…', tags: [ … ] } — already validated
+}
+```
+
+| Behaviour | Rule |
+|---|---|
+| On the wire | Injected as the transport's `response_format: { type: 'json_schema', json_schema: { name, schema } }`, through the same `provider.responseFormat` seam the transport section describes. An explicit `provider.responseFormat` wins on the wire, and `structured` still gates the reply. |
+| The value | `message.structured` carries the parsed, validated value. The key is absent for every agent that did not set `structured`, and absent when the turn was not judged (see the two rows below). |
+| Bad answer | Not JSON, or valid JSON that fails the schema: a `HarnessError` with code `structured-output-invalid` — an `error` event from `stream()`, a throw from `turn()` — and **nothing is committed to history**. Never a silent `{}`. |
+| Retries | A schema failure is **not** a transport retry, whatever `retry` says: the provider answered successfully, so re-sending the identical request would burn a request and a backoff on the same shape of failure. Exactly one transport call, then the host decides. |
+| `stopReason: 'length'` | Not judged. A truncated answer is a different problem than a malformed one, so the caller keeps the distinguishable `stopReason: 'length'` and no `structured` value. |
+| `stopReason: 'tool_calls'` | Not judged: the turn has no answer yet. The final answer of the same run is. |
+| Bad schema | Rejected at construction with code `structured-schema-invalid`, under the same bounds a created tool schema passes (`MAX_CREATED_SCHEMA_DEPTH` / `_NODES` / `_BYTES`). Parsing is strict — a code-fenced answer is a failure, not something to sniff out. |
+| A custom `stream` | Cannot be told about `response_format`, so `structured` is validation-only there; the wire half needs `provider`. |
+
+Forks and persistent threads inherit the schema: they are the same brain, so they
+must not silently commit answers the owning agent would have refused.
 
 ### `tool()` — an action the model can request, or you can call
 
@@ -663,6 +725,18 @@ file) and reports a rollback failure explicitly; the previous module stays usabl
 Disk-backed create/update does not enter `createdToolRecords` or spend
 `maxCreatedTools` because a restart re-scans the folder. Runtime-only revisions
 survive snapshot/restore but are not persisted to disk by the harness.
+
+Checking an editable module does not require registering it. `compileToolSourceModule`
+(exported from `@underload/harness`, with `supportsToolCompilation` as the platform flag)
+transpiles a candidate and answers with its metadata, the content-addressed `revision`
+(the same identity `toolManage source` reports for those bytes), the `checks` actually
+performed, and a callable `definition` that is registered nowhere. The limit is the one
+this section already states: the compiler is `ts.transpileModule`, so **syntax only** — no
+semantic type check — and loading a candidate runs its top-level code, which
+`{ evaluate: 'syntax' }` opts out of entirely. A host that compiles its user tools once
+can hand the compiled `definition` plus its bytes to every harness it builds
+(`tools: { name: { tool, source } }`) and keep the inspect/revision surface. Full
+contract: [`docs/runtime-tools.md`](./docs/runtime-tools.md#compile-a-candidate-without-touching-the-registry).
 
 ### Session tasks (`tasks`)
 
@@ -1376,6 +1450,7 @@ await definition?.({ url: 'https://example.com/sso-page', provider: 'linkup' });
 | Native response body | **1 MiB** (1,048,576 bytes) — declared `content-length` first (the body is cancelled before a byte is read), then counted per streamed chunk. It is a **transfer** budget, not a content budget: the old 100 KiB was refusing pages whose raw HTML merely weighed more than their converted text needed |
 | Returned content | 240,000 characters across the whole page (`truncated: true` while more of the page exists) |
 | One serialized result | **64 KiB** — the tool keeps its own result inside the harness's model-facing budget instead of being re-wrapped by a generic envelope that would drop `url`/`title`/`truncated`/`nextOffset`, so the content slice is capped at 64 KiB minus a 2,048-byte object allowance. Paging keys ride along: `pageCharacters` is the page's real character count, `offset` echoes where this window started (an out-of-range request is clamped and reports `offsetClamped` plus a `note`), and `nextOffset` is present **only when `truncated`** — pass it back as `offset` to read on. They count CHARACTERS, not bytes, and only within one `format` |
+| A `query` answer that came back short | `stopReason` names which bound closed it, because the two need opposite responses. `"contentBudget"` = the 64 KiB result budget cut the answer and `nextOffset` is where it resumes — re-fetch at that offset **without** `query`, since `offset` is ignored while `query` is set; `"resultCap"` = the 20-section cap withheld matching sections (`totalMatches` > `matches`), which paging cannot reach, so narrowing the query is the fix. `query` results report no `offset` at all: selection runs on the whole converted page. Matching sections are ordered by hits per character before the cap is applied, so a long section can no longer buy a slot with its length. Absent when nothing was withheld |
 | Hosted provider response body | 512 KiB — the shared provider-request budget, not the page budget |
 | Per-request timeout | 15 s, `AbortController`, timer cleared in `finally` |
 | Retries | None, except one honest-`User-Agent` retry when Cloudflare challenges the browser one |
@@ -1532,6 +1607,7 @@ const writer = harness({
 | `toolSources` | Map of wire name → editable source path. Registered after the baseline/presets and before `tools`; each revision is inspectable through `toolSource()`/`toolSources()`. |
 | `toolFolders` | Ordered external folders scanned recursively for `*.tool.ts` modules. Absolute or cwd-relative; later folders win name collisions; invalid folders/modules fail construction. Folder code is trusted code with process permissions. |
 | `maxEnabledTools` | Maximum number of SEARCHABLE tools enabled at once (default **32**). Core tools never count. This is the persistent enabled-set bound, not a per-query match cap; `toolRequest` reports the full union in `matched` and what the bound withheld in `omitted`. |
+| `maxCreatedTools` | Lifetime budget for `toolCreate` / `toolRegistry` **in this harness instance** (default **32**, `unlimited` disables it). It is not a process-wide guard: a replacement that removes a name frees no slot, and N harnesses each hold their own budget. A host that builds one harness per conversation therefore pays the construction cost per conversation and gets N independent budgets — see [External tool folders](#external-tool-folders-and-toolts) for the shared-source shape. |
 | `presets` | Preload the discovered `preset`-group entries. **True by default**; `false` filters that group out, so the runtime (harness-owned) rows plus `tools` remain. `download` is one of those preset entries, so `presets: false` removes it too. |
 | `websearch` | `true` or `{ env?, exa?, tavily?, linkup? }`. Registers the core `search` tool when at least one provider key resolves; the default provider is the first key in the **exa → tavily → linkup** order and `provider` overrides per call. Absent, `false`, or no key means no tool. A configured `tools.search` wins. |
 | `webfetch` | `true` or `{ env?, exa?, linkup? }`. Registers the `fetch` tool even with no key at all, because the default provider is the keyless native GET; `EXA_API_KEY` / `LINKUP_API_KEY` only add the per-call hosted crawlers. Absent or `false` means no tool. A configured `tools.fetch` wins. |
@@ -1602,6 +1678,29 @@ only a new harness starts the count again. `toolCreation` configures the capabil
 `'all'` (default — `toolCreate` is declared to every agent), `'primary'` (declared to
 the primary only; a subagent that guesses the name gets a clear refusal), or `false`
 (no model-facing tool at all — the host method `harness.createTool()` still works).
+
+**The budget is per instance, and so is the construction cost.** The counter belongs to
+ONE harness, so N harnesses hold N independent budgets and nothing in the library bounds
+how many user tools exist process-wide. That is deliberate: a process-global registry (or
+a thread-local one, or a host-side counter standing in for either) would have to survive
+`snapshot()`/`restore()` per harness, and sharing the registry is exactly what breaks
+the isolation those two give each conversation. The number's job is to stop ONE runaway
+session growing its own registry, which it does — `reset()` does not restore it, and
+removing a name does not free a slot.
+
+What actually costs on a host that builds one harness per conversation is CONSTRUCTION,
+not the budget: each instance re-runs the AST descriptor scan over the tool tree (nothing
+is cached across calls, `src/tools/descriptors.ts`), wires the `presets: true`
+catalogue, scans every `toolFolders` root and compiles each `*.tool.ts` revision it
+finds, then registers `toolSources` and `tools`. For a per-conversation sandbox that is
+usually the point — a fresh registry, a fresh budget, no shared state. A host that instead
+wants ONE reviewed catalogue shared across many conversations keeps the source in a
+configured folder, or compiles it once with `compileToolSourceModule` and passes the
+compiled `definition` beside the bytes it came from —
+`tools: { name: { tool: compiled.definition, source: compiled.record } }`. Either
+way those tools are catalogue state: they arrive with every instance, and none of them
+ever spends `maxCreatedTools`. `toolSource(name)` still reports the revision, because the
+source travels with the entry.
 
 **No sandbox.** A created tool is compiled with the host realm's `Function`
 constructor and runs with the process's full permissions — the same trust model as
@@ -1937,9 +2036,84 @@ Tool calls are streamed by providers as indexed fragments with partial JSON
 arguments. The transport accumulates them and reports complete calls on the
 terminal frame — partial arguments are not executable.
 
-`stream_options` is not sent — several gateways reject unknown request fields.
-Usage is captured when a provider reports it and left `undefined` when it does
-not.
+#### What is on the wire
+
+An unconfigured request body is exactly `{ model, stream: true, messages,
+tools?, ...sampling }`, and that stays true byte-for-byte when none of the three
+seams below is used. `stream_options` is not sent **by default** — several
+gateways reject unknown request fields, so a default would break working
+deployments to fix an optional counter. Usage is captured when a provider reports
+it and left `undefined` when it does not.
+
+A host reaches any other outbound field through one of three seams, widest first
+(issue 0001):
+
+| Seam | Use it for | What it cannot change |
+|---|---|---|
+| `provider.extraBody` | `stream_options`, `seed`, `stop`, `top_k`, `parallel_tool_calls`, `tool_choice`, `max_completion_tokens`, any provider-specific field | `model`, `stream`, `messages`, `tools`, the sampling fields, `response_format` |
+| `provider.responseFormat` | requiring an output shape: `'text'`, `'json'`, or a named `jsonSchema` | anything else in the body |
+| `openAICompatible(provider, { buildBody })` | a non-OpenAI dialect: rename or rebuild the body while reusing message mapping, attachment parts, video policy, aborting, error scrubbing and the SSE reader | the URL, the headers, the frame parser |
+
+```ts
+// (1) The opt-in the token counter needs. Merged FIRST, so it can add fields but
+// never rewrite the request shape.
+agent({
+    model: 'x',
+    provider: {
+        baseURL: 'http://localhost:5500/providers/private/v1',
+        extraBody: { stream_options: { include_usage: true } }
+    }
+});
+
+// (2) A function form, called once per request with the resolved request, so the
+// extension can key off `request.tools` or `request.signal`.
+agent({
+    model: 'x',
+    provider: { baseURL, extraBody: (request) => ({ seed: request.tools ? 7 : 11 }) }
+});
+
+// (3) The three response shapes.
+agent({
+    model: 'x',
+    provider: {
+        baseURL,
+        responseFormat: { jsonSchema: { name: 'answer', schema, strict: true } }
+        //  'text' -> { response_format: { type: 'text' } }
+        //  'json' -> { response_format: { type: 'json_object' } }
+    }
+});
+
+// (4) A host whose gateway uses different field names keeps the whole transport and
+// overrides only the body.
+const transport = openAICompatible(
+    { baseURL },
+    { buildBody: (body) => ({ ...body, max_output_tokens: body.max_tokens }) }
+);
+```
+
+The rules that keep the first seam from becoming a foot-gun:
+
+- **Precedence.** `extraBody` is merged first, so `model`, `stream`, `messages`,
+  the declared `tools`, the sampling numbers and `response_format` always win. An
+  `extraBody` `tools` entry is dropped outright, not just outranked: a provider
+  told about a tool the harness never declared produces calls with no
+  implementation to route them to. Overriding `stream` is deliberately not
+  available here — it changes what the reader below parses — so it is a
+  `buildBody` decision, not a side effect of spread order.
+- **Fail at construction, not at the first prompt.** A plain-object `extraBody`
+  and any `responseFormat` are validated when the transport is built, which for
+  `agent({ provider })` means when the agent is built. Rejected: a non-object, an
+  `undefined`/function/symbol-valued key (JSON would silently drop it), a cycle,
+  and anything over `MAX_EXTRA_BODY_BYTES` (8 KiB) once serialized. Every
+  rejection is a `HarnessError` with code `provider-request-body` and a message
+  naming the field.
+- **A function form that fails at request time is an `error` frame**, not a
+  throw, and nothing was sent — the transport keeps its "never retries, report
+  honestly" contract.
+
+`buildBody` receives the fully assembled default body (extension, mapped
+transcript, wire tool list, sampling, `response_format`) plus the request, and
+must return a plain JSON object.
 
 The transport never retries: it reports every failure as an `error` frame (any HTTP
 status, a provider error on a `200` stream, a malformed frame, a truncated stream
@@ -2638,7 +2812,7 @@ declared tools or outgrows its prompt budget. The discovery selector's own contr
 `matched`/`omitted`) lives in `toolRequest`'s description, which the model reads as
 part of that declaration.
 
-### The seven real presets
+### The eight real presets
 
 | Preset | Visible title | Role |
 |---|---|---|
@@ -2649,6 +2823,7 @@ part of that declaration.
 | `reviewer` | Reviewer | Strict, independent judge of plans, code, documents and claims; every finding carries evidence, and it is non-mutating by default. |
 | `planner` | Manager | Holds the goal, writes the plan, delegates EVERY step, and accepts a result only after `reviewer` has independently checked it. Never executes a step, and refuses to run as a delegate. |
 | `debugger` | Debugger | Stress-tests the system: unlocks any searchable tool, runs any command, exercises each capability at its edges, and reports a reproduction. |
+| `chat` | Chat | The one card that opts out of the toolbox: the General profile on an EMPTY catalogue — no file, search, delegation, or record tool is registered — and one model call. It cannot read or write the server host and never spends a tool round, so it is the card for a surface that only talks. `tools: []` on the card is made true in the runtime by `sharedToolbox: false`, not merely promised. |
 
 Every real preset's team is derived from ONE list: each card lists every *other* real
 role plus the `summarizer` as a direct subagent (`teamOf()` in
@@ -2659,7 +2834,7 @@ to run as a delegate. `general`'s own team is empty on purpose, which is what ma
 Delegation is **one level deep** and a subagent never receives `delegate`; the
 profiles say so, and none of them asks a subagent to delegate again.
 
-There is no example tier left. The two presets that used to sit beside these seven —
+There is no example tier left. The two presets that used to sit beside these eight —
 `demo` (a scripted offline transport) and `flaky` (the shared toolbox plus a tool that
 throws two calls out of three) — are deleted, along with the `demo`/`flaky` agent
 profiles and the `testFlaky` tool and its scanned `src/server/tools/examples` folder.
@@ -2832,6 +3007,25 @@ can order a read against a stream frame. Writes answer SLIM RECEIPTS
 (`TaskReceipt`, `ResetSessionResult`, `CancelSessionResult`, `DeleteSessionResult`,
 `TranscriptWriteReceipt`, …) and never the mutated aggregate. A path that exists but
 not for the verb you used is a `405` naming the verbs it does take.
+
+**Seeding a new conversation.** `POST /v1/harness/sessions` takes
+`{ harness, title?, settings? }` and ONE extra field: `messages`, the transcript the
+entry agent's default conversation starts with. It is the only piece of recorded state a
+client may supply at creation, and only in transcript shape — the same document
+`PUT .../transcript` takes (see [Editable thread transcripts](#editable-thread-transcripts)).
+Present, including empty, it **replaces** that conversation exactly as a transcript PUT
+does, so a seed with no `system` entry runs the agent with no instruction until the next
+reset; absent, the profile's own seeded instruction stands. Every entry is validated by the
+same reader the runtime and a snapshot restore enforce, **before** anything is created — an
+unknown role, an unknown key, or non-string content is a `400` that leaves no session —
+and the write then carries the transcript route's live-work guard and durability. An
+optional `messageId` on an entry is honoured as a stable address and backfilled when
+absent. The seed is initial state, not history: it is written ONCE, never merged or
+re-applied on a later create, and it appears in the transcript, not in `/turns`, because
+those turns were never executed. To carry an executed conversation across a restart,
+restore the session from its own durable record instead — the server reloads what it
+committed ([Persistence](#persistence-database_root)), which is the state a seeded
+transcript stands in for.
 
 #### The tool call body
 
@@ -3135,6 +3329,23 @@ or a lane that stopped — becomes an ordinary queued continuation. The declared
 recomputed the same way it is trusted: from the tool revision that is installed NOW, so a tool
 created or replaced after the session started widens the window instead of being scanned against
 a snapshot from session creation.
+
+**The one piece of conversation state that is neither routed nor refused: the display
+lane.** It is the number the context bar stacks its rows by, and the shipped
+`summarize` compaction raises it mid-run (`harness.threads.setContextLane`,
+`src/harness.ts`). No `SharedMutation` kind carries a lane
+(`src/server/workers/lane-commit.ts` — `thread:status` digests status and label
+only), so the bump has no route to the canonical record the recorder reads, and it is
+deliberately NOT refused: a tool body would be blameless for losing a cosmetic marker,
+and refusing it would close a door that costs nothing to walk through. The loss, stated
+plainly: in worker mode a session that compacts keeps **one-row** context bars with every
+event stamped lane 0, where the same session on the default inline engine paints that
+boundary as two stacked rows. Everything the compaction actually does is unaffected — the
+summarize call, the history it replaces, and the transcript it commits cross back like any
+other turn content — and the value is **lost**, not deferred: a rebuilt lane reads the
+canonical record and starts on lane 0 again. The capability list the session reports
+carries this as `LIMITATION (display lane, not routed)`, so an operator flips the switch
+knowing the context bar goes flat.
 
 Compatibility is unchanged: the default stays `inline`, no existing host changes
 shape on upgrade, and a worker session answers exactly the same HTTP surface.
@@ -3757,6 +3968,29 @@ tools resolve relative paths against the server process's working directory
 promise behaviour the tools do not implement. The service's `variables.root` is
 the shared database/storage boundary: the harness endpoint uses it as the durable
 database root (below `<root>/harness/`), never as a workspace.
+
+**Streaming from your own endpoint.** The loader offers an endpoint exactly two
+passthroughs (`packages/underload/service/src/server/start.ts:357-387`):
+`{ raw: Response }`, which it returns untouched, and `{ stream: AsyncIterable }`, which
+it feeds to hono's `streamSSE`. Prefer `raw`, and do not write the writer:
+`createHarnessSseResponse(start, signal)` — exported from `@underload/harness/server`,
+and the same function both in-package adapters use — builds the response with the
+`: connected\n\n` preamble, one `data: <json>\n\n` frame per item (the shape the shipped
+UI already parses), `X-Accel-Buffering: no`, a frame that waits for the consumer's next
+pull instead of buffering a transcript into memory, and the step the `{ stream }` shape
+**cannot** express: `cancel()` (tab closed) or an aborting request signal aborts the
+signal handed to `start`, so a browser disconnect actually cancels a run. `{ stream }`
+is fine for a producer with nothing to cancel, but the loader only stops writing on
+`stream.aborted` and never tells the handler, so a `{ stream }` handler running anything
+cancellable must wire its own abort from `context.req.raw.signal` and pass it in — that
+one line is what decides whether a disconnect stops a run or only stops a socket. The
+other thing the loader does quietly is pre-parse a JSON body with no cap, which is why
+`src/server/endpoint/harness/service-route.ts` declares `body: 'raw'`: the endpoint then
+streams the body through the route-aware cap in `bodyLimitFor` (`src/server/api.ts:744`)
+— **16 MiB** (`MAX_SUBMIT_BODY_BYTES`) for `POST /v1/harness/sessions/:id/tasks`, the one
+route that carries base64 attachments, and **1,000,000 bytes** (`MAX_API_BODY_BYTES`) for
+every other route — rejecting an over-sized payload before the whole thing is in memory.
+Pinned by `src/server/sse-writer.test.ts`.
 
 ### Persistence (`DATABASE_ROOT`)
 

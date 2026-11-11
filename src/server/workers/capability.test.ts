@@ -57,9 +57,9 @@ const presetOf = (template?: 'live' | 'flaky' | 'scripted', name = 'instruct'): 
     }
 });
 
-// The nine documented properties of worker mode, INCLUDING the one limitation the build
-// states instead of hiding. They are asserted verbatim: a change to any of them is a change
-// to the isolation promise an operator reads.
+// The documented properties of worker mode, INCLUDING the limitations the build states instead
+// of hiding (nested runs, and 0018 item 1's display lane). They are asserted verbatim: a change
+// to any of them is a change to the isolation promise an operator reads.
 const WORKER_MODE_NOTES = [
     'In worker mode every harness body runs in a lane worker: a queue turn, the legacy root /messages run, a session-bound direct tool call (POST /tools/:name with a sessionId), and a slash command alike, so the coordinator executes no harness work inline on the event loop.',
     'A session-shared operation (a record store, the tool registry, tool discovery, the agent-result archive, a cross-thread send or roster read) is routed from the lane replica through harness.runtime to the coordinator, which performs it on the canonical harness and returns the answer - so shared state has exactly one writer of record.',
@@ -70,7 +70,13 @@ const WORKER_MODE_NOTES = [
     'A tool registered from anywhere - a lane, the operator, a model - is applied at the coordinator first and broadcast to every live worker, so no replica keeps running a definition the authority replaced.',
     'LIMITATION (nested runs, refused before execution): worker mode does not centralise nested conversation state, so EVERY door that can start a child conversation is refused on a lane, and every refusal names itself (nested-run-unsupported). The policy is ARMED ON EVERY LANE, whatever preset that lane rebuilt - it is a property of the execution mode, not an opt-in a harness can skip - and a replica whose build has no nested-run seam faults the handshake instead of running children on a private copy (there is no inline fallback). The two tool doors - delegate and threadFork - are removed from the replica at hello, and harness.runtime.delegate on a replica throws. The execution-context doors are refused by the armed core at the surfaces it hands the tool itself: context.run/ctx.run in whatever spelling the body uses, the harness callable, harness.sendThreadInput, and a sibling brain run through context.agents - and because a REFUSING replica hands the body a guarded handle view rather than the raw one, a reference the body stores and calls AFTER its own call settled is refused just the same. A refused door creates nothing at all - no child thread record, no transcript append, no provider request. A revision whose captured source reaches one of those doors is refused at hello naming the tool, because a body whose purpose is a nested child has nothing to do on a lane; one that only reaches context.run is reported with the same code, because that is what it gets at runtime, and the shipped textSummarize answers with its documented local condensation instead. A plain read and every routed harness.runtime operation pass through the same view untouched, which is why threadRead, threadSend and threadList keep working in worker mode. An unscanned closure body (a tool the preset factory constructed) is refused the same doors by the armed core, and a harness INJECTED as a factory closure - which no lane can rebuild - is refused worker mode outright (preset-not-rebuildable) rather than run inline. Worker mode does not promise nested conversation state.',
     'Deployment-wide switches (the global tool deny list and the per-plugin settings overrides) reach a lane worker as a SNAPSHOT taken when the lane is created: a new lane - an idle reclaim, a new conversation, an authority rebuild - states the current value, while a lane that is already running keeps the one it was built with until it is next created. Tool discovery is not delayed even inside that window: a lane\'s toolRequest is routed to the coordinator, which answers against the LIVE store, so a name just switched off is already reported forbidden and is never written into the session\'s enabled set.',
-    'A branch audit is lane-local by core design (branch state is deliberately absent from snapshot v1), so worker mode removes the fork tool rather than keeping a private branch the coordinator cannot list. A tool body that touches a canonical-document member of the live handle (harness.snapshot/restore/reset/registerTool/createThread/sendThreadInput and friends) is refused at hello naming the tool, never run against a private copy.'
+    'A branch audit is lane-local by core design (branch state is deliberately absent from snapshot v1), so worker mode removes the fork tool rather than keeping a private branch the coordinator cannot list. A tool body that touches a canonical-document member of the live handle (harness.snapshot/restore/reset/registerTool/createThread/sendThreadInput and friends) is refused at hello naming the tool, never run against a private copy.',
+    // 0018 item 1, verbatim from ./capability.ts `WORKER_MODE_NOTES`. The display lane is the
+    // one piece of conversation state with no commit op (../lane-commit.ts `SharedMutation`
+    // digests status + label for `thread:status`, and `setContextLane` appears nowhere under
+    // ../workers), so the loss has to be stated rather than left in the ../sessions.ts
+    // comment. Asserted whole — see the dedicated case below for why the wording is pinned.
+    'LIMITATION (display lane, not routed): the conversation display lane - the number the context bar stacks its rows by, which the shipped summarize compaction raises mid-run through api.threads.setContextLane - has no lane-commit operation, so a bump raised on a lane worker stays on that private replica and never reaches the canonical record the coordinator records events from. A worker-mode session that compacts therefore keeps ONE-row context bars, every event stamped lane 0, where the same session on the default inline engine paints that boundary as two stacked rows. The compaction itself is unaffected, and the value is not deferred: a rebuilt lane reads the canonical record and starts on lane 0 again.'
 ];
 
 describe('assessLaneWorkerCapability', () => {
@@ -136,8 +142,33 @@ describe('assessLaneWorkerCapability', () => {
         // and the plugin overrides reach a lane as a lane-CREATION snapshot
         // (./protocol.ts `disabledTools`/`pluginSettings`), which is a promise about what a
         // running lane does NOT see, so it belongs in this list rather than in a code comment.
-        expect(first.notes).toHaveLength(10);
+        // 11 since 0018 item 1 published the display-lane limitation: a lane bump has no route
+        // to the canonical record (./lane-commit.ts carries no lane key), which is the same
+        // kind of promise about what a worker-mode bar does NOT show.
+        expect(first.notes).toHaveLength(11);
         expect(first.notes).not.toBe(second.notes);
+    });
+
+    it('states the display-lane limitation where the operator meets the switch (0018 item 1)', () => {
+        // WHY this is a capability note and not a source comment: the operator flips
+        // `threadExecution: 'worker'` from the config surface, and the loss they get is a
+        // context bar that stops splitting at a compaction boundary. The route is structural,
+        // so the note has to state three facts exactly — WHAT is lost (the two-row bar, not the
+        // compaction), WHERE it is lost (worker mode; inline stays the default and covered by
+        // the lane tests), and that the lane is LOST rather than queued (a rebuilt lane reads
+        // the canonical record, whose lane is still 0).
+        const limitation = assessLaneWorkerCapability(presetOf('live')).notes.find((note) =>
+            note.startsWith('LIMITATION (display lane')
+        );
+
+        expect(limitation).toBe(
+            'LIMITATION (display lane, not routed): the conversation display lane - the number the context bar stacks its rows by, which the shipped summarize compaction raises mid-run through api.threads.setContextLane - has no lane-commit operation, so a bump raised on a lane worker stays on that private replica and never reaches the canonical record the coordinator records events from. A worker-mode session that compacts therefore keeps ONE-row context bars, every event stamped lane 0, where the same session on the default inline engine paints that boundary as two stacked rows. The compaction itself is unaffected, and the value is not deferred: a rebuilt lane reads the canonical record and starts on lane 0 again.'
+        );
+
+        // The note is a NOTE, not a reason: worker mode still runs the session (the compaction
+        // itself works, only the bar's boundary is invisible), so adding it must not turn a
+        // supported preset into a 400 at session creation.
+        expect(assessLaneWorkerCapability(presetOf('live'))).toMatchObject({ supported: true, reasons: [] });
     });
 });
 

@@ -1,6 +1,6 @@
 # 0015 — One generic "network error" sentence for DNS failure, refused connection, and unreachable host
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-11 (see **Update (2026-11-11, fix)** at the bottom)
 > **Severity:** Minor
 > **Area:** `src/tools/webfetch/request.ts` (error classification)
 > **Date opened:** 2026-11-10
@@ -123,4 +123,64 @@ the raw body:
   a class, not the message.
 - The runtime rows are left **as recorded** (live 2026-11-10); the collapse they describe is
   still what the code does.
-- Status stays **Open**.
+- Status moved to **Fixed** — closing note below.
+
+## Update (2026-11-11, fix) — closed
+
+- **Shipped.** The transport cause is classified and reported as a class. Implementation:
+  `src/tools/webfetch/request.ts:160-270` — `DNS_CAUSE_CODES` (`:180`, `ENOTFOUND`, `EAI_AGAIN`),
+  `CONNECTION_CAUSE_CODES` (`:185`, `ECONNREFUSED`, `ECONNRESET`, `EPIPE`), `TLS_CAUSE_CODES`
+  (`:191-202`, plus the `ERR_TLS*` / `ERR_SSL*` / `ALERT_*` prefix rules so a long-tail handshake
+  failure never falls into the unclassified bucket), one sentence per class
+  (`TRANSPORT_FAILURE_MESSAGES`, `:211-218`), code extraction (`transportCodesOf`, `:226-244`),
+  dispatch (`transportCause`, `:249-264`).
+- **The binding-less catch the re-anchoring flagged is now bound**: `send`'s catch reads
+  `catch (error) { throw networkFailure(error) }` (`:746-751`), and `networkFailure` checks the
+  abort discriminator FIRST (`:720-723`) so a timeout is never relabelled — the timeout sentence
+  is byte-identical to the one 0015 says is fine (criterion 3). Body-stream failures are threaded
+  through too: `readBody` takes a `failure` factory (`:540-543`) and classifies what the stream
+  throws (`:594-599`), which is the exact shape of the httpbin case in **Evidence** — a response
+  that starts and dies mid-download.
+- **Codes are read from three positions, not one.** The proposal named `error.cause.code`. Real
+  rejections need all three: `error.code` (a direct connect failure, and what a body-stream reset
+  carries), `error.cause.code` (undici's wrapped `TypeError: fetch failed`), and
+  `error.cause.errors[].code` (the happy-eyeballs dual-stack aggregate, where every attempt's code
+  lives on the attempt). `:220-225` records why. Nothing but the code is read — never the message,
+  never the stack.
+- **Criterion-by-criterion.** 1 — DNS, refused, reset, TLS and unknown each get their own
+  sentence; a test asserts DNS ≠ connection (`:1489`). 2 — every sentence states the retry
+  verdict: DNS "retrying will not help", connection "a retry may help", TLS "Retrying will not
+  help: the same handshake fails", unclassified "a retry may help". 3 — the timeout message is
+  unchanged and still tested (`:647`, plus `:1573` for a timeout that also carries a code). 4 —
+  no raw text: the classifier maps code → constant, and a test feeds an HTML error page plus a
+  stack-shaped tail and asserts neither appears (`:1554-1571`).
+- **Step 2 (the verified fallback) is named where it was verified.** `"provider": "exa"` appears
+  in the connection, TLS and unclassified sentences; it is deliberately absent from the DNS
+  sentence, where a different client changes nothing (a test pins that absence, `:1510`). It is
+  written into the sentences rather than appended through `providerDiagnostics`: the params echo
+  adds nothing when the host was never reached, and naming the alternative client IS the remedy
+  here. Consequence: a transport failure no longer carries the `provider`/`params` JSON tail —
+  say so if a consumer depended on it.
+- **Sanitization rule untouched.** The class is reported, not the Node text, so `:37-40` (no page
+  body in the transcript) and the no-retry rule at `:39-40` still hold — classification is not a
+  retry, and none was added (out of scope, as filed).
+- **Anchors this fix moved**: `networkFailure` 576-579 → 720-723 (inside `requestPage`), the send
+  catch 602-604 → 746-751, and the whole classifier sits at 160-270. `MAX_RESPONSE_BYTES` is 73.
+- **Tests** (`src/tools/webfetch/webfetch.test.ts:1422-1597`, plus the envelope case in
+  `src/harness.webfetch.test.ts:399`). The code→class table is pinned directly through the
+  exported `transportFailureMessage` (`:269`, exported so the contract can be pinned without
+  fabricating a GET around it), then the four classes are pinned end-to-end through the tool with
+  a stubbed rejecting `fetch` — no live network anywhere in the file. The native-path assertion
+  this issue asked to update (it pinned only the collapsed sentence) no longer exists: every
+  native transport assertion now pins a class.
+- **Left for the search side (another owner).** The classifier covers the native GET path
+  (`requestPage`) and the body stream. A `fetch` call that goes through a hosted provider
+  (`provider: "exa"` / `"linkup"`) still fails with one generic sentence, because that leg uses
+  `src/tools/websearch/request.ts:419` — `${label} search could not be reached (network error).`
+  — and its tests still assert that string (`src/tools/websearch/websearch.test.ts:627`, `:892`,
+  and the fetch tool's own Linkup case at `src/tools/webfetch/webfetch.test.ts:789`). Same shape,
+  same fix, files outside this issue's area and this fix's ownership; whoever takes it can reuse
+  the exported `transportFailureMessage`.
+- **Verification.** `vitest run src/tools/webfetch/webfetch.test.ts src/harness.webfetch.test.ts`
+  → 106 passed; `tsc --noEmit -p .` → clean. The live rows were not re-run (provider spend and
+  the flaky host they recorded); every class is reproduced offline by the stubs above.

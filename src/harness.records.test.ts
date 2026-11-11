@@ -664,6 +664,102 @@ describe('record tools read surface: describe, the bare name list, and where', (
             collections: ['chapters', 'locations', 'probeg1', 'profiles', 'tasks']
         });
     });
+
+    // -----------------------------------------------------------------------
+    // R-0010 — the tool entry point used to consume `define` first and THROW AWAY the
+    // `collection` riding beside it: the stress test sent
+    // `{ collection: "unicode", define: { name: "verifyG", … } }`, got a success, and read
+    // back `"collection": "verifyG"` — not the name it sent. The engine's own guard calls
+    // that pair ambiguous, so the enforced contract is refusal, and it now holds here too.
+    // -----------------------------------------------------------------------
+    const VERIFY_G = {
+        name: 'verifyG',
+        fields: [{ key: 'note', type: 'text', maxLength: 40 }]
+    };
+
+    // The name list of an untouched session, which is the control every case below re-reads.
+    const BUILT_IN_LIST = {
+        entries: [],
+        counts: { total: 4 },
+        page: page(),
+        storeRev: 0,
+        collections: ['chapters', 'locations', 'profiles', 'tasks']
+    };
+
+    it('0010: the records tool refuses define beside a collection and registers nothing', async () => {
+        const writer = quiet(brain(scripted([answer('hi')])));
+
+        expect(await writer.executeTool('records', {})).toEqual(BUILT_IN_LIST);
+
+        // Acceptance 1: the same wording the engine guard has always used, from the door
+        // that actually runs, and ahead of any collection lookup.
+        await expect(
+            writer.executeTool('records', { collection: 'unicode', define: VERIFY_G })
+        ).rejects.toThrow(
+            'invalid-input: records "define" registers a NEW collection, so it takes no "collection" beside it.'
+        );
+
+        // Acceptance 2: the refused call registered nothing, so the list is what it was and
+        // the caller's `unicode` typo is still reported as the typo it is.
+        expect(await writer.executeTool('records', {})).toEqual(BUILT_IN_LIST);
+        await expect(writer.executeTool('records', { collection: 'unicode' })).rejects.toThrow(
+            'unknown-collection: records has no collection "unicode"; defined collections: tasks, chapters, profiles, locations.'
+        );
+    });
+
+    it('0010: define on its own through the tool still registers, exactly as before', async () => {
+        const writer = quiet(brain(scripted([answer('hi')])));
+
+        const defined = (await writer.executeTool('records', { define: VERIFY_G })) as {
+            collection: string;
+            storeRev: number;
+        };
+
+        expect(defined.collection).toBe('verifyG');
+        // A `define` writes no record, so it moves no collection's revision (F12's quiet
+        // notification), and the name list is the only place it lands.
+        expect(defined.storeRev).toBe(0);
+        expect(await writer.executeTool('records', {})).toEqual({
+            entries: [],
+            counts: { total: 5 },
+            page: page(),
+            storeRev: 0,
+            collections: ['chapters', 'locations', 'profiles', 'tasks', 'verifyG']
+        });
+    });
+
+    // The one question 0010 left UNCONFIRMED was whether a wrapper's JSON schema admits an
+    // undeclared `define` at all — i.e. whether the engine guard at
+    // src/core/records.ts:2902 is live or dead. Settled by this case: `tasks.tool.ts:170`
+    // sets `additionalProperties: false`, that schema never declares `define`, and
+    // core/schema-validation.ts:208 enforces the key on every call path
+    // (`executeTool` included — harness.ts:11226). So a TOOL-surface wrapper call dies
+    // before the engine runs, and the guard is reached only by a caller that enters the
+    // engine directly — pinned in src/core/records.test.ts, same wording either way.
+    it('0010: a wrapper schema refuses an undeclared define before the engine can merge it', async () => {
+        const writer = quiet(brain(scripted([answer('hi')])));
+
+        await expect(
+            writer.executeTool('tasks', { tasks: [{ text: 'Ride' }], define: VERIFY_G })
+        ).rejects.toThrow('must not include the additional property "define".');
+
+        expect(await writer.executeTool('records', {})).toEqual(BUILT_IN_LIST);
+    });
+
+    // Acceptance 3, as a check that survives a forgotten regeneration: the entry states the
+    // enforced rule in the description a model reads, and the generated manifest carries the
+    // same sentence. (`scripts/generate-tool-manifest.mjs --check` is the build-time twin of
+    // this assertion; it exits 0 on this tree.)
+    it('0010: the records description states the rule, and the manifest carries it verbatim', async () => {
+        const RULE =
+            '`define` beside a `collection` is an ERROR, never a merge that discards your `collection`';
+
+        const entry = await readFile(new URL('./tools/runtime/records.tool.ts', import.meta.url), 'utf8');
+        const manifest = await readFile(new URL('./core/tool-manifest.ts', import.meta.url), 'utf8');
+
+        expect(entry).toContain(RULE);
+        expect(manifest).toContain(RULE);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -746,5 +842,139 @@ describe('record wrappers call the engine exactly once (F12)', () => {
             expect(engineCalls).toEqual([name]);
             expect(events).toEqual([{ type: 'state_change', reason: 'tool_execute', tool: name }]);
         }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 0008 — a multi-record mutation names the ids it wrote, at the TOOL entry point.
+//
+// src/core/records.test.ts pins the engine rule (one id list per affected-record list, each
+// emitted only when THAT list has more than one entry, whatever `limit` says); this file
+// pins the two things only a harness call can show — the un-wrapped `records` tool a model
+// actually reaches for, and the `tasks` batch wrapper's historical envelope. The live
+// failure was `records { entries: [a, b], limit: 1 }` answering with one unrelated page row,
+// so every case below keeps the documented cheap recipe (`limit: 1`) and asserts the exact
+// ids. `TaskResult`/`RecordsResult` (src/types, another pass owns that file) do not declare
+// the new keys yet, so each case narrows the result it reads.
+// ---------------------------------------------------------------------------
+describe('a multi-record mutation names the ids it wrote (issue 0008)', () => {
+    // The engine's canonical entry order, with the harness caller stamped in: `executeTool`
+    // is an identified caller, so a stored record carries `updatedBy` (and no thread,
+    // because the host path has none). The frozen clock gives `updatedAt` one value.
+    const taskRow = (id: string, text: string, rev: number, completed = false) => ({
+        id,
+        text,
+        completed,
+        rev,
+        updatedBy: 'writer',
+        updatedAt: EPOCH_ISO
+    });
+
+    it('names both ids a two-add `records` batch minted, beside a `limit: 1` page', async () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+
+        const added = (await writer.executeTool('records', {
+            collection: 'tasks',
+            entries: [{ text: 'One' }, { text: 'Two' }],
+            limit: 1
+        })) as Record<string, unknown>;
+
+        // The whole envelope, because the fix must not disturb anything beside the new key:
+        // the page is still the one row `limit` allowed, `entry` stays absent for two
+        // records, and the sibling lists stay out when they describe nothing.
+        expect(added).toEqual({
+            entries: [taskRow('1', 'One', 1)],
+            counts: { total: 2, completed: 0, pending: 2 },
+            page: { offset: 0, limit: 1, hasMore: true, nextOffset: 1 },
+            storeRev: 2,
+            oldestAvailableRev: 1,
+            addedIds: ['1', '2']
+        });
+
+        // Two patches, in caller order under the `limit: 1` recipe — the other half of the
+        // issue, which had no `entry` and no id list either.
+        const patched = (await writer.executeTool('records', {
+            collection: 'tasks',
+            entries: [
+                { id: '1', completed: true },
+                { id: '2', completed: true }
+            ],
+            expects: [
+                { id: '1', rev: 1 },
+                { id: '2', rev: 1 }
+            ],
+            limit: 1
+        })) as Record<string, unknown>;
+
+        expect(patched).toEqual({
+            entries: [taskRow('1', 'One', 2, true)],
+            counts: { total: 2, completed: 2, pending: 0 },
+            page: { offset: 0, limit: 1, hasMore: true, nextOffset: 1 },
+            storeRev: 4,
+            oldestAvailableRev: 1,
+            changedIds: ['1', '2']
+        });
+
+        // One record still answers with `entry` alone — the M3 rule that keeps every
+        // affected-record key one stable type, now enforced for adds and patches too.
+        const single = (await writer.executeTool('records', {
+            collection: 'tasks',
+            entries: [{ id: '1', text: 'Renamed' }],
+            expects: [{ id: '1', rev: 2 }],
+            limit: 1
+        })) as Record<string, unknown>;
+
+        expect(single.changedIds).toBeUndefined();
+        expect(single.addedIds).toBeUndefined();
+        expect(single.entry).toEqual(taskRow('1', 'Renamed', 3, true));
+    });
+
+    it('names the ids a `tasks` batch added or changed, and stays silent for one record', async () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+
+        const twoAdds = (await writer.executeTool('tasks', {
+            tasks: [{ text: 'One' }, { text: 'Two' }],
+            limit: 1
+        })) as Record<string, unknown>;
+
+        // `tasks` is the batch-style wrapper: its page envelope predates the engine, and the
+        // new key is the ONLY addition. Note the absence of `oldestAvailableRev` — the floor
+        // rides the wrapper only beside `changes` (0011), so this envelope stays as it was.
+        expect(twoAdds).toEqual({
+            tasks: [taskRow('1', 'One', 1)],
+            counts: { total: 2, completed: 0, pending: 2 },
+            page: { offset: 0, limit: 1, hasMore: true, nextOffset: 1 },
+            storeRev: 2,
+            addedIds: ['1', '2']
+        });
+
+        const twoPatches = (await writer.executeTool('tasks', {
+            tasks: [{ id: '2', completed: true }, { id: '1', completed: true }],
+            expects: [
+                { id: '2', rev: 1 },
+                { id: '1', rev: 1 }
+            ],
+            limit: 1
+        })) as Record<string, unknown>;
+
+        // Caller order again: the batch named 2 first, so `changedIds` starts with it while
+        // the page (offset 0) still shows id 1.
+        expect(twoPatches).toEqual({
+            tasks: [taskRow('1', 'One', 2, true)],
+            counts: { total: 2, completed: 2, pending: 0 },
+            page: { offset: 0, limit: 1, hasMore: true, nextOffset: 1 },
+            storeRev: 4,
+            changedIds: ['2', '1']
+        });
+
+        const oneAdd = (await writer.executeTool('tasks', { tasks: [{ text: 'Three' }], limit: 1 })) as Record<
+            string,
+            unknown
+        >;
+
+        // Key ORDER included: the wrapper's envelope is pinned byte-for-byte elsewhere, and a
+        // one-record batch must not grow a list beside `entry`.
+        expect(Object.keys(oneAdd)).toEqual(['tasks', 'counts', 'page', 'storeRev', 'entry']);
+        expect(oneAdd.entry).toEqual(taskRow('3', 'Three', 1));
     });
 });

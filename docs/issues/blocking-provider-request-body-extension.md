@@ -1,6 +1,6 @@
 # 0001 — No extension point for outbound request fields (`stream_options`, response format)
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-11 (see **Update (2026-11-11) — closed**)
 > **Severity:** Blocking
 > **Area:** `src/transport/openai.ts`, `src/types/index.ts` (transport/provider configuration)
 > **Date opened:** 2026-11-02
@@ -219,3 +219,157 @@ reused rather than rewritten:
   `wireTool` (`:592`) and `samplingBody` (`:672`) remain module-private.
 - Status stays **Open**; the `unconfirmed` note about whether the LAN relay
   already emits a usage frame is unchanged.
+
+## Update (2026-11-11) — closed
+
+All three parts of the proposal are implemented, (A) and (C) first and (B) on top
+of them, so the header's **Open** (set by the re-anchor section above, which
+changed no code) is superseded by this one. **Gap**, **Evidence**, **Proposal**,
+**Acceptance criteria** and **Tests to add** are left as filed — this issue was
+closed whole, not in part, so nothing is deleted from them; the section below
+records what shipped and what the implementation settled that the proposal left
+open.
+
+**What shipped**
+
+- **(A) `provider.extraBody`** — `HarnessExtraBody`
+  (`src/types/index.ts:485`), object or function form, on
+  `HarnessProviderConfiguration` (`:562`). Merged **first**, so `model`,
+  `stream`, `messages`, `tools` and the sampling fields always win
+  (`transportBody`, `src/transport/openai.ts:999-1030`). The source header's
+  "`stream_options` is NOT sent" note now reads "NOT sent **by default**" and
+  points at the seam (`src/transport/openai.ts:16-22`).
+- **(B) `provider.responseFormat`** — `'text' | 'json' | { jsonSchema }`
+  (`HarnessResponseFormat`, `src/types/index.ts:514`; provider field `:567`),
+  mapped onto `response_format` by `responseFormatField`
+  (`src/transport/openai.ts:915`). At the agent layer,
+  `agent({ structured })` (`src/types/index.ts:615`) both sends the schema —
+  injected into the built-in transport as `provider.responseFormat`
+  (`src/core/agent.ts:289-297`) — and hands back the validated value as
+  `HarnessAssistantMessage.structured` (`:327`).
+- **(C) composable transport** — `openAICompatible(config, { buildBody })`
+  (`src/transport/openai.ts:1048`, `HarnessTransportOptions`
+  `src/types/index.ts:537-542`), so a non-OpenAI dialect reuses message mapping,
+  attachment parts, aborting, error scrubbing and chunk parsing instead of
+  forking the file.
+
+**Decisions the proposal left open, and what the implementation chose**
+
+- **`extraBody.tools` is removed, not merely outranked.** Spread order already
+  makes a declared tool list win, but when the request declares **no** tools the
+  spread would leave the host's list standing — and a provider told about a tool
+  the harness never registered produces calls whose results cannot be paired back
+  to an implementation. So `tools` is dropped from the extension outright
+  (`src/transport/openai.ts:1008-1020`, inside `transportBody`).
+- **`stream` is not overridable** through `extraBody` either: the transport is a
+  streaming transport, and the issue asked for an explicit option, not a spread
+  side effect, if an override is ever wanted.
+- **Cap and error type.** `MAX_EXTRA_BODY_BYTES = 8 * 1024`
+  (`src/transport/openai.ts:817`) measured on the **serialized** value (a `>`
+  test, so exactly 8 KiB passes), with `MAX_RESPONSE_SCHEMA_NAME_CHARS = 64`
+  (`:823`) and an OpenAI-gateway `[a-zA-Z0-9_-]` name pattern (`:945`) for
+  `jsonSchema.name`. The proposal suggested a "`SettingsError`-style" error; the
+  package's own `HarnessError` with code `provider-request-body`
+  (`PROVIDER_REQUEST_BODY_CODE`, `:831`) is used instead — importing the
+  settings engine's error class into the transport would invert the layering.
+  Messages name the offending field (`extraBody`, `provider.responseFormat`,
+  `options.buildBody`).
+- **Validation timing** follows the fail-early rule exactly as filed: object
+  forms are validated at **transport construction**, the function form per
+  request, and a rejected per-request value becomes an `error` frame **before**
+  any fetch.
+- **Structured answers spend no repair retry.** The proposal allowed "or one
+  schema-repair retry inside the existing retry budget"; the shipped gate runs
+  **after** the transport retry loop and **before** `precommit`, so a schema
+  failure is neither retried nor committed (`src/core/agent.ts:1022-1056`).
+  `stopReason: 'length'` and `'tool_calls'` are not judged, keeping truncation
+  distinguishable from a schema miss. Codes: `structured-schema-invalid`,
+  `structured-output-invalid` (`src/core/agent.ts:169-170`). The reply is parsed
+  strictly — a non-JSON body fails, no code-fence sniffing.
+- **Custom `{ stream }` + `structured`** is validation-only: a host transport owns
+  its wire format, so nothing is injected, while the answer is still gated
+  (`src/core/agent.ts:270-284`). An explicit `provider.responseFormat` always
+  wins on the wire over what `structured` injects.
+- **Scope kept:** `harness()`/the server preset do not expose `structured` yet —
+  the issue scoped storage/session-level schemas out, and this is agent-level
+  only. Forks and threads inherit `structured` (`src/core/agent.ts:1185`, `:1296`).
+
+**Evidence against each acceptance criterion**
+
+1. Usage without a custom transport, reaching the committed message:
+   `src/transport/openai.test.ts:1102` (transport yields the `usage` event from
+   the `stream_options` frame it bought) and `src/core/agent.test.ts:671`
+   (the same usage lands on the committed `HarnessAssistantMessage.usage`).
+2. Response format on the wire, asserted on a fetch stub:
+   `src/transport/openai.test.ts:1340` (`text`), `:1348` (`json_object`),
+   `:1356` (`json_schema` with `strict`), `:1377` (`strict` omitted when unset),
+   `:1397` (first-class field beats an `extraBody` key of the same name);
+   `src/core/agent.test.ts:701` (the agent's schema reaches `response_format`)
+   and `:726` (an explicit `provider.responseFormat` survives on the wire while
+   `structured` still gates the reply).
+3. `extraBody` cannot change the request shape, and a rejected value fails at
+   construction naming the field: `src/transport/openai.test.ts:1180`
+   (`model`/`messages`/`tools`/`stream`/sampling all win), `:1243` (the 8 KiB cap,
+   field named), `:1269` and `:1299` (every non-plain-object and every
+   JSON-drops-it key rejected at construction), `:1319` (function-form rejection
+   is an `error` frame with no fetch).
+4. Documented body-override seam with the import split intact:
+   `src/transport/openai.test.ts:1454`/`:1491` (`buildBody` rewrites the body and
+   is handed the assembled base body plus the resolved request), `:1531`/`:1547`
+   (a non-object result and a non-function option), `:1557` (the transport module
+   imports no Node built-in, so nothing new reaches the browser chunk).
+5. Docs: `README.md:1980-2010` ("What is on the wire" — the seam table, the
+   precedence rule, the cap), `README.md:459-490` (`#### Structured output` under
+   `agent()`, the section runs to the next `####` at `:807`), `docs/request-body.md`
+   (new, the full wire contract), and the `knowledge.md`
+   transport/agent/type sections.
+
+**Tests** — `src/transport/openai.test.ts` 58/58 (19 new, `describe` at `:1081`)
+and `src/core/agent.test.ts` 34/34 (12 new, `describe` at `:645`); scoped
+regressions green: `src/structure.test.ts` 21/21, an 8-file core batch 213/213,
+and a 10-file batch covering `harness.retry/races/fork`,
+`agent.retry/fork/attachments`, `harness.test.ts`, `schema-validation`,
+`harness.background` and `server/background` at 173/173. `tsc --noEmit` over the
+package exits 0. `scripts/check-package-types.mjs` gained the consumer fixtures
+this issue asked for (both consumers configure the new fields; the NodeNext
+consumer compiles).
+
+**One packaging finding, not closed here:** the published **browser** consumer
+check (`yarn test:package` → `scripts/check-package-types.mjs`) fails — but it
+fails identically with HEAD's fixture (verified by compiling HEAD's browser entry
+verbatim against this tree's `dist`: the same `dist/server/**` `node:http` /
+`NodeJS` / `Buffer` errors), and **both** fixtures — HEAD's entry and the one with
+this issue's additions — compile clean (exit 0) once `types: ["node"]` is added to
+the browser fixture's tsconfig. Cause: `dist/browser.d.ts` re-exports
+`./harness.js`, whose published declarations reference the server surface, and the
+browser fixture omits `types: ["node"]` while the script's own comment at
+`scripts/check-package-types.mjs:347-349` states the server declarations require
+it; the `@ts-expect-error` on the server import does not suppress those unrelated
+declaration errors, so the run exits 1. Issue 0001 adds no Node reference to the
+browser declarations (`dist/browser.d.ts` and `dist/harness.d.ts` contain no
+`node:`/`NodeJS` reference); the one-line fixture tsconfig change sits in a file
+this issue owns only for its fixture lines, so it is left for the owner alongside
+the alternative — stop `browser.d.ts` from pulling in the server surface.
+
+**Drift against the cites above** — the **body** cite in **Evidence** is now
+historical: the assembled body is built by `transportBody` at
+`src/transport/openai.ts:999-1030` and serialized at `:1174-1180`, not
+`:829-835`, because this fix grew the file from **929** lines to **1292**. The
+header-note cite `:16-20` still lands on the (reworded) `stream_options` note.
+`README.md:1938` was the "`stream_options` is not sent" line; it is now
+`README.md:1984` inside the new subsection. Every `src/types/index.ts` cite moved
+**down by 8 lines** (a usage field was added to the `done` stream event above
+them, which is what AC1's "usage reaches the committed message unchanged"
+depends on): sampling `:447-453` → `:455-461`, `HarnessStream` `:443` → `:451`,
+`HarnessStreamRequest` `:409-417` → `:417-425`, provider configuration
+`:457-467` → `:547-569` (a documentation block for the new fields also sits
+above the type), and the "`{ stream }` wins over `provider`" cites `:455-456` →
+`:583-590`. The validator cites (`src/harness.ts:12021-12034`) and
+`src/core/agent.ts:147-159` (`resolveStream`, now `:270`) are the two other
+affected spots: `resolveStream` moved because the structured codes and helpers
+were inserted above it.
+
+- Status is **Fixed**. The log's rule for a closed issue is to delete the file and
+  drop the index row; the file is kept, with the row marked, so the fix can be
+  reviewed against its issue in the same pass — the owner's integrated run decides,
+  and deletion is then a one-command step.

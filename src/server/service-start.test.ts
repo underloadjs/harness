@@ -137,10 +137,12 @@ process.on('SIGINT', shutdown);
 `;
 
 // The catalogue the driver-injected runtime serves (T5 + the roster/role-contract
-// pass): the SEVEN shipped production presets plus the two fixtures the driver
+// pass): the EIGHT shipped production presets plus the two fixtures the driver
 // registers so this suite can run a real turn offline. An un-injected runtime lists
-// only the first seven. Order is the shipped catalogue order, fixtures last
-// (../harnesses/presets.ts:486-494 + PRODUCTION_WITH_FIXTURES at :513).
+// only the first eight. Order is the shipped catalogue order, fixtures last
+// (../harnesses/presets.ts + PRODUCTION_WITH_FIXTURES). The trailing production card is
+// `chat`, the tool-less card of issue 0005-D — production, so it ships in the list, and
+// last because it is not a role.
 const PRESET_NAMES = [
     'general',
     'instruct',
@@ -149,6 +151,7 @@ const PRESET_NAMES = [
     'reviewer',
     'planner',
     'debugger',
+    'chat',
     'demo',
     'flaky'
 ];

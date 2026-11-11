@@ -9,13 +9,17 @@
 //   - a supplied captured revision never re-reads changed files on disk;
 //   - non-literal local resolution is rejected with an actionable diagnostic;
 //   - the installed metadata/schema and live preset catalogue are part of the
-//     complete revision identity.
+//     complete revision identity;
+//   - the published read-only compile (`compileToolSourceModule`) reports exactly the
+//     checks it ran, pays no evaluation in `evaluate: 'syntax'`, and serves a repeated
+//     compile from the process cache without evaluating the module again (issue 0002).
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { prepareToolCandidate } from './tool-source';
+import { compileToolSourceModule, prepareToolSourceRecord, prepareToolCandidate } from './tool-source';
 import { prepareToolCandidate as prepareBrowserCandidate } from './tool-source-browser';
+import { tool } from './tool';
 import type { ToolSourceRecord } from './tool-source';
 
 // Scratch lives under the repository-root Temp/ directory as required by the
@@ -466,5 +470,310 @@ export const catalogueProbe = tool({
         );
         expect(catalogue).toBeDefined();
         expect(catalogue?.revision).toMatch(/^[0-9a-f]{16}$/);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 0002 — `compileToolSourceModule`, the published READ-ONLY compile.
+//
+// Pinned in this file (the kernel's own file, so no harness and therefore no
+// registry is involved — the "publishes nothing" half of the same contract lives
+// in src/harness.tool-catalogue.test.ts, where a registry exists to be read):
+//   - the default mode does the registration path's own work and reports exactly
+//     the checks it ran (`load:module` included);
+//   - `evaluate: 'syntax'` costs NO evaluation: the module below counts its own
+//     evaluations on `globalThis`, the metadata reported is the CANDIDATE's
+//     rather than the module's, and the result carries no `definition` key;
+//   - a candidate that cannot describe itself in that mode is refused with the
+//     three ways out, not with an empty result;
+//   - the compile cache serves the same revision without re-evaluating, is keyed
+//     on the mode, never caches a failure, and `{ cache: false }` re-evaluates;
+//   - a supplied `definition` is returned by identity, and the revision it
+//     derives equals `prepareToolSourceRecord`'s for the same bytes.
+// ---------------------------------------------------------------------------
+
+// The canonical editable module shape (declarative metadata + execute) plus the
+// evaluation probe. Every compile/registration evaluates a FRESH CommonJS graph, so
+// `globalThis` is the only observer of "was this module evaluated at all" — exactly
+// the fact the `evaluate` switch and the compile cache are defined by.
+const compiledEntryText = (value: string): string => `
+export const metadata = {
+    name: 'compileProbe',
+    description: 'Report the probe value.',
+    tags: ['test', 'compiler'],
+    parameters: { type: 'object', properties: {}, additionalProperties: false }
+};
+
+globalThis.__compileProbeEvaluations = (globalThis.__compileProbeEvaluations ?? 0) + 1;
+
+export const execute = () => ${JSON.stringify(value)};
+`;
+
+// A candidate whose top-level code runs and throws: in 'load' mode that throw IS the
+// validation failure; in 'syntax' mode it must never happen.
+const throwingEntryText = (message: string): string => `
+export const metadata = {
+    name: 'throwingProbe',
+    description: 'Throws while loading.',
+    tags: ['test', 'compiler'],
+    parameters: { type: 'object', properties: {}, additionalProperties: false }
+};
+
+globalThis.__compileProbeEvaluations = (globalThis.__compileProbeEvaluations ?? 0) + 1;
+
+throw new Error(${JSON.stringify(message)});
+
+export const execute = () => 'unreachable';
+`;
+
+// The probe counter, read as a number (the candidate module writes it).
+const evaluations = (): number =>
+    (globalThis as { __compileProbeEvaluations?: number }).__compileProbeEvaluations ?? 0;
+
+describe('compileToolSourceModule (issue 0002: compile, validate, publish nothing)', () => {
+    beforeEach(() => {
+        // Reset the probe so every case starts from a known count and the exact
+        // `before + 1` arithmetic below stays meaningful.
+        (globalThis as { __compileProbeEvaluations?: number }).__compileProbeEvaluations = 0;
+    });
+
+    it('loads the module and reports the registration checks with no registry involved', async () => {
+        const compiled = compileToolSourceModule({
+            name: 'compileProbe',
+            moduleText: compiledEntryText('loaded')
+        });
+
+        // The metadata is the MODULE's, because the module was evaluated.
+        expect(compiled.name).toBe('compileProbe');
+        expect(compiled.description).toBe('Report the probe value.');
+        expect(compiled.tags).toEqual(['test', 'compiler']);
+        expect(compiled.parameters).toEqual({
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+        });
+        expect(compiled.visibility).toBe('searchable');
+        expect(compiled.checks).toEqual([
+            'transpile:syntax',
+            'load:module',
+            'contract:tool',
+            'schema:json'
+        ]);
+        expect(evaluations()).toBe(1);
+        await expect(compiled.definition?.execute({ parameters: {} } as never)).resolves.toBe(
+            'loaded'
+        );
+
+        // The record is the shape `toolSource()` reports, so a host comparing the two
+        // surfaces is comparing like with like.
+        expect(compiled.record.name).toBe('compileProbe');
+        expect(compiled.record.revision).toBe(compiled.revision);
+        expect(compiled.record.format).toBe('module');
+        expect(compiled.record.dependencies).toEqual([]);
+        expect(compiled.record.checks).toEqual([
+            'transpile:syntax',
+            'load:module',
+            'contract:tool',
+            'schema:json'
+        ]);
+    });
+
+    it('reports the candidate metadata and never loads in syntax mode', () => {
+        const compiled = compileToolSourceModule(
+            {
+                // Every field here DIFFERS from the module's own metadata, so these
+                // assertions cannot pass by reading the module.
+                name: 'compileProbe',
+                description: 'Declared by the caller.',
+                tags: ['Test', 'Caller'],
+                parameters: { type: 'object', properties: { city: { type: 'string' } } },
+                moduleText: compiledEntryText('loaded')
+            },
+            { evaluate: 'syntax' }
+        );
+
+        // Nothing was evaluated, and the result says so by NOT carrying the key.
+        expect('definition' in compiled).toBe(false);
+        expect(evaluations()).toBe(0);
+        expect(compiled.description).toBe('Declared by the caller.');
+        expect(compiled.tags).toEqual(['test', 'caller']);
+        expect(compiled.parameters).toEqual({
+            type: 'object',
+            properties: { city: { type: 'string' } }
+        });
+        expect(compiled.visibility).toBe('searchable');
+        expect(compiled.checks).toEqual(['transpile:syntax', 'schema:json']);
+        expect(compiled.record.checks).toEqual(['transpile:syntax', 'schema:json']);
+    });
+
+    it('omits schema:json and the parameters key when syntax mode has no schema', () => {
+        const compiled = compileToolSourceModule(
+            { name: 'compileProbe', moduleText: compiledEntryText('loaded') },
+            { evaluate: 'syntax' }
+        );
+
+        expect(compiled.checks).toEqual(['transpile:syntax']);
+        expect('parameters' in compiled).toBe(false);
+        expect(compiled.description).toBe('');
+        expect(compiled.tags).toEqual([]);
+        expect(evaluations()).toBe(0);
+    });
+
+    it('refuses a syntax-mode candidate that cannot name itself, naming the three ways out', () => {
+        expect(() =>
+            compileToolSourceModule({ moduleText: compiledEntryText('loaded') }, { evaluate: 'syntax' })
+        ).toThrow(
+            'Tool source "<inline-tool-module>" was compiled without loading, so its name cannot be read from the module. Pass `name` on the candidate, supply a `definition`, or use evaluate: "load" to get a validated definition.'
+        );
+    });
+
+    it('treats a throwing top level as a validation failure, never as an evaluation in syntax mode', () => {
+        // 'syntax' never evaluates: an endpoint can answer about untrusted source
+        // without paying its side effects.
+        const checked = compileToolSourceModule(
+            { name: 'throwingProbe', moduleText: throwingEntryText('top-level side effect ran') },
+            { evaluate: 'syntax' }
+        );
+        expect(checked.checks).toEqual(['transpile:syntax']);
+        expect(evaluations()).toBe(0);
+
+        // 'load' runs the module, so the candidate's own throw IS the refusal.
+        expect(() =>
+            compileToolSourceModule({
+                name: 'throwingProbe',
+                moduleText: throwingEntryText('top-level side effect ran')
+            })
+        ).toThrow('top-level side effect ran');
+    });
+
+    it('serves a repeated compile of the same input without evaluating it again', () => {
+        const first = compileToolSourceModule({
+            name: 'compileProbe',
+            moduleText: compiledEntryText('cached')
+        });
+        expect(evaluations()).toBe(1);
+
+        const again = compileToolSourceModule({
+            name: 'compileProbe',
+            moduleText: compiledEntryText('cached')
+        });
+
+        // Same revision, and the probe proves the cached module was NOT re-evaluated.
+        expect(again.revision).toBe(first.revision);
+        expect(again.checks).toEqual(first.checks);
+        expect(evaluations()).toBe(1);
+
+        // A compile-produced definition is cloned per call, so a cache hit shares no
+        // object one caller could mutate into the next caller's result.
+        expect(again.definition).not.toBe(first.definition);
+        expect(again.record).toEqual(first.record);
+
+        // `{ cache: false }` re-runs the whole operation.
+        const uncached = compileToolSourceModule(
+            { name: 'compileProbe', moduleText: compiledEntryText('cached') },
+            { cache: false }
+        );
+        expect(uncached.revision).toBe(first.revision);
+        expect(evaluations()).toBe(2);
+    });
+
+    it('keys the compile cache on the mode and never caches a failure', () => {
+        const candidate = { name: 'compileProbe', moduleText: compiledEntryText('mode') };
+
+        // A syntax answer must not serve the load call: the mode is part of the key.
+        const syntax = compileToolSourceModule(candidate, { evaluate: 'syntax' });
+        expect(syntax.checks).toEqual(['transpile:syntax']);
+        expect(evaluations()).toBe(0);
+
+        const loaded = compileToolSourceModule(candidate);
+        expect(loaded.checks).toEqual([
+            'transpile:syntax',
+            'load:module',
+            'contract:tool',
+            'schema:json'
+        ]);
+        expect(evaluations()).toBe(1);
+
+        // A failing candidate is reported again on the next call: a validation
+        // endpoint must never serve a stale answer about source that can fail.
+        expect(() =>
+            compileToolSourceModule({
+                name: 'throwingProbe',
+                moduleText: throwingEntryText('refused twice')
+            })
+        ).toThrow('refused twice');
+        expect(evaluations()).toBe(2);
+        expect(() =>
+            compileToolSourceModule({
+                name: 'throwingProbe',
+                moduleText: throwingEntryText('refused twice')
+            })
+        ).toThrow('refused twice');
+        expect(evaluations()).toBe(3);
+    });
+
+    it('reports a syntax error in either mode with the transpile diagnostic', () => {
+        const brokenText =
+            'export const metadata = { name: "brokenProbe", description: "Does not parse", tags: ["test"], parameters: { type: "object" } };\n\nexport const execute = () => ;\n';
+
+        // The diagnostic is the transpile's own, quoted verbatim: the candidate name
+        // is the module label, so the position is readable as line:column of the text
+        // the caller passed.
+        const diagnostic = 'Tool source could not be transpiled: brokenProbe:3:30: Expression expected.';
+
+        expect(() =>
+            compileToolSourceModule({ name: 'brokenProbe', moduleText: brokenText })
+        ).toThrow(diagnostic);
+        expect(() =>
+            compileToolSourceModule(
+                { name: 'brokenProbe', moduleText: brokenText },
+                { evaluate: 'syntax' }
+            )
+        ).toThrow(diagnostic);
+        expect(evaluations()).toBe(0);
+    });
+
+    it('describes a supplied definition by identity and derives the revision from its bytes', () => {
+        const definition = tool({
+            name: 'compileProbe',
+            description: 'A definition the caller already owns.',
+            tags: ['test', 'compiler'],
+            parameters: { type: 'object', properties: {}, additionalProperties: false },
+            execute: () => 'caller-owned'
+        });
+        const moduleText = compiledEntryText('loaded');
+
+        const compiled = compileToolSourceModule({
+            name: 'compileProbe',
+            moduleText,
+            definition
+        });
+
+        // The object the caller holds is the object the result carries — in BOTH
+        // modes — and its module is never evaluated.
+        expect(compiled.definition).toBe(definition);
+        expect(evaluations()).toBe(0);
+        expect(compiled.description).toBe('A definition the caller already owns.');
+        expect(compiled.checks).toEqual(['transpile:syntax', 'contract:tool', 'schema:json']);
+        expect(compiled.record.checks).toEqual([
+            'transpile:syntax',
+            'contract:tool',
+            'schema:json'
+        ]);
+
+        const syntaxCompiled = compileToolSourceModule(
+            { name: 'compileProbe', moduleText, definition },
+            { evaluate: 'syntax' }
+        );
+        expect(syntaxCompiled.definition).toBe(definition);
+        expect(syntaxCompiled.revision).toBe(compiled.revision);
+        expect(evaluations()).toBe(0);
+
+        // The identity the harness installs for the same definition + bytes is THIS
+        // revision, which is what lets ONE compile serve many harness instances.
+        expect(prepareToolSourceRecord({ name: 'compileProbe', moduleText }, definition)).toEqual({
+            record: compiled.record,
+            revision: compiled.revision
+        });
     });
 });

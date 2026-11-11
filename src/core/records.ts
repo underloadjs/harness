@@ -256,6 +256,15 @@ const recordError = (
         ...(details === undefined ? {} : { details })
     });
 
+// R-0010 — the ONE wording for a `define` sent beside a `collection`. The engine has
+// always called that pair ambiguous and refused it, and the tool entry point used to
+// consume `define` first and silently throw the caller's `collection` away. Two sites
+// enforce the rule (`dispatchCall` for the `records` surface, `executeCollection` for
+// the wrapper path) and they share this string, so the pair can never answer with two
+// different sentences depending on the door it came through.
+const DEFINE_WITH_COLLECTION_MESSAGE =
+    'records "define" registers a NEW collection, so it takes no "collection" beside it.';
+
 // The human-facing label for a collection: the wrapper's singular noun when it has
 // one (`task`, `profile`), otherwise the collection name. It keeps the historical
 // sentence shape (`tasks has no task with id "9".`) while the code carries the
@@ -1227,6 +1236,18 @@ const stalePayloadOf = (
     };
 };
 
+// The refusal tail every conflict rejection ends with: the current entry as compact
+// JSON, plus the projection clause when the budget forced one. This is R9's shape,
+// extracted into the ONE renderer both conflict errors share (0009) — `stale-record`
+// emits exactly what it emitted before the extraction, and `guarded-write` now emits
+// byte-for-byte the same tail, so the two refusals can never drift apart.
+const stalePayloadTail = (payload: { json: string; projected: boolean; note?: string }): string =>
+    `current: ${payload.json}${
+        payload.projected === false
+            ? ''
+            : ` (projection: ${payload.note === undefined ? 'large fields omitted' : `${payload.note} omitted`})`
+    }`;
+
 // R4 — what the caller could ACTUALLY do about the conflict. `staleRecordError` used to
 // append `or pass "mergeDisjoint": true` unconditionally, which twice sent a live agent
 // after a knob that cannot help: a REMOVAL is never merged (the tool schemas say so),
@@ -1257,10 +1278,6 @@ const staleRecordError = (
     const fields = changedFieldsSince(definition, changes, entry.id, expected);
     const hint = fields === undefined || fields.length === 0 ? '' : `; changed fields: ${fields.join(', ')}`;
     const payload = stalePayloadOf(definition, entry);
-    const projection =
-        payload.projected === false
-            ? ''
-            : ` (projection: ${'note' in payload && payload.note !== undefined ? `${payload.note} omitted` : 'large fields omitted'})`;
 
     // The clashing fields, in canonical declaration order — the same intersection the
     // provable-merge refusal composes above (`cannot merge "<field>" because this patch
@@ -1302,7 +1319,8 @@ const staleRecordError = (
             `(now ${entry.rev}, last edited by "${entry.updatedBy ?? 'unknown'}"` +
             `${entry.updatedAt === undefined ? '' : ` at ${entry.updatedAt}`})${hint}; ` +
             `${adviceText} ` +
-            `current: ${payload.json}${projection}`,
+            // R9's payload, rendered by the shared tail — see `stalePayloadTail`.
+            stalePayloadTail(payload),
         {
             id: entry.id,
             expectedRev: expected,
@@ -1315,6 +1333,37 @@ const staleRecordError = (
             ...(advice.mergeDisjoint && clash.length > 0 ? { clash } : {}),
             projected: payload.projected,
             entry: copyEntry(definition, entry, payload.projected === false)
+        }
+    );
+};
+
+// R-0009 — the one message every guarded-write rejection shows. The sentence is the
+// historical one, byte-identical (the advice "read it first" is correct, so the
+// rejected alternative here was dropping it, not keeping the payload out); what was
+// missing is the RECORD the advice points at. `stale-record` on the same record already
+// returns it, budgeted, and the asymmetry is what made every first write to every record
+// cost a third call. So the same budgeted helper (`stalePayloadOf`) and the same
+// `current: …` tail are attached here: the caller reads the rev out of this refusal and
+// retries in one step, and the refusal stays bounded because the budget is the one R9
+// already set.
+//
+// `details` carries `projected` + `entry` exactly as `staleRecordError` emits them, plus
+// `note` naming what the projection withheld. WHY the extra key: `stale-record` composes
+// that note into its message, and this message is a pinned sentence that must not change,
+// so the note rides in the structured twin where a caller can still read it — the
+// degradation is still said out loud, never silent.
+const guardedWriteError = (definition: RecordCollectionDefinition, entry: RecordEntry): HarnessError => {
+    const payload = stalePayloadOf(definition, entry);
+
+    return recordError(
+        RECORD_ERROR_CODES.guardedWrite,
+        `guarded write: pass "expects" [{ id, rev }] for ${recordLabel(definition)} "${entry.id}" (read it first). ` +
+            stalePayloadTail(payload),
+        {
+            id: entry.id,
+            projected: payload.projected,
+            entry: copyEntry(definition, entry, payload.projected === false),
+            ...(payload.note === undefined ? {} : { note: payload.note })
         }
     );
 };
@@ -1403,6 +1452,67 @@ type Plan = {
     mutates: boolean;
 };
 
+// ---------------------------------------------------------------------------
+// Issue 0008 / 0011 — the keys this pair adds to the engine's ONE success envelope
+// (Decision D) and to the store-wide feed (R2a).
+//
+// WHY THE DECLARATION LIVES HERE AND NOT IN ../types
+// -------------------------------------------------
+// `RecordsResult`, `RecordStoreView` and `RecordStoreDelta` are published from
+// ../types/index.ts, which a concurrent pass owns right now (its own issue edits that
+// file), so this pass widens the engine's OWN view of its result instead of editing
+// under the other worker. The widening is additive and optional-only, so every existing
+// consumer that types the result as `RecordsResult` keeps compiling — a wider object is
+// still assignable to it, and `Harness.recordsChanges`/`Harness.records` (../types)
+// simply do not expose the new key yet. Follow-up for the types owner: declare
+// `addedIds?`, `changedIds?` and `oldestAvailableRev?` on `RecordsResult`,
+// `oldestAvailableRev?` on `RecordStoreDelta`/`RecordStoreView`, and `addedIds?` /
+// `changedIds?` on `TaskResult` (which already declares `removedIds?`).
+// ---------------------------------------------------------------------------
+export type RecordsResultAdditions = {
+    // 0008 — the ids a batch MINTED, in mint order, when it minted more than one.
+    addedIds?: string[];
+    // 0008 — the ids a batch REALLY changed (a no-op patch counts as nothing, exactly
+    // as it counts as nothing for `entry` and for the change log), in caller order,
+    // when it changed more than one.
+    changedIds?: string[];
+    // 0011 — the oldest revision this collection's retained change window can still
+    // show. Emitted beside `changes`, and on a plain read of a collection.
+    oldestAvailableRev?: number;
+};
+
+export type RecordsEngineResult = RecordsResult & RecordsResultAdditions;
+
+// 0011 — the store-wide feed carries the same floor (its events are numbered by `seq`,
+// which is the store revision each event was recorded at).
+export type RecordStoreWindow = {
+    oldestAvailableRev: number;
+};
+
+// 0011 — THE FLOOR OF A FIFO CHANGE WINDOW: the oldest revision it still holds.
+//
+// WHY IT IS READ OFF THE RETAINED EVENTS AND NEVER DERIVED FROM `storeRev`
+// -----------------------------------------------------------------------
+// `storeRev` steps once per RECORDED event, and a no-op patch or a lease-style write
+// records nothing (knowledge.md:1085-1086), so `storeRev - RECORD_MAX_CHANGES` is not
+// the floor. An EMPTY window means nothing at or below `storeRev` survives — a trimmed
+// window, or the epoch floor a re-`define` inherits (`freshState(definition, storeRev)`
+// below) — so the floor is then `storeRev + 1`: the reader is current only at
+// `since === storeRev`. A collection that has never written is 1, which is the revision
+// its first event will carry.
+//
+// `window[0]` is the oldest retained entry; `revKey` names the revision field of that
+// feed (`rev` for a per-collection window, `seq` for the store-wide feed).
+const windowFloor = (oldest: { rev?: number; seq?: number } | undefined, storeRev: number): number => {
+    if (oldest === undefined) return storeRev + 1;
+
+    // Both feeds are read here, and only one key exists on each; taking whichever is
+    // present keeps the helper honest about the feed it was handed.
+    const rev = oldest.rev ?? oldest.seq;
+
+    return rev ?? storeRev + 1;
+};
+
 // The store reads the planner needs. Reads only: the planner never mutates, so a
 // rejection anywhere in it leaves the collection exactly as it was.
 type StoreView = {
@@ -1417,6 +1527,19 @@ type StoreView = {
     // phrase its answer truthfully. Optional so a caller that cannot see the rest of
     // the store degrades to the "absent everywhere" wording rather than lying.
     ownerOf?: (id: string) => string | undefined;
+    // 0011 — the two facts that let the absent-id refusal below state ONE cause instead
+    // of hedging between two (issue 0011, proposal step 2):
+    //   - `oldestAvailableRev()` is this collection's window floor, the oldest revision
+    //     its change log still holds. At 1 the log reaches the collection's first event,
+    //     so "the log holds no removal" really is evidence that no removal happened;
+    //     above 1 the window has dropped events and stops being evidence about anything
+    //     older.
+    //   - `everMinted(id)` asks the id counter, which is global, monotonic and never
+    //     re-uses an id inside an instance (F3): `false` proves this store never handed
+    //     that id out at all, so the record was never anything anywhere — no removal can
+    //     be hiding in any window.
+    oldestAvailableRev: () => number;
+    everMinted: (id: string) => boolean;
     by?: string;
     threadId?: string;
 };
@@ -1706,14 +1829,42 @@ const readPlan = (
             );
         }
 
-        // Absent here with nothing in the log: never in this collection, or a removal
-        // the 200-event window has already dropped. Both are stated, neither claims a
-        // removal, and `removed` stays out of the details (T5.3).
+        // 0011 (issue 0011, proposal step 2) — this refusal used to offer BOTH causes in
+        // one sentence, because the log alone cannot tell them apart: an absent removal
+        // entry means "never removed" only while the window still reaches the
+        // collection's first event. With the floor and the id counter in hand it states
+        // ONE cause, and each branch is provable:
+        //
+        //   NEVER EXISTED — either this store never minted the id at all (`everMinted`
+        //   is false; the counter is global, monotonic and never re-uses an id, so no
+        //   window can be hiding its removal), or the window still reaches revision 1
+        //   (`oldestAvailableRev() <= 1`), where "no removal logged" is evidence rather
+        //   than silence. A re-`define`d collection keeps its epoch floor ABOVE 1
+        //   precisely so this branch cannot fire for a log that was rebuilt.
+        //
+        //   AGED OUT — the id WAS minted and the window has dropped events, so the
+        //   removal this collection did record can no longer be shown. The message names
+        //   the floor, which is the boundary the caller can branch on (the text is no
+        //   longer a choice between two causes). The one case this cannot see is an id
+        //   minted in ANOTHER collection and removed there — `ownerOf` only reports a
+        //   record that is still live — and that stays disclosed rather than argued.
+        const floor = store.oldestAvailableRev();
+
+        if (!store.everMinted(id) || floor <= 1) {
+            throw recordError(
+                RECORD_ERROR_CODES.staleRecord,
+                `${label} has no ${recordLabel(definition)} with id "${id}" — "${definition.name}" never held it, ` +
+                    `and this collection's change log${floor <= 1 ? '' : ` (which now starts at revision ${floor})`} holds no removal for it either. Re-read the list.`,
+                { id, expectedRev: rev, currentRev: 0, updatedBy: 'unknown' }
+            );
+        }
+
         throw recordError(
             RECORD_ERROR_CODES.staleRecord,
-            `${label} has no ${recordLabel(definition)} with id "${id}" and this collection's change log holds no removal for it — ` +
-                `it was never in "${definition.name}", or its removal aged out of the ${RECORD_MAX_CHANGES}-event window. Re-read the list.`,
-            { id, expectedRev: rev, currentRev: 0, updatedBy: 'unknown' }
+            `${label} has no ${recordLabel(definition)} with id "${id}" — its removal is older than this collection's ` +
+                `retained change window, which now starts at revision ${floor} (${RECORD_MAX_CHANGES} events), so the log can no ` +
+                `longer show it. Re-read the list.`,
+            { id, expectedRev: rev, currentRev: 0, updatedBy: 'unknown', oldestAvailableRev: floor }
         );
     }
 
@@ -1767,22 +1918,22 @@ const readPlan = (
     // call — a direct `tool()` or driver call — may still write blind.
     if (store.by !== undefined) {
         for (const entry of patches) {
-            if (!expects.has(entry.id as string)) {
-                throw recordError(
-                    RECORD_ERROR_CODES.guardedWrite,
-                    `guarded write: pass "expects" [{ id, rev }] for ${recordLabel(definition)} "${entry.id as string}" (read it first).`,
-                    { id: entry.id as string }
-                );
+            const patchedId = entry.id as string;
+
+            if (!expects.has(patchedId)) {
+                // R-0009: the refusal carries the current record (see `guardedWriteError`).
+                // STEP 4 (`:1871-1879`) has already proved this id resolves, so the lookup
+                // below cannot miss — the cast is that proven fact, not a hope.
+                throw guardedWriteError(definition, store.find(patchedId) as RecordEntry);
             }
         }
 
         for (const id of removals) {
             if (!expects.has(id)) {
-                throw recordError(
-                    RECORD_ERROR_CODES.guardedWrite,
-                    `guarded write: pass "expects" [{ id, rev }] for ${recordLabel(definition)} "${id}" (read it first).`,
-                    { id }
-                );
+                // Same payload for a removal: STEP 4 registers removal ids in the
+                // existence pass too (`:1766-1773`), so an unknown id is already
+                // `unknown-record` by the time this line can run.
+                throw guardedWriteError(definition, store.find(id) as RecordEntry);
             }
         }
     }
@@ -2318,8 +2469,15 @@ export type RecordEngine = {
      * window can no longer answer (trimmed away, or a store that was replaced wholesale
      * by a restore/reset — including a `since` ABOVE the watermark, i.e. a watermark
      * carried across a `reset()` that rewound the store to 0).
+     *
+     * 0011 — and plus `oldestAvailableRev`, the floor of that same window: the store
+     * revision the OLDEST retained event carries (`storeFeed[0].seq`). `reset` says a gap
+     * happened; this says where the reader can pick it back up. ../types'
+     * `RecordStoreView`/`RecordStoreDelta` (a file another pass owns) do not carry the key
+     * yet, so the harness facade still projects the narrower type — the engine's own view
+     * is the wide one, and the field is in the returned object.
      */
-    changesSince: (since: number) => RecordStoreDelta;
+    changesSince: (since: number) => RecordStoreDelta & RecordStoreWindow;
 };
 
 export const createRecordEngine = (): RecordEngine => {
@@ -2541,7 +2699,7 @@ export const createRecordEngine = (): RecordEngine => {
             // 5). `readWhere` has already normalized it, so `project` never re-validates.
             where?: Record<string, unknown>;
         }
-    ): RecordsResult => {
+    ): RecordsEngineResult => {
         const definition = state.definition;
         // The collection's sort key, when it declares one. `orderedFor` uses the first
         // `sortable` field; R2's cursor rule below asks the same question, so the two
@@ -2642,7 +2800,7 @@ export const createRecordEngine = (): RecordEngine => {
             }
         }
 
-        const result: RecordsResult = {
+        const result: RecordsEngineResult = {
             entries,
             // R7/T7.1 — the counts rule, stated exactly because it is what a caller
             // reconciles the page against: an UNFILTERED read still counts the WHOLE
@@ -2655,6 +2813,20 @@ export const createRecordEngine = (): RecordEngine => {
             page,
             storeRev: state.storeRev
         };
+
+        // 0011 (issue 0011, proposal step 1) — THE WINDOW FLOOR, on every result this
+        // builds: the feed the caller polls with, and a plain read beside it. The reader
+        // already had `changesTruncated` (a boolean) and `storeRev`; what it never had was
+        // where the retained window STARTS, so it could not tell "3 events behind" from "400
+        // lost" without re-reading the collection, and an empty feed could not say anything
+        // at all. The value is in hand at this point (the oldest retained event), so it
+        // costs one integer here and is not derivable from `storeRev` (see `windowFloor`).
+        //
+        // It is ALWAYS present, never count-dependent: one key, one stable type, the same
+        // rule `removed`/`removedIds` follow. Through a batch wrapper the key rides only
+        // beside `changes` (see `toWrapperResult`), because the wrappers' historical
+        // envelopes are pinned byte-for-byte and a plain wrapper read carries no feed.
+        result.oldestAvailableRev = windowFloor(state.changes[0], state.storeRev);
 
         // Copy the watermark into a const so the narrowing survives into the filter
         // callback (a property access is not narrowed inside a closure).
@@ -2710,19 +2882,26 @@ export const createRecordEngine = (): RecordEngine => {
         input: RecordsParameters & Record<string, unknown>,
         identity: CallerIdentity,
         callerBatchKey: string = 'entries'
-    ): RecordsResult => {
+    ): RecordsEngineResult => {
         const definition = state.definition;
         const label = callLabelOf(definition);
         const raw = input as Record<string, unknown>;
 
-        // `define` is answered by runCall, because a NEW collection has no
-        // collection to operate on. Reaching it here means the caller passed BOTH a
-        // collection and a define, which is ambiguous and refused, not merged.
+        // R-0010 — WHO CAN REACH THIS LINE. Not the `records` surface: `dispatchCall`
+        // refuses `collection` + `define` (`:3823`) ahead of its `define` short-circuit
+        // (`:3830`), so the engine never sees the pair from there. The one caller left is the
+        // WRAPPER path (`:3852` → `executeCollection` at `:3854`), whose input is built by
+        // `toCollectionInput`; its batch-style branch copies the caller's parameters
+        // verbatim (`{ ...raw }` at `:3551`), so a `tasks`-style call that carries a `define`
+        // does arrive here and is refused rather than merged into the wrapper's own
+        // collection. A TOOL-surface wrapper call gets no further than its own schema:
+        // `tasks.tool.ts:170` sets `additionalProperties: false` and never declares `define`,
+        // so core/schema-validation.ts:208 refuses that call before the engine runs — pinned
+        // in src/harness.records.test.ts. This guard is what a caller that enters the engine
+        // directly hits (as src/core/records.test.ts does), and it stays because the rule has
+        // to hold for every door, not just the model's.
         if (raw.define !== undefined) {
-            throw recordError(
-                RECORD_ERROR_CODES.invalidInput,
-                `records "define" registers a NEW collection, so it takes no "collection" beside it.`
-            );
+            throw recordError(RECORD_ERROR_CODES.invalidInput, DEFINE_WITH_COLLECTION_MESSAGE);
         }
 
         if (raw.drop === true) {
@@ -2882,6 +3061,18 @@ export const createRecordEngine = (): RecordEngine => {
 
                     return undefined;
                 },
+                // 0011 — the two reads the split refusal needs (see the STEP 3 comment in
+                // `readPlan`). Both come from the engine closure because nothing else owns
+                // the window or the id counter: the floor is the OLDEST retained event of
+                // THIS collection's window, and `everMinted` is the global, monotonic id
+                // counter — never re-used inside an instance, so an id at or above the
+                // next slot was never anything at all.
+                oldestAvailableRev: () => windowFloor(state.changes[0], state.storeRev),
+                everMinted: (id: string): boolean => {
+                    const numeric = Number(id);
+
+                    return Number.isInteger(numeric) && numeric >= 1 && numeric < nextId;
+                },
                 ...(identity.by === undefined ? {} : { by: identity.by }),
                 ...(identity.threadId === undefined ? {} : { threadId: identity.threadId })
             },
@@ -2939,6 +3130,15 @@ export const createRecordEngine = (): RecordEngine => {
         // batch answers with the page like any other success.
         const affected: RecordEntry[] = [];
 
+        // 0008 (issue 0008, proposal step 1) — the two id lists `affected` cannot express,
+        // because it mixes the two kinds of write: `minted` takes an id per ADDITION, in
+        // mint order (the order the caller sent them, which is the order the global counter
+        // handed them out), and `changed` takes an id per PATCH THAT ACTUALLY WROTE. A no-op
+        // patch is skipped by the loop above — no rev bump, no event — so it belongs in
+        // neither list, exactly as it belongs in no `entry` and no `changes` row.
+        const minted: string[] = [];
+        const changed: string[] = [];
+
         // 1. PATCHES. An existing entry keeps its position and its id, and only the
         //    fields the caller named change. A patch whose named fields already hold
         //    those values is a SUCCESS with no event — no rev bump, no attribution, no
@@ -2987,6 +3187,8 @@ export const createRecordEngine = (): RecordEngine => {
                 itemRev: entry.rev
             });
             affected.push(entry);
+            // 0008 — a patch that wrote something belongs in `changedIds` (see above).
+            changed.push(entry.id);
         }
 
         // 2. REMOVALS, before the additions, so a caller may restate a full section in
@@ -3028,6 +3230,9 @@ export const createRecordEngine = (): RecordEngine => {
 
             pushChange(state, { id, op: 'add', ...identityFields, at, itemRev: 1 });
             affected.push(entry);
+            // 0008 — the id this call just minted, in mint order (F3's global counter), so
+            // a batch that minted several can name them without paging the collection.
+            minted.push(id);
         }
 
         const result = project(state, {
@@ -3041,6 +3246,29 @@ export const createRecordEngine = (): RecordEngine => {
         });
 
         if (removed.length > 0) result.removed = removed;
+
+        // 0008 (issue 0008, proposal steps 1 and 2) — M3's remedy, extended to the two
+        // writes it never reached. A batch that minted or changed MORE THAN ONE record used
+        // to answer with the page only: `entry` is singular-only (the rule below), so the
+        // caller of `{ entries: [a, b], limit: 1 }` — the recipe `records.tool.ts` tells
+        // every caller to use — got one unrelated survivor row and NOTHING naming its own
+        // write, exactly the gap `removedIds` closed for removals. `addedIds` is the ids
+        // this call minted, `changedIds` the ids it really patched.
+        //
+        // WHY ONE, NOT ONE OR MORE, AND WHY A SEPARATE KEY
+        // ------------------------------------------------
+        // Mirrors `removedIds` for the reason that key states (the one-stable-type rule in
+        // the batch wrapper below): at exactly one affected record `entry` already says
+        // everything, so the list would restate it, and widening `entry` to
+        // `RecordEntry | RecordEntry[]` is what that rule forbids — the action wrappers
+        // unpack `entry` as ONE typed record. Each key keeps one stable type, and a caller
+        // branches on which KEY is present, never on a count.
+        //
+        // Emitted whatever `limit` says: the page is a plain projection (`project` above
+        // runs no matter what the batch touched), so the page can never be the answer, and
+        // shrinking it is the documented cheap-write recipe this has to keep working.
+        if (minted.length > 1) result.addedIds = minted;
+        if (changed.length > 1) result.changedIds = changed;
 
         // One affected record → `entry`, which is what lets an action wrapper answer
         // `add`/`update` with its singular domain shape.
@@ -3417,7 +3645,7 @@ export const createRecordEngine = (): RecordEngine => {
     const toWrapperResult = (
         definition: RecordCollectionDefinition,
         input: RecordsParameters & Record<string, unknown>,
-        result: RecordsResult
+        result: RecordsEngineResult
     ): RecordsResult | Record<string, unknown> => {
         const wrapper = definition.wrapper;
 
@@ -3448,14 +3676,15 @@ export const createRecordEngine = (): RecordEngine => {
             // It is surfaced SINGULAR, mirroring `entry`, and only when exactly ONE
             // record was removed:
             //   - `entry` follows the same one-record rule (`affected.length === 1` at
-            //     `records.ts:2857`), so a multi-record batch keeps the historical
+            //     `records.ts:3219`), so a multi-record batch keeps the historical
             //     page-only shape and every existing pin stays exact;
             //   - the sibling action-wrapper branch already answers `removed` as ONE
-            //     record — `removed: (result.removed ?? [])[0]` below at `:3253` — so
+            //     record — `removed: (result.removed ?? [])[0]` below at `:3698` — so
             //     the two wrapper styles now agree about what `removed` MEANS;
             //   - a caller that removes several records still gets the full array from
             //     the engine surface (`records` with no wrapper returns `result`
-            //     verbatim, `:3183`), where `removed?: RecordEntry[]` is declared.
+            //     verbatim, `:3596`), where `removed?: RecordEntry[]` is declared.
+            //   (issue 0008 re-anchored these three cites; they had drifted ~150-250 lines.)
             const shaped: Record<string, unknown> = {
                 [wrapper.plural]: result.entries ?? [],
                 counts: result.counts,
@@ -3478,7 +3707,15 @@ export const createRecordEngine = (): RecordEngine => {
                 // went, because at exactly one `removed` already says everything.
                 ...(result.removed && result.removed.length > 1
                     ? { removedIds: result.removed.map((entry) => entry.id) }
-                    : {})
+                    : {}),
+                // 0008 — the two sibling lists the engine emits for a batch that minted or
+                // changed more than one record (see `executeCollection`). They ride the
+                // wrapper unchanged: no `entry` and no `removed` is ever an ARRAY, and at
+                // exactly one affected record the engine leaves both keys OUT, because
+                // `entry` already names the record. So `tasks {"tasks":[a,b], "limit":1}`
+                // now answers with the ids it created instead of a survivor page.
+                ...(result.addedIds === undefined ? {} : { addedIds: result.addedIds }),
+                ...(result.changedIds === undefined ? {} : { changedIds: result.changedIds })
             };
 
             if (result.changes !== undefined) shaped.changes = result.changes;
@@ -3487,6 +3724,14 @@ export const createRecordEngine = (): RecordEngine => {
             }
             if (result.changesTruncated !== undefined) {
                 shaped.changesTruncated = result.changesTruncated;
+            }
+            // 0011 — the window floor rides the feed, and ONLY the feed: the wrappers'
+            // historical envelopes are pinned byte-for-byte, and a plain wrapper read has no
+            // `changes` for the floor to bound. Where the feed IS present, `changesTruncated`
+            // without this number tells a poller that it lost events and nothing about where
+            // it can resume.
+            if (result.changes !== undefined && result.oldestAvailableRev !== undefined) {
+                shaped.oldestAvailableRev = result.oldestAvailableRev;
             }
 
             return shaped;
@@ -3564,6 +3809,19 @@ export const createRecordEngine = (): RecordEngine => {
                     RECORD_ERROR_CODES.invalidInput,
                     'records expects an object with a "collection" and the store operations.'
                 );
+            }
+
+            // R-0010 — the pair is refused HERE, ahead of the `define` short-circuit below.
+            // The short-circuit answers a `define` before `findCollection` (its miss message
+            // with the registered names is at `:2624-2631`) can object, so a `collection`
+            // riding along used to be consumed and DISCARDED: the
+            // call succeeded and echoed `define.name` instead of the name the caller sent.
+            // The engine's own guard in `executeCollection` (`:2903`) already calls this
+            // combination ambiguous, so the enforced contract is refusal, and it is enforced
+            // at the door that actually runs. `undefined` is absence, not a sent collection:
+            // `records({ define })` on its own is the documented call and stays untouched.
+            if (raw.define !== undefined && raw.collection !== undefined) {
+                throw recordError(RECORD_ERROR_CODES.invalidInput, DEFINE_WITH_COLLECTION_MESSAGE);
             }
 
             // `define` creates a collection, so it arrives WITHOUT a `collection` to
@@ -3759,7 +4017,20 @@ export const createRecordEngine = (): RecordEngine => {
             };
         },
 
-        changesSince: (since: number): RecordStoreDelta => {
+        // 0011 — the store-wide feed gets the SAME floor the per-collection feed carries
+        // (issue 0011's second surface: this reader learned a gap happened from `reset` and
+        // could not say where the retained window starts). The floor used to be read here
+        // only to decide `reset` and then dropped. The key is `seq`, because that is how a
+        // store-wide event is numbered; it means exactly what `oldestAvailableRev` means
+        // beside a per-collection `changes` list.
+        //
+        // WHY `view()` DOES NOT CARRY IT: the snapshot hands over the WHOLE retained feed,
+        // so its own `changes[0].seq` is the floor and there is nothing to disambiguate;
+        // the delta is the envelope that can come back with a gap or an empty list, which is
+        // where the number is actually needed. `RecordStoreDelta` in ../types (a file
+        // another pass owns) does not declare the key yet, so the engine widens its own
+        // return type; `Harness.recordsChanges` keeps projecting the narrower one.
+        changesSince: (since: number): RecordStoreDelta & RecordStoreWindow => {
             const changes = storeFeed.filter((change) => change.seq > since).map((change) => ({ ...change }));
 
             // THE RESET RULE, in the three cases that exist:
@@ -3774,7 +4045,7 @@ export const createRecordEngine = (): RecordEngine => {
                 since > storeRev ||
                 (since < storeRev && (storeFeed.length === 0 || (storeFeed[0] as RecordStoreChange).seq > since + 1));
 
-            return { storeRev, collectionsRev, changes, reset };
+            return { storeRev, collectionsRev, changes, reset, oldestAvailableRev: windowFloor(storeFeed[0], storeRev) };
         },
 
         // "Start over": every collection's records, both counters and every change

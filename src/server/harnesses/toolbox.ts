@@ -54,8 +54,13 @@
 //     failures" example harness, which adds it as an extra tool. T25: it is excluded
 //     STRUCTURALLY — it lives in the sibling `examples` folder, which the shared
 //     folder scan never reads — rather than by a name list.
-//   - the `demo` preset stays the scripted offline fixture (timeNow only): it is
-//     not a live harness, so the equal-toolbox rule does not apply to it.
+//   - the `chat` card opts OUT of this toolbox entirely (issue 0005-D):
+//     `configuration.sharedToolbox: false` skips `SHARED_TOOL_SOURCES` and both
+//     environment rows, and `configuration.maxIterations: 1` gives it one model call.
+//     It is the ONLY shipped preset that does, it is declared at the card in
+//     ./presets.ts rather than inferred from `tools: []`, and it exists because a
+//     client that wants a session which never touches the server host had no way to
+//     ask for one. Everything else on the factory's default path is unchanged.
 //
 // LAZY, NOT EAGER
 // ---------------
@@ -452,7 +457,14 @@ export const createProfiledHarness =
         agentModels: Readonly<Record<string, string>> = {},
         agentInstructions: Readonly<Record<string, string>> = {},
         agentColors: Readonly<Record<string, string>> = {},
-        customAgents: Readonly<Record<string, string>> = {}
+        customAgents: Readonly<Record<string, string>> = {},
+        // THE TOOLBOX POSTURE (issue 0005-D): the one thing a preset may say about tools. It is a
+        // trailing OPTIONAL argument, so every existing caller (./presets.ts, ./registry.ts, the CLI)
+        // keeps the shared toolbox by construction exactly as before, and only a card that explicitly
+        // asks for the tool-less posture leaves it. Kept as a separate argument rather than folded into
+        // the six map arguments because those are all AGENT configuration — mixing a toolbox field in
+        // there would blur the rule this module exists to protect.
+        toolbox?: ProfiledHarnessToolbox
     ) =>
     (
         settings: RunnerSettings,
@@ -470,12 +482,23 @@ export const createProfiledHarness =
                     customAgents
                 ),
                 primary,
-                subagents: [...subagents]
+                subagents: [...subagents],
+                ...(toolbox === undefined ? {} : toolbox)
             },
             settings,
             progress,
             report
         );
+
+// What a preset may say about the TOOLBOX half of its harness — the exception list, not a knob panel.
+// Exported because ./presets.ts is the only caller today and a future host must find it HERE rather
+// than inventing a third factory beside this one.
+export type ProfiledHarnessToolbox = {
+    // See `ToolboxHarnessConfiguration.sharedToolbox`.
+    sharedToolbox?: boolean;
+    // See `ToolboxHarnessConfiguration.maxIterations`.
+    maxIterations?: number;
+};
 
 // What a live preset supplies: the agents and how they are routed. Everything
 // else is the shared toolbox, so two presets cannot end up with different tools.
@@ -484,6 +507,23 @@ export type ToolboxHarnessConfiguration = {
     primary: string;
     // Omitted/empty means a single-agent harness (no delegate tool).
     subagents?: readonly string[];
+    // THE TOOL-LESS POSTURE (issue 0005-D): `false` registers NO catalogue tool at all — neither the
+    // package presets nor the app folder (both ride `SHARED_TOOL_SOURCES`) and neither environment row
+    // (search/fetch), so the harness keeps only the harness-owned rows the kernel always owns
+    // (toolRegistry/toolRequest/toolList/toolManage/toolCreate/records/tasks/profiles/chapters/
+    // locations/agentManage/agentResult, plus the searchable demoted set) and, with no subagents, not
+    // even `delegate`. THAT is the gap this closes: a card whose model must never spend a tool round
+    // on the server host's filesystem.
+    //
+    // DELIBERATELY NOT THE DEFAULT. Every live preset still shares one toolbox by construction; this
+    // flag exists so ONE shipped card (and a host that injects its own preset) can state the opposite
+    // posture without a second factory, and its effect is pinned per-card in ./presets.test.ts.
+    // `presets: false` stays exactly as it is — the kernel's own baseline is skipped either way, so a
+    // tool-less card registers nothing the descriptor does not advertise.
+    sharedToolbox?: boolean;
+    // The tool-loop budget for THIS harness. Omitted means the app-wide `PRESET_MAX_ITERATIONS`, which
+    // is every live card. A single-answer card passes 1: one model call, no tool rounds.
+    maxIterations?: number;
     // Extra SOURCE entries, by package-relative path. Merged after the shared source
     // map and before host `extraTools`, so an extra is still compiled from its editable
     // entry instead of a prebuilt definition, while a host definition can still override
@@ -528,6 +568,8 @@ export const createToolboxHarness = (
     // kernel commits `toolSources` after the baseline and before `tools` overrides,
     // which preserves the documented "source, then host definition" order. A host
     // definition of the same name still wins.
+    const useSharedToolbox = configuration.sharedToolbox !== false;
+
     const liveConfiguration: HarnessConfiguration = {
         agents: configuration.agents,
         // Explicit routing: the entry agent is named even with one key, and the
@@ -545,24 +587,35 @@ export const createToolboxHarness = (
         // process start, so a brand-new `*.tool.ts` in the folder is compiled and
         // registered by the next startup with no map edit. The folder is the
         // authority; the map is only its projection.
-        toolSources: { ...SHARED_TOOL_SOURCES, ...configuration.extraToolSources },
+        //
+        // TOOL-LESS POSTURE (issue 0005-D): `sharedToolbox: false` drops the shared half and keeps only
+        // the caller's own `extraToolSources` — a card that declares no catalogue tools must register
+        // none, or the descriptor would advertise an empty list while the harness still declares core
+        // file tools to every request.
+        toolSources: useSharedToolbox
+            ? { ...SHARED_TOOL_SOURCES, ...configuration.extraToolSources }
+            : { ...configuration.extraToolSources },
         // Host/example DEFINITIONS override sources by being registered last.
         tools: { ...configuration.extraTools },
         presets: false,
-        // Live sessions use the app-wide tool-loop budget, not the library's 16.
-        maxIterations: PRESET_MAX_ITERATIONS,
+        // Live sessions use the app-wide tool-loop budget, not the library's 16. A tool-less card
+        // overrides it (issue 0005-D: `maxIterations: 1` for one answer, no tool rounds).
+        maxIterations: configuration.maxIterations ?? PRESET_MAX_ITERATIONS,
         // Environment-backed search; no key means the factory returns undefined
         // and the harness is unchanged. Keys are resolved at construction, after
         // `.env` is loaded by the CLI/server. The CONFIGURATION field keeps its
         // name (`websearch`); the core tool it registers is search (R18).
-        websearch: true,
+        // Both environment rows follow the shared-toolbox flag: a tool-less card declares no catalogue
+        // tool, and `fetch` in particular registers WITHOUT a credential, so it would otherwise sneak
+        // a core declaration onto a card whose descriptor promises none.
+        websearch: useSharedToolbox,
         // Page fetch (W4) must be opted into as well, or `fetch` never enters
         // this harness's tool map and `toolRequest` has nothing to surface under
         // the `web`/`fetch`/`url` tags — the agent then legitimately reports
         // "search only". `native` needs no credential, so this is safe on a
         // keyless host; the tool stays SEARCHABLE (see src/harness.ts), so it
         // costs no request schema until the model asks for it.
-        webfetch: true,
+        webfetch: useSharedToolbox,
         // The server's persistence observer rides along with progress; either may
         // be absent (CLI, direct preset creation).
         report: {

@@ -23,8 +23,11 @@
 // evaluated, and no compiler dependency is imported.
 
 import { HarnessError } from '../util';
+import type { Tool } from '../types';
 import type {
+    CompiledToolSourceModule,
     PreparedTool,
+    ToolCompileCandidate,
     ToolFolderTarget,
     ToolRegistrationCandidate,
     ToolSourceRecord
@@ -77,6 +80,31 @@ export const prepareToolCandidate = (
     );
 };
 
+// The published read-only compile (issue 0002) and the definition-plus-source
+// record (issue 0003) need the Node compiler too: capturing a module graph reads the
+// filesystem and hashes with `node:crypto`. Both keep their exported names here so
+// the aliased graph links and a browser host gets a named capability answer instead
+// of `undefined is not a function`. The harness never calls either one when
+// `supportsToolCompilation` is false, so a plain prebuilt tool still registers.
+export const compileToolSourceModule = (
+    candidate: ToolCompileCandidate
+): CompiledToolSourceModule => {
+    const name = candidate.name ?? '<unnamed>';
+    throw new HarnessError(
+        `Tool source compilation is unavailable in the browser build (candidate "${name}"). The browser root exposes prebuilt tool definitions only; run the harness on Node to compile or validate editable source revisions.`
+    );
+};
+
+export const prepareToolSourceRecord = (
+    candidate: ToolRegistrationCandidate,
+    _definition: Tool
+): { record: ToolSourceRecord; revision: string } => {
+    const name = candidate.name ?? '<unnamed>';
+    throw new HarnessError(
+        `Tool source compilation is unavailable in the browser build (candidate "${name}"). The browser root exposes prebuilt tool definitions only; run the harness on Node to derive a source revision for a prebuilt definition.`
+    );
+};
+
 // Inspection clones are pure data, so they remain available in a browser for a
 // host that holds an already-captured record (for example one received from a
 // Node server). Copying is still necessary: callers must not mutate the record.
@@ -99,10 +127,14 @@ export const cloneToolSourceRecord = (record: ToolSourceRecord): ToolSourceRecor
 });
 
 export type {
+    CompiledToolSourceModule,
     PreparedTool,
+    ToolCompileCandidate,
     ToolFolderTarget,
     ToolRegistrationCandidate,
+    ToolSourceCompileOptions,
     ToolSourceDependency,
+    ToolSourceEvaluateMode,
     ToolSourceLiveDependency,
     ToolSourceRecord
 } from './tool-source';

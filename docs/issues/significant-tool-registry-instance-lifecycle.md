@@ -1,6 +1,6 @@
 # 0003 — Tool registry and creation budget are per-instance, with no shared-catalogue path
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-11 (**part A** published the shared-catalogue source record, **part B** documented the per-instance budget; see **Fixed (2026-11-11)** below)
 > **Severity:** Significant
 > **Area:** `src/harness.ts` construction, `src/types/index.ts` (`HarnessConfiguration`, `Harness`)
 > **Date opened:** 2026-11-02
@@ -166,3 +166,68 @@ leak between sessions.
 - README cites follow the 2026-11-11 README realignment (`:599` for the tool
   discovery Lifetime row, `:2683-2684` for the one-harness-per-session
   statement); `README.md:75-119` (sessions/agents/threads) is unchanged.
+
+## Fixed (2026-11-11)
+
+- **Part A shipped — a source record for a definition the host already owns.**
+  `configuration.tools` now takes `Tool | { tool, source }`
+  (`HarnessConfiguredTool`, `src/types/index.ts:1071`; the attachment is
+  `HarnessToolSourceAttachment`, `:1057-1065` — `moduleText` or `sourcePath`, plus captured
+  `dependencies`). It is validated at construction, naming the tool
+  (`configuredToolEntry`, `src/harness.ts:854`), and the registration kernel gained one
+  branch: a candidate with a `definition` AND source bytes derives its record from those bytes
+  WITHOUT re-evaluating the module (`prepareDefinedSource`, `src/harness.ts:2097`, reached at
+  `:2137-2142` through `hasSourceBytes` `:2117`), while a bare `definition` keeps the
+  historical no-record path. `registerTool({ definition, moduleText })` takes the same branch.
+  One catalogue object therefore installs into N instances, each of which still answers
+  `toolSource()`/`toolSources()` with the SAME content-addressed revision
+  `compileToolSourceModule` reported for those bytes — the identity both sides derive is
+  pinned in `src/core/tool-source.test.ts` (last case) and
+  `src/harness.tool-catalogue.test.ts:79`.
+- **The comment/type drift this issue named is closed.** `HarnessToolRegistrationCandidate`
+  declares `definition` and states the two-case rule beside it
+  (`src/types/index.ts:1080-1093`), so the comment no longer describes a field the type
+  lacks.
+- **The browser boundary stays a refusal, not a construction failure.** The browser alias
+  gained throwing `compileToolSourceModule`/`prepareToolSourceRecord`
+  (`src/core/tool-source-browser.ts:89`, `:98`), and `prepareDefinedSource` skips the record
+  when `supportsToolCompilation` is false (`src/harness.ts:2103`) — a browser harness still
+  registers a prebuilt tool with the historical no-record shape instead of failing to build it.
+- **Part B is documentation, as proposed.** The budget is stated as per-instance in the
+  configuration comment (`src/types/index.ts:3428-3445`, including the pointer to the
+  shared-catalogue shape) and in the README: the configuration row
+  (`README.md:1610`, added — the field had no row) and
+  "The budget is per instance, and so is the construction cost" (`README.md:1682-1701), which
+  names what each construction actually pays for (the AST descriptor scan, which
+  `src/tools/descriptors.ts:61` states is not cached across calls, the `presets` wiring, each
+  `toolFolders` root scan and compile, then `toolSources`/`tools`) and which host shape fits
+  which need.
+- **Deliberately NOT implemented** (the alternatives the issue rejected): no thread-local or
+  process-global registry, no host-visible counter, no thread-semantics change, and discovery
+  state stays per-instance. A global registry could not preserve the per-instance
+  `snapshot()`/`restore()` isolation the package promises, which is what `src/harness.ts`'s
+  per-instance `tools`/`toolSourceRecords` maps encode.
+- **Tests.** `src/harness.tool-catalogue.test.ts:79` (7 cases: one catalogue into two
+  instances with the compile revision and identical records; a replacement in one instance
+  moving that instance's revision while the sibling's record and implementation stay
+  byte-identical; the `sourcePath` attachment form, whose record matches the standalone
+  compile and whose file is NOT discovered as a second tool; a bare configured `Tool` still
+  answering `undefined`; the four attachment refusals).
+  `src/harness.creation-policy.test.ts:184` and `:328` (per-instance budget: the spent
+  ceiling refuses with no half-created tool and a `createdToolCount` of exactly the limit,
+  a sibling built from the same configuration object creates the same name cleanly and keeps
+  its own instances, neither instance sees the other's creations, and a configured catalogue
+  tool never spends `maxCreatedTools`).
+  `src/harness.browser-fallback.test.ts:67` (a `{ tool, source }` entry on a build without
+  the source compiler installs the definition, runs it, and claims NO source record).
+- **Verification.** The same runs recorded under **Fixed (2026-11-11)** in issue 0002 —
+  both issues touch the same registration path: the focused pair
+  (`src/core/tool-source.test.ts`, `src/harness.tool-catalogue.test.ts`) → **31 passed**, the
+  12-file registration/records/web/root-surface set → **148 passed**, the full package from
+  `packages/underload/harness` → **187 files / 3559 tests passed, 2 skipped, exit 0**, and
+  `yarn workspace @underload/harness run typecheck` → **exit 0**. `harness.missing-source`
+  and `harness.browser-fallback` are inside that set, which is what pins the capability
+  boundary this issue's Part A depends on.
+- **What stays as proposed.** The registry is still per-instance state, the budget is still a
+  per-instance lifetime budget that `reset()` does not restore, and this issue closes the
+  shared-catalogue GAP and the wording; it does not turn the registry into session memory.

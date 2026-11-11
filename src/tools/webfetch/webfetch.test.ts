@@ -20,14 +20,29 @@ import {
     FETCH_TIMEOUT_MS,
     HONEST_USER_AGENT,
     MAX_CONTENT_CHARS,
+    MAX_QUERY_BLOCKS,
     MAX_RESPONSE_BYTES,
     MAX_RESULT_BYTES,
     MAX_RESULT_CONTENT_BYTES,
     binaryExtension,
     charsetFrom,
     isPrivateHost,
-    safeFetchUrl
+    safeFetchUrl,
+    transportFailureMessage
 } from './request';
+
+// The oversized-response sentence, pinned WHOLE. The two existing oversize tests
+// asserted only the first clause, which let the ADVICE drift back to remedies that
+// cannot work in the state that triggers this error (issue 0014: `query` selects
+// sections of the converted document, so it never runs when a content-length
+// rejection fires before a byte is read, and `grep` skips files larger than the
+// 1 MiB that caused the error — silently, with `matches: []`).
+const OVERSIZED_MESSAGE =
+    `fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes. Try the plain-text or raw source form of the page if the host offers one (.txt, a "?action=raw" / print view) — that is the only remedy that reduces the transferred body; "query" and "format" cannot help, because they apply after this size check. Or use the \`download\` tool to save the bytes and read them with \`read\` (\`grep\` skips files over 1 MiB).`;
+// The native module's own entry, imported directly (not through the lazy
+// `import()` ./index uses) so the math-flattening fact the conversion reports
+// can be pinned without depending on the envelope that turns it into a `note`.
+import { MATH_FLATTENED_NOTE, fetchNative } from './native';
 
 const call = async (
     definition: Tool<WebFetchParameters, WebFetchResult>,
@@ -553,9 +568,16 @@ if (a &lt; 2) log(a);</pre>
                 })
         );
 
-        await expect(call(keyless(), { url: 'https://example.com/big' })).rejects.toThrow(
-            `fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`
+        // The WHOLE sentence, not just the first clause (issue 0014). The advice is
+        // the part that drifted: pinning only "…larger than N bytes." left the remedy
+        // list free to name `query` (which cannot run in this state) and `grep` (which
+        // skips files above the very size that caused the error).
+        const message = await call(keyless(), { url: 'https://example.com/big' }).then(
+            () => undefined,
+            (error: unknown) => (error as Error).message
         );
+
+        expect(message).toBe(OVERSIZED_MESSAGE);
 
         // Nothing was downloaded: the advertised size alone is the rejection, and
         // cancelling releases the connection instead of streaming a page we throw
@@ -1139,5 +1161,769 @@ describe('fetch: content shape and safety (defect fixes)', () => {
                 'model'
             )
         ).toThrow(/must not include the additional property "bogus"/);
+    });
+});
+
+// Issue 0012 — the converter used to delete `<sup>`/`<sub>` with their text, so
+// `10<sup>12</sup>` reached the model as "1012" and the NIST Planck constant as
+// "x 10-34 J s" (a subtraction, wrong by 34 orders of magnitude), and the same
+// byte-level tag boundary let Parsoid's `data-mw='{…}'` — a quoted attribute
+// value containing a literal `>` — spill `{{rp|…}}` and `{{cite journal |…}}`
+// into the middle of an article. Every fixture here is a crafted page, so the
+// mechanism is pinned offline; the live-page counts in the issue doc are history.
+describe('fetch: math markup and attribute metadata (issue 0012)', () => {
+    it('converts superscripts and subscripts into markers instead of joining them to the base', async () => {
+        stubFetch(() =>
+            html(
+                '<article><p>agrees with experiment to within 1 part in 10<sup id="mwZA">12</sup>, ' +
+                    'and H<sub>n</sub>O is water.</p></article>'
+            )
+        );
+
+        const result = await call(keyless(), { url: 'https://example.com/qm' });
+
+        // Exact, not "contains a caret": the whole point is that the digits of the
+        // exponent no longer run into the base.
+        expect(result.content).toBe('agrees with experiment to within 1 part in 10^12, and H_nO is water.');
+        expect(result.content).not.toContain('1012');
+        expect(result.content).not.toContain('HnO');
+    });
+
+    it('keeps the same markers in text output', async () => {
+        // `format=text` used to be no help at all: its own catch-all deleted the
+        // tag exactly like markdown's, one space apart, so the sentence came back
+        // as "1 part in 10 12".
+        stubFetch(() =>
+            html(
+                '<article><p>agrees with experiment to within 1 part in 10<sup id="mwZA">12</sup>, ' +
+                    'and H<sub>n</sub>O is water.</p></article>'
+            )
+        );
+
+        const result = await call(keyless(), { url: 'https://example.com/qm', format: 'text' });
+
+        expect(result.content).toBe('agrees with experiment to within 1 part in 10^12, and H_nO is water.');
+        expect(result.content).not.toContain('10 12');
+    });
+
+    it('does not read a NIST-style exponent as a subtraction', async () => {
+        // Source HTML is `10<sup>-34</sup>`; the minus sign must land after the
+        // marker, where it is unambiguously an exponent, not glued to the mantissa.
+        stubFetch(() => html('<p>&#8463; = 1.054 571 817&hellip; x 10<sup>-34</sup> J s</p>'));
+
+        const markdown = await call(keyless(), { url: 'https://physics.example.gov/cgi-bin/cuu/Value?hbar' });
+
+        expect(markdown.content).toBe('\u210f = 1.054 571 817… x 10^-34 J s');
+        expect(markdown.content).not.toContain('10-34');
+
+        stubFetch(() => html('<p>&#8463; = 1.054 571 817&hellip; x 10<sup>-34</sup> J s</p>'));
+
+        const text = await call(keyless(), {
+            url: 'https://physics.example.gov/cgi-bin/cuu/Value?hbar',
+            format: 'text'
+        });
+
+        expect(text.content).toBe('\u210f = 1.054 571 817… x 10^-34 J s');
+        expect(text.content).not.toContain('10-34');
+    });
+
+    it('returns math and metadata markup verbatim when the caller asked for html', async () => {
+        // `format=html` is the lossless escape hatch the note points at, so it has
+        // to keep the marker AND the round-trip metadata the other formats drop.
+        const markup =
+            '<html><body><p>1 part in 10<sup id="mwZA">12</sup> and ' +
+            '<span data-mw=\'{"a":"x>y"}\'>kept</span>.</p></body></html>';
+
+        stubFetch(() => html(markup));
+
+        const result = await call(keyless(), { url: 'https://example.com/raw', format: 'html' });
+
+        expect(result.content).toBe(markup);
+        expect(result.content).toContain('10<sup id="mwZA">12</sup>');
+        expect(result.content).toContain('data-mw=\'{"a":"x>y"}\'');
+    });
+
+    it('reports math as flattened exactly when math markup was flattened', async () => {
+        // The disclosure is the part that protects a model that never notices, so
+        // it must fire for every carrier — <sup>, <sub>, <math>/MathML — in either
+        // format, and must stay silent for a page that has none.
+        stubFetch(() => html('<p>within 1 part in 10<sup>12</sup></p>'));
+        expect((await fetchNative('https://example.com/sup', 'markdown')).converted.mathFlattened).toBe(true);
+
+        stubFetch(() => html('<p>H<sub>n</sub>O</p>'));
+        expect((await fetchNative('https://example.com/sub', 'text')).converted.mathFlattened).toBe(true);
+
+        stubFetch(() => html('<p><math><mrow><mfrac><mi>\u210F</mi><mn>2</mn></mfrac></mrow></math></p>'));
+        expect((await fetchNative('https://example.com/math', 'markdown')).converted.mathFlattened).toBe(true);
+
+        // "1012 kelvin" is a real number in prose, not flattened math: the note for
+        // it would train a model to ignore the note.
+        stubFetch(() => html('<p>a star of 1012 kelvin, no markup here.</p>'));
+        expect((await fetchNative('https://example.com/plain', 'markdown')).converted.mathFlattened).toBe(false);
+        expect((await fetchNative('https://example.com/plain', 'text')).converted.mathFlattened).toBe(false);
+
+        // Nothing was converted on the other two paths, so nothing was flattened.
+        stubFetch(() => html('<p>within 1 part in 10<sup>12</sup></p>'));
+        expect((await fetchNative('https://example.com/html', 'html')).converted.mathFlattened).toBe(false);
+
+        stubFetch(() => response('{"value":"10^-34"}', { headers: { 'content-type': 'application/json' } }));
+        expect((await fetchNative('https://example.com/json', 'markdown')).converted.mathFlattened).toBe(false);
+    });
+
+    it('names the flattening and the format=html remedy in the disclosure it hands ./index', () => {
+        // ./index owns the envelope prose, so the wording is pinned here: it must
+        // say what happened and how to get the exact values back.
+        expect(MATH_FLATTENED_NOTE).toBe('Math markup flattened; use format="html" for exact values.');
+        expect(MATH_FLATTENED_NOTE).toContain('flattened');
+        expect(MATH_FLATTENED_NOTE).toContain('format="html"');
+    });
+
+    it('does not report a code sample that mentions <sup> as flattened math', async () => {
+        // A <pre> is code and comes back as written: the escaped form stays literal
+        // text and the raw wrapper tags are stripped by PRE_WRAPPER_TAGS. Flagging
+        // that would put a math note on any page with a highlighted snippet.
+        stubFetch(() =>
+            html('<pre>if (a&lt;b) log(10&lt;sup&gt;12&lt;/sup&gt;)\nif (x<sup>2</sup>) y;</pre><p>prose after the sample.</p>')
+        );
+
+        const { converted } = await fetchNative('https://example.com/code', 'markdown');
+
+        expect(converted.mathFlattened).toBe(false);
+        expect(converted.content).toContain('```\nif (a<b) log(10<sup>12</sup>)\nif (x2) y;\n```');
+        expect(converted.content).toContain('prose after the sample.');
+    });
+
+    it('keeps Parsoid data-mw metadata out of mid-prose markdown', async () => {
+        // The Wikipedia shape, in miniature: the round-trip JSON sits on the ref
+        // <sup> and on the <li>, and it contains a literal `>` inside the quoted
+        // value. A boundary that ends the tag at that `>` emits everything after it
+        // — `}}'>`, `{{rp|…}}`, `"i":0`, `{{cite journal |…}}` — as article text.
+        const article =
+            '<article><h1>Quantum mechanics</h1>' +
+            '<p>The electron is<sup about="#mwa2" class="mw-ref-link-indicator" ' +
+            `data-mw='{"tag":"ref","attrs":{"title":"The Physics of Atoms"},"body":{"mt":"{{rp|100\u2013105 >x}}"}},"i":0}'>` +
+            '[1]</sup> stable.</p>' +
+            '<h2>Philosophical implications</h2>' +
+            '<ol class="references"><li id="cite_note-1" about="#cite_note-1" ' +
+            `data-mw='{"name":"Foo","template":{"1":{"value":{"mt":"{{cite journal |title=Quantum decoherence |doi>10.1234}}"}}},"i":0}'>` +
+            '^ "Foo".</li></ol></article>';
+
+        stubFetch(() => html(article));
+
+        const markdown = await call(keyless(), { url: 'https://en.wikipedia.org/wiki/Quantum_mechanics' });
+
+        expect(markdown.content).not.toContain('{{rp|');
+        expect(markdown.content).not.toContain('{{cite journal');
+        expect(markdown.content).not.toContain('"i":0');
+        // The tell-tale fragment of a mis-split tag: the tail of the attribute.
+        expect(markdown.content).not.toContain("'>");
+        // And the reader keeps what was actually on the page.
+        expect(markdown.content).toContain('# Quantum mechanics');
+        expect(markdown.content).toContain('The electron is^[1] stable.');
+        expect(markdown.content).toContain('- ^ "Foo".');
+
+        stubFetch(() => html(article));
+
+        const text = await call(keyless(), { url: 'https://en.wikipedia.org/wiki/Quantum_mechanics', format: 'text' });
+
+        expect(text.content).not.toContain('{{rp|');
+        expect(text.content).not.toContain('{{cite journal');
+        expect(text.content).not.toContain('"i":0');
+        expect(text.content).toContain('The electron is^[1] stable.');
+    });
+
+    it('treats a `>` inside any quoted attribute value as inside the tag', async () => {
+        // The mechanism, with no MediaWiki involved: `data-mw` is only the most
+        // common carrier. The naive boundary `<[^>]*>` returned `see b">only this
+        // text` for this exact page.
+        stubFetch(() => html('<p>see <span class="tip" title="a>b">only this</span> text</p>'));
+
+        const markdown = await call(keyless(), { url: 'https://example.com/attr' });
+
+        expect(markdown.content).toBe('see only this text');
+
+        stubFetch(() => html('<p>see <span class="tip" title="a>b">only this</span> text</p>'));
+
+        const text = await call(keyless(), { url: 'https://example.com/attr', format: 'text' });
+
+        expect(text.content).toBe('see only this text');
+    });
+
+    // --- Envelope level (issue 0012: criterion 1 as the issue now numbers it,
+    // criterion 3 as originally filed) ----------------------------------------
+    // Everything above pins the converter. The consumer is the model, and the
+    // model only sees the RESULT, so the disclosure has to survive the hand-off
+    // through ./index. These call the tool entry point and assert `result.note`.
+    it('discloses the flattening on the result in markdown and in text', async () => {
+        // The whole gap: the converter said "flattened", the envelope dropped it.
+        // Both lossy formats must carry the sentence, verbatim — a paraphrase
+        // invented in ./index would drift from the module that knows the loss.
+        stubFetch(() => html('<p>within 1 part in 10<sup id="mwZA">12</sup></p>'));
+
+        const markdown = await call(keyless(), { url: 'https://example.com/qm' });
+
+        // The marker did the rescue; the note reports the loss the marker cannot
+        // rescue (MathML still flattens), and proves the flag was actually set.
+        expect(markdown.content).toBe('within 1 part in 10^12');
+        expect(markdown.note).toBe(MATH_FLATTENED_NOTE);
+
+        stubFetch(() => html('<p>within 1 part in 10<sup id="mwZA">12</sup></p>'));
+
+        const text = await call(keyless(), { url: 'https://example.com/qm', format: 'text' });
+
+        expect(text.content).toBe('within 1 part in 10^12');
+        expect(text.note).toBe(MATH_FLATTENED_NOTE);
+    });
+
+    it('leaves the disclosure off the result when nothing was flattened', async () => {
+        // A note on a page that lost nothing trains a model to ignore the note.
+        // Three silent paths: prose that only LOOKS like a flattened exponent,
+        // `format=html` (the verbatim body the note points at), and a non-HTML
+        // body, which is passed through without any conversion at all.
+        stubFetch(() => html('<p>a star of 1012 kelvin, no markup here.</p>'));
+
+        const plain = await call(keyless(), { url: 'https://example.com/plain' });
+
+        expect(plain.content).toBe('a star of 1012 kelvin, no markup here.');
+        expect(plain.note).toBeUndefined();
+
+        const markup = '<html><body><p>within 1 part in 10<sup>12</sup></p></body></html>';
+
+        stubFetch(() => html(markup));
+
+        const raw = await call(keyless(), { url: 'https://example.com/raw', format: 'html' });
+
+        expect(raw.content).toBe(markup);
+        expect(raw.note).toBeUndefined();
+
+        stubFetch(() =>
+            response('{"unit":"J s","value":"1.054571817e-34"}', { headers: { 'content-type': 'application/json' } })
+        );
+
+        const json = await call(keyless(), { url: 'https://example.com/api/value' });
+
+        expect(json.content).toBe('{"unit":"J s","value":"1.054571817e-34"}');
+        expect(json.note).toBeUndefined();
+    });
+
+    it('discloses the flattening on a query answer as well as on a window', async () => {
+        // Section selection is its own return path, and it converts the same page,
+        // so it loses the same math. A caller that paid only for the sections would
+        // otherwise cite `10-34` with no warning at all. Three headings, because a
+        // document with two or fewer sections is answered by the proximity fallback
+        // instead (sections.ts:52, FLAT_DOCUMENT_SECTIONS).
+        stubFetch(() =>
+            html(
+                '<article><h1>Planck constant</h1><p>The value is 1.054 571 817 x 10<sup>-34</sup> J s.</p>' +
+                    '<h2>History</h2><p>Max Planck, 1900.</p>' +
+                    '<h2>Related constants</h2><p>The reduced constant is &#8463; = h / 2&#960;.</p></article>'
+            )
+        );
+
+        const result = await call(keyless(), { url: 'https://example.com/qm', query: 'Planck' });
+
+        expect(result.matchMode).toBe('heading');
+        expect(result.content).toContain('10^-34');
+        expect(result.note).toBe(MATH_FLATTENED_NOTE);
+    });
+
+    it('keeps the clamp note when a clamped offset lands on flattened math', async () => {
+        // Acceptance criterion 2. `note` is ONE field, so when two disclosures
+        // compete the one that explains the window the caller is holding wins —
+        // here, the clamp. Overwriting is fine; dropping the clamp would send the
+        // caller paging for a page it has already read to the end.
+        stubFetch(() => html('<p>within 1 part in 10<sup>12</sup></p>'));
+
+        // First: the same page with no offset, which pins that the math note WOULD
+        // have been set. Without this the precedence claim could pass on a fixture
+        // whose flag was simply never raised.
+        const unclamped = await call(keyless(), { url: 'https://example.com/qm' });
+
+        expect(unclamped.note).toBe(MATH_FLATTENED_NOTE);
+
+        stubFetch(() => html('<p>within 1 part in 10<sup>12</sup></p>'));
+
+        const clamped = await call(keyless(), { url: 'https://example.com/qm', offset: 40_000 });
+
+        expect(clamped.content).toBe('');
+        expect(clamped.offsetClamped).toBe(true);
+        expect(clamped.note).toContain('past the end');
+        expect(clamped.note).not.toBe(MATH_FLATTENED_NOTE);
+    });
+
+    it('keeps the proximity note when a headingless query lands on flattened math', async () => {
+        // The other half of criterion 2, on the query return path: the proximity
+        // note explains why the caller got an excerpt instead of a section, which
+        // is the fact it needs in order to page correctly.
+        const page = `<p>${'filler prose. '.repeat(500)}needle: 1 part in 10<sup>12</sup></p>`;
+
+        stubFetch(() => html(page));
+
+        // Same page, no `query`: the math note is what a plain read gets.
+        const windowed = await call(keyless(), { url: 'https://example.com/rfc' });
+
+        expect(windowed.content).toContain('needle: 1 part in 10^12');
+        expect(windowed.note).toBe(MATH_FLATTENED_NOTE);
+
+        stubFetch(() => html(page));
+
+        const proximity = await call(keyless(), { url: 'https://example.com/rfc', query: 'needle' });
+
+        expect(proximity.matchMode).toBe('proximity');
+        expect(proximity.note).toContain('no heading structure');
+        expect(proximity.note).not.toBe(MATH_FLATTENED_NOTE);
+    });
+});
+
+// Shared helper for the issue-0014/0015/0016 blocks below: the message a call
+// rejected with, so an error sentence can be pinned exactly rather than matched
+// by fragment.
+const failureMessage = async (parameters: WebFetchParameters): Promise<string> => {
+    try {
+        await call(keyless(), parameters);
+    } catch (error) {
+        return (error as Error).message;
+    }
+
+    throw new Error(`expected fetch to reject for ${JSON.stringify(parameters)}`);
+};
+
+// A transport rejection shaped the way undici rejects: a `fetch failed` error with
+// the system error hanging off `cause`. Fabricated, so none of these tests needs
+// the network or a live host.
+const transportRejection = (cause: unknown): Error =>
+    Object.assign(new Error('fetch failed'), { cause });
+
+// One errno-shaped error, optionally carrying the HTML body a hostile transport
+// might echo back, to prove the sanitizer still keeps page content out.
+const causeWithCode = (code: string, message = `connect ${code} 203.0.113.9:443`): Error =>
+    Object.assign(new Error(message), { code });
+
+describe('fetch: the oversized-response remedy list (issue 0014)', () => {
+    it('names only remedies that can work in the state that triggers the size error', async () => {
+        const counters = { produced: 0, cancelled: false };
+
+        stubFetch(
+            () =>
+                response(countedStream(64 * 1024, counters), {
+                    headers: { 'content-type': 'text/plain', 'content-length': String(MAX_RESPONSE_BYTES + 1) }
+                })
+        );
+
+        const message = await failureMessage({ url: 'https://example.com/big' });
+
+        expect(message).toBe(OVERSIZED_MESSAGE);
+        // Acceptance criterion 1 and 2, stated as facts a rewrite has to keep:
+        // `query` is gone from the remedy list, and the downloaded file is handed to
+        // `read`, with `grep`'s 1 MiB skip called out instead of recommended.
+        expect(message).toContain('read them with `read`');
+        expect(message).toContain('(`grep` skips files over 1 MiB)');
+        expect(message).not.toContain('ask for fewer characters with "query"');
+        expect(message).not.toContain('read them with grep and read');
+    });
+
+    it('rejects an oversized page identically with and without query, because query never runs', async () => {
+        // The measurement behind the rewrite: selection runs on CONVERTED content
+        // (./sections.ts:6-7) while this rejection fires from the content-length
+        // pre-check (./request.ts:700-707) before a byte is read, so the remedy the
+        // old message offered could not change the outcome.
+        const counters = { produced: 0, cancelled: false };
+
+        stubFetch(
+            () =>
+                response(countedStream(64 * 1024, counters), {
+                    headers: { 'content-type': 'text/plain', 'content-length': String(MAX_RESPONSE_BYTES + 1) }
+                })
+        );
+
+        const withoutQuery = await failureMessage({ url: 'https://example.com/big' });
+        const withQuery = await failureMessage({ url: 'https://example.com/big', query: 'field name' });
+
+        expect(withQuery).toBe(OVERSIZED_MESSAGE);
+        expect(withQuery).toBe(withoutQuery);
+    });
+});
+
+describe('fetch: transport failure classes (issue 0015)', () => {
+    // One sentence per class, pinned whole. Each states whether retrying is
+    // plausible, which is the decision the class exists to inform.
+    const DNS_MESSAGE =
+        'fetch could not resolve this hostname (DNS found no address for it). Check the URL — the host was never reached, so retrying will not help.';
+    const CONNECTION_MESSAGE =
+        'fetch could not keep a connection to this host (refused or reset). The host was reached, so a retry may help; "provider": "exa" fetches through a different client and may work where the direct GET does not.';
+    const TLS_MESSAGE =
+        'fetch could not complete the TLS handshake with this host (certificate or protocol error). Retrying will not help: the same handshake fails; "provider": "exa" connects separately and may work.';
+    const UNCLASSIFIED_MESSAGE =
+        'fetch could not be reached (network error). The cause is not one this tool can classify, so a retry may help; "provider": "exa" fetches through a different client.';
+
+    it('maps every documented cause code to its class', () => {
+        // The table directly, including the codes the tool-level tests below do not
+        // exercise. `transportFailureMessage` reads only the code — never the
+        // message, never the stack.
+        expect(transportFailureMessage(transportRejection(causeWithCode('ENOTFOUND')))).toBe(DNS_MESSAGE);
+        expect(transportFailureMessage(transportRejection(causeWithCode('EAI_AGAIN')))).toBe(DNS_MESSAGE);
+        expect(transportFailureMessage(transportRejection(causeWithCode('ECONNREFUSED')))).toBe(CONNECTION_MESSAGE);
+        expect(transportFailureMessage(transportRejection(causeWithCode('ECONNRESET')))).toBe(CONNECTION_MESSAGE);
+        expect(transportFailureMessage(transportRejection(causeWithCode('EPIPE')))).toBe(CONNECTION_MESSAGE);
+        expect(transportFailureMessage(transportRejection(causeWithCode('ERR_TLS_CERT_ALTNAME_INVALID')))).toBe(TLS_MESSAGE);
+        expect(transportFailureMessage(transportRejection(causeWithCode('DEPTH_ZERO_SELF_SIGNED_CERT')))).toBe(TLS_MESSAGE);
+        expect(transportFailureMessage(transportRejection(causeWithCode('CERT_HAS_EXPIRED')))).toBe(TLS_MESSAGE);
+        // The prefix rules cover the long tail of handshake codes.
+        expect(transportFailureMessage(transportRejection(causeWithCode('ERR_SSL_WRONG_VERSION')))).toBe(TLS_MESSAGE);
+        expect(transportFailureMessage(transportRejection(causeWithCode('EPROTO')))).toBe(TLS_MESSAGE);
+        // A dual-stack (happy-eyeballs) failure nests its codes one level deeper,
+        // and a body-stream failure carries the code on the error itself.
+        expect(
+            transportFailureMessage(transportRejection({ errors: [causeWithCode('ENOTFOUND'), causeWithCode('ECONNREFUSED')] }))
+        ).toBe(DNS_MESSAGE);
+        expect(transportFailureMessage(causeWithCode('ECONNRESET'))).toBe(CONNECTION_MESSAGE);
+        // Anything unrecognised — including no error at all — keeps the historical
+        // sentence rather than guessing a class.
+        expect(transportFailureMessage(new Error('no code, no cause'))).toBe(UNCLASSIFIED_MESSAGE);
+        expect(transportFailureMessage(undefined)).toBe(UNCLASSIFIED_MESSAGE);
+    });
+
+    it('gives a name that does not resolve its own sentence, and says retrying will not help', async () => {
+        stubFetch(() => {
+            throw transportRejection(causeWithCode('ENOTFOUND'));
+        });
+
+        const message = await failureMessage({ url: 'https://example.com/typo-does-not-exist' });
+
+        expect(message).toBe(DNS_MESSAGE);
+        expect(message).toContain('retrying will not help');
+    });
+
+    it('gives a host that refuses the connection its own sentence, and says a retry may help', async () => {
+        stubFetch(() => {
+            throw transportRejection(causeWithCode('ECONNREFUSED'));
+        });
+
+        const refused = await failureMessage({ url: 'https://example.com/refused' });
+
+        stubFetch(() => {
+            throw transportRejection(causeWithCode('ECONNRESET'));
+        });
+
+        const reset = await failureMessage({ url: 'https://example.com/reset' });
+
+        expect(refused).toBe(CONNECTION_MESSAGE);
+        expect(reset).toBe(CONNECTION_MESSAGE);
+        expect(refused).toContain('a retry may help');
+        // Acceptance criterion 1: the two situations are no longer one sentence.
+        expect(refused).not.toBe(DNS_MESSAGE);
+    });
+
+    it('names the verified provider fallback in the reachable-but-failing case', async () => {
+        // The proposal's step 2: `provider: "exa"` is named where it was measured to
+        // work (it reached httpbin.org/html on 2026-11-10 where the GET failed 5/5),
+        // and not named in the DNS class, where a different client changes nothing.
+        stubFetch(() => {
+            throw transportRejection(causeWithCode('ECONNRESET'));
+        });
+
+        const connection = await failureMessage({ url: 'https://example.com/reset' });
+
+        stubFetch(() => {
+            throw transportRejection(causeWithCode('EAI_AGAIN'));
+        });
+
+        const dns = await failureMessage({ url: 'https://example.com/again' });
+
+        expect(connection).toContain('"provider": "exa"');
+        expect(dns).toBe(DNS_MESSAGE);
+        expect(dns).not.toContain('exa');
+    });
+
+    it('classifies a reset that lands mid-body, not only one on the request', async () => {
+        // The body stream fails with the bare errno, the way a real reset does: the
+        // `cause.code` shape is not the only one reachable, and the httpbin case in
+        // the issue is exactly this one.
+        const reset = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode('# Page\n\nbody'));
+                controller.error(causeWithCode('ECONNRESET'));
+            }
+        });
+
+        stubFetch(() => response(reset, { headers: { 'content-type': 'text/plain' } }));
+
+        await expect(call(keyless(), { url: 'https://example.com/mid-body' })).rejects.toThrow(
+            CONNECTION_MESSAGE
+        );
+    });
+
+    it('reports a failed TLS handshake as its own class', async () => {
+        stubFetch(() => {
+            throw transportRejection(causeWithCode('ERR_TLS_CERT_ALTNAME_INVALID'));
+        });
+
+        const message = await failureMessage({ url: 'https://example.com/bad-cert' });
+
+        expect(message).toBe(TLS_MESSAGE);
+        expect(message).toContain('Retrying will not help');
+    });
+
+    it('keeps the historical sentence for a cause it cannot classify', async () => {
+        stubFetch(() => {
+            throw new TypeError('fetch failed');
+        });
+
+        const message = await failureMessage({ url: 'https://example.com/unknown' });
+
+        expect(message).toBe(UNCLASSIFIED_MESSAGE);
+        // A caller that matched the old string still recognizes the failure.
+        expect(message.startsWith('fetch could not be reached (network error).')).toBe(true);
+    });
+
+    it('leaks no page body and no stack into a transport message', async () => {
+        // Acceptance criterion 4: classification names a class. The raw error text —
+        // here an HTML error page and a stack-shaped tail — stays out of the
+        // transcript, exactly as the sanitization rule in ./request.ts:37-40 requires.
+        const body = '<html><head>502 Bad Gateway</head></html>';
+        const cause = causeWithCode('ECONNRESET', `connect ECONNRESET 203.0.113.9:443\n${body}\n at Socket.onclose (node:internal)`);
+
+        stubFetch(() => {
+            throw transportRejection(cause);
+        });
+
+        const message = await failureMessage({ url: 'https://example.com/noisy' });
+
+        expect(message).toBe(CONNECTION_MESSAGE);
+        expect(message).not.toContain('502 Bad Gateway');
+        expect(message).not.toContain('203.0.113.9');
+        expect(message).not.toContain('node:internal');
+    });
+
+    it('still reports the timeout sentence when an aborted request also carries a cause', async () => {
+        // The abort check stays the FIRST discriminator: a timeout that also happens
+        // to surface an errno must not be reclassified as a transport failure, and
+        // the timeout sentence itself is unchanged (issue 0015 criterion 3).
+        vi.useFakeTimers();
+
+        stubFetch((_url, init) => {
+            const signal = (init as RequestInit).signal as AbortSignal;
+
+            return new Promise<Response>((_, reject) => {
+                signal.addEventListener('abort', () => {
+                    reject(transportRejection(causeWithCode('ECONNRESET')));
+                });
+            });
+        });
+
+        const pending = call(keyless(), { url: 'https://example.com/slow' });
+        pending.catch(() => undefined);
+        await vi.advanceTimersByTimeAsync(FETCH_TIMEOUT_MS);
+
+        await expect(pending).rejects.toThrow(`fetch timed out after ${FETCH_TIMEOUT_MS} ms.`);
+
+        vi.useRealTimers();
+    });
+});
+
+describe('fetch: query-mode truncation causes and ordering (issue 0016)', () => {
+    // The synthetic heading label of each returned section, in the order the answer
+    // delivered them. Only lines shaped `[line N]` count, because a section's own
+    // markdown heading appears verbatim in its text right below the label.
+    const returnedHeadings = (result: WebFetchResult): string[] =>
+        result.content
+            .split('\n')
+            .filter((line) => /^## .+ \[line \d+\]$/.test(line))
+            .map((line) => line.slice(3, line.indexOf(' [line')));
+
+    // `count` sections of identical length: one hit each in equal-length blocks means
+    // equal density, so these cases isolate the CAP from the ranking.
+    const equalSections = (count: number): string =>
+        Array.from(
+            { length: count },
+            (_, index) =>
+                `## Section ${String(index + 1).padStart(2, '0')}\n\nquantum entry ${String(index + 1).padStart(2, '0')}.`
+        ).join('\n\n');
+
+    const plainPage = (body: string) => () => response(body, { headers: { 'content-type': 'text/plain' } });
+
+    it('names the section cap as the cause when MAX_QUERY_BLOCKS closes the answer', async () => {
+        stubFetch(plainPage(equalSections(24)));
+
+        const result = await call(keyless(), { url: 'https://example.com/capped', query: 'quantum' });
+
+        // The cap the description promises, pinned as a number before it is used.
+        expect(MAX_QUERY_BLOCKS).toBe(20);
+        expect(result.matches).toBe(20);
+        expect(result.totalMatches).toBe(24);
+        expect(result.totalSections).toBe(24);
+        expect(result.truncated).toBe(true);
+        // Acceptance criterion 2: the cap is named as the cause, distinctly from a
+        // byte-budget cut, and no resumable offset is promised — the withheld
+        // sections are not one page away, because selection ran on the whole page.
+        expect(result.stopReason).toBe('resultCap');
+        expect(result.nextOffset).toBeUndefined();
+        expect(result.offset).toBeUndefined();
+        // Exact survivors: equal densities keep document order, so sections 01-20.
+        expect(returnedHeadings(result)).toEqual(
+            Array.from({ length: 20 }, (_, index) => `Section ${String(index + 1).padStart(2, '0')}`)
+        );
+        expect(result.content).not.toContain('## Section 21 [line');
+    });
+
+    it('reports no cause and no nextOffset when the query answer was whole', async () => {
+        stubFetch(plainPage(equalSections(3)));
+
+        const result = await call(keyless(), { url: 'https://example.com/whole', query: 'quantum' });
+
+        expect(result.matches).toBe(3);
+        expect(result.totalMatches).toBe(3);
+        expect(result.truncated).toBe(false);
+        expect(result.stopReason).toBeUndefined();
+        expect(result.nextOffset).toBeUndefined();
+    });
+
+    it('reports a resumable nextOffset when the byte budget cuts the answer', async () => {
+        // Six sections of ~15,000 characters each: the joined answer is 90,331
+        // characters, so the content byte budget (MAX_RESULT_CONTENT_BYTES, 63,488)
+        // cuts it inside section 05. Every section ends with its own marker, so
+        // "resumed correctly" is a fact rather than a claim.
+        const page = Array.from(
+            { length: 6 },
+            (_, index) => {
+                const label = String(index + 1).padStart(2, '0');
+
+                return `## Section ${label}\n\nquantum ${'x'.repeat(15_000)} END-${label}`;
+            }
+        ).join('\n\n');
+
+        stubFetch(plainPage(page));
+
+        const result = await call(keyless(), { url: 'https://example.com/long', query: 'quantum' });
+
+        // Acceptance criterion 1: a budget cut says so, and it is resumable.
+        expect(result.stopReason).toBe('contentBudget');
+        expect(result.truncated).toBe(true);
+        expect(result.matches).toBe(6);
+        expect(result.totalMatches).toBe(6);
+        // Exact: an all-ASCII answer lands precisely on the byte budget.
+        expect(result.characters).toBe(MAX_RESULT_CONTENT_BYTES);
+        // The cut landed inside section 05: 04 came through whole, 05 did not.
+        expect(result.content).toContain('END-04');
+        expect(result.content).not.toContain('END-05');
+
+        const nextOffset = result.nextOffset as number;
+
+        // The offset is the exact continuation. Layout arithmetic, from the fixture:
+        // each section block occupies 4 lines, so the heading labels are 1, 5, 9, 13,
+        // 17, 21 — 23-character labels for sections 01-03 (one digit) and 24 for the
+        // rest; every section text is 15,030 characters; blocks are joined by "\n\n".
+        // That puts section 05's text at 60,245 in the joined answer, and the budget
+        // keeps 63,488 - 60,245 = 3,243 characters of it.
+        expect(nextOffset).toBe(page.indexOf('## Section 05') + 3_243);
+        // Which is also, character for character, where the answer stopped.
+        expect(page.slice(nextOffset - 24, nextOffset)).toBe(result.content.slice(-24));
+
+        // And re-fetching at that offset (WITHOUT `query`, which ignores `offset`)
+        // returns the matching content the cut answer never delivered.
+        const resumed = await call(keyless(), { url: 'https://example.com/long', offset: nextOffset });
+
+        expect(resumed.offset).toBe(nextOffset);
+        expect(resumed.content.startsWith(page.slice(nextOffset, nextOffset + 40))).toBe(true);
+        expect(resumed.content).toContain('END-05');
+        expect(resumed.content).toContain('END-06');
+    });
+
+    it('orders a query answer by hits per character instead of by document position', async () => {
+        // Acceptance criterion 4: one hit in each of three sections, so LENGTH alone
+        // decides the ranking — the shortest first, the 2,000-character References
+        // block last. The measured motivation in the issue: on a long article the
+        // `## References` section took ~75% of one answer because length, not
+        // relevance, was buying its slot.
+        const page = [
+            '## Intro', '', `quantum ${'a'.repeat(300)}`, '',
+            '## References', '', `quantum ${'b'.repeat(2000)}`, '',
+            '## Details', '', `quantum ${'c'.repeat(60)}`, ''
+        ].join('\n');
+
+        stubFetch(plainPage(page));
+
+        const result = await call(keyless(), { url: 'https://example.com/density', query: 'quantum' });
+
+        expect(returnedHeadings(result)).toEqual(['Details', 'Intro', 'References']);
+        // Deprioritized, never excluded: a section that matches is still returned.
+        expect(result.matches).toBe(3);
+        expect(result.totalMatches).toBe(3);
+        expect(result.truncated).toBe(false);
+    });
+
+    it('lets the dense sections survive the cap and drops the longest match', async () => {
+        // One 6,000-character wall FIRST in the document, twenty small sections after
+        // it. Document order put the wall in the answer; density puts it last, so the
+        // cap drops it and keeps all twenty small sections.
+        const small = (index: number): string => `## Small ${String(index).padStart(2, '0')}\n\nquantum entry.`;
+
+        const page = [
+            `## Wall\n\nquantum ${'w'.repeat(6_000)}`,
+            ...Array.from({ length: 20 }, (_, index) => small(index))
+        ].join('\n\n');
+
+        stubFetch(plainPage(page));
+
+        const result = await call(keyless(), { url: 'https://example.com/wall', query: 'quantum' });
+
+        expect(result.totalMatches).toBe(21);
+        expect(result.matches).toBe(20);
+        expect(result.stopReason).toBe('resultCap');
+        expect(returnedHeadings(result)).toEqual(
+            Array.from({ length: 20 }, (_, index) => `Small ${String(index).padStart(2, '0')}`)
+        );
+        expect(result.content).not.toContain('## Wall [line');
+    });
+
+    it('ignores offset when query is set, exactly as the parameter description says', async () => {
+        const page = ['## Installation', '', 'Run npm install.', '', '## Usage', '', 'Call the tool.'].join('\n');
+
+        stubFetch(plainPage(page));
+
+        const withoutOffset = await call(keyless(), { url: 'https://example.com/manual', query: 'install' });
+        const withOffset = await call(keyless(), {
+            url: 'https://example.com/manual',
+            query: 'install',
+            offset: 12
+        });
+
+        // Section selection runs on the whole converted page, so there is no window
+        // for `offset` to move: the answer is identical, and no `offset` is echoed as
+        // if the argument had been applied.
+        expect(withOffset).toEqual(withoutOffset);
+        expect(withOffset.offset).toBeUndefined();
+        expect(withOffset.content).toContain('Run npm install.');
+    });
+
+    it('reports the withheld occurrences of a proximity answer without promising a resume', async () => {
+        // A heading-less page answers with one window around the FIRST occurrence.
+        // The other 300 occurrences are the withheld matches, and paging the page
+        // cannot recover them as a section — so the cause is named and no `nextOffset`
+        // is offered.
+        const page = `${'alpha needle beta '.repeat(300)}\ngamma needle delta`;
+
+        stubFetch(plainPage(page));
+
+        const result = await call(keyless(), { url: 'https://example.com/flat', query: 'needle' });
+
+        expect(result.matchMode).toBe('proximity');
+        expect(result.matches).toBe(1);
+        expect(result.totalMatches).toBe(301);
+        expect(result.truncated).toBe(true);
+        expect(result.stopReason).toBe('resultCap');
+        expect(result.nextOffset).toBeUndefined();
+        expect(result.note).toContain('no heading structure');
+    });
+
+    it('states the offset/query rule where the caller reads it', () => {
+        // Acceptance criterion 3: the rule used to exist only in source.
+        const properties = (
+            keyless().parameters as unknown as { properties: Record<string, { description: string }> }
+        ).properties;
+
+        expect(properties.offset.description).toContain('IGNORED when "query" is set');
+        expect(properties.offset.description).toContain('"stopReason": "resultCap"');
+        expect(properties.query.description).toContain('Up to 20 sections.');
     });
 });

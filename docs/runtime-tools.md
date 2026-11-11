@@ -220,8 +220,13 @@ const source = harness.toolSource('toolRegistry');
 //   name, revision, sourcePath?, moduleText?, dependencies,
 //   format: 'module' | 'function-body', source?, checks
 // }
-// undefined means the tool was registered from an already-built definition
-// (a configured tool/plugin) and has no editable source revision.
+// undefined means the tool was registered from an already-built definition with no
+// source attachment (a bare configured tool or a plugin) and has no editable source
+// revision. A configured tool that ALSO carries its bytes — `tools: { name: { tool,
+// source: { moduleText | sourcePath } } }` — does have one: the revision the compile
+// derived from those bytes, with the definition itself never re-evaluated. Its
+// `checks` report what construction actually established for the pair
+// (`transpile:syntax`, `contract:tool`, `schema:json`), never `'load:module'`.
 
 const allSources = harness.toolSources(); // every installed source revision
 ```
@@ -234,6 +239,64 @@ promise to re-read the same disk file later. A source entry that imports another
 registered tool instead of resolving it through the harness can bake a fixed copy
 into its own revision; use `context.callTool`/`harness.callTool` for live
 tool-to-tool resolution.
+
+### Compile a candidate without touching the registry
+
+Answering "is this definition valid?" with a harness is expensive and ambiguous:
+constructing one builds agents and a transport, and a throw from inside that build is not
+the same fact as "the candidate does not transpile". The root export
+`compileToolSourceModule(candidate, options?)` is the read-only half of the same kernel —
+no harness, no registry, no registration semantics changed:
+
+```ts
+import { compileToolSourceModule, supportsToolCompilation } from '@underload/harness';
+
+const compiled = compileToolSourceModule({
+    name: 'example',
+    description: 'Return a greeting.',
+    parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+    moduleText: 'export default { … }'
+    // sourcePath: 'tools/example.tool.ts'   // alternative: an editable entry on disk
+    // dependencies: [{ path, text }]        // virtual local helpers for moduleText
+    // definition                            // an already-built Tool to publish instead
+});
+// compiled: { name, description, tags, parameters?, visibility,
+//             revision, record, checks, definition? }
+```
+
+- `revision`/`record` are the SAME content-addressed identity `harness.toolSource()`
+  reports for that source, because both sides derive it from the same captured bytes:
+  `compileToolSourceModule({ name, moduleText })` and
+  `tools: { name: { tool, source: { moduleText } } }` produce the same revision.
+- `definition` is callable and registered **nowhere**. The caller may run it, publish it
+  into a harness with `registerTool({ definition, … })`, or drop it.
+- `evaluate` selects how far the compile goes. `'load'` (default) transpiles, resolves the
+  static import graph, and EVALUATES the module to take the definition it exports — so the
+  candidate's top-level code runs, with the side-effect cost stated in **Platform and
+  limits**. `'syntax'` stops after the transpile (plus the JSON-shape check of a supplied
+  `parameters`), which is what an endpoint validating untrusted source wants: the answer
+  costs no side effects. `'syntax'` with no supplied `definition` must be given `name`,
+  because nothing is evaluated to read it from, and the metadata reported is then the
+  candidate's own.
+- A supplied `definition` selects the no-load path in EITHER mode: the module is not
+  evaluated, the caller's object is what `definition` holds, and the revision still comes
+  from the bytes beside it.
+- `checks` is the whole claim, and it is mode-honest:
+  `['transpile:syntax']` (plus `'schema:json'` for a supplied schema) in `'syntax'` mode,
+  `['transpile:syntax', 'contract:tool', 'schema:json']` for a supplied definition with
+  source, and `'load:module'` with `'load'`.
+  **No mode performs semantic type checking** — the compiler is `ts.transpileModule`, so a
+  type error a project build would report is not a compile failure here, exactly as with
+  registration.
+- Repeated compiles of the SAME input are served from a process-level compile cache
+  (bounded FIFO, 128 entries; failures are not cached, and a disk-path candidate is never
+  cached, because an edited helper would move the revision under unchanged entry bytes).
+  `{ cache: false }` re-transpiles and re-evaluates every call. The cache is compile-side
+  only: the registration path never consults it, so
+  `toolRegistry`/`toolFolders` still evaluate fresh bytes every time.
+- `supportsToolCompilation` is the flag to branch on instead of probing an error string:
+  true on Node, false in the browser build, where this entry throws the same actionable
+  error `toolSource` does.
 
 ### Register or replace a tool
 

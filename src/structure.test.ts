@@ -47,6 +47,22 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
+// Type-only pin (issue 0002): the vocabulary of the published compile result is part
+// of the ROOT type surface, so a host that types `compiled.record` or a
+// `tools: { name: { tool, source } }` catalogue can name it without reaching for a
+// subpath. A value assertion cannot catch a TYPE name; an import of a name the root
+// does not export is a `tsc` error, which is how such an omission reaches CI.
+import type {
+    CompiledToolSourceModule,
+    HarnessConfiguredTool,
+    HarnessToolSourceAttachment,
+    ToolCompileCandidate,
+    ToolSourceCompileOptions,
+    ToolSourceEvaluateMode,
+    ToolSourceDependency,
+    ToolSourceLiveDependency,
+    ToolSourceRecord
+} from './index';
 
 // `src/` — this file sits at its root.
 const SRC = fileURLToPath(new URL('.', import.meta.url));
@@ -318,6 +334,14 @@ describe('package layout', () => {
             './frontend',
             './shared'
         ]);
+
+        // Issue 0002 published the standalone tool-source compile on the ROOT and
+        // deliberately added NO `./core` subpath: a second public door into the kernel
+        // would put two surfaces in charge of one contract (registration, the source
+        // record, and the compile all share `core/tool-source.ts`). The exhaustive
+        // subpath list above is the general guard; this one names the entry the issue
+        // could have shipped and did not.
+        expect(manifest.exports['./core']).toBeUndefined();
     });
 
     it('publishes only targets inside "files", each with a matching extension', () => {
@@ -860,6 +884,91 @@ describe('import safety', () => {
         // Library.
         expect(typeof root.harness).toBe('function');
         expect(typeof root.agent).toBe('function');
+        // (issue 0004) The context estimator is on the published surface too: a host
+        // trimming its own transcript must measure with the SAME `ceil(chars / 4)` the
+        // UI context bar and the `context-compaction` plugin use, and `context-overflow`
+        // is the one name its own floor and the provider's answer share. Both are values,
+        // so a name missing from the root barrel fails here rather than in a consumer.
+        expect(root.estimateContextTokens([{ role: 'user', content: 'x'.repeat(400) }])).toBe(100);
+        expect(root.CONTEXT_OVERFLOW_CODE).toBe('context-overflow');
+        // (issue 0002) The published READ-ONLY tool-source compile rides the same root,
+        // and on Node it is the REAL implementation, not the browser stub: a compile
+        // through the root answers with the checks it ran and a revision. The flag a
+        // host branches on is next to it, and the harness's own helper
+        // (`prepareToolSourceRecord`) stays internal — a published name would be a
+        // second door to the same contract.
+        const compiled = root.compileToolSourceModule({
+            name: 'structureProbe',
+            moduleText: `export const metadata = { name: 'structureProbe', description: 'Pins the root export.', tags: ['test'], parameters: { type: 'object', properties: {}, additionalProperties: false } };\n\nexport const execute = () => 'published';\n`
+        });
+
+        expect(compiled.name).toBe('structureProbe');
+        expect(compiled.description).toBe('Pins the root export.');
+        expect(compiled.tags).toEqual(['test']);
+        expect(compiled.visibility).toBe('searchable');
+        expect(compiled.checks).toEqual([
+            'transpile:syntax',
+            'load:module',
+            'contract:tool',
+            'schema:json'
+        ]);
+        expect(compiled.record.revision).toBe(compiled.revision);
+        expect(compiled.record.format).toBe('module');
+        expect(await compiled.definition?.execute({ parameters: {} } as never)).toBe('published');
+        expect(root.supportsToolCompilation).toBe(true);
+        expect((root as unknown as Record<string, unknown>).prepareToolSourceRecord).toBeUndefined();
+
+        // Every TYPE the result needs is nameable from the root, and the value the root
+        // returns is assignable to the published result type — runtime shape and type
+        // surface cannot drift apart silently.
+        const publishedResult: CompiledToolSourceModule = compiled;
+        const candidate: ToolCompileCandidate = {
+            name: 'structureProbe',
+            moduleText: compiled.record.moduleText
+        };
+        const options: ToolSourceCompileOptions = {
+            evaluate: 'syntax' satisfies ToolSourceEvaluateMode,
+            cache: false
+        };
+        const dependency: ToolSourceDependency = { path: './helper.ts', text: 'export const value = 1;' };
+        const liveDependency: ToolSourceLiveDependency = {
+            path: 'tools/catalogue',
+            revision: compiled.revision
+        };
+        const record: ToolSourceRecord = compiled.record;
+
+        // (issue 0003) The shared-catalogue shape is published too: a host types its
+        // catalogue once and passes the same object to every instance.
+        const attachment: HarnessToolSourceAttachment = {
+            moduleText: compiled.record.moduleText,
+            dependencies: [dependency]
+        };
+        const catalogueEntry: HarnessConfiguredTool = {
+            tool: publishedResult.definition as never,
+            source: attachment
+        };
+
+        expect([
+            publishedResult.revision,
+            candidate.name,
+            options.evaluate,
+            options.cache,
+            dependency.path,
+            liveDependency.path,
+            record.name,
+            attachment.dependencies?.length,
+            'tool' in catalogueEntry
+        ]).toEqual([
+            compiled.revision,
+            'structureProbe',
+            'syntax',
+            false,
+            './helper.ts',
+            'tools/catalogue',
+            'structureProbe',
+            1,
+            true
+        ]);
         // Shared.
         expect(root.LOOPBACK_HOSTNAMES.has('localhost')).toBe(true);
         expect(typeof root.isLoopbackHostname).toBe('function');
@@ -892,7 +1001,10 @@ describe('import safety', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            // The tool-less card trails the roles (issue 0005-D): it is not a role, so it never
+            // joins a team and never displaces a picker row a user already knows.
+            'chat'
         ]);
         // TITLES MOVED, IDS DID NOT. `research`/`workspace`/`planner` keep their
         // persisted ids while the visible titles became Explore/Analyst/Manager,
@@ -906,14 +1018,16 @@ describe('import safety', () => {
             'Analyst',
             'Reviewer',
             'Manager',
-            'Debugger'
+            'Debugger',
+            'Chat'
         ]);
-        // The default card is also the ONLY live card with no team: `subagents: []`
-        // means the runtime never registers `delegate` for it (src/harness.ts
-        // `activation: 'subagents'`), so the exact empty-allowlist set is ['general'].
+        // TWO cards have no team: the default (a load-bearing contract, src/harness.ts
+        // `activation: 'subagents'` means `delegate` is never registered for it) and the tool-less
+        // `chat` card (issue 0005-D — no team, so no delegation row either, on a harness that has
+        // no catalogue tool to hand off). The exact empty-allowlist set is those two names.
         expect(
             root.presets.filter((preset) => preset.subagents.length === 0).map((preset) => preset.name)
-        ).toEqual(['general']);
+        ).toEqual(['general', 'chat']);
         // The deleted fixtures are gone from the published surface, not hidden behind it:
         // a root that still exported `FIXTURE_PRESETS` or `ALL_PRESET_TEMPLATES` would be
         // offering a scripted card and a throwing tool to any host that imports the

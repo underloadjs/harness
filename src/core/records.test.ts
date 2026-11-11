@@ -308,15 +308,177 @@ describe('records engine — no locks, and one complete conflict answer (Decisio
             RECORD_ERROR_CODES.guardedWrite
         );
 
-        expect(guarded.message).toBe(
-            'guarded-write: guarded write: pass "expects" [{ id, rev }] for task "1" (read it first).'
+        // 0009 — the sentence stays byte-identical (the advice "read it first" is correct);
+        // what was added is the record the advice points at, appended in the exact
+        // `current: {…}` shape `stale-record` has always used. The tail after `"rev":1,` is
+        // the store's `updatedAt`, which this file does not fake, hence `toContain`.
+        expect(guarded.message).toContain(
+            'guarded-write: guarded write: pass "expects" [{ id, rev }] for task "1" (read it first). ' +
+                'current: {"id":"1","text":"Blind","completed":false,"rev":1,'
         );
+
+        // The structured twin, for a caller that branches on the code instead of prose.
+        expect((guarded.details as { entry: RecordEntry }).entry).toEqual({
+            id: '1',
+            text: 'Blind',
+            completed: false,
+            rev: 1,
+            updatedAt: (guarded.details as { entry: RecordEntry }).entry.updatedAt
+        });
 
         // The pre-T1 host/driver path stays: no identity, no token required.
         await tasks(engine, { tasks: [{ id: '1', completed: true }] });
         const page = await tasks(engine, {});
 
         expect((page.tasks as RecordEntry[])[0].completed).toBe(true);
+    });
+
+    // -----------------------------------------------------------------------
+    // R-0009 — the guarded-write refusal used to carry `{ id }` and nothing else while
+    // `stale-record` on the SAME record returned the whole current entry, so the error
+    // that most needed the retry `rev` was the one that omitted it, and every first write
+    // to every record cost a third call. Both throw sites now emit the `stale-record`
+    // payload through the same budgeted helper (`stalePayloadOf`): no new budget, no new
+    // shape, no new sentence.
+    // -----------------------------------------------------------------------
+    it('0009: a guarded patch carries the record and the rev a one-step retry needs', async () => {
+        const engine = createRecordEngine();
+
+        await tasks(engine, { tasks: [{ text: 'Blind' }] }, 'author');
+
+        const failure = await expectCode(
+            tasks(engine, { tasks: [{ id: '1', completed: true }] }, 'author'),
+            RECORD_ERROR_CODES.guardedWrite
+        );
+        const details = failure.details as { id: string; projected: boolean; entry: RecordEntry };
+
+        // Acceptance 1, the cheap case: a `getOnly`-free collection fits inside the budget,
+        // so the WHOLE record rides the refusal and nothing is withheld.
+        expect(details.id).toBe('1');
+        expect(details.projected).toBe(false);
+        expect(details.entry).toEqual({
+            id: '1',
+            text: 'Blind',
+            completed: false,
+            rev: 1,
+            updatedBy: 'author',
+            updatedAt: details.entry.updatedAt
+        });
+        expect(failure.message).toContain(
+            'current: {"id":"1","text":"Blind","completed":false,"rev":1,"updatedBy":"author",'
+        );
+
+        // Acceptance 2: the retry is sent with the rev THIS refusal handed back, with no
+        // read in between — refusal then write, two calls where the old shape cost three.
+        const retry = await tasks(
+            engine,
+            { tasks: [{ id: '1', completed: true }], expects: [{ id: '1', rev: details.entry.rev as number }] },
+            'author'
+        );
+
+        expect((retry.tasks as RecordEntry[])[0].rev).toBe(2);
+        expect((retry.tasks as RecordEntry[])[0].completed).toBe(true);
+    });
+
+    it('0009: a guarded removal returns the record it is about to delete', async () => {
+        const engine = createRecordEngine();
+
+        await tasks(engine, { tasks: [{ text: 'Doomed' }] }, 'author');
+
+        const failure = await expectCode(
+            tasks(engine, { remove: ['1'] }, 'author'),
+            RECORD_ERROR_CODES.guardedWrite
+        );
+        const details = failure.details as { id: string; projected: boolean; entry: RecordEntry };
+
+        // The removal site carries it too: an identified caller that named `remove` without
+        // a token still learns the id, the rev, and who last touched the record.
+        expect(details.id).toBe('1');
+        expect(details.projected).toBe(false);
+        expect(details.entry).toEqual({
+            id: '1',
+            text: 'Doomed',
+            completed: false,
+            rev: 1,
+            updatedBy: 'author',
+            updatedAt: details.entry.updatedAt
+        });
+        // Under budget there is no degradation to report, so the key is ABSENT rather than
+        // empty — the same rule the engine applies to every optional key.
+        expect('note' in details).toBe(false);
+        expect(failure.message).toContain(
+            'current: {"id":"1","text":"Doomed","completed":false,"rev":1,"updatedBy":"author",'
+        );
+    });
+
+    it('0009: a guarded patch over the payload budget returns the projection and says what it withheld', async () => {
+        const engine = createRecordEngine();
+
+        // Three `getOnly` bodies whose combined size clears RECORD_STALE_PAYLOAD_BUDGET_BYTES
+        // (8 KiB, src/core/records.ts:179), so the full entry cannot ride the refusal — the
+        // exact case the budget exists for ("a conflict into a second flood").
+        await run(
+            engine,
+            'records',
+            {
+                define: {
+                    name: 'bulky',
+                    fields: [
+                        { key: 'title', type: 'text', required: true, maxLength: 42 },
+                        { key: 'alpha', type: 'text', maxLength: 4000, getOnly: true },
+                        { key: 'beta', type: 'text', maxLength: 4000, getOnly: true },
+                        { key: 'gamma', type: 'text', maxLength: 2000, getOnly: true }
+                    ]
+                }
+            },
+            'author'
+        );
+
+        const added = await run(
+            engine,
+            'records',
+            {
+                collection: 'bulky',
+                entries: [
+                    {
+                        title: 'Ship',
+                        alpha: 'a'.repeat(4000),
+                        beta: 'b'.repeat(4000),
+                        gamma: 'c'.repeat(2000)
+                    }
+                ]
+            },
+            'author'
+        );
+        const id = (added.entry as RecordEntry).id as string;
+
+        const failure = await expectCode(
+            run(engine, 'records', { collection: 'bulky', entries: [{ id, title: 'Ship it' }] }, 'author'),
+            RECORD_ERROR_CODES.guardedWrite
+        );
+        const details = failure.details as {
+            projected: boolean;
+            entry: RecordEntry;
+            note: string;
+        };
+
+        expect(details.projected).toBe(true);
+        // Acceptance 1's other half: the degradation is the projection a page already
+        // uses, and the `note` names what left, in the collection's declaration order.
+        expect(details.note).toBe('"alpha", "beta", "gamma"');
+        // DROPPED, not emptied: an `alpha: ""` would read as "no body", not "not shown".
+        expect(details.entry).toEqual({
+            id,
+            title: 'Ship',
+            rev: 1,
+            updatedBy: 'author',
+            updatedAt: details.entry.updatedAt
+        });
+        // The message says it out loud rather than truncating mid-JSON, in the same
+        // clause `stale-record` composes.
+        expect(failure.message).toContain('(projection: "alpha", "beta", "gamma" omitted)');
+        // And the withheld bodies really are gone from what the caller receives.
+        expect(failure.message).not.toContain('aaaa');
     });
 });
 
@@ -570,12 +732,18 @@ describe('records engine — a token for an absent id tells the truth (R5)', () 
             RECORD_ERROR_CODES.staleRecord
         );
 
+        // 0011 (proposal step 2) — this refusal used to hedge between two causes in one
+        // sentence because it could not tell them apart. It can now: the id was never
+        // minted (the counter is global and monotonic), so nothing was ever removed. The
+        // aged-out sibling is pinned in the next test.
         expect(failure.message).toBe(
-            'stale-record: tasks has no task with id "9999" and this collection\'s change log holds no removal for it — ' +
-                'it was never in "tasks", or its removal aged out of the 200-event window. Re-read the list.'
+            'stale-record: tasks has no task with id "9999" — "tasks" never held it, and ' +
+                "this collection's change log holds no removal for it either. Re-read the list."
         );
         expect(failure.message.includes('was removed')).toBe(false);
         expect(failure.message.includes('free again')).toBe(false);
+        // One cause, so the sentence may not offer a choice.
+        expect(failure.message.includes(' or ')).toBe(false);
         // No `removed` key at all (T5.3), asserted on the whole details object.
         expect(failure.details).toEqual({
             id: '9999',
@@ -583,6 +751,74 @@ describe('records engine — a token for an absent id tells the truth (R5)', () 
             currentRev: 0,
             updatedBy: 'unknown'
         });
+    });
+
+    // 0011 (issue 0011, acceptance criterion 2) — the two causes of an absent id with no
+    // removal in the log now get DIFFERENT sentences, and each states one cause:
+    //   - an id this store never minted (the counter never went that high), and
+    //   - a record that really was removed, whose removal event has been trimmed out of the
+    //     200-event window.
+    // The second is provable because the window still says where it starts: `storeRev` runs
+    // to 599 while the oldest retained event is 400, and the id was minted (it is below the
+    // counter), so the absence is the window's, not the record's.
+    it('0011: an id whose removal aged out states that one cause, and names the floor', async () => {
+        const engine = createRecordEngine();
+
+        // 200 adds (the batch cap), then id 1 is REMOVED — the removal is event 201.
+        await run(
+            engine,
+            'tasks',
+            { tasks: Array.from({ length: 200 }, (_, index) => ({ text: `task ${index + 1}` })) },
+            'author'
+        );
+        await run(engine, 'tasks', { remove: ['1'], expects: [{ id: '1', rev: 1 }] }, 'author');
+
+        // Two rounds of flips across the surviving 199 ids = 398 more events, so the window
+        // has dropped everything before revision 400 — including the removal at 201. The
+        // writes go through the identity-less driver call: no token churn, no attribution.
+        const fillerIds = Array.from({ length: 199 }, (_, index) => String(index + 2));
+
+        for (let round = 0; round < 2; round += 1) {
+            await run(engine, 'tasks', {
+                tasks: fillerIds.map((id) => ({ id, completed: round === 0 }))
+            });
+        }
+
+        const window = engine.snapshot().collections.tasks as { storeRev: number; changes: RecordChange[] };
+
+        // 200 adds + 1 remove + 398 updates = 599 recorded events, and the FIFO keeps the
+        // last 200: revisions 400..599. Neither of id 1's events (1 and 201) survives.
+        expect(window.storeRev).toBe(599);
+        expect(window.changes).toHaveLength(200);
+        expect(window.changes[0].rev).toBe(400);
+        expect(window.changes.some((change) => change.id === '1')).toBe(false);
+
+        const agedOut = await expectCode(
+            run(engine, 'tasks', { tasks: [{ id: '1', text: 'ghost' }], expects: [{ id: '1', rev: 1 }] }, 'author'),
+            RECORD_ERROR_CODES.staleRecord
+        );
+
+        expect(agedOut.message).toBe(
+            'stale-record: tasks has no task with id "1" — its removal is older than this ' +
+                "collection's retained change window, which now starts at revision 400 (200 events), so the " +
+                'log can no longer show it. Re-read the list.'
+        );
+        expect((agedOut.details as { oldestAvailableRev: number }).oldestAvailableRev).toBe(400);
+
+        // The never-minted id, in the SAME trimmed collection, gets the other sentence —
+        // the floor alone would have hedged here, the id counter is what separates them.
+        const neverExisted = await expectCode(
+            run(engine, 'tasks', { tasks: [{ id: '9999', text: 'ghost' }], expects: [{ id: '9999', rev: 1 }] }, 'author'),
+            RECORD_ERROR_CODES.staleRecord
+        );
+
+        expect(neverExisted.message).toBe(
+            'stale-record: tasks has no task with id "9999" — "tasks" never held it, and this ' +
+                "collection's change log (which now starts at revision 400) holds no removal for it either. " +
+                'Re-read the list.'
+        );
+        expect(neverExisted.message).not.toBe(agedOut.message);
+        expect((neverExisted.details as { oldestAvailableRev?: number }).oldestAvailableRev).toBeUndefined();
     });
 });
 
@@ -728,6 +964,73 @@ describe('records engine — collections are declared, extensible, and permanent
             run(engine, 'records', { collection: 'notes', entries: [{ body: 'x'.repeat(501) }] }, 'author'),
             RECORD_ERROR_CODES.fieldTooLong
         );
+    });
+
+    // -----------------------------------------------------------------------
+    // R-0010 — `define` beside a `collection` was refused by the engine's own guard as
+    // "ambiguous and refused, not merged", and silently consumed by the entry point that
+    // actually runs: the live session sent `{ collection: "unicode", define: { name:
+    // "verifyG", … } }`, got a SUCCESS, and read back `"collection": "verifyG"` — a
+    // different name than the one it sent, with no warning. The pair is now refused at
+    // that entry point too, in the engine guard's exact wording.
+    // -----------------------------------------------------------------------
+    const VERIFY = {
+        name: 'verifyG',
+        fields: [{ key: 'note', type: 'text', maxLength: 40 }]
+    };
+
+    const BUILT_INS = ['chapters', 'locations', 'profiles', 'tasks'];
+
+    it('0010: records refuses define beside a collection and registers nothing', async () => {
+        const engine = createRecordEngine();
+
+        const before = await run(engine, 'records', {}, 'author');
+        const pair = await expectCode(
+            run(engine, 'records', { collection: 'unicode', define: VERIFY }, 'author'),
+            RECORD_ERROR_CODES.invalidInput
+        );
+
+        // Acceptance 1: one wording, the engine's own sentence, reused verbatim.
+        expect(pair.message).toBe(
+            'invalid-input: records "define" registers a NEW collection, so it takes no "collection" beside it.'
+        );
+
+        // Acceptance 2: the refusal registers nothing, so the name list is what it was
+        // before the call — and the caller's `unicode` typo is still reported as the typo
+        // it is on the next call, not papered over by a new collection.
+        expect(before).toEqual(await run(engine, 'records', {}, 'author'));
+        expect((await run(engine, 'records', {}, 'author')).collections).toEqual(BUILT_INS);
+    });
+
+    it('0010: the wrapper path answers the identical refusal and changes nothing', async () => {
+        const engine = createRecordEngine();
+
+        // The batch wrapper copies the caller's parameters verbatim into the engine input
+        // (`{ ...raw }` at src/core/records.ts:3551), so this is the one path that still
+        // reaches `executeCollection`'s own guard (`:2903`) — it must not answer with a
+        // second wording, and it must not merge the pair into the wrapper's collection.
+        const pair = await expectCode(
+            tasks(engine, { tasks: [{ text: 'Ride' }], define: VERIFY }, 'author'),
+            RECORD_ERROR_CODES.invalidInput
+        );
+
+        expect(pair.message).toBe(
+            'invalid-input: records "define" registers a NEW collection, so it takes no "collection" beside it.'
+        );
+        expect((await tasks(engine, {})).tasks).toEqual([]);
+        expect((await run(engine, 'records', {}, 'author')).collections).toEqual(BUILT_INS);
+    });
+
+    it('0010: define on its own still registers — the call the rule protects is unchanged', async () => {
+        const engine = createRecordEngine();
+
+        const defined = await run(engine, 'records', { define: VERIFY }, 'author');
+
+        expect(defined.collection).toBe('verifyG');
+        expect((await run(engine, 'records', {}, 'author')).collections).toEqual([
+            ...BUILT_INS,
+            'verifyG'
+        ]);
     });
 });
 
@@ -2114,6 +2417,150 @@ describe('records engine — page-budget marker, bulk-removal ids, and the mutat
         expect(single.removedIds).toBeUndefined();
     });
 
+    // -------------------------------------------------------------------------
+    // 0008 (issue 0008) — M3's remedy, extended to the two writes it never reached.
+    // Every case pins the DOCUMENTED cheap-write recipe (`limit: 1`) and asserts the exact
+    // ids, because the whole point of the key is that the caller confirms its own write
+    // without a second round trip. The rule mirrored from `removedIds` is: emit per key,
+    // only when that key's count is more than one, whatever `limit` says.
+    // -------------------------------------------------------------------------
+    it('0008: a batch that mints two records answers with `addedIds`, in mint order, whatever `limit` says', async () => {
+        const engine = createRecordEngine();
+
+        const added = await tasks(engine, { tasks: [{ text: 'First' }, { text: 'Second' }], limit: 1 }, 'author');
+
+        // Mint order is caller order — the ids come off the global counter in the order the
+        // batch named them (F3).
+        expect(added.addedIds).toEqual(['1', '2']);
+        // The page stays exactly as `limit` bounded it: the key is not a widened page.
+        expect((added.tasks as RecordEntry[]).length).toBe(1);
+        // The sibling keys stay out when they describe nothing.
+        expect(added.changedIds).toBeUndefined();
+        expect(added.removedIds).toBeUndefined();
+        expect(added.entry).toBeUndefined();
+        expect(added.counts).toEqual({ total: 2, completed: 0, pending: 2 });
+        expect(added.storeRev).toBe(2);
+    });
+
+    it('0008: a batch that patches two records answers with `changedIds`, in caller order', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 3);
+
+        const patched = await tasks(
+            engine,
+            {
+                tasks: [{ id: '3', completed: true }, { id: '1', completed: true }],
+                expects: [
+                    { id: '3', rev: 1 },
+                    { id: '1', rev: 1 }
+                ],
+                limit: 1
+            },
+            'author'
+        );
+
+        // CALLER order, not id order — the batch named 3 first, and the apply loop walked
+        // the list in that order.
+        expect(patched.changedIds).toEqual(['3', '1']);
+        expect(patched.addedIds).toBeUndefined();
+        expect(patched.entry).toBeUndefined();
+        expect((patched.tasks as RecordEntry[]).length).toBe(1);
+        expect(patched.counts).toEqual({ total: 3, completed: 2, pending: 1 });
+    });
+
+    it('0008: one affected record answers with `entry`, and both lists stay absent', async () => {
+        const engine = createRecordEngine();
+
+        const added = await tasks(engine, { tasks: [{ text: 'Solo' }], limit: 1 }, 'author');
+
+        expect((added.entry as RecordEntry).id).toBe('1');
+        // The M3 rule: at exactly one affected record the singular key already says
+        // everything, so a list beside it would only restate it.
+        expect(added.addedIds).toBeUndefined();
+        expect(added.changedIds).toBeUndefined();
+
+        const patched = await tasks(
+            engine,
+            { tasks: [{ id: '1', completed: true }], expects: [{ id: '1', rev: 1 }], limit: 1 },
+            'author'
+        );
+
+        expect((patched.entry as RecordEntry).rev).toBe(2);
+        expect(patched.changedIds).toBeUndefined();
+    });
+
+    it('0008: a no-op patch batch is not a change, so it names no `changedIds`', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 2);
+
+        const untouched = await tasks(
+            engine,
+            {
+                tasks: [{ id: '1', completed: false }, { id: '2', completed: false }],
+                expects: [
+                    { id: '1', rev: 1 },
+                    { id: '2', rev: 1 }
+                ]
+            },
+            'author'
+        );
+
+        // Neither field moved, so neither record was written: no rev bump, no change event,
+        // and no `changedIds`. The key names what the call WROTE, not what it mentioned.
+        expect(untouched.changedIds).toBeUndefined();
+        expect(untouched.entry).toBeUndefined();
+        expect(untouched.storeRev).toBe(2);
+    });
+
+    it('0008: the un-wrapped `records` surface answers with both lists, each on its own count', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 3);
+
+        // Two patches AND one add in one call. `changedIds` names the two patches;
+        // `addedIds` stays ABSENT because one addition is under the rule's bar — each key
+        // follows the `removedIds` rule on its own count, which is what keeps every key one
+        // stable type. (The consequence for a one-add-plus-one-patch batch — no key at all,
+        // because `entry` needs the TOTAL to be one — is recorded in the issue's Update note
+        // rather than widened here.)
+        const mixed = await run(
+            engine,
+            'records',
+            {
+                collection: 'tasks',
+                entries: [{ id: '1', completed: true }, { id: '2', completed: true }, { text: 'minted' }],
+                expects: [
+                    { id: '1', rev: 1 },
+                    { id: '2', rev: 1 }
+                ],
+                limit: 1
+            },
+            'author'
+        );
+
+        expect(mixed.changedIds).toEqual(['1', '2']);
+        expect(mixed.addedIds).toBeUndefined();
+        expect(mixed.entry).toBeUndefined();
+        // The `limit: 1` page cannot name the new record — the row it shows is id 1 — which
+        // is exactly the shape a caller used to have to re-read for.
+        expect((mixed.entries as RecordEntry[]).map((entry) => entry.id)).toEqual(['1']);
+        expect(mixed.counts).toEqual({ total: 4, completed: 2, pending: 2 });
+
+        // Two adds through the engine surface: same key, same mint order, ids continuing the
+        // global counter (F3).
+        const added = await run(
+            engine,
+            'records',
+            { collection: 'tasks', entries: [{ text: 'a' }, { text: 'b' }], limit: 1 },
+            'author'
+        );
+
+        expect(added.addedIds).toEqual(['5', '6']);
+        expect(added.changedIds).toBeUndefined();
+    });
+
     it('m11: an `expects` token for an untouched id names what the call DID change', async () => {
         const engine = createRecordEngine();
 
@@ -2188,5 +2635,110 @@ describe('records engine — page-budget marker, bulk-removal ids, and the mutat
         // The echo shrinks; the answer does not. `entry` is the record the call changed.
         expect((quiet.entry as RecordEntry).id).toBe('2');
         expect((quiet.entry as RecordEntry).completed).toBe(true);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 0011 — the floor watermark of a collection's retained change window.
+//
+// `changesTruncated` told a poller THAT it had lost events and never WHERE the retained
+// window starts; the floor was computed in the head-loss test and thrown away
+// (`src/core/records.ts` reads `state.changes[0].rev` there). Every number below is derived,
+// not observed: 300 recorded events against a `RECORD_MAX_CHANGES` = 200 window
+// (`src/core/records.ts:165`) leaves exactly revs 101..300, and the result shows the first
+// `RECORD_MAX_CHANGES_IN_RESULT` = 50 of them (`:166`).
+// ---------------------------------------------------------------------------
+describe('records engine — the change feed names its floor (0011)', () => {
+    // 100 adds + 2 real patches per record = 300 events in one collection. A patch counts
+    // only when a field actually changes, so the two passes flip `completed` rather than
+    // repeating themselves (knowledge.md:1085-1086 — a no-op records nothing).
+    const fillThreeHundredEvents = async (engine: ReturnType<typeof createRecordEngine>) => {
+        await tasks(engine, { tasks: Array.from({ length: 100 }, (_, index) => ({ text: `t${index + 1}` })) });
+
+        for (const completed of [true, false]) {
+            await tasks(engine, {
+                tasks: Array.from({ length: 100 }, (_, index) => ({ id: `${index + 1}`, completed }))
+            });
+        }
+    };
+
+    it('0011: a trimmed feed reports the oldest retained revision, equal to its first entry', async () => {
+        const engine = createRecordEngine();
+
+        await fillThreeHundredEvents(engine);
+
+        const feed = await tasks(engine, { since: 0, limit: 1 });
+
+        expect(feed.storeRev).toBe(300);
+        // Every add has aged out of the window: the feed starts at 101 and runs 50 deep.
+        expect((feed.changes as RecordChange[]).map((change) => change.rev)).toEqual(
+            Array.from({ length: 50 }, (_, index) => 101 + index)
+        );
+        expect(feed.changesHasMore).toBe(true);
+        expect(feed.changesTruncated).toBe(true);
+        // Acceptance criterion 1: the key is there, and it is the revision the reader can
+        // resume from — the same number the first entry already carries.
+        expect(feed.oldestAvailableRev).toBe(101);
+        expect(feed.oldestAvailableRev).toBe((feed.changes as RecordChange[])[0].rev);
+
+        // A watermark INSIDE the window is the same collection read from a covered point:
+        // the floor does not move, and nothing is truncated.
+        const inside = await tasks(engine, { since: 150, limit: 1 });
+
+        expect(inside.changesTruncated).toBe(false);
+        expect(inside.changesHasMore).toBe(true);
+        expect(inside.oldestAvailableRev).toBe(101);
+        expect((inside.changes as RecordChange[]).map((change) => change.rev)).toEqual(
+            Array.from({ length: 50 }, (_, index) => 151 + index)
+        );
+
+        // A watermark at the floor itself is still answerable — the reader is one event
+        // from the oldest thing the log holds, so it loses nothing.
+        const atFloor = await tasks(engine, { since: 100, limit: 1 });
+
+        expect(atFloor.changesTruncated).toBe(false);
+        expect((atFloor.changes as RecordChange[])[0].rev).toBe(101);
+    });
+
+    it('0011: a fresh collection answers with the floor at 1, feed or no feed', async () => {
+        const engine = createRecordEngine();
+
+        const fresh = await tasks(engine, { since: 0, limit: 1 });
+
+        // The empty feed is the case the key exists for: it is now distinguishable from a
+        // lost head without arithmetic — floor 1 beside storeRev 0 means "caught up".
+        expect(fresh.changes).toEqual([]);
+        expect(fresh.changesHasMore).toBe(false);
+        expect(fresh.changesTruncated).toBe(false);
+        expect(fresh.storeRev).toBe(0);
+        expect(fresh.oldestAvailableRev).toBe(1);
+
+        await tasks(engine, { tasks: [{ text: 'first' }] }, 'author');
+
+        const oneEvent = await tasks(engine, { since: 0, limit: 1 });
+
+        expect(oneEvent.changes).toHaveLength(1);
+        expect(oneEvent.oldestAvailableRev).toBe(1);
+    });
+
+    it('0011: a plain read carries the floor on the engine surface; the wrapper envelope is untouched', async () => {
+        const engine = createRecordEngine();
+
+        await tasks(engine, { tasks: [{ text: 'one' }] }, 'author');
+
+        const read = await run(engine, 'records', { collection: 'tasks' }, 'author');
+
+        // Proposal step 1 also covers a plain read of a collection, where the key costs one
+        // integer and tells a cold reader where its `since` may start.
+        expect(read.oldestAvailableRev).toBe(1);
+        // It is not a feed: `changes` still requires `since`.
+        expect(read.changes).toBeUndefined();
+
+        // The batch wrapper's historical page envelope is pinned elsewhere byte-for-byte, so
+        // the floor rides the wrapper only beside `changes` (`toWrapperResult`).
+        const wrapper = await tasks(engine, {});
+
+        expect(wrapper.oldestAvailableRev).toBeUndefined();
+        expect(Object.keys(wrapper).sort()).toEqual(['counts', 'page', 'storeRev', 'tasks']);
     });
 });

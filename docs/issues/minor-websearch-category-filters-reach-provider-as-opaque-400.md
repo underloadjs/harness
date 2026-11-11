@@ -1,6 +1,6 @@
 # 0013 — `category` combined with date or domain filters reaches the provider and returns an opaque `HTTP 400`
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-11 (see **Update (2026-11-11) — closed**)
 > **Severity:** Minor
 > **Area:** `src/tools/websearch/index.ts` (argument validation)
 > **Date opened:** 2026-11-10
@@ -149,3 +149,59 @@ Three traps for the implementer:
 - The three live-provider rows are left **as recorded** (2026-11-10): re-running them costs
   provider spend and nothing in the tree suggests the provider's behaviour changed.
 - Status stays **Open**.
+
+## Update (2026-11-11) — closed
+
+- **Shipped as proposed**, in argument validation only: `src/tools/websearch/index.ts:357-388`
+  adds the three combination checks to `readInvocation` (comment `:357-371`, checks `:372-388`),
+  after every per-field validator. The
+  remaining field readers were hoisted out of the returned object literal
+  (`src/tools/websearch/index.ts:344-355`) so the checks run on **validated** values — in the
+  same evaluation order the literal used (`maxResults`, `provider`, `includeDomains`,
+  `excludeDomains`, `category`, `speed`), so no existing field error lost precedence. No change
+  to `src/tools/websearch/request.ts`: provider bodies stay unsurfaced, and the description
+  sentence that already stated the rule (`src/tools/websearch/index.ts:508`) is unchanged.
+- **Exact refusals** (`HarnessError`, thrown before `loadSearch`):
+  `:372-376` `search category "people" does not support date filters. Drop "since"/"until", or
+  use another category.` — `:378-382` the same sentence for `"company"` — `:384-388`
+  `search category "people" does not support "excludeDomains". Drop the category or the domain
+  filter.` `company` + `excludeDomains` and `news` + date filters are untouched.
+- **Tests added**, in `src/tools/websearch/websearch.test.ts` inside
+  `describe('provider filters')`, beside the existing `rejects a malformed filter before paying
+  for the request` (`:1053`), using that test's request-counter stub (`stubFetch(async …)`):
+  `refuses a category the provider cannot combine with a filter, before paying for the request`
+  (`:1075`) asserts all six refused messages in full — `people`/`company` × `since` **and**
+  `until`, `people` + `excludeDomains`, plus `category: "People"` to pin the case-folded compare —
+  then `expect(requests).toBe(0)`; `keeps a precise field error ahead of a combination error`
+  (`:1110`) runs `excludeDomains: []`, a malformed date, an inverted range and a bad `speed`
+  **each with `category: "people"`**, so only these calls can prove the ordering;
+  `still accepts the category and filter pairs the provider accepts` (`:1138`) resolves the four
+  valid pairs and asserts the filters are still on the wire (`category`, `excludeDomains`,
+  `startPublishedDate` per request body), so nothing was silently dropped.
+- **Offline evidence:** `yarn vitest run src/tools/websearch/websearch.test.ts` → 58/58 (55
+  before the change); with the source hunk reverted the same run is **1 failed | 57 passed**, the
+  failure being the refusal test — so the local guarantee is pinned, not assumed.
+  `src/server/websearch.test.ts` and `src/server/harnesses/catalogue.test.ts` (the other two
+  files that touch this tool) pass unchanged; 68/68 across all three. `tsc --noEmit` and
+  `eslint` on the changed source are clean.
+- **Criteria met:** (1) all four combinations throw from `readInvocation` with the request
+  counter at 0; (2) each message names the category, the unsupported filter, and what to drop;
+  (3) `people` alone, `company` alone, `company` + `excludeDomains` and `news` + `since` all
+  resolve and still send their filters; (4) field-level errors still win.
+- **Drift in the cites above**, re-read against the tree before the fix: every `index.ts` and
+  `request.ts` cite in the 2026-11-11 re-anchor re-verified **exact** (inverted range condition
+  `:340`, throw `:341`; `readCategory` `:271-279`; description sentence verbatim; body suppression
+  `request.ts:32-33` and `:280-281`, opaque message `:300`, `cancelBody` `:441` and `:452`). The
+  two **test-file** cites were already 5 lines low — the test name is `:1043` (not `:1038`) and
+  the `/array of 1-20 domains/` assertion is `:1060` (not `:1055`) — and this fix's 10 helper
+  lines push them to `:1053` and `:1070`; the +46-line source change likewise shifts the
+  description cite `:462` → `:508`, the open-set comment `:457-460` → `:503-506`, and the
+  adapter hand-off `:528-539`/`:533-537` → `:574-585`/`:579-583`. The policy comment
+  (`:236-243`) and `readCategory` sit above the edit and did not move.
+- **Not covered by this fix** (still out of scope): the guard is provider-agnostic, so
+  Tavily/Linkup combination behaviour stays unverified — only Exa was exercised; a provider that
+  would accept `people` + `since` is now refused locally instead. Surfacing provider bodies, and
+  closing `category` to an enum, remain out.
+- Status is **Fixed**. The log's rule for a closed issue is to delete the file and drop the
+  index row; the file is kept, with the row marked, so the fix can be reviewed against its issue
+  in the same pass — the owner's integrated run decides, and deletion is then a one-command step.

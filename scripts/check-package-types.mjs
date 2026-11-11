@@ -366,7 +366,7 @@ const nodeConsumer = consumer(
         },
         include: ['index.ts']
     },
-    `import { agent, harness, tool } from '@underload/harness';
+    `import { agent, harness, tool, openAICompatible, MAX_EXTRA_BODY_BYTES, PROVIDER_REQUEST_BODY_CODE, STRUCTURED_OUTPUT_INVALID_CODE, STRUCTURED_SCHEMA_INVALID_CODE, estimateContextTokens, CONTEXT_OVERFLOW_CODE } from '@underload/harness';
 import { startHarnessServer } from '@underload/harness/server';
 import { LOOPBACK_HOSTNAMES, isLoopbackHostname } from '@underload/harness/shared';
 import { API_ROOT, loadBootstrap } from '@underload/harness/frontend';
@@ -377,6 +377,38 @@ export const loopback: boolean = isLoopbackHostname('localhost') && LOOPBACK_HOS
 export const clientRoot: string = API_ROOT;
 export const bootstrap = loadBootstrap();
 export const factories = { agent, harness, tool };
+
+// issue 0001: the request-body extension, the response format and the structured
+// agent setting must reach a published consumer's declarations, in both the object
+// and the function form, plus the transport's options argument and the caps.
+export const extensionBrain = agent({
+    model: 'm',
+    provider: {
+        baseURL: 'http://x/v1',
+        extraBody: { stream_options: { include_usage: true } },
+        responseFormat: { jsonSchema: { name: 'answer', schema: { type: 'object' }, strict: true } }
+    },
+    structured: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] }
+});
+export const dialectTransport = openAICompatible(
+    { baseURL: 'http://x/v1', extraBody: (request) => ({ seed: request.tools?.length ?? 0 }) },
+    { buildBody: (body, request) => ({ ...body, tenant: request.model }) }
+);
+export const bodyCap: number = MAX_EXTRA_BODY_BYTES;
+export const bodyCode: string = PROVIDER_REQUEST_BODY_CODE;
+export const structuredCodes: string[] = [STRUCTURED_SCHEMA_INVALID_CODE, STRUCTURED_OUTPUT_INVALID_CODE];
+
+// issue 0004: the estimator, the overflow code and BOTH spellings of the context
+// floor are published API. A published consumer reads them from the emitted
+// declarations — the number a host measures with, the name it classifies with, and
+// the two settings the pre-request guard accepts.
+export const fittedTokens: number = estimateContextTokens([{ role: 'user', content: 'hi' }]);
+export const overflowCode: string = CONTEXT_OVERFLOW_CODE;
+export const guardedBrain = agent({
+    model: 'm',
+    maxPromptTokens: 4000,
+    provider: { baseURL: 'http://x/v1', contextWindow: 8192 }
+});
 `
 );
 
@@ -386,13 +418,37 @@ const browserConsumer = consumer(
         compilerOptions: { ...baseOptions, module: 'ESNext', moduleResolution: 'Bundler', customConditions: ['browser'] },
         include: ['index.ts']
     },
-    `import { agent, createTurnBoard, loadBootstrap } from '@underload/harness';
+    `import { agent, createTurnBoard, loadBootstrap, estimateContextTokens, CONTEXT_OVERFLOW_CODE } from '@underload/harness';
 // @ts-expect-error - the "browser" condition must resolve dist/browser.d.ts, which
 // deliberately has no Node server surface. If this import ever type-checks, the
 // condition mapping regressed and a browser bundle could reach node:http types.
 import { startHarnessServer } from '@underload/harness';
 
 export const client = { agent, createTurnBoard, loadBootstrap };
+
+// issue 0001: a browser host configures the request body exactly like a Node host,
+// so the new provider fields and the structured-agent setting must resolve from the
+// browser declarations too — they are wire configuration, not server configuration.
+export const browserBrain = agent({
+    model: 'm',
+    provider: {
+        baseURL: 'https://x/v1',
+        extraBody: { stream_options: { include_usage: true } },
+        responseFormat: 'json'
+    },
+    structured: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] }
+});
+
+// issue 0004: a browser host owns its own transcript, so the context floor and the
+// estimator must resolve from the browser declarations too — they are transcript
+// configuration, not server configuration.
+export const browserGuard = agent({
+    model: 'm',
+    maxPromptTokens: 4000,
+    provider: { baseURL: 'https://x/v1', contextWindow: 8192 }
+});
+export const browserTokens: number = estimateContextTokens([{ role: 'user', content: 'hi' }]);
+export const browserOverflow: string = CONTEXT_OVERFLOW_CODE;
 `
 );
 

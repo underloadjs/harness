@@ -20,7 +20,7 @@
 // src/shared/harness-api.test.ts so a future spec edit that changes the shape fails loudly.
 
 import { readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
 
@@ -111,6 +111,31 @@ const refName = (ref) => ref.split('/').pop();
  * Type emitter
  * ------------------------------------------------------------------------- */
 
+/**
+ * True when a schema node contributes a TYPE of its own: a ref, a declared scalar/array/object
+ * type, an enum, an inline field map, `additionalProperties`, array `items`, or a nested
+ * composite. A member that carries ONLY validation keywords — `required` above all, which is how
+ * OpenAPI spells "at least ONE of these fields must be present" — contributes a CONSTRAINT and no
+ * type, so `baseType` can only answer `unknown` for it. Telling the two apart is what keeps a
+ * body shaped like `PatchTurnBlockRequest` (src/server/harness.swagger.yaml:8415-8440: an `anyOf`
+ * pair whose members carry nothing but `required`, sitting beside the real `properties:` map) from
+ * collapsing to `unknown | unknown` and silently dropping every field of the request.
+ */
+function carriesType(node) {
+    if (!node) return false;
+    return Boolean(
+        node.$ref ??
+            node.type ??
+            node.enum ??
+            node.properties ??
+            node.additionalProperties ??
+            node.items ??
+            node.allOf ??
+            node.oneOf ??
+            node.anyOf,
+    );
+}
+
 /** Collects every schema name referenced while emitting one definition. */
 class Emitter {
     constructor() {
@@ -139,7 +164,26 @@ class Emitter {
         // oneOf / anyOf -> discriminated (or plain) union. TS narrows on the literal tag
         // field the spec marks as `discriminator`, so no runtime helper is needed.
         const variants = node.oneOf ?? node.anyOf;
-        if (variants) return variants.map((v) => this.type(v, depth).replace(/\s+/g, ' ')).join(' | ');
+        if (variants) {
+            // Only members that carry a type join the union. A `required`-only member states a
+            // rule over the SIBLING `properties` map instead, so letting it in as `unknown` would
+            // absorb the whole schema (`unknown | X` is `unknown` to TS).
+            const typed = variants.filter(carriesType).map((v) => this.type(v, depth).replace(/\s+/g, ' '));
+            // Sibling `properties` fold into the result the way the `allOf` branch below already
+            // folds them; ignoring them is what dropped the fields of `PatchTurnBlockRequest`.
+            const extra = node.properties || node.required ? this.objectBody(node, depth + 1) : null;
+
+            // A union of nothing but constraints beside a field map: the field map IS the type,
+            // and the "at least one of these" rule stays normative prose in the schema
+            // description the declaration's JSDoc already carries verbatim.
+            if (!typed.length) return extra ?? 'unknown';
+            if (!extra) return typed.join(' | ');
+
+            // Typed members PLUS sibling fields: intersect, parenthesising the union so `&`
+            // binds to the whole union and not to its last member only.
+            const union = typed.length === 1 && !typed[0].includes('|') ? typed[0] : `(${typed.join(' | ')})`;
+            return `${union}\n    & ${extra}`;
+        }
 
         // allOf -> intersection; a single ref collapses to that ref.
         if (node.allOf) {
@@ -193,16 +237,20 @@ class Emitter {
         const lines = [];
 
         for (const [key, schema] of Object.entries(props)) {
+            // Per-property `description` is normative spec prose too, so it renders here as an
+            // indented JSDoc block instead of being dropped (the shipped contract carries that
+            // prose, e.g. `TurnBlockWriteReceipt.included` at src/server/harness.swagger.yaml:8458).
+            const doc = jsdoc(schema?.description, undefined, inner);
             // A property whose schema is a bare ref/inline object is rendered inline; long
             // expressions are broken onto their own line for readability.
             const rendered = this.type(schema, depth + 1).split('\n');
             const optional = required.has(key) ? '' : '?';
             if (rendered.length === 1) {
-                lines.push(`${inner}${key}${optional}: ${rendered[0]};`);
+                lines.push(`${doc}${inner}${key}${optional}: ${rendered[0]};`);
             } else {
                 const head = `${inner}${key}${optional}:`;
                 const body = rendered.map((l) => l.trim()).join(`\n${inner}  `);
-                lines.push(`${head} ${body};`);
+                lines.push(`${doc}${head} ${body};`);
             }
         }
 
@@ -224,18 +272,25 @@ class Emitter {
  * File writers
  * ------------------------------------------------------------------------- */
 
-/** JSDoc block carrying the spec description verbatim (it is the normative prose). */
-function jsdoc(description, closedNote) {
+/**
+ * JSDoc block carrying the spec description verbatim (it is the normative prose).
+ * `indent` places the block at a property's own column (schema-level blocks pass the default
+ * `''`). The hard-wrap budget is measured on the block's TEXT lines and shrinks by the indent, so
+ * a property block at indent 4 renders to the same right edge (3 columns of `/**` + ` * ` gutter)
+ * as a schema-level block does today - which keeps every existing schema-level block byte-identical.
+ */
+function jsdoc(description, closedNote, indent = '') {
     const text = String(description ?? '')
         .replace(/\s+/g, ' ')
         .trim();
     const lines = [];
+    const width = 110 - indent.length;
     if (text) {
         // Hard-wrap so the generated file stays readable in a diff.
         const words = text.split(' ');
         let line = '';
         for (const w of words) {
-            if (line.length + w.length + 1 > 110) {
+            if (line.length + w.length + 1 > width) {
                 lines.push(line.trimEnd());
                 line = '';
             }
@@ -245,15 +300,25 @@ function jsdoc(description, closedNote) {
     }
     if (closedNote) lines.push(closedNote);
     if (!lines.length) return '';
-    if (lines.length === 1) return `/** ${lines[0].replace(/\*\//g, '*\\/')} */\n`;
-    return `/**\n${lines.map((l) => ` * ${l}`.replace(/\*\//g, '*\\/')).join('\n')}\n */\n`;
+    if (lines.length === 1) return `${indent}/** ${lines[0].replace(/\*\//g, '*\\/')} */\n`;
+    return `${indent}/**\n${lines
+        .map((l) => `${indent} * ${l}`.replace(/\*\//g, '*\\/'))
+        .join('\n')}\n${indent} */\n`;
 }
 
 const emitter = new Emitter();
 
-/** Emit one top-level schema as a declaration string. */
+/** Emit one top-level schema (looked up by name) as a declaration string. */
 function emitSchema(name) {
-    const node = schemas[name];
+    return emitDeclaration(name, schemas[name]);
+}
+
+/**
+ * Render one schema NODE as a declaration string. The node is a parameter (not read out of
+ * `schemas`) so a fixture test can drive the same rules the shipped spec goes through without
+ * touching the real spec or the real output files.
+ */
+function emitDeclaration(name, node) {
     const alias = ALIASES[name];
     if (alias) {
         // The imported binding is namespaced with a `Model` suffix so it can never collide with
@@ -264,13 +329,24 @@ function emitSchema(name) {
     emitter.begin(name);
 
     // Interfaces read better than aliases for the resource shapes; unions/intersections and
-    // scalars must be type aliases.
+    // scalars must be type aliases. A union whose members ALL carry only constraints (a `required`
+    // pair beside the real field map) adds no type, so the schema is still an object shape and
+    // stays an interface: that is the `PatchTurnBlockRequest` shape
+    // (src/server/harness.swagger.yaml:8415-8440), and an interface carrying the field map is
+    // exactly what `src/server/api.ts` reads its `body.<axis>` fields off (api.ts:4600-4662).
+    const variants = node.oneOf ?? node.anyOf;
+    const constraintOnlyUnion = Array.isArray(variants) && !variants.some(carriesType);
     const isPlainObject =
-        !node.$ref && !node.oneOf && !node.anyOf && !node.allOf && !!node.properties;
+        !node.$ref && !node.allOf && (!variants || constraintOnlyUnion) && !!node.properties;
     const body = isPlainObject ? emitter.objectBody(node, 0) : emitter.type(node, 0);
 
-    // Top-level unions read as a one-per-line list; nested ones stay inline.
-    const isUnion = !isPlainObject && body.includes(' | ');
+    // Top-level unions read as a one-per-line list; nested ones stay inline. An INTERSECTION
+    // body (`X\n    & Y`, which both the `allOf` branch and a typed union with sibling fields
+    // return) must NOT be split on ` | `: its members are already parenthesised, and splitting
+    // would push the `&` onto the last member only, silently re-associating `(A | B) & C` into
+    // `A | (B & C)` - a type that reads fine and means something else.
+    const isIntersection = body.includes('\n    & ');
+    const isUnion = !isPlainObject && !isIntersection && body.includes(' | ');
     const finalBody = isUnion
         ? `\n${body.split(' | ').map((v) => `    | ${v}`).join('\n')}\n`
         : body;
@@ -612,31 +688,54 @@ const targets = new Map([
     [STREAM_OUT, streamText],
 ]);
 
-const check = process.argv.includes('--check');
-let stale = [];
-for (const [path, text] of targets) {
-    const next = text.endsWith('\n') ? text : `${text}\n`;
-    let current = '';
+/**
+ * True when this module is the process entry. The generator reads the spec and builds both
+ * outputs at import time (read-only), but the write/exit pass below must NOT run on import:
+ * `scripts/generate-harness-contract.test.mjs` imports the renderer to pin its rules, and a
+ * stray write there would rewrite the shipped contract from a test run.
+ */
+const invokedDirectly = () => {
+    const entry = process.argv[1];
+    if (!entry) return false;
     try {
-        current = readFileSync(path, 'utf8');
+        return fileURLToPath(import.meta.url) === resolve(entry);
     } catch {
-        current = '';
+        return false;
     }
-    if (current === next) continue;
-    stale.push(relative(PKG_ROOT, path));
-    if (!check) writeFileSync(path, next, 'utf8');
+};
+
+/** The CLI pass: compare both outputs against disk, write when not checking, exit 1 when stale. */
+function runCli() {
+    const check = process.argv.includes('--check');
+    let stale = [];
+    for (const [path, text] of targets) {
+        const next = text.endsWith('\n') ? text : `${text}\n`;
+        let current = '';
+        try {
+            current = readFileSync(path, 'utf8');
+        } catch {
+            current = '';
+        }
+        if (current === next) continue;
+        stale.push(relative(PKG_ROOT, path));
+        if (!check) writeFileSync(path, next, 'utf8');
+    }
+
+    if (check) {
+        if (stale.length) {
+            console.error(
+                `harness contract types are stale: ${stale.join(', ')} - run \`node scripts/generate-harness-contract.mjs\``,
+            );
+            process.exit(1);
+        }
+        console.log('harness contract types are up to date');
+    } else {
+        console.log(
+            `generated ${apiNames.length} REST types -> src/shared/harness-api.ts, ${streamNames.length} stream types -> src/shared/harness-stream.ts (${Object.keys(spec.paths ?? {}).length} paths)`,
+        );
+    }
 }
 
-if (check) {
-    if (stale.length) {
-        console.error(
-            `harness contract types are stale: ${stale.join(', ')} - run \`node scripts/generate-harness-contract.mjs\``,
-        );
-        process.exit(1);
-    }
-    console.log('harness contract types are up to date');
-} else {
-    console.log(
-        `generated ${apiNames.length} REST types -> src/shared/harness-api.ts, ${streamNames.length} stream types -> src/shared/harness-stream.ts (${Object.keys(spec.paths ?? {}).length} paths)`,
-    );
-}
+if (invokedDirectly()) runCli();
+
+export { Emitter, schemas as SPEC_SCHEMAS, carriesType, emitDeclaration, jsdoc };

@@ -1,6 +1,6 @@
 # 0009 — The `guarded-write` refusal says "read it first" but withholds the record that `stale-record` returns
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-11 (see **Update (2026-11-11) — closed**)
 > **Severity:** Minor
 > **Area:** `src/core/records.ts` (conflict errors)
 > **Date opened:** 2026-11-09
@@ -95,4 +95,85 @@ read".
   `stale-record` inlines the entry — the asymmetry the issue describes is exactly what the
   current code does, and the helper is still wired into one error out of two.
 - The runtime row is left **as recorded** (live session store, 2026-11-09).
-- Status stays **Open**.
+
+## Update (2026-11-11) — closed
+
+- **Shipped as proposed, with one addition the acceptance list needs to know about.** The
+  shared payload helper is now a renderer rather than a second producer: `stalePayloadTail`
+  (`src/core/records.ts:1244-1250`) turns the ONE budgeted payload from `stalePayloadOf` into
+  the `current: {…} (projection: … omitted)` tail, and both conflict refusals call it —
+  `staleRecordError` (its own wording and its `details` literal are byte-identical, so the
+  `stale-record` pins at `src/harness.task.test.ts:589` and `:804` still pass untouched) and
+  the new `guardedWriteError` (`:1355-1370`, called from the two guard sites at `:1927` and
+  `:1936`). The rejected alternative in **Alternatives** — "last-write-wins always, drop both
+  codes" — stays rejected.
+- **The payload rides in `error.details` exactly as the proposal asked**: `projected`, `entry`
+  (the whole record, or the projection when it is over budget, with `rev` in it either way),
+  and `note` naming what the projection withheld — `guardedWriteError` reads the same
+  `stalePayloadOf` result, so the budget is still `RECORD_STALE_PAYLOAD_BUDGET_BYTES` and the
+  shape is still the one `stale-record` emits.
+- **The message carries the record too, which is the one place this fix reads the doc
+  differently.** `src/harness.ts:6892` renders a failing agent task as
+  `Tool "tasks" failed: <message>` and **nothing else** — `error.details` never reaches the
+  model. A details-only payload would have made the structured API richer while leaving the
+  reported symptom (one extra read on EVERY first write) exactly where it was. So the pinned
+  sentence is kept **byte-identical** and the payload is appended after it, in `stale-record`'s
+  exact form. Reading "no message change" as "the refusal must not say more" is the reading
+  that fails acceptance criterion 1; the reading shipped is "the sentence must not change".
+  Flagged for owner review, since it is an interpretation of a premise, not an extension.
+- **A projected refusal still says so out loud.** `stale-record` composes its projection note
+  into the message; this refusal keeps its pinned sentence, so `details.note` carries the note
+  as well — the degradation stays spoken in both surfaces, per R11.
+- **`details` is not a published type.** `HarnessError`'s `details` is a free-form record
+  already (`src/util/errors.ts:24`), so this adds no type surface; the shape is pinned by tests
+  and documented here rather than in `knowledge.md`.
+- **Tests** (`src/core/records.test.ts`, `guarded write token contract`):
+  - `:344` — the patch refusal: `code`, the `id`/`projected`/`entry` `details` keys asserted
+    with `toEqual` (the `rev` a one-step retry needs, pinned field by field), and the exact
+    message tail.
+  - `:383` — the removal refusal: `updatedBy`/`updatedAt` arrive, because an
+    identity-less removal is a guarded write that must say which record it deletes.
+  - `:414` — over-budget entry: `projected: false`, the `note` naming what was withheld, the
+    budgeted tail in the message, and `rev` still present so the retry needs no read.
+  - `:301` (its pinned string at `:311-316`) — the pre-existing exact-message pin is
+    **updated, not weakened**: the sentence is verbatim and the tail is appended inside the
+    same string.
+  - `src/harness.task.test.ts:719` — the model-visible string end to end
+    (`Tool "tasks" failed: guarded-write: guarded write: … current: {…}`) plus the retry that
+    reads the rev out of the refusal and succeeds with **no read in between**.
+- **Both refusals stay the "exists but unguarded" refusal.** The payload is read only after
+  STEP 3/STEP 4 (`:1766-1773`, `:1871-1879`) have answered an unknown id, so 0011's split —
+  guarded complaint for an id that exists, plain rejection with the defined names for an id
+  that does not — is untouched, and `never-held`/`aged-out` for `stale-record` are untouched.
+- **Drift in the citations above, corrected**: the `stale-record` inlining site cited as
+  `:1243-1251` is the `stalePayloadTail` call at `:1323` now, its `details` literal is
+  `:1319-1336` with the `entry` field at `:1335`, `stalePayloadOf` (`:1200-1228` in the
+  2026-11-11 re-anchor) is `:1213-1237`, and `RECORD_STALE_PAYLOAD_BUDGET_BYTES` is `:179`.
+  Those moved while 0008 and 0011 were landing in the same files, and this pass moved the
+  region again.
+- **Evidence** (offline, deterministic; 2026-11-11):
+  - `yarn vitest run src/core/records.test.ts src/core/records.store-events.test.ts
+    src/harness.records.test.ts src/harness.task.test.ts` — **112 passed** (101 in those same
+    files before the fix).
+  - The same command over the 11 records-adjacent files (the four above plus
+    `src/core/schema-validation.test.ts`, `src/tools/runtime/threadRead.test.ts`,
+    `src/server/workers/lane-authority.test.ts`,
+    `src/server/workers/lane-authority.request-scope.test.ts`, `src/harness.tool-list.test.ts`,
+    `src/harness.discovery.test.ts`, `src/core/tool-discovery.test.ts`) — **242 passed**.
+  - `npx tsc --noEmit` — clean (exit 0), so the `entry`/`note` keys type-check inside the
+    existing `HarnessError` details contract.
+  - **Negative control**: with ONLY the 0009 payload (back to `{ id }` and the bare sentence)
+    and the 0010 entry-point guard reverted — every other in-flight change kept — `yarn vitest
+    run src/core/records.test.ts src/harness.records.test.ts src/harness.task.test.ts` answers
+    **7 failed / 87 passed**: the three 0009 tests, the pinned sentence test
+    (`refuses an identified write that skipped its token…`, `src/core/records.test.ts:301`),
+    the model-visible test at `src/harness.task.test.ts:719`, and 0010's two entry-point tests.
+    Nothing else moves — the 0011 feed pins, the 0008 id-list pins, the wrapper-route 0010
+    pins and the unchanged `stale-record` pins all still pass. `src/core/records.ts` was
+    restored byte-for-byte from `Temp/T9/records.current.ts` (sha `d918fadc…`) and re-ran
+    green at 94/94.
+- **Not covered by these tests**: no published wire type for `details`, so a consumer that
+  reads `entry` structurally is pinned only by these assertions; the tasks/chapters wrappers
+  are not given their own guarded-write tests (they route through the same
+  `executeCollection`); no `knowledge.md` row was added for the payload.
+- Status: **Fixed 2026-11-11**.

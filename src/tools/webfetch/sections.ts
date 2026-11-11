@@ -89,6 +89,44 @@ export const splitSections = (content: string): Section[] => {
     return sections.filter((section) => section.end > section.start);
 };
 
+// Non-overlapping occurrences of `needle` in an already-lowercased haystack.
+// Same scan selectProximity uses for `totalMatches`, so both modes count hits the
+// same way (a needle that cannot advance stops the loop rather than spinning).
+const countOccurrences = (haystack: string, needle: string): number => {
+    if (needle.length === 0) return 0;
+
+    let count = 0;
+
+    for (let at = haystack.indexOf(needle); at !== -1; ) {
+        count += 1;
+
+        const next = haystack.indexOf(needle, at + needle.length);
+        at = next === -1 || next === at ? -1 : next;
+    }
+
+    return count;
+};
+
+// Hits per character of the section: the ranking `selectSections` orders by.
+// A 4 KB section with 3 hits (7.5e-4) outranks a 39 KB one with the same 3 hits
+// (7.6e-5). The measured motivation (issue 0016): on a Wikipedia article about
+// quantum error correction, the `## References` section was ~39,600 of the
+// 52,643 characters returned (75% of the answer) because a link-heavy reference
+// list contains almost any phrase — length, not relevance, was buying it the slot.
+//
+// Both sides are measured on the text the caller actually RECEIVES (trimmed):
+// ranking on the raw slice would let a one-character difference in trailing
+// whitespace reorder two otherwise identical sections, which turns a stable
+// document order into an ordering nobody chose.
+//
+// The denominator includes the heading so a section matched ONLY by its heading
+// still ranks — a 0-hit body of any length would otherwise score 0 and sink.
+const matchDensity = (text: string, heading: string, needle: string): number => {
+    const hits = countOccurrences(text.toLowerCase(), needle) + countOccurrences(heading.toLowerCase(), needle);
+
+    return hits / Math.max(1, text.length + heading.length);
+};
+
 // The sections whose heading or body contains the phrase. Matching is on the
 // WHOLE section text, so a hit anywhere in a block returns that block with its
 // heading — the context is the point, not the line.
@@ -96,6 +134,17 @@ export const splitSections = (content: string): Section[] => {
 // `maxBlocks` bounds the answer: a one-word query against a long page would
 // otherwise match most of it and smuggle the whole document back past every
 // bound the tool just applied.
+//
+// WHICH blocks survive the cap is a ranking decision (issue 0016). Taking the
+// first 20 in DOCUMENT order means the cap is won by whatever appears earliest,
+// and on a long article that is the lead plus a link-heavy References block.
+// Sections are therefore ordered by match density BEFORE the cap is applied, so
+// the blocks that are dropped are the ones that matched because they are long.
+// This deprioritizes, never excludes: a section is still returned whenever it
+// matches (a `query="Bibcode"` call must still answer with References and
+// External links), and equal densities keep document order — the sort breaks
+// ties on the section's line, so a one-hit-per-heading query behaves exactly as
+// it did before whenever the sections are the same size.
 export const selectSections = (
     content: string,
     query: string,
@@ -104,24 +153,41 @@ export const selectSections = (
     const sections = splitSections(content);
     const needle = query.toLowerCase();
     const lines = content.split('\n');
-    const matches: SectionMatch[] = [];
-    let totalMatches = 0;
 
-    for (const section of sections) {
-        const text = lines.slice(section.start, section.end).join('\n');
+    // Every matching section, ranked. `raw` (not the trimmed text) is what the
+    // match test and the density denominator use, so trimming can never change
+    // which sections match or how they measure.
+    const ranked = sections
+        .map((section) => {
+            const raw = lines.slice(section.start, section.end).join('\n');
 
-        if (!section.heading.toLowerCase().includes(needle) && !text.toLowerCase().includes(needle)) {
-            continue;
-        }
+            return { section, raw };
+        })
+        .filter(
+            ({ section, raw }) =>
+                section.heading.toLowerCase().includes(needle) || raw.toLowerCase().includes(needle)
+        )
+        .map(({ section, raw }) => {
+            // The trimmed text is BOTH what the caller receives and what the ranking
+            // measures, so two sections with the same content measure the same.
+            const text = raw.trim();
 
-        totalMatches += 1;
+            return {
+                heading: section.heading,
+                text,
+                line: section.start,
+                density: matchDensity(text, section.heading, needle)
+            };
+        })
+        // Densest first; identical densities keep document order.
+        .sort((left, right) => right.density - left.density || left.line - right.line);
 
-        if (matches.length < maxBlocks) {
-            matches.push({ heading: section.heading, text: text.trim(), line: section.start });
-        }
-    }
-
-    return { matches, totalSections: sections.length, totalMatches, matchMode: 'heading' };
+    return {
+        matches: ranked.slice(0, maxBlocks).map(({ heading, text, line }) => ({ heading, text, line })),
+        totalSections: sections.length,
+        totalMatches: ranked.length,
+        matchMode: 'heading'
+    };
 };
 
 // The fallback for a document with no heading structure: one window of text

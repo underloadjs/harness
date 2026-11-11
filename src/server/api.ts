@@ -234,6 +234,12 @@ import { writeHarnessAgentRecords } from './persistence';
 import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
 import { SessionError, SessionStore, validateAttachmentsForSubmit } from './sessions';
 import type { EnqueuedTask, SessionRecord, ThreadLaneInfo } from './sessions';
+// Issue 0005 (C): the seed on `POST /sessions` is validated by the ONE transcript reader the
+// runtime and snapshot restore already enforce (`readHarnessMessages`, src/core/snapshot.ts), and
+// it lands in the entry agent's DEFAULT conversation, whose id prefix is `THREAD_AGENT_PREFIX`
+// (src/core/thread.ts). `src/server/sessions.ts:216` imports this same pair, so the API layer and
+// the store cannot drift onto two different transcript validators or two spellings of that id.
+import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
 // T5 (R2/R3): the plugin settings store's status-carrying failure (404 unknown plugin, 400
 // unknown key / mistyped / out-of-range value). The store itself is reached through
 // `store.pluginSettings`, so this dispatcher never constructs a second one.
@@ -2515,10 +2521,40 @@ export const createHarnessApi = ({
     const postSession: Handler = async (ctx) => {
         const body = requireObjectBody<CreateSessionRequest>(await ctx.body());
 
-        requireKnownFields(body, ['harness', 'title', 'settings']);
+        requireKnownFields(body, ['harness', 'title', 'settings', 'messages']);
 
         if (typeof body.harness !== 'string' || body.harness.length === 0) {
             throw new HttpError(400, 'A session requires a harness name.');
+        }
+
+        // ISSUE 0005 (C) — the optional SEEDED TRANSCRIPT, validated BEFORE anything exists.
+        //
+        // WHY THE ORDER MATTERS: `messages` is the one piece of recorded state a client may hand the
+        // built-in session API (importing a history, forking at turn N). A transcript PUT deliberately
+        // accepts a broken document (it is stored raw as `unreadable`, because an operator's editor
+        // buffer is the user's own data). A SEED has no such reader-repair story: a half-created session
+        // whose conversation is an unreadable placeholder is a broken session, so the seed is refused
+        // with a 400 and NOTHING is created — the same "validate before the mutation" discipline the
+        // submit route applies to `attachments`.
+        //
+        // The reader IS the runtime's own (`readHarnessMessages`, src/core/snapshot.ts), so a seed that
+        // passes here is a document `snapshot()` and `restore()` also accept, and the ids it mints
+        // (`msg-<n>`, backfilled per entry) are exactly what the transcript read will show later. An
+        // empty array is a VALID seed — "start this conversation with no transcript at all" — and so is
+        // a list with no `system` entry, which is the client's decision, not a server error.
+        //
+        // The detached copy the reader returns IS what gets written: it is the client's document with
+        // every entry validated and every absent `messageId` backfilled (`msg-<n>`), so the transcript
+        // the session ends up with is exactly the list this route accepted. The store write below
+        // re-validates it, and that reader is idempotent (an id already present is carried verbatim).
+        let seed: HarnessMessage[] | undefined;
+
+        if (body.messages !== undefined) {
+            try {
+                seed = readHarnessMessages(body.messages, 'body.messages');
+            } catch (error) {
+                throw new HttpError(400, messageOf(error));
+            }
         }
 
         const input = settingsInputOf(body.settings as Record<string, unknown> | undefined, 'body');
@@ -2547,6 +2583,40 @@ export const createHarnessApi = ({
         });
 
         const record = store.liveSession(session.id);
+
+        // ISSUE 0005 (C) — the seed is written through the SAME store call the transcript PUT makes
+        // (`store.updateThreadTranscript`, src/server/sessions.ts:9170), so it inherits that write's
+        // whole contract instead of re-deriving a weaker one: the shared `readHarnessMessages` validation
+        // (a second, idempotent pass), the runtime's live-work guard (409), the in-place install the
+        // harness's own `snapshot()` projects, the durable `persistOrThrow` BEFORE this route answers,
+        // and the `transcript.updated` signal that moves the `transcript` / `transcript_messages`
+        // counters and reaches a watching stream (the hub listener above, not a second publish here).
+        //
+        // THE TARGET is the entry agent's DEFAULT conversation, `agent:<primary>`: `src/harness.ts` keeps
+        // one per configured agent on a freshly built harness (see the `threads()` note there), so this
+        // row exists on every session this route can create. The primary is read from the definition THIS
+        // session froze (`record.definition.primary`), not from the registry entry, which may have moved
+        // since the create.
+        //
+        // REPLACE, not append: the seed is a transcript DOCUMENT, exactly like the PUT it reuses. A
+        // client that wants its history in front of the trusted instruction sends a `system` entry too —
+        // a transcript write is the operator surface where that is legal; the harness DEFINITION's prompt
+        // text stays trusted-catalogue-only (src/agents/types.ts).
+        //
+        // The only realistic failures left at this point are the live-work guard and an I/O failure (a
+        // closed database root); both map through the outer catch to their own status. The body was
+        // already validated, so a malformed seed can never reach here and leave a half-built session.
+        if (seed !== undefined) {
+            const seedThreadId = `${THREAD_AGENT_PREFIX}${record.definition.primary}`;
+
+            await store.updateThreadTranscript(record.id, seedThreadId, seed);
+
+            // Same counter split as `putTranscript` below: the store's signal has already moved
+            // `transcript`/`transcript_messages`, and the conversation ROW is the REST-owned counter for a
+            // content change like this one, so a client holding the thread row can tell the transcript
+            // moved before the first turn ran.
+            events.bumpRevision('thread', threadKey(record.id, seedThreadId));
+        }
 
         if (typeof body.title === 'string' && body.title.trim().length > 0) {
             // T16: durable through the store (the document carrying the title is written before

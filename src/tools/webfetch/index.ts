@@ -49,6 +49,17 @@
 // constructing a harness, listing tools, or calling toolRequest never loads
 // them. There is no SDK: every provider uses `fetch` and plain strings/JSON.
 //
+// Reported losses
+// ---------------
+// A converted page is only authoritative where the conversion kept things, so
+// every loss this tool can cause reaches the caller as `note` rather than being
+// left for the model to guess: an `offset` that clamped, a headingless `query`
+// that degraded to a proximity window, and math markup the native conversion
+// flattened (the fact from `ConvertedPage.mathFlattened`, the wording from
+// `MATH_FLATTENED_NOTE`, both in ./native — see issue 0012 in docs/issues). The
+// two notes about the WINDOW win when they overlap with the math note, because
+// they explain the excerpt the caller is holding.
+//
 // Cross-references:
 //   - ./request   — bounds, the bounded GET, URL/content-type validation
 //   - ./native    — the regex HTML-to-markdown/text conversion
@@ -68,6 +79,10 @@ import type {
 } from '../../types';
 import { createRedactor } from '../websearch/request';
 import { FLAT_DOCUMENT_SECTIONS, selectProximity, selectSections } from './sections';
+// The section shape `selectSections`/`selectProximity` hand back — the resume
+// offset mapping below has to read a block's `line` and `text` to translate a cut
+// position back into an offset in the converted page.
+import type { SectionMatch } from './sections';
 import type { DnsLookup } from './request';
 import {
     MAX_CONTENT_CHARS,
@@ -298,6 +313,78 @@ const fitResult = (content: string): string => {
     return candidate;
 };
 
+// How a `query` answer is assembled: the label each returned section carries and
+// the blank line between blocks. Named because the resume-offset mapping below
+// has to reproduce this layout exactly to turn a cut position back into a page
+// offset — if the two drift, `nextOffset` silently points at the wrong character.
+const SECTION_SEPARATOR = '\n\n';
+
+const sectionHeader = (match: SectionMatch): string =>
+    `## ${match.heading || '(no heading)'} [line ${match.line + 1}]\n`;
+
+// The character offset where line `line` (0-based) starts. A linear scan, run at
+// most once per truncated `query` result, so paging a page never costs more than
+// one pass over the converted document. A line number past the end clamps to the
+// end of the document rather than throwing — the caller only uses it as a search
+// hint below.
+const lineStartOffset = (content: string, line: number): number => {
+    let offset = 0;
+
+    for (let index = 0; index < line; index += 1) {
+        const next = content.indexOf('\n', offset);
+        if (next === -1) return content.length;
+        offset = next + 1;
+    }
+
+    return offset;
+};
+
+// Where a cut `query` answer should be resumed from (issue 0016).
+//
+// `fitResult` cuts the JOINED answer, and a caller can only page the PAGE — so
+// the cut position has to be translated back into an offset in the converted
+// document. Every block selectSections/selectProximity hands back is a verbatim
+// substring of `content` (both trim, neither rewrites), so locating it from its
+// own starting line gives an exact anchor: the page offset returned here is the
+// character immediately AFTER the last character the answer delivered, which is
+// what makes the resume lossless — nothing is skipped, and at most the synthetic
+// `[line N]` header can overlap with what was already shown.
+//
+// Returns undefined when no block contains the cut (the answer was not cut) or
+// when a block cannot be found in the page (defensive; a caller then gets no
+// `nextOffset` rather than a wrong one).
+const resumeOffsetForCut = (
+    content: string,
+    matches: readonly SectionMatch[],
+    kept: number
+): number | undefined => {
+    let cursor = 0;
+
+    for (const match of matches) {
+        const header = sectionHeader(match);
+        const textStart = cursor + header.length;
+        const blockEnd = textStart + match.text.length;
+
+        if (kept < blockEnd) {
+            // The block came from `match.line`, so search from there; the whole
+            // document is the fallback for a block that trims away its line start.
+            const hint = lineStartOffset(content, match.line);
+            const found = content.indexOf(match.text, hint);
+            const at = found === -1 ? content.indexOf(match.text) : found;
+
+            if (at === -1) return undefined;
+
+            // A cut that lands in the header or the separator resumes at the
+            // block's first real character.
+            return Math.min(content.length, kept <= textStart ? at : at + (kept - textStart));
+        }
+
+        cursor = blockEnd + SECTION_SEPARATOR.length;
+    }
+
+    return undefined;
+};
+
 // A trailing lone high surrogate would serialize as an escape and is not the
 // text the page produced.
 const trimBrokenSurrogate = (value: string): string => {
@@ -402,7 +489,7 @@ const metadataFor = (available: readonly WebFetchProvider[]) => ({
                 type: 'integer',
                 minimum: 0,
                 description:
-                    'Character offset (NOT bytes) to start reading at, default 0. Pass the "nextOffset" a truncated result reported to read the rest of the page. An offset past the end is clamped to it and reported as "offsetClamped" with a "note", so overshooting reads as the end of the page rather than as an empty document. Offsets are only comparable within one "format": the same URL converts to different character counts as markdown, text, or html.'
+                    'Character offset (NOT bytes) to start reading at, default 0. Pass the "nextOffset" a truncated result reported to read the rest of the page. An offset past the end is clamped to it and reported as "offsetClamped" with a "note", so overshooting reads as the end of the page rather than as an empty document. Offsets are only comparable within one "format": the same URL converts to different character counts as markdown, text, or html. IGNORED when "query" is set: section selection runs on the whole converted page, so there is no window to start partway through and the result reports no "offset". A truncated "query" answer that reports "nextOffset" was cut by the result byte budget and resumes by re-fetching at that offset WITHOUT "query"; one that reports "stopReason": "resultCap" hit the 20-section cap instead, and narrowing the query is the fix there.'
             },
             ...(available.length > 1
                 ? {
@@ -499,8 +586,30 @@ export const createWebFetchTool = (
 
             let redirects = 0;
 
+            // Set when the native conversion flattened math markup (a <sup>,
+            // <sub>, <math> or MathML node in prose). The `^`/`_` markers rescue
+            // sup/sub, but MathML still flattens into juxtaposition (`\frac12` →
+            // `12`), and a reader cannot see that a fraction was ever there — so
+            // the loss has to be STATED. The converter reports the fact
+            // (native.ts:53, `ConvertedPage.mathFlattened`) and writes the
+            // sentence (native.ts:63, `MATH_FLATTENED_NOTE`); this is the hand-off
+            // that gets it to the model (issue 0012).
+            // Held as the note TEXT rather than a boolean plus an imported
+            // constant because `MATH_FLATTENED_NOTE` lives in the lazily imported
+            // native module: it can only be destructured inside the native branch,
+            // while the note is needed by the return paths below. Carrying the
+            // sentence through one variable keeps the wording owned by the module
+            // that knows the loss, and `undefined` doubles as "nothing flattened".
+            // Stays undefined for the hosted providers, which answer with
+            // pre-rendered markdown and never run the local conversion, and for
+            // `format: "html"` / non-HTML bodies, where nothing was converted.
+            let mathFlattenedNote: string | undefined;
+
             if (invocation.provider === 'native') {
-                const { fetchNative } = await loadNative();
+                // MATH_FLATTENED_NOTE comes from the same lazy import as
+                // fetchNative, so the disclosure is quoted verbatim instead of a
+                // second sentence here drifting out of sync with it.
+                const { fetchNative, MATH_FLATTENED_NOTE } = await loadNative();
                 const { page, converted } = await fetchNative(
                     invocation.url,
                     invocation.format,
@@ -512,6 +621,12 @@ export const createWebFetchTool = (
                 url = page.url;
                 contentType = page.contentType;
                 redirects = page.redirects;
+                // The sixth field of the provider result, previously dropped here.
+                // `format: "html"` and a non-HTML body report `false`
+                // (native.ts:481/487), so those paths stay silent by construction —
+                // html is the lossless remedy the note points at, and saying
+                // "flattened" about a verbatim body would be a lie.
+                if (converted.mathFlattened) mathFlattenedNote = MATH_FLATTENED_NOTE;
             } else {
                 // Unreachable through readProvider, but the closure's invariant is
                 // worth enforcing where the key is used rather than trusting a cast.
@@ -597,10 +712,36 @@ export const createWebFetchTool = (
                 }
 
                 const joined = matches
-                    .map((match) => `## ${match.heading || '(no heading)'} [line ${match.line + 1}]\n${match.text}`)
-                    .join('\n\n');
+                    .map((match) => `${sectionHeader(match)}${match.text}`)
+                    .join(SECTION_SEPARATOR);
 
                 const boundedSections = fitResult(joined);
+
+                // Two different limits share this one flag, and they need OPPOSITE
+                // responses (issue 0016):
+                //   - the result BYTE BUDGET cut the answer mid-text: more content
+                //     exists for the sections already returned, and paging the page
+                //     from where the cut landed is the remedy, so `nextOffset` goes
+                //     with it;
+                //   - MAX_QUERY_BLOCKS capped the SECTION LIST: the withheld sections
+                //     are not one page away — selection runs on the whole document, so
+                //     paging cannot reach them and the caller has to narrow the query.
+                // `stopReason` names which one closed the answer, in the same
+                // vocabulary glob.tool.ts:140 and grep.tool.ts:250 use for the same
+                // ambiguity. When both bounds close at once the budget wins the name,
+                // because the budget is the one that ships a resume pointer.
+                const budgetCut = boundedSections.length < joined.length;
+                const capCut = totalMatches > matches.length;
+                // Typed through the result field so the two literals stay checked
+                // against the contract instead of being inferred as bare strings.
+                const stopReason: WebFetchResult['stopReason'] = budgetCut
+                    ? 'contentBudget'
+                    : capCut
+                        ? 'resultCap'
+                        : undefined;
+                const nextOffset = budgetCut
+                    ? resumeOffsetForCut(safeContent, matches, boundedSections.length)
+                    : undefined;
 
                 return {
                     provider: invocation.provider,
@@ -609,10 +750,17 @@ export const createWebFetchTool = (
                     format: invocation.format,
                     characters: boundedSections.length,
                     // True when the returned sections were cut, or when matches were
-                    // dropped by the block cap — either way, more exists.
-                    truncated: boundedSections.length < joined.length || totalMatches > matches.length,
+                    // dropped by the block cap — either way, more exists. Which kind
+                    // it is comes from `stopReason`, because the two have different
+                    // remedies and one flag alone sent the caller paging for content
+                    // that paging cannot reach.
+                    truncated: budgetCut || capCut,
+                    ...(stopReason !== undefined ? { stopReason } : {}),
                     content: boundedSections,
                     query: invocation.query,
+                    // `totalMatches` exceeds `matches` exactly when the cap dropped
+                    // sections, which is what makes a `resultCap` answer actionable:
+                    // the caller can see how much of the page it has not been shown.
                     matches: matches.length,
                     totalSections,
                     totalMatches,
@@ -620,9 +768,26 @@ export const createWebFetchTool = (
                     // page had no headings to filter on, so this is a window around
                     // the best match; page with `offset` for more.
                     matchMode: answered.matchMode,
+                    // Math flattening, disclosed FIRST so the proximity note below
+                    // overwrites it (later spread wins in an object literal). A
+                    // caller that got a proximity window needs the sentence that
+                    // explains the window it is looking at more than the one about
+                    // the document's math; overwriting rather than appending keeps
+                    // `note` a single actionable sentence (issue 0012, criterion 2).
+                    ...(mathFlattenedNote !== undefined ? { note: mathFlattenedNote } : {}),
                     ...(answered.matchMode === 'proximity'
                         ? { note: 'This page has no heading structure, so "query" returned a text window around the first match instead of a section. Use "offset" to read further.' }
                         : {}),
+                    // Where a BUDGET-cut answer resumes: an offset into the converted
+                    // page, to be passed back as `offset` WITHOUT `query` (`offset` is
+                    // ignored while `query` is set — see its parameter description).
+                    // Absent when the cap rather than the budget caused the truncation,
+                    // because there is no page position that reaches the withheld
+                    // sections.
+                    ...(nextOffset !== undefined ? { nextOffset } : {}),
+                    // No `offset` echo in this branch. Selection ignores `offset`
+                    // (it runs on `safeContent`, not on the caller's window), and
+                    // echoing a number would read as "your offset was applied".
                     pageCharacters: safeContent.length,
                     ...(redirects > 0 ? { redirects } : {}),
                     ...(title !== undefined && title.length > 0
@@ -663,6 +828,11 @@ export const createWebFetchTool = (
                 // Every other content tool in this harness pages; fetch used to be
                 // the one that silently lost the rest of the document.
                 ...(truncated ? { nextOffset: startOffset + output.length } : {}),
+                // Math flattening (issue 0012), disclosed BEFORE the clamp note so
+                // the clamp still wins when both apply — the clamp explains the
+                // window the caller actually received, and a caller that overshot
+                // needs that first. Criterion 2 pins the precedence.
+                ...(mathFlattenedNote !== undefined ? { note: mathFlattenedNote } : {}),
                 ...(offsetClamped
                     ? {
                           offsetClamped: true,

@@ -36,8 +36,10 @@
 //
 // Errors are sanitized on purpose: a page status is reported, a page body
 // never is (error pages are HTML), and a network failure is reduced to one
-// fixed sentence. There is no retry beyond the Cloudflare UA swap, so a model
-// cannot multiply spend by hammering a slow host.
+// fixed sentence PER CAUSE CLASS (see the transport classification below) — the
+// class, never the Node error text. There is no retry beyond the Cloudflare UA
+// swap, so a model cannot multiply spend by hammering a slow host; the class is
+// what tells a caller whether a retry could have helped at all.
 //
 // Cross-references:
 //   - ./native      — the GET flow and the HTML conversion
@@ -154,6 +156,119 @@ const statusFailure = (status: number): HarnessError => {
     return new HarnessError(`fetch failed (HTTP ${status}).`);
 };
 
+// ---------------------------------------------------------------------------
+// Transport failure classification (issue 0015)
+// ---------------------------------------------------------------------------
+//
+// Everything below exists because ONE sentence was doing the work of three
+// situations. A typo'd hostname, a host that refuses the connection, and a
+// certificate the chain does not trust are different conditions with different
+// remedies, and a caller cannot choose one without knowing which it has.
+//
+// The sanitization rule (see the header of this file) still holds: the class is
+// reported, never the Node error text. `error.cause.code` is a machine-readable
+// errno name, not page content, so naming the class adds no transcript noise.
+// The no-retry rule is untouched (:39-40 — classification is not a retry); what
+// changed is that a message can now say honestly whether a retry could have
+// helped at all.
+type TransportCause = 'dns' | 'connection' | 'tls' | 'unknown';
+
+// The name behind the host never resolved. `ENOTFOUND` is a definitive NXDOMAIN
+// style answer; `EAI_AGAIN` is getaddrinfo failing to get one at all. Both are
+// reported as one class because the caller's action is the same: the request
+// never reached a host, so repeating it unchanged buys nothing.
+const DNS_CAUSE_CODES: readonly string[] = ['ENOTFOUND', 'EAI_AGAIN'];
+
+// The host was reached (or at least addressed) and the connection itself failed:
+// refused port, reset mid-handshake/mid-body, or a broken pipe. A retry is
+// plausible here, which is exactly what the DNS class is saying it is not.
+const CONNECTION_CAUSE_CODES: readonly string[] = ['ECONNREFUSED', 'ECONNRESET', 'EPIPE'];
+
+// Certificate and TLS-protocol failures, by their exact OpenSSL/undici names.
+// The prefix rules below catch the long tail (`ERR_TLS_*`, `ERR_SSL_*`, and the
+// `ALERT_*` codes a peer sends), so a handshake problem never falls back into the
+// unclassified sentence.
+const TLS_CAUSE_CODES: readonly string[] = [
+    'EPROTO',
+    'ERR_TLS_CERT_ALTNAME_INVALID',
+    'DEPTH_ZERO_SELF_SIGNED_CERT',
+    'SELF_SIGNED_CERT_IN_CHAIN',
+    'UNABLE_TO_GET_ISSUER_CERT',
+    'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+    'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+    'CERT_HAS_EXPIRED',
+    'CERT_UNTRUSTED',
+    'CERT_HAS_REVOKED_SIGNED_CERT'
+];
+
+// One sentence per class. Each says whether retrying is plausible, because that
+// is the decision the class exists to inform. `provider: "exa"` is named in the
+// two classes where a different client can genuinely help: it fetches from
+// Exa's own crawler, which reached `httpbin.org/html` on 2026-11-10 in the exact
+// situation where the direct GET failed 5 times out of 5 (issue 0015 evidence).
+// The `unknown` sentence keeps the historical wording as its first clause, so a
+// caller matching on the old string still recognizes the failure.
+const TRANSPORT_FAILURE_MESSAGES: Record<TransportCause, string> = {
+    dns: 'fetch could not resolve this hostname (DNS found no address for it). Check the URL — the host was never reached, so retrying will not help.',
+    connection:
+        'fetch could not keep a connection to this host (refused or reset). The host was reached, so a retry may help; "provider": "exa" fetches through a different client and may work where the direct GET does not.',
+    tls: 'fetch could not complete the TLS handshake with this host (certificate or protocol error). Retrying will not help: the same handshake fails; "provider": "exa" connects separately and may work.',
+    unknown:
+        'fetch could not be reached (network error). The cause is not one this tool can classify, so a retry may help; "provider": "exa" fetches through a different client.'
+};
+
+// Every errno-style code reachable on one transport rejection. undici rejects
+// with `TypeError('fetch failed')` carrying the system error as `cause`, so the
+// code is one level down; a dual-stack (happy-eyeballs) failure nests it once
+// more inside `cause.errors`; and a failure raised on the response BODY stream
+// (a reset mid-download) carries the code on the error itself. Nothing else is
+// read — no message, no stack.
+const transportCodesOf = (error: unknown): string[] => {
+    if (error === undefined || error === null || typeof error !== 'object') return [];
+
+    const shaped = error as { code?: unknown; cause?: unknown };
+    const cause = shaped.cause;
+    const nested =
+        cause !== undefined && cause !== null && typeof cause === 'object'
+            ? [
+                  (cause as { code?: unknown }).code,
+                  ...(Array.isArray((cause as { errors?: unknown }).errors)
+                      ? (cause as { errors: unknown[] }).errors.map(
+                            (entry) => (entry as { code?: unknown } | undefined)?.code
+                        )
+                      : [])
+              ]
+            : [];
+
+    return [shaped.code, ...nested].filter((code): code is string => typeof code === 'string');
+};
+
+// The class a transport rejection belongs to; `unknown` when its code is not one
+// of the three groups, which keeps the historical sentence reachable rather than
+// inventing a fourth guess.
+const transportCause = (error: unknown): TransportCause => {
+    for (const code of transportCodesOf(error)) {
+        if (DNS_CAUSE_CODES.includes(code)) return 'dns';
+        if (CONNECTION_CAUSE_CODES.includes(code)) return 'connection';
+        if (
+            TLS_CAUSE_CODES.includes(code) ||
+            code.startsWith('ERR_TLS') ||
+            code.startsWith('ERR_SSL') ||
+            code.startsWith('ALERT_')
+        ) {
+            return 'tls';
+        }
+    }
+
+    return 'unknown';
+};
+
+// Exported for the test suite: the classification is a contract (issue 0015
+// acceptance criteria 1, 2 and 4), and pinning it directly keeps the tool-level
+// tests from having to fabricate a whole GET around it.
+export const transportFailureMessage = (error: unknown): string =>
+    TRANSPORT_FAILURE_MESSAGES[transportCause(error)];
+
 // The cap itself is a deliberate design (2 tests pin it): a page that will not
 // fit is a file, not an article, and the tool refuses rather than streaming an
 // arbitrary host into memory. What was missing is the REMEDY. The binary path
@@ -162,9 +277,26 @@ const statusFailure = (status: number): HarnessError => {
 // .html, the same RFC's 1.1 MB sibling, and a 1.6 MB Project Gutenberg text —
 // were simply unfetchable with no way forward offered, even though the tool can
 // serve 240,000 characters of a page it would accept.
+//
+// SCOPED TO THE STATE THAT TRIGGERS IT (issue 0014). The first wording offered
+// three generic fetch remedies and two of them cannot work HERE:
+//   - `query` selects sections of the CONVERTED document (see ./sections:6-7),
+//     and this error fires from the content-length pre-check BEFORE a byte is
+//     read (:700-707), so `query` never runs — measured, the identical error came
+//     back with and without it. `format` only steers the Accept header (:134-143),
+//     which a host is free to ignore; neither is a lever on this body.
+//   - `download` + `grep` is self-contradictory BY CONSTRUCTION: this error only
+//     fires above 1 MiB and `grep` skips files above 1 MiB
+//     (./files/glob.ts:81 `MAX_SEARCH_FILE_BYTES = 1024 * 1024`), and it fails
+//     SILENTLY there — `matches: []` with the reason only in `note`.
+// `read` is the tool that does handle a large file (windowed continuation via
+// `nextByte`/`nextLine`, ./files/read.tool.ts:152-165), and a plain-text or raw
+// source URL is the one remedy that shrinks the transferred body — verified
+// 2026-11-10 against rfc-editor.org/rfc/rfc9110.txt (502,906 B, fetched fine).
+// Every remedy named below was checked in the state that produces this error.
 const oversizedResponse = (): HarnessError =>
     new HarnessError(
-        `fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes. Try the plain-text or raw source form of the page if the host offers one (for example .txt, or a "?action=raw" / print view), ask for fewer characters with "query", or use the \`download\` tool to save the bytes and read them with grep and read.`
+        `fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes. Try the plain-text or raw source form of the page if the host offers one (.txt, a "?action=raw" / print view) — that is the only remedy that reduces the transferred body; "query" and "format" cannot help, because they apply after this size check. Or use the \`download\` tool to save the bytes and read them with \`read\` (\`grep\` skips files over 1 MiB).`
     );
 
 // ---------------------------------------------------------------------------
@@ -398,9 +530,15 @@ const cancelBody = (response: Response): void => {
 // Same streaming budget as ../websearch/request's reader: chunk-by-chunk byte
 // counting, stream-cancel on overflow, and a TextDecoder that carries partial
 // multi-byte characters across chunk boundaries.
+//
+// `failure` takes the caught error so a reset that lands MID-BODY is reported as
+// the same transport class as one that lands on the request (issue 0015): the
+// host was reached, so the caller's answer is "a retry may help", not the generic
+// sentence. The size error stays its own class — the `HarnessError` passthrough
+// below is what keeps it that way.
 const readBody = async (
     response: Response,
-    failure: () => HarnessError,
+    failure: (error?: unknown) => HarnessError,
     charset?: string
 ): Promise<string> => {
     const stream = response.body;
@@ -413,8 +551,8 @@ const readBody = async (
             // only runs on a runtime with no readable stream, and the byte check
             // below still bounds it.
             body = await response.text();
-        } catch {
-            throw failure();
+        } catch (error) {
+            throw failure(error);
         }
 
         if (new TextEncoder().encode(body).byteLength > MAX_RESPONSE_BYTES) throw oversizedResponse();
@@ -456,7 +594,9 @@ const readBody = async (
     } catch (error) {
         if (error instanceof HarnessError) throw error;
 
-        throw failure();
+        // A stream error is a transport failure: hand the error over so its code
+        // picks the right sentence (issue 0015).
+        throw failure(error);
     } finally {
         try {
             reader.releaseLock();
@@ -572,11 +712,15 @@ export const requestPage = async (
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
     // `aborted` is the only way to tell our timeout from a network refusal,
-    // since fetch rejects with an AbortError for both.
-    const networkFailure = (): HarnessError =>
+    // since fetch rejects with an AbortError for both. Beyond that one
+    // discriminator the CAUSE CLASS is reported (issue 0015): a name that does
+    // not resolve, a host that drops the connection, and a failed TLS handshake
+    // are three situations with opposite remedies, and the class — never the
+    // Node error text — is what a caller needs in order to pick one.
+    const networkFailure = (error?: unknown): HarnessError =>
         controller.signal.aborted
             ? new HarnessError(`fetch timed out after ${FETCH_TIMEOUT_MS} ms.`)
-            : new HarnessError('fetch could not be reached (network error).');
+            : new HarnessError(TRANSPORT_FAILURE_MESSAGES[transportCause(error)]);
 
     // A binary extension is a `download` job before a single byte is paid for.
     const extension = binaryExtension(url);
@@ -599,8 +743,11 @@ export const requestPage = async (
                 // Followed by hand so each hop is validated (see above).
                 redirect: 'manual'
             });
-        } catch {
-            throw networkFailure();
+        } catch (error) {
+            // The caught error is passed on, not discarded (issue 0015): its
+            // `cause.code` is the only thing that can tell a name that does not
+            // resolve from a refused port, and the catch used to throw it away.
+            throw networkFailure(error);
         }
     };
 

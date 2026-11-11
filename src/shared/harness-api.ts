@@ -274,9 +274,25 @@ import type {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface PageMeta {
+    /**
+     * The number of rows THIS page carries, which is the effective page size: a short final page reports its
+     * own length, and a page read past the end carries zero rows. It is never the requested size echoed back,
+     * so a client detects the end from this field and from `next_cursor` without comparing against what it
+     * asked for.
+     */
     limit: number;
+    /**
+     * Opaque position for the following page (this page's served ordinal), or null when there is no following
+     * page - which includes the case where this page filled `limit` AND completed the collection, because the
+     * server knows these collections' totals and does not advertise an empty page after the last real one.
+     */
     next_cursor: string | null;
+    /** Epoch milliseconds at which the page was assembled. */
     observed_at: number;
+    /**
+     * Monotonic revision of THIS collection in this scope. It changes on any mutation that adds, removes, or
+     * reorders an entry, so a client can tell whether a read and a stream frame describe the same state.
+     */
     revision: number;
 }
 
@@ -287,6 +303,7 @@ export interface PageMeta {
  */
 export interface ErrorBody {
     error: {
+      /** Human-readable, names the field or rule that failed. Never a stack trace and never a credential. */
       message: string;
       };
 }
@@ -298,6 +315,7 @@ export interface ErrorBody {
 export interface HealthResponse {
     ok: true;
     sessions: number;
+    /** The server epoch, identical to the value `GET /v1/harness` reports. */
     epoch: string;
 }
 
@@ -313,14 +331,53 @@ export interface HealthResponse {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ServiceCapabilities {
+    /**
+     * Whether `GET /v1/harness/stream` completes an upgrade. THE ONE ENFORCED FLAG: the stream route reads this
+     * value and answers 403 when it is false, which is the only capability in this object that can change an
+     * answer.
+     */
     websocket_stream: boolean;
+    /**
+     * Whether manual tool execution routes are enabled at all. NOT ENFORCED by any route in this build: the
+     * execution routes answer as documented whatever this says, and an entry that cannot run says so in its own
+     * `execution` block.
+     */
     tool_execution: boolean;
+    /**
+     * Whether a session tool may be created or edited over HTTP. NOT ENFORCED by any route in this build:
+     * source submission is always accepted, and the only refusals on those routes are the policy refusals the
+     * `Forbidden` response enumerates.
+     */
     tool_registration: boolean;
+    /**
+     * Whether the whole-document transcript PUT is enabled. NOT ENFORCED by any route in this build; the route
+     * answers as documented and refuses on session state, not on this flag.
+     */
     transcript_editing: boolean;
+    /**
+     * Whether a `/`-prefixed submit is executed by the in-process command registry rather than sent to a model.
+     * NOT ENFORCED by any route in this build; the submit path consults the session's own command registry.
+     */
     command_dispatch: boolean;
+    /**
+     * Whether the server will perform a provider model list on a client's behalf. NOT ENFORCED by any route in
+     * this build: `POST /models` always attempts the provider call.
+     */
     model_discovery: boolean;
+    /**
+     * Whether harness definitions may be created, edited, and removed over HTTP. NOT ENFORCED by any route in
+     * this build, and no definition is read-only.
+     */
     harness_definition_writes: boolean;
+    /**
+     * Whether global agent profile text may be overridden over HTTP. NOT ENFORCED by any route in this build:
+     * the override layer is implemented and durable.
+     */
     agent_writes: boolean;
+    /**
+     * Whether this session family supports persistent conversations. NOT ENFORCED by any route in this build;
+     * whether a session actually has threads is state the session resource reports.
+     */
     persistent_threads: boolean;
 }
 
@@ -333,18 +390,49 @@ export interface ServiceCapabilities {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ServiceLimits {
+    /** Ordinary request body cap in bytes (decimal). */
     body_bytes: number;
+    /** Task submit body cap in bytes, higher because base64 media rides inside the JSON. */
     submit_body_bytes: number;
+    /** Trimmed task input cap in characters. */
     input_chars: number;
+    /** Queued tasks allowed per session before a submit answers 429. */
     pending_tasks: number;
+    /**
+     * Persistent thread records per session. The status this bound produces depends on the route: a task submit
+     * that has to open a conversation answers 429, while `POST /sessions/{session_id}/threads` passes the
+     * runtime's refusal through unclassified and answers 500.
+     */
     thread_records: number;
+    /** Attachments accepted per submitted turn. */
     attachments_per_turn: number;
+    /** Decoded bytes per attachment. */
     attachment_bytes: number;
+    /** Decoded bytes across one turn's attachments. */
     total_attachment_bytes: number;
+    /** Result blocks one submit may reference. */
     result_references: number;
+    /** Live owner questions open per session. */
     pending_actions: number;
+    /**
+     * Entries kept in one turn's steer AUDIT ring. Archived steer TEXT is not ring-bounded, which is why the
+     * block detail route can still answer a segment the ring has moved past.
+     */
     steer_records: number;
+    /**
+     * Tools one session's harness may create in its lifetime, across resets. Going beyond it answers 400, not
+     * 409: the registration is refused with the budget named ("This harness already created 32 tools; reuse an
+     * existing tool instead of creating more."), because the caller's fix is to reuse a name rather than to
+     * wait for server state to change. Only a NEW name spends the budget, so a replacement under an existing
+     * name never does.
+     */
     created_tools: number;
+    /**
+     * Model-facing text bound for one tool result: 262,144 bytes (256 KiB). It is set to match the `read`
+     * tool's own output budget, so a full-budget read survives the wire instead of being cut into the
+     * truncation envelope; it is PER RESULT with no aggregate guard, so parallel calls can each commit up to
+     * this many bytes in one turn. Detail routes answer verbatim recorded bytes.
+     */
     tool_result_bytes: number;
     page_limit_default: number;
     page_limit_max: number;
@@ -356,14 +444,33 @@ export interface ServiceLimits {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ServiceInfo {
+    /** The API URL this document was served from (the mount), never a filesystem path. */
     api_root: string;
     service: string;
+    /**
+     * The API version this server answers as. The build states it as `v1` (the mount's version segment), not as
+     * a dotted contract number, and it is the only version field the boot document sends.
+     */
     api_version: string;
+    /**
+     * Optional informational field the shape allows. This build does NOT send it: the boot document carries no
+     * package version, so a client must not read a missing value as `0.0.0` and must use `epoch` to detect a
+     * restart.
+     */
     build_version?: string;
+    /** Epoch milliseconds, so a client can render relative times against the server clock. */
     server_time: number;
+    /**
+     * Opaque server-lifetime id. It changes on every restart, which invalidates every retained stream cursor
+     * and is the only restart signal a client is given.
+     */
     epoch: string;
     capabilities: ServiceCapabilities;
     limits: ServiceLimits;
+    /**
+     * Canonical path for each named resource family, so a client never hard-codes the mount. Keys are stable
+     * names; values are paths relative to the server origin.
+     */
     links: {
       [key: string]: string;
       };
@@ -375,8 +482,13 @@ export interface ServiceInfo {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ProviderDefaults {
+    /** Provider base URL the defaults point at. */
     base_url: string;
     model: string;
+    /**
+     * True when a server key is configured. No read document can show, replace, or remove the key; only `PATCH
+     * /config` writes it and no response echoes it.
+     */
     has_api_key: boolean;
 }
 
@@ -387,6 +499,11 @@ export interface ProviderDefaults {
  */
 export interface RunnerSettingsInput {
     base_url?: string;
+    /**
+     * Sent to the provider as a bearer header. Credential rule (src/server/config.ts `mergeSettings`): a blank
+     * or omitted key reuses the SERVER key only when `base_url` is the configured provider's origin plus base
+     * path; for any other base URL it means "no key".
+     */
     api_key?: string;
     model?: string;
 }
@@ -398,10 +515,23 @@ export interface RunnerSettingsInput {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface RuntimeSettings {
+    /**
+     * `inline` runs every conversation on the server's event loop. `worker` runs each persistent thread's turn
+     * on its own worker thread so a heavy lane cannot freeze a sibling or the HTTP surface; it is a promise,
+     * not a hint, so a session whose harness a worker cannot rebuild is REJECTED with a reason instead of
+     * silently running inline.
+     */
     thread_execution: "inline" | "worker";
+    /** Reclaim a lane worker after this much idle time; 0 keeps it until the session goes. */
     worker_idle_ms: number;
+    /** Upper bound on concurrently live lane workers per store (the memory guard). */
     max_lane_workers: number;
+    /** Upper bound on the worker hello handshake (import, build, capability report). */
     worker_handshake_ms: number;
+    /**
+     * True when the deployment pins an explicit worker entry path instead of resolving the built default. A
+     * path is never echoed, because it is a host filesystem detail.
+     */
     worker_entry_configured?: boolean;
 }
 
@@ -413,7 +543,12 @@ export interface RuntimeSettings {
 export interface GlobalConfigDocument {
     defaults: ProviderDefaults;
     runtime?: RuntimeSettings;
+    /** The exact fields `PATCH /config` accepts, so a client cannot guess the allowlist. */
     writable_fields: ("settings.base_url" | "settings.model" | "settings.api_key")[];
+    /**
+     * Monotonic revision of the global configuration document. A stream `config.updated` frame carries this
+     * value, so a client that already read a newer revision ignores the frame.
+     */
     revision: number;
 }
 
@@ -425,8 +560,26 @@ export interface GlobalConfigDocument {
  */
 export interface GlobalConfigUpdateRequest {
     settings: {
+      /**
+      * A `null` value restores the built-in default base URL. An empty string is NOT a default: it is a 400
+      * ('A provider base URL cannot be empty.'). The cap measures the TRIMMED value, which is the string a
+      * later session actually validates and sends.
+      */
       base_url?: string | null;
+      /**
+      * A `null` value restores the built-in default model. The cap measures the TRIMMED value, and the patch
+      * commits only if every stated field passes, so a refusal here leaves an earlier `base_url` in the same
+      * body unchanged as well.
+      */
       model?: string | null;
+      /**
+      * Write-only, and three distinct outcomes: a non-empty string issues a NEW process-only credential
+      * whose provider scope is the base URL the FINAL settings settle on (so a body that moves `base_url`
+      * and writes a key together issues the key for THAT provider); an explicit empty string REMOVES the key
+      * and the response reports `has_api_key: false`; and `null` RESTORES the shipped credential together
+      * with the shipped provider it belongs to, reporting the shipped `has_api_key` - it never means "no
+      * key". An omitted property leaves the key untouched. The stored value is never echoed back.
+      */
       api_key?: string | null;
       };
 }
@@ -442,12 +595,28 @@ export interface HarnessCard {
     name: string;
     title: string;
     description: string;
+    /** False only for a scripted definition, which needs no provider base URL; no shipped card is endpoint-free. */
     requires_endpoint: boolean;
+    /** The entry agent, and the agent an unfocused submit opens a conversation for. */
     primary: string;
+    /** The exact delegation allowlist. Empty means `delegate` is not registered at all. */
     subagents: string[];
     agents: string[];
+    /** The declared tool set of this definition. */
     tools: string[];
+    /**
+     * Shipped with the application rather than created through POST. Informational only: a built-in is edited
+     * and deleted exactly like a created entry.
+     */
     builtin: boolean;
+    /**
+     * The `definition`-family counter keyed by this harness NAME, so cards do count separately (this is not the
+     * host-wide `harnesses` counter the collection page reports). A shipped entry nothing has mutated in this
+     * process reads 0; a created entry reads 1, because its POST counts as its first mutation; and every
+     * accepted PATCH or DELETE of this name adds exactly one. Counters live in memory, so a restart renumbers
+     * everything and a revision is only comparable inside one epoch. A PATCH produces a new immutable registry
+     * entry under the same name, which is how a session can state which copy it froze.
+     */
     definition_revision: number;
 }
 
@@ -462,7 +631,12 @@ export interface HarnessCard {
 export interface HarnessInstructionSummaryEntry {
     agent: string;
     source: "catalogue" | "global" | "harness" | "session";
+    /**
+     * True when this definition itself carries an override for the member; on a session read, true when the
+     * session re-wrote a session-defined agent's own base text.
+     */
     overridden: boolean;
+    /** EXACT character count of the effective text, so a client can size a preview honestly. */
     chars: number;
 }
 
@@ -472,13 +646,30 @@ export interface HarnessInstructionSummaryEntry {
  */
 export type HarnessDefinition = HarnessCard
     & {
+    /**
+     * The core tools this definition's runs will actually declare - the file tools when registered, the
+     * harness-owned control tools, `delegate` when a subagent allowlist exists, and `search` only when a
+     * provider key exists. Runtime visibility, not a hard-coded list.
+     */
     core_tools?: string[];
+    /**
+     * Per-agent MODEL overrides (agent name to model id), present only when this definition overrides
+     * something. A member absent from the map uses the session's model. This is the creation-time record; the
+     * live map a session runs now is on the session resource.
+     */
     agent_models?: {
       [key: string]: string;
       };
+    /**
+     * Per-agent display COLORS (agent name to CSS hex color), present only when this definition configures at
+     * least one. A member absent from the map has no configured color, and the client applies its own
+     * derivation for it. Display-only: it never shapes a prompt or a request, and the value is the one stored
+     * on the agent the definition builds, so a swatch here and a swatch in a session are the same bytes.
+     */
     agent_colors?: {
       [key: string]: string;
       };
+    /** One row per member, in `[primary, ...subagents]` order. No text. */
     instruction_summary?: HarnessInstructionSummaryEntry[];
 };
 
@@ -496,12 +687,27 @@ export interface CreateHarnessRequest {
     description?: string;
     primary: string;
     subagents?: string[];
+    /**
+     * Agent name to model id. An id only - never a provider or a credential - trimmed, non-empty, and free of
+     * control characters.
+     */
     agent_models?: {
       [key: string]: string;
       };
+    /**
+     * Agent name to instruction text. A stored value IS that member's COMPLETE prompt, so `GET /agents`'s
+     * `guidelines` are the default for an un-overridden member and are never appended underneath an override;
+     * the trusted profile itself is never rewritten.
+     */
     agent_instructions?: {
       [key: string]: string;
       };
+    /**
+     * Agent name to an optional per-agent display COLOR: a CSS hex color (`#rgb`, `#rgba`, `#rrggbb` or
+     * `#rrggbbaa`, either case). Purely cosmetic - it changes what a client paints, never what the agent runs -
+     * but it is validated like every other field, so a stored color is always one the agent accepts and a
+     * client can render.
+     */
     agent_colors?: {
       [key: string]: string;
       };
@@ -525,6 +731,10 @@ export interface UpdateHarnessRequest {
     agent_instructions?: {
       [key: string]: string;
       };
+    /**
+     * Agent name to CSS hex color. `{}` clears every color, so every member falls back to the client's own
+     * derivation.
+     */
     agent_colors?: {
       [key: string]: string;
       };
@@ -551,6 +761,7 @@ export interface HarnessDefinitionResponse {
  */
 export interface HarnessInstructionIndexResponse {
     harness_name: string;
+    /** Number of members, which is `items.length`. */
     total: number;
     items: HarnessInstructionSummaryEntry[];
 }
@@ -563,9 +774,19 @@ export interface HarnessInstructionIndexResponse {
 export interface HarnessInstructionTextResponse {
     harness_name: string;
     agent: string;
+    /**
+     * Which layer supplied the text: `harness` when this definition carries an override for the member,
+     * `global` when the deployment-wide agent layer does, `catalogue` when the trusted profile does. The value
+     * set is the shared projection's - `instructionTextOf` (api-reads.ts:1143) reports `global` whenever its
+     * optional global-overlay argument is supplied - while THIS route calls it without that argument
+     * (api.ts:1688), so in practice the answer here is only ever `harness` or `catalogue`: a global `PATCH
+     * /agents/{id}` override still reports `catalogue`, and the INDEX route is the surface that names `global`.
+     */
     source: "catalogue" | "global" | "harness";
     instruction: string;
+    /** The rules appended to the instruction at runtime; an instruction override never changes them. */
     guidelines: string[];
+    /** EXACT character count of `instruction`, so a client can state truncation honestly. */
     chars: number;
 }
 
@@ -578,7 +799,14 @@ export interface HarnessInstructionTextResponse {
 export interface DeleteHarnessResult {
     deleted: true;
     harness_name: string;
+    /** True when the removed entry was shipped by the application, so the name stays absent. */
     tombstoned: boolean;
+    /**
+     * Always false, and it is a statement about durability rather than a flag that can flip: the tombstone is
+     * written into the harness document, so no restart re-ships a removed entry - not a built-in and not a
+     * created one. A built-in comes back only when a NEW release ships it again or an operator recreates it
+     * through `POST /harnesses`, which is a new entry that clears the tombstone, not a restore.
+     */
     restored_by_restart: boolean;
 }
 
@@ -591,7 +819,9 @@ export interface AgentSummary {
     name: string;
     title: string;
     description: string;
+    /** True when the effective instruction differs from the shipped catalogue value. */
     has_instruction_override: boolean;
+    /** True when a global (host-level) override of any kind is recorded for this profile. */
     has_global_override: boolean;
 }
 
@@ -607,9 +837,25 @@ export interface AgentProfile {
     description: string;
     instruction: string;
     guidelines: string[];
+    /** Which layer supplied the text this read returns. */
     instruction_source: "catalogue" | "global";
+    /** The fields the global layer currently overrides, so an operator sees the delta at a glance. */
     overridden_fields?: ("title" | "description" | "instruction" | "guidelines")[];
+    /**
+     * INFORMATIONAL ONLY: the harness definitions that currently name this profile as a member, so an operator
+     * can see what a retirement leaves behind. It is never a delete precondition - `DELETE /agents/{agent_id}`
+     * succeeds whatever this list holds - and it is a live registry scan, not a stored back-reference, so a
+     * definition that keeps naming a retired profile still appears here until it is edited.
+     */
     referenced_by: string[];
+    /**
+     * The host-wide `agents` counter, NOT a per-profile counter: `agents` is a host-wide resource kind whose id
+     * is discarded when the revision key is built, so every profile in the catalogue reports the SAME number
+     * and any profile's write moves it. An accepted agent write bumps that shared counter TWICE (once as the
+     * collection, once as the per-id key that collapses onto it), so consecutive accepted writes advance it by
+     * 2. It is a staleness signal for the whole agent catalogue, never an identity or a per-resource version,
+     * and a process that has mutated nothing reports 0.
+     */
     revision: number;
 }
 
@@ -649,7 +895,15 @@ export interface UpdateAgentRequest {
 export interface DeleteAgentResult {
     deleted: true;
     agent_id: string;
+    /** True when the retired profile shipped with the application, so a restart does not re-add it. */
     tombstoned: boolean;
+    /**
+     * The only restore path, stated honestly for the deployment rather than as a constant. It is TRUE only when
+     * the host has no database root: the retirement is then process state, so the next start re-ships the
+     * profile from the catalogue and the operator's decision is gone. It is FALSE when a root exists, because
+     * the tombstone is written into `<root>/harness/agents.json` and no restart re-adds the profile. Either way
+     * there is no HTTP undo: re-creating a profile with the same name is a code change.
+     */
     restored_by_restart: boolean;
 }
 
@@ -664,10 +918,18 @@ export interface DeleteAgentResult {
 export interface PluginSetting {
     key: string;
     label: string;
+    /** The declared value type; `PATCH` validates against it and normalizes to it. */
     type: "number" | "string" | "boolean";
+    /** The plugin's own fallback value - a number, string, or boolean, per `type`. */
     default: number | string | boolean;
+    /** Lower bound a `number` setting accepts, when the plugin declared one. */
     min?: number;
+    /** Upper bound a `number` setting accepts, when the plugin declared one. */
     max?: number;
+    /**
+     * Increment hint for an editor. A server-side advisory ONLY: a value off the step is accepted, because the
+     * runtime that has to live with the value accepts it too.
+     */
     step?: number;
     description?: string;
 }
@@ -684,11 +946,33 @@ export interface PluginSummary {
     title: string;
     description?: string;
     version?: string;
+    /** Free-form categorisation for filtering and search; never behaviour-bearing. */
     tags?: string[];
+    /**
+     * The lifecycle stages this plugin DECLARES it subscribes to (`turn.before`, `async.pending`, ...).
+     * Informational by contract: the bus records what setup() actually registered, and this list is the
+     * declared description shown to an operator. A disabled plugin's subscriptions are still listed, because it
+     * is still loaded.
+     */
     hooks?: string[];
+    /** True when the plugin ships with the application (every row on this route). */
     builtin: boolean;
+    /**
+     * R2's GLOBAL switch, resolved live as stored override -> the plugin's declared `enabled` default -> true,
+     * and therefore present on EVERY row - including a plugin that declares no settings at all, because this
+     * key belongs to the framework rather than to the plugin. False means the plugin is loaded, listed, and
+     * still receives `harness.dispose`, but NO other lifecycle hook is delivered to it, in any session, from
+     * the next turn. It is the same stored value a plugin that declares `enabled` reads itself, so a row and a
+     * running session can never disagree.
+     */
     enabled: boolean;
+    /** The declared descriptors, in the plugin's own declared order. Empty when the plugin has no settings. */
     settings: PluginSetting[];
+    /**
+     * The EFFECTIVE value of every declared key: the stored override when the operator changed it, otherwise
+     * the declared default. Same spelling as a `PATCH` body, so a client edits the object it read. A key absent
+     * from `settings` can never appear here.
+     */
     values: {
       [key: string]: unknown;
       };
@@ -719,6 +1003,11 @@ export interface PluginDetailResponse {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface PluginSettingsUpdate {
+    /**
+     * Key -> value, validated against each key's declared `type`, `min`, and `max`. A value may also be sent as
+     * the numeric or `true`/`false` STRING form a query string or a JSON document legitimately carries, and the
+     * server normalizes it to the declared type.
+     */
     settings: {
       [key: string]: number | string | boolean | null;
       };
@@ -731,7 +1020,9 @@ export interface PluginSettingsUpdate {
  */
 export interface ToolAvailability {
     state: "available" | "unconfigured";
+    /** Variable NAMES the entry needs; never their values. */
     environment?: string[];
+    /** Non-secret sentence explaining what to configure. */
     hint?: string;
 }
 
@@ -743,12 +1034,31 @@ export interface ToolAvailability {
  */
 export interface ToolSummary {
     name: string;
+    /**
+     * Display group. `Core tools` is the harness-owned set, listed for review and manual execution but only
+     * runnable inside a session.
+     */
     group: string;
     description: string;
     tags: string[];
+    /** `core` is the harness-owned set; `searchable` is discovery-eligible through `toolRequest`. */
     visibility: "core" | "searchable";
     availability?: ToolAvailability;
+    /**
+     * True for a harness-owned entry with no standalone implementation, which must be executed through a
+     * session's registry.
+     */
     session_bound: boolean;
+    /**
+     * R3's GLOBAL switch, resolved live as "this name is not on the deployment's disabled list". It applies to
+     * every session and every thread at once, and it is what a `PATCH /v1/harness/tools/{tool_id}` body
+     * changes. A disabled name is hidden from a model's tool declarations, refused at the launch gate, and
+     * answered as `forbidden` by `toolRequest`; the entry stays REGISTERED, so re-enabling costs nothing and
+     * needs no restart. It COMPOSES with the per-run gates rather than replacing them: a delegation's
+     * `scope.tools` allowlist and a session's own enabled set keep deciding independently, and a name has to
+     * pass all three to reach a request. Every listed entry takes that switch, the harness-owned control tools
+     * included - a row states no exception, because there is none on this surface.
+     */
     enabled: boolean;
 }
 
@@ -759,6 +1069,10 @@ export interface ToolSummary {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ToolSettingsUpdate {
+    /**
+     * The state to apply. `false` adds the name to the deployment's disabled set; `true` removes it. Applying
+     * the state it already has is accepted and changes nothing, like every other switch here.
+     */
     enabled: boolean;
 }
 
@@ -766,15 +1080,33 @@ export interface ToolSettingsUpdate {
  * A catalogue entry plus what only the identified read carries: the argument schema the model is given, and the
  * execution scope this entry supports.
  */
-export type ToolDetail = 
-    | ToolSummary
+export type ToolDetail = ToolSummary
     & {
+    /**
+     * The JSON Schema of the arguments, exactly as the model sees it. Bounded in depth (12), node count (256),
+     * and serialised size (16,384 bytes).
+     */
     parameters?: {
       [key: string]: unknown;
       };
+    /**
+     * Whether this entry can be executed at all, and from which route. Stated instead of inferred, because
+     * `group` and `visibility` are display concepts and cannot classify runnability.
+     */
     execution: {
-      scope: "global"
-    | "session_required";
+      /**
+      * `global` answers on `POST /tools/{tool_id}/executions`; `session_required` answers only on `POST
+      * /sessions/{session_id}/tools/{tool_id}/executions`.
+      */
+      scope: "global" | "session_required";
+      /**
+      * False when this entry has no standalone implementation on this deployment, so an operator call cannot
+      * run it as submitted. Where the reason is stated depends on WHY: a session-bound control tool is
+      * refused with 403 whose message names the session route to call instead, and an entry that is merely
+      * unconfigured answers 200 with `ok: false` and the availability hint, because "not configured" is tool
+      * data rather than a request failure. Neither case is a 409 - this route is not reporting a concurrency
+      * conflict - and a session row's own `execution` projection always reports `manual: true`.
+      */
       manual: boolean;
       };
 };
@@ -800,6 +1132,7 @@ export interface ToolDetailResponse {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface GlobalToolExecutionRequest {
+    /** Arbitrary JSON (object, array, string, number, boolean, or `null`). */
     parameters?: unknown;
 }
 
@@ -809,6 +1142,7 @@ export interface GlobalToolExecutionRequest {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface SessionToolExecutionRequest {
+    /** Arbitrary JSON (object, array, string, number, boolean, or `null`). */
     parameters?: unknown;
 }
 
@@ -821,6 +1155,7 @@ export interface SessionToolExecutionRequest {
  */
 export interface ToolCallSuccess {
     ok: true;
+    /** The tool's result value, arbitrary JSON. */
     result: unknown;
     panels?: ToolUiPanel[];
     media?: ToolMediaDescriptor[];
@@ -852,9 +1187,13 @@ export type ToolCallResult =
  */
 export interface ToolUiBlock {
     type: "text" | "table" | "keyValue";
+    /** `text` only. */
     text?: string;
+    /** `table` only. */
     columns?: string[];
+    /** `table` only, every row the width of `columns`. */
     rows?: string[][];
+    /** `keyValue` only. */
     items?: {
       label: string;
       value: string;
@@ -866,7 +1205,9 @@ export interface ToolUiBlock {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ToolUiPanel {
+    /** Stable within one tool result, so a client can update a panel in place. */
     id: string;
+    /** Placement hint, extensible by the host; `right` is the default mount point. */
     slot: string;
     title: string;
     blocks: ToolUiBlock[];
@@ -895,6 +1236,7 @@ export interface ModelDiscoveryRequest {
  */
 export interface ModelIndex {
     models: string[];
+    /** Epoch milliseconds at which the provider answered. */
     observed_at: number;
 }
 
@@ -926,11 +1268,33 @@ export type SessionTurnStatus =
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface SessionPluginDiagnostic {
+    /** When the server received the report, in epoch milliseconds. */
     at: number;
+    /**
+     * The three framework kinds name a dropped handler; `policy` is a plugin speaking for itself (the shipped
+     * compaction pass names the units it withheld), which is why it carries no `event`.
+     */
     kind: "handler-threw" | "handler-timed-out" | "invalid-decision" | "policy";
+    /**
+     * The plugin that registered the hook, which is who to name to an operator. Empty string when the
+     * subscription carried no owner (a hand-written programmatic plugin may omit its metadata).
+     */
     owner: string;
+    /**
+     * The lifecycle event whose handler failed (`turn.before`, `tool.after`, ...). ABSENT for a `policy`
+     * report, which is not tied to one hook — naming one would claim a failure that did not happen.
+     */
     event?: string;
+    /**
+     * The complete human-readable fact, never empty (the server substitutes `no message` for a report that
+     * arrived without one, so a consumer never renders a blank).
+     */
     message: string;
+    /**
+     * The structured payload of a `policy` report (for a compaction pass: the withheld units, their estimated
+     * tokens, and the id of the unit that superseded each). Absent for a framework failure, whose `message` is
+     * the whole view.
+     */
     data?: {
       [key: string]: unknown;
       };
@@ -944,15 +1308,29 @@ export interface SessionPluginDiagnostic {
  */
 export interface SessionSummary {
     id: string;
+    /**
+     * The operator or client supplied display name, when one was set. It grants no authority and is never an
+     * identifier - the same rule as a conversation label - which is why a session stays addressable by `id`
+     * even with a duplicate or missing title.
+     */
     title?: string;
+    /** The definition this session froze. */
     harness: string;
     status: SessionStatus;
+    /**
+     * Tasks waiting in the server queue; the active turn is not counted. ABSENT when the queue is empty, which
+     * is how "nothing waiting" and "zero waiting" stay one honest statement.
+     */
     queue_depth?: number;
+    /** The model the entry agent runs now. */
     model: string;
     created_at: number;
     updated_at: number;
+    /** The failure the session is currently sitting on, when it is in `error`. */
     last_error?: string;
+    /** Recorded turns of every status, so a client pages `/turns` with a total in hand. */
     turn_count: number;
+    /** Persistent conversations, so a client pages `/threads` without a second request. */
     thread_count: number;
     revision: number;
 }
@@ -962,19 +1340,53 @@ export interface SessionSummary {
  * view, the created-tool and pending-action counts, and where turns actually execute. Still none of the heavy
  * children: those are each one named subresource away.
  */
-export type SessionResource = 
-    | SessionSummary
+export type SessionResource = SessionSummary
     & {
+    /**
+     * This session's OWN `definition` counter - the session-keyed counter of `StreamResourceKind`, the same
+     * figure the frozen-definition read publishes as `revision`. It is 1 for a session this process created and
+     * 0 for one restored from disk after a restart, because these counters are per-process and a restore does
+     * not re-advance them. It is NOT the registry entry's `definition_revision` and is not comparable with `GET
+     * /harnesses/{harness_name}`; the currency of the captured copy is what that definition read's `current`
+     * field answers.
+     */
     definition_revision: number;
+    /**
+     * The LIVE agent id to model id map, after every session override. An agent absent from the map runs
+     * `model`.
+     */
     agent_models: {
       [key: string]: string;
       };
     endpoint: ProviderDefaults;
-    runtime_execution: "inline"
-    | "worker";
+    /**
+     * Where this session's turns run, resolved from the deployment. Reported rather than advertised, because it
+     * is a deployment fact the client cannot derive.
+     */
+    runtime_execution: "inline" | "worker";
+    /** Owner questions waiting right now. The list itself is `/actions`. */
     pending_action_count: number;
+    /** Tools created in this session so far, against the created-tool budget. */
     created_tool_count: number;
+    /**
+     * This session's lifetime created-tool budget. The figure the API reports is the advertised constant (32),
+     * while enforcement is the harness's own `maxCreatedTools`, whose default is the same number, so read this
+     * as the budget and `created_tool_count` as the live side. A client can use it to explain a 400 instead of
+     * guessing: exhausting it is a 400 that carries the runtime's advice to reuse an existing tool, NOT a 409,
+     * and the same pair appears as `budget` on a registration receipt. Replacements of a name this session
+     * already holds do not consume it.
+     */
     created_tool_limit: number;
+    /**
+     * Plugin diagnostics this session reported, OLDEST FIRST and capped at the last 24 (the server drops the
+     * oldest once full, so a plugin that fails every turn cannot grow this without bound). ABSENT when the
+     * session has never reported one, which is the shape every pre-existing client reads today, so a healthy
+     * session's resource is unchanged. This is the observable half of the plugin framework's fail-open rule: a
+     * hook that THREW, TIMED OUT, or returned an unparseable decision is dropped and the run continues, so
+     * without this surface "the plugin is broken" and "the plugin decided to do nothing" are the same answer.
+     * The same records ride `GET /sessions/{id}` after a restart (they are durable on the session), and the
+     * failure kinds are additionally printed on the server log.
+     */
     plugin_diagnostics?: SessionPluginDiagnostic[];
 };
 
@@ -1000,7 +1412,9 @@ export type SessionSummaryPage = PageMeta
 export interface DeleteSessionResult {
     deleted: true;
     session_id: string;
+    /** Turns that were executing and are now terminal. */
     aborted_turns: number;
+    /** Queued tasks discarded by the disposal. */
     dropped_queued_tasks: number;
 }
 
@@ -1014,11 +1428,40 @@ export interface DeleteSessionResult {
 export type SessionDefinitionResource = HarnessDefinition
     & {
     session_id: string;
+    /**
+     * The SESSION-keyed `definition` counter of `StreamResourceKind` - the same number this resource prints as
+     * `definition_revision`, and the figure a `session` subscription reports for this conversation, so a client
+     * compares one number in both places. It is 1 for a session this process created and 0 for one restored
+     * from disk. It is NOT the registry entry's counter and therefore NOT equal to `current_revision`: those
+     * two live in different key spaces and move independently.
+     */
     revision: number;
+    /** Epoch milliseconds at which the session captured this definition. */
     frozen_at: number;
+    /**
+     * Misleading by name, and the build is authoritative here: this is the live `definition` counter of the
+     * registry entry this session was built from, sampled at REQUEST time, not the revision the copy was
+     * captured at (the capture-time figure is never stored). It is computed from the same read as
+     * `current_revision`, so the two are always identical, and 0 means this process has never written that
+     * entry - a built-in or a session restored after a restart.
+     */
     source_revision: number;
+    /**
+     * The live registry entry's counter right now, and by construction always equal to `source_revision`.
+     * Because both halves of the pair are live reads of one counter, "the two numbers match" carries no
+     * information about this session; `current` does.
+     */
     current_revision: number;
+    /**
+     * A deep structural comparison of the live entry's projection against this session's frozen copy, performed
+     * on every read. It is NOT `current_revision === source_revision`, and equal revisions do not imply it: the
+     * numbers always match while the copy may not. False when the entry has been edited, and false when it has
+     * been DELETED, because a removed harness has nothing to compare against - which is exactly what a saved
+     * session restoring from its own record means. False is not an error: running a captured copy is the whole
+     * point of snapshot isolation.
+     */
     current: boolean;
+    /** The tools `toolRequest` has enabled in this session, in discovery order. Read-only; a reset empties it. */
     discovered_tools?: string[];
 };
 
@@ -1031,15 +1474,39 @@ export interface SessionDefinitionResponse {
 }
 
 /**
- * Selects the definition to freeze and optionally overrides the endpoint settings for THIS session only.
- * Recorded history, member set, and tool list are not accepted: a session is created from a definition, not
- * configured into one.
+ * Selects the definition to freeze and optionally overrides the endpoint settings for THIS session only. The
+ * member set and tool list are not accepted: a session is created from a definition, not configured into one.
+ * `messages` is the one piece of recorded state a client may supply, and only as the transcript the new
+ * conversation starts with.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CreateSessionRequest {
+    /**
+     * The definition to freeze, matched with the registry's own name rule: one letter, then letters, digits,
+     * `_` or `-`, at most 64 characters, so an upper-case first letter is legal. A legacy alias resolves here
+     * (`writer` builds the definition it names) while the created session reports the canonical name, and a
+     * name this build does not hold is 404 - a lookup is direct and never falls back to a tombstone.
+     */
     harness: string;
+    /**
+     * Optional display name for a rail or a picker. Trimmed server-side and then TRUNCATED to 200 characters,
+     * so a longer title is accepted rather than refused and the read returns what was stored; a blank title
+     * stores nothing. It carries no authority, so a duplicate title is not a conflict, and a value that is not
+     * a string is ignored on create (a patch is stricter and refuses it with 400).
+     */
     title?: string;
     settings?: RunnerSettingsInput;
+    /**
+     * Optional SEED for the entry agent's default conversation, in transcript shape: the messages the first
+     * provider request sees, in order. Absent means the profile's own seeded instruction. Present (including
+     * empty) means this list REPLACES that conversation, exactly as a transcript PUT does, so a seed without a
+     * `system` entry runs the agent with no instruction until the next reset. Every entry is validated by the
+     * same reader the runtime and snapshot restore enforce, BEFORE anything is created: an unknown role, an
+     * unknown key, or a non-string content is a 400 that leaves no session, and the write then carries the
+     * transcript route's live-work guard and durability. An optional `messageId` on an entry is honoured as a
+     * stable address and backfilled when absent, like any other transcript write.
+     */
+    messages?: HarnessMessage[];
 }
 
 /**
@@ -1058,9 +1525,18 @@ export interface CreateSessionRequest {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateSessionRequest {
+    /**
+     * Agent id to model id, merged over the live map. An empty map is a VALID patch, not a no-op refusal: it
+     * replaces nothing, so the response is 200 with the live map unchanged and the `revision` bumped. The
+     * `{}`-is-400 rule is about a body that names no field at all, never about this field being empty.
+     */
     agent_models?: {
       [key: string]: string;
       };
+    /**
+     * Longer input is accepted and truncated to 200 characters, so the stored value is what a later read
+     * reports; a value that is neither a string nor `null` is 400.
+     */
     title?: string | null;
 }
 
@@ -1071,20 +1547,88 @@ export interface UpdateSessionRequest {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface SessionAgentBinding {
+    /** The session roster key, which is also the delegation and identity namespace name. */
     agent_id: string;
+    /**
+     * The catalogue profile this binding resolves to, which for a session-defined agent is its own name: a name
+     * that is not in the trusted catalogue was created by THIS session and has no profile behind it.
+     */
     profile: string;
+    /** `subagent` means the primary may delegate to it; `primary` is the entry agent. */
     role: "primary" | "subagent";
+    /**
+     * How this member entered the conversation, NOT whether it can leave: `definition` means it came with the
+     * frozen harness definition and `session` means `POST …/agents` bound it here, and BOTH are removable with
+     * a 200 while the member is neither the entry agent nor the owner of a conversation. The distinction
+     * matters elsewhere only: `origin: session` is what tells a client this row is a binding this conversation
+     * made (and, for a session-defined agent, that no catalogue profile stands behind it), and a membership
+     * change on a scripted or injected harness template is the one case that answers 409 instead.
+     */
     origin: "definition" | "session";
+    /** The model this agent runs NOW, after any session override. */
     model: string;
+    /** What it would run if the session override were cleared, so a client can show a `null` patch's effect. */
     inherited_model: string;
+    /**
+     * Provenance of the effective text, so a client states where it came from instead of guessing. Read the
+     * values carefully, because the ladder is not the layer names a client would expect: `session` labels
+     * exactly one case - an agent THIS conversation invented, whose prompt no profile supplies - and never a
+     * profile member's session override. A session-level instruction override written onto a profile member is
+     * reported as `harness`, which is why the value does not mean "the harness definition's
+     * `agent_instructions` wrote this". `global` is reported only when the live text actually contains the
+     * deployment-wide override, so a session created before an operator edit keeps the layer it really runs;
+     * anything else is `catalogue`.
+     */
     instruction_source: "catalogue" | "global" | "harness" | "session";
+    /** EXACT character count of the effective instruction text, without carrying the text. */
     instruction_chars: number;
+    /**
+     * ABSENT, not false, when there is no override to report. For a profile member it is true exactly when
+     * `instruction_source` is `harness` - this session carries its own instruction text for that member. For a
+     * session-defined agent it states the narrower truth: the session has RE-WRITTEN the base instruction it
+     * created that agent with (`PATCH …/instruction`), so `null` here returns the conversation's own base
+     * rather than a profile's text.
+     */
     has_instruction_override?: boolean;
+    /**
+     * How many system-message blocks this member's live brain carries - its instruction plus any guideline
+     * blocks - and absent when the roster exposes no brain for it. The lines themselves are on the instruction
+     * route.
+     */
     guidelines_count?: number;
+    /**
+     * Always true on this build: every session-scoped agent write is available on every session, so a client
+     * can treat the flag as informational rather than gating a button on it.
+     */
     editable: boolean;
+    /**
+     * False for the entry agent (every session needs one) and for a member that still owns an independent
+     * conversation, because removing it would take that history with it; `DELETE …/agents/{id}` answers 409 on
+     * exactly those two conditions. True for every other member of either origin - a member the frozen
+     * definition declared is detachable from this conversation just like one this conversation bound. One case
+     * the flag cannot see: a scripted or in-memory-injected harness template refuses a membership change with
+     * 409 for durability reasons, whatever this row says.
+     */
     deletable: boolean;
+    /**
+     * True when a `null` patch has something to undo. For an agent this conversation invented it is always
+     * true, because `null` returns the base instruction this session created the agent with; for a profile
+     * member it is true as soon as the text it runs is not the plain shipped profile - a session override or a
+     * deployment-layer text - and false for a member that has never been retuned.
+     */
     restorable: boolean;
+    /**
+     * ABSENT unless true, and true only while this member owns a turn that is RUNNING right now (an active
+     * conversation lane, or the legacy session run). Queued work is deliberately not included here, even though
+     * it blocks the same writes: a binding change and an instruction change answer 409 while a live run OR any
+     * queued work exists, so `busy` is a hint about the moment, not the gate.
+     */
     busy?: boolean;
+    /**
+     * The roster-wide `session_agents` counter this row carries - the same number every other row of this
+     * session and the roster envelope report, bumped by any accepted agent write, so a client detects "the team
+     * moved" rather than diffing one binding's private counter.
+     */
     revision: number;
 }
 
@@ -1097,6 +1641,10 @@ export interface SessionAgentListResponse {
     session_id: string;
     total: number;
     agents: SessionAgentBinding[];
+    /**
+     * The `session_agents` counter of `StreamResourceKind`, matching the baseline a `session` subscription
+     * reports, so a binding change can be ordered against a roster read.
+     */
     revision: number;
 }
 
@@ -1121,10 +1669,47 @@ export interface SessionAgentResponse {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CreateSessionAgentRequest {
+    /**
+     * The session roster key. A name that spells a trusted catalogue profile (the all-lower-case subset the
+     * global catalogue lists) BINDS that profile; any other name in this alphabet DECLARES a session-defined
+     * agent, and a name outside it - starting with a space or `_`, containing `:` or `/`, longer than 64
+     * characters - is 400, because the same string becomes a delegation id, a runtime registry key, an
+     * `agent:<name>` conversation id and a durable preset key in one step. A key that collides exactly with an
+     * existing member is 409, a key that differs from one only in CASE is 409 too (the roster is
+     * case-insensitive by rule), and `unknown` in any case is 400 because it is the placeholder id every
+     * surface paints for "no agent at all". A blank or whitespace-only name is 400.
+     */
     name: string;
+    /**
+     * Optional, and redundant by rule: omitted it takes the value of `name`, and a supplied value that is not
+     * `name` after trimming is refused with 400, because the roster key is the identity a restart rebuilds the
+     * team from and no alias map is stored. A name that spells a catalogue profile binds that profile, and a
+     * retired profile is refused with 409; any other name is a session-defined agent.
+     */
     profile?: string;
+    /**
+     * Optional model id for this member. Trimmed, and blank or omitted runs the session model. This route
+     * states no length bound of its own - an over-long id is accepted and recorded here - while the
+     * session-level `agent_models` patch and a binding PATCH re-validate the same id at 200 characters, so keep
+     * it inside 200 if a dropdown may edit it later.
+     */
     model?: string;
+    /**
+     * Optional text that IS the agent's complete prompt: for a catalogue profile it replaces the whole composed
+     * instruction, so the profile's guidelines are NOT appended underneath it, and omitted or blank runs the
+     * trusted text (identity sentence plus its guidelines); for a session-defined agent it IS the agent's whole
+     * instruction, and a blank or omitted value stores the default identity sentence this conversation builds
+     * for the name. A blank value is therefore "none", not an error, on this route - the PATCH is stricter and
+     * refuses blank instead of clearing. More than 8000 characters is 400. Never mutates the profile it
+     * overrides.
+     */
     instruction?: string;
+    /**
+     * `subagent` adds this binding to the primary's delegation allowlist for THIS session only, and is what an
+     * omitted value means. `primary` is ALWAYS 409, running or idle: the entry agent is structural metadata of
+     * the harness definition, so no session write can re-target what an unfocused submit opens; the refusal
+     * says so rather than binding a subagent and ignoring the request. A value outside these two is 400.
+     */
     role?: "primary" | "subagent";
 }
 
@@ -1136,7 +1721,19 @@ export interface CreateSessionAgentRequest {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateSessionAgentRequest {
+    /**
+     * The model this member runs. Trimmed, non-empty, at most 200 characters, no control characters; a `null`
+     * clears the session override and runs the model this session's settings carry. The value is applied to the
+     * live brain, so an in-flight request keeps the model it started with.
+     */
     model?: string | null;
+    /**
+     * The member's COMPLETE system prompt, at most 8000 characters (longer is 400). A blank or whitespace-only
+     * string is 400 rather than a silent clear: send `null` to clear the override, which re-seeds a profile
+     * member from the deployment's CURRENT effective profile text and restores an agent this conversation
+     * invented to the base it was created with. Changing it at all requires an idle session, because a queued
+     * turn has already been accepted against the prompt it will run.
+     */
     instruction?: string | null;
 }
 
@@ -1148,6 +1745,11 @@ export interface UpdateSessionAgentRequest {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateSessionAgentInstructionRequest {
+    /**
+     * Trimmed and required non-blank: a whitespace-only string is a 400 that names the `null` remedy, and more
+     * than 8000 characters is a 400 from the same store rule that bounds a harness definition's per-agent
+     * instruction. Any non-string type is a 400.
+     */
     instruction: string | null;
 }
 
@@ -1162,7 +1764,13 @@ export interface DeleteSessionAgentResult {
     deleted: true;
     agent_id: string;
     session_id: string;
+    /**
+     * Always 0 on an accepted removal: removing an agent never deletes the conversations it owns, which is why
+     * a removal that would own one is refused with 409 instead. The field stays for clients that read the
+     * receipt.
+     */
     detached_threads: number;
+    /** The roster revision after the removal. */
     revision: number;
 }
 
@@ -1173,9 +1781,29 @@ export interface DeleteSessionAgentResult {
 export interface SessionInstructionTextResponse {
     session_id: string;
     agent_id: string;
+    /**
+     * Which layer supplied the text, decided in this order: `session` for an agent THIS conversation invented
+     * (a name no catalogue profile describes) - that value never labels a profile member's session override;
+     * otherwise `harness` when this session carries its own instruction text for the member, which is what a
+     * session-level override is reported as; then `global`, and only when the live text actually contains the
+     * deployment-wide override; everything else is `catalogue`. The names are the layers the server keeps, not
+     * a client's mental model of who wrote the prompt.
+     */
     source: "catalogue" | "global" | "harness" | "session";
+    /**
+     * The whole text this member runs - the identity sentence with its composed guideline block beneath it, or
+     * exactly the override this session stored. The bound here is the response's own generous ceiling; the
+     * bound a client WRITES against is 8000 characters, so a composed profile prompt that no session override
+     * stands behind can legitimately be longer than anything this API accepts.
+     */
     instruction: string;
+    /**
+     * The trusted profile's rule lines, each one a bounded bullet. EMPTY for an agent this conversation
+     * invented, because nothing trusted supplies its guidelines - which is why an override of a profile member
+     * replaces the whole prompt: these lines are not re-appended underneath it.
+     */
     guidelines: string[];
+    /** EXACT character count of `instruction`. */
     chars: number;
 }
 
@@ -1183,23 +1811,63 @@ export interface SessionInstructionTextResponse {
  * A catalogue projection plus the live session facts the catalogue cannot state. Composed additively, so the
  * catalogue shape a global read returns is unaffected by the session surface.
  */
-export type SessionToolSummary = 
-    | ToolSummary
+export type SessionToolSummary = ToolSummary
     & {
     session_id: string;
+    /**
+     * True when this session's FROZEN definition declares the name, which is the set that is in context on
+     * every request. It is a property of what the session was built with, not of what the current turn happens
+     * to be running, so the value does not flicker between turns.
+     */
     declared: boolean;
+    /**
+     * True when the tool is callable in this session right now - the live enabled set, whether the name is
+     * declared, was discovered through `toolRequest`, or was created at runtime. `PATCH` toggles it. `false`
+     * withdraws the name without losing its registration or its captured source revision, and `true` switches
+     * that same live slot back on: it does NOT restore an inherited binding, because a removal or an override
+     * here never keeps a superseded copy to hand back. Toggling requires an idle session (409) and is refused
+     * with 403 on a protected entry.
+     */
     enabled: boolean;
-    origin: "catalogue"
-    | "discovered"
-    | "created";
+    /**
+     * How it got into this session's toolbox: `created` is a name this session registered (it owns the source
+     * revision and a created-tool slot), `discovered` is a catalogue tool this conversation enabled through
+     * `toolRequest`, `catalogue` is everything else - declared by the frozen definition or inherited from the
+     * shared registry with no local registration.
+     */
+    origin: "catalogue" | "discovered" | "created";
+    /**
+     * True for the control plane this session runs on: the harness-owned core set the runtime manifest ships
+     * (`toolRegistry`, `toolRequest`, `toolCreate`, `toolManage`, `task`, `delegate`, ...) OR any name this
+     * session's FROZEN definition declares. The declared half is why an ordinary preset tool is protected too -
+     * the definition, not the operator, chose it. Consequences, stated exactly: a protected entry refuses an
+     * `enabled`-only PATCH and refuses DELETE with 403, and it accepts a source PATCH (replacing an
+     * implementation is a different privilege from switching the control plane off). A CREATE that collides
+     * with a protected name is NOT refused: the POST answers 201 with `replaced: true` even here, so a client
+     * must not expect 403 from a collision.
+     */
     protected: boolean;
+    /**
+     * False states "this registration has no editable source" rather than returning an empty string, so an
+     * editor can tell an inherited entry from an empty created one. It is the gate on the source route (404
+     * without it) and on a metadata-only PATCH, which re-publishes the installed revision and has nothing to
+     * re-publish when this is false.
+     */
     source_available: boolean;
+    /**
+     * Content-addressed revision of the installed source registration. Absent for a definition-registered tool,
+     * which has no editable source.
+     */
     source_revision?: string;
 };
 
 /** A session tool row plus the argument schema and the execution gate, as on the global detail read. */
 export type SessionToolDetail = SessionToolSummary
     & {
+    /**
+     * The JSON Schema of the arguments as this session's registry holds it, which for a created tool is the
+     * schema the operator submitted.
+     */
     parameters?: {
       [key: string]: unknown;
       };
@@ -1213,7 +1881,26 @@ export type SessionToolDetail = SessionToolSummary
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ToolExecutionScope {
+    /**
+     * On a session row: `session_required` for a harness-owned core name (the control plane, whose effect
+     * depends on a live conversation) and `session_only` for EVERY other live entry this session holds -
+     * created, discovered, replaced, or inherited with no local registration. It is a statement about the name,
+     * not about where the entry came from, so a replaced catalogue tool still reads `session_only`. `global` is
+     * not answered by this route at all: it appears only on the catalogue detail read (`GET /tools/{tool_id}`),
+     * where an entry with a standalone implementation is callable without a session. Treat the three values as
+     * two different projections of one gate rather than a ladder.
+     */
     scope: "global" | "session_required" | "session_only";
+    /**
+     * Always true on a session row: the session-scoped execution route is the documented surface for every live
+     * entry, so no name is listed there and then refused. The field exists for the catalogue projection, where
+     * it only states whether the entry has an implementation that can run standalone. The 403 belongs to
+     * `scope: session_required` and comes from the entry being session-bound, never from this flag: that global
+     * execution is refused with the session route to use named in the message - never a 409, because it is a
+     * routing policy, not a concurrency conflict. A `global` entry with `manual: false` is not refused: it
+     * answers 200 `ok: false` carrying the catalogue's availability hint, so an unconfigured tool is a failure
+     * reported as data rather than a policy outcome.
+     */
     manual: boolean;
 }
 
@@ -1224,6 +1911,11 @@ export interface ToolExecutionScope {
 export type SessionToolPage = PageMeta
     & {
     items: SessionToolSummary[];
+    /**
+     * The created-tool budget for this session, reported on the collection so a client can explain a 400 before
+     * trying to register: spending the last slot is what makes the next create fail, and the refusal is a 400
+     * carrying the runtime's advice to reuse an existing tool.
+     */
     budget: {
       used: number;
       limit: number;
@@ -1244,20 +1936,54 @@ export interface SessionToolResponse {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CreateSessionToolRequest {
+    /**
+     * The registry key this session publishes, matched against the kernel's own rule: one letter, then letters,
+     * digits, `_` or `-`, at most 64 characters, with upper case legal anywhere a letter may stand. A name that
+     * breaks it is a 400 quoting the rule, and a name this session already resolves is not a conflict - the
+     * registration replaces it and the receipt says `replaced: true`.
+     */
     name: string;
+    /** Shown to the model and used by discovery matching. */
     description: string;
     tags: string[];
+    /** JSON Schema for the arguments, bounded in depth (12), node count (256), and serialised bytes (16,384). */
     parameters?: {
       [key: string]: unknown;
       };
+    /**
+     * Optional async function BODY, e.g. `return args.toUpperCase();`, at most 20,000 characters - the kernel's
+     * own ceiling, refused with a 400 that says to split the work. Compiled with the host realm's `Function`
+     * constructor and run with the process's own permissions: no sandbox, no isolation, the same trust model as
+     * the `shell` tool. Mutually exclusive with `module_text`.
+     */
     source?: string;
+    /**
+     * Full editable module source for a module revision. Mutually exclusive with `source`; the only
+     * request-level bound is this route's 1 MB body cap, and a module that fails to compile or load is a 400
+     * whose diagnostics leave the previous registration callable.
+     */
     module_text?: string;
+    /**
+     * Package-relative or absolute entry path, so a restore can re-read the editable source. A path the host
+     * can already resolve; this route never uploads a file tree.
+     */
     source_path?: string;
+    /** Captured local helper modules belonging to this revision. */
     dependencies?: {
       path: string;
       text: string;
       }[];
+    /**
+     * Omitted means `searchable`, registered enabled at once, so the next turn can call it without a discovery
+     * round.
+     */
     visibility?: "core" | "searchable";
+    /**
+     * Refusal, not a modifier: this route has no atomic replace-on-create, so `true` is answered 403 naming the
+     * operation and the missing capability, and `false` is accepted and ignored. A collision without the field
+     * is not a conflict either - the registration publishes over the name this session already resolves and
+     * answers 201 with `created: false, replaced: true`, protected names included.
+     */
     replace?: boolean;
 }
 
@@ -1274,13 +2000,34 @@ export interface UpdateSessionToolRequest {
       [key: string]: unknown;
       };
     visibility?: "core" | "searchable";
+    /**
+     * The discovery gate, and it is a real runtime write. `false` withdraws the tool from this session's
+     * callable set without losing its registration or its captured revision; `true` switches that same live
+     * slot back on - it does NOT restore an inherited binding, and no superseded revision comes back. A patch
+     * naming ONLY this field is refused 403 on a protected entry and 409 unless the session is idle, and its
+     * receipt reports `created: false, replaced: false` because the code did not change.
+     */
     enabled?: boolean;
+    /**
+     * Function body for a new revision, at most 20,000 characters (the kernel's ceiling; 400 beyond it).
+     * Publishing one requires no `replace` flag and no idle session.
+     */
     source?: string;
+    /**
+     * Module text for a new revision. Supplying either text replaces the installed revision atomically; a
+     * compile failure is a 400 that leaves the previous revision callable.
+     */
     module_text?: string;
     dependencies?: {
       path: string;
       text: string;
       }[];
+    /**
+     * Accepted and IGNORED on this route: a source write here always replaces, so nothing is gated on the flag
+     * and a body naming only `replace` is treated as a metadata-only patch (which re-publishes the installed
+     * revision, or 403s when there is none). The 403 this field earns exists on the POST route, where an atomic
+     * replace-on-create is the capability that is missing.
+     */
     replace?: boolean;
 }
 
@@ -1291,12 +2038,44 @@ export interface UpdateSessionToolRequest {
  */
 export interface SessionToolRegistrationResult {
     name: string;
+    /**
+     * The revision this call installed. Three honest shapes: a content-addressed id for a registration that
+     * captured source text, the literal `definition` for a registration built from an already-constructed
+     * definition (nothing was captured, so nothing is editable), and an empty string when the receipt is not
+     * about source at all - a gate-only `enabled` patch of a name with no captured revision reports `""` rather
+     * than pretending a revision moved. A replacement always changes this value.
+     */
     source_revision: string;
+    /**
+     * True only when this session's live registry had NO entry under this name before this call. A POST that
+     * collides with a name the session already resolves reports `false` - it registered a replacement, not a
+     * creation - and still answers 201, and a PATCH never reports `true`.
+     */
     created: boolean;
+    /**
+     * True when an existing registration was atomically replaced: on a colliding POST (which is why that 201
+     * carries `created: false, replaced: true` rather than a 409) and on a source PATCH. A gate-only `enabled`
+     * patch reports `false`, because no code changed.
+     */
     replaced: boolean;
+    /**
+     * The revision this write replaced, when there was one. Identity only: the kernel keeps just the installed
+     * revision, so naming a previous one does not mean the server could roll back to it - which is exactly why
+     * a deletion reports `restored_inherited: false`.
+     */
     previous_revision?: string;
+    /**
+     * The owning entry path a restore re-reads, present only when this revision actually originates from a
+     * file; a runtime-only registration detaches the association.
+     */
     source_path?: string;
+    /** The validation checks the registration kernel performed for this revision. */
     checks?: string[];
+    /**
+     * The created-tool budget as of this write, so a client learns the limit was consumed without a second
+     * read. Only a genuinely NEW name spends a slot - a replacement of a name this session already held, and a
+     * gate-only patch, leave `used` where it was.
+     */
     budget: {
       used: number;
       limit: number;
@@ -1322,7 +2101,20 @@ export interface DeleteSessionToolResult {
     deleted: true;
     tool_id: string;
     session_id: string;
+    /**
+     * True when the name this session removed was one THIS session created - decided from the live created-tool
+     * records measured before the removal, so the figure describes this write and not the last committed
+     * snapshot. A name that was only discovered, replaced, or inherited reports `false` even though the call
+     * succeeded and the model can no longer call it.
+     */
     removed_created: boolean;
+    /**
+     * ALWAYS false, and set that way on purpose rather than left to a client's inference: restoring an
+     * inherited baseline would need a second copy of the definition this session overrode, and the registration
+     * kernel keeps only the INSTALLED revision - a replaced revision's identity is reported, its bytes are not
+     * retained. So a deletion here is a destruction, never an undo, and the receipt says so instead of
+     * promising a baseline the server cannot produce.
+     */
     restored_inherited: false;
 }
 
@@ -1333,9 +2125,23 @@ export interface DeleteSessionToolResult {
 export interface SessionToolSourceResponse {
     session_id: string;
     name: string;
+    /** Content-addressed, so a client can diff what is live against what it last sent. */
     revision: string;
     source_path?: string;
+    /**
+     * The captured entry module, and this read carries NO character cap of its own: a path-shaped revision
+     * reports the whole entry file as the kernel read it from disk, so the text can be longer than anything an
+     * HTTP body could have uploaded. The write side is bounded differently: `module_text` on the create and
+     * update bodies has no length bound either, so only this route's 1,000,000-byte body cap applies to it. The
+     * 262,144-byte figure elsewhere in this contract is the model-facing tool RESULT bound and has nothing to
+     * do with source text in either direction.
+     */
     module_text?: string;
+    /**
+     * The function body of a body-shaped registration, absent for a module-shaped one. 20,000 is the
+     * registration kernel's OWN ceiling (`createDynamicTool`), and it is re-checked when a persisted revision
+     * is restored, so no historical value can arrive here above it.
+     */
     source?: string;
     dependencies?: {
       path: string;
@@ -1353,7 +2159,21 @@ export interface SessionToolSourceResponse {
 export interface SubmitTaskRequest {
     input: string;
     attachments?: HarnessAttachment[];
+    /**
+     * Prior blocks whose completed results this task wants as context. A malformed entry, an unknown turn or
+     * label, and an already-failed or cancelled block are all 400 before a turn exists. Typed `#LABEL` tokens
+     * inside `input` are resolved server-side when the array is absent or does not already cover that label, so
+     * a client without metadata still works.
+     */
     references?: AgentResultReference[];
+    /**
+     * The persistent conversation this input belongs to. Absent opens a NEW host thread for the primary agent,
+     * connected by a reference edge to any referenced threads. Present and RUNNING steers the text into that
+     * conversation at its next safe model boundary, unless an attachment is present or a reference has not
+     * completed - both become a QUEUED CONTINUATION instead. Present and IDLE or STOPPED starts a continuation
+     * turn in that thread, reviving a stopped conversation. Unknown or deleted ids are 404 before anything
+     * mutates.
+     */
     thread_id?: string;
 }
 
@@ -1365,18 +2185,39 @@ export interface SubmitTaskRequest {
  */
 export interface TaskReceipt {
     session_id: string;
+    /**
+     * The created turn, or the OWNING turn when the submit was steered into a running conversation rather than
+     * becoming a new record. A slash command is terminal by the time this receipt is produced, so a command
+     * submit may report `done` or `error` directly.
+     */
     turn_id: string;
     status: SessionTurnStatus;
+    /** The conversation this input will run in. */
     thread_id: string;
+    /** Present ONLY when the submit folded into a running conversation. */
     steered?: true;
+    /**
+     * Always names the conversation the text was delivered to, which disambiguates `turn_id` when the owning
+     * turn belongs to a PARENT conversation (a steered delegated child).
+     */
     steered_thread_id?: string;
+    /** Present when the submit became a queued task, and equal to `GET .../queue`'s ordering. */
     queue_position?: number;
+    /** The session revision this receipt was produced at, echoed in `X-Harness-Revision`. */
     session_revision: number;
     accepted_at: number;
+    /**
+     * Concrete paths for the resources this submit created or changed, so a client reads exactly what it needs
+     * instead of pulling a tree.
+     */
     links: {
+      /** The turn metadata read. */
       turn: string;
+      /** The turn page to re-read after a gap. */
       turns: string;
+      /** The conversation metadata read. */
       thread: string;
+      /** The stream path a client uses to subscribe to this turn's display ops. */
       stream: string;
       };
 }
@@ -1390,6 +2231,7 @@ export interface ResetSessionResult {
     session_id: string;
     discarded_turns: number;
     discarded_threads: number;
+    /** Always 0 on a successful reset, because a running or queued session is refused with 409. */
     dropped_queued_tasks: number;
     revision: number;
 }
@@ -1399,6 +2241,10 @@ export interface ResetSessionResult {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CancelSessionRequest {
+    /**
+     * Also drop every queued task, which stay recorded as `cancelled` turn rows rather than disappearing. This
+     * is the Stop button.
+     */
     all?: boolean;
 }
 
@@ -1407,9 +2253,12 @@ export interface CancelSessionRequest {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CancelSessionResult {
+    /** False when nothing was running and nothing was queued, which is a success, not an error. */
     cancelled: boolean;
     session_id: string;
+    /** Queued tasks removed by this call (0 unless `all` was requested). */
     dropped_queued_tasks: number;
+    /** The turn that was executing, when there was one. */
     active_turn_id?: string;
     revision: number;
 }
@@ -1421,15 +2270,35 @@ export interface CancelSessionResult {
  */
 export interface QueuedTask {
     turn_id: string;
+    /** The turn's recorded ordinal, stable from submit to terminal. */
     index: number;
+    /** Order in the pump's queue, 0 first. */
     position: number;
     status: SessionTurnStatus;
+    /**
+     * At most 160 characters of the task text: whitespace is flattened onto one line, the head is kept, and a
+     * cut is marked with a trailing ellipsis INSIDE the 160. Read `prompt_chars` for the real length.
+     */
     prompt_preview: string;
+    /** EXACT recorded prompt length, which the preview stands in for. */
     prompt_chars: number;
+    /**
+     * The conversation this task will continue. An unfocused submit already owns one by the time it is queued -
+     * the route opens the host thread when the turn is created, not at execution - so the field is present on a
+     * queued row the moment the 202 is issued. Absent means the turn has no conversation of its own: a
+     * slash-command turn, or a session whose harness cannot carry threads.
+     */
     thread_id?: string;
     thread_label?: string;
+    /** The labels of the blocks this task waits on, so a client can show why it is still queued. */
     reference_labels?: string[];
     attachment_count?: number;
+    /**
+     * When the server took this task. It is the turn's `startedAt` when one exists and otherwise its
+     * `updatedAt`, which for a queued record is exactly the instant the submit was accepted - the same figure
+     * the turn row and the stream carry, so a queue panel and a turn list cannot show two different times for
+     * one task.
+     */
     accepted_at?: number;
 }
 
@@ -1448,9 +2317,13 @@ export type QueuedTaskPage = PageMeta
  */
 export interface PendingAction {
     request: HarnessActionRequest;
+    /** The turn whose run is parked waiting for this answer. */
     turn_id: string;
+    /** The persistent conversation the question came from. */
     thread_id?: string;
+    /** The agent that asked, which is also the identity the answer resumes. */
     agent: string;
+    /** Epoch milliseconds when the runtime opened the request. */
     received_at: number;
 }
 
@@ -1464,8 +2337,17 @@ export interface PendingAction {
  */
 export interface RecordFieldDescriptor {
     key: string;
+    /**
+     * The declared value type. `strings` is a bounded, de-duplicated string array; `enum` carries its closed
+     * set in `values`.
+     */
     type: "text" | "boolean" | "integer" | "enum" | "strings";
+    /**
+     * True when an ADD must supply it. A patch may still omit any field, which leaves the stored value
+     * unchanged, so this never means "every entry carries this key".
+     */
     required: boolean;
+    /** The closed value set, present ONLY for a field of type `enum`. */
     values?: string[];
 }
 
@@ -1480,10 +2362,17 @@ export interface RecordFieldDescriptor {
  * engine restored from a snapshot, or a caller with no agent identity).
  */
 export interface RecordEntryRow {
+    /**
+     * Unique across EVERY collection of this session (one id counter per store), so a panel may key a list on
+     * it without qualifying the collection.
+     */
     id: string;
     rev: number;
+    /** The agent that last changed this record, when the write carried an identity. */
     updated_by?: string;
+    /** The conversation that last changed this record, when the write carried one. */
     updated_thread_id?: string;
+    /** ISO-8601 instant of the last real change (a patch that changed no field does not move it). */
     updated_at?: string;
     [key: string]: unknown;
 }
@@ -1499,15 +2388,26 @@ export interface RecordEntryRow {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface RecordChangeRow {
+    /**
+     * The entry's position in the store-wide feed. Monotonic across collections, and the value a client
+     * advances to after applying this row.
+     */
     seq: number;
+    /** The collection this event belongs to (`tasks`, `chapters`, or an agent-defined name). */
     collection: string;
+    /** The collection's own store revision this event produced. */
     rev: number;
     id: string;
     op: "add" | "update" | "remove";
+    /** The agent that made the change, when the write carried an identity. */
     by?: string;
+    /** The conversation that made the change, when the write carried one. */
     thread_id?: string;
+    /** ISO-8601 instant of the mutation (one timestamp per tool call, so a batch agrees). */
     at: string;
+    /** Which fields an `update` changed, in the collection's canonical order; absent for `add`/`remove`. */
     fields?: string[];
+    /** The record's content revision after this event; absent for a `remove`. */
     item_rev?: number;
 }
 
@@ -1521,7 +2421,12 @@ export interface RecordChangeRow {
  */
 export interface RecordCollectionRow {
     name: string;
+    /**
+     * THIS collection's revision watermark - the per-collection `storeRev` of the record engine, the domain a
+     * `records since:` read and a CAS guard live in. Not the store-wide `store_rev`.
+     */
     store_rev: number;
+    /** Entries in the collection (equals `entries.length` here, which is the point of the field). */
     count: number;
     fields: RecordFieldDescriptor[];
     entries: RecordEntryRow[];
@@ -1537,8 +2442,23 @@ export interface RecordCollectionRow {
  */
 export interface RecordsSnapshotResponse {
     session_id: string;
+    /**
+     * The `records` counter of `StreamResourceKind` for this session, the same figure a `session` subscription
+     * reports in `subscription_state.revisions` and the value of `X-Harness-Revision`, so a read can be ordered
+     * against a subscription exactly like every other resource here.
+     */
     revision: number;
+    /**
+     * The store-wide feed watermark. Pass it back as `?since=` to get only what moved after this read. It
+     * rewinds to 0 when the session is reset, which is a fact the client must handle by re-bootstrapping, never
+     * by replaying.
+     */
     store_rev: number;
+    /**
+     * Counts changes to the registered COLLECTION SET (a `define`, a `drop`, a reset, a restore) - events that
+     * append nothing to the feed. A client that sees this move re-bootstraps from this read instead of applying
+     * a delta.
+     */
     collections_rev: number;
     collections: RecordCollectionRow[];
     changes: RecordChangeRow[];
@@ -1555,10 +2475,24 @@ export interface RecordsSnapshotResponse {
  */
 export interface RecordsDeltaResponse {
     session_id: string;
+    /**
+     * The `records` counter of `StreamResourceKind`, identical in meaning to the snapshot field of the same
+     * name. A delta that changed nothing moves no counter, so a polling client can stop when the number stops
+     * moving.
+     */
     revision: number;
+    /** The store-wide feed watermark AFTER the entries this response carries. */
     store_rev: number;
+    /**
+     * The collection-set watermark. Compared against the value the client bootstrapped with, this is how a
+     * collection defined or dropped mid-subscription is noticed.
+     */
     collections_rev: number;
     changes: RecordChangeRow[];
+    /**
+     * True when `since` predates (or postdates) what this process can still answer. The recovery is the
+     * snapshot read, and only that.
+     */
     reset: boolean;
 }
 
@@ -1569,7 +2503,15 @@ export interface RecordsDeltaResponse {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface RecordsSignal {
+    /**
+     * The store-wide feed watermark this frame announces. A client whose applied position is below it calls
+     * `GET .../records?since=<its position>`; a client already at it ignores the frame.
+     */
     store_rev: number;
+    /**
+     * The collection-set watermark. Present so a client can tell "a collection appeared or vanished" from
+     * "records moved" without a second read.
+     */
     collections_rev: number;
 }
 
@@ -1581,6 +2523,11 @@ export interface RecordsSignal {
 export interface PendingActionListResponse {
     session_id: string;
     actions: PendingAction[];
+    /**
+     * The `actions` counter of `StreamResourceKind`, the same figure a `session` subscription reports in
+     * `subscription_state.revisions`, so an opened or closed question can be ordered against a read. It moves
+     * when the waiting set changes, not when a question is merely re-read.
+     */
     revision: number;
 }
 
@@ -1620,8 +2567,10 @@ export interface AnswerActionResult {
  */
 export interface CommandDescriptor {
     name: string;
+    /** The exact prefix that dispatches this command, e.g. `/task`. */
     invocation: string;
     description: string;
+    /** Argument template shown by `/help`, for example `/task add <text>`. */
     usage?: string;
 }
 
@@ -1650,10 +2599,24 @@ export interface UsageByThread {
  */
 export interface SessionUsageResponse {
     session_id: string;
+    /** Recorded turns of every status. */
     turn_count: number;
+    /** Turns that carried a server-summed tally; the difference had no provider usage at all. */
     reported_turns: number;
+    /** Absent when no turn reported usage, which is not the same statement as zero. */
     usage?: HarnessUsage;
+    /**
+     * Per-conversation totals, UNCAPPED and unpaginated: one row for every conversation whose turns reported
+     * anything, in first-reported order - the order the fold met each conversation while walking the turns
+     * oldest first. It is deliberately not sorted by cost, so a client that wants the expensive conversations
+     * first sorts the rows itself. Nothing is ever omitted from this list.
+     */
     by_thread: UsageByThread[];
+    /**
+     * True once 256 distinct conversations reported usage - the session's conversation budget - and NOT because
+     * a row was dropped: no row is ever dropped here. Read it as "this session is at the thread cap and this
+     * list is as large as a session can get", which is the only signal the fold can honestly give.
+     */
     truncated: boolean;
     revision: number;
 }
@@ -1670,16 +2633,54 @@ export interface SessionUsageResponse {
 export interface ThreadSummary {
     id: string;
     agent: string;
+    /**
+     * `agent` is that agent's DEFAULT conversation, implicit and never deletable; `host` is an ADDITIONAL
+     * independent conversation, opened by an unfocused submit, by a client, or by a delegated child. Only
+     * `host` conversations are listed by `GET /sessions/{id}/threads`, so a row read over REST is `host` by
+     * construction and `agent` shows up only in projections that include the implicit conversation.
+     */
     origin: "agent" | "host";
+    /**
+     * The record's lifecycle state. All four values can be REPORTED; the roster's `status` filter accepts only
+     * `idle`, `running` and `stopped`, so `paused` is a state you can read but cannot filter on (the filter
+     * answers 400 for it).
+     */
     status: "idle" | "running" | "paused" | "stopped";
+    /** Creation order, monotonic per session. */
     sequence: number;
+    /** The persistent parent thread of a delegated child. This is lineage; a reference edge is not. */
     owner_thread_id?: string;
+    /** The stable agent-prefixed conversation label (`RR2`, `IT1`), drawn from one per-code sequence. */
     label?: string;
+    /**
+     * `unreadable` means the stored transcript is not a valid message list, so the live transcript is a valid
+     * placeholder. One hand-broken transcript must never cost the user the whole session, which is why this is
+     * a per-row flag rather than a load failure.
+     */
     transcript_state: "ok" | "unreadable";
+    /** The validation refusal message for an `unreadable` transcript. */
     transcript_error?: string;
+    /**
+     * How many transcript entries the conversation holds, never their content - and 0 for an `unreadable`
+     * conversation, because what the model is sent there is the placeholder, not the stored value.
+     */
     message_count: number;
+    /**
+     * Exact character total of the live entries' text content, so a client can size a paged read. ABSENT when
+     * the conversation holds no entry, rather than answering 0 twice over.
+     */
     chars?: number;
+    /**
+     * True when there is a transcript worth reading. False for an empty conversation and for an `unreadable`
+     * one, whose stored value lives only on the document route.
+     */
     has_transcript: boolean;
+    /**
+     * The OPENING of the last committed entry (not its tail): flattened onto one line, cut at 160 characters
+     * with a trailing ellipsis inside the bound, and absent entirely when the last entry has no text content.
+     * NEVER present on a REST thread row - the roster list, the create receipt and the identified read all omit
+     * it - and only a stream `thread.upsert` row projects it.
+     */
     preview?: string;
 }
 
@@ -1690,15 +2691,52 @@ export interface ThreadSummary {
 export type ThreadResource = ThreadSummary
     & {
     session_id: string;
+    /** The first recorded turn that ran in this conversation; absent for a runtime-created child. */
     origin_turn_id?: string;
+    /** That first run's invocation identity, the join to the events of the turn that started it. */
     origin_invocation_id?: string;
+    /** The invocation identity of this conversation's LATEST run. */
     invocation_id?: string;
+    /**
+     * The invocation ids recorded as running here, oldest first, at most 64 of them. The cap keeps the FIRST 64
+     * and stops, so on a conversation with more recorded work than that it is the NEWEST ids that are missing -
+     * the opposite of what "recent work first" would suggest - which is why `invocation_id` (latest) and
+     * `origin_invocation_id` (first) are carried separately and stay correct whatever this list dropped. Values
+     * are unique and belong to this thread only.
+     */
     invocation_ids: string[];
+    /**
+     * True as soon as 64 ids were recorded for this conversation, because that is the point where the
+     * projection stopped adding - so it reports "the list hit its bound", including in the exact case where
+     * there were precisely 64 and nothing was actually lost. Treat it as "ask for the newer ids from the turn
+     * routes", never as a count of what was dropped.
+     */
     invocation_ids_truncated: boolean;
+    /**
+     * The result blocks this conversation consumes (the `#` links), copied VERBATIM from the recorded turn this
+     * row names in `origin_turn_id` and in the order that submit bound them - explicit entries first, then any
+     * typed `#LABEL` token - with NO deduplication and no sorting, so the same block can appear more than once
+     * (one submit merges its explicit list with its prompt tokens). Because only that one turn is read, this is
+     * the conversation's ENTRY reference list rather than its whole reference history: links added by a later
+     * turn of the same conversation appear on the turn routes instead. The 16-entry bound is the kernel's cap
+     * on ONE submit, not on a conversation.
+     */
     references?: AgentResultReference[];
+    /**
+     * The conversations those blocks belong to, as a sorted, deduplicated union across EVERY recorded turn of
+     * this conversation - a wider view than `references`, which states only the entry turn's list. A connection
+     * is a reference EDGE, never ownership: stopping or deleting a connected source neither aborts nor removes
+     * this conversation.
+     */
     connected_thread_ids?: string[];
+    /**
+     * Monotonic revision of this transcript. A stream `transcript.updated` frame carries it, so a client that
+     * already read a newer revision ignores the frame.
+     */
     transcript_revision: number;
+    /** Stored size in bytes, so a client chooses a page size rather than guessing one. */
     transcript_bytes?: number;
+    /** Monotonic revision of this thread record (status, label, and roster changes). */
     revision: number;
 };
 
@@ -1722,8 +2760,20 @@ export type ThreadSummaryPage = PageMeta
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CreateSessionThreadRequest {
+    /** Must name a member of this session's frozen harness definition. */
     agent: string;
+    /**
+     * Trimmed display label, at most 120 characters. Grants no authority and is not an identifier. The bound is
+     * enforced by the runtime rather than by request parsing, so a blank or over-long value is an unclassified
+     * failure and answers 500 with the runtime's message - keep it inside 120 on the client.
+     */
     label?: string;
+    /**
+     * Must already exist and must be a HOST thread, because an agent's default conversation is implicit and is
+     * never persisted as a thread record that could be restored as an owner. An id this session does not have
+     * is 404, checked before anything mutates; an id that exists but names an agent's default conversation is
+     * refused by the runtime and therefore answers 500.
+     */
     owner_thread_id?: string;
 }
 
@@ -1739,6 +2789,7 @@ export interface DeleteThreadResult {
     session_id: string;
     removed_descendants: number;
     removed_turns: number;
+    /** The roster revision after the removal. */
     revision: number;
 }
 
@@ -1747,10 +2798,32 @@ export interface DeleteThreadResult {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CancelThreadResult {
+    /**
+     * True exactly when this call TERMINATED WORK: it aborted a live run, released a turn parked in a reference
+     * wait (its lane had claimed work the runtime had not started yet), or dropped at least one queued
+     * continuation - counting the named conversation and every conversation it owns. False when there was
+     * nothing in flight and nothing queued: the stop still lands - the row goes `stopped`, the backlog is
+     * cleared, its open questions expire - it just terminated no work. This is the store's own answer, relayed
+     * verbatim; an earlier contract discarded it and always claimed `true`.
+     */
     cancelled: boolean;
     thread_id: string;
     session_id: string;
+    /**
+     * The conversation's status AFTER the call, taken from its own runtime thread record - the value the roster
+     * list and a stream `thread.upsert` row carry, because both are projections of that same record (and a
+     * roster row exists only for a host-origin conversation, so the record is the source in every case). A stop
+     * marks the conversation `stopped`, which an explicit later submit revives, and that is what the route
+     * reports in practice; the wider vocabulary is stated because the field mirrors the record rather than a
+     * constant.
+     */
     status: "idle" | "running" | "paused" | "stopped";
+    /**
+     * Tasks removed from the queue by this stop, counted as the NAMED conversation's own lane backlog measured
+     * before the stop began. A conversation this one owns is also stopped and its backlog drained, and a
+     * session-level (legacy) backlog may go too, but neither is counted here - so the figure is a floor, not
+     * the total this call discarded.
+     */
     dropped_queued_tasks: number;
     revision: number;
 }
@@ -1769,13 +2842,22 @@ export interface TranscriptMetadata {
     chars: number;
     bytes: number;
     revision: number;
+    /** Entries per role, so an operator sees the shape of a conversation before opening it. */
     role_counts: {
       system: number;
       user: number;
       assistant: number;
       tool: number;
       };
+    /**
+     * Present only when `transcript_state` is `unreadable`: the validation message that refused the stored
+     * value.
+     */
     unreadable_reason?: string;
+    /**
+     * Present only when `transcript_state` is `unreadable`: the JSON kind actually stored, so an editor can
+     * state the problem without downloading the value.
+     */
     stored_type?: "object" | "array" | "string" | "number" | "boolean" | "null";
 }
 
@@ -1796,13 +2878,15 @@ export interface TranscriptMetadataResponse {
  * result, with no aggregate cap across a turn's parallel calls), which is precisely why this route is paged
  * rather than embedded in a session read.
  */
-export type TranscriptMessagePage = 
-    | PageMeta
+export type TranscriptMessagePage = PageMeta
     & {
     thread_id: string;
     agent: string;
-    transcript_state: "ok"
-    | "unreadable";
+    /**
+     * `unreadable` means these entries are the valid placeholder the model is sent, not the broken stored
+     * value; the stored value is on the document route.
+     */
+    transcript_state: "ok" | "unreadable";
     total: number;
     items: HarnessMessage[];
 };
@@ -1817,9 +2901,19 @@ export interface TranscriptDocumentResponse {
     session_id: string;
     thread_id: string;
     agent: string;
+    /**
+     * The transcript revision this document was rendered from. A client sends it back with a whole-document
+     * write to detect that someone else edited in the meantime.
+     */
     revision: number;
     transcript_state: "ok" | "unreadable";
+    /**
+     * The pretty-printed JSON text an editor edits. For an `unreadable` transcript this is the stored value
+     * VERBATIM, so what is shown is what is actually saved. Delivered as a string field, not an object, because
+     * formatting and key order are what an operator is editing.
+     */
     document: string;
+    /** The format the `document` string holds. */
     content_type?: "application/json";
 }
 
@@ -1829,7 +2923,16 @@ export interface TranscriptDocumentResponse {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateThreadTranscriptRequest {
+    /**
+     * The whole transcript document, valid or not: arbitrary JSON of any kind (object, array, string, number,
+     * boolean, or `null`).
+     */
     messages: unknown;
+    /**
+     * Optional optimistic lock: the transcript revision the document was edited from. A mismatch is 409 with
+     * the current revision in the message, and nothing is written, so an editor cannot silently overwrite a
+     * concurrent change.
+     */
     if_revision?: number;
 }
 
@@ -1842,13 +2945,22 @@ export interface UpdateThreadTranscriptRequest {
 export interface TranscriptWriteReceipt {
     session_id: string;
     thread_id: string;
+    /**
+     * `transcript` means the value parsed into a valid message list and is now live. `raw` means it was stored
+     * verbatim and the live transcript is a placeholder; `invalid` explains it.
+     */
     accepted_as: "transcript" | "raw";
+    /** Entries now LIVE for the model, which is 0-plus-placeholder for a `raw` acceptance. */
     message_count: number;
+    /** The new transcript revision, echoed for a client's optimistic lock. */
     revision: number;
+    /** Present only when `accepted_as` is `raw`. */
     invalid?: {
+      /** The exact validation refusal, so an editor can fix the real problem. */
       error: string;
       stored_type: "object" | "array" | "string" | "number" | "boolean" | "null";
       };
+    /** The reads that show the result, so a client never receives a tree back. */
     links?: {
       transcript?: string;
       messages?: string;
@@ -1863,12 +2975,21 @@ export interface TranscriptWriteReceipt {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface AttachmentDescriptor {
+    /** Stable and unique within one turn, so a preview can be updated in place and a record round-trips. */
     id: string;
     kind: "image" | "video" | "audio" | "pdf" | "file";
+    /** The exact label the composer inserted into the prompt, e.g. `[Image 1]`. */
     marker: string;
+    /** Plain file name only, never a path or a URL. */
     name: string;
+    /** Lowercase MIME type without parameters, e.g. `image/png`. */
     mime: string;
+    /** Decoded byte length of the recorded bytes. */
     size: number;
+    /**
+     * True when recorded bytes exist and are served by `GET .../turns/{turn_id}/attachments/{attachment_id}`. A
+     * descriptor never carries bytes of its own, so this field is how a client knows a fetch would succeed.
+     */
     has_bytes: boolean;
 }
 
@@ -1881,9 +3002,15 @@ export interface AttachmentDescriptor {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface SteerRecord {
+    /**
+     * The submit's durable identity, minted once by the server. It is also the context bar's key for this
+     * segment, which is what keeps two submits in one millisecond distinct and lets an archived entry be
+     * resolved after the ring truncates.
+     */
     id?: string;
     at: number;
     prompt_preview: string;
+    /** EXACT character count of the submitted text, which the preview stands in for. */
     prompt_chars: number;
     thread_id?: string;
     references?: AgentResultReference[];
@@ -1899,22 +3026,49 @@ export interface SteerRecord {
 export interface TurnResource {
     session_id: string;
     id: string;
+    /** Position in the session, monotonic, stable from submit to terminal. */
     index: number;
     status: SessionTurnStatus;
+    /** The trimmed task text the harness received, verbatim. */
     prompt: string;
+    /** The persistent conversation this turn executed in. Absent on a command turn and on a fresh-block run. */
     thread_id?: string;
+    /** The conversation's stable display label; it names the thread, so every continuation turn repeats it. */
     thread_label?: string;
+    /** Absent while `queued`, always present once running or terminal. */
     started_at?: number;
+    /** Moves on every recorded event and again when the turn reaches a terminal status. */
     updated_at: number;
+    /** The server-summed tally across every agent request in this turn, absent when no request reported any. */
     usage?: HarnessUsage;
+    /** The recorded failure, present for a turn that ended in `error`. */
     error?: HarnessErrorInfo;
+    /** The result blocks this task was submitted with, bound at enqueue. */
     references?: AgentResultReference[];
+    /** Descriptors only; bytes are one named subresource each. */
     attachments?: AttachmentDescriptor[];
+    /**
+     * Recorded events for this turn, including events from a delegation it reached. Page them with `GET
+     * .../turns/{turn_id}/events`.
+     */
     event_count: number;
+    /**
+     * Entries in `eventTimes`; equals `event_count` for a fully recorded turn, and a difference is stated
+     * rather than hidden.
+     */
     event_time_count?: number;
     attachment_count: number;
+    /**
+     * Entries in the audit ring (at most `steer_records`), not the number of submits - the archive below is the
+     * complete count.
+     */
     steer_count: number;
+    /**
+     * Steered submits whose TEXT is archived for this turn. Archived text is never ring-truncated, so a
+     * context-bar segment always resolves, but the text is served per segment, not as a list.
+     */
     steer_text_count?: number;
+    /** The bounded audit ring itself, newest last. */
     steers?: SteerRecord[];
     revision: number;
 }
@@ -1934,7 +3088,12 @@ export interface TurnResponse {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface TurnEventRow {
+    /**
+     * The event's ordinal inside this turn - the same number `src/server/journal.ts` addresses as `(turn_id,
+     * index)`, and the number a step or block id is derived from.
+     */
     index: number;
+    /** Epoch milliseconds the server recorded this event, from the record's `eventTimes`. */
     at?: number;
     event: HarnessEvent;
 }
@@ -1952,7 +3111,16 @@ export interface TurnEventRow {
 export type TurnEventPage = PageMeta
     & {
     turn_id: string;
+    /**
+     * Events recorded so far that match the current `type` filter - every recorded event when the filter is
+     * absent, and 0 for a filter naming a type this turn never recorded. It is recomputed on every page and
+     * never refers to the unfiltered stream when a filter was sent.
+     */
     total_events: number;
+    /**
+     * True while the turn is `queued` or `running` - accepted work that has not started yet reports it too,
+     * because its event list is genuinely incomplete rather than merely short.
+     */
     partial: boolean;
     items: TurnEventRow[];
 };
@@ -2009,11 +3177,15 @@ export type DisplayBlockSummary = DisplayBlockSummaryModel;
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface DisplaySteerSummary {
+    /** The submit's durable identity, which is also the context bar's key for this segment. */
     id?: string;
     at: number;
     promptPreview: string;
+    /** EXACT recorded length of the submitted text. */
     promptChars: number;
+    /** Set only when the steer belongs to a nested invocation of this turn. */
     sectionId?: string;
+    /** The conversation the text was delivered to, when it is not this turn's own thread. */
     threadId?: string;
     references?: AgentResultReference[];
 }
@@ -2030,7 +3202,12 @@ export interface DisplaySteerSummary {
 export interface TurnSummary {
     id: string;
     index: number;
+    /** Bounded head of the recorded prompt, at `DISPLAY_PREVIEW_CHARS`, standing in for the full task text. */
     promptPreview: string;
+    /**
+     * EXACT recorded prompt length, so a client states "showing 280 of 12,400 characters" instead of implying
+     * the row holds the whole task.
+     */
     promptChars: number;
     status: SessionTurnStatus;
     state: DisplayState;
@@ -2038,16 +3215,23 @@ export interface TurnSummary {
     threadLabel?: string;
     startedAt?: number;
     updatedAt: number;
+    /** The server-owned token tally, absent when no request reported usage. */
     usage?: HarnessUsage;
+    /** The LATEST request's input tokens, precomputed so a tile never derives a figure. */
     latestInput?: number;
+    /** Turn-wide cached input, precomputed. */
     cachedInput?: number;
+    /** Short bounded status line for a settled tile (the model name, the error text, the cancellation reason). */
     detail?: string;
     sectionCount: number;
     stepCount: number;
+    /** Agent names with live work in this turn. Empty means nothing runs, replacing a walk over every event. */
     activeAgents: string[];
     attachments?: DisplayAttachmentSummary[];
     references?: AgentResultReference[];
+    /** The bounded audit ring of steered submits, as display summaries. */
     steers?: DisplaySteerSummary[];
+    /** The reference-picker source, decided server-side. */
     blocks: DisplayBlockSummary[];
 }
 
@@ -2067,13 +3251,23 @@ export type TurnSummaryPage = PageMeta
 export interface DisplayNode {
     kind: "text" | "reasoning" | "step" | "notice";
     id: string;
+    /** A preview, bounded at `DISPLAY_NODE_PREVIEW_CHARS`, unless this node holds a designated full payload. */
     text?: string;
+    /** True once the node's window is final, so a later retry cannot discard it. */
     committed?: boolean;
+    /** EXACT recorded length in UTF-16 code units, whether or not `text` is the whole thing. */
     chars?: number;
+    /**
+     * Tri-state by presence: absent means "no statement", true means `text` is a preview, false means `text` is
+     * the whole recorded bytes again because the block that superseded it was discarded.
+     */
     redacted?: boolean;
+    /** Fraction of the section's output this node accounts for, used for a proportional bar. */
     share?: number;
+    /** Notice tone only. */
     tone?: "retry" | "wake" | "error" | "steer" | "answer" | "info";
     at?: number;
+    /** For a notice, the step it explains. */
     stepId?: string;
 }
 
@@ -2087,13 +3281,19 @@ export interface DisplayStep {
     id: string;
     turnId: string;
     sectionId: string;
+    /** Carried so a renderer can keep its own per-call handle; wire identity stays `id`. */
     callId?: string;
+    /** Tool name, or the action's question title for kind `action`. */
     name: string;
+    /** Preview of the recorded raw arguments string, bounded at `DISPLAY_ARGS_PREVIEW_CHARS`. */
     argsPreview?: string;
+    /** Settled tool result preview shown on a collapsed row, bounded at `DISPLAY_PREVIEW_CHARS`. */
     preview?: string;
     state: StepDisplayState;
     durationMs?: number;
+    /** Declarative panels the recorded result carried, previewed rather than inlined in full. */
     panels?: ToolUiPanel[];
+    /** Media DESCRIPTORS only; the bytes belong to the step detail route. */
     media?: ToolMediaDescriptor[];
 }
 
@@ -2110,21 +3310,109 @@ export interface DisplayStep {
  */
 export interface ContextBlock {
     kind: "user" | "system" | "reasoning" | "assistant" | "tool";
+    /**
+     * Stable and unique WITHIN the turn, and the detail route's key: `${sectionOrdinal}-${kind}-${key}`. `key`
+     * is the recorded event index that opens a tool, reasoning, or assistant block, `instructions` for the
+     * single system block, and `prompt` or a steered submit's own identity for a user block. A block discarded
+     * with a failed attempt is removed by id and never renumbered.
+     */
     id: string;
     turnId: string;
     sectionId: string;
+    /**
+     * DISPLAY LANE: which stacked row of the context bar this segment belongs to (the bar renders one row per
+     * lane). Pure UI metadata and NEVER model-facing - it is not on `HarnessMessage` and never part of a
+     * projection. ABSENT means lane 0, the default lane, so a producer that says nothing is lane 0 and a client
+     * never synthesizes another number. Assigned at MINT time by the `context:add` that creates the block and
+     * IMMUTABLE afterwards, so it is not a key of `ContextBlockPatch` (the shared whitelist in
+     * src/shared/turn-display.ts `ContextBlockPatch` is the authority): a block that would change lanes is a
+     * `context:remove` + `context:add` pair, exactly like an identity-field change. The NUMBER is opaque here -
+     * the server decides what mints a new lane, a renderer only groups rows by it.
+     */
     lane?: number;
+    /**
+     * THE server-decided display name, in the projector's own spelling, and the spelling this server actually
+     * transports: the recorded tool name for a tool block, and `instructions` / `reasoning` / `answer` /
+     * `prompt` / `steer` for the others. Optional so a client reads `name`, then `label`, then `kind`, and
+     * never synthesizes a figure the record does hold; a server producer always states it, and `context:set`
+     * re-stamps it ONLY when the recorded name changes.
+     */
     name?: string;
+    /**
+     * The same server-decided display figure under its older spelling. No harness producer sends it (the
+     * display and block routes carry the projector's `name`, and `TurnBlockDetail` is this record plus its
+     * text), so it is OPTIONAL and a client prefers `name` over it. It stays in the closed set because
+     * `additionalProperties: false` would otherwise forbid a record a bounded producer may still publish.
+     */
     label?: string;
+    /** EXACT recorded length of the segment's text, the figure a preview stands in for. */
     chars: number;
+    /**
+     * `tool` only: the call's own state, in the STEP vocabulary the projector mints (`running` while the call
+     * is open, `ok` / `error` / `cancelled` once it settles, src/server/turn-projector.ts:2022 and :2482, and
+     * the same figure `DisplayStep.state` carries). ABSENT for a `user` / `system` / `reasoning` / `assistant`
+     * segment and before a call settles - a system segment answers with NO `state` key at all, which is the
+     * closed key set the block route returns (src/server/api.test.ts:2195-2206). A record that carries a
+     * SECTION-vocabulary value anyway is mapped, not narrowed, by the client (src/frontend/display-project.ts
+     * `segmentStateOf`).
+     */
     state?: StepDisplayState;
+    /**
+     * Recorded time this block's text entered the conversation: the opening event's timestamp, a steered
+     * submit's own `at`, or the turn's `startedAt` for the prompt. ABSENT when the record carries no timestamp,
+     * and never `0`, so a renderer never paints a fake time.
+     */
     at?: number;
+    /**
+     * Settle time of a tool block (its `tool_result`'s recorded time). Absent while the call is still running,
+     * and for every other kind.
+     */
     endedAt?: number;
+    /**
+     * Time taken, so a segment states its own duration without a fetch, and ONLY ever a figure the record
+     * supports - never a re-derivation or an estimate: the tool's own measured span for a `tool` block (the
+     * same value `DisplayStep.durationMs` carries, deliberately NOT `endedAt - at`), the recorded stream
+     * window's span for a `reasoning` / `assistant` window with two distinct timestamped events, and absent for
+     * `user` / `system`, which have no recorded span.
+     */
     durationMs?: number;
+    /**
+     * `tool` only: EXACT length of the recorded `tool_call.arguments` string (raw JSON); while the call runs,
+     * every argument byte recorded SO FAR, which is all the record holds.
+     */
     argsChars?: number;
+    /**
+     * `tool` only: EXACT length of the recorded `tool_result.content`. ABSENT while no result is recorded (then
+     * `chars === argsChars`), exact once the call settles, including a failed or cancelled result.
+     */
     resultChars?: number;
+    /**
+     * The PROJECTOR'S STATIC per-kind fallback verdict: true when this block's recorded text is part of what
+     * the requests that follow replay - instructions, the user prompt, a steered submit, a committed answer,
+     * and a tool block whose text is a settled (including failed or cancelled) result or only the arguments of
+     * a call still running. False for a `reasoning` block, which the projector mints per KIND and not per
+     * decision: whether a given window's thinking actually rides is decided by the context trimmer's thinking
+     * policy (`dropOldThoughts`, and the per-entry `reasoningIncluded` flag it writes), so this field is the
+     * answer a server uses only where it cannot name the entry behind the segment - `included` on the detail
+     * read is the per-entry verdict. Stated explicitly so a bar never assumes every counted segment is prompt
+     * text.
+     */
     inPrompt?: boolean;
+    /**
+     * T7: the READER-facing inclusion axis, distinct from `inPrompt`. `true`/`false` state what the requests
+     * that follow actually carry for THIS segment - the transcript unit it is built from as switched ON or OFF
+     * for a call (a tool unit is excluded as a whole: the assistant call plus every result answering it), or,
+     * for a `reasoning` segment, whether the thinking of the ONE assistant entry that streamed this window
+     * still rides (the `reasoningIncluded` axis, trimmer uplift T7 - a withheld window's thinking is dropped
+     * from the request copy while its entry keeps travelling). ABSENT means this server could not name the
+     * entry behind the segment: no live call id behind a call, no live assistant entry carrying this EXACT
+     * recorded thinking (or more than one carrying it), an answer window that spans several entries, a system
+     * block that joins several instruction messages, or an analysis that predates this field. The block detail
+     * route states it, because that read holds BOTH the recorded event and the live transcript; `PATCH` on this
+     * same path writes it. A client never derives it.
+     */
     included?: boolean;
+    /** Recorded event range the block's text is served from, so the lazy answer is reproducible after a restart. */
     eventFrom?: number;
     eventTo?: number;
     callId?: string;
@@ -2143,13 +3431,20 @@ export type DisplayTail = DisplayTailModel;
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface TurnSection {
+    /** Server-minted and stable, `${turnId}:${ordinal}` in allocation order. */
     id: string;
     parentSectionId?: string;
     role: "primary" | "subagent";
     agent: string;
+    /** The block label (`RR2`), from one sequence shared with the conversation label. */
     agentLabel: string;
     model?: string;
+    /** The runtime invocation identity this section's events carry. */
     invocationId?: string;
+    /**
+     * The PERSISTENT conversation, which is what focus, steer, and delete act on. Set for a delegated child
+     * section as well as the root. Absent honestly means "no recorded join", NEVER "the root conversation".
+     */
     threadId?: string;
     threadLabel?: string;
     branchId?: string;
@@ -2158,11 +3453,20 @@ export interface TurnSection {
     endedAt?: number;
     latestInput?: number;
     cachedInput?: number;
+    /**
+     * Pointer to the node holding this section's copy target (the last committed answer). A pointer, not a
+     * copy, so prose travels once.
+     */
     answerNodeId?: string;
+    /** Ordered flow content. */
     nodes?: DisplayNode[];
+    /** Tool and action rows, addressable by their opening event index. */
     steps?: DisplayStep[];
+    /** The ONE context bar, metadata only, so the frame never grows with the length of the conversation. */
     context?: ContextBlock[];
+    /** The one block this section displays in full; absent means this producer designated nothing. */
     tail?: DisplayTail;
+    /** Background calls still running for this invocation. */
     pending?: HarnessPendingTool[];
 }
 
@@ -2175,8 +3479,13 @@ export interface TurnSection {
  */
 export interface TurnDisplay {
     turnId: string;
+    /** The `turn_display` counter of `StreamResourceKind`, defined to equal the owning turn's revision. */
     revision: number;
     sections: TurnSection[];
+    /**
+     * Counter a client needs to keep numbering consistent when it adopts a PARTIAL tree. Absent on a full tree,
+     * which never needs it.
+     */
     lastSectionOrdinal?: number;
 }
 
@@ -2198,9 +3507,13 @@ export interface TurnDisplayResponse {
 export type TurnBlockDetail = ContextBlock
     & {
     sessionId?: string;
+    /** The whole recorded text of the segment, never truncated and never re-projected. */
     text?: string;
+    /** The recorded raw arguments string of the call this segment represents. */
     args?: string;
+    /** The recorded result content, absent while the call is still running. */
     result?: string;
+    /** The instruction text the agent ACTUALLY ran with, one entry per recorded system message. */
     entries?: string[];
 };
 
@@ -2213,26 +3526,31 @@ export interface TurnBlockDetailResponse {
 }
 
 /**
- * The fields a context segment has, on two independent axes; at least one of them must be present. There is
- * deliberately no `if_revision` here — the write names the ENTRY, not a document, so it cannot carry a stale copy
- * of anything a concurrent writer moved, and the whole-document PUT stays the only resource with an optimistic
- * lock. A body that names neither is a 400.
+ * The fields a context segment has, on two independent axes; at least ONE of them must be present (a body
+ * naming neither is a 400). There is deliberately no `if_revision` here — the write names the ENTRY, not a
+ * document, so it cannot carry a stale copy of anything a concurrent writer moved, and the whole-document PUT
+ * stays the only resource with an optimistic lock.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface PatchTurnBlockRequest {
     /**
-     * The segment's OWN prompt axis, resolved by the join that can name this segment's entry: the exclusion UNIT
-     * behind a recorded call for a tool segment, or the THINKING of the single assistant entry that streamed a
-     * `reasoning` window (for a thinking segment, what rides in the prompt IS its thinking — this is the same
-     * figure `GET` on this path publishes as `included`, so the write mirrors the read).
+     * The segment's OWN prompt axis, resolved through the join that can name this segment's entry. For a `tool`
+     * segment it is the WHOLE unit this segment belongs to: `false` stores the flag core keeps only as a
+     * literal `false` (src/core/agent.ts `withIncluded`), and `true` removes it, which is how a reader switches
+     * a segment back on. For a `reasoning` segment the same field addresses that entry's THINKING, because
+     * thinking is what rides in the prompt for a thinking window — it is the same figure this path's `GET`
+     * publishes as `included`, so the write mirrors the read.
      */
     included?: boolean;
     /**
-     * The thinking axis, named explicitly (trimmer uplift T7): the `reasoningIncluded` flag core's `turn.before
-     * setReasoningIncluded` writes on ONE assistant entry, with NO unit cascade. It resolves through the thought
-     * join only, so it is writable on a `reasoning` segment and refused 409 on any other segment, whose recorded
-     * bytes name no thinking text. When a body carries both fields on a thinking segment they address the same
-     * entry, and this field — the one that names the axis — decides.
+     * The THINKING axis, named explicitly (trimmer uplift T7): the per-entry `reasoningIncluded` flag core's
+     * `turn.before setReasoningIncluded` writes (src/harness.ts `setReasoningIncluded`). It withholds ONE
+     * assistant entry's thinking from its projection copy while the entry itself keeps travelling, and there is
+     * NO unit cascade, because thinking belongs to exactly one entry. It resolves through the thought join
+     * only, so it is writable on a `reasoning` segment and refused 409 on any other kind, whose recorded bytes
+     * name no thinking text. `false` stores the flag and `true` removes it, the same minimal-delta rule
+     * `included` follows. When a thinking segment's body carries both fields they address the same entry and
+     * this field — the one that names the axis — decides.
      */
     reasoningIncluded?: boolean;
 }
@@ -2246,20 +3564,26 @@ export interface PatchTurnBlockRequest {
 export interface TurnBlockWriteReceipt {
     session_id: string;
     turn_id: string;
+    /** The segment the write was addressed to, echoed so a late answer can be matched to its click. */
     block_id: string;
     /**
-     * The verdict the next block-detail read publishes for THIS segment: the exclusion unit's state for a call
-     * (`false` only when the whole unit is excluded), or the thinking axis for a `reasoning` segment.
+     * The verdict the NEXT block-detail read publishes for this segment, read back AFTER the write: for a tool
+     * segment the unit's state (`false` only when the unit is excluded, because that is what the exclusion
+     * switched - one verdict for the call and every result answering it); for a `reasoning` segment the
+     * thinking axis, which is the only thing that segment's prompt state can mean.
      */
     included: boolean;
     /**
-     * The thinking axis itself, read back after the write — present exactly when this segment names a thinking
-     * entry (a `reasoning` segment), absent for every other kind. On a thinking segment it is the same figure as
-     * `included` by construction, because the two fields address that one entry.
+     * The THINKING axis itself, read back after the write, present exactly when this segment names a thinking
+     * entry (a `reasoning` segment) and absent for every other kind. On a thinking segment it is the same
+     * figure as `included` by construction, because both fields address that one assistant entry.
      */
     reasoning_included?: boolean;
+    /** The conversation whose transcript changed — the route a reader checks the document on. */
     thread_id?: string;
+    /** The transcript revision this write landed at, in the conversation's own counter domain. */
     revision?: number;
+    /** The reads that show the result, so a client never receives a tree back. */
     links?: {
       block?: string;
       transcript?: string;
@@ -2285,10 +3609,17 @@ export interface RecordedEventRef {
 export interface TurnStepDetail {
     sessionId: string;
     turnId: string;
+    /** Echo of the requested key, equal to the opening event's index as a decimal string. */
     stepId: string;
+    /** The invocation this step belongs to, for identity scoping. */
     sectionId: string;
+    /** The tool-call identity the two events share, when both carry one. */
     callId?: string;
     opening: RecordedEventRef;
+    /**
+     * Absent while the step is running or for a call that never settled, which is the honest answer and never a
+     * synthesized one.
+     */
     result?: RecordedEventRef;
 }
 
@@ -2379,24 +3710,43 @@ export type HarnessMessage = HarnessMessageModel;
 export interface HarnessEvent {
     type: HarnessEventType;
     agent: string;
+    /** `start` only (and the answer events): the model the request was made against. */
     model?: string;
+    /** `text` and `reasoning` only: the incremental content. */
     delta?: string;
+    /** `tool_call` only: the invocation the model requested. */
     call?: HarnessToolCall;
+    /** `tool_result` and the state-change events: the tool or action name. */
     name?: string;
+    /** The id of the `tool_call` this result answers; optional so an older recording stays valid. */
     callId?: string;
+    /** `tool_result` and `done`: the result or answer text. */
     content?: string;
+    /** `tool_result` only: the tool reported a failure rather than a value. */
     isError?: boolean;
+    /** `tool_result` only: the tool's structured value, presentation-unwrapped. */
     outcome?: unknown;
+    /** `tool_result` only: declarative panels the tool supplied. */
     ui?: ToolUiPanel[];
+    /** `tool_result` only: media DESCRIPTORS. Bytes live in the transcript entry, never in the event. */
     media?: ToolMediaDescriptor[];
+    /** `tool_result`: wall-clock duration of the call. */
     durationMs?: number;
+    /** `done` only, and present when the run is NOT terminal because background calls are still live. */
     pending?: HarnessPendingTool[];
+    /** `usage` only: this request's accounting, already summed into the turn tally. */
     usage?: HarnessUsage;
+    /** `error`, `retry`, and a failed `done`: the serialised failure. */
     error?: HarnessErrorInfo;
+    /** `retry` only: how long the harness waits before the next attempt. */
     delayMs?: number;
+    /** `action_request` only: the bounded question the model asked its owner. */
     request?: HarnessActionRequest;
+    /** `action_answer` only: the choice that resolved the request, with its `requestId` and `source`. */
     answer?: unknown;
+    /** `branch_start` and `branch_end`: the automatic owner fork this event delimits. */
     branchId?: string;
+    /** Non-root runs only: the invocation identity this event belongs to. */
     thread?: HarnessThread;
 }
 
@@ -2408,10 +3758,13 @@ export interface HarnessEvent {
  */
 export interface SessionStatePatch {
     id: string;
+    /** Present only when the display name changed. */
     title?: string;
     status?: SessionStatus;
+    /** Present whenever the depth changed, including the honest 0 that clears a "N waiting" badge. */
     queue_depth?: number;
     model?: string;
+    /** Present only when a model assignment changed; the WHOLE live map, never a partial merge. */
     agent_models?: {
       [key: string]: string;
       };
@@ -2427,6 +3780,7 @@ export interface SessionStatePatch {
  */
 export interface UsagePatch {
     turn_id?: string;
+    /** Absent means no request has reported usage yet, which is not the same statement as zero. */
     usage?: HarnessUsage;
     latest_input?: number;
     cached_input?: number;

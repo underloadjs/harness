@@ -43,7 +43,9 @@
 // per test, so the suite is isolated from the machine and from `.env`.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { HarnessProgress } from '../../harness';
+import { agent } from '../../harness';
+import type { HarnessProgress, HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '../../harness';
+import { createToolboxHarness } from './toolbox';
 import {
     createHarnessRegistry,
     createToolCatalogue,
@@ -59,7 +61,7 @@ import {
     teamOf
 } from './index';
 import { FIXTURE_PRESETS, PRODUCTION_WITH_FIXTURES } from './fixture-presets.test-support';
-import { AGENT_PROFILES, agentInstruction } from '../../agents';
+import { AGENT_PROFILE_NAMES, AGENT_PROFILES, agentInstruction } from '../../agents';
 import { DEFAULT_CLI_PRESET } from '../cli/options';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
@@ -167,6 +169,11 @@ const CORE = [
 // The seven real primaries, in catalogue order, DEFAULT FIRST.
 const REAL = ['general', 'instruct', 'research', 'workspace', 'reviewer', 'planner', 'debugger'] as const;
 
+// The harness-owned rows the kernel registers on EVERY harness, including a tool-less one
+// (issue 0005-D): the core set plus the two session tools that trail it. `chat` gets
+// exactly this and nothing else, which is the whole point of the card.
+const HARNESS_OWNED = [...CORE, 'threadFork', 'toolCancel'];
+
 // The six that get a built-in team. `general` is deliberately NOT here: its card passes
 // `subagents: []`, so `delegate` is not registered for it at all — every assertion about
 // `delegate` and about the delegated `summarizer` applies to this list only.
@@ -204,11 +211,11 @@ afterEach(() => {
 });
 
 describe('preset catalogue', () => {
-    it('ships the seven real roles and nothing else; the fixtures are test-owned', () => {
-        // The shipped catalogue is exactly the real roles: every card is a live
-        // harness a user can actually run. The scripted `demo` and the failure example
-        // used to ship behind FIXTURE_PRESETS/ALL_PRESET_TEMPLATES; they are deleted, and
-        // what a suite injects now comes from ./fixture-presets.test-support.ts.
+    it('ships the seven real roles plus the tool-less card and nothing else', () => {
+        // The shipped catalogue is the real roles plus `chat`: every card is a live harness
+        // a user can actually run. The scripted `demo` and the failure example used to ship
+        // behind FIXTURE_PRESETS/ALL_PRESET_TEMPLATES; they are deleted, and what a suite
+        // injects now comes from ./fixture-presets.test-support.ts.
         expect(presets.map((preset) => preset.name)).toEqual([
             'general',
             'instruct',
@@ -216,12 +223,16 @@ describe('preset catalogue', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            // Issue 0005-D: the tool-less card, LAST on purpose (see the comment on the card
+            // in ./presets.ts) — appending it keeps every existing picker row's index.
+            'chat'
         ]);
 
         // ORDER IS A CONTRACT: this is the order `GET /harnesses` returns, the order a
         // picker renders, and the order the frontend palette assigns tones by. It must
-        // match `AGENT_PROFILE_NAMES` (../../agents/index.ts) minus summarizer/fixtures.
+        // match `AGENT_PROFILE_NAMES` (../../agents/index.ts) minus summarizer/fixtures,
+        // with the one non-role card trailing.
         expect(presets.map((preset) => preset.title)).toEqual([
             'General',
             'Instruct',
@@ -229,8 +240,15 @@ describe('preset catalogue', () => {
             'Analyst',
             'Reviewer',
             'Manager',
-            'Debugger'
+            'Debugger',
+            'Chat'
         ]);
+
+        // `chat` is not a profile, so it must not displace a role the user knows: the first
+        // seven rows are exactly the roles, in the shipped order.
+        expect(presets.slice(0, 7).map((preset) => preset.name)).toEqual([...REAL]);
+        expect(presets.at(-1)?.name).toBe('chat');
+        expect(presets.at(-1)?.primary).toBe('general');
 
         // The UI selects the first descriptor at boot and the CLI uses it with no
         // `--preset`, so the first card must be the default real harness — the two
@@ -330,7 +348,20 @@ describe('preset catalogue', () => {
             card('workspace', ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']),
             card('reviewer', ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']),
             card('planner', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']),
-            card('debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer'])
+            card('debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']),
+            // Issue 0005-D spelled out as a literal rather than through `card()`, because the
+            // helper hard-codes the shared toolbox the tool-less card does NOT declare.
+            // `tools: []` and `environmentTools: undefined` are the whole feature: the picker
+            // renders no toolbox and no delegation row for this card, and the runtime agrees
+            // (asserted in the chat test below).
+            {
+                name: 'chat',
+                primary: 'general',
+                subagents: [],
+                agents: ['general'],
+                tools: [],
+                environmentTools: undefined
+            }
         ]);
 
         // The test fixtures are still declared honestly, and they select only ids this
@@ -574,6 +605,164 @@ describe('one toolbox, different agents', () => {
             'search',
             'fetch'
         ]);
+    });
+
+    it('keeps the tool-less chat card free of every catalogue tool, delegate, and environment tool', () => {
+        // Issue 0005-D. THE posture, pinned as an exact registration list rather than
+        // "fewer tools than the roles": a chat harness holds ONLY the rows the kernel owns,
+        // so nothing in `src/tools/**` can appear in a request built from it.
+        vi.stubEnv('EXA_API_KEY', '');
+        vi.stubEnv('TAVILY_API_KEY', '');
+        expect(registeredTools('chat')).toEqual(HARNESS_OWNED);
+
+        // A configured search does not change it either — the card opts out of the shared
+        // toolbox, it does not inherit the host's credentials.
+        vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
+        vi.stubEnv('TAVILY_API_KEY', '');
+        expect(registeredTools('chat')).toEqual(HARNESS_OWNED);
+
+        const chat = presetOf('chat').create(SETTINGS, progress);
+
+        // No delegation (empty team), no workspace rows, no environment rows. Absence is
+        // asserted on the exact keys, not on a count.
+        expect(chat.tools.delegate).toBeUndefined();
+        expect(chat.tools.read).toBeUndefined();
+        expect(chat.tools.write).toBeUndefined();
+        expect(chat.tools.search).toBeUndefined();
+        expect(chat.tools.fetch).toBeUndefined();
+        expect(Object.keys(chat.agents)).toEqual(['general']);
+        expect(Object.keys(chat.subagents)).toEqual([]);
+
+        // The kernel-owned bootstrap pair is still CORE, so `toolRequest` remains the model's
+        // documented way to unlock a tool later — the escape hatch the issue keeps open.
+        expect(chat.tools.toolRequest.visibility).toBe('core');
+        expect(chat.tools.tasks.visibility).toBe('core');
+
+        // THE picker contract: an EMPTY catalogue describes no tool and only the bootstrap
+        // declarations, and a FULLY configured catalogue says the same thing. The tool-less
+        // posture is a property of the card, not of what the host happens to have.
+        const empty = createToolCatalogue();
+        const configured = createToolCatalogue({
+            websearch: createWebSearchCatalogueEntry({
+                configuration: { env: { EXA_API_KEY: 'configured-exa-key' } }
+            })
+        });
+
+        for (const catalogue of [empty, configured]) {
+            const description = describeHarness(presetOf('chat'), catalogue);
+
+            expect(description.tools).toEqual([]);
+            expect(description.coreTools).toEqual(['toolRequest', 'tasks']);
+        }
+
+        // And the descriptor still agrees with the runtime exactly, the way every other card's
+        // does (the same comparison the descriptor test above runs).
+        const coreNamesAtRuntime = Object.values(chat.tools)
+            .filter((tool) => tool.visibility === 'core')
+            .map((tool) => tool.name);
+
+        expect(describeHarness(presetOf('chat'), configured).coreTools).toEqual(coreNamesAtRuntime);
+    });
+
+    it('gives the tool-less posture one model call and leaves the roles on the shipped budget', async () => {
+        // `maxIterations` is resolved INSIDE the harness (`src/harness.ts:896`) and no Harness
+        // field exposes it, so the card's one-round-trip posture is pinned at the seam the card
+        // feeds: `createToolboxHarness` with the card's own configuration, driven by a scripted
+        // stream that always asks for a tool.
+        const seen: HarnessStreamRequest[] = [];
+        const alwaysAsksForATool: HarnessStream = async function* (request): AsyncGenerator<HarnessStreamEvent> {
+            seen.push(request);
+            yield {
+                type: 'done',
+                stopReason: 'tool_calls',
+                toolCalls: [{ id: 'c1', name: 'read', arguments: '{}' }]
+            };
+        };
+
+        const chatLike = createToolboxHarness(
+            {
+                agents: { general: agent({ model: 'test-model', stream: alwaysAsksForATool }) },
+                primary: 'general',
+                subagents: [],
+                sharedToolbox: false,
+                maxIterations: 1
+            },
+            SETTINGS,
+            progress
+        );
+
+        // ONE request, then the loop bound refuses instead of starting a second round-trip. The row
+        // the model asked for is not even registered here — `sharedToolbox: false` registered no
+        // `read` — which is the other half of the same posture.
+        await expect(chatLike('go')).rejects.toThrow(
+            'Agent "general" requested tools more than 1 times without answering.'
+        );
+        expect(seen).toHaveLength(1);
+
+        // THE wire-level statement of issue 0005-D: the only tool declarations this card ever
+        // sends are the kernel's bootstrap pair, so the model is told to unlock the rest.
+        expect(seen[0].tools?.map((declaration) => declaration.name)).toEqual(['toolRequest', 'tasks']);
+
+        // The roles are untouched: the same factory WITHOUT the option answers across two rounds,
+        // i.e. the budget is the shipped 1000 and not the chat card's 1.
+        const roleSeen: HarnessStreamRequest[] = [];
+        const twoRounds = [
+            [
+                {
+                    type: 'done' as const,
+                    stopReason: 'tool_calls' as const,
+                    toolCalls: [{ id: 'c1', name: 'timeNow', arguments: '{}' }]
+                }
+            ],
+            [
+                { type: 'text' as const, delta: 'done' },
+                { type: 'done' as const, stopReason: 'stop' as const, toolCalls: [] }
+            ]
+        ];
+        let round = 0;
+
+        const roleHarness = createToolboxHarness(
+            {
+                agents: {
+                    general: agent({
+                        model: 'test-model',
+                        stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
+                            const frames = twoRounds[round] ?? twoRounds.at(-1)!;
+
+                            round += 1;
+                            for (const frame of frames) yield frame;
+                        }
+                    })
+                },
+                primary: 'general',
+                subagents: []
+            },
+            SETTINGS,
+            progress
+        );
+
+        expect((await roleHarness('go')).content).toBe('done');
+        expect(Object.keys(roleHarness.tools).length).toBeGreaterThan(Object.keys(chatLike.tools).length);
+        expect(PRESET_MAX_ITERATIONS).toBe(1000);
+    });
+
+    it('reuses the trusted general profile for chat instead of adding a role', () => {
+        // Issue 0005-D chose reuse over a new profile: `chat` runs the SAME prompt as the
+        // default card, so the roster (../../agents/index.ts) keeps its eight ids and a team
+        // can never name `chat`.
+        expect(instructionOf('chat', 'general')).toBe(instructionOf('general', 'general'));
+        expect((AGENT_PROFILES as Record<string, unknown>).chat).toBeUndefined();
+        expect(AGENT_PROFILE_NAMES).not.toContain('chat');
+        expect(SPECIALIST_AGENT_NAMES).not.toContain('chat');
+        // A team is built from agent profiles, so the new card cannot appear inside one.
+        expect(REAL.map((primary) => teamOf(primary).includes('chat'))).toEqual(REAL.map(() => false));
+
+        // The card is distinct from the default in the one way that matters to the user: its
+        // name, its title, and the fact that it declares no tools.
+        expect(presetOf('chat').name).toBe('chat');
+        expect(presetOf('chat').title).toBe('Chat');
+        expect(presetOf('general').tools.length).toBeGreaterThan(0);
+        expect(presetOf('chat').tools).toEqual([]);
     });
 
     it('registers the identical toolbox on every team preset when the host is keyless', () => {
@@ -913,6 +1102,9 @@ describe('one toolbox, different agents', () => {
             { name: 'reviewer', builtin: true, editable: true, template: 'live' },
             { name: 'planner', builtin: true, editable: true, template: 'live' },
             { name: 'debugger', builtin: true, editable: true, template: 'live' },
+            // Issue 0005-D: a production card, so it is built-in, editable, and `live` — the
+            // tool-less posture is about tools, not about a new template.
+            { name: 'chat', builtin: true, editable: true, template: 'live' },
             // R20.1: there is no read-only template. `editable: true` is a wire
             // compatibility field; `template` is the registry's internal signal
             // for what a metadata-only vs executable patch must do.

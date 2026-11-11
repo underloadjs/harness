@@ -389,7 +389,9 @@ describe('delegation stance per role', () => {
 
     // No built-in team can name the Manager: a Manager running as a subagent has no
     // `delegate` (it is primary-only), so its own rule would fire and burn a child run. The
-    // string form keeps this one exact assertion over all seven presets.
+    // string form keeps this one exact assertion over all eight presets. The trailing
+    // `chat:general:` entry is the tool-less card (issue 0005-D): it selects the trusted
+    // `general` profile and declares NO team, so it is neither a delegator nor a target.
     it('keeps the Manager out of every built-in team', () => {
         expect(
             presets.map((preset) => `${preset.name}:${preset.primary}:${preset.subagents.join('+')}`)
@@ -400,7 +402,8 @@ describe('delegation stance per role', () => {
             'workspace:workspace:general+instruct+research+reviewer+debugger+summarizer',
             'reviewer:reviewer:general+instruct+research+workspace+debugger+summarizer',
             'planner:planner:general+instruct+research+workspace+reviewer+debugger+summarizer',
-            'debugger:debugger:general+instruct+research+workspace+reviewer+summarizer'
+            'debugger:debugger:general+instruct+research+workspace+reviewer+summarizer',
+            'chat:general:'
         ]);
     });
 

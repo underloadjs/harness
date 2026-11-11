@@ -1617,7 +1617,8 @@ describe('T5 durable harness deletion', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(document.sessions.map((session) => session.harness)).toEqual(['instruct']);
 
@@ -1639,7 +1640,8 @@ describe('T5 durable harness deletion', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(second.registry.find('instruct')).toBeUndefined();
 
@@ -1701,7 +1703,8 @@ describe('T5 durable harness deletion', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(second.store.restoreErrors).toEqual([
             `${stateFile(root)}: Session "${id}" could not be restored: ` +
@@ -1793,7 +1796,8 @@ describe('T5 durable harness deletion', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
 
         // The same guarantee for a create: no phantom card.
@@ -1898,7 +1902,8 @@ describe('T5 durable harness deletion', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(second.registry.deletedBuiltins()).toEqual([]);
     });

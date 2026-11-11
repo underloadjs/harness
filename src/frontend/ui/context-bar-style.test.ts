@@ -21,7 +21,8 @@
 //     element is removed from the accessibility tree, which would silently delete the bar's
 //     text from a screen reader);
 //   - forced colors keeps a per-segment boundary, because a colour-only difference is the
-//     one thing that mode guarantees to erase;
+//     one thing that mode guarantees to erase — and 0018 item 3: the SAME convention for the
+//     per-row lane chip, the only cue that names which stacked row a segment belongs to;
 //   - T22 (R23): the ONE current content block, printed as pre-wrapped text in its own scroll
 //     box, and BOTH withdrawal rules hide it — the element's `hidden` and the decision's own
 //     `[data-superseded]` attribute; T27 (R2) moved WHERE it prints (the section's flow, below
@@ -456,6 +457,36 @@ it('keeps every segment bounded under forced colors', () => {
     expect(css).toMatch(
         /@media \(forced-colors: active\)[\s\S]*?\.context-bar-segment \{[\s\S]*?outline: 1px solid CanvasText;/
     );
+});
+
+it('keeps the per-row lane chip bounded under forced colors (0018 item 3)', () => {
+    // The chip is the ONLY cue naming which stacked row a segment belongs to, and its base
+    // look is exactly what this mode collapses: quiet ink on a translucent panel with no
+    // border. So it joins the section's one forced-colors convention beside the segment's —
+    // `forced-color-adjust: none` keeps its own tint instead of letting the palette repaint
+    // it into the row behind it, and the `CanvasText` outline gives it an edge in any palette.
+    // `atRulesOf` rather than `blockOf` because a `@media` body's first `}` is an INNER rule's
+    // (the helper above), and the slice is pinned whole so a declaration that moves into the
+    // segment rule cannot keep this test green.
+    const forced = atRulesOf('@media (forced-colors: active)');
+
+    expect(forced).toContain('.context-bar-lane {');
+
+    const laneRuleStart = forced.indexOf('.context-bar-lane {');
+    const laneRule = forced.slice(laneRuleStart, forced.indexOf('}', laneRuleStart) + 1);
+
+    expect(laneRule.replace(/\s+/g, ' ').trim()).toBe(
+        '.context-bar-lane { forced-color-adjust: none; outline: 1px solid CanvasText; outline-offset: -1px; }'
+    );
+
+    // WHY the rule is needed, pinned where it is needed: the base chip is a tint and a muted
+    // colour with no border of its own, which is the combination the mode erases. The words
+    // (`aria-label` from `contextBarLaneLabelOf`) state the number either way, so this is the
+    // rendering half of the cue and nothing else.
+    expect(blockOf('.context-bar-lane {')).toContain(
+        'background: color-mix(in srgb, var(--bg-deep) 78%, transparent);'
+    );
+    expect(blockOf('.context-bar-lane {')).toContain('color: var(--muted);');
 });
 
 it('styles the segment dialog with the panes and states the payload already has', () => {

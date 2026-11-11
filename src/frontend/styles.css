@@ -8020,6 +8020,20 @@ body.is-resizing-rail {
     .context-bar-segment[data-focused='true'] {
         outline: 2px solid Highlight;
     }
+
+    /* The lane chip (0018 item 3): same recipe as the segment right above it, because the chip
+       is the ONLY cue naming which stacked row a segment belongs to and its quiet ink on a
+       translucent panel (`.context-bar-lane`, --bg-deep at 78% + `--muted`, no border) is
+       exactly what this mode collapses. `forced-color-adjust: none` keeps the chip's own
+       tint rather than letting the palette repaint it into the row behind it, and the
+       CanvasText outline gives it an edge that survives whichever palette the mode picks. The
+       words already carry the fact (`aria-label` is `contextBarLaneLabelOf`, ui/context-bar.ts),
+       so the border only has to carry the boundary. */
+    .context-bar-lane {
+        forced-color-adjust: none;
+        outline: 1px solid CanvasText;
+        outline-offset: -1px;
+    }
 }
 
 /* --- the segment detail dialog (ui/context-detail.ts) -------------------

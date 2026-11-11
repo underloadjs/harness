@@ -1,6 +1,6 @@
 # 0014 — The oversized-response error names two remedies that cannot work in the situation that triggers it
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-11 (see **Update (2026-11-11, fix)** at the bottom)
 > **Severity:** Minor
 > **Area:** `src/tools/webfetch/request.ts` (the `oversizedResponse` message)
 > **Date opened:** 2026-11-10
@@ -125,4 +125,45 @@ scoped to this specific failure.
   searched'`, `matches: []`, `skipped.tooLarge`). The `grep` leg of the message is still
   self-contradictory, since the error only fires above 1 MiB and `grep` skips files above 1 MiB.
 - The live-fetch rows are left **as recorded** (2026-11-10 measurements).
-- Status stays **Open**.
+- Status moved to **Fixed** — closing note below.
+
+## Update (2026-11-11, fix) — closed
+
+- **Shipped as proposed: message-only.** `oversizedResponse` is
+  `src/tools/webfetch/request.ts:297-300` and the reasoning that scopes each remedy is the block
+  above it, `:272-296`. The sentence, verbatim apart from `${MAX_RESPONSE_BYTES}` (1048576):
+  "…that is the only remedy that reduces the transferred body; `query` and `format` cannot help,
+  because they apply after this size check. Or use the `download` tool to save the bytes and read
+  them with `read` (`grep` skips files over 1 MiB)."
+- **Acceptance criteria.** 1 — `query` now appears only inside the negation; a test asserts the
+  old remedy string (`ask for fewer characters with "query"`) is gone. 2 — `read` is the named
+  tool for the downloaded file and the 1 MiB `grep` skip is stated as a warning, not a
+  recommendation. 3 — each remedy was checked in the state that produces the error before it was
+  written; `:272-296` records the checks, including the live 502,906 B `.txt` fetch and the
+  `grep`-skips-over-1 MiB contradiction at `src/tools/files/glob.ts:81`.
+- **One nuance the sentence flattens.** "`format` … appl[ies] after this size check" is right in
+  outcome but not by mechanism: `format` never touches the body at all — it only steers the
+  `Accept` header (`acceptHeader`, used at `:733-745`), which a host may ignore. `query` is the
+  remedy that genuinely runs after the check (selection on CONVERTED content,
+  `src/tools/webfetch/sections.ts:6-7`, versus the content-length pre-check at `:847-851`). Both
+  are dead ends in THIS state, which is all the sentence claims; the comment at `:284-287`
+  records the difference so the next reader does not infer a conversion step that does not happen.
+- **Anchors this fix moved** (relative to the re-anchoring above): `oversizedResponse` 165-168 →
+  297-300 (the 0015 classifier landed above it), the content-length pre-check 700-707 → 847-851
+  (`cancelBody` at `:851`), `MAX_RESPONSE_BYTES` 71 → 73. `sections.ts` and `glob.ts:81` are
+  unchanged. The stale 100 KiB prose stays open in 0007.
+- **Tests** (`src/tools/webfetch/webfetch.test.ts`). The whole sentence is pinned once as
+  `OVERSIZED_MESSAGE` (`:40-41`) and asserted whole where the error comes from the content-length
+  pre-check (`:561-586`, which also pins `{ produced: 0, cancelled: true }` — so "rejected before
+  a byte is read" is an assertion, not a comment). A dedicated describe (`:1377-1420`) pins the
+  acceptance criteria directly: the identical message with and without `query`, the old
+  `query`-as-remedy string absent, `read` and the 1 MiB `grep` parenthetical present. The streamed
+  path with no advertised `Content-Length` still pins only the first clause plus
+  `produced: 17` / `cancelled: true` (`:588-611`); the remedy list is one shared string, so
+  pinning it whole once is enough.
+- **Out of scope respected.** `MAX_RESPONSE_BYTES` unchanged, the check still runs before the body
+  is read, no retry added, no conversion change.
+- **Verification.** `vitest run src/tools/webfetch/webfetch.test.ts src/harness.webfetch.test.ts`
+  → 106 passed; `tsc --noEmit -p .` → clean; `vite-node scripts/generate-tool-manifest.mjs
+  --check` → current. The three measured pages were not re-fetched live (provider spend): the
+  change is a string, and the state that emits it is reproduced exactly by the stubs above.

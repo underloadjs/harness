@@ -1,6 +1,6 @@
 # 0016 — `query` mode reports `truncated: true` with no `nextOffset`, and `truncated` conflates two causes
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-11 (see **Update (2026-11-11, fix)** at the bottom)
 > **Severity:** Minor
 > **Area:** `src/tools/webfetch/index.ts` (the `query` return path)
 > **Date opened:** 2026-11-10
@@ -130,4 +130,68 @@ complete`. `fetch` `query` mode has no equivalent.
   `src/tools/files/grep.tool.ts:250`.
 - The runtime rows are left **as recorded** (live 2026-11-10): re-running them costs provider
   spend, and the shape they describe is what the code at `:605-631` still produces.
-- Status stays **Open**.
+- Status moved to **Fixed** — closing note below.
+
+## Update (2026-11-11, fix) — closed
+
+- **All three proposal steps shipped**, inside the existing rules (no cap change, no exclusion by
+  section name).
+  1. **`nextOffset` on a byte-budget cut.** `src/tools/webfetch/index.ts:703-705` computes it
+     through `resumeOffsetForCut` (`:345-375`), which walks the emitted blocks with the same
+     `sectionHeader` / `SECTION_SEPARATOR` layout the answer was built with (`:309-316`) and maps
+     the cut back to an offset **in the converted page** — not in the joined answer — using
+     `lineStartOffset(match.line)` as the search hint and the whole document as the fallback.
+     2. **The cause is named.** `stopReason` (`:698-706`) reports which bound closed the answer,
+     in the sibling vocabulary the issue cites (`glob.tool.ts:140`, `grep.tool.ts:250`):
+     `'contentBudget'` ships a resume pointer, `'resultCap'` does not. 3. **Density ranking.**
+     `src/tools/webfetch/sections.ts:148-190` ranks every matching section by hits per character
+     (`countOccurrences:95`, `matchDensity:124`) and applies `maxBlocks` AFTER the sort, so the
+     cap drops the thickest section instead of whatever came first; nothing is excluded.
+- **Decisions worth knowing before re-reading the code.**
+  - The field is **`stopReason`**, not the literal `cause` the proposal sketched — the issue's own
+    wording was "a `stopReason`-style cause", and the two sibling tools already use this name with
+    exactly these two values, so the shared vocabulary won. Contract:
+    `src/types/index.ts:2423-2430`.
+  - When **both** bounds close at once, `contentBudget` wins the name (`index.ts:690-697`): it is
+    the one that ships a resume pointer, so it is the one the caller can act on.
+  - Density is measured on the **trimmed** section text — the same string the caller receives —
+    because ranking on the raw slice let a single trailing whitespace character reorder two
+    otherwise-identical sections. Ties keep document order (`sections.ts:183`).
+- **Criterion-by-criterion.** 1 — a budget cut carries `nextOffset`, and a test proves it resumes:
+  re-fetching at it returns content containing the markers of the sections the cut answer never
+  delivered (`webfetch.test.ts:1685-1704`). 2 — a cap cut reports `'resultCap'` with
+  `nextOffset` absent and `totalMatches > matches` actionable (`:1628-1641`). 3 — the `offset`
+  parameter description now says it is ignored with `query` and what each cause means
+  (`index.ts:481`), pinned by a test (`:1794-1803`). 4 — density order is pinned exactly, not as a
+  range (`:1723` expects `['Details', 'Intro', 'References']`).
+- **A consequence the issue did not spell out, now documented in three places.** The resume offset
+  counts converted-page characters, and `offset` is ignored while `query` is set — so resuming a
+  query answer means **re-fetching at `nextOffset` without `query`**. Stated in the parameter
+  description (`:481`), in the `nextOffset` contract comment
+  (`src/types/index.ts:2400-2406`), and in the branch itself (`index.ts:738-744`). Query mode also
+  stops echoing `offset` entirely: selection runs on the whole page, so echoing a number read as
+  "your offset was applied" (`index.ts:745-748`, test `:1754-1772`).
+- **Proximity answers** (no heading structure) keep their existing note and now also report
+  `stopReason: 'resultCap'` with no `nextOffset` when occurrences were withheld — paging reaches
+  other parts of the page, not the withheld sections (`:1774-1792`).
+- **Public surface.** `WebFetchResult.stopReason` is a new optional field (additive);
+  `nextOffset`'s query-mode semantics are newly written down. The contract lives in
+  `src/types/index.ts`, which is outside this issue's declared area — flag for the package owner.
+- **Anchors this fix moved**: the `query` branch 576-632 → `index.ts:652-751`; the `offset`
+  description 405 → 481; `selectSections` → `sections.ts:148`; `nextOffset` in the types →
+  `:2400-2406`. `MAX_QUERY_BLOCKS = 20` is unchanged, still pinned as a number by a test
+  (`webfetch.test.ts:1626`).
+- **Tests** (`src/tools/webfetch/webfetch.test.ts:1599-1804`, envelope in
+  `src/harness.webfetch.test.ts:418` and `:444`). Cap and ranking are asserted separately, as the
+  issue's test note asked: the cap case gives every section equal density so only the cap can
+  reorder it, and the two ordering cases assert the opposite of document order (a 2,000-character
+  `## References` block last; a 6,000-character wall dropped by the cap while all twenty thin
+  sections survive). The budget case pins the resume offset to the character
+  (`page.indexOf('## Section 05') + 3243`) and then proves it by re-fetching.
+- **Not done here** (as scoped): the per-section length cap, which the issue wants to follow this
+  work, and the markdown verbosity that inflated the measured payload (tracked in 0012 — density
+  ranking shrinks its blast radius, it does not remove it).
+- **Verification.** `vitest run src/tools/webfetch/webfetch.test.ts src/harness.webfetch.test.ts`
+  → 106 passed; `tsc --noEmit -p .` → clean; `vite-node scripts/generate-tool-manifest.mjs
+  --check` → current. The live QEC/Wikipedia rows were not re-run (provider spend); the ordering,
+  cap and budget cases they describe are reproduced offline by the fixtures above.

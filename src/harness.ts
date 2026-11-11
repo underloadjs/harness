@@ -302,6 +302,9 @@ import {
     TOOL_REQUEST_NAME,
     TOOL_CANCEL_NAME,
     prepareToolCandidate,
+    // Issue 0003: the source record of an already-constructed definition (a shared
+    // tool catalogue), derived from captured bytes without re-evaluating the module.
+    prepareToolSourceRecord,
     deleteToolSourceFile,
     discoverToolFolderSources,
     readToolSourceFile,
@@ -477,6 +480,10 @@ import type {
     HarnessToolRegistrationCandidate,
     HarnessToolRegistrationResult,
     HarnessToolSource,
+    // Issue 0003: the shared-catalogue tool shape (`{ tool, source }`) and the
+    // source bytes a prebuilt definition can be installed with.
+    HarnessToolSourceAttachment,
+    HarnessConfiguredTool,
     HarnessMemory,
     HarnessToolRuntime,
     NestedRunPolicy,
@@ -824,6 +831,74 @@ const resolveMaxCreatedTools = (value: number | undefined): number => {
     }
 
     return value;
+};
+
+// Issue 0003 — one entry of `configuration.tools`, normalised. A bare `Tool` keeps
+// the historical shape (no source record). A `{ tool, source }` entry carries the
+// bytes the definition was compiled from, so a host that compiles its user tools ONCE
+// can hand the same definition to every harness instance and still get a real
+// `toolSource()` revision for each one.
+type ConfiguredToolEntry = {
+    definition: Tool;
+    // Registration-candidate fields derived from the attachment; empty when the host
+    // supplied no source, which is what leaves the no-record path intact.
+    source: Pick<
+        HarnessToolRegistrationCandidate,
+        'moduleText' | 'sourcePath' | 'dependencies'
+    >;
+};
+
+// Validated at construction, never silently ignored: an attachment that names no
+// entry form describes no revision, and a host that asked for one deserves the
+// tool's name in the error rather than a missing `toolSource()` later.
+const configuredToolEntry = (name: string, entry: HarnessConfiguredTool): ConfiguredToolEntry => {
+    // A Tool is callable and carries `execute`; the wrapper form is a plain object.
+    const isDefinition = typeof (entry as Tool)?.execute === 'function';
+    const definition = isDefinition
+        ? (entry as Tool)
+        : (entry as { tool?: Tool } | undefined)?.tool;
+
+    if (definition === undefined || typeof definition.execute !== 'function') {
+        throw new HarnessError(`Tool "${name}" is not a tool: create it with tool({...}).`);
+    }
+
+    const source = isDefinition
+        ? undefined
+        : (entry as { source?: HarnessToolSourceAttachment }).source;
+
+    if (source === undefined) return { definition, source: {} };
+
+    if (typeof source !== 'object' || source === null) {
+        throw new HarnessError(
+            `Tool "${name}" source attachment must be an object with moduleText or sourcePath.`
+        );
+    }
+
+    const moduleText = typeof source.moduleText === 'string' ? source.moduleText : undefined;
+    const sourcePath = typeof source.sourcePath === 'string' ? source.sourcePath : undefined;
+
+    if (moduleText === undefined && sourcePath === undefined) {
+        throw new HarnessError(
+            `Tool "${name}" source attachment needs moduleText or sourcePath: an attachment with neither describes no revision.`
+        );
+    }
+
+    const dependencies = source.dependencies;
+
+    if (dependencies !== undefined && !Array.isArray(dependencies)) {
+        throw new HarnessError(
+            `Tool "${name}" source attachment dependencies must be an array of { path, text }.`
+        );
+    }
+
+    return {
+        definition,
+        source: {
+            ...(moduleText === undefined ? {} : { moduleText }),
+            ...(sourcePath === undefined ? {} : { sourcePath }),
+            ...(dependencies === undefined ? {} : { dependencies })
+        }
+    };
 };
 
 // Who may create tools at runtime (R12). Validated at construction so a typo
@@ -2008,6 +2083,40 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         };
     };
 
+    // Issue 0003 — a prebuilt definition registered WITH its source bytes. The
+    // definition is validated and published exactly as `prepareDefinition` always
+    // published it (the host's own object, uncloned, its declared `mode` intact);
+    // only the source record is added, derived from the captured bytes without
+    // re-evaluating the module. That is the whole point of a shared catalogue: the
+    // module's top-level code ran once, at compile time, not once per instance.
+    //
+    // A build without the source compiler (the browser alias) cannot capture or hash
+    // a module graph, so it keeps the historical no-record shape instead of failing
+    // construction of a tool it can otherwise run — the same capability boundary
+    // `registerBaselineSource` already states.
+    const prepareDefinedSource = (
+        definition: Tool,
+        intent: RegistrationIntent
+    ): PreparedTool => {
+        const preparedDefinition = prepareDefinition(definition);
+
+        if (!sourceStartupSupported) return preparedDefinition;
+
+        const derived = prepareToolSourceRecord(intent, preparedDefinition.tool);
+
+        return {
+            tool: preparedDefinition.tool,
+            revision: derived.revision,
+            record: derived.record
+        };
+    };
+
+    // True when a definition candidate also carries the bytes a source record can be
+    // derived from. A bare `definition` keeps returning `undefined` from
+    // `toolSource()`, exactly as documented.
+    const hasSourceBytes = (intent: RegistrationIntent): boolean =>
+        intent.moduleText !== undefined || intent.sourcePath !== undefined;
+
     // The synchronous commit half. Returns everything the public paths need.
     const acceptTool = (
         intent: RegistrationIntent,
@@ -2022,11 +2131,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             preserveOwningPath?: boolean;
         } = {}
     ): { prepared: PreparedTool; result: HarnessToolRegistrationResult } => {
-        // 1. CAPTURE + COMPILE + LOAD + VALIDATE. Nothing below runs on failure.
+        // 1. CAPTURE + COMPILE + LOAD + VALIDATE. Nothing below runs on failure. A
+        // supplied `definition` never loads a module: with source bytes it derives a
+        // record from them (issue 0003), without them it is published as-is.
         const prepared =
             intent.definition === undefined
                 ? prepareToolCandidate(intent, { expectedName: intent.name })
-                : prepareDefinition(intent.definition);
+                : hasSourceBytes(intent)
+                  ? prepareDefinedSource(intent.definition, intent)
+                  : prepareDefinition(intent.definition);
 
         const name = prepared.tool.name;
         const existing = tools[name];
@@ -4214,10 +4327,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // configured tool of the same name intentionally wins. Function-closure tools
     // remain compatible, but they are wrapped in a fresh definition instead of
     // mutating the caller's shared Tool object (`name` is a mutable own property).
-    for (const [name, definition] of Object.entries(configuration.tools ?? {})) {
-        if (!definition || typeof definition.execute !== 'function') {
-            throw new HarnessError(`Tool "${name}" is not a tool: create it with tool({...}).`);
-        }
+    //
+    // Issue 0003: an entry may also be `{ tool, source }`. The wrapper is built the
+    // same way, and the attachment travels with the registration intent, so a
+    // catalogue compiled once by `compileToolSourceModule` can be shared by every
+    // instance this host constructs while each one still reports a real
+    // `toolSource()`/`toolSources()` entry — and the budget stays untouched, because
+    // a configured tool is catalogue state, never a creation.
+    for (const [name, entry] of Object.entries(configuration.tools ?? {})) {
+        const configured = configuredToolEntry(name, entry);
+        const { definition } = configured;
 
         const wrapped = defineTool({
             name,
@@ -4237,7 +4356,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             execute: (context) => definition.execute(context)
         });
 
-        registerAtStartup({ definition: wrapped });
+        // `name` travels too: it is the identity label a captured inline revision is
+        // hashed under, and it matches what the host passed to
+        // `compileToolSourceModule({ name, moduleText })`, so both sides derive the
+        // same revision from the same bytes.
+        registerAtStartup({ name, definition: wrapped, ...configured.source });
     }
 
     // Opt-in web tools (W3/W4). The provider closure (and its credentials) stays
@@ -11971,7 +12094,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 // src/ holds only this file. Everything else is barrelled from its role folder,
 // and re-exported here so the package has one entry point:
 //
-//   core       agent, tool, searchTools, createDynamicTool — usable without a harness
+//   core       agent, tool, searchTools, createDynamicTool, estimateContextTokens —
+//              usable without a harness
 //   transport  openAICompatible, listModels, ModelListError — wire + catalogue
 //   tools      the preset tools        — executable on their own
 //   util       HarnessError            — the error type
@@ -12004,6 +12128,45 @@ export {
 } from './core';
 export type { ToolSelectionOptions, ToolSelectionQuery, ToolSelectionResult } from './core';
 export type { ToolMediaExtraction, ToolResultExtraction } from './core';
+// (issue 0002) The published READ-ONLY tool-source compile, on the same surface as
+// the body compiler above. The two are different operations and the names say so:
+// `compileToolSource` compiles the BODY of an async function with `Function` (what
+// `toolCreate` installs), while `compileToolSourceModule` compiles a whole editable
+// `*.tool.ts` MODULE — metadata + execute, local helpers, live core imports — and
+// answers "is this definition valid?" with metadata, the content-addressed
+// `revision`, the honest `checks` list and a callable `definition` that is
+// registered NOWHERE. No harness, no transport, no registry: constructing one of
+// those to *check* a definition also builds agents and makes a throw ambiguous.
+//
+// TWO LIMITS the entry states rather than implies:
+//   - it is SYNTAX-only. `checks` is the whole claim, and the compiler is
+//     `ts.transpileModule`, never a semantic type checker (docs/runtime-tools.md);
+//   - `evaluate: 'syntax'` opts out of running candidate top-level code, so an
+//     untrusted-source endpoint can answer without its side effects. In that mode
+//     the metadata reported is the candidate's, and there is no loaded `definition`
+//     unless the caller supplies one.
+// `supportsToolCompilation` is the flag a host branches on instead of probing an
+// error string: true on Node, false in the browser build.
+export { compileToolSourceModule, supportsToolCompilation } from './core';
+export type {
+    CompiledToolSourceModule,
+    ToolCompileCandidate,
+    ToolSourceCompileOptions,
+    ToolSourceEvaluateMode,
+    // The record `compileToolSourceModule` returns, named so a host can type the
+    // whole result (it is the same shape `harness.toolSource()` reports).
+    ToolSourceDependency,
+    ToolSourceLiveDependency,
+    ToolSourceRecord
+} from './core';
+// (issue 0004) The "will this transcript fit?" helper, on the published surface. It
+// already backs the UI context bar, the `context-compaction` plugin's `contextLimit`
+// check and the `agent({ maxPromptTokens })` floor, so a host that trims its own
+// history measures with the SAME number instead of inventing a second heuristic that
+// disagrees with all three. An ESTIMATE — `ceil(chars / 4)` over the counted text,
+// total, dependency-free (core/context-estimate.ts states what it counts and why no
+// tokenizer ships).
+export { estimateContextTokens } from './core';
 // R3a persistence: the schema version a caller stores beside a snapshot. The
 // snapshot types (HarnessSnapshot, HarnessAgentSnapshot, ...) and the per-store
 // state types are part of `export type * from './types'` below.
@@ -12077,6 +12240,24 @@ export {
 } from './core';
 export type { ParsedCommand } from './core';
 export { openAICompatible, listModels, ModelListError } from './transport';
+// (issue 0001) The request-body extension's bounds and error code are public for the
+// same reason every other cap here is: a host quotes the number the package actually
+// enforces instead of guessing, and classifies a rejection by code rather than by
+// prose. `provider.extraBody` / `provider.responseFormat` themselves are TYPES, and
+// ride on `export type * from './types'` at the bottom.
+export {
+    MAX_EXTRA_BODY_BYTES,
+    MAX_RESPONSE_SCHEMA_NAME_CHARS,
+    // (issue 0004) `context-overflow` — the one name for "the prompt does not fit",
+    // whether the agent refused before sending or the provider refused after. A host
+    // switches on it instead of matching English, and it is also `error.name`.
+    CONTEXT_OVERFLOW_CODE,
+    PROVIDER_REQUEST_BODY_CODE
+} from './transport';
+// (issue 0001 B) `agent({ structured })` fails two ways, and a host that has to tell
+// "my schema is rejected" from "the model answered something else" switches on these
+// codes (they are also `error.name`), never on prose.
+export { STRUCTURED_OUTPUT_INVALID_CODE, STRUCTURED_SCHEMA_INVALID_CODE } from './core';
 export type { ModelListConfiguration, ModelListErrorKind } from './transport';
 export {
     syntax,

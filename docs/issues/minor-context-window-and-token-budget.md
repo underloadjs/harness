@@ -1,6 +1,6 @@
 # 0004 — No pre-request context guard, and no provider overflow classification
 
-> **Status:** Open — reduced on 2026-11-08 (closed parts deleted)
+> **Status:** Fixed — 2026-11-11 (see **Update (2026-11-11) — closed**)
 > **Severity:** Minor (was Significant — the remaining gap is a guard and an error
 > classification, not a missing capability)
 > **Area:** `src/transport/openai.ts`, `src/core/agent.ts`, `src/types/index.ts`, `src/harness.ts`
@@ -148,4 +148,92 @@ the wire.
 - `src/core/context-estimate.ts:167`/`:221`/`:250`,
   `src/core/context-pruning.ts:90`/`:361`, `src/core/agent.ts:25-30` and
   `README.md:12-14` were re-checked and are still exact.
+
+## Update (2026-11-11) — closed
+
+All four parts of the proposal shipped, in the proposal's order, and nothing was
+redesigned: the estimator is published, the guard is a floor that refuses before the
+socket opens, the provider's own overflow answer is a named failure, and the README
+says what the package does. **Gap**, **Evidence**, **Proposal**, **Acceptance
+criteria** and **Tests to add** are left as filed — the issue closed whole, not in
+part, so nothing is deleted from them; the section below records what shipped and what
+the implementation settled that the proposal left open.
+
+**What shipped**
+
+- **(1) The estimator is public.** `estimateContextTokens` is re-exported from the
+  root barrel (`src/harness.ts:12008-12015`, through
+  `src/core/index.ts:282-291`), with the contract — an estimate, `ceil(chars / 4)`,
+  what it counts and what it excludes — stated on the helper itself
+  (`src/core/context-estimate.ts:161-181`).
+- **(2) The pre-request guard.** `provider.contextWindow`
+  (`src/types/index.ts:581-605`) and `agent({ maxPromptTokens })`
+  (`src/types/index.ts:659-682`), validated at construction (`requireContextWindow`,
+  `src/core/agent.ts:551-589`), enforced on the exact transcript about to be sent and
+  **outside** the retry sequence (`src/core/agent.ts:908-958`): a typed
+  `context-overflow` (`HarnessError.code`, also `error.name`, also the first token of
+  the message) naming the estimate and the window, with
+  `details: { estimatedTokens, contextWindow, model, agent }` for a caller that has to
+  recover. No fetch, no retry, no `retry` event, and `stream()` still rolls its own
+  prompt back.
+- **(3) The provider's own overflow answer.** A 413 (by status) or a 400 whose body
+  matches one of eight documented wordings
+  (`CONTEXT_OVERFLOW_PATTERNS` / `isContextOverflowResponse`,
+  `src/transport/openai.ts:1082-1091`/`:1116-1121`) yields an error frame carrying
+  `code: 'context-overflow'` (`:1063`) and a message that leads with it, quoting at
+  most 300 collapsed characters of the provider's line instead of the whole body
+  (`:1295-1313`). The frame's optional `code` (`HarnessStreamEvent`,
+  `src/types/index.ts:447-459`) rides onto the thrown `HarnessError` in
+  `attemptRequest` (`src/core/agent.ts:1018`/`:1048`), and the retry owner rethrows
+  that code on the first attempt (`src/core/agent.ts:1108-1121`) — cancellation's
+  precedent, as this issue said.
+- **(4) The README.** A paragraph in the `agent()` section, immediately after the
+  "no compaction" line, states what is measured, what the estimate counts and
+  excludes, what the floor refuses, what is never retried, and that
+  `turn.before` plus the shipped `context-compaction` plugin (`contextLimit`) own
+  replacement policy.
+
+**Decisions the proposal left open, and what the implementation chose**
+
+- **One guard, in the agent.** `provider.contextWindow` is enforced by `agent()`, not
+  by `openAICompatible`, so the same floor covers a custom `stream` and the failure
+  lands where the retry decision lives. A host calling the transport directly has no
+  guard and measures with the published helper — stated on the field.
+- **`maxPromptTokens` wins over `provider.contextWindow`** (agent scope is narrower
+  than endpoint scope), and **both** spellings are validated even when one is shadowed,
+  so a typo in the losing field is not a silently dead setting.
+- **Checked after `turn.before`.** The guard measures the projection it is handed, so
+  a compaction pass gets its chance to shrink the transcript first and the floor only
+  refuses what survives policy — the "floor, not a second policy owner" line from the
+  proposal, made literal.
+- **Status-gated classification.** Only 413 and 400 can be an overflow, whatever the
+  body says: a 401 or a 5xx quoting the provider's own context docs stays the plain
+  frame it always was, because the remedy there is not "send less". A 400 that matches
+  no pattern keeps its raw detail, so the worst case is the pre-0004 frame, never a
+  wrong diagnosis.
+- **Fork and thread inherit the floor**, re-spelled as `maxPromptTokens` because both
+  carry the resolved transport rather than the provider block — a branch that dropped
+  it would send what its source refuses.
+- **Only the plain estimator is published.** The provider-anchored
+  `estimateContextTokensHybrid` and its `ContextTokenAnchor` stay internal; the
+  proposal publishes the one helper a host needs, and a host that wants the anchored
+  number and the heuristic to agree has to wait for a reason to publish the anchor.
+- **The refusal says what the estimate does not see.** Both the guard's message and the
+  provider frame's message name the exclusions (attachment bytes, and the tool schemas
+  that ride in the same request body). A host that reads only "estimated 100 against a
+  99 window" would reach for the wrong knob: those tokens are real and are outside the
+  measurement, so a tool-heavy agent has to shrink its schemas or its media, not its
+  transcript.
+
+**Tests** — `src/core/agent.test.ts` (12 cases: the published helper and code, refusal
+before `fetch`, zero transport calls and no `retry` event under a 3-retry policy, the
+`details` pair, a fitting transcript sent byte-for-byte, the projection path, a
+provider overflow frame not retried, an ordinary failure still retried with no code on
+its payloads, both precedence directions, construction-time validation, and a fork);
+`src/transport/openai.test.ts` (8 cases: the OpenAI and Anthropic wordings, a 413 by
+status, all eight patterns, an unrelated 400 and four non-overflow statuses keeping
+the raw frame with no `code` key, and the whitespace collapse and 300-character cap);
+`src/structure.test.ts` (the root barrel carries the helper and the code); and
+`scripts/check-package-types.mjs` carries both names plus both configuration fields in
+the NodeNext and `customConditions: ["browser"]` consumer fixtures.
 

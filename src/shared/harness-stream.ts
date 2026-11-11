@@ -158,23 +158,52 @@ export type HarnessEventType =
 export interface TurnDisplayOp {
     op: "turn" | "section:open" | "section:set" | "section:remove" | "node:insert" | "node:append" | "node:set" | "node:remove" | "step:set" | "context:add" | "context:set" | "context:remove" | "tail:set" | "tail:clear" | "pending:set" | "usage" | "attempt:commit" | "attempt:discard";
     turnId?: string;
+    /**
+     * For the `turn` op: the whole row to upsert by id (queued, running, and terminal transitions all ride this
+     * one place).
+     */
     turn?: TurnSummary;
+    /**
+     * For a `usage` op the literal `turn` means the turn-wide figures, a section id means that invocation's own
+     * line.
+     */
     sectionId?: string;
+    /** `section:open` only: the whole section, established before anything names it. */
     section?: TurnSection;
+    /** `node:insert` only: the whole node. */
     node?: DisplayNode;
+    /** `step:set` only: the whole step object, replacing whatever held the same id. */
     step?: DisplayStep;
+    /** `context:add` only: the whole context segment, metadata only. */
     block?: ContextBlock;
+    /** `tail:set` only: the whole descriptor, identity plus payload, replacing the previous designation. */
     tail?: DisplayTail;
     nodeId?: string;
+    /** `attempt:discard` only: exactly which nodes to drop. */
     nodeIds?: string[];
     blockId?: string;
     stepId?: string;
+    /**
+     * `node:append` only: bounded incremental text. Deltas for one node arrive in order, so concatenation is
+     * the whole rule.
+     */
     delta?: string;
+    /**
+     * Position WITHIN the section's own list, used only for out-of-order recovery, which keeps the normal
+     * stream free of bookkeeping.
+     */
     index?: number;
+    /**
+     * Field-level patch whose keys mirror the addressed object (`section:set`, `node:set`, `context:set`):
+     * `TurnSectionPatch`, `DisplayNodePatch`, `ContextBlockPatch`. A key the patch omits is unchanged; a key it
+     * names is replaced.
+     */
     patch?: {
       [key: string]: unknown;
       };
+    /** `pending:set` only, and ABSENT means "nothing is pending", which is a statement, not an omission. */
     pending?: HarnessPendingTool[];
+    /** `usage` op only: the turn's running tally AFTER this point, as the server summed it. */
     usage?: HarnessUsage;
     latestInput?: number;
     cachedInput?: number;
@@ -191,23 +220,76 @@ export interface TurnDisplayOp {
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface WsStreamLimits {
+    /** Deployment-tunable. A 65th concurrent subscription answers `too_many_subscriptions`, then close 4401. */
     subscriptions_per_connection: number;
+    /**
+     * Fixed. Maximum `TurnDisplayOp` entries in one `display.ops` frame; more ops become more frames, never a
+     * bigger one. Mirrors `x-websocket.limits.ops_per_update_frame` and `WsUpdateDisplayOps.ops.maxItems`.
+     */
     ops_per_update_frame: number;
+    /**
+     * Fixed. Maximum characters in one `node:append` delta, which bounds a frame against a fast model. Mirrors
+     * `TurnDisplayOp.delta.maxLength`.
+     */
     delta_chars_per_append_op: number;
+    /**
+     * Fixed. Maximum recorded events in one opt-in `run.event` frame. Mirrors
+     * `WsUpdateRunEvent.events.maxItems`.
+     */
     events_per_update_frame: number;
+    /**
+     * Fixed. Maximum ids in one invalidation frame. Mirrors `WsUpdateToolRegistry.ids.maxItems` and
+     * `WsUpdateCatalogue.ids.maxItems`.
+     */
     ids_per_invalidation_frame: number;
+    /**
+     * Fixed. A larger client frame is `frame_too_large`, then close 1009. Mirrors
+     * `x-websocket.framing.max_client_frame_bytes`.
+     */
     max_client_frame_bytes: number;
+    /** Fixed. The server never emits a larger frame, so a client can size one buffer and keep it. */
     max_server_frame_bytes: number;
+    /**
+     * Deployment-tunable. Sustained excess answers `rate_limited`, then close 4429. Mirrors
+     * `x-websocket.framing.client_messages_per_second`.
+     */
     client_messages_per_second: number;
+    /** Fixed. Mirrors `x-websocket.heartbeat.interval_ms`. */
     heartbeat_interval_ms: number;
+    /** Fixed. Missed `pong` replies before the server closes. Mirrors `x-websocket.heartbeat.timeout_intervals`. */
     heartbeat_timeout_intervals: number;
+    /** Fixed. The close code used when the heartbeat budget is exhausted. */
     heartbeat_timeout_close_code: 4408;
+    /**
+     * Fixed. Frames retained per subscription for a reconnecting cursor. Mirrors
+     * `x-websocket.replay.retained_frames_per_subscription`.
+     */
     replay_frames: number;
+    /** Fixed. How long retained frames stay valid; whichever of the two bounds ends first applies. */
     replay_seconds: number;
+    /**
+     * Deployment-tunable. Backlog at which the server starts dropping update frames. Mirrors
+     * `x-websocket.backpressure.send_queue_frames`.
+     */
     send_queue_frames: number;
+    /** Deployment-tunable. Byte half of the backlog bound. Mirrors `x-websocket.backpressure.send_queue_bytes`. */
     send_queue_bytes: number;
+    /**
+     * Deployment-tunable. How long a full send queue may persist before close 1013. Mirrors
+     * `x-websocket.backpressure.sustained_stall_ms`.
+     */
     sustained_stall_ms: number;
+    /**
+     * Deployment-tunable. On a `pace: ack` subscription, how long the server waits for the next `ack` before it
+     * converts that subscription to `resync_required` instead of queueing without bound. Mirrors
+     * `x-websocket.backpressure.ack_paced_rule`.
+     */
     ack_timeout_ms: number;
+    /**
+     * Fixed. The size of the per-scope revision baseline array (`WsSubscriptionState.revisions`), which is the
+     * number of `StreamResourceKind` values a scope can publish. Bounding it is what keeps a subscription
+     * answer a constant-size frame.
+     */
     revision_records_per_state: number;
 }
 
@@ -228,10 +310,24 @@ export type WsSubscriptionScope =
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface WsSubscriptionFilters {
+    /** `session` scope only: publish turn rows in these recorded statuses. */
     status?: SessionTurnStatus;
+    /** `session` scope only: rows for one conversation. */
     thread_id?: string;
+    /**
+     * '`session` scope only, default false: add `run.event` frames carrying verbatim recorded events. Debug and
+     * inspection traffic; a render path never turns this on.'
+     */
     events?: boolean;
+    /**
+     * `turn` scope, default true: when false, node and step payloads are suppressed and only metadata-bearing
+     * ops arrive.
+     */
     sections?: boolean;
+    /**
+     * `turn` scope, default true: when false, `context:*` ops are suppressed for a client not drawing the
+     * context bar.
+     */
     context?: boolean;
 }
 
@@ -305,9 +401,12 @@ export interface WsRevisionRecord {
  */
 export interface WsResourceLink {
     resource: StreamResourceKind;
+    /** The instance the counter belongs to, or null for a host-wide resource. */
     id: string | null;
+    /** The current revision of THAT counter at the moment the resync was issued. */
     revision: number;
     epoch: string;
+    /** Absolute path under the mount, e.g. `/v1/harness/sessions/8c1b/turns?limit=25`. */
     link: string;
 }
 
@@ -361,6 +460,7 @@ export interface WsSubscribeGlobal {
     type: "subscribe";
     subscription_id: string;
     scope: "global";
+    /** No filter is published for this scope; any key answers unsupported_filter. */
     filters?: Record<string, never>;
     pace?: "ordered" | "ack";
     cursor?: string;
@@ -392,6 +492,7 @@ export interface WsSubscribeThread {
     scope: "thread";
     session_id: string;
     thread_id: string;
+    /** No filter is published for this scope; any key answers unsupported_filter. */
     filters?: Record<string, never>;
     pace?: "ordered" | "ack";
     cursor?: string;
@@ -513,11 +614,25 @@ export interface WsSubscriptionState {
     subscription_id: string;
     scope: WsSubscriptionScope;
     epoch: string;
+    /** Always 0 for a new subscription; frames above it are new information. */
     sequence: number;
     cursor: string;
+    /**
+     * The atomic counter baseline at registration: one `WsRevisionRecord` per kind THIS scope publishes, keyed
+     * by resource kind and instance id (see `StreamResourceKind` for the per-scope sets). A REST read issued
+     * after this frame that returns a revision at or above the matching record already reflects everything the
+     * stream has said, so any frame at or below `sequence` is redundant for that kind. Comparisons are per
+     * kind, per id, per epoch - never across kinds and never across epochs.
+     */
     revisions: WsRevisionRecord[];
     filters_applied?: WsSubscriptionFilters;
     replayed_frames?: number;
+    /**
+     * The authoritative kind set THIS subscription may send, after its scope and applied filters. It is stated
+     * per connection rather than assumed from the document, so a client knows whether `run.event` is coming
+     * (the `events` filter) and can ignore a kind it was never promised. Adding a kind means re-subscribing,
+     * never renegotiating.
+     */
     publishes: WsUpdateKind[];
 }
 
@@ -802,9 +917,21 @@ export type WsUpdate =
 export interface WsResyncRequired {
     type: "resync_required";
     subscription_id: string;
+    /**
+     * Exactly three causes, and each one says what the client must do. `cursor_expired` = the resume cursor is
+     * older than the replay window (the advertised `replay_frames` / `replay_seconds`), so the client re-reads
+     * the listed resources. `epoch_mismatch` = the cursor came from a previous server lifetime, so every
+     * retained position is dead. `frames_dropped` = the server is still live and this subscription lost frames
+     * it could not deliver (send-queue backpressure or an expired ack), so the client re-reads the listed
+     * resources and keeps its cursor at `cursor`. A filter problem is NOT a reason here: it is reported by
+     * `WsProtocolError{ code: unsupported_filter }` at subscribe time, which is the single place that condition
+     * is ever stated.
+     */
     reason: "cursor_expired" | "epoch_mismatch" | "frames_dropped";
     epoch: string;
+    /** The cursor a client resumes FROM, which is the oldest position still retained. */
     cursor: string;
+    /** How many frames this subscription can no longer receive, so a client can bound its re-reads. */
     lost_frames?: number;
     resources: WsResourceLink[];
 }
@@ -817,10 +944,25 @@ export interface WsResyncRequired {
  */
 export interface WsProtocolError {
     type: "error";
+    /**
+     * One code per condition, decided in the single precedence order in `x-websocket.validation_precedence`.
+     * `invalid_payload` covers every client-union failure, INCLUDING a `scope` value outside the fixed enum
+     * (there is no negotiated scope, so there is no separate scope code). `unknown_resource` is a valid frame
+     * whose required session, thread, or turn id does not exist. `unknown_subscription` names a
+     * `subscription_id` this connection never opened or already closed. `late_hello` is a `hello` that arrived
+     * after the first `subscribe`. `too_many_subscriptions` and `rate_limited` carry the advertised close code
+     * when the deployment closes; `frame_too_large` and `internal` may also close.
+     */
     code: "invalid_payload" | "unknown_subscription" | "unknown_resource" | "unsupported_filter" | "late_hello" | "too_many_subscriptions" | "frame_too_large" | "rate_limited" | "internal";
+    /** Names the offending field or budget, and never contains a credential. */
     message: string;
     subscription_id?: string;
+    /**
+     * True when resending the same frame after the stated condition changes can succeed (a full subscription
+     * budget, an internal stall); false when the frame itself is wrong.
+     */
     retryable: boolean;
+    /** Present when this error is fatal to the connection. */
     close_code?: number;
 }
 

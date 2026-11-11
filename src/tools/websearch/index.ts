@@ -341,16 +341,62 @@ const readInvocation = (
         throw new HarnessError('search "until" must not be earlier than "since".');
     }
 
+    // Every remaining field is read here, in exactly the order the returned
+    // object used to evaluate them (maxResults, provider, includeDomains,
+    // excludeDomains, category, speed). Hoisting is only so the combination
+    // checks below run on validated values; a caller that passes both a bad
+    // field and a bad combination still gets the precise field error first,
+    // which is the precedence the existing filter tests already pin.
+    const maxResults = readMaxResults(input?.maxResults);
+    const provider = readProvider(input?.provider, configured, fallback);
+    const includeDomains = readDomains(input?.includeDomains, 'includeDomains');
+    const excludeDomains = readDomains(input?.excludeDomains, 'excludeDomains');
+    const category = readCategory(input?.category);
+    const speed = readSpeed(input?.speed);
+
+    // Combination rules the model-facing description already states (see the
+    // `category` property in metadataFor) but nothing enforced, so a caller that
+    // read the warning still paid a provider round trip for `Exa search failed
+    // (HTTP 400).` — a message naming no field, because provider bodies are
+    // deliberately never surfaced (request.ts, statusFailure). Same policy as the
+    // domain grammar and the ISO date check above: the provider answers these
+    // with a bare 400, so catching it here costs nothing and names the fix.
+    //
+    // Gated on the validated readDomains result, never raw input, so
+    // `excludeDomains: []` keeps throwing its `/array of 1-20 domains/` error
+    // rather than reaching here as an empty-but-defined filter.
+    //
+    // Only the four combinations verified against the live provider are refused;
+    // `company` + excludeDomains and `news` + date filters both work remotely and
+    // must not be over-rejected.
+    if (category === 'people' && (since !== undefined || until !== undefined)) {
+        throw new HarnessError(
+            'search category "people" does not support date filters. Drop "since"/"until", or use another category.'
+        );
+    }
+
+    if (category === 'company' && (since !== undefined || until !== undefined)) {
+        throw new HarnessError(
+            'search category "company" does not support date filters. Drop "since"/"until", or use another category.'
+        );
+    }
+
+    if (category === 'people' && excludeDomains !== undefined) {
+        throw new HarnessError(
+            'search category "people" does not support "excludeDomains". Drop the category or the domain filter.'
+        );
+    }
+
     return {
         query,
-        maxResults: readMaxResults(input?.maxResults),
-        provider: readProvider(input?.provider, configured, fallback),
-        includeDomains: readDomains(input?.includeDomains, 'includeDomains'),
-        excludeDomains: readDomains(input?.excludeDomains, 'excludeDomains'),
+        maxResults,
+        provider,
+        includeDomains,
+        excludeDomains,
         since,
         until,
-        category: readCategory(input?.category),
-        speed: readSpeed(input?.speed)
+        category,
+        speed
     };
 };
 

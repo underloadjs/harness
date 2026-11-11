@@ -1100,8 +1100,16 @@ paths:
         data for a session rail and carries no authority, so two sessions may share one title; it is trimmed
         and then TRUNCATED to 200 characters server-side rather than refused, and a value that is not a
         string is ignored instead of rejected. `settings.api_key` is
-        accepted here, used for this session only, and never echoed back. The answer is the created
-        session resource (metadata plus counters), not a conversation tree.
+        accepted here, used for this session only, and never echoed back. `messages` SEEDS the conversation:
+        it is the transcript the entry agent's default conversation holds BEFORE the first turn, so a client
+        can import an existing history or fork a conversation at an arbitrary turn instead of starting empty.
+        The list is validated by the same reader the runtime and restore use, so a malformed entry is a 400
+        that creates NOTHING - unlike a transcript PUT, where a broken document is a successful write stored
+        as unreadable. It is then written through that SAME transcript write (whole-document replace, live-work
+        guard, durable before the answer), which replaces the profile-seeded instruction: the seeded list IS
+        what the first provider request sees, entry for entry, including a `system` entry when the client
+        supplies one. The answer is the created session resource (metadata plus counters), not a conversation
+        tree.
       requestBody:
         required: true
         content:
@@ -1116,6 +1124,16 @@ paths:
                   title: Repo survey
                   settings:
                     model: merge/ds4-pro
+              seeded:
+                summary: Create a session that already contains a conversation
+                value:
+                  harness: general
+                  title: Imported history
+                  messages:
+                    - role: user
+                      content: What does this repository do?
+                    - role: assistant
+                      content: It is a harness package with a server API.
       responses:
         '201':
           description: Created session.
@@ -5523,8 +5541,9 @@ components:
       type: object
       description: >-
         Selects the definition to freeze and optionally overrides the endpoint settings for THIS session only.
-        Recorded history, member set, and tool list are not accepted: a session is created from a definition,
-        not configured into one.
+        The member set and tool list are not accepted: a session is created from a definition, not configured
+        into one. `messages` is the one piece of recorded state a client may supply, and only as the transcript
+        the new conversation starts with.
       required: [harness]
       additionalProperties: false
       properties:
@@ -5546,6 +5565,20 @@ components:
             a value that is not a string is ignored on create (a patch is stricter and refuses it with 400).
         settings:
           $ref: '#/components/schemas/RunnerSettingsInput'
+        messages:
+          type: array
+          description: >-
+            Optional SEED for the entry agent's default conversation, in transcript shape: the messages the
+            first provider request sees, in order. Absent means the profile's own seeded instruction. Present
+            (including empty) means this list REPLACES that conversation, exactly as a transcript PUT does, so
+            a seed without a `system` entry runs the agent with no instruction until the next reset. Every
+            entry is validated by the same reader the runtime and snapshot restore enforce, BEFORE anything is
+            created: an unknown role, an unknown key, or a non-string content is a 400 that leaves no session,
+            and the write then carries the transcript route's live-work guard and durability. An optional
+            `messageId` on an entry is honoured as a stable address and backfilled when absent, like any other
+            transcript write.
+          items:
+            $ref: '#/components/schemas/HarnessMessage'
     UpdateSessionRequest:
       type: object
       description: >-

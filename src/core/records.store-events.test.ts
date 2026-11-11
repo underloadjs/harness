@@ -32,6 +32,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRecordEngine } from './records';
+import type { RecordStoreWindow } from './records';
 import type { RecordStoreDelta, RecordStoreNotification, RecordStoreView } from '../types';
 
 // THE FROZEN CLOCK. Every store timestamp (an entry's `updatedAt`, a feed entry's `at`)
@@ -425,18 +426,26 @@ describe('the reset rule — an honest reader says when a cursor is no longer an
 
         // `since: 0` is CURRENT after a reset (the store genuinely is at 0), so it is not a
         // reset; `since: 5` is a watermark this store never had, so it is.
+        //
+        // 0011 — every delta now carries `oldestAvailableRev`, the floor of the retained
+        // store-wide window. An EMPTY window reports `storeRev + 1`: nothing at or below the
+        // head survives, so the reader is current only at exactly `storeRev`. The harness REST
+        // projection (../server/api-reads.ts `recordsDeltaOf`) maps its row keys by name, so
+        // this stays engine-side until that pass chooses to surface it.
         expect(engine.changesSince(0)).toEqual({
             storeRev: 0,
             collectionsRev: 1,
             changes: [],
-            reset: false
-        } satisfies RecordStoreDelta);
+            reset: false,
+            oldestAvailableRev: 1
+        } satisfies RecordStoreDelta & RecordStoreWindow);
         expect(engine.changesSince(5)).toEqual({
             storeRev: 0,
             collectionsRev: 1,
             changes: [],
-            reset: true
-        } satisfies RecordStoreDelta);
+            reset: true,
+            oldestAvailableRev: 1
+        } satisfies RecordStoreDelta & RecordStoreWindow);
     });
 
     it('reseeds the watermark on restore and clears the feed, so every other cursor re-bootstraps', async () => {
@@ -462,17 +471,22 @@ describe('the reset rule — an honest reader says when a cursor is no longer an
             reason: 'restore'
         });
         expect(engine.view()).toMatchObject({ storeRev: 1, collectionsRev: 2, changes: [] });
+        // 0011 — the restored store has a watermark of 1 and an EMPTY feed (a restore starts
+        // a fresh epoch), so its floor is 2: a cursor at 1 is current, anything below it has
+        // been dropped and says so via `reset`.
         expect(engine.changesSince(1)).toEqual({
             storeRev: 1,
             collectionsRev: 2,
             changes: [],
-            reset: false
+            reset: false,
+            oldestAvailableRev: 2
         });
         expect(engine.changesSince(0)).toEqual({
             storeRev: 1,
             collectionsRev: 2,
             changes: [],
-            reset: true
+            reset: true,
+            oldestAvailableRev: 2
         });
     });
 
@@ -481,11 +495,14 @@ describe('the reset rule — an honest reader says when a cursor is no longer an
 
         await run(engine, 'tasks', { tasks: [{ text: 'A' }] }, 'writer');
 
+        // 0011 — an untrimmed window reports its own oldest event: the single add sits at
+        // seq 1, so the floor is 1 and a `since: 1` cursor is genuinely current.
         expect(engine.changesSince(1)).toEqual({
             storeRev: 1,
             collectionsRev: 0,
             changes: [],
-            reset: false
+            reset: false,
+            oldestAvailableRev: 1
         });
     });
 
@@ -512,6 +529,11 @@ describe('the reset rule — an honest reader says when a cursor is no longer an
         // entries come back. The flag is the point; the tail is a courtesy.
         expect(engine.changesSince(0).reset).toBe(true);
         expect(engine.changesSince(0).changes).toHaveLength(200);
+        // 0011 — the SECOND envelope this issue names (the store-wide feed). `reset` says a gap
+        // happened; the floor says where the reader resumes, and it is the `seq` of the oldest
+        // retained event — the same number `view().changes[0].seq` already showed.
+        expect(engine.changesSince(0).oldestAvailableRev).toBe(11);
+        expect(engine.changesSince(0).oldestAvailableRev).toBe(engine.changesSince(0).changes[0].seq);
 
         // A cursor inside the window resumes exactly: the 90 chapters adds, gap-free, and the
         // collection's OWN revision restarts at 1 while the store position keeps climbing.
@@ -519,6 +541,9 @@ describe('the reset rule — an honest reader says when a cursor is no longer an
 
         expect(resumed.reset).toBe(false);
         expect(resumed.storeRev).toBe(210);
+        // 0011 — the floor is a property of the window, not of the cursor: a reader that is
+        // covered still sees where the retained log begins, so it can size its own lag.
+        expect(resumed.oldestAvailableRev).toBe(11);
         expect(resumed.collectionsRev).toBe(0);
         expect(resumed.changes).toHaveLength(90);
         expect(resumed.changes[0]).toEqual({

@@ -323,7 +323,9 @@ src/server/
   index.ts              server barrel -> @underload/harness/server
   start.ts              startHarnessServer: standalone node:http server (explicit)
   api.ts                transport-neutral dispatcher: routes, body policy, bootstrap
-  handler.ts            Node adapter on /v1/harness; no header gate (T15); dormant SSE writer
+  handler.ts            Node adapter on /v1/harness; no header gate (T15); SSE by bridging
+                        `runHarnessSseStream` onto the ONE exported writer
+                        `createHarnessSseResponse` (./service.ts, issue 0006)
   service.ts            @underload/service adapter: /v1/harness, Origin gate, raw SSE
   runtime.ts            lazy shared store/catalogue for the service routes, keyed by root
   persistence.ts        durable database: versioned JSON DTO, atomic write, validation
@@ -689,6 +691,19 @@ const brain = agent({ model, instruction, provider });   // name optional
 
 - `instruction` accepts a string or an array; each entry becomes its own system
   message, in order. Seed `messages` follow the instructions.
+- `structured: schema` (issue 0001) — "send the schema AND hand me a validated
+  value". It rides into the built-in transport as `provider.responseFormat`
+  (`json_schema`, name derived from the agent name) unless the host set
+  `responseFormat` explicitly, and it becomes the acceptance test every answer
+  passes: `validateSchemaValue` — the same gate a created tool's arguments pass —
+  and the parsed value lands on the turn as `message.structured`. A bad answer is a
+  `HarnessError` with code `structured-output-invalid` and NO commit to history
+  (never a silent `{}`), and it is deliberately NOT a transport retry: the provider
+  answered, so the retry loop already finished. A `stopReason: 'length'` truncation
+  or a `stopReason: 'tool_calls'` round is not judged, so a truncated answer stays
+  distinguishable from a malformed one. The schema itself is gated at construction
+  by `checkToolSchemaComplexity` (`structured-schema-invalid`), and forks and
+  threads inherit it.
 - `name` is optional (default `'agent'`). **A harness overwrites it with its
   registry key**, so `agents: { writer: agent({...}) }` gives `agent.name ===
   'writer'` without repeating the name.
@@ -2730,15 +2745,41 @@ watcher frames, restart replay, lane bypass, 400s),
 ## openAICompatible
 
 ```ts
-const stream = openAICompatible({
-    baseURL,                 // trailing slashes trimmed; /chat/completions appended
-    apiKey,                  // string or () => string, resolved per request
-    headers,                 // merged over generated headers
-    sampling                 // temperature, top_p, max_tokens, presence/frequency_penalty
-});
+const stream = openAICompatible(
+    {
+        baseURL,                 // trailing slashes trimmed; /chat/completions appended
+        apiKey,                  // string or () => string, resolved per request
+        headers,                 // merged over generated headers
+        sampling,                // temperature, top_p, max_tokens, presence/frequency_penalty
+        extraBody,               // Record | (request) => Record — merged FIRST
+        responseFormat           // 'text' | 'json' | { jsonSchema: { name, schema, strict? } }
+    },
+    { buildBody }                // (body, request) => body — the composable seam (issue 0001)
+);
 ```
 
-- Posts `{ model, stream: true, messages, tools?, ...sampling }`.
+- Posts `{ model, stream: true, messages, tools?, ...sampling }` — byte-for-byte
+  when none of the three seams below is used. `extraBody` is spread FIRST, so the
+  first-class fields written after it always win; an `extraBody` `tools` key is
+  REMOVED rather than outranked (a declared tool list is the harness's, and an
+  out-of-band list produces calls with no implementation). `stream` is not
+  overridable through `extraBody` at all: it decides what the reader parses.
+- `extraBody` / `responseFormat` are validated at TRANSPORT CONSTRUCTION (a
+  `HarnessError` with code `provider-request-body`, message naming the field):
+  plain JSON object only, no `undefined`/function/symbol values, no cycles, and at
+  most `MAX_EXTRA_BODY_BYTES` (8 KiB) serialized. A `responseFormat.jsonSchema.name`
+  must match a gateway's `[a-zA-Z0-9_-]{1,MAX_RESPONSE_SCHEMA_NAME_CHARS}`. The
+  function form is called once per request, AFTER the model/transcript/tools are
+  resolved, and a rejected result is an `error` frame with nothing sent.
+- `responseFormat` maps to `response_format`: `{ type: 'text' }`,
+  `{ type: 'json_object' }`, or `{ type: 'json_schema', json_schema: { name, schema,
+  strict? } }`. `strict` is omitted when unset, and a first-class
+  `responseFormat` beats an `extraBody` key of the same name.
+- `options.buildBody` receives that assembled body plus the request and returns the
+  body to serialize — the seam that keeps message mapping, attachment parts, video
+  policy, aborting, error scrubbing and this SSE reader reusable. Its result must be
+  a plain JSON object (else an `error` frame), and serialization happens BEFORE
+  fetch so a cycle is an honest body error rather than a fake network failure.
 - Maps internal messages to the wire format: assistant `toolCalls` become
   `tool_calls[{ id, type: 'function', function: { name, arguments } }]`, and
   `role: 'tool'` becomes `{ role: 'tool', tool_call_id, content }`.
@@ -2755,8 +2796,10 @@ const stream = openAICompatible({
   on the terminal frame, ordered by index. Partial arguments are never executed.
 - A provider that reports tool calls without `finish_reason` is treated as a
   tool turn (`stopReason: 'tool_calls'`).
-- Does **not** send `stream_options` — several gateways reject unknown request
-  fields. Usage is parsed when a provider volunteers it.
+- Does **not** send `stream_options` BY DEFAULT — several gateways reject unknown
+  request fields. Usage is parsed when a provider volunteers it. A host that needs
+  the opt-in asks for it per agent:
+  `provider.extraBody: { stream_options: { include_usage: true } }`.
 - Reads reasoning from `delta.reasoning_content` (DeepSeek-compatible) or
   `delta.reasoning`.
 - Ignores non-`data:` lines (`event:`, `id:`, `:` comments). Stops at `[DONE]`.
@@ -2930,8 +2973,15 @@ duplicate/reused id before it launches or persists the call.
         total: number;
         cached?: number; // replayed prefix the provider served from cache, when reported
     };
+    structured?: unknown;   // ONLY for an agent({ structured }): the parsed, validated answer
 }
 ```
+
+`structured` is written only when a `structured` agent's answer PASSED the schema,
+and the key is absent (never `undefined`) otherwise — including for every agent
+that did not configure one, for a `length`-truncated turn, and for a tool-call
+round. A turn whose answer failed the schema never produces this message at all:
+it fails with code `structured-output-invalid` and commits nothing.
 
 `usage.cached` is optional and never defaulted: “not reported” and “reported, 0”
 are different facts. The transport reads it from `prompt_tokens_details.cached_tokens`
@@ -3236,7 +3286,8 @@ as their own entries.
 - **Server (`src/server/`)** owns HTTP and sessions, not harness policy. Routing and
   validation live in transport-neutral `api.ts`; `handler.ts` is only the Node
   adapter for the ONE mount `/v1/harness` (no header gate since T15, streamed body
-  bound, an SSE writer kept dormant) and
+  bound, SSE served by piping `runHarnessSseStream` onto the one exported writer
+  `createHarnessSseResponse`) and
   `service.ts` the `@underload/service` adapter for the SAME mount (Origin gate,
   content-length/serialized body bound, raw SSE `Response` for a streamed result).
   CORRECTED IN PLACE 2026-11-11: this bullet called `handler.ts` "the Node adapter for

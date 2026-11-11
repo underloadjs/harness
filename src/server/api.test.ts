@@ -105,10 +105,12 @@ const SETTINGS: RunnerSettings = {
 
 const DEFAULTS = { baseURL: 'http://provider.test/v1', model: 'demo-model', hasApiKey: true };
 
-// The nine cards this file sees: the seven shipped production templates PLUS the two scripted
+// The ten cards this file sees: the eight shipped production templates PLUS the two scripted
 // fixtures injected by `createRuntime`. `general` is FIRST because it is the default card
-// (DEFAULT_CLI_PRESET), and the live order mirrors `AGENT_PROFILE_NAMES` in ../agents/index.ts.
-// A runtime built without an injection lists only the first seven - pinned by 'ships only the
+// (DEFAULT_CLI_PRESET), and the live order mirrors `AGENT_PROFILE_NAMES` in ../agents/index.ts
+// except for the trailing `chat` card, which is not a role: it reuses the `general` profile with
+// NO toolbox (issue 0005-D, src/server/harnesses/presets.ts).
+// A runtime built without an injection lists only the first eight - pinned by 'ships only the
 // production cards without an injected registry'.
 const CARD_NAMES = [
     'general',
@@ -118,14 +120,20 @@ const CARD_NAMES = [
     'reviewer',
     'planner',
     'debugger',
+    'chat',
     'demo',
     'flaky'
 ];
 
-// The head of `CARD_NAMES`: the seven shipped production templates, i.e. what a runtime with NO
+// The head of `CARD_NAMES`: the eight shipped production templates, i.e. what a runtime with NO
 // injected registry lists (`presets` in src/server/harnesses/presets.ts). The two fixtures are the
 // tail and only reachable through the explicit injection `createRuntime` performs.
-const LIVE_CARD_NAMES = CARD_NAMES.slice(0, 7);
+const LIVE_CARD_NAMES = CARD_NAMES.slice(0, 8);
+
+// The seven ROLE cards inside `LIVE_CARD_NAMES`: every production card except the trailing
+// tool-less `chat` card, whose registered tool list is empty by design (issue 0005-D). Assertions
+// about "the shared toolbox on every card" range over this list, and chat is pinned separately.
+const ROLE_CARD_NAMES = CARD_NAMES.slice(0, 7);
 
 // The exact card row `GET /harnesses` answers (`HarnessCard` in ../shared/harness-api.ts). Pinned
 // once at module scope so a projection change is a visible diff, not a renamed field nobody
@@ -850,6 +858,228 @@ describe('canonical root and provider document', () => {
     });
 });
 
+// Issue 0005 (C): `POST /sessions` may START with a transcript instead of an empty one, so a
+// client that already holds the conversation does not have to replay it through the transcript
+// PUT after the session exists. THE semantics this pins (./api.ts postSession, and the JSDoc on
+// `CreateSessionRequest.messages` in ./harness.swagger.yaml):
+//   - the seed is validated BEFORE anything is created, so a bad row is a 400 and no session;
+//   - it is a whole-document REPLACE of the entry agent's default conversation (`agent:<primary>`),
+//     which is why a seed with no `system` row drops the profile prompt (see `role_counts` below);
+//   - the write goes through the same store signal as a transcript PUT, so the optimistic lock and
+//     the persistence layer are unchanged - the seeded document simply starts at revision 1.
+describe('seeded transcript on session create', () => {
+    // The seed, spelled once. Deliberately NO `system` row: the row below that says the prompt is
+    // gone is the assertion, not an accident of this fixture.
+    const SEED = [
+        { role: 'user', content: 'What is 2+2?' },
+        { role: 'assistant', content: '4.' }
+    ];
+
+    // The conversation a `general` session seeds: the entry agent's default thread, id derived
+    // from the card's primary (./sessions.ts `THREAD_AGENT_PREFIX`). It is NOT a user thread, so
+    // `GET /sessions/:id/threads` stays empty - pinned below so a future "seed creates a thread"
+    // change is a visible decision here.
+    const ENTRY_THREAD = 'agent:general';
+
+    it('writes the seed into the entry conversation and reads back exactly those rows', async () => {
+        const runtime = createRuntime();
+
+        const created = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'general', messages: SEED });
+
+        expect(created.status).toBe(201);
+        // A seeded create bumps the session record once more than a plain one (revision 1), because
+        // the seed commits a thread revision alongside it (./api.ts postSession).
+        expect(created.body.session).toEqual({
+            ...created.body.session,
+            harness: 'general',
+            status: 'idle',
+            turn_count: 0,
+            thread_count: 0,
+            revision: 2,
+            definition_revision: 1
+        });
+
+        const sessionId = created.body.session.id as string;
+
+        // The seed does not create a listed conversation.
+        expect((await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdThreads(sessionId))).body).toEqual({
+            limit: 0,
+            next_cursor: null,
+            observed_at: expect.any(Number),
+            revision: 1,
+            items: []
+        });
+
+        // The metadata read: two rows, and `role_counts.system` is ZERO - the profile prompt the
+        // card would have seeded is gone, exactly as the replace semantics promise.
+        const meta = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscript(sessionId, ENTRY_THREAD));
+
+        expect(meta.status).toBe(200);
+        expect(meta.body.transcript).toEqual({
+            session_id: sessionId,
+            thread_id: ENTRY_THREAD,
+            agent: 'general',
+            transcript_state: 'ok',
+            message_count: 2,
+            chars: 14,
+            bytes: 118,
+            revision: 1,
+            role_counts: { system: 0, user: 1, assistant: 1, tool: 0 }
+        });
+
+        // THE row-level proof: the transcript the next provider request will send is byte-for-byte
+        // the seed, ids minted from `msg-1` like any fresh transcript.
+        const messages = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscriptMessages(sessionId, ENTRY_THREAD)
+        );
+
+        expect(messages.status).toBe(200);
+        expect(messages.body).toEqual({
+            limit: 2,
+            next_cursor: null,
+            observed_at: expect.any(Number),
+            revision: 1,
+            items: [
+                { role: 'user', content: 'What is 2+2?', messageId: 'msg-1' },
+                { role: 'assistant', content: '4.', messageId: 'msg-2' }
+            ],
+            thread_id: ENTRY_THREAD,
+            agent: 'general',
+            transcript_state: 'ok',
+            total: 2
+        });
+    });
+
+    it('a plain create still carries the profile prompt the seed replaces', async () => {
+        // The contrast that makes the assertion above mean something: with NO seed the same
+        // conversation opens with the General system message, so `system: 0` above is the seed's
+        // doing and not the default.
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
+        const threadId = 'agent:general';
+
+        const meta = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscript(session.id, threadId));
+
+        // `demo` runs the real General profile, so this is the General prompt: one system row and
+        // an empty transcript apart from it.
+        expect(meta.body.transcript.agent).toBe('general');
+        expect(meta.body.transcript.message_count).toBe(1);
+        expect(meta.body.transcript.role_counts).toEqual({ system: 1, user: 0, assistant: 0, tool: 0 });
+        expect(meta.body.transcript.revision).toBe(0);
+    });
+
+    it('refuses a seed the transcript reader rejects, and creates nothing', async () => {
+        const runtime = createRuntime();
+
+        const before = await call(runtime, 'GET', HARNESS_ROUTES.sessions());
+
+        expect(before.body.items).toHaveLength(0);
+
+        // THE one validator: the message names the offending path and the accepted roles, the same
+        // wording a transcript PUT uses (./api.ts reads the seed with `readHarnessMessages`).
+        const rejected = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), {
+            harness: 'general',
+            messages: [{ role: 'nope', content: 'x' }]
+        });
+
+        expect(rejected.status).toBe(400);
+        expect(rejected.body).toEqual({
+            error: { message: 'body.messages[0].role must be one of: system, user, assistant, tool.' }
+        });
+
+        const after = await call(runtime, 'GET', HARNESS_ROUTES.sessions());
+
+        expect(after.body.items).toEqual([]);
+    });
+
+    it('keeps the transcript optimistic lock honest after a seed', async () => {
+        const runtime = createRuntime();
+        const created = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'general', messages: SEED });
+        const sessionId = created.body.session.id as string;
+        const transcriptRoute = HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscript(sessionId, ENTRY_THREAD);
+
+        // The seeded document is ALREADY at revision 1, so the write a client would have sent
+        // against an empty transcript (`if_revision: 0`) is now a stale write, refused with the
+        // current revision named - the lock survives seeding rather than resetting.
+        const stale = await call(runtime, 'PUT', transcriptRoute, {
+            messages: [{ role: 'user', content: 'stale' }],
+            if_revision: 0
+        });
+
+        expect(stale.status).toBe(409);
+        expect(stale.body).toEqual({
+            error: { message: 'This transcript is at revision 1; the write expected 0. Re-read before writing.' }
+        });
+
+        // The correct guard writes, and the revision moves exactly once.
+        const fresh = await call(runtime, 'PUT', transcriptRoute, {
+            messages: [{ role: 'user', content: 'fresh' }],
+            if_revision: 1
+        });
+
+        expect(fresh.status).toBe(200);
+        expect(fresh.body).toEqual({
+            session_id: sessionId,
+            thread_id: ENTRY_THREAD,
+            accepted_as: 'transcript',
+            message_count: 1,
+            revision: 2,
+            links: {
+                transcript: transcriptRoute,
+                messages: `${transcriptRoute}/messages?limit=25`,
+                document: `${transcriptRoute}/document`
+            }
+        });
+
+        // And the replace really replaced the SEED, not just the prompt.
+        const messages = await call(
+            runtime,
+            'GET',
+            HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdTranscriptMessages(sessionId, ENTRY_THREAD)
+        );
+
+        expect(messages.body.items).toEqual([{ role: 'user', content: 'fresh', messageId: 'msg-1' }]);
+        expect(messages.body.total).toBe(1);
+    });
+
+    it('runs the tool-less chat card over the wire with no catalogue tool', async () => {
+        // Issue 0005 (D) through the same surface a client uses: the card lists in the catalogue,
+        // declares no tool, and creates a session like any other card.
+        const runtime = createRuntime();
+
+        const definition = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('chat'));
+
+        expect(definition.status).toBe(200);
+        expect(definition.body.harness.name).toBe('chat');
+        expect(definition.body.harness.title).toBe('Chat');
+        expect(definition.body.harness.primary).toBe('general');
+        expect(definition.body.harness.agents).toEqual(['general']);
+        // THE picker contract: an empty tool list, and the only declarations the harness makes are
+        // the kernel's bootstrap pair - which is how the model is told to unlock a tool later.
+        expect(definition.body.harness.tools).toEqual([]);
+        expect(definition.body.harness.core_tools).toEqual(['toolRequest', 'tasks']);
+        expect(definition.body.harness.instruction_summary).toEqual([
+            { agent: 'general', source: 'catalogue', overridden: false, chars: 135 }
+        ]);
+
+        const created = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'chat' });
+
+        expect(created.status).toBe(201);
+        expect(created.body.session.harness).toBe('chat');
+        // Unseeded, so the record revision is the plain create figure (1, not the seed's 2).
+        expect(created.body.session.revision).toBe(1);
+        expect(created.body.session.agent_models).toEqual({ general: 'demo-model' });
+
+        // A chat session can also be seeded, the same as any other card.
+        const seeded = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'chat', messages: SEED });
+
+        expect(seeded.status).toBe(201);
+        expect(seeded.body.session.harness).toBe('chat');
+    });
+});
+
 // The removed surface, pinned as REMOVED. Replaces the old '/presets alias', '/tools/bootstrap'
 // and 'standalone /api compatibility' blocks: an old address is a 404 that names the canonical
 // root's rules, never a redirect and never a second route table.
@@ -1016,6 +1246,7 @@ describe('harness catalogue reads', () => {
             ['reviewer', 'Reviewer'],
             ['planner', 'Manager'],
             ['debugger', 'Debugger'],
+            ['chat', 'Chat'],
             ['demo', 'Scripted fixture'],
             ['flaky', 'Recoverable failures (fixture)']
         ]);
@@ -1072,9 +1303,29 @@ describe('harness catalogue reads', () => {
             'summarizer'
         ]);
 
+        // THE TOOL-LESS CARD (issue 0005-D), byte for byte. This is the wire evidence that a client
+        // CAN select an empty toolbox: `tools: []` is what the card advertises, and the runtime
+        // behind it registers no catalogue tool either (pinned in
+        // ./harnesses/presets.test.ts, which compares this card's descriptor against
+        // `harness.tools`). `primary: 'general'` is deliberate — the card selects the trusted
+        // lone-wolf profile rather than inventing a prompt.
+        expect(page.body.items[7]).toEqual({
+            name: 'chat',
+            title: 'Chat',
+            description:
+                'A single answer with no toolbox: the General profile on an empty catalogue (no file, search, delegation, or record tool is registered) and one model call. It cannot read or write the server host and never spends a tool round, so it is the card for a surface that only talks.',
+            requires_endpoint: true,
+            primary: 'general',
+            subagents: [],
+            agents: ['general'],
+            tools: [],
+            builtin: true,
+            definition_revision: 0
+        });
+
         // The offline fixture stays described, just not first, and its registry is still
         // timeNow-only (no package toolbox).
-        expect(page.body.items[7]).toEqual({
+        expect(page.body.items[8]).toEqual({
             name: 'demo',
             title: 'Scripted fixture',
             description:
@@ -1527,30 +1778,38 @@ describe('harness catalogue reads', () => {
         });
     });
 
-    it('keeps the same toolbox on every live card, and adds search only with a key', async () => {
+    it('keeps the same toolbox on every role card, adds search only with a key, and gives chat none', async () => {
         const keyless = createRuntime();
         const keylessCards = (await call(keyless, 'GET', HARNESS_ROUTES.harnesses())).body.items;
         const keylessTools = new Map(keylessCards.map((card: any) => [card.name, card.tools]));
 
         // R9-R11: keyless still registers `fetch` (the native provider needs no credential), so
-        // every live card's registered list ends with it; only `search` is absent. No real card
+        // every role card's registered list ends with it; only `search` is absent. No real card
         // gets a subset any more - the toolbox is not part of what a harness choice changes.
-        for (const name of LIVE_CARD_NAMES) {
+        for (const name of ROLE_CARD_NAMES) {
             expect(keylessTools.get(name)).toEqual([...TOOLBOX, 'fetch']);
         }
         expect(keylessTools.get('demo')).toEqual(['timeNow']);
         expect(keylessTools.get('flaky')).toEqual([...TOOLBOX, 'testFlaky', 'fetch']);
+
+        // THE tool-less card (issue 0005-D): the one production card whose registered list is
+        // EMPTY, in both states. `fetch` in particular registers without a credential on every
+        // other card, so pinning `[]` keyless is what proves the card opted out rather than that
+        // the host had no keys.
+        expect(keylessTools.get('chat')).toEqual([]);
 
         // The configured host: the same cards, plus the environment row.
         const configured = createConfiguredRuntime();
         const configuredCards = (await call(configured, 'GET', HARNESS_ROUTES.harnesses())).body.items;
         const configuredTools = new Map(configuredCards.map((card: any) => [card.name, card.tools]));
 
-        for (const name of LIVE_CARD_NAMES) {
+        for (const name of ROLE_CARD_NAMES) {
             expect(configuredTools.get(name)).toEqual([...TOOLBOX, 'search', 'fetch']);
         }
         expect(configuredTools.get('demo')).toEqual(['timeNow']);
         expect(configuredTools.get('flaky')).toEqual([...TOOLBOX, 'testFlaky', 'search', 'fetch']);
+        // And a web-search key does not leak onto the tool-less card either.
+        expect(configuredTools.get('chat')).toEqual([]);
 
         // The direct catalogue agrees: the same key makes the tool callable.
         const row = (await call(configured, 'GET', HARNESS_ROUTES.tools(), {}, { limit: '100' })).body.items.find(
@@ -1576,7 +1835,11 @@ describe('harness catalogue reads', () => {
         const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
 
         expect(page.body.items.map((card: any) => card.name)).toEqual(LIVE_CARD_NAMES);
-        expect(page.body.items.map((card: any) => card.requires_endpoint)).toEqual([true, true, true, true, true, true, true]);
+        // Every shipped card needs a provider endpoint — the tool-less `chat` card included, because
+        // "no tools" removes the toolbox, never the model.
+        expect(page.body.items.map((card: any) => card.requires_endpoint)).toEqual(
+            LIVE_CARD_NAMES.map(() => true)
+        );
         expect(page.body.items.every((card: any) => card.tools.includes('testFlaky'))).toBe(false);
 
         // The fixtures are not runnable by accident: the offline demo is a template this build

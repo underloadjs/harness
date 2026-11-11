@@ -1484,7 +1484,8 @@ describe('queue HTTP contract', () => {
 
         // SCOPE NOTE (transport move, not a dropped expectation): the old version of this
         // test gated the SSE WRITER, because the REST route owned a serialized write chain
-        // (`createSseWriter`, ./handler.ts). No canonical REST route streams any more (T15),
+        // (`createHarnessSseResponse`, ./service.ts — the single writer both adapters use
+        // since issue 0006). No canonical REST route streams any more (T15),
         // so writer backpressure is now the WebSocket plane's guarantee (./stream/**, the
         // realtime owner). What the store and the hub still own — and what is asserted here
         // — is that ONE change publishes exactly one frame, in order, and moves each resource

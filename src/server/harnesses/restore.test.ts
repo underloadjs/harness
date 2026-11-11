@@ -233,7 +233,8 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(registry.deletedBuiltins()).toEqual([]);
         expect(registry.find('general')).toBeDefined();
@@ -479,7 +480,8 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
             'research',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(registry.find('workspace')).toBeUndefined();
 
@@ -523,7 +525,8 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
     });
 
@@ -554,6 +557,7 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
             'reviewer',
             'planner',
             'debugger',
+            'chat',
             'workspace'
         ]);
     });
@@ -574,7 +578,8 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(registry.deletedBuiltins()).toEqual([]);
     });

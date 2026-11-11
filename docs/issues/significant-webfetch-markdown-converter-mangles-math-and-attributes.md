@@ -1,149 +1,246 @@
-# 0012 — The markdown converter drops `<sup>`/`<sub>` markers and leaks `data-mw` metadata into prose
+# 0012 — the math-flattening disclosure is produced by the converter and dropped by `fetch`
 
-> **Status:** Open — reduced on 2026-11-11 (the "real parser, not a regex hack"
-> evidence row and acceptance criterion 5 were deleted outright: the module header no
-> longer makes that claim — `src/tools/webfetch/native.ts:4-10` now says the conversion
-> is "a bounded regex pass" and "is not a DOM")
+> **Status:** Fixed — 2026-11-11 (**reduced 2026-11-11**: the `<sup>`/`<sub>` marker conversion in
+> both passes, the `data-mw` attribute-metadata leak, and the converter's own report of the
+> flattening landed first — see **Update (2026-11-11) — partially closed**; the last gap, the
+> envelope hand-off in `src/tools/webfetch/index.ts`, closed the same day — see **Update
+> (2026-11-11, fix) — closed** at the bottom). File kept for review — delete it and its index row
+> once the owner's integrated run confirms.
 > **Severity:** Significant
-> **Area:** `src/tools/webfetch/native.ts` (the markdown and text conversion passes)
+> **Area:** `src/tools/webfetch/index.ts` (the result envelope's `note`). The conversion passes in
+> `src/tools/webfetch/native.ts`, which this issue used to point at, are closed.
 > **Date opened:** 2026-11-10
 
 ## Context
 
-Found by stress-testing `fetch` against Wikipedia and physics reference pages. The tool
-advertises "STRUCTURED CONTENT as markdown … readable text, not raw bytes", so a model
-treats the output as authoritative and cites it. Two classes of output break that trust, and
-both come from one line: the conversion is a regex pass that ends with a blanket tag strip.
-
-The first is **silent and value-changing**. `10<sup>12</sup>` becomes `1012`, so "quantum
-electrodynamics agrees with experiment to within 1 part in 10<sup>12</sup>" reads as "1 part
-in 1012". On `physics.nist.gov/cgi-bin/cuu/Value?hbar` the Planck constant renders as
-`1.054 571 817… x 10-34 J s` — the exponent's minus sign is glued to the mantissa, so the
-line reads as a subtraction and the value is wrong by 34 orders of magnitude.
-
-The second is **noisy**: Parsoid round-trip metadata appears mid-prose as `{{rp|100–105}}"}},"i":0}}]}'>`,
-including ~1.4 KB of `{{cite journal |…}}` fields dumped into the *Philosophical implications*
-section. It costs context and reads like article text.
+Found by stress-testing `fetch` against Wikipedia and physics reference pages. The tool advertises
+"STRUCTURED CONTENT as markdown … readable text, not raw bytes", so a model treats the output as
+authoritative and cites it. The value-changing loss (`10<sup>12</sup>` → `1012`, the Planck constant
+→ `x 10-34 J s`) and the noisy Parsoid leak are gone. What is left is the half of the original
+complaint that was never about the conversion: **a caller has no way to know that math was
+flattened**, because the fact the converter now states is discarded on the way to the result.
 
 ## Gap
 
-A caller that asks for readable content gets readable content **plus silently wrong numbers**,
-and has no way to know. Specifically the consumer needs:
+The consumer needs **the disclosure on the result**, so a model that needs an exact value can
+re-fetch rather than cite a corrupted one. Both ends exist and are not joined:
 
-- **Superscript and subscript markers preserved**, so an exponent survives as an exponent
-  rather than being concatenated into the base.
-- **A disclosure when math markup was flattened**, so a model that needs the exact value can
-  re-fetch rather than cite a corrupted one. `fetch` already has a `note` field for exactly
-  this kind of disclosure (`src/tools/webfetch/index.ts:623-625` emits one when a headingless
-  `query` falls back to a proximity window; `:666-671` emits one for a clamped offset).
-- **Attribute metadata kept out of the text stream**, so a tag boundary is a tag boundary.
+- The conversion pass reports it — `src/tools/webfetch/native.ts:47-53`
+  (`ConvertedPage.mathFlattened`, set from both passes at `:413` and `:453`, handed up at `:503`) —
+  and the sentence to say is already written and exported at `:63` (`MATH_FLATTENED_NOTE`).
+- `fetch` already has a `note` field for exactly this kind of disclosure:
+  `src/tools/webfetch/index.ts:732-734` emits one when a headingless `query` falls back to a
+  proximity window, `:785-790` one for a clamped offset.
+- The native branch, `src/tools/webfetch/index.ts:578-590`, copies `content`, `title`, `url`,
+  `contentType` and `redirects` out of the provider's return and drops the flag on the floor.
 
 ## Why it is the way it is
 
-Partly deliberate. The module header states the conversion contract as a set of regex passes
-and names its own limits (`native.ts:15-16`: markdown "keeps headings, links, images, emphasis,
-code, list items, blockquotes, and rules"; `:245-246`: list "Nesting is flattened — a known
-limit of a regex pass"). Math and superscripts are simply **not in the enumerated list** of
-what markdown output keeps, so their loss is consistent with the documented contract.
-
-What is *not* argued anywhere is that the loss is **unreported**. Every other lossy boundary in
-this tool family is reported — `grep` emits a `note` naming what it skipped, `fetch` reports
-`offsetClamped` with a `note` when an offset overshoots (`src/tools/webfetch/index.ts:564-566` computes it and `:666-671` reports `offsetClamped` with the `note`), and
-`download` reports `searchable` so a model does not grep a JPEG. Math flattening is the one
-degradation this tool performs silently.
+Not a design rule — an unwired hand-off, created the same day the fix landed. The module header now
+documents the loss and the report beside it (`src/tools/webfetch/native.ts:12-30`, the conversion
+contract), so the conversion is no longer the undocumented part; `MATH_FLATTENED_NOTE` was exported
+for `./index` to quote and nothing imports it. Every other lossy boundary in this tool family
+reaches the caller: `grep` names what it skipped, `fetch` reports `offsetClamped` with a `note` when
+an offset overshoots (`src/tools/webfetch/index.ts:640-641` computes the clamp, `:785-790` reports
+it), and `download` reports `searchable` so a model does not grep a JPEG.
 
 ## Evidence
 
 | Fact | Source |
 |---|---|
-| Every inline tag is deleted with its marker, keeping only its text | `src/tools/webfetch/native.ts:263` (`output.replace(/<[^>]*>/g, '')`) — the catch-all that runs after the named passes |
-| `<sup>`/`<sub>` are handled only inside `<pre>`, never in prose | `src/tools/webfetch/native.ts:146` (`PRE_WRAPPER_TAGS`, applied to `<pre>` bodies at `:163` so a code sample survives) |
-| No `<sup>`, `<sub>`, `<math>`, or MathML rule exists in the markdown pass | `src/tools/webfetch/native.ts:191-277` (the whole of `convertHtmlToMarkdown`: emphasis at `:210-214`, links, images, headings, blockquotes, lists at `:245-250`, rules, block boundaries at `:258-263`) |
-| The documented markdown contract does not list math | `src/tools/webfetch/native.ts:15-16` |
-| The served HTML carries the marker; the converter discards it | measured 2026-11-10: `en.wikipedia.org/wiki/Quantum_mechanics` HTML contains `10<sup id="mwZA">12</sup>`; `format=markdown` returns `within 1 part in 1012`; `&action=raw` wikitext contains `10<sup>12</sup>` |
-| Plain `<sup>` on a non-MediaWiki site corrupts the same way | measured 2026-11-10: `physics.nist.gov/cgi-bin/cuu/Value?hbar` → `x 10-34 J s` (source HTML has `10<sup>-34</sup>`); no MathML, no LaTeX involved |
-| Fractions flatten to juxtaposition | measured: `\sigma_X \sigma_P \geq \frac{\hbar}{2}` → `σXσP≥ℏ2`; `\tfrac12` → `12` |
-| `format=text` does not fix it | measured: same sentence returns `within 1 part in 10 12` — a space, still no exponent marker; `src/tools/webfetch/native.ts:283-309` is that pass and its own catch-all is `:297` (`replace(/<[^>]*>/g, ' ')`) — the same defect, one space apart |
-| `format=html` is lossless | measured: returns `10<sup id="mwZA">12</sup>` intact, plus the original LaTeX verbatim in `data-mw` (`"extsrc":"\\sigma_X \\sigma_P \\geq \\frac{\\hbar}{2}."`) |
-| The metadata leak is mid-prose, not in References | measured: leaks at HTML byte offsets 250857 (*Free particle*) and 369843/370233 (*Philosophical implications*), all before the References heading at 419870 |
-| The leak is an attribute-boundary error, not a template-expansion failure | the raw `{{…}}` text lives in a `data-mw='{…}'` attribute on the ref element, and Parsoid escapes `<` as `&lt;` but leaves a literal `>` inside the quoted value; a tokenizer that ends the tag at the first `>` emits the remainder as text — which is why the fragment ends in the tell-tale `'>` |
-| A spec-compliant parser leaks nothing from the same bytes | measured 2026-11-10: the identical HTML through `html.parser` yields 0 occurrences of `{{rp\|`, `{{cite journal`, `"i":0`; a naive `re.sub(r'<[^>]*>',' ',html)` reproduces the claim byte-for-byte |
-| The trigger is common, not a `{{refn}}` edge case | counted per page in `data-mw` attributes containing a literal `>`: Photosynthesis 34, General_relativity 6, Quantum_mechanics 5, DNA 3 |
+| The conversion reports the flattening; the envelope ignores it | `src/tools/webfetch/native.ts:47-53` and `:503` vs `src/tools/webfetch/index.ts:586-590` (five fields copied, the sixth dropped) |
+| The wording exists, exported, unused | `src/tools/webfetch/native.ts:63` (`MATH_FLATTENED_NOTE`); `grep -rn MATH_FLATTENED_NOTE src` reaches only `native.ts` and its test |
+| The precedent shape to copy | `src/tools/webfetch/index.ts:732-734` (`"query"` → proximity `note`), `:785-790` (`offsetClamped` + `note`) |
+| `format=html` is still the lossless remedy the note points at | `src/tools/webfetch/native.ts:484-488` returns the body verbatim, flagged `mathFlattened: false`; pinned by `src/tools/webfetch/webfetch.test.ts:1230` |
 
 ## Proposal
 
-Three changes, in the order an implementer should take them. (1) alone removes the headline
-defect.
+Three lines in `src/tools/webfetch/index.ts`; `native.ts` needs nothing.
 
-1. **Convert `<sup>`/`<sub>` to an explicit marker** in both the markdown and text passes:
-   `10<sup>12</sup>` → `10^12` (or `10¹²`), `<sub>n</sub>` → `_n`. A few lines beside the
-   existing emphasis pass at `native.ts:210-214`. This fixes the numeric case everywhere,
-   including the NIST page, and needs no parser change.
-2. **Disclose the loss.** When any `<sup>`, `<sub>`, `<math>`, or MathML node was flattened,
-   set the existing `note` to e.g. `"math markup flattened; use format=html for exact values"`.
-   This turns an undisclosed corruption into a documented limitation and is the change that
-   protects a model that never notices.
-3. **Stop the metadata leak** by making the tag boundary attribute-aware — a `>` inside a
-   quoted attribute value does not end the tag. Cheaper targeted mitigation if a tokenizer
-   swap is too invasive: strip `data-mw="…"`/`data-mw='…'` before conversion, since they are
-   editing metadata no reader needs.
+1. Capture the flag where the provider result is unpacked: `const { fetchNative,
+   MATH_FLATTENED_NOTE } = await loadNative();` at `:579`, `let mathFlattened = false;` beside
+   `let redirects = 0;` at `:576`, and `mathFlattened = converted.mathFlattened;` with the other
+   assignments at `:586-590`.
+2. Emit it in both return paths — the `query` result and the window result — as
+   `...(mathFlattened ? { note: MATH_FLATTENED_NOTE } : {})`, placed **before** the proximity spread
+   (`:732-734`) and the clamp spread (`:785-790`) so that when a caller also clamped an offset or
+   asked a headingless `query`, the note that explains the window it received is still the one
+   returned. If both are wanted, appending is the alternative; overwriting is not.
 
 **Alternatives considered.**
 
-- *Tell callers to use `format=html`.* Rejected as the sole answer: it is a verified lossless
-  escape hatch (4.4× the characters — 853,017 vs 193,912 on the same page), but the default
-  output is the one a model will use, and it stays silently wrong.
-- *Recover the LaTeX from `data-mw` `extsrc` instead of flattening MathML.* Genuinely better
-  for math, and the source is already in the bytes, but it is a larger change than (1) and
-  does not help plain `<sup>` on ordinary sites. Worth a follow-up.
-- *Swap the regex converter for a real HTML parser.* The honest long-term fix and the only one
-  that closes the attribute class properly, but it is a rewrite of `native.ts` and should not
-  block (1) and (2).
+- *Say nothing and rely on the `^`/`_` markers now in the text.* Rejected: the markers rescue
+  `<sup>`/`<sub>`, but `<math>` and MathML still flatten into juxtaposition — `\frac{\hbar}{2}` →
+  `ℏ2`, `\tfrac12` → `12` — and a reader cannot see that a fraction was ever there.
+- *Recover the LaTeX from `data-mw` `extsrc` instead of flattening MathML.* Still the better answer
+  for math, still the larger change; kept out of scope below.
 
 ## Acceptance criteria
 
-1. `10<sup>12</sup>` in source HTML yields `10^12` (or `10¹²`), never `1012`, in both markdown
-   and text output.
-2. The NIST Planck-constant page yields an exponent that is not read as a subtraction.
-3. A page containing `<sup>`/`<sub>`/`<math>` sets a `note` naming the flattening and the
-   `format=html` remedy; a page with none sets no such note.
-4. `{{rp|`, `{{cite journal`, and `"i":0` do not appear in markdown output for
-   `en.wikipedia.org/wiki/Quantum_mechanics`.
+1. A `fetch` of a page containing `<sup>`, `<sub>`, or `<math>` returns a `note` naming the
+   flattening and the `format=html` remedy, in `markdown` **and** in `text`; a page with neither
+   returns no such note, and `format: "html"` never does.
+2. When an offset clamp or a headingless-`query` proximity fallback applies at the same time, that
+   note is still the one returned — the new disclosure never replaces the note that explains the
+   window the caller got.
 
 ## Tests to add
 
-- `src/tools/webfetch/webfetch.test.ts` — stub HTML containing `10<sup>12</sup>`, `<sub>n</sub>`,
-  and an `<math>` block; assert the marker survives in `markdown` and `text`, and that the
-  `note` is set. Assert `format=html` still returns the markup verbatim.
-- `src/tools/webfetch/webfetch.test.ts` — stub HTML with a `data-mw='{"a":"x>y"}'` attribute
-  containing a literal `>`; assert nothing after the inner `>` leaks into the text.
-- `src/harness.webfetch.test.ts` — the same through the tool entry point, so the `note` reaches
-  the model-facing envelope.
+- `src/harness.webfetch.test.ts`, or the `describe('fetch: math markup and attribute metadata
+  (issue 0012)')` block already in `src/tools/webfetch/webfetch.test.ts` — the `<sup>`/`<math>`
+  fixture through the **tool entry point**: `result.note` is `MATH_FLATTENED_NOTE` verbatim for
+  `markdown` and for `text`, absent for a math-free page, absent for `format: "html"`; plus one case
+  where an oversized `offset` clamps at the same time, pinning criterion 2. The conversion-level
+  half of these already exists (`webfetch.test.ts:1246` and `:1273`); what is missing is the
+  envelope-level assertion.
 
 ## Out of scope
 
 - Full MathML/LaTeX semantic rendering, or recovering `extsrc` into the text (follow-up).
-- Replacing the converter wholesale (may be its own issue once (1) and (2) land).
+- Replacing the regex converter wholesale (may be its own issue once the disclosure lands).
 - List nesting, which the header already declares a known limit.
+- The marker conversion, the attribute-boundary leak, and the converter-side flag — **closed
+  2026-11-11**; do not re-open them here.
 
-## Update (2026-11-11)
+## Update (2026-11-11) — partially closed
 
-- **Reduced** — the Evidence row "The module claims to be 'a real parser, not a regex hack'"
-  and acceptance criterion 5 are deleted. The header no longer claims it: `src/tools/webfetch/native.ts:4-10`
-  now states the opposite in plain terms ("the HTML handling below is a bounded regex pass",
-  "It is not a DOM: it will not resolve CSS, run scripts, or preserve nesting perfectly"), so
-  the claim this row contradicted is gone and there is nothing left to earn or correct. The
-  measurement rows below it still stand on their own.
-- **Re-anchored** — `convertHtmlToMarkdown` is `src/tools/webfetch/native.ts:191-277` (not
-  `191-282`: the text pass begins at `:283`), the catch-all tag strip is still `:263`, the
-  `<pre>` wrapper rule is `:146` and its application site is `:163`, the emphasis pass the
-  proposal points at is `:210-214`, the documented conversion contract is `:12-18` (the
-  markdown bullet the issue quotes is `:15-16`), and the list-nesting limit comment is
-  `:245-246`. The text pass, newly cited here, is `:283-309` with its own catch-all at `:297`.
-- **Re-verified** — no `<sup>`, `<sub>`, `<math>` or MathML rule exists anywhere in either
-  pass (`grep -nE 'sup\|sub\|math' src/tools/webfetch/native.ts` returns exactly one line —
-  `PRE_WRAPPER_TAGS` at `:146`, where `sub`/`sup` are stripped rather than converted), so the headline defect is unchanged. The reported-clamp
-  precedent the issue leans on is `src/tools/webfetch/index.ts:564-566` + `:666-671`.
-- The measured rows are left **as recorded** (2026-11-10 measurements against live pages);
-  nothing in the tree contradicts them, and the `format=html` escape hatch is unchanged.
-- Status stays **Open**.
+- **Fixed: `<sup>`/`<sub>` convert to explicit markers in BOTH passes.** `SUP_SUB`
+  (`src/tools/webfetch/native.ts:276`) maps `<sup>12</sup>` → `^12` and `<sub>n</sub>` → `_n` —
+  prefix-only, so a closing `_` cannot be mis-read as markdown's underscore emphasis. It runs from
+  `flattenMathMarkup` (`:293-307`), called by the markdown pass at `:339` (after the `<pre>` and
+  `<code>` extractions, so a code sample is never marker-ised) and by the text pass at `:434`.
+  `10<sup>12</sup>` now yields `10^12`, and the NIST Planck constant yields `10^-34` — never `1012`
+  or `10-34`.
+- **Fixed: the attribute-boundary metadata leak.** `ATTR_RUN` (`:241`) consumes a `"…"` or `'…'`
+  group verbatim, so a `>` inside a quoted attribute value no longer ends a tag; it backs the
+  catch-all `TAG_STRIP` (`:246`) that both passes now use (`:400` and `:442`) — the two blanket
+  strips this issue cited as `native.ts:263` and `:297`. `MW_METADATA` (`:259`) additionally drops
+  `data-mw`/`data-mw-dt`/`data-parsoid` before conversion (after `extractPreBlocks`, so a code
+  sample that mentions them is untouched), which makes every name-anchored pass that keeps a
+  `[^>]*` boundary — `<li>`, `<a>`, `<p>`, `<div>` — safe on MediaWiki. `{{rp|`, `{{cite journal`,
+  `"i":0` and the tell-tale `'>` are gone. Both mitigations this issue named are in place: the
+  attribute-aware boundary (its primary proposal) **and** the targeted `data-mw` strip (its cheaper
+  fallback), because the strip is what protects those named passes.
+- **Fixed at the conversion level: the converter reports the loss.** `MATH_MARKUP` (`:283-284`)
+  tests for `<sup>`, `<sub>`, `<math>` and the MathML element set **after** the metadata strip (a
+  `data-mw` value can hold wikitext that spells `10<sup>12</sup>` literally, which is not flattened
+  prose) and **after** `extractPreBlocks` (a highlighted snippet is not prose math either); the
+  result is `ConvertedPage.mathFlattened` (`:47-53`), always false for `format=html` (`:487`) and
+  for a non-HTML body (`:481`). The module header states the markers and the report
+  (`:12-30`), which closes this issue's "math is not in the enumerated list of what the contract
+  keeps" point. It is **not** delivered to the caller — that is the open part above.
+- **Tests added**, all in `src/tools/webfetch/webfetch.test.ts` inside
+  `describe('fetch: math markup and attribute metadata (issue 0012)')` (`:1166-1351`):
+  `converts superscripts and subscripts into markers instead of joining them to the base` (`:1175`),
+  `keeps the same markers in text output` (`:1192`), `does not read a NIST-style exponent as a
+  subtraction` (`:1209`), `returns math and metadata markup verbatim when the caller asked for html`
+  (`:1230`), `reports math as flattened exactly when math markup was flattened` (`:1246`),
+  `names the flattening and the format=html remedy in the disclosure it hands ./index` (`:1273`),
+  `does not report a code sample that mentions <sup> as flattened math` (`:1281`), `keeps Parsoid
+  data-mw metadata out of mid-prose markdown` (`:1296`), ``treats a `>` inside any quoted attribute
+  value as inside the tag`` (`:1335`). Each asserts an exact converted string (`toBe` on the whole
+  content) or the exact fragments that must be absent — no range checks, no smoke assertions.
+- **Offline evidence:** `yarn vitest run src/tools/webfetch/webfetch.test.ts` → 75/75 (66 before the
+  change); with `native.ts` reverted to `HEAD:src/tools/webfetch/native.ts` the same run is
+  **8 failed | 67 passed**, the failures being exactly the mechanism tests — so the guarantee is
+  pinned, not assumed. `src/harness.webfetch.test.ts` 9/9; and `yarn vitest run
+  src/core/tool-discovery.test.ts src/harness.webfetch.test.ts src/server/harnesses/{catalogue,
+  presets,registry}.test.ts` → 111/111. `tsc --noEmit` clean (0 errors package-wide at the time of
+  the run) and `eslint` clean on the changed source.
+- **Criteria met:** 1 (`10^12` and `H_nO` in markdown and in text, never `1012`/`HnO`); 2 (NIST-style
+  `x 10^-34 J s`, no `10-34`, in both formats); 4 (`{{rp|`, `{{cite journal`, `"i":0` and `'>`
+  absent from a Quantum_mechanics-shaped fixture, in markdown and in text). Criterion 3 is met
+  **one level short** — the flag is set and the wording exists, which is what `:1246` and `:1273`
+  pin — but it is not on the result yet, which is the open gap.
+- **Verification limits, stated rather than glossed:** criteria 1, 2 and 4 were verified against
+  crafted HTML fixtures, not by re-fetching the live pages (this suite is offline), so the per-page
+  trigger counts recorded in the deleted evidence rows (Photosynthesis 34, General_relativity 6,
+  Quantum_mechanics 5, DNA 3) remain 2026-11-10 history and were not re-run; and a fixture is a
+  miniature of the real markup, so a Wikipedia construct the fixture does not reproduce could still
+  behave differently.
+- **Drift in the cites above.** Every anchor this issue carried was re-read against the tree **before**
+  the change and matched exactly: the markdown catch-all `/<[^>]*>/g` at `native.ts:263`, the text
+  catch-all at `:297`, `PRE_WRAPPER_TAGS` at `:146`, the emphasis pass at `:210-214`,
+  `convertHtmlToMarkdown` at `:191-277`, the text pass at `:283-309`, and `grep -nE 'sup|sub|math'`
+  returning only the `PRE_WRAPPER_TAGS` line — zero drift on the pre-change file. The numbers used
+  **after** the change are where those same points sit once the fix adds 157 lines to the file
+  (349 → 506): catch-alls `:400` and `:442`, `PRE_WRAPPER_TAGS` `:176`, emphasis `:342-346`,
+  `convertHtmlToMarkdown` `:313-414`, `convertHtmlToText` `:420-454`. The `index.ts` cites moved
+  because a different change landed in that file the same day (+124/−5 against `HEAD`): the
+  proximity `note` is now `:732-734` and the clamp `note` `:785-790` (this issue recorded
+  `:623-625` and `:666-671`), and the clamp computation is `:640-641` (recorded `:564-566`). Test
+  cites in `webfetch.test.ts` shift as the sibling 0014/0015/0016 fixes land in the same file; the
+  ones above are as of this update.
+- **Not covered by this change** (still out of scope): MathML semantics, `extsrc` recovery, a real
+  parser, list nesting.
+
+## Update (2026-11-11, fix) — closed
+
+The one gap this issue reduced to — the converter's `mathFlattened` fact never becoming the
+result's `note` — is closed. **Numbering note:** the disclosure was criterion 3 when the issue was
+filed; after the reduction above it is criterion 1, and the precedence rule is criterion 2.
+
+- **The hand-off shipped, in `src/tools/webfetch/index.ts` only — `native.ts` was not touched.**
+  1. **Capture.** `let mathFlattenedNote: string | undefined;` at `:606`; the constant pulled from
+     the same lazy import as the fetcher at `:612` (`const { fetchNative, MATH_FLATTENED_NOTE } =
+     await loadNative();`); the flag read with the other provider fields at `:629`
+     (`if (converted.mathFlattened) mathFlattenedNote = MATH_FLATTENED_NOTE;`).
+  2. **Emit in both return paths, first so the existing notes still win** (a later spread clobbers
+     an earlier one in an object literal): `:777` in the `query` result, immediately before the
+     proximity spread at `:778-780`, and `:835` in the window result, immediately before the clamp
+     spread at `:836-841`.
+- **One deliberate deviation from the proposal's shape.** The proposal sketched a boolean plus an
+  imported `MATH_FLATTENED_NOTE`. The constant lives in the **lazily imported** `./native` module,
+  so it can only be destructured inside the native branch, while the note is needed by the return
+  paths outside it; carrying a boolean would have meant a second module-scope import and broken the
+  laziness rule in this file's header (S4). So the disclosure travels as one variable holding the
+  note **text** — `undefined` doubles as "nothing flattened". Observably identical, and the wording
+  stays owned by the module that knows the loss. The hosted providers never set it, so they never
+  claim a flattening they did not do, and `format: "html"` / a non-HTML body report
+  `mathFlattened: false` (`native.ts:481`/`:487`) so those paths stay silent by construction.
+- **Criterion 1** (note present iff math was flattened, in the envelope):
+  `src/tools/webfetch/webfetch.test.ts:1356-1375` — `discloses the flattening on the result in
+  markdown and in text` asserts `result.note` is `MATH_FLATTENED_NOTE` **verbatim** in both formats,
+  next to the exact converted content so the fixture cannot silently stop converting;
+  `:1408-1427` — `discloses the flattening on a query answer as well as on a window` covers the
+  second return path (`matchMode: "heading"`). Three silent paths, `:1377-1406` —
+  `leaves the disclosure off the result when nothing was flattened`: prose that merely looks like a
+  flattened exponent (`1012 kelvin`), `format: "html"` (the verbatim body the note points at), and a
+  JSON body that is never converted. Each asserts the exact content **and** `note` absent.
+- **Criterion 2** (the window note still wins): `:1429-1451` — `keeps the clamp note when a clamped
+  offset lands on flattened math`, and `:1453-1474` — `keeps the proximity note when a headingless
+  query lands on flattened math`. Both call the same page twice: once without the competing
+  argument, asserting `note` IS `MATH_FLATTENED_NOTE`, so the precedence claim cannot pass on a
+  fixture whose flag was simply never raised; then with the clamp/fallback, asserting the
+  pre-existing note and `note` `not` the math note.
+- **Fixture trap worth recording:** the `query`-mode fixture carries **three** headings. A page with
+  two or fewer sections is answered by the proximity fallback
+  (`src/tools/webfetch/sections.ts:52`, `FLAT_DOCUMENT_SECTIONS = 2`), which would have made that
+  test pin the fallback rather than heading selection.
+- **Verification.** `yarn vitest run src/tools/webfetch/webfetch.test.ts
+  src/harness.webfetch.test.ts` → **111 passed** (106 before the change; 5 envelope tests added,
+  none rewritten). Two mutation probes by editing `index.ts` and re-running: deleting both spreads
+  fails **exactly** the four disclosure-bearing tests and nothing else — the fifth (the negative
+  test) is the only one that cannot fail on a missing emission — and moving the math spread AFTER
+  the clamp/proximity spreads fails **exactly** the two precedence tests, so the placement is
+  pinned by the assertions rather than incidental. `npm run tools:manifest:check` → current, 31
+  descriptors (neither the parameters nor `WebFetchResult` changed, so the contract did not move).
+  `tsc --noEmit` → 0 errors package-wide at the time of the run; `eslint
+  src/tools/webfetch/index.ts` clean (this repo's eslint config ignores `*.test.ts`).
+- **Two sentences now stale in files this fix does not own** (one-line wording updates, left for
+  the owner rather than edited here): `src/tools/webfetch/native.ts:23-25` and `:49-52` still say
+  "./index does not read the flag yet", and `src/types/index.ts:2431-2433` still enumerates `note`
+  as only the clamped offset and the proximity degradation.
+- **The three stale sentences this fix named were corrected the same day** (2026-11-11):
+  `src/tools/webfetch/native.ts` now states that ./index DOES read `mathFlattened` and put
+  `MATH_FLATTENED_NOTE` on the result (header bullet and the `ConvertedPage.mathFlattened`
+  field comment), and `src/types/index.ts`'s `WebFetchResult.note` comment enumerates all
+  three note kinds — the clamped offset, the headingless `query` → proximity degradation, and
+  the math flattening — together with the precedence rule (a window note wins over the math
+  note because it explains the excerpt the caller is holding).
+- **Verification limit, same as the reduction above:** every case runs against a crafted HTML
+  fixture in an offline suite, not against the live pages, so a Wikipedia construct the fixture
+  does not reproduce could still behave differently — but the disclosure is now keyed to the
+  converter's own flag, which is format- and site-independent, so that risk no longer applies to
+  this half of the issue.
+- **Not covered** (unchanged): MathML semantics, `extsrc` recovery, a real parser, list nesting.

@@ -164,6 +164,19 @@ export const transcriptChars = (
 //
 // Empty input is exactly 0, so a caller can distinguish "nothing to send" from a
 // rounding artifact.
+//
+// PUBLISHED FROM THE ROOT BARREL (issue 0004), so the contract a host may rely on is
+// stated here rather than only in the header above: this is an ESTIMATE, derived as
+// `ceil(chars / 4)` over exactly the text listed under WHAT IS COUNTED (message
+// content, tool-call names and raw arguments, the instruction strings handed in, and
+// an attachment's name and MIME — never attachment bytes, never `reasoning`, and never
+// the tool schemas that ride in the same request body, which is why the prompt a
+// provider really measures is a little larger than this number). A provider's real
+// count is not available before the request, so a call costs nothing
+// and answers before the round trip. It is total — nothing throws — and it is the very
+// number `agent({ maxPromptTokens })` / `provider.contextWindow` measure a request
+// against (see ../core/agent.ts), which is why a host that trims its own history and
+// the package's own floor cannot disagree.
 export const estimateContextTokens = (
     messages: readonly HarnessMessage[] | undefined,
     instructions?: string | readonly string[]

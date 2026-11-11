@@ -7,7 +7,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
-import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
+import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest, WebFetchResult } from '@underload/harness';
 import { createToolboxHarness } from './server/harnesses/toolbox';
 
 // Pass `seen` to record every request, which is how the discovery tests inspect
@@ -366,5 +366,111 @@ describe('live toolbox harness', () => {
 
         // The declarations are untouched by the query.
         expect(declaredNames(seen[1])).toEqual(declaredNames(seen[0]));
+    });
+});
+
+// What the MODEL sees for the fetch fixes, as opposed to what the factory returns:
+// the harness runs the tool, serializes the result into the transcript, and turns a
+// thrown HarnessError into the tool error a turn receives. Issues 0014-0016 are all
+// about information reaching the consumer, so the classification and the new result
+// fields have to survive this layer, not just the tool.
+describe('fetch error classes and query fields through the tool envelope', () => {
+    // `dns: { off: true }` keeps these offline: no resolver call, and the transport
+    // verdict comes only from the stubbed `fetch`.
+    const webfetch = () =>
+        harness({ agents: { writer: idle() }, webfetch: { env: {}, dns: { off: true } } });
+
+    // The message a tool call surfaces, whether it succeeded or threw.
+    const settled = async (name: string, args: Record<string, unknown>): Promise<string> =>
+        webfetch()
+            .executeTool(name, args)
+            .then(() => '', (error: unknown) => (error as Error).message);
+
+    const rejectingFetch = (code: string) =>
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => {
+                throw Object.assign(new Error('fetch failed'), {
+                    cause: Object.assign(new Error(`connect ${code} 203.0.113.9:443`), { code })
+                });
+            })
+        );
+
+    it('keeps a DNS failure and a refused connection distinct through the envelope', async () => {
+        rejectingFetch('ENOTFOUND');
+        const dns = await settled('fetch', { url: 'https://nonexistent-host-xyz-abc.invalid/page' });
+
+        rejectingFetch('ECONNREFUSED');
+        const refused = await settled('fetch', { url: 'https://example.com/refused' });
+
+        // Acceptance criterion 1 of issue 0015, at the layer a model reads: two
+        // situations, two sentences, each naming its own retry verdict.
+        expect(dns).toContain('fetch could not resolve this hostname');
+        expect(dns).toContain('retrying will not help');
+        expect(refused).toContain('fetch could not keep a connection to this host');
+        expect(refused).toContain('a retry may help');
+        expect(dns).not.toBe(refused);
+        // Criterion 4: the raw errno and the host never ride into the transcript.
+        expect(dns).not.toContain('ENOTFOUND');
+        expect(refused).not.toContain('203.0.113.9');
+    });
+
+    it('reports the section cap as the cause of a truncated query answer', async () => {
+        const sections = Array.from(
+            { length: 24 },
+            (_, index) =>
+                `## Section ${String(index + 1).padStart(2, '0')}\n\nquantum entry ${String(index + 1).padStart(2, '0')}.`
+        ).join('\n\n');
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => new Response(sections, { headers: { 'content-type': 'text/plain' } }))
+        );
+
+        const capped = (await webfetch().executeTool('fetch', {
+            url: 'https://example.com/capped',
+            query: 'quantum'
+        })) as WebFetchResult;
+
+        // Issue 0016 criterion 2, through the envelope: the cap is named, and no
+        // resumable offset is promised for a cause paging cannot fix.
+        expect(capped.truncated).toBe(true);
+        expect(capped.stopReason).toBe('resultCap');
+        expect(capped.matches).toBe(20);
+        expect(capped.totalMatches).toBe(24);
+        expect(capped.nextOffset).toBeUndefined();
+    });
+
+    it('keeps a budget-cut query answer resumable through the envelope', async () => {
+        const page = Array.from(
+            { length: 6 },
+            (_, index) => {
+                const label = String(index + 1).padStart(2, '0');
+
+                return `## Section ${label}\n\nquantum ${'x'.repeat(15_000)} END-${label}`;
+            }
+        ).join('\n\n');
+
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(page, { headers: { 'content-type': 'text/plain' } })));
+
+        const cut = (await webfetch().executeTool('fetch', {
+            url: 'https://example.com/long',
+            query: 'quantum'
+        })) as WebFetchResult;
+
+        // Issue 0016 criterion 1: the byte budget is named as the cause, and the
+        // answer arrives with the offset that continues it.
+        expect(cut.stopReason).toBe('contentBudget');
+        expect(cut.truncated).toBe(true);
+        expect(typeof cut.nextOffset).toBe('number');
+        expect(cut.content).not.toContain('END-05');
+
+        const resumed = (await webfetch().executeTool('fetch', {
+            url: 'https://example.com/long',
+            offset: cut.nextOffset as number
+        })) as WebFetchResult;
+
+        expect(resumed.offset).toBe(cut.nextOffset);
+        expect(resumed.content).toContain('END-05');
     });
 });

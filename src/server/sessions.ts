@@ -2742,6 +2742,19 @@ export class SessionStore {
     // one row. The lane tests all run the default `inline` engine (../config.ts), so this is an
     // untested deployment shape, not a verified one — see 0017 (../docs/issues/) for the
     // port-side resync of the same field.
+    //
+    // 0018 ITEM 1 (2026-11-11): the gap is now PUBLISHED where an operator meets the switch —
+    // one `LIMITATION (display lane, not routed)` line in the worker-mode capability notes
+    // (./workers/capability.ts `WORKER_MODE_NOTES`, pinned verbatim in ./workers/
+    // capability.test.ts). It is a NOTE, not a refusal: worker mode still runs the session and
+    // the compaction itself, and only the bar's boundary is lost, so a preset stays supported.
+    // The real fix stays open, and it is a cross-layer one rather than a worker-side one: the
+    // lane commit needs its own op whose authority replay writes the lane on the canonical
+    // harness, which means a lane-shaped write seam on the harness handle next to
+    // `setThreadStatus` (../harness.ts + its `Harness` contract in ../types/index.ts). Adding
+    // the op alone would fold into the coordinator's view without ever moving the number read
+    // below, and reading it from the worker's own replica is rejected — two sources for one
+    // number is how a bar starts lying.
     private contextLaneOf(session: Session, threadId: string | undefined): number {
         if (threadId === undefined || !this.threadsSupported(session)) return 0;
 
@@ -7827,9 +7840,10 @@ export class SessionStore {
         // The harness awaits the progress it emits from its main loop, but
         // BACKGROUND deliveries (scheduler wake / tool-completion mailboxes, see
         // harness.ts enqueueMailbox) call the same sink concurrently, and neither
-        // adapter serializes an emitter — handler.ts createSseWriter and
-        // service.ts write both suspend on backpressure, so two concurrent frames
-        // could be flushed out of order. Queuing each frame behind the previous
+        // adapter serializes an emitter — service.ts createHarnessSseResponse, the ONE
+        // writer both adapters now stream through (issue 0006), suspends on
+        // backpressure, so two concurrent frames could be flushed out of order.
+        // Queuing each frame behind the previous
         // one keeps wire order exact under backpressure: nothing is reordered and
         // nothing is dropped. The /events route already guarantees this with its
         // own `tail` chain (api.ts watchSessionRoute); this is the same rule for

@@ -6,13 +6,16 @@
 //
 // EVERY PRESET HERE IS A PRODUCTION CONFIGURATION
 // ------------------------------------------------
-//   general, instruct, research, workspace, reviewer, planner, debugger. All seven
+//   general, instruct, research, workspace, reviewer, planner, debugger, chat. All eight
 //   are built from TRUSTED agent profiles in src/agents through `createProfiledHarness`
-//   (./toolbox.ts), so they register the SAME toolbox: package coding tools, the app
-//   tools, environment-backed search, and the harness core tools. Only the agents
-//   differ: names, instructions, guidelines, primary, and subagents. These seven are
-//   `presets`, the default catalogue every registry and every `GET /harnesses` listing
-//   starts from — and they are the WHOLE catalogue. There is no second tier.
+//   (./toolbox.ts), and the first SEVEN register the SAME toolbox: package coding tools, the app
+//   tools, environment-backed search, and the harness core tools. Only the agents differ: names,
+//   instructions, guidelines, primary, and subagents. The eighth, `chat`, is the ONE declared
+//   exception on the toolbox axis (./toolbox.ts `sharedToolbox: false`, `maxIterations: 1`): it
+//   registers no catalogue tool at all, which is exactly why it exists — a client that wants a
+//   session that never touches the server host had no card to pick. These eight are `presets`, the
+//   default catalogue every registry and every `GET /harnesses` listing starts from — and they are
+//   the WHOLE catalogue. There is no second tier.
 //
 //   THE FIXTURES ARE GONE. `demo` (a scripted offline run with timeNow only) and
 //   `flaky` (the recoverable-failure example with `testFlaky`) used to ship as
@@ -32,8 +35,8 @@
 //   `flaky` no longer has a template to rebuild from, so it is reported rather than
 //   silently resurrected (see the note above `presetFromRecord`).
 //
-// THE SEVEN REAL ROLES
-// --------------------
+// THE SEVEN REAL ROLES, PLUS THE TOOL-LESS CARD
+// ---------------------------------------------
 //   general   — DEFAULT. Does the whole task alone; `subagents: []`, so `delegate` is
 //               never even registered for it (src/harness.ts `activation: 'subagents'`).
 //   instruct  — a worker that delegates ONLY the steps that would burn its context
@@ -44,6 +47,9 @@
 //   planner   — the orchestrator (visible title "Manager"): delegates every step and
 //               independently reviews each result before accepting it.
 //   debugger  — stress-tests the whole system; widest allowlist, nothing off-limits.
+//   chat      — NOT a role: the same trusted `general` profile with NO toolbox and ONE model
+//               call (issue 0005-D). It is last in the catalogue because it is not a team and
+//               never joins one; see the note above the card.
 //
 // HOW A TEAM IS DERIVED, AND THE ONE EXCEPTION. `teamOf()` builds every live preset's
 // allowlist from ONE list, so the presets cannot drift. Two ids are excluded: the primary
@@ -52,7 +58,8 @@
 // states the refusal) — offering a member that answers "I do not run as a subagent" is a
 // wasted run. A USER-created team may still select the Manager; the refusal is what makes
 // that honest. `summarizer` stays everywhere so the `textSummarize` delegated path keeps
-// working (it condenses locally when absent).
+// working (it condenses locally when absent). `chat` is not in that derivation at all: it
+// declares no team, so `teamOf` is never called for it and it is never a member of one.
 //
 // The one-level delegation rule is a harness property (a subagent never receives delegate,
 // src/harness.ts `primaryOnlyDefinitions`), so none of these prompts may ask a subagent to
@@ -318,14 +325,74 @@ const debuggerPreset: HarnessPreset = {
     create: createProfiledHarness('debugger', debuggerTeam)
 };
 
+// Chat: THE TOOL-LESS CARD (issue 0005-D). Every other card here answers "what can an agent do with
+// the toolbox"; this one answers "just reply". It is the minimum a chat product needs from the built-in
+// `/sessions` API, and it is a CATALOGUE ENTRY, not a new mechanism: the same trusted-profile
+// composition every live card uses (`createProfiledHarness`, ./toolbox.ts) plus the one declared
+// toolbox exception that factory now accepts.
+//
+// WHAT THIS BUYS A CLIENT, exactly:
+//   - `tools: []` with NO `environmentTools`, and `sharedToolbox: false` in the factory: the card
+//     advertises no catalogue tool AND the harness registers none, so a "answer me" session can never
+//     spend a tool round reading or writing the SERVER HOST's filesystem. That is the gap this card
+//     exists to close — before it, a client had no way to select an empty toolbox, because every
+//     shipped card declared `SHARED_TOOL_NAMES`.
+//   - `subagents: []`: `delegate` is not even registered (src/harness.ts `activation: 'subagents'`),
+//     so there is no delegation and no child conversation.
+//   - `maxIterations: 1` (the toolbox factory's new per-harness override): one model call, one answer.
+//     If the model still asks for a tool, the loop ends at that boundary instead of running a round.
+//
+// WHY `general` IS THE PRIMARY. "The preset name is also the entry agent's name" is a convention, not
+// a rule (the deleted `demo`/`flaky` fixtures ran `general` the same way), and `general` is the one
+// TRUSTED profile whose own guidelines already state this card's contract — it works alone, and it is
+// told not to spawn a branch with `threadFork` or hand a step over with `threadSend`
+// (../../agents/general.ts). Selecting that profile keeps the product rule intact: a client chooses an
+// agent, it never supplies the text a model is seeded with (../../agents/types.ts). A new `chat` agent
+// id would instead be a new prompt in the trusted catalogue, which is a different change (and an agent
+// id is persisted in every record with no alias fallback).
+//
+// WHAT STAYS, and why the card is not literally "zero tools": the kernel always owns its harness-owned
+// rows, and two of them declare core visibility (`toolRequest`, the discovery bootstrap, and `tasks`,
+// the session plan). They are the harness's own surface, not a toolbox, and there is nothing registered
+// for `toolRequest` to surface here.
+//
+// WHAT AN EXECUTABLE PATCH DOES. The registry rebuilds a 'live' template through
+// `createProfiledHarness(primary, subagents, …)` (./registry.ts), which passes no toolbox argument, so
+// PATCHing this card's TEAM gives the shared toolbox back. That is deliberate: the tool-less posture is
+// a property of the shipped TEMPLATE, not a durable field — `HarnessPresetRecord` carries no tool
+// column, and widening the durable schema is out of scope for this issue. A metadata-only patch
+// (title/description) keeps this factory exactly like every other template.
+const chat: HarnessPreset = {
+    name: 'chat',
+    title: 'Chat',
+    description:
+        'A single answer with no toolbox: the General profile on an empty catalogue (no file, search, delegation, or record tool is registered) and one model call. It cannot read or write the server host and never spends a tool round, so it is the card for a surface that only talks.',
+    requiresEndpoint: true,
+    // The trusted profile it runs — see the note above for why this is `general` and not a new id.
+    primary: 'general',
+    // Empty on purpose, exactly like the default card: no team, therefore no `delegate` row.
+    subagents: [],
+    agents: ['general'],
+    // THE load-bearing line. The descriptor projects this list (plus any environment row the host can
+    // run), and `sharedToolbox: false` below is what makes the empty promise true in the runtime rather
+    // than only on the card.
+    tools: [],
+    // No `environmentTools`: `fetch` registers WITHOUT a credential, so a card that declared the flag
+    // would advertise a core declaration this harness no longer makes.
+    builtin: true,
+    editable: true,
+    template: 'live',
+    create: createProfiledHarness('general', [], {}, {}, {}, {}, { sharedToolbox: false, maxIterations: 1 })
+};
+
 // ---------------------------------------------------------------------------
 // Catalogue exports (T5)
 // ---------------------------------------------------------------------------
-
-// THE catalogue, in UI/CLI order (general is the default/first card, which is
+// THE CATALOGUE, in UI/CLI order (general is the default/first card, which is
 // also what `DEFAULT_CLI_PRESET` in ../cli/options.ts selects). Every entry is a real,
 // usable configuration: a live agent team on the shared toolbox that runs against the
-// configured provider. This array IS the product — there is no fixture tier behind it
+// configured provider — EXCEPT `chat`, the one card that deliberately opts out of the
+// toolbox (see its note). This array IS the product — there is no fixture tier behind it
 // any more, so `presets` is both the shipped catalogue and the complete set of
 // templates this build can rebuild a factory from.
 //
@@ -339,7 +406,8 @@ export const presets: readonly HarnessPreset[] = [
     workspace,
     reviewer,
     planner,
-    debuggerPreset
+    debuggerPreset,
+    chat
 ];
 
 // There is no `FIXTURE_PRESETS` and no `ALL_PRESET_TEMPLATES` any more. Both existed to

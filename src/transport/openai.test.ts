@@ -4,8 +4,16 @@
 // wire-format mapping, and the real frame parser without any network.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { openAICompatible } from '@underload/harness';
-import type { HarnessStreamEvent } from '@underload/harness';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import {
+    CONTEXT_OVERFLOW_CODE,
+    MAX_EXTRA_BODY_BYTES,
+    PROVIDER_REQUEST_BODY_CODE,
+    HarnessError,
+    openAICompatible
+} from '@underload/harness';
+import type { HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
 
 const sseBody = (frames: string[]): ReadableStream<Uint8Array> => {
     const encoder = new TextEncoder();
@@ -1035,5 +1043,675 @@ describe('openAICompatible', () => {
             { type: 'text', delta: 'complete' },
             { type: 'done', stopReason: 'stop', toolCalls: [], usage: undefined }
         ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// issue 0001 — request-body extension (`extraBody`, `responseFormat`,
+// `options.buildBody`). Every body claim here is asserted on the fetch stub, i.e.
+// on the exact bytes that would leave the process — not inferred from a helper.
+// ---------------------------------------------------------------------------
+
+// The serialized body of the single call a stubbed fetch recorded.
+const sentBody = (fetchMock: ReturnType<typeof stubFetch>): string =>
+    String((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].body);
+
+// The parsed body, for assertions about a specific field.
+const sentJson = (fetchMock: ReturnType<typeof stubFetch>): Record<string, unknown> =>
+    JSON.parse(sentBody(fetchMock)) as Record<string, unknown>;
+
+// Asserts a construction-time rejection: right error type, right machine code, and a
+// message that NAMES the field the host wrote (issue 0001 AC3).
+const expectRejected = (build: () => unknown, field: string): string => {
+    let caught: unknown;
+
+    try {
+        build();
+    } catch (error) {
+        caught = error;
+    }
+
+    if (!(caught instanceof HarnessError)) throw new Error(`expected a HarnessError, got ${JSON.stringify(caught)}`);
+
+    expect(caught.code).toBe(PROVIDER_REQUEST_BODY_CODE);
+    expect(caught.message).toContain(field);
+
+    return caught.message;
+};
+
+describe('request-body extension (issue 0001)', () => {
+    // The regression the whole issue exists for: an UNSET extension must not move a
+    // single byte, so a gateway that rejects unknown fields sees the body it always
+    // saw. `toBe` on the serialized string is the exact form of that claim.
+    it('sends the default body byte-for-byte when no extension is configured', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({ baseURL: 'http://x/v1', sampling: { temperature: 0.7 } })(request)
+        );
+
+        expect(sentBody(fetchMock)).toBe(
+            '{"model":"merge/ds4-flash","stream":true,' +
+                '"messages":[{"role":"system","content":"You are a writer."},' +
+                '{"role":"user","content":"Write"}],"temperature":0.7}'
+        );
+    });
+
+    // AC1, the wire half: the opt-in is a host decision, and the usage frame the
+    // gateway then sends is parsed by the SAME reader (the agent/harness halves of AC1
+    // are pinned in src/core/agent.test.ts and the existing harness usage tests).
+    it('sends stream_options from extraBody and reports the usage frame it bought', async () => {
+        const fetchMock = stubFetch([
+            sse({ choices: [{ delta: { content: 'hi' }, finish_reason: 'stop' }] }),
+            sse({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(
+            openAICompatible({
+                baseURL: 'http://x/v1',
+                extraBody: { stream_options: { include_usage: true } }
+            })(request)
+        );
+
+        expect(sentJson(fetchMock)).toEqual({
+            model: 'merge/ds4-flash',
+            stream: true,
+            messages: request.messages,
+            stream_options: { include_usage: true }
+        });
+        expect(events).toEqual([
+            { type: 'text', delta: 'hi' },
+            { type: 'done', stopReason: 'stop', toolCalls: [], usage: { input: 10, output: 4, total: 14 } }
+        ]);
+    });
+
+    it('calls the extraBody function form once per request with the resolved request', async () => {
+        const fetchMock = stubFetch([
+            'data: [DONE]\n\n',
+        ]);
+        const controller = new AbortController();
+        const withTools: HarnessStreamRequest = {
+            model: 'merge/ds4-flash',
+            messages: [{ role: 'user', content: 'Search' }],
+            tools: [{ name: 'websearch', description: 'Search the web.' }],
+            signal: controller.signal
+        };
+
+        const seen: HarnessStreamRequest[] = [];
+        const stream = openAICompatible({
+            baseURL: 'http://x/v1',
+            extraBody: (req) => {
+                seen.push(req);
+
+                return { tool_choice: 'required', parallel_tool_calls: false };
+            }
+        });
+
+        await collect(stream(withTools));
+        await collect(stream(withTools));
+
+        // Identity, not a copy: a host keys the extension off the very request object
+        // the transport was handed (its `signal` and `tools` are the live ones).
+        expect(seen).toEqual([withTools, withTools]);
+        expect(sentJson(fetchMock)).toEqual({
+            model: 'merge/ds4-flash',
+            stream: true,
+            messages: [{ role: 'user', content: 'Search' }],
+            tools: [
+                {
+                    type: 'function',
+                    // wireTool's default for a declaration with no `parameters` — the
+                    // point of this test is the extension fields, not this shape.
+                    function: {
+                        name: 'websearch',
+                        description: 'Search the web.',
+                        parameters: { type: 'object', properties: {} }
+                    }
+                }
+            ],
+            tool_choice: 'required',
+            parallel_tool_calls: false
+        });
+    });
+
+    // AC3, the precedence rule: an extension ADDS fields. It cannot hijack the request
+    // shape, including `stream` (which the SSE reader below depends on) and the
+    // sampling numbers.
+    it('never lets extraBody override model, messages, tools, stream or sampling', async () => {
+        const hijack = {
+            model: 'hijacked',
+            messages: [{ role: 'user', content: 'injected' }],
+            tools: [{ type: 'function', function: { name: 'ghost' } }],
+            stream: false,
+            temperature: 0.9
+        };
+
+        // Case 1: the request declares NO tools. The host's `tools` must not survive
+        // either, because a tool the harness never declared has no implementation to
+        // route its call to.
+        const withoutTools = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({
+                baseURL: 'http://x/v1',
+                sampling: { temperature: 0.2 },
+                extraBody: hijack
+            })(request)
+        );
+
+        expect(sentJson(withoutTools)).toEqual({
+            model: 'merge/ds4-flash',
+            stream: true,
+            messages: request.messages,
+            temperature: 0.2
+        });
+
+        // Case 2: the request DOES declare tools — the declared list wins, and every
+        // other extension field still arrives.
+        const withDeclared = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({
+                baseURL: 'http://x/v1',
+                sampling: { temperature: 0.2 },
+                extraBody: { ...hijack, seed: 11 }
+            })({
+                ...request,
+                tools: [{ name: 'websearch', description: 'Search the web.' }]
+            })
+        );
+
+        expect(sentJson(withDeclared)).toEqual({
+            model: 'merge/ds4-flash',
+            stream: true,
+            messages: request.messages,
+            tools: [
+                {
+                    type: 'function',
+                    function: {
+                        name: 'websearch',
+                        description: 'Search the web.',
+                        parameters: { type: 'object', properties: {} }
+                    }
+                }
+            ],
+            temperature: 0.2,
+            seed: 11
+        });
+    });
+
+    it('bounds the extension at MAX_EXTRA_BODY_BYTES and names the field', async () => {
+        const over = { filler: 'x'.repeat(MAX_EXTRA_BODY_BYTES) };
+        const message = expectRejected(
+            () => openAICompatible({ baseURL: 'http://x/v1', extraBody: over }),
+            'provider.extraBody'
+        );
+
+        // `{"filler":"…"}` adds 13 bytes of structure, so the reported size is exactly
+        // the filler plus that.
+        expect(message).toContain(`${MAX_EXTRA_BODY_BYTES + 13} bytes`);
+        expect(message).toContain(`over the ${MAX_EXTRA_BODY_BYTES} byte cap`);
+
+        // EXACTLY at the cap still sends — the cap is `>`, not `>=`, so a host that
+        // measures the same way is never rejected by an off-by-one.
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({
+                baseURL: 'http://x/v1',
+                extraBody: { filler: 'x'.repeat(MAX_EXTRA_BODY_BYTES - 13) }
+            })(request)
+        );
+
+        expect(String(sentJson(fetchMock).filler)).toHaveLength(MAX_EXTRA_BODY_BYTES - 13);
+    });
+
+    it('rejects every extraBody shape that is not a plain JSON object at construction', () => {
+        const circular: Record<string, unknown> = { name: 'loop' };
+        circular.self = circular;
+
+        const rejected: Array<[string, unknown]> = [
+            ['an array', []],
+            ['a string', 'stream_options'],
+            ['a number', 7],
+            ['a Date', new Date()],
+            ['a class instance', new (class Thing { own = 1; })()],
+            ['a circular object', circular]
+        ];
+
+        for (const [label, value] of rejected) {
+            expectRejected(
+                () => openAICompatible({ baseURL: 'http://x/v1', extraBody: value as never }),
+                'provider.extraBody'
+            );
+        }
+
+        // A value that is not an object AND not a function gets the shape sentence, so
+        // the host learns both accepted forms.
+        expect(
+            expectRejected(
+                () => openAICompatible({ baseURL: 'http://x/v1', extraBody: 7 as never }),
+                'provider.extraBody'
+            )
+        ).toContain('a plain JSON object or a function returning one');
+    });
+
+    it('rejects an extraBody key that JSON would silently drop', () => {
+        const cases: Array<[Record<string, unknown>, string]> = [
+            [
+                { stream_options: undefined },
+                '`provider.extraBody.stream_options` cannot be undefined'
+            ],
+            [{ seed: () => 1 }, '`provider.extraBody.seed` cannot be function'],
+            [{ seed: Symbol('s') }, '`provider.extraBody.seed` cannot be symbol']
+        ];
+
+        for (const [value, expected] of cases) {
+            expect(
+                expectRejected(
+                    () => openAICompatible({ baseURL: 'http://x/v1', extraBody: value as never }),
+                    'provider.extraBody'
+                )
+            ).toContain(expected);
+        }
+    });
+
+    it('reports an extraBody function that returns a rejected value as an error frame without fetching', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        const events = await collect(
+            openAICompatible({
+                baseURL: 'http://x/v1',
+                extraBody: () => ({ nope: undefined }) as never
+            })(request)
+        );
+
+        expect(events).toEqual([
+            {
+                type: 'error',
+                message:
+                    '`provider.extraBody.nope` cannot be undefined: it would be dropped from the request body. Omit the key instead.'
+            }
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    // AC2: all three shapes, each asserted on the serialized body.
+    it('maps responseFormat "text" onto response_format.type text', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(openAICompatible({ baseURL: 'http://x/v1', responseFormat: 'text' })(request));
+
+        expect(sentJson(fetchMock).response_format).toEqual({ type: 'text' });
+    });
+
+    it('maps responseFormat "json" onto response_format.type json_object', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(openAICompatible({ baseURL: 'http://x/v1', responseFormat: 'json' })(request));
+
+        expect(sentJson(fetchMock).response_format).toEqual({ type: 'json_object' });
+    });
+
+    it('maps a jsonSchema responseFormat onto response_format.type json_schema', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+        const schema = {
+            type: 'object',
+            properties: { answer: { type: 'string' } },
+            required: ['answer']
+        };
+
+        await collect(
+            openAICompatible({
+                baseURL: 'http://x/v1',
+                responseFormat: { jsonSchema: { name: 'answer', schema, strict: true } }
+            })(request)
+        );
+
+        expect(sentJson(fetchMock).response_format).toEqual({
+            type: 'json_schema',
+            json_schema: { name: 'answer', schema, strict: true }
+        });
+    });
+
+    it('omits strict from the json_schema body when it is not configured', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({
+                baseURL: 'http://x/v1',
+                responseFormat: { jsonSchema: { name: 'answer', schema: { type: 'object' } } }
+            })(request)
+        );
+
+        // `toStrictEqual` is the point: an emitted `strict: undefined` key would still
+        // satisfy `toEqual`, and a gateway may read it as an explicit false.
+        expect(sentJson(fetchMock)).toStrictEqual({
+            model: 'merge/ds4-flash',
+            stream: true,
+            messages: request.messages,
+            response_format: { type: 'json_schema', json_schema: { name: 'answer', schema: { type: 'object' } } }
+        });
+    });
+
+    it('lets the first-class responseFormat win over an extraBody key of the same name', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        await collect(
+            openAICompatible({
+                baseURL: 'http://x/v1',
+                responseFormat: 'json',
+                extraBody: { response_format: { type: 'text' }, seed: 7 }
+            })(request)
+        );
+
+        expect(sentJson(fetchMock)).toEqual({
+            model: 'merge/ds4-flash',
+            stream: true,
+            messages: request.messages,
+            seed: 7,
+            response_format: { type: 'json_object' }
+        });
+    });
+
+    it('rejects every malformed responseFormat at construction, naming the field', () => {
+        const rejected: unknown[] = [
+            'jsonl',
+            7,
+            {},
+            { jsonSchema: 'answer' },
+            { jsonSchema: { name: '', schema: { type: 'object' } } },
+            { jsonSchema: { name: 'not a gateway name!', schema: { type: 'object' } } },
+            { jsonSchema: { name: 'x'.repeat(65), schema: { type: 'object' } } },
+            { jsonSchema: { name: 'answer', schema: 'object' } },
+            { jsonSchema: { name: 'answer', schema: { type: 'object' }, strict: 'yes' } },
+            { jsonSchema: { name: 'answer', schema: { type: 'object', fill: 'x'.repeat(MAX_EXTRA_BODY_BYTES) } } }
+        ];
+
+        for (const value of rejected) {
+            expectRejected(
+                () => openAICompatible({ baseURL: 'http://x/v1', responseFormat: value as never }),
+                'provider.responseFormat'
+            );
+        }
+
+        const circular: Record<string, unknown> = {};
+        circular.self = circular;
+
+        expectRejected(
+            () =>
+                openAICompatible({
+                    baseURL: 'http://x/v1',
+                    responseFormat: { jsonSchema: { name: 'answer', schema: circular } } as never
+                }),
+            'provider.responseFormat.jsonSchema.schema'
+        );
+    });
+
+    // AC4: the composable seam. A host with a different dialect changes ONLY the body;
+    // the URL, the bearer auth, the custom headers, the mapped transcript and the SSE
+    // reader all stay the transport's.
+    it('lets buildBody rewrite the body while reusing the rest of the transport', async () => {
+        const fetchMock = stubFetch([
+            sse({ choices: [{ delta: { content: 'rewritten' }, finish_reason: 'stop' }] }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(
+            openAICompatible(
+                { baseURL: 'http://x/v1/', apiKey: 'secret', headers: { 'x-dialect': 'v2' } },
+                {
+                    buildBody: (base) => ({
+                        target_model: base.model,
+                        chat: base.messages,
+                        wants_stream: true
+                    })
+                }
+            )(request)
+        );
+
+        const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+
+        expect(url).toBe('http://x/v1/chat/completions');
+        expect(init.headers).toMatchObject({
+            'content-type': 'application/json',
+            authorization: 'Bearer secret',
+            'x-dialect': 'v2'
+        });
+        expect(String(init.body)).toBe(
+            '{"target_model":"merge/ds4-flash","chat":[{"role":"system","content":"You are a writer."},' +
+                '{"role":"user","content":"Write"}],"wants_stream":true}'
+        );
+        expect(events).toEqual([
+            { type: 'text', delta: 'rewritten' },
+            { type: 'done', stopReason: 'stop', toolCalls: [], usage: undefined }
+        ]);
+    });
+
+    it('hands buildBody the assembled base body and the request', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+        const controller = new AbortController();
+
+        let seenBase: unknown;
+        let seenRequest: HarnessStreamRequest | undefined;
+
+        await collect(
+            openAICompatible(
+                {
+                    baseURL: 'http://x/v1',
+                    sampling: { temperature: 0.5 },
+                    extraBody: { seed: 3 },
+                    responseFormat: 'json'
+                },
+                {
+                    buildBody: (base, req) => {
+                        seenBase = base;
+                        seenRequest = req;
+
+                        return { ...base, note: 'added' };
+                    }
+                }
+            )({ ...request, signal: controller.signal })
+        );
+
+        // The base is the FULL default body: extension, first-class fields, mapped
+        // transcript and wire tool list — so an override adjusts, it does not rebuild.
+        expect(seenBase).toEqual({
+            seed: 3,
+            model: 'merge/ds4-flash',
+            stream: true,
+            messages: request.messages,
+            temperature: 0.5,
+            response_format: { type: 'json_object' }
+        });
+        expect(seenRequest).toEqual({ ...request, signal: controller.signal });
+        expect(sentJson(fetchMock).note).toBe('added');
+    });
+
+    it('reports a buildBody that returns a non-object as an error frame without fetching', async () => {
+        const fetchMock = stubFetch(['data: [DONE]\n\n']);
+
+        const events = await collect(
+            openAICompatible({ baseURL: 'http://x/v1' }, { buildBody: () => [] as never })(request)
+        );
+
+        expect(events).toEqual([
+            {
+                type: 'error',
+                message: '`options.buildBody` must return a plain JSON object of request fields.'
+            }
+        ]);
+        expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-function options.buildBody at construction', () => {
+        expectRejected(
+            () => openAICompatible({ baseURL: 'http://x/v1' }, { buildBody: 'nope' as never }),
+            'options.buildBody'
+        );
+    });
+
+    // AC4's other half: the default transport also reaches the BROWSER chunk, so this
+    // file must keep importing no Node built-in. `src/structure.test.ts` pins the
+    // entry split itself; this pins the module the new code lives in.
+    it('keeps the transport free of any Node built-in import', () => {
+        const source = fs.readFileSync(
+            fileURLToPath(new URL('./openai.ts', import.meta.url)),
+            'utf8'
+        );
+
+        expect(source).not.toContain("from 'node:");
+        expect(source).not.toMatch(/^import .* from '[a-z]+';$/m);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// issue 0004 — a provider "input too long" answer is its OWN failure class.
+//
+// Two things are pinned here and both matter to a caller:
+//   - an overflow frame carries the machine `code` and a message that LEADS with it,
+//     so `agent()` can refuse to retry it and a host can switch on it (the agent-side
+//     half is pinned in src/core/agent.test.ts);
+//   - every other non-2xx keeps the historical frame byte-for-byte, INCLUDING the
+//     absence of the `code` key — hence `toStrictEqual` on those cases.
+// ---------------------------------------------------------------------------
+
+describe('provider context overflow (issue 0004)', () => {
+    // The frame's message, spelled out in full rather than matched loosely: a
+    // reworded message is a contract change a test has to notice.
+    const quoted = (text: string): string => ` The provider said: "${text}"`;
+
+    const overflowMessage = (status: number, quotedDetail: string): string =>
+        `context-overflow: HTTP ${status} — the provider says this request is too large for the ` +
+        `model's context window, so a retry would be refused again. Send less: a turn.before handler ` +
+        `may replace the transcript, and the shipped context-compaction plugin does exactly that.` +
+        quotedDetail;
+
+    const overflowFrame = (status: number, providerSaid: string): HarnessStreamEvent => ({
+        type: 'error',
+        code: CONTEXT_OVERFLOW_CODE,
+        message: overflowMessage(status, providerSaid.length > 0 ? quoted(providerSaid) : '')
+    });
+
+    it('classifies the OpenAI maximum-context-length 400 as an overflow frame', async () => {
+        const providerLine =
+            "This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens";
+
+        stubFetch([providerLine], { status: 400 });
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events).toStrictEqual([overflowFrame(400, providerLine)]);
+    });
+
+    it('classifies an Anthropic-style prompt-is-too-long 400 as an overflow frame', async () => {
+        const providerLine = 'prompt is too long: 210000 tokens > 200000 maximum';
+
+        stubFetch([providerLine], { status: 400 });
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events).toStrictEqual([overflowFrame(400, providerLine)]);
+    });
+
+    it('classifies a 413 by status alone, quoting the status line when the body is empty', async () => {
+        // A proxy that caps request bodies answers 413 with no body at all. On a
+        // chat-completions POST there is exactly one thing that was too large.
+        stubFetch([''], { status: 413, statusText: 'Payload Too Large' });
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events).toStrictEqual([overflowFrame(413, 'Payload Too Large')]);
+    });
+
+    it('recognizes every documented overflow wording and nothing else', async () => {
+        // The list mirrors CONTEXT_OVERFLOW_PATTERNS in openai.ts, one live phrasing
+        // per entry. A new gateway means a new entry here AND a new pattern there.
+        const wordings = [
+            'This model\'s maximum context length is 8192 tokens',
+            'context_length_exceeded',
+            'context length exceeded',
+            'exceeds the model context window',
+            'prompt is too long: 210000 tokens > 200000 maximum',
+            'input is too long for this model',
+            'Input too long',
+            'too many tokens to complete chat',
+            'token limit exceeded',
+            'request too large',
+            'payload too large'
+        ];
+
+        for (const wording of wordings) {
+            stubFetch([wording], { status: 400 });
+
+            const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+            expect(events).toStrictEqual([overflowFrame(400, wording)]);
+        }
+    });
+
+    it('keeps an unrelated 400 with its raw detail and no code', async () => {
+        // The near-miss that must NOT be called an overflow: a complaint about the
+        // `max_tokens` FIELD. Nothing here may rewrite it into a size diagnosis.
+        stubFetch(['Invalid value for max_tokens: expected integer'], { status: 400 });
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events).toStrictEqual([{ type: 'error', message: 'HTTP 400: Invalid value for max_tokens: expected integer' }]);
+    });
+
+    it('never calls a non-400/413 answer an overflow, whatever it quotes', async () => {
+        // The status gate: a broken credential or a dead gateway whose error page
+        // happens to mention the context window must stay the plain frame it always
+        // was, because the remedy there is not "send less".
+        for (const status of [401, 429, 500, 503]) {
+            stubFetch(["This model's maximum context length is 8192 tokens"], { status });
+
+            const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+            expect(events).toStrictEqual([
+                {
+                    type: 'error',
+                    message: `HTTP ${status}: This model's maximum context length is 8192 tokens`
+                }
+            ]);
+        }
+    });
+
+    it('collapses a multi-line provider message into one quoted line', async () => {
+        const page = '<html>\n    <body>\n\n        maximum context length\n        exceeded\n\n    </body>\n</html>';
+
+        stubFetch([page], { status: 400 });
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events).toStrictEqual([
+            {
+                type: 'error',
+                code: CONTEXT_OVERFLOW_CODE,
+                message: overflowMessage(
+                    400,
+                    quoted('<html> <body> maximum context length exceeded </body> </html>')
+                )
+            }
+        ]);
+    });
+
+    it('quotes at most 300 characters of a gateway error page', async () => {
+        // The pre-0004 behaviour dumped the whole body into an event stream and into
+        // every event consumer. The cap keeps the provider's numbers — they are the
+        // actionable half — and drops the rest of the page.
+        const page = `maximum context length exceeded: 9000 tokens over 8192 ${'x'.repeat(400)} trailing`;
+
+        stubFetch([page], { status: 400 });
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        const frame = events[0];
+        if (frame?.type !== 'error') throw new Error(`expected an error frame, got ${JSON.stringify(frame)}`);
+
+        expect(frame.code).toBe(CONTEXT_OVERFLOW_CODE);
+        expect(frame.message).toBe(overflowMessage(400, quoted(`${page.slice(0, 300)}…`)));
     });
 });

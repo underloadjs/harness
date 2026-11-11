@@ -317,6 +317,14 @@ export type HarnessAssistantMessage = {
     stopReason: HarnessStopReason;
     // Undefined when the provider did not report usage for this request.
     usage?: HarnessUsage;
+    // (issue 0001) Only present for an agent built with `structured: schema`: the
+    // answer parsed and VALIDATED against that schema (core/agent.ts
+    // `requireStructuredAnswer`). The key is absent — never `undefined` — for every
+    // other agent, so an existing consumer that compares this message key-by-key
+    // sees exactly what it saw before. A turn whose answer failed the schema commits
+    // NOTHING and fails with a typed error instead, so a value here is always a
+    // value that passed.
+    structured?: unknown;
 };
 
 // Why generation ended. `tool_calls` means the model wants tools run and the
@@ -436,7 +444,19 @@ export type HarnessStreamEvent =
           toolCalls: HarnessToolCall[];
           usage?: HarnessUsage;
       }
-    | { type: 'error'; message: string };
+    // (issue 0004) `code` is a transport's MACHINE NAME for a failure a caller has
+    // to act on rather than read. One value ships today — `context-overflow`, the
+    // built-in transport's classification of a provider "input too long" answer —
+    // and it follows the `HarnessError` code convention (util/errors.ts): the code
+    // is also the FIRST TOKEN of `message`, so a model, an event consumer and a log
+    // line all quote one identifiable name.
+    //
+    // It is optional and ABSENT for every unclassified failure, so a frame that has
+    // always been `{ type: 'error', message }` keeps exactly that shape, and a
+    // custom transport is free never to set it. `agent()` reads it for one decision
+    // only: a frame carrying `context-overflow` is not retried (an oversized retry
+    // of an oversized request is the same rejection, paid for again).
+    | { type: 'error'; message: string; code?: string };
 
 // A transport is an async iterable of those events. Supplying one is how a
 // caller swaps the wire protocol; the default is `openAICompatible()`.
@@ -452,6 +472,89 @@ export type HarnessSampling = {
     frequency_penalty?: number;
 };
 
+// ---------------------------------------------------------------------------
+// Request-body extension (issue 0001)
+// ---------------------------------------------------------------------------
+
+// A host-supplied extension of the outbound chat-completion body: the ONLY way to
+// reach a field the built-in transport does not model (`stream_options`, `seed`,
+// `stop`, `top_k`, `parallel_tool_calls`, `tool_choice`,
+// `max_completion_tokens`, a provider-specific switch) without replacing the whole
+// transport.
+//
+// Rules the transport enforces (see ../transport/openai.ts: `serializedExtraBody`
+// for the value gate, `transportBody` for the merge order):
+//   - merged FIRST, so `model`, `stream`, `messages`, `tools`, the sampling fields
+//     and `responseFormat` always win — an extension can add fields, never hijack
+//     the request shape;
+//   - the plain-object form is validated (JSON-serializable, no `undefined`/
+//     function/symbol values, no cycles, ≤ MAX_EXTRA_BODY_BYTES) at TRANSPORT
+//     CONSTRUCTION, so a bad value fails where it was written, exactly like
+//     `resolveStream` in ../core/agent.ts does for a missing transport;
+//   - the function form is called ONCE PER REQUEST, after the model, transcript and
+//     tool declarations are resolved, so a host can key the extension off
+//     `request.tools` or `request.signal`. Its result is validated with the same
+//     rules; a rejected result is an `error` frame (the transport never throws).
+export type HarnessExtraBody =
+    | Record<string, unknown>
+    | ((request: HarnessStreamRequest) => Record<string, unknown>);
+
+// The `json_schema` shape: a named schema the provider must produce. `name` and
+// `strict` follow the OpenAI `response_format.json_schema` contract (the name is
+// what the gateway validates, so the transport checks it before sending).
+export type HarnessJsonSchemaFormat = {
+    jsonSchema: {
+        // Provider-side identifier for the schema. OpenAI-compatible gateways
+        // require `[a-zA-Z0-9_-]{1,64}`.
+        name: string;
+        // The schema itself, sent verbatim under `json_schema.schema`.
+        schema: Record<string, unknown>;
+        // Provider-enforced strict mode (every property required, additional
+        // properties disallowed). Omit to leave the decision to the provider.
+        strict?: boolean;
+    };
+};
+
+// The response shape to require from the model. Maps onto `response_format`:
+//   'text'          -> { type: 'text' }
+//   'json'          -> { type: 'json_object' }
+//   { jsonSchema }  -> { type: 'json_schema', json_schema: { name, schema, strict? } }
+//
+// This is configuration for the TRANSPORT (what goes on the wire). The agent-level
+// `structured` setting reuses it and additionally validates the reply — a provider
+// that ignores `response_format` still cannot hand back a value that fails the
+// schema (see AgentConfiguration.structured).
+export type HarnessResponseFormat = 'text' | 'json' | HarnessJsonSchemaFormat;
+
+// The body the built-in transport assembles for one request, BEFORE a `buildBody`
+// override sees it. `messages` are already wire-mapped (attachments expanded, tool
+// calls paired), so an override works on provider-shaped data, not on harness
+// records. Sampling fields and any `extraBody`/`responseFormat` contribution are
+// already merged in, which is what makes `buildBody` an ADJUSTMENT rather than a
+// re-implementation.
+export type HarnessTransportBody = {
+    model: string;
+    stream: boolean;
+    messages: Array<Record<string, unknown>>;
+    // Present only when the request declares tools.
+    tools?: Array<Record<string, unknown>>;
+    // Sampling fields, `extraBody` keys, `response_format` and any other
+    // provider-shaped field land here.
+    [field: string]: unknown;
+};
+
+// Options for `openAICompatible` (issue 0001, (C)). The built-in transport already
+// owns message mapping, attachment parts, video policy, aborting, error scrubbing
+// and SSE chunk parsing; `buildBody` is the one seam a host with a non-OpenAI
+// dialect needs, so it does not have to fork the module to change the body.
+export type HarnessTransportOptions = {
+    // Receives the default body and the resolved request, and returns the body to
+    // serialize. It may add, rename or drop fields; it must return a plain
+    // JSON-serializable object. Called once per request, and never on a request
+    // whose transcript failed to map (that already ends in an `error` frame).
+    buildBody?: (body: HarnessTransportBody, request: HarnessStreamRequest) => Record<string, unknown>;
+};
+
 // Endpoint configuration for the built-in transport. Ignored when an explicit
 // `stream` is supplied to the agent.
 export type HarnessProviderConfiguration = {
@@ -464,6 +567,42 @@ export type HarnessProviderConfiguration = {
     headers?: Record<string, string>;
     // Sampling fields attached to every request built by this transport.
     sampling?: HarnessSampling;
+    // (issue 0001) Extra outbound request-body fields — the escape hatch for
+    // `stream_options.include_usage`, `seed`, `stop`, `tool_choice`, and every
+    // other provider field this type does not model. Merged FIRST, so the
+    // first-class fields above (and `model`/`stream`/`messages`/`tools`) always
+    // win. Validated at transport construction, not at the first prompt.
+    extraBody?: HarnessExtraBody;
+    // (issue 0001) Require a response shape: 'text', 'json' (json_object), or a
+    // named `jsonSchema`. Serialized as `response_format`, and it beats whatever
+    // `extraBody` puts under that key — a first-class setting wins over the
+    // escape hatch.
+    responseFormat?: HarnessResponseFormat;
+    // (issue 0004) The model's input window in tokens: what this endpoint can be
+    // SENT, i.e. the floor below `HarnessSampling.max_tokens` (which caps the
+    // ANSWER). Set it and `agent()` refuses a request whose estimate exceeds it,
+    // BEFORE the request leaves — a typed `context-overflow` failure, never
+    // retried (see AgentConfiguration.maxPromptTokens for the same floor spelled
+    // per agent, and for which of the two wins).
+    //
+    // What it is measured against: `estimateContextTokens` (core/context-estimate
+    // .ts, published from the root barrel), i.e. `ceil(chars / 4)` over the
+    // transcript about to be sent — the same convention as the UI context bar and
+    // the `context-compaction` plugin's `contextLimit`. It is an ESTIMATE, not a
+    // provider count, and it deliberately ignores attachment bytes AND the
+    // request's tool schemas: both cost real tokens on the wire, so the prompt the
+    // provider measures is a little larger than the number this floor compares.
+    //
+    // Enforced by `agent()`, not by the transport, so the same floor applies to a
+    // custom `stream` too, and only the agent can keep the failure out of the retry
+    // ladder. A host that calls `openAICompatible()` directly has no guard: it
+    // measures with `estimateContextTokens()` itself. This is a FLOOR (a request
+    // that cannot fit is a bug), not a compaction policy — replacement policy
+    // lives on the plugin bus at `turn.before`.
+    //
+    // A positive safe integer, validated when the transport-bearing agent is
+    // constructed, so a typo fails where it was written.
+    contextWindow?: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -486,11 +625,61 @@ export type AgentConfiguration = {
     provider?: HarnessProviderConfiguration;
     // Explicit transport. Takes precedence over `provider`.
     stream?: HarnessStream;
+    // (issue 0001) Structured output: a JSON Schema this agent's ANSWER must
+    // satisfy, meaning "send the schema AND hand me a validated value".
+    //
+    //   - on the wire it is the `response_format` of every request this agent makes
+    //     (injected into the built-in transport through `provider.responseFormat`),
+    //     unless the host already set `provider.responseFormat` explicitly — that
+    //     explicit value wins on the wire, and `structured` still gates the reply;
+    //   - the reply is parsed and validated with the same runtime gate a created
+    //     tool's arguments pass (`validateSchemaValue`), and the schema itself is
+    //     gated at construction with `checkToolSchemaComplexity` /
+    //     `MAX_CREATED_SCHEMA_*`, so a hostile schema is rejected where the agent is
+    //     built, not on the wire;
+    //   - an answer that is not valid JSON, or not valid against the schema, is an
+    //     explicit typed failure (`structured-output-invalid`) with NO commit to
+    //     history. It is deliberately NOT a transport retry: the provider answered,
+    //     so re-sending the same request would cost a request for the same shape of
+    //     failure (retry belongs to the host, above the agent).
+    //   - a turn that stops for tool calls, or one truncated with
+    //     `stopReason: 'length'`, is not judged against the schema: the first has no
+    //     answer yet, and the second is a truncation problem, not a format problem.
+    //
+    // With an explicit `stream` (a custom transport) the schema cannot reach the
+    // wire — the agent has no way to describe the field to someone else's protocol —
+    // so `structured` is validation-only there, and `provider` is ignored as it
+    // always is.
+    structured?: Record<string, unknown>;
     // Model-request retry policy (R1). Omit for the default: one initial attempt
     // plus ten retries with 1s..512s doubling waits. `false` = one attempt only.
     // Retries re-send ONLY the current model request; tools and the run are never
     // replayed.
     retry?: HarnessRetryConfiguration;
+    // (issue 0004) The pre-request context floor for this agent, in tokens: the
+    // largest estimate this agent is allowed to SEND. Before a request leaves,
+    // `agent()` measures the transcript about to go out with `estimateContextTokens`
+    // (`ceil(chars / 4)`, published from the root barrel; transcript text only — the
+    // request's tool schemas are not counted) and, when it exceeds this number,
+    // fails with a typed `context-overflow` — no fetch, no retry, and the
+    // message names BOTH numbers (the estimate and the window), with the pair also
+    // on `HarnessError.details` as `{ estimatedTokens, contextWindow, model, agent }`
+    // for a caller that has to recover.
+    //
+    //   - it is the same floor as `HarnessProviderConfiguration.contextWindow`,
+    //     spelled per agent; when both are set THIS one wins, because an agent is
+    //     the narrower scope (one brain on a shared endpoint can aim lower than the
+    //     endpoint's window);
+    //   - it is checked AFTER any `turn.before` replacement, so a compaction plugin
+    //     gets its chance to shrink the transcript first — the floor only refuses
+    //     what is still too big after policy ran;
+    //   - it is a refusal, not a policy: no truncation, no summarisation, and the
+    //     transcript is never trimmed to fit (`agent()` still owns no compaction).
+    //     A fork and a persistent thread inherit it — both are the same brain.
+    //
+    // A positive safe integer, validated at construction like every other numeric
+    // bound, so a typo fails where it was written rather than on the first prompt.
+    maxPromptTokens?: number;
     // Display-only identity color (R2): a CSS hex color `#rgb`, `#rgba`,
     // `#rrggbb` or `#rrggbbaa`, case-insensitive. It NEVER reaches a model request
     // or a transcript — a host (the harness UI) paints a stable swatch from it
@@ -833,9 +1022,13 @@ export type HarnessToolSourceDependency = {
     text: string;
 };
 
-// Inspection view of the exact source revision behind a registered tool. `tools`
-// registered from an already-constructed definition (configured tools/plugins)
-// have no source entry and return undefined from `harness.toolSource()`.
+// Inspection view of the exact source revision behind a registered tool. A tool
+// registered from an already-constructed definition has no source entry and returns
+// undefined from `harness.toolSource()` — UNLESS the caller attached the source it
+// was compiled from (issue 0003): `tools: { name: { tool, source } }` and
+// `registerTool({ definition, moduleText })` both publish a real revision for a
+// prebuilt definition, because the kernel derives it from the captured bytes without
+// re-evaluating the module.
 export type HarnessToolSource = {
     name: string;
     // Content-addressed revision of the entry plus every captured local helper.
@@ -850,11 +1043,40 @@ export type HarnessToolSource = {
     checks: readonly string[];
 };
 
+// The captured bytes a prebuilt definition can be installed WITH, so a shared tool
+// catalogue keeps the inspect/revision/source surface (issue 0003). This is DATA
+// only: the harness never re-evaluates it, so a module's top-level code does not run
+// again per instance, and its syntax is transpile-checked. Deriving the record needs
+// the Node source compiler (`supportsToolCompilation`); on a browser build a source
+// attachment registers the definition with no source record, exactly like a bare
+// prebuilt tool.
+//
+// The revision here is the same one `compileToolSourceModule` reported for the same
+// bytes, so a catalogue compiled once and shared N times stays inspectable, and a
+// replacement under the same name still changes it.
+export type HarnessToolSourceAttachment = {
+    // The exact entry bytes the definition was compiled from.
+    moduleText?: string;
+    // Or an editable entry path, resolved like `toolSources`.
+    sourcePath?: string;
+    // Captured local helpers for a `moduleText` revision, addressed by the exact
+    // specifier the entry imports.
+    dependencies?: readonly HarnessToolSourceDependency[];
+};
+
+// One entry of `configuration.tools`: either a prebuilt definition, or a definition
+// plus the source revision it came from. A host that compiles its user tools once
+// (issue 0002) keeps one `Record<string, Tool | { tool, source }>` and passes the
+// SAME object to every harness it constructs.
+export type HarnessConfiguredTool = Tool | { tool: Tool; source: HarnessToolSourceAttachment };
+
 // A candidate accepted by the kernel's single compile/load/validate/register
 // operation. `sourcePath` and `moduleText` are module forms; `source` is the
 // legacy async-body form. `definition` is accepted for host/plugin compatibility:
 // those definitions are already constructed and are published through the SAME
-// registry commit path (no source revision exists to inspect).
+// registry commit path. With no source bytes attached a definition has no source
+// revision to inspect; with `moduleText`/`sourcePath` supplied it keeps one, derived
+// from those bytes without re-evaluating the module (issue 0003).
 export type HarnessToolRegistrationCandidate = {
     name?: string;
     description?: string;
@@ -865,6 +1087,9 @@ export type HarnessToolRegistrationCandidate = {
     moduleText?: string;
     sourcePath?: string;
     dependencies?: readonly HarnessToolSourceDependency[];
+    // An already-constructed definition. It is published as-is (never cloned), so
+    // what the host built is what the registry holds.
+    definition?: Tool;
 };
 
 // What a successful registration returns. It is metadata only: no function,
@@ -1594,6 +1819,12 @@ export type RecordStoreView = {
     collections: RecordStoreCollection[];
     // The retained store-wide feed, oldest first.
     changes: RecordStoreChange[];
+    // 0011 — the FLOOR of that retained feed: the store revision the oldest returned
+    // event carries. A client that bootstraps here and then polls
+    // `recordsChanges(lastRev)` needs the number to know whether its first `since` can
+    // be answered at all; the engine emits it (src/core/records.ts `view()`). Optional
+    // because a projection built by an older host may omit it.
+    oldestAvailableRev?: number;
 };
 
 // `recordsChanges(since)` — the delta a client applies on top of its last read.
@@ -1605,6 +1836,12 @@ export type RecordStoreDelta = {
     collectionsRev: number;
     changes: RecordStoreChange[];
     reset: boolean;
+    // 0011 — where to RESUME after a `reset`. `reset` alone says a gap happened; this is
+    // the floor of the window the response does hold, so a poller picks the feed back up
+    // at a revision instead of guessing between 0 (re-reading everything) and `storeRev`
+    // (skipping what is still retained). The engine emits it on every delta
+    // (src/core/records.ts `changesSince()`); a projection from an older host may omit it.
+    oldestAvailableRev?: number;
 };
 
 // One page cursor. Offset mode keeps `nextOffset`; keyset mode (`afterId`) echoes
@@ -1646,6 +1883,26 @@ export type RecordsResult = {
     changesTruncated?: boolean;
     // `define`/`drop` only: the collection this call registered or removed.
     collection?: string;
+    // 0008 — the ids a batch MINTED, in mint order, and the ids it REALLY changed (a
+    // no-op patch counts as nothing, exactly as it counts as nothing for `entry` and in
+    // the change log), in caller order. Emitted only when the call affected MORE THAN
+    // ONE record: at exactly one, `entry` already names the record. Before these keys a
+    // multi-record batch capped by `limit` answered with a survivor page and nothing that
+    // named what it had just written, so a caller could not confirm its own write without
+    // re-reading the list.
+    //
+    // The engine has emitted both since 0008 (src/core/records.ts `executeCollection`,
+    // mirrored by the tasks wrapper at `toWrapperResult`); they lived in the engine's own
+    // `RecordsResultAdditions` until this declaration, which is what lets a typed
+    // consumer read them off the published result.
+    addedIds?: string[];
+    changedIds?: string[];
+    // 0011 — the floor of THIS collection's retained change window: the oldest revision
+    // `changes` can still show. It rides the feed, so it appears when `since` asked for
+    // changes (and on a plain read of one collection, which reports its own window).
+    // `changesTruncated`/`changesHasMore` tell a poller it lost events; this tells it
+    // where it can resume.
+    oldestAvailableRev?: number;
     // R6/T6.1 — `describe: true` only: the collection's OWN definition, verbatim from
     // the stored spec (fields with `key`, `type`, `required`, `maxLength`, `maxItems`,
     // `values`, `max`, `default`, `getOnly`, `sortable`, `count`, plus `maxRecords` and
@@ -1830,6 +2087,16 @@ export type TaskResult = Omit<RecordsResult, 'entries' | 'counts' | 'removed'> &
     // branches on which KEY is present rather than on a union. Absent at one deletion,
     // where `removed` already names the record and its body.
     removedIds?: string[];
+    // INHERITED from `RecordsResult` through the `Omit`, but worth spelling out because
+    // the `batch` wrapper projects these three itself (`toWrapperResult`,
+    // src/core/records.ts:3711-3735) rather than passing the engine result through:
+    //   - `addedIds` / `changedIds` ride through UNCHANGED (0008) — a
+    //     `tasks {"tasks":[a,b], "limit":1}` answer names the ids it minted instead of
+    //     only a survivor page;
+    //   - `oldestAvailableRev` (0011) is copied ONLY when the response carries `changes`,
+    //     because the number is the floor OF THE FEED and a wrapper read has no feed to
+    //     bound. A truncated feed without it says "you lost events" and nothing about
+    //     where to resume.
 };
 
 // The shared CRUD action set is declared above with the engine types.
@@ -2236,6 +2503,9 @@ export type WebFetchParameters = {
     // Character offset to start reading at, for resuming a cut page with the
     // `nextOffset` the result reported. Clamped to the page rather than rejected:
     // reaching slightly past the end is a question with an answer, not an error.
+    // IGNORED when `query` is set: section selection runs on the whole converted
+    // page, so there is no window to start partway through (issue 0016 documents
+    // the rule where the caller will read it — the `offset` parameter schema).
     offset?: number;
 };
 
@@ -2268,7 +2538,10 @@ export type WebFetchResult = {
     offsetClamped?: boolean;
     // Character offset of the NEXT page of this page. Present only when
     // `truncated` is true, so resuming is a fact from the tool rather than a
-    // guess about where the cut landed.
+    // guess about where the cut landed. In query mode it appears only for the
+    // byte-budget cause (see `stopReason`) — the section cap has no page position
+    // that reaches what it withheld — and `offset` is ignored while `query` is
+    // set, so resuming a query answer means re-fetching without `query`.
     nextOffset?: number;
     // Redirect hops followed, present only when the chain was not empty.
     redirects?: number;
@@ -2286,9 +2559,32 @@ export type WebFetchResult = {
     // is a text window around the first match rather than a section, and the
     // caller should not read it as a precise structural hit.
     matchMode?: 'heading' | 'proximity';
-    // A plain-language pointer attached when a behaviour needs explaining: an
-    // offset that was clamped, or a query that degraded to proximity. Cheap to
-    // ignore, and cheaper than a wasted turn.
+    // WHICH bound closed a query answer. `truncated` alone conflated two causes
+    // with opposite remedies (issue 0016), so the cause is reported in the same
+    // vocabulary as FileGlobStopReason / FileGrepStopReason (glob.tool.ts:140,
+    // grep.tool.ts:250): 'contentBudget' = the serialized-result byte budget cut
+    // the answer, and `nextOffset` is resumable; 'resultCap' = MAX_QUERY_BLOCKS
+    // withheld matching sections, which paging cannot reach, so the caller narrows
+    // the query instead. Absent when nothing was withheld.
+    stopReason?: 'contentBudget' | 'resultCap';
+    // A plain-language pointer attached when a behaviour needs explaining:
+    //   - an `offset` past the end that was clamped (`offsetClamped` carries the fact;
+    //     the note names the page length so the caller can tell "fully read" from
+    //     "empty"),
+    //   - a `query` on a headingless page that degraded to a proximity window
+    //     (`matchMode: 'proximity'` carries the fact; the note says the excerpt is not
+    //     a section),
+    //   - math markup the native conversion FLATTENED — 'Math markup flattened; use
+    //     format="html" for exact values.' (`src/tools/webfetch/native.ts`,
+    //     `MATH_FLATTENED_NOTE`). This one is lossy in a way the other two are not: the
+    //     values are still on the page, but the conversion wrote what TeX/MathML looked
+    //     like rather than what they said, so an exact formula needs `format: 'html'`.
+    // `note` holds ONE sentence, so when a window note (the clamp or the proximity
+    // degradation) and the math note would both apply, the window note wins — it
+    // explains the excerpt the caller is holding (src/tools/webfetch/index.ts:52-61).
+    // A refusal is one of these instead: `note` never carries an error, which
+    // `errorKind`/`retryable` and the thrown `HarnessError` own. Cheap to ignore, and
+    // cheaper than a wasted turn.
     note?: string;
 };
 
@@ -3136,12 +3432,31 @@ export type HarnessConfiguration = {
     // reset() does NOT restore this budget — restoring it would let a session
     // grow the registry without bound one reset at a time. Must be a positive
     // safe integer; validated at construction.
+    //
+    // PER INSTANCE, NOT GLOBAL (issue 0003): the counter belongs to ONE harness, so
+    // a host that constructs one harness per conversation gets a fresh budget every
+    // time. The number is the guard that stops ONE runaway session growing its own
+    // registry; it bounds nothing across instances and is deliberately not a
+    // process-wide limit (a shared registry would break the isolation snapshot and
+    // restore rely on). A host that needs a real bound on how many USER tools exist
+    // keeps its own catalogue — compile once with `compileToolSourceModule`, share
+    // one `Record<string, HarnessConfiguredTool>` into every instance — because a
+    // configured/catalogue tool is catalogue state, never a creation, and so never
+    // spends this budget.
     maxCreatedTools?: number;
 
     // Every tool the harness can run. Keyed by the name the model calls. Only
     // `visibility: 'core'` tools are declared up front; the rest are found
     // through the built-in toolRequest tool and enabled for the next turn.
-    tools?: Record<string, Tool>;
+    //
+    // A value is either a prebuilt `Tool` or `{ tool, source }`, where `source`
+    // carries the bytes the definition was compiled from (issue 0003). That second
+    // shape is the shared-catalogue path: compile the host's user tools ONCE with
+    // `compileToolSourceModule`, keep one `Record<string, …>`, and pass the same
+    // object to every harness instance — each instance still reports a real
+    // `toolSource()` revision and source text for it, and the module's top-level
+    // code is not evaluated again per instance.
+    tools?: Record<string, HarnessConfiguredTool>;
     // Independently compiled source entries, keyed by wire name. Semantics:
     //   - each value is a source path accepted by the kernel's shared compiler
     //     (package-source-relative, e.g. `server/tools/shared/foo.tool.ts`, or
@@ -3289,12 +3604,20 @@ export type Harness = {
     // definition, and overlapping registrations complete in submission (FIFO)
     // order because no compilation is deferred to a background task. Replacements
     // do not consume the new-tool budget.
+    //
+    // A `definition` candidate is the shared-catalogue form (issue 0003): the
+    // prebuilt definition is published as-is, and a `moduleText`/`sourcePath`
+    // supplied alongside it becomes the installed source revision — derived from
+    // those bytes WITHOUT re-evaluating the module, so a tool compiled once can serve
+    // many instances and each one still answers `toolSource()`/`toolSources()`.
     registerTool: (
         candidate: HarnessToolRegistrationCandidate
     ) => Promise<HarnessToolRegistrationResult>;
     // Inspect the captured source/revision of the installed registration. `undefined`
-    // means the tool was registered from an already-constructed definition (no
-    // editable source revision exists for it).
+    // means the tool was registered from an already-constructed definition with no
+    // source bytes attached, so no editable source revision exists for it. A
+    // definition registered WITH its source (a configured `{ tool, source }` entry or
+    // `registerTool({ definition, moduleText })`) does report one.
     toolSource: (name: string) => HarnessToolSource | undefined;
     // Every installed source revision, in registry insertion order.
     toolSources: () => HarnessToolSource[];

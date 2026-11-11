@@ -14,13 +14,19 @@
 //
 // Cross-references:
 //   - ./api.ts      — routes, validation, bootstrap document, error mapping
-//   - ./service.ts  — the other adapter (`/v1/harness` on @underload/service)
+//   - ./service.ts  — the other adapter (`/v1/harness` on @underload/service), and the
+//                     home of `createHarnessSseResponse`, the ONE SSE writer this
+//                     adapter also uses (issue 0006; see `runHarnessSseStream` below)
 //   - ./start.ts    — starts a real node:http server around this handler AND the stream upgrade
 //   - ./stream/     — the update stream mounted at `${mount}/stream`
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Readable } from 'node:stream';
+// The `ReadableStream` this package builds is the Fetch API one (the DOM lib), while
+// `Readable.fromWeb` is declared against `node:stream/web`; the two are the same runtime
+// object under two declarations, so the bridge is typed with the Node spelling.
+import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import type { HarnessRegistry, ToolCatalogue } from './harnesses';
-import type { SessionStreamItem, SessionViewStreamItem } from './protocol';
 import type { HarnessIndex } from './protocol';
 // T28: the credential-bearing settings type (`createHarnessApi({ settings })`).
 import type { RunnerSettings } from './harnesses/types';
@@ -34,9 +40,14 @@ import {
     MAX_API_BODY_BYTES,
     STANDALONE_MOUNT
 } from './api';
-import type { HarnessApiEmit, HarnessApiResult } from './api';
+import type { HarnessApiResult } from './api';
 import type { HarnessStreamMount } from './stream';
 import type { HarnessEventHub } from './api-events';
+// Issue 0006: the package's one SSE writer, shared with the service adapter. It lives in
+// ./service.ts (where it was private until now) and is published from ./index.ts, so the
+// frame contract, the preamble, the header set, the backpressure rule and the cancel->abort
+// wiring exist once in the package instead of once per adapter.
+import { createHarnessSseResponse } from './service';
 
 export type HarnessHandlerOptions = {
     store: SessionStore;
@@ -136,60 +147,75 @@ const readJson = <T>(request: IncomingMessage, limitBytes = MAX_API_BODY_BYTES):
         });
     });
 
-// Write one SSE frame and honour backpressure. The harness awaits progress, so a
-// slow client naturally paces the run instead of buffering the transcript.
-const createSseWriter = (response: ServerResponse): HarnessApiEmit => {
-    return async (item: SessionStreamItem | SessionViewStreamItem): Promise<void> => {
-        if (response.writableEnded || response.destroyed) return;
-
-        if (response.write(`data: ${JSON.stringify(item)}\n\n`)) return;
-
-        await new Promise<void>((resolve) => {
-            const done = (): void => {
-                response.off('drain', done);
-                response.off('close', done);
-                resolve();
-            };
-
-            response.once('drain', done);
-            response.once('close', done);
-        });
-    };
-};
-
-// Open the SSE response, run the dispatcher's stream, and cancel the run when
-// the client goes away. HTTP headers are sent only after the dispatcher has
-// validated the request, so busy/unknown sessions still answer with JSON.
-const runStream = async (
+// Issue 0006: this file used to hold the package's SECOND, independent SSE writer — its own
+// `data: <json>\n\n` literal, its own `: connected\n\n` preamble, its own `X-Accel-Buffering`,
+// its own cancel->abort wiring, all written before the service adapter existed. Both copies
+// are now one: the Node adapter consumes `createHarnessSseResponse` (./service.ts, published
+// from `@underload/harness/server`) and pipes that Response's body onto the `ServerResponse`,
+// so the frame contract, the preamble, the header set, the backpressure rule and the abort
+// wiring have exactly one implementation in the package.
+//
+// The bridge is `Readable.fromWeb` + `pipe`: `pipe` only pulls while the socket has drained,
+// which is what keeps the writer's `desiredSize` backpressure rule meaningful on a Node
+// listener, and destroying the bridge (the `finally` below) cancels the web ReadableStream —
+// the writer's own `cancel()` -> abort path. One honest difference from the deleted copy:
+// header NAMES reach the wire lower-cased, because `Response.headers` normalises them; HTTP
+// header names are case-insensitive (RFC 9110 §5.1) and every value is unchanged.
+//
+// Exported, and therefore published by the `./server` barrel, because a host that owns its own
+// Node listener can now serve harness SSE without writing a writer of its own.
+//
+// HTTP headers are sent only after the dispatcher has validated the request (the caller awaits
+// `api(...)` first), so a busy or unknown session still answers with JSON.
+export const runHarnessSseStream = async (
     result: Extract<HarnessApiResult, { kind: 'stream' }>,
     request: IncomingMessage,
     response: ServerResponse
 ): Promise<void> => {
-    response.statusCode = 200;
-    response.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    response.setHeader('Cache-Control', 'no-cache, no-transform');
-    response.setHeader('Connection', 'keep-alive');
-    response.setHeader('X-Accel-Buffering', 'no');
-    response.flushHeaders();
-
-    response.write(': connected\n\n');
-
-    // One abort source for both directions: a disconnected socket cancels the
-    // run, and a completed run leaves a harmless abort after the response ends.
+    // One abort source for both directions, exactly as the deleted copy had it: a
+    // disconnected socket cancels the run, and a completed run leaves a harmless abort
+    // after the response ends.
     //
     // R4: this signal means different things per route and the dispatcher decides.
     // POST /messages treats it as "abort the run" (legacy); GET /sessions/:id/events
-    // treats it as "unsubscribe only" — a queued task keeps running server-side, so
-    // the watch handler must simply return (see api.ts watchSessionRoute).
+    // treats it as "unsubscribe only" — a queued task keeps running server-side, so the
+    // watch handler must simply return (see api.ts watchSessionRoute).
     const controller = new AbortController();
     const abort = (): void => controller.abort();
 
     response.on('close', abort);
     request.on('error', abort);
 
+    // Build the canonical response — status, the four headers, the preamble and every frame
+    // come from the shared writer, not from this adapter.
+    const sse = createHarnessSseResponse(result.start, controller.signal);
+
+    response.statusCode = sse.status;
+
+    for (const [name, value] of sse.headers) response.setHeader(name, value);
+
+    response.flushHeaders();
+
+    // `sse.body` is never null: the writer always constructs the Response around a stream.
+    const readable = Readable.fromWeb(sse.body as unknown as NodeReadableStream<Uint8Array>);
+
     try {
-        await result.start(createSseWriter(response), controller.signal);
+        // Settles on the FIRST of: the run finished and the bridge ended, the socket died and
+        // the response closed, or the bridge failed. All three mean "this request is over";
+        // the cleanup below is what actually releases the run.
+        await new Promise<void>((resolve) => {
+            readable.once('error', resolve);
+            readable.once('close', resolve);
+            response.once('close', resolve);
+
+            readable.pipe(response);
+        });
     } finally {
+        // Destroying the bridge cancels the web stream, which is the writer's `cancel()` ->
+        // abort path: a run still streaming after a client disconnect stops here instead of
+        // writing into a dead socket.
+        if (!readable.destroyed) readable.destroy();
+
         response.off('close', abort);
         request.off('error', abort);
 
@@ -271,7 +297,7 @@ export const createHarnessHandler = ({
                 return true;
             }
 
-            await runStream(result, request, response);
+            await runHarnessSseStream(result, request, response);
             return true;
         } catch (error) {
             if (response.headersSent) {

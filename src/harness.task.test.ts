@@ -692,6 +692,10 @@ describe('task concurrency across harness callers', () => {
         );
 
         // Untouched: same record, same rev, same storeRev, and one log entry (the add).
+        // 0011 — the feed carries `oldestAvailableRev` beside `changes`: the one revision
+        // the retained window still starts at, which is what makes `changesTruncated`
+        // actionable. The wrapper carries the key ONLY with a feed — the plain-envelope
+        // pins in this file stay byte-identical.
         expect(await callAs(writer, editor, 'thread-editor', { since: 0 })).toEqual({
             tasks: [task('1', 'Shared', { by: 'writer', at: EPOCH_ISO })],
             counts: { total: 1, completed: 0, pending: 1 },
@@ -699,7 +703,67 @@ describe('task concurrency across harness callers', () => {
             storeRev: 1,
             changes: [event(1, '1', 'add', { by: 'writer', itemRev: 1 })],
             changesHasMore: false,
-            changesTruncated: false
+            changesTruncated: false,
+            oldestAvailableRev: 1
+        });
+    });
+
+    // -----------------------------------------------------------------------
+    // R-0009, at the door a MODEL actually sees. harness.ts:6892 renders a thrown tool
+    // error as `Tool "<name>" failed: <message>`, so ONLY the message reaches a model —
+    // a payload parked in `error.details` would not have removed the extra round trip the
+    // stress test recorded. The refusal now ends with the current record, in the same
+    // `current: {…}` shape `stale-record` has always used, and the model's next call is
+    // the write rather than a read.
+    // -----------------------------------------------------------------------
+    it('gives a model the current record in a guarded-write refusal so its retry needs no read (0009)', async () => {
+        const entry = brain(
+            scripted([
+                // 1. The write an agent must send with a token, sent with none: refused.
+                callTool('c1', 'tasks', '{"tasks":[{"id":"1","completed":true}]}'),
+                // 2. The retry, built from the rev THIS refusal handed back — no read in
+                //    between, which is the point: two calls, not three.
+                callTool(
+                    'c2',
+                    'tasks',
+                    '{"tasks":[{"id":"1","completed":true}],"expects":[{"id":"1","rev":1}]}'
+                ),
+                answer('recovered')
+            ])
+        );
+        const writer = quiet(entry);
+
+        // Seed one record through the host door, so the model has something to patch at
+        // rev 1 and the refusal has a current record to carry.
+        await writer.executeTool('tasks', { tasks: [{ text: 'Shared' }] });
+
+        const message = await writer('work on the plan');
+
+        expect(message.content).toBe('recovered');
+
+        const results = entry.messages
+            .filter((record) => record.role === 'tool')
+            .map((record) => (record as { content: string }).content);
+
+        // Acceptance 1 and 2 exactly as the model receives them: the historical sentence,
+        // byte-identical, then the record — and the `rev` in it is the one the retry uses.
+        expect(results[0]).toBe(
+            'Tool "tasks" failed: guarded-write: guarded write: pass "expects" [{ id, rev }] for task "1" (read it first). ' +
+                'current: {"id":"1","text":"Shared","completed":false,"rev":1,"updatedBy":"writer","updatedAt":"2026-01-01T00:00:00.000Z"}'
+        );
+
+        // The write landed on the model's SECOND call, which is the acceptance test for
+        // "read → retry is two calls": `entry` answers with the patched record at rev 2.
+        const retried = JSON.parse(results[1]) as { entry: Record<string, unknown> };
+
+        expect(retried.entry).toEqual({
+            id: '1',
+            text: 'Shared',
+            completed: true,
+            rev: 2,
+            updatedBy: 'writer',
+            updatedThreadId: 'agent:writer',
+            updatedAt: EPOCH_ISO
         });
     });
 
@@ -927,6 +991,9 @@ describe('task concurrency across harness callers', () => {
 
         const feed = (await writer.executeTool('tasks', { since: 0 })) as TaskResult & {
             changes: TaskChange[];
+            // 0011 — the window floor. `TaskResult` (src/types, owned by another pass) does
+            // not declare the key yet, so the test narrows the result it reads.
+            oldestAvailableRev: number;
         };
 
         expect(feed.changes).toEqual([
@@ -937,6 +1004,9 @@ describe('task concurrency across harness callers', () => {
         expect(feed.changesHasMore).toBe(false);
         expect(feed.changesTruncated).toBe(false);
         expect(feed.storeRev).toBe(3);
+        // 0011 (issue 0011, "Tests to add") — the `tasks` wrapper carries the floor beside
+        // `changes`: nothing has been trimmed, so the window still starts at revision 1.
+        expect(feed.oldestAvailableRev).toBe(1);
 
         // A reader that already saw two of them gets exactly the third: the feed
         // is per-event, not a snapshot of the list.
@@ -947,11 +1017,15 @@ describe('task concurrency across harness callers', () => {
         // Nothing new since the watermark the reader holds.
         const idle = (await writer.executeTool('tasks', { since: 3 })) as TaskResult & {
             changes: TaskChange[];
+            oldestAvailableRev: number;
         };
 
         expect(idle.changes).toEqual([]);
         expect(idle.changesHasMore).toBe(false);
         expect(idle.changesTruncated).toBe(false);
+        // 0011 — an empty feed is no longer ambiguous: floor 1 beside storeRev 3 says the
+        // window still holds everything and this reader is simply caught up.
+        expect(idle.oldestAvailableRev).toBe(1);
 
         // A watermark ahead of the store is a bug, not an empty answer.
         await expect(writer.executeTool('tasks', { since: 5 })).rejects.toThrow(
@@ -964,7 +1038,7 @@ describe('task concurrency across harness callers', () => {
         const writer = quiet(author);
 
         // 200 additions (the record cap) is 200 events; one more event pushes the
-        // window past TASK_MAX_CHANGES, so the oldest entry is dropped FIFO.
+        // window past RECORD_MAX_CHANGES (200), so the oldest entry is dropped FIFO.
         await writer.executeTool('tasks', {
             tasks: Array.from({ length: 200 }, (_, index) => ({ text: `T${index + 1}` }))
         });
@@ -973,6 +1047,7 @@ describe('task concurrency across harness callers', () => {
         // 51 entries are asked for at once: the feed is capped at 50 and says so.
         const capped = (await writer.executeTool('tasks', { since: 2 })) as TaskResult & {
             changes: TaskChange[];
+            oldestAvailableRev: number;
         };
 
         expect(capped.changes.map((change) => change.rev)).toEqual(
@@ -983,6 +1058,9 @@ describe('task concurrency across harness callers', () => {
         expect(capped.changesHasMore).toBe(true);
         // Nothing has left the window yet, so the gap is a CAP, not a truncation.
         expect(capped.changesTruncated).toBe(false);
+        // 0011 — and the floor confirms it independently of the flag: the window still
+        // reaches back to revision 1, so a reader at `since: 2` has lost nothing.
+        expect(capped.oldestAvailableRev).toBe(1);
 
         // One more event overflows the 200-entry window, dropping rev 1.
         await writer.executeTool('tasks', {
@@ -991,6 +1069,7 @@ describe('task concurrency across harness callers', () => {
         });
         const trimmed = (await writer.executeTool('tasks', { since: 0 })) as TaskResult & {
             changes: TaskChange[];
+            oldestAvailableRev: number;
         };
 
         // The reader fell behind the oldest retained event, so the feed cannot be
@@ -1000,6 +1079,10 @@ describe('task concurrency across harness callers', () => {
         expect(trimmed.changesHasMore).toBe(true);
         expect(trimmed.changesTruncated).toBe(true);
         expect(trimmed.storeRev).toBe(201);
+        // 0011 (acceptance criterion 1) — the flag now comes with the number: rev 1 is gone,
+        // the window starts at 2, and that is exactly where this reader resumes.
+        expect(trimmed.oldestAvailableRev).toBe(2);
+        expect(trimmed.oldestAvailableRev).toBe(trimmed.changes[0].rev);
     });
 });
 

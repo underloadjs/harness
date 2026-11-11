@@ -45,6 +45,11 @@ import type {
 } from '../shared/harness-api';
 import type { SessionSnapshot, SessionThread, SessionView } from './protocol';
 import { listAgentResultBlocks, REFERENCED_RESULTS_FOOTER, REFERENCED_RESULTS_HEADER } from '../shared/agent-results';
+// 0018 item 2 — the two strings the SHIPPED summarize pass commits into the transcript
+// (../plugins/context-compaction.plugin.ts). They are the only witness that the pass, not a
+// hand-written bump, is what moved the lane in the joined case below: no other code in this
+// package can put them on the wire.
+import { COMPACTION_INSTRUCTION, CONTINUATION_NUDGE } from '../plugins/context-compaction.plugin';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
 // src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
@@ -342,6 +347,85 @@ const laneFixture = (): {
         gate,
         started
     };
+};
+
+// C1 FIXTURE (0018 item 2) — the SAME scripted transport, with the SHIPPED compactor as the
+// lane writer instead of a hand-performed bump. Everything else is the `laneFixture` above:
+// a preset, a `report.progress` recorder, and a store run.
+//
+// WHY A SEPARATE FIXTURE: the two halves of the lane path were each pinned against a real
+// thing, but never against each other — `src/plugin/context-compaction.test.ts` drives the
+// shipped plugin through a bare harness and samples the lane from inside each provider
+// request, and `laneFixture` drives a real `SessionStore` with a bump performed by the test
+// at a controllable instant. What nothing joined was the middle: does a bump the SHIPPED
+// summarize pass raises mid-run actually reach the store's per-event stamping and come back
+// out of the projector as stacked rows. This fixture is only the combination — settings plus
+// a transcript long enough to cross the trigger — so the pass's own extra model request and
+// its fire-and-forget continuation turn happen for real, uncontrolled by the test.
+//
+// THE NUMBERS, derived before the run rather than read off it:
+//   - `contextLimit: 250` is the firing point (the operator's one-number ruling —
+//     ../plugins/context-compaction.plugin.ts resolves the trigger with no headroom);
+//   - the estimate is `ceil(chars / 4)` of the projected request (../core/context-estimate.ts),
+//     so the 1 200-character prompt alone is 300 tokens, plus the 3-character `sys`
+//     instruction: over 250 on the very first boundary, and the pass must therefore fire on
+//     the FIRST submit and on nothing after it (the retained head it leaves is ~40 tokens);
+//   - `minTokens: 0` keeps the summarize floor from refusing the pass by accident;
+//   - `context-trimmer.enabled: false` is the same isolation the producer half uses, so
+//     exactly one withheld unit shows up in the folded bar.
+const COMPACTION_LIMIT = 250;
+const COMPACTING_PROMPT = 'x'.repeat(1200);
+
+const compactionFixture = (): { preset: HarnessPreset; prompts: string[] } => {
+    // The LAST user message of every provider request the harness sends, in order. It is the
+    // only honest witness that the pass really ran: the compaction instruction and the
+    // continuation nudge are the shipped plugin's own constants, and no other code in this
+    // package can put them on the wire.
+    const prompts: string[] = [];
+
+    const preset = presetOf('probe', (settings, progress) =>
+        harness({
+            agents: {
+                probe: agent({
+                    model: settings.model,
+                    instruction: 'sys',
+                    stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
+                        prompts.push(lastUser(request.messages));
+
+                        // One answer per request, numbered by the request count: request 1 is
+                        // the pass's own summary, request 2 the continuation nudge's answer, and
+                        // request 3 the second submit's answer. The text is the only content the
+                        // bar's answer blocks carry, so it names which block is whose.
+                        yield { type: 'text', delta: `answer:${prompts.length}` };
+                        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                    }
+                })
+            },
+            primary: 'probe',
+            presets: false,
+            // THE SHIPPED PLUGIN, mounted by settings alone: `context-compaction` is a
+            // built-in (../plugin/manifest.ts), so nothing here imports or re-implements it —
+            // the store's own harness loads it and this provider only states the operator's
+            // three settings.
+            pluginSettings: {
+                get: (plugin: string, key: string): unknown => {
+                    if (plugin === 'context-trimmer' && key === 'enabled') return false;
+                    if (plugin !== 'context-compaction') return undefined;
+
+                    return key === 'contextLimit'
+                        ? COMPACTION_LIMIT
+                        : key === 'minTokens'
+                          ? 0
+                          : key === 'mode'
+                            ? 'summarize'
+                            : undefined;
+                }
+            },
+            report: { progress }
+        })
+    );
+
+    return { preset, prompts };
 };
 
 // The restore's recovery sentence, verbatim (./sessions.ts:764, module-private there). The
@@ -4179,6 +4263,144 @@ describe('display lane (C1)', () => {
             ['0-reasoning-1', 'reasoning', undefined],
             ['0-assistant-2', 'answer', 1]
         ]);
+    });
+
+    // THE JOIN (0018 item 2): the shipped compaction plugin driving a store run, and the
+    // folded bar read back out of `getView`. Neither existing half covers this — the producer
+    // case in ../plugin/context-compaction.test.ts stops at the lane value inside the
+    // provider request, and the two cases above hand the bump to the api themselves. Only
+    // here does a real pass's mid-run bump cross the recorder, the fold, and the row grouping
+    // the browser will use, which is the seam a later change can break silently.
+    //
+    // The grouping rule is re-stated below rather than imported: this file runs under the node
+    // config, which EXCLUDES src/frontend (./vitest.config.ts), so a store test must not lean
+    // on the client module. It is the same three lines as `contextBlockLaneOf` +
+    // `contextBarLanesOf` (../frontend/view-context.ts:436 and :449) — `lane` absent or
+    // malformed means row 0, rows exist only for lanes the blocks occupy, ascending.
+    const lanesOf = (blocks: { lane?: number }[]): number[] => {
+        const lanes = new Set<number>();
+
+        for (const block of blocks) {
+            lanes.add(
+                typeof block.lane === 'number' && Number.isInteger(block.lane) && block.lane >= 0 ? block.lane : 0
+            );
+        }
+
+        return [...lanes].sort((left, right) => left - right);
+    };
+
+    // One recorded frame as [type, delta, lane] — the three figures that say which row the
+    // recorder stamped, and which run (the pass's summary, its continuation, or the submit's
+    // own answer) the frame came from.
+    const framesOf = (events: readonly unknown[]): [string, unknown, number | undefined][] =>
+        events.map((event) => {
+            const frame = event as Record<string, unknown>;
+
+            return [String(frame.type), frame.delta, frame.lane as number | undefined];
+        });
+
+    it('paints a real summarize compaction as two stacked rows, and the next turn as one', async () => {
+        const fixture = compactionFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        const first = await store.enqueue(created.id, COMPACTING_PROMPT);
+
+        await first.settled;
+        await store.waitForIdle(created.id);
+
+        // THE CONTINUATION RUN BELONGS TO THIS TURN. The pass ends with a fire-and-forget
+        // nudge run, and its three frames are recorded into the SAME turn the pass fired in
+        // (the recorder is bound to the run's context, not to the queue entry). Waiting on the
+        // exact frame count is the deterministic form of "let the continuation land" — the
+        // alternative, a sleep, would let a missing continuation pass as a short bar.
+        await waitUntil(() => store.get(created.id).turns[0].events.length === 6);
+
+        const boundary = store.get(created.id).turns[0];
+
+        // THE RECORD, exactly as the conversation moved: `start` is stamped before the pass
+        // fires (lane 0, absent), and every frame from the pass's own request onward carries
+        // lane 1 — including the continuation run's frames, which happen AFTER the submit's
+        // `done` but still inside this turn.
+        expect(framesOf(boundary.events)).toEqual([
+            ['start', undefined, undefined],
+            ['text', 'answer:1', 1],
+            ['done', undefined, 1],
+            ['start', undefined, 1],
+            ['text', 'answer:2', 1],
+            ['done', undefined, 1]
+        ]);
+
+        // THE PASS, named by its own bytes: request 1 carries the committed compaction
+        // instruction as its last user turn, request 2 the continuation nudge. Nothing else
+        // fired — the second submit's request is asserted below.
+        expect(fixture.prompts).toEqual([COMPACTION_INSTRUCTION, CONTINUATION_NUDGE]);
+
+        // THE BAR, from the store's own fold: the instruction and the 1 200-character prompt
+        // sit on row 0, and both answers the pass produced sit on row 1. `chars` is pinned
+        // alongside the lane because it is what proves the split is a compaction boundary and
+        // not just two runs: the row-0 pair is the oversized prompt, the row-1 pair is eight
+        // characters of answer each.
+        const boundaryContext = store.getView(created.id).displays[boundary.id].sections[0].context ?? [];
+
+        expect(
+            boundaryContext.map((block) => [block.id, block.name, block.lane, block.chars])
+        ).toEqual([
+            ['0-system-instructions', 'instructions', undefined, 3],
+            ['0-user-prompt', 'prompt', undefined, 1_200],
+            ['0-assistant-1', 'answer', 1, 8],
+            ['0-assistant-4', 'answer', 1, 8]
+        ]);
+
+        // TWO ROWS, by the browser's own grouping rule — the promise this join exists for.
+        expect(lanesOf(boundaryContext)).toEqual([0, 1]);
+
+        // THE CONTINUATION TURN: the same conversation, one submit later, on the lane the pass
+        // raised. It starts there (`turn.lane`, the row the whole turn shares) and never
+        // returns to row 0.
+        const second = await store.enqueue(created.id, 'again', undefined, undefined, 'thread-1');
+
+        expect(second.turn.lane).toBe(1);
+
+        await second.settled;
+        await store.waitForIdle(created.id);
+
+        const continuation = store.get(created.id).turns[1];
+
+        expect(framesOf(continuation.events)).toEqual([
+            ['start', undefined, 1],
+            ['text', 'answer:3', 1],
+            ['done', undefined, 1]
+        ]);
+
+        // ONE ROW, entirely on the raised lane — and the prompt block is FIVE characters now,
+        // which is the compacted head the pass left behind rather than the 1 200-character
+        // prompt the first turn carried.
+        const continuationContext =
+            store.getView(created.id).displays[continuation.id].sections[0].context ?? [];
+
+        expect(
+            continuationContext.map((block) => [block.id, block.name, block.lane, block.chars])
+        ).toEqual([
+            ['0-system-instructions', 'instructions', 1, 3],
+            ['0-user-prompt', 'prompt', 1, 5],
+            ['0-assistant-1', 'answer', 1, 8]
+        ]);
+
+        expect(lanesOf(continuationContext)).toEqual([1]);
+
+        // EXACTLY ONE PASS for the whole session: the third request is this submit's answer,
+        // not a second compaction. The retained head is far under the limit, so the cooldown
+        // is not what stopped it — the estimate did — and the bar above stays one row because
+        // nothing raised a lane 2.
+        expect(fixture.prompts).toEqual([COMPACTION_INSTRUCTION, CONTINUATION_NUDGE, 'again']);
+
+        // The turn the compaction happened IN keeps the lane it STARTED on (absent = row 0),
+        // exactly as the hand-performed case above: the pass moved the conversation, not the
+        // row the turn began on.
+        expect('lane' in boundary).toBe(false);
+
+        store.dispose();
     });
 
     it('starts the next turn on the raised lane, and keeps it across a restart', async () => {

@@ -970,6 +970,21 @@ describe('provider filters', () => {
         results: [{ title: 'A', url: 'https://example.com/a', highlights: ['one'] }]
     });
 
+    // Runs a call that must be refused and hands back the WHOLE message, so the
+    // combination assertions below can pin "names the category, the filter and
+    // what to drop" exactly instead of matching a fragment of it.
+    const refusalMessage = async (parameters: WebSearchParameters): Promise<string> => {
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        try {
+            await tool(parameters);
+        } catch (error) {
+            return (error as Error).message;
+        }
+
+        throw new Error(`Expected a refusal for ${JSON.stringify(parameters)}.`);
+    };
+
     it('sends the domain, date and category filters Exa documents', async () => {
         const fetchMock = stubFetch(rows);
         const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
@@ -1055,6 +1070,109 @@ describe('provider filters', () => {
         await expect(tool({ query: 'q', includeDomains: [] })).rejects.toThrow(/array of 1-20 domains/);
         await expect(tool({ query: 'q', speed: 'turbo' })).rejects.toThrow(/"balanced" or "fast"/);
         expect(requests).toBe(0);
+    });
+
+    it('refuses a category the provider cannot combine with a filter, before paying for the request', async () => {
+        // The description already names these pairs; accepting them locally
+        // spent a provider round trip and came back as the opaque
+        // "Exa search failed (HTTP 400).", which names neither the field nor the
+        // fix because the response body is never surfaced (it can echo the key).
+        let requests = 0;
+
+        stubFetch(async () => {
+            requests += 1;
+
+            return rows.clone();
+        });
+
+        const peopleDate =
+            'search category "people" does not support date filters. Drop "since"/"until", or use another category.';
+        const companyDate =
+            'search category "company" does not support date filters. Drop "since"/"until", or use another category.';
+
+        // Both date filters are covered on purpose: pinning only `since` leaves
+        // the defect half-fixed.
+        expect(await refusalMessage({ query: 'q', category: 'people', since: '2026-01-01' })).toBe(peopleDate);
+        expect(await refusalMessage({ query: 'q', category: 'people', until: '2026-06-30' })).toBe(peopleDate);
+        expect(await refusalMessage({ query: 'q', category: 'company', since: '2026-01-01' })).toBe(companyDate);
+        expect(await refusalMessage({ query: 'q', category: 'company', until: '2026-06-30' })).toBe(companyDate);
+        expect(await refusalMessage({ query: 'q', category: 'people', excludeDomains: ['forum.example'] })).toBe(
+            'search category "people" does not support "excludeDomains". Drop the category or the domain filter.'
+        );
+        // readCategory case-folds, so the guard fires whatever casing the caller sent.
+        expect(await refusalMessage({ query: 'q', category: 'People', since: '2026-01-01' })).toBe(peopleDate);
+
+        // The local guarantee, proven rather than assumed: the provider never saw
+        // any of the six calls above.
+        expect(requests).toBe(0);
+    });
+
+    it('keeps a precise field error ahead of a combination error', async () => {
+        // Every call below is also a `people` + filter combination, so only these
+        // calls can show that the per-field validators still run first — the
+        // ordering the fix depends on, including `excludeDomains: []` keeping its
+        // own error instead of reaching the combination check as a defined filter.
+        let requests = 0;
+
+        stubFetch(async () => {
+            requests += 1;
+
+            return rows.clone();
+        });
+
+        expect(await refusalMessage({ query: 'q', category: 'people', excludeDomains: [] })).toBe(
+            'search excludeDomains must be an array of 1-20 domains.'
+        );
+        expect(await refusalMessage({ query: 'q', category: 'people', since: 'last tuesday' })).toBe(
+            'search since must be an ISO-8601 date, for example "2026-01-01".'
+        );
+        expect(
+            await refusalMessage({ query: 'q', category: 'people', since: '2026-06-01', until: '2026-01-01' })
+        ).toBe('search "until" must not be earlier than "since".');
+        expect(await refusalMessage({ query: 'q', category: 'people', speed: 'turbo' })).toBe(
+            'search speed must be "balanced" or "fast".'
+        );
+        expect(requests).toBe(0);
+    });
+
+    it('still accepts the category and filter pairs the provider accepts', async () => {
+        // Guards against over-rejection. These four pairs were verified working
+        // against the live provider, so each must still resolve — and still send
+        // its filter, since silently dropping the filter was the rejected
+        // alternative (it returns results the caller believes are filtered).
+        const fetchMock = stubFetch(rows);
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        const people = await tool({ query: 'q', category: 'people' });
+        const company = await tool({ query: 'q', category: 'company' });
+        const companyDomains = await tool({ query: 'q', category: 'company', excludeDomains: ['forum.example'] });
+        const newsSince = await tool({ query: 'q', category: 'news', since: '2026-01-01' });
+
+        expect(people.category).toBe('people');
+        expect(people.since).toBeUndefined();
+        expect(company.category).toBe('company');
+        expect(companyDomains.category).toBe('company');
+        expect(companyDomains.excludeDomains).toEqual(['forum.example']);
+        expect(newsSince.category).toBe('news');
+        expect(newsSince.since).toBe('2026-01-01');
+
+        const bodies = fetchMock.mock.calls.map(
+            (call) => JSON.parse(String(call[1].body)) as Record<string, unknown>
+        );
+
+        expect(bodies.map((body) => body.category)).toEqual(['people', 'company', 'company', 'news']);
+        expect(bodies.map((body) => body.excludeDomains)).toEqual([
+            undefined,
+            undefined,
+            ['forum.example'],
+            undefined
+        ]);
+        expect(bodies.map((body) => body.startPublishedDate)).toEqual([
+            undefined,
+            undefined,
+            undefined,
+            '2026-01-01'
+        ]);
     });
 
     it('echoes the applied filters in the result', async () => {

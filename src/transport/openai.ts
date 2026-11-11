@@ -15,9 +15,29 @@
 //
 // Request shape follows the proven pattern in
 // packages/underload/service/src/providers/fetch-client.ts: `{ model, stream,
-// messages }` with an Authorization bearer token. `stream_options` is
-// deliberately NOT sent — several gateways this workspace talks to reject
-// unknown request fields. Usage is captured when a provider reports it anyway.
+// messages }` with an Authorization bearer token. `stream_options` is NOT sent by
+// DEFAULT — several gateways this workspace talks to reject unknown request
+// fields, and a default would break working deployments to fix an optional
+// counter. Usage is captured when a provider reports it anyway. A host that needs
+// the opt-in asks for it explicitly through `provider.extraBody`
+// (`{ stream_options: { include_usage: true } }`), which is issue 0001's (A): the
+// field stays opt-in per agent, so a gateway that rejects unknown fields receives
+// exactly the body it always did.
+//
+// Request-body seams (issue 0001), from widest to narrowest:
+//   - `provider.extraBody`      — add provider fields without touching the shape;
+//   - `provider.responseFormat` — require a response shape (`response_format`);
+//   - `openAICompatible(config, { buildBody })` — rewrite the body while reusing
+//     message mapping, attachment parts, aborting, error scrubbing and this file's
+//     SSE parser, so a non-OpenAI dialect is no longer a fork of 929 lines.
+//
+// Context overflow (issue 0004): a 413, or a 400 whose body matches a documented
+// "input too long" phrasing, is reported as a `context-overflow` error FRAME — a
+// machine `code` beside a message that leads with that same name — instead of the
+// generic `HTTP <status>: <raw body>` dump, and `agent()` treats it as non-retriable
+// (see ../core/agent.ts, where the pre-request guard raises the same code before any
+// fetch). Every other non-2xx keeps its historical frame byte-for-byte, and a 400
+// that matches none of the patterns still answers with its raw detail.
 //
 // Tool calls: the provider streams `tool_calls` as indexed fragments whose
 // `function.arguments` arrive as partial JSON. They are accumulated here and
@@ -31,7 +51,7 @@
 //   - ../core/tool-media    — the tool media this module expands into user parts
 //   - ./index.ts      — the transport barrel
 
-import { toErrorInfo } from '../util';
+import { HarnessError, toErrorInfo } from '../util';
 import {
     attachmentMarker,
     DOWNLOAD_ATTACHMENT_LIMITS,
@@ -41,14 +61,19 @@ import {
 import type {
     HarnessAttachment,
     HarnessAttachmentLimits,
+    HarnessExtraBody,
     HarnessMessage,
     HarnessProviderConfiguration,
+    HarnessResponseFormat,
     HarnessSampling,
     HarnessStopReason,
     HarnessStream,
     HarnessStreamEvent,
+    HarnessStreamRequest,
     HarnessStreamTool,
     HarnessToolCall,
+    HarnessTransportBody,
+    HarnessTransportOptions,
     HarnessUsage
 } from '../types';
 
@@ -783,17 +808,385 @@ const finishToolCalls = (pending: Map<number, PendingToolCall>): HarnessToolCall
 };
 
 // ---------------------------------------------------------------------------
+// Request-body extension (issue 0001)
+// ---------------------------------------------------------------------------
+
+// Byte cap for the host-supplied extension of the outbound body. It sits with the
+// package's other caps (`MAX_BASE_URL_LENGTH` 2048 chars and `MAX_MODEL_LENGTH`
+// 256 chars in ../server/config.ts, `MAX_CREATED_SCHEMA_BYTES` 16 KiB in
+// ../core/schema-validation.ts) and answers the same question: how big may
+// host-supplied request metadata be before it stops being metadata.
+//
+// 8 KiB is the answer: `stream_options`, `seed`, `stop`, `tool_choice` and a
+// provider switch are all well under a kilobyte, so anything reaching this cap is
+// a host pasting a payload into request metadata. Rejecting at construction beats
+// shipping a body the gateway 400s on, and it keeps one agent from silently
+// growing every request in the process.
+export const MAX_EXTRA_BODY_BYTES = 8 * 1024;
+
+// Cap for `responseFormat.jsonSchema.name`. The OpenAI-compatible gateways this
+// package targets validate the name against `[a-zA-Z0-9_-]{1,64}` and reject
+// anything longer, so the transport enforces the same rule rather than learning it
+// from a 400 on the first prompt.
+export const MAX_RESPONSE_SCHEMA_NAME_CHARS = 64;
+
+const RESPONSE_SCHEMA_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+// Stable machine name for every request-body rejection (records-engine Decision O
+// convention, see ../util/errors.ts). A host that has to distinguish "my provider
+// config is wrong" from a transport failure switches on this instead of parsing
+// prose; `HarnessError` sets `name` to the same value.
+export const PROVIDER_REQUEST_BODY_CODE = 'provider-request-body';
+
+// UTF-8 byte length of an already-serialized value. `TextEncoder` is a global from
+// Node 18 (the package's `engines.node`) and in every browser, so this adds no
+// dependency and no Node built-in to the browser chunk (issue 0001 AC4).
+const byteLengthOf = (value: string): number => new TextEncoder().encode(value).length;
+
+// A JSON-serializable plain object: not null, not an array, not a class instance
+// (whose private fields would serialize as `{}` and lie to the caller), and not a
+// boxed primitive. Own inherited keys are ignored, which is exactly what
+// `JSON.stringify` does too, so the value validated here is the value sent.
+const isPlainBodyObject = (value: unknown): value is Record<string, unknown> => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+
+    const prototype = Object.getPrototypeOf(value) as unknown;
+
+    return prototype === Object.prototype || prototype === null;
+};
+
+// Validate one extension object and return its serialized form.
+//
+// Rejections (all named by the field the host wrote, so the fix is obvious):
+//   - not a plain object (`extraBody: []`, `extraBody: 'x'`, a Date, a class
+//     instance) — the body is a JSON object, so anything else is a mistake;
+//   - an `undefined`/function/symbol VALUE at the top level — `JSON.stringify`
+//     silently DROPS those keys, so a typo like `{ stream_options: undefined }`
+//     would otherwise send a body the host never asked for;
+//   - anything that cannot serialize (a cycle, a BigInt, a hostile `toJSON`) —
+//     `JSON.stringify` throws, and it must throw HERE rather than inside fetch;
+//   - over MAX_EXTRA_BODY_BYTES once serialized.
+//
+// Nested functions are not rejected: `JSON.stringify` drops them where they sit,
+// and a nested value is the provider's business, not the merge contract.
+const serializedExtraBody = (value: unknown, field: string): Record<string, unknown> => {
+    if (!isPlainBodyObject(value)) {
+        throw new HarnessError(
+            `\`${field}\` must be a plain JSON object of request fields.`,
+            { code: PROVIDER_REQUEST_BODY_CODE }
+        );
+    }
+
+    for (const [key, entry] of Object.entries(value)) {
+        if (entry === undefined || typeof entry === 'function' || typeof entry === 'symbol') {
+            throw new HarnessError(
+                `\`${field}.${key}\` cannot be ${entry === undefined ? 'undefined' : typeof entry}: ` +
+                    `it would be dropped from the request body. Omit the key instead.`,
+                { code: PROVIDER_REQUEST_BODY_CODE }
+            );
+        }
+    }
+
+    let serialized: string;
+
+    try {
+        serialized = JSON.stringify(value);
+    } catch (error) {
+        // A cycle, a BigInt, or a `toJSON` that throws. Reported as the config
+        // error it is, with the original message kept for the operator.
+        throw new HarnessError(
+            `\`${field}\` cannot be serialized as JSON: ${toErrorInfo(error).message}`,
+            { code: PROVIDER_REQUEST_BODY_CODE, cause: error }
+        );
+    }
+
+    const bytes = byteLengthOf(serialized);
+
+    if (bytes > MAX_EXTRA_BODY_BYTES) {
+        throw new HarnessError(
+            `\`${field}\` serializes to ${bytes} bytes, over the ${MAX_EXTRA_BODY_BYTES} byte cap. ` +
+                `Request metadata belongs here, not a payload.`,
+            { code: PROVIDER_REQUEST_BODY_CODE }
+        );
+    }
+
+    return value;
+};
+
+// The `response_format` field for one configured response shape, computed ONCE at
+// transport construction (it is per-agent configuration, not per-request data), so
+// a malformed shape is a construction error like every other provider setting.
+//
+// Only an ABSENT `responseFormat` sends nothing — that keeps every pre-existing
+// request byte-for-byte identical. The string 'text' is an explicit ask and is
+// serialized as `{ type: 'text' }`.
+const responseFormatField = (format: HarnessResponseFormat | undefined): Record<string, unknown> => {
+    if (format === undefined) return {};
+
+    if (format === 'text') return { response_format: { type: 'text' } };
+    if (format === 'json') return { response_format: { type: 'json_object' } };
+
+    // Every rejection names the field the host wrote and ends with the shape that
+    // IS accepted, because a config error is only useful if it says what to write.
+    const reject = (reason: string): never => {
+        throw new HarnessError(
+            `\`provider.responseFormat\` ${reason}. Use 'text', 'json', or { jsonSchema: { name, schema, strict? } }.`,
+            { code: PROVIDER_REQUEST_BODY_CODE }
+        );
+    };
+
+    if (!isPlainBodyObject(format)) reject('is neither "text", "json", nor an object');
+
+    const jsonSchema = format.jsonSchema;
+
+    if (!isPlainBodyObject(jsonSchema)) reject('is an object without a plain `jsonSchema` object');
+
+    const rawName: unknown = jsonSchema.name;
+    const schema: unknown = jsonSchema.schema;
+    const strict: unknown = jsonSchema.strict;
+    const name = typeof rawName === 'string' ? rawName : '';
+
+    if (typeof rawName !== 'string' || name.length === 0) {
+        reject('has a `jsonSchema.name` that is not a non-empty string');
+    }
+
+    if (name.length > MAX_RESPONSE_SCHEMA_NAME_CHARS || !RESPONSE_SCHEMA_NAME_PATTERN.test(name)) {
+        reject(
+            `has a \`jsonSchema.name\` a gateway rejects: use at most ${MAX_RESPONSE_SCHEMA_NAME_CHARS} ` +
+                'of a-z, A-Z, 0-9, "_" or "-"'
+        );
+    }
+
+    if (!isPlainBodyObject(schema)) reject('has a `jsonSchema.schema` that is not a plain JSON object');
+    if (strict !== undefined && typeof strict !== 'boolean') {
+        reject('has a `jsonSchema.strict` that is neither a boolean nor absent');
+    }
+
+    // The schema rides inside the SAME byte cap as `extraBody`: both are
+    // host-supplied request metadata, and a schema large enough to break the body
+    // is a schema that belongs in a tool, not in `response_format`.
+    let serialized: string;
+
+    try {
+        serialized = JSON.stringify(schema);
+    } catch (error) {
+        throw new HarnessError(
+            `\`provider.responseFormat.jsonSchema.schema\` cannot be serialized as JSON: ${toErrorInfo(error).message}`,
+            { code: PROVIDER_REQUEST_BODY_CODE, cause: error }
+        );
+    }
+
+    const bytes = byteLengthOf(serialized);
+
+    if (bytes > MAX_EXTRA_BODY_BYTES) {
+        throw new HarnessError(
+            `\`provider.responseFormat.jsonSchema.schema\` serializes to ${bytes} bytes, over the ` +
+                `${MAX_EXTRA_BODY_BYTES} byte cap.`,
+            { code: PROVIDER_REQUEST_BODY_CODE }
+        );
+    }
+
+    const wireSchema: Record<string, unknown> = { name, schema };
+
+    // `strict` is omitted, not sent as `false`: an absent key leaves the decision
+    // with the provider, while an explicit `false` is a claim the host made.
+    if (strict !== undefined) wireSchema.strict = strict;
+
+    return { response_format: { type: 'json_schema', json_schema: wireSchema } };
+};
+
+// The default body for one request, in the order the wire expects.
+//
+// PRECEDENCE (issue 0001 AC3, the rule that keeps `extraBody` from becoming a
+// foot-gun): the extension is spread FIRST, so every first-class field written
+// after it wins. `model`, `stream`, `messages`, `tools` and the sampling numbers
+// therefore cannot be hijacked, and neither can `response_format` — a first-class
+// setting beats the escape hatch. An override of `stream` is deliberately NOT
+// available through `extraBody`: it would change what the SSE reader downstream
+// parses, and that belongs in an explicit option, not in a spread order.
+const transportBody = (input: {
+    extra: Record<string, unknown>;
+    model: string;
+    messages: Array<Record<string, unknown>>;
+    tools: Array<Record<string, unknown>>;
+    sampling: Record<string, number>;
+    responseFormat: Record<string, unknown>;
+}): HarnessTransportBody => {
+    // `tools` is the one extension key the transport REMOVES rather than merely
+    // outranks. When the request DOES declare tools the spread order already loses the
+    // host's value, but when it declares none the spread would leave the host's list
+    // standing — and a provider told about a tool the harness never declared produces
+    // calls whose results cannot be paired back to a registered implementation. Same
+    // reason the tool declarations come from the registry and not from the wire.
+    const extension: Record<string, unknown> = {};
+
+    for (const [key, value] of Object.entries(input.extra)) {
+        if (key !== 'tools') extension[key] = value;
+    }
+
+    return {
+        ...extension,
+        model: input.model,
+        stream: true,
+        messages: input.messages,
+        ...(input.tools.length > 0 ? { tools: input.tools } : {}),
+        ...input.sampling,
+        ...input.responseFormat
+    };
+};
+
+// A `buildBody` result must still be a plain JSON object — the same gate the
+// extension passes, so a host that rewrites the body cannot smuggle a cycle or a
+// non-object into `JSON.stringify` mid-request.
+const requireBuiltBody = (body: unknown): Record<string, unknown> => {
+    if (!isPlainBodyObject(body)) {
+        throw new HarnessError(
+            '`options.buildBody` must return a plain JSON object of request fields.',
+            { code: PROVIDER_REQUEST_BODY_CODE }
+        );
+    }
+
+    return body;
+};
+
+// ---------------------------------------------------------------------------
+// Provider context overflow (issue 0004)
+// ---------------------------------------------------------------------------
+
+// ONE machine name for "this prompt does not fit", shared with the pre-request
+// guard in ../core/agent.ts and published from the root barrel. A host switches on
+// it instead of parsing prose, and it sees the same name whether the harness
+// refused the request before sending it or the provider refused it after. It
+// follows the `HarnessError` code convention (../util/errors.ts): the code is also
+// the FIRST TOKEN of the message, because `harness.ts` renders a thrown error as
+// `Tool "…" failed: <message>` and only the message reaches the model.
+export const CONTEXT_OVERFLOW_CODE = 'context-overflow';
+
+// Providers do not agree on one wording, so recognition is an explicit list of the
+// phrasings real endpoints actually emit — never a status guess and never a bare
+// number. Every entry is a phrase only a size rejection uses:
+//   - `maximum context length` / `context_length_exceeded` — OpenAI and the
+//     gateways that relay it ("This model's maximum context length is 8192 tokens.
+//     However, your messages resulted in 9000 tokens…");
+//   - `prompt is too long` — Anthropic and the gateways that pass its text through;
+//   - `input is too long`, `too many tokens`, `context window`,
+//     `token limit exceeded` — the vLLM / Ollama / OpenRouter phrasings;
+//   - `request|payload|body too large` — the plain proxy-layer rejection, which on
+//     a chat-completions POST can only mean the prompt.
+//
+// Deliberately NOT matched: `max_tokens` on its own (a sampling-field complaint —
+// "Invalid value for max_tokens" is a broken request, not an oversized one), a bare
+// `length`, or any number. And a 400 that matches nothing keeps its raw detail:
+// this classifier decides only how a failure is NAMED, never what it says, so the
+// worst case is the pre-0004 frame, not a wrong diagnosis.
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+    /maximum context length/i,
+    /context[ _-]?length[ _-]?exceeded/i,
+    /context[ _-]?window/i,
+    /prompt[ _-]?is[ _-]?too[ _-]?long/i,
+    /input[ _-]?(?:is[ _-]|was[ _-])?too[ _-]?long/i,
+    /too[ _-]?many[ _-]?tokens/i,
+    /token[ _-]?limit[ _-]?exceeded/i,
+    /(?:request|payload|body)[ _-]?too[ _-]?large/i
+];
+
+// How much of the provider's own line survives in the frame. The provider's number
+// is the actionable half ("your messages resulted in 9000 tokens"), so the detail
+// is not thrown away — it is bounded, because a gateway error page is HTML and the
+// old behaviour of pasting all of it into an event stream is what this issue is
+// about. 300 characters carries every real message and cannot carry a page.
+const OVERFLOW_DETAIL_CHARS = 300;
+
+// The capped, single-line form of the provider's detail for an overflow frame.
+const overflowDetailOf = (detail: string): string => {
+    const text = detail.replace(/\s+/g, ' ').trim();
+
+    if (text.length <= OVERFLOW_DETAIL_CHARS) return text;
+
+    return `${text.slice(0, OVERFLOW_DETAIL_CHARS)}…`;
+};
+
+// Is this non-2xx an input-too-long answer? A 413 needs no pattern: on a
+// chat-completions POST the only thing that can be too large is the request body,
+// and a proxy that caps body size means the same thing by it. A 400 is the case
+// that needs the wording, because a 400 is otherwise "your request is malformed" —
+// every other status (401, 404, 429, 5xx) is never an overflow, whatever its body
+// says, so a broken credential that quotes the provider's own context docs cannot
+// be misread as a size problem.
+const isContextOverflowResponse = (status: number, detail: string): boolean => {
+    if (status === 413) return true;
+    if (status !== 400) return false;
+
+    return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(detail));
+};
+
+// ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
-export const openAICompatible = (configuration: HarnessProviderConfiguration): HarnessStream => {
-    const { baseURL, apiKey, headers, sampling } = configuration;
+export const openAICompatible = (
+    configuration: HarnessProviderConfiguration,
+    options: HarnessTransportOptions = {}
+): HarnessStream => {
+    const { baseURL, apiKey, headers, sampling, extraBody, responseFormat } = configuration;
 
     // Normalize the base URL once so callers may pass either form.
     const url = `${baseURL.replace(/\/+$/, '')}/chat/completions`;
 
     // Resolve the key per request: a getter may rotate credentials between turns.
     const resolveKey = (): string | undefined => (typeof apiKey === 'function' ? apiKey() : apiKey);
+
+    // --- fail-early validation of the request-body seams (issue 0001 AC3) -----
+    //
+    // Everything checkable WITHOUT a request is checked HERE, at transport
+    // construction. For an `agent({ provider })` that is `resolveStream`
+    // (../core/agent.ts), i.e. the line the misconfiguration was written on — not
+    // the first prompt, and not a gateway 400. Same rule the transport already
+    // applies to a malformed transcript: decide before sending.
+    const responseFormatBody = responseFormatField(responseFormat);
+
+    // Resolves the extension for ONE request, already validated, or throws. Decided
+    // once at construction so a request never re-inspects the configuration:
+    //   - absent       -> `undefined`, and a request does no work at all (the body
+    //                     keeps its exact pre-0001 shape);
+    //   - plain object -> validated HERE, and the same (never mutated) object is
+    //                     reused for every request;
+    //   - function     -> called once per request, its result validated per request.
+    let extraBodyFor: ((request: HarnessStreamRequest) => Record<string, unknown>) | undefined;
+
+    if (extraBody !== undefined) {
+        if (typeof extraBody === 'function') {
+            // The union narrows to the callable arm, so no runtime check is needed for
+            // a typed host; a JS host that wrote a non-object falls into the branch
+            // below and gets the both-forms message.
+            const callable = extraBody;
+
+            extraBodyFor = (req) => serializedExtraBody(callable(req), 'provider.extraBody');
+        } else {
+            // The union's other arm was ruled out above, so anything that is not a
+            // plain object here is a shape mistake, and the message names BOTH accepted
+            // forms — a host that wrote `extraBody: mySettings()` learns the function
+            // form exists.
+            if (!isPlainBodyObject(extraBody)) {
+                throw new HarnessError(
+                    '`provider.extraBody` must be a plain JSON object or a function returning one.',
+                    { code: PROVIDER_REQUEST_BODY_CODE }
+                );
+            }
+
+            const checked = serializedExtraBody(extraBody, 'provider.extraBody');
+
+            extraBodyFor = () => checked;
+        }
+    }
+
+    const buildBody = options.buildBody;
+
+    if (buildBody !== undefined && typeof buildBody !== 'function') {
+        throw new HarnessError('`options.buildBody` must be a function or absent.', {
+            code: PROVIDER_REQUEST_BODY_CODE
+        });
+    }
 
     return async function* stream(request): AsyncGenerator<HarnessStreamEvent> {
         const key = resolveKey();
@@ -817,6 +1210,61 @@ export const openAICompatible = (configuration: HarnessProviderConfiguration): H
             return;
         }
 
+        // (issue 0001) The FUNCTION form runs here — after the model, the mapped
+        // transcript and the tool declarations are resolved — so a host may key
+        // `stream_options` off `request.tools` or `request.signal`. A rejected result
+        // is an `error` frame: the transport never throws mid-request, and the agent's
+        // retry owner decides what a failure means.
+        let extra: Record<string, unknown> = {};
+
+        if (extraBodyFor !== undefined) {
+            try {
+                extra = extraBodyFor(request);
+            } catch (error) {
+                yield { type: 'error', message: toErrorInfo(error).message };
+                return;
+            }
+        }
+
+        // The default body, in the documented precedence order: `extra` first, so the
+        // first-class fields written after it always win.
+        const baseBody = transportBody({
+            extra,
+            model: request.model,
+            messages,
+            tools: toolList,
+            sampling: samplingBody(sampling),
+            responseFormat: responseFormatBody
+        });
+
+        // (C) The composable seam: a host may rewrite this body — rename a field, use
+        // a different dialect's names, drop `stream` — while keeping message mapping,
+        // attachment parts, video policy, aborting, error scrubbing and the SSE
+        // reader below. Without it, a non-OpenAI dialect means forking this file.
+        let body: Record<string, unknown>;
+
+        try {
+            body = buildBody ? requireBuiltBody(buildBody(baseBody, request)) : baseBody;
+        } catch (error) {
+            yield { type: 'error', message: toErrorInfo(error).message };
+            return;
+        }
+
+        // Serialize BEFORE fetch so a value only a `buildBody` could have introduced
+        // (a cycle, a BigInt) is an honest error frame about the BODY, rather than a
+        // "Request to <url> failed" line that blames the network.
+        let serialized: string;
+
+        try {
+            serialized = JSON.stringify(body);
+        } catch (error) {
+            yield {
+                type: 'error',
+                message: `Request body cannot be serialized: ${toErrorInfo(error).message}`
+            };
+            return;
+        }
+
         let response: Response;
         try {
             response = await fetch(url, {
@@ -826,13 +1274,7 @@ export const openAICompatible = (configuration: HarnessProviderConfiguration): H
                     ...(key ? { authorization: `Bearer ${key}` } : {}),
                     ...headers
                 },
-                body: JSON.stringify({
-                    model: request.model,
-                    stream: true,
-                    messages,
-                    ...(toolList.length > 0 ? { tools: toolList } : {}),
-                    ...samplingBody(sampling)
-                }),
+                body: serialized,
                 signal: request.signal
             });
         } catch (error) {
@@ -843,6 +1285,33 @@ export const openAICompatible = (configuration: HarnessProviderConfiguration): H
 
         if (!response.ok) {
             const detail = await response.text().catch(() => '');
+
+            // (issue 0004) A context overflow is a DIFFERENT failure from a broken
+            // credential or a dead route, and the frame says so: the code is the
+            // machine name `agent()` uses to keep it out of the retry ladder, and the
+            // message leads with that same name instead of pasting a raw body. An
+            // unrelated 400, and every other status, keeps the historical frame
+            // byte-for-byte — including the absence of the `code` key.
+            if (isContextOverflowResponse(response.status, detail)) {
+                const providerSaid = overflowDetailOf(detail || response.statusText);
+
+                // The provider's own line is the actionable half (it usually quotes
+                // both numbers), and a gateway that answers a 413 with an empty body
+                // leaves nothing to quote — then the sentence simply ends.
+                const quoted = providerSaid.length > 0 ? ` The provider said: "${providerSaid}"` : '';
+
+                yield {
+                    type: 'error',
+                    code: CONTEXT_OVERFLOW_CODE,
+                    message:
+                        `${CONTEXT_OVERFLOW_CODE}: HTTP ${response.status} — the provider says this request is too ` +
+                        `large for the model's context window, so a retry would be refused again. Send less: a ` +
+                        `turn.before handler may replace the transcript, and the shipped context-compaction ` +
+                        `plugin does exactly that.${quoted}`
+                };
+                return;
+            }
+
             yield { type: 'error', message: `HTTP ${response.status}: ${detail || response.statusText}` };
             return;
         }

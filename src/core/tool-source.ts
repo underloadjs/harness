@@ -43,6 +43,20 @@
 //   - behavioural correctness or safety. Candidate code runs with this process's
 //     permissions, exactly like `toolCreate` and `shell`.
 //
+// TWO CALLERS, ONE COMPILER
+// -------------------------
+//   1. the harness registration kernel (`prepareToolCandidate`) — compile + load +
+//      validate + publish, the only path that mutates a registry;
+//   2. the published read-only compile (`compileToolSourceModule`, issue 0002) —
+//      metadata + revision + checks + a definition that is registered NOWHERE, with
+//      `evaluate: 'syntax'` for a host that must answer "is this valid?" without
+//      running the candidate's untrusted top-level code, and
+//      `supportsToolCompilation` so a host branches Node/browser by flag.
+// A third shape, `prepareToolSourceRecord`, derives the source record of a
+// definition the caller already owns (issue 0003, a shared tool catalogue), so a
+// prebuilt tool keeps the inspect/revision/source surface without being loaded
+// a second time.
+//
 // MODULE RESOLUTION
 // -----------------
 // A source revision is captured synchronously before anything is published:
@@ -68,6 +82,10 @@
 // is not cached across registrations; no ESM cache is involved, so a new revision
 // is always genuinely new code. Old revisions remain reachable only through
 // already-captured tool definitions and are eventually garbage-collected.
+// The REGISTRATION path therefore keeps its old semantics even though the
+// published read-only compile below keeps a process-level compile cache: the cache
+// is only what `compileToolSourceModule()` (issue 0002) reuses across calls, and
+// `prepareToolCandidate()` never consults it.
 //
 // CANDIDATE METADATA IS CLONED
 // ----------------------------
@@ -186,6 +204,60 @@ export type PreparedTool = {
     record: ToolSourceRecord;
     // Revision is repeated here for callers that only need publication data.
     revision: string;
+};
+
+// A candidate for the PUBLISHED read-only compile (issue 0002). It is the
+// registration candidate plus an optional already-constructed `definition`:
+// supplying one selects the no-load path, so the result describes the tool the
+// caller already holds and the module's top-level code is never evaluated.
+export type ToolCompileCandidate = ToolRegistrationCandidate & {
+    definition?: Tool;
+};
+
+// How much of a candidate the published compile may DO.
+//   - 'load'   (default) — the registration path's own operation: transpile, then
+//     EVALUATE the module graph, select the exported tool, and contract-check it.
+//     Candidate top-level code runs, exactly as it does on registration.
+//   - 'syntax'           — capture the graph and transpile every captured module for
+//     SYNTAX diagnostics only. Nothing is evaluated, so untrusted top-level code
+//     never runs, and the result carries no loaded definition unless the caller
+//     supplied one. The reported `checks` list says exactly this: it never claims
+//     `load:module`.
+export type ToolSourceEvaluateMode = 'load' | 'syntax';
+
+export type ToolSourceCompileOptions = {
+    evaluate?: ToolSourceEvaluateMode;
+    // The process-level compile cache is ON by default and only ever serves a
+    // candidate whose bytes the caller supplied (`moduleText`). `cache: false`
+    // re-transpiles and re-evaluates every call. It cannot change what a
+    // REGISTRATION does: the registration kernel never consults the cache.
+    cache?: boolean;
+};
+
+// What `compileToolSourceModule` returns: the inspectable half of a compiled
+// candidate — metadata, the content-addressed revision, the honest `checks` list,
+// and (unless `evaluate: 'syntax'` ran with no supplied definition) a callable Tool
+// that is registered nowhere.
+//
+// HONESTY RULES, in the order a caller is likely to be surprised by:
+//   - `checks` is the only claim made about validation, and no mode of this call
+//     ever claims semantic type checking (`ts.transpileModule` is syntax-only);
+//   - in `evaluate: 'syntax'` mode with no supplied `definition`, the metadata is
+//     what the CANDIDATE declares — the module's own metadata is unknowable without
+//     loading it, which is why such a candidate must name itself;
+//   - `definition` is absent in exactly that case; every other mode returns one.
+export type CompiledToolSourceModule = {
+    name: string;
+    description: string;
+    tags: readonly string[];
+    parameters?: Record<string, unknown>;
+    visibility: ToolVisibility;
+    revision: string;
+    checks: readonly string[];
+    definition?: Tool;
+    // The full captured source record, for a host that wants the dependency bytes
+    // and live-module identities as well as the revision.
+    record: ToolSourceRecord;
 };
 
 // ---------------------------------------------------------------------------
@@ -1619,23 +1691,26 @@ const metadataIdentityOf = (definition: Tool): string =>
     });
 
 // ---------------------------------------------------------------------------
-// Prepare
+// Candidate shape + capture (shared by the registration kernel and issue 0002's
+// published read-only compile, so the two can never disagree about what a
+// revision's inputs are)
 // ---------------------------------------------------------------------------
 
-// Compile, load, and contract-check one candidate. Publication is the caller's
-// responsibility (harness.acceptTool), which is what makes restoration and failed
-// replacement atomic.
-export const prepareToolCandidate = (
+// Which form the candidate is in, resolved once, with the diagnostics BOTH callers
+// must share. A supplied moduleText is a captured revision: its path is an identity
+// label for relative resolution, not a file to probe. Do not resolve/stat it, so a
+// deleted or edited source file cannot change the restored graph. `sourcePath`
+// resolution DOES touch the filesystem, so it is computed here and reused.
+type CandidateShape = {
+    suppliedModuleText: boolean;
+    sourcePath?: string;
+    expectedName?: string;
+};
+
+const resolveCandidateShape = (
     candidate: ToolRegistrationCandidate,
     options: { expectedName?: string } = {}
-): PreparedTool => {
-    // Browser (or a Node install missing the compiler) gets this actionable error
-    // before any filesystem/TypeScript access.
-    source();
-
-    // A supplied moduleText is a captured revision: its path is an identity label
-    // for relative resolution, not a file to probe. Do not resolve/stat it, so a
-    // deleted or edited source file cannot change the restored graph.
+): CandidateShape => {
     const suppliedModuleText = candidate.moduleText !== undefined;
     const sourcePath = suppliedModuleText ? undefined : resolveCandidatePath(candidate);
     const expectedName = candidate.name ?? options.expectedName;
@@ -1654,9 +1729,176 @@ export const prepareToolCandidate = (
         );
     }
 
+    return { suppliedModuleText, sourcePath, expectedName };
+};
+
+// True when the candidate carries neither module form, i.e. it is the legacy
+// async-function-body form (or an empty candidate).
+const isFunctionBodyCandidate = (shape: CandidateShape): boolean =>
+    !shape.suppliedModuleText && shape.sourcePath === undefined;
+
+// Everything both prepare paths need AFTER capture and BEFORE evaluation.
+type CapturedCandidate = {
+    entry: CapturedModule;
+    entryLabel: string;
+    evaluation: Evaluation;
+    suppliedModuleText: boolean;
+    suppliedLabel?: string;
+    sourcePath?: string;
+    expectedName?: string;
+};
+
+// CAPTURE FIRST. A supplied moduleText is authoritative even when sourcePath still
+// points at a (possibly edited or deleted) file. This reads the entry bytes, builds
+// the deterministic labels, and walks the static module graph WITHOUT evaluating
+// anything; a resolution failure is reported with the same actionable diagnostic the
+// load path has always produced, because capture is where a missing helper surfaces.
+const captureModuleCandidate = (
+    candidate: ToolRegistrationCandidate,
+    shape: CandidateShape
+): CapturedCandidate => {
+    const { suppliedModuleText, sourcePath, expectedName } = shape;
+    const entryText =
+        candidate.moduleText !== undefined
+            ? (candidate.moduleText as string)
+            : source().readFileSync(sourcePath as string, 'utf8');
+    // A captured path is kept verbatim (normalised to posix) instead of being
+    // resolved against current disk: it is the relative-resolution identity at
+    // install time, and the file may legitimately be gone on restore.
+    const suppliedLabel =
+        candidate.sourcePath === undefined
+            ? undefined
+            : isAbsoluteLabel(candidate.sourcePath)
+              ? labelOf(candidate.sourcePath)
+              : normalizeLabel(candidate.sourcePath);
+    const entryLabel = suppliedModuleText
+        ? suppliedLabel ?? candidate.name ?? expectedName ?? '<inline-tool-module>'
+        : sourcePath !== undefined
+          ? labelOf(sourcePath)
+          : candidate.name ?? expectedName ?? '<inline-tool-module>';
+    // A persisted revision carries BOTH its captured entry text and its path; the
+    // path is the resolution identity (so relative imports/aliases behave exactly
+    // as at install time) while the captured text is what is actually compiled.
+    const entryKey = suppliedModuleText ? `virtual:${entryLabel}` : (sourcePath as string);
+    const entry: CapturedModule = { key: entryKey, label: entryLabel, text: entryText };
+
+    const evaluation = createEvaluation(candidate, entryKey);
+
+    try {
+        captureGraph(entry, candidate, evaluation);
+    } catch (error) {
+        if (error instanceof HarnessError) throw error;
+        throw new HarnessError(
+            `Tool source "${entryLabel}" could not be loaded: ${toErrorInfo(error).message}`,
+            { cause: error }
+        );
+    }
+
+    return {
+        entry,
+        entryLabel,
+        evaluation,
+        suppliedModuleText,
+        ...(suppliedLabel === undefined ? {} : { suppliedLabel }),
+        ...(sourcePath === undefined ? {} : { sourcePath }),
+        ...(expectedName === undefined ? {} : { expectedName })
+    };
+};
+
+// The dependency + live-identity halves of a record, read off a captured graph.
+// Live identities are sorted so the revision never depends on Map insertion order.
+const capturedDependenciesOf = (captured: CapturedCandidate): CapturedDependencies => {
+    const dependencies = captured.evaluation.dependencies.map((dependency) => ({
+        ...dependency
+    }));
+    const liveDependencies = [...captured.evaluation.live.entries()]
+        .map(([path, revision]) => ({ path, revision }))
+        .sort((left, right) => left.path.localeCompare(right.path));
+
+    return { dependencies, liveDependencies };
+};
+
+type CapturedDependencies = {
+    dependencies: ToolSourceDependency[];
+    liveDependencies: ToolSourceLiveDependency[];
+};
+
+// Complete identity: captured bytes + installed metadata/schema + live framework
+// metadata. A source-only hash missed candidate overrides and the preset catalogue
+// that supplies a preset entry's declarative half. Both prepare paths call this with
+// the metadata identity of the tool they are describing, which is what makes a
+// prebuilt definition and the module it came from produce the SAME revision.
+const moduleRevisionOf = (
+    captured: CapturedCandidate,
+    dependencies: readonly ToolSourceDependency[],
+    metadataIdentity: string,
+    liveDependencies: readonly ToolSourceLiveDependency[]
+): string =>
+    revisionOf([
+        captured.entryLabel,
+        captured.entry.text,
+        ...dependencies.flatMap((dependency) => [dependency.path, dependency.text]),
+        'metadata',
+        metadataIdentity,
+        ...liveDependencies.flatMap((dependency) => [dependency.path, dependency.revision])
+    ]);
+
+// The captured source record both prepare paths publish. `moduleText` is always the
+// entry bytes, not just a path: an inspection record must correspond to the exact
+// revision it describes even if the editable file changes or disappears later.
+const moduleRecordOf = (
+    captured: CapturedCandidate,
+    name: string,
+    revision: string,
+    dependencies: readonly ToolSourceDependency[],
+    liveDependencies: readonly ToolSourceLiveDependency[],
+    checks: readonly string[]
+): ToolSourceRecord => ({
+    name,
+    revision,
+    moduleText: captured.entry.text,
+    ...(captured.suppliedModuleText
+        ? captured.suppliedLabel === undefined
+            ? {}
+            : { sourcePath: captured.suppliedLabel }
+        : captured.sourcePath === undefined
+          ? {}
+          : { sourcePath: labelOf(captured.sourcePath) }),
+    dependencies: dependencies.map((dependency) => ({ ...dependency })),
+    // Cloned into mutable arrays: the caller's identity list stays readonly, and the
+    // record a registry stores must not alias it.
+    ...(liveDependencies.length === 0
+        ? {}
+        : {
+              liveDependencies: liveDependencies.map((dependency) => ({
+                  ...dependency
+              }))
+          }),
+    format: 'module',
+    checks
+});
+
+// ---------------------------------------------------------------------------
+// Prepare — the registration kernel's compile + load + validate step
+// ---------------------------------------------------------------------------
+
+// Compile, load, and contract-check one candidate. Publication is the caller's
+// responsibility (harness.acceptTool), which is what makes restoration and failed
+// replacement atomic.
+export const prepareToolCandidate = (
+    candidate: ToolRegistrationCandidate,
+    options: { expectedName?: string } = {}
+): PreparedTool => {
+    // Browser (or a Node install missing the compiler) gets this actionable error
+    // before any filesystem/TypeScript access.
+    source();
+
+    const shape = resolveCandidateShape(candidate, options);
+    const { suppliedModuleText, sourcePath, expectedName } = shape;
+
     // Legacy function-body form. It keeps the historical toolCreate contract and
     // validation bounds (name/description/tags/source length/schema complexity).
-    if (sourcePath === undefined && candidate.moduleText === undefined) {
+    if (isFunctionBodyCandidate(shape)) {
         if (typeof candidate.source !== 'string' || candidate.source.trim().length === 0) {
             // Preserve the legacy toolCreate diagnostic when a caller supplied no
             // module form and an empty/missing function body.
@@ -1671,7 +1913,7 @@ export const prepareToolCandidate = (
             );
         }
 
-        const creationName = candidate.name ?? options.expectedName ?? '';
+        const creationName = expectedName ?? '';
         const creation = {
             name: creationName,
             description: candidate.description ?? '',
@@ -1710,41 +1952,17 @@ export const prepareToolCandidate = (
         };
     }
 
-    if (sourcePath === undefined && candidate.moduleText === undefined) {
+    if (isFunctionBodyCandidate(shape)) {
         throw new HarnessError('Tool source candidate is empty.');
     }
 
-    // CAPTURE FIRST. A supplied moduleText is authoritative even when sourcePath
-    // still points at a (possibly edited or deleted) file.
-    const entryText =
-        candidate.moduleText !== undefined
-            ? candidate.moduleText
-            : source().readFileSync(sourcePath as string, 'utf8');
-    // A captured path is kept verbatim (normalised to posix) instead of being
-    // resolved against current disk: it is the relative-resolution identity at
-    // install time, and the file may legitimately be gone on restore.
-    const suppliedLabel =
-        candidate.sourcePath === undefined
-            ? undefined
-            : isAbsoluteLabel(candidate.sourcePath)
-              ? labelOf(candidate.sourcePath)
-              : normalizeLabel(candidate.sourcePath);
-    const entryLabel = suppliedModuleText
-        ? suppliedLabel ?? candidate.name ?? options.expectedName ?? '<inline-tool-module>'
-        : sourcePath !== undefined
-          ? labelOf(sourcePath)
-          : candidate.name ?? options.expectedName ?? '<inline-tool-module>';
-    // A persisted revision carries BOTH its captured entry text and its path; the
-    // path is the resolution identity (so relative imports/aliases behave exactly
-    // as at install time) while the captured text is what is actually compiled.
-    const entryKey = suppliedModuleText ? `virtual:${entryLabel}` : (sourcePath as string);
-    const entry: CapturedModule = { key: entryKey, label: entryLabel, text: entryText };
-
-    const evaluation = createEvaluation(candidate, entryKey);
+    const captured = captureModuleCandidate(candidate, shape);
+    const { entry, entryLabel, evaluation } = captured;
     let exports: Record<string, unknown>;
 
+    // EVALUATION is the only step this path adds on top of the shared capture, and
+    // it is the step `evaluate: 'syntax'` skips: top-level candidate code runs here.
     try {
-        captureGraph(entry, candidate, evaluation);
         exports = evaluateModule(entry, evaluation);
     } catch (error) {
         if (error instanceof HarnessError) throw error;
@@ -1793,45 +2011,481 @@ export const prepareToolCandidate = (
 
     assertToolContract(definition);
 
-    const dependencies = evaluation.dependencies.map((dependency) => ({ ...dependency }));
-    const liveDependencies = [...evaluation.live.entries()]
-        .map(([path, revision]) => ({ path, revision }))
-        .sort((left, right) => left.path.localeCompare(right.path));
-
-    // Complete identity: captured bytes + installed metadata/schema + live
-    // framework metadata. A source-only hash missed candidate overrides and the
-    // preset catalogue that supplies a preset entry's declarative half.
-    const revision = revisionOf([
-        entryLabel,
-        entryText,
-        ...dependencies.flatMap((dependency) => [dependency.path, dependency.text]),
-        'metadata',
-        metadataIdentityOf(definition),
-        ...liveDependencies.flatMap((dependency) => [dependency.path, dependency.revision])
-    ]);
-
-    const record: ToolSourceRecord = {
-        name: definition.name,
-        revision,
-        // Always capture the entry bytes, not just a path: a snapshot/inspection
-        // record must correspond to the exact revision that was installed even if
-        // the editable file changes or disappears later.
-        moduleText: entryText,
-        ...(suppliedModuleText
-            ? suppliedLabel === undefined
-                ? {}
-                : { sourcePath: suppliedLabel }
-            : sourcePath === undefined
-              ? {}
-              : { sourcePath: labelOf(sourcePath) }),
+    const { dependencies, liveDependencies } = capturedDependenciesOf(captured);
+    const revision = moduleRevisionOf(
+        captured,
         dependencies,
-        ...(liveDependencies.length === 0 ? {} : { liveDependencies }),
-        format: 'module',
-        checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
-    };
+        metadataIdentityOf(definition),
+        liveDependencies
+    );
+    const record = moduleRecordOf(
+        captured,
+        definition.name,
+        revision,
+        dependencies,
+        liveDependencies,
+        ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
+    );
 
     return { tool: definition, record, revision: record.revision };
 };
+
+// ---------------------------------------------------------------------------
+// The published read-only compile (issue 0002) and the shared-catalogue record
+// (issue 0003)
+// ---------------------------------------------------------------------------
+
+// One prepare result, before the public shape is applied. `callerOwned` says whose
+// object `definition` is: a supplied definition is published as-is (exactly like a
+// configured tool, which the harness wraps but never clones), while a definition the
+// compile produced is cloned for every caller so two hosts never share one metadata
+// object through the cache.
+type CompiledCandidate = {
+    definition?: Tool;
+    callerOwned: boolean;
+    // The metadata block of the public result, derived from `definition` when one
+    // exists and from the CANDIDATE otherwise (the syntax-only case).
+    metadata: CompiledMetadata;
+    record: ToolSourceRecord;
+    revision: string;
+};
+
+type CompiledMetadata = {
+    name: string;
+    description: string;
+    tags: readonly string[];
+    parameters?: Record<string, unknown>;
+    visibility: ToolVisibility;
+};
+
+// Transpile every captured module for SYNTAX diagnostics and nothing else. This is
+// the whole of what `evaluate: 'syntax'` proves: `ts.transpileModule` reports
+// syntactic errors only, never the semantic type errors a project build reports, and
+// no candidate module is evaluated. Running it over the helpers too is what keeps a
+// syntax answer from being only an answer about the entry file.
+const assertCapturedSyntax = (captured: CapturedCandidate): void => {
+    transpileModule(captured.entry.text, captured.entry.label);
+
+    for (const dependency of captured.evaluation.dependencies) {
+        transpileModule(dependency.text, dependency.path);
+    }
+};
+
+// The metadata identity of a candidate whose module was never loaded: whatever the
+// CANDIDATE declares. A module that states its own name/description/tags is
+// unreadable without loading it, so this is the only identity a syntax-only compile
+// can fold into the revision — and the reason the same bytes compiled in the two
+// modes can differ, which the docs state instead of hiding.
+const declaredMetadataIdentityOf = (candidate: ToolCompileCandidate): string =>
+    stableSerialize({
+        name: candidate.name ?? null,
+        description: candidate.description ?? null,
+        tags: candidate.tags === undefined ? null : normalizeTags(candidate.tags),
+        visibility: candidate.visibility ?? null,
+        parameters:
+            candidate.parameters === undefined
+                ? null
+                : cloneJsonValue(candidate.parameters, candidate.name ?? '<tool-module>')
+    });
+
+// ---------------------------------------------------------------------------
+// Process-level compile cache
+// ---------------------------------------------------------------------------
+//
+// A compiled revision is a pure function of the captured bytes plus the candidate-
+// declared (or supplied-definition) metadata and the live framework identities, so
+// one process may reuse it across every call and every harness instance. That reuse
+// is the point: it is what makes the per-conversation host of issue 0003 cheap,
+// because N constructions then cost zero transpiles.
+//
+// WHAT THE KEY IS: the caller-supplied input set — mode, the entry text, the
+// supplied helper bytes, and the metadata identity. Live framework identities are
+// constant for the life of a process, so they need not appear. `revision` itself is
+// not computable before the capture, which is why the key is the revision's INPUT
+// set rather than its output.
+//
+// WHAT IS NOT CACHED:
+//   - a path-only candidate. Its helpers are read from disk, and an edited helper
+//     changes the revision while the entry bytes stay the same, so a key over the
+//     entry alone could serve a stale revision. Such a candidate behaves exactly as
+//     it does today: it re-reads and re-evaluates;
+//   - a failure. A candidate whose top-level code throws is reported again on the
+//     next call, because a validation endpoint must never see a stale refusal;
+//   - anything on the REGISTRATION path. `prepareToolCandidate` never consults this
+//     map, so publishing semantics are untouched (issue 0002 acceptance 4).
+const COMPILE_CACHE_LIMIT = 128;
+const compileCache = new Map<string, CompiledCandidate>();
+
+const compileCacheRead = (key: string): CompiledCandidate | undefined => {
+    const cached = compileCache.get(key);
+    if (cached === undefined) return undefined;
+
+    // Re-insert so the most recently reused entry is the last one evicted.
+    compileCache.delete(key);
+    compileCache.set(key, cached);
+
+    return cached;
+};
+
+const compileCacheWrite = (key: string, value: CompiledCandidate): void => {
+    compileCache.set(key, value);
+
+    // Bounded FIFO: a server that compiles a fresh revision per session must not
+    // grow a process-level map for the life of the process.
+    while (compileCache.size > COMPILE_CACHE_LIMIT) {
+        const oldest = compileCache.keys().next();
+        if (oldest.done === true) break;
+        compileCache.delete(oldest.value);
+    }
+};
+
+// The cache key, computed BEFORE any transpile or evaluation, from the bytes and
+// declarations the caller supplied. See the cache block above for why each part is
+// there and why live identities are not.
+const compileCacheKeyOf = (
+    candidate: ToolCompileCandidate,
+    definition: Tool | undefined,
+    mode: ToolSourceEvaluateMode
+): string => {
+    const dependencies = candidate.dependencies ?? [];
+
+    return revisionOf([
+        'compile-cache',
+        mode,
+        definition === undefined ? 'candidate-metadata' : 'supplied-definition',
+        candidate.name ?? '<unnamed>',
+        candidate.sourcePath ?? '<inline>',
+        candidate.moduleText ?? '<no-text>',
+        ...dependencies.flatMap((dependency) => [dependency.path, dependency.text]),
+        'metadata',
+        definition === undefined
+            ? declaredMetadataIdentityOf(candidate)
+            : metadataIdentityOf(definition)
+    ]);
+};
+
+// The no-load prepare: capture the graph, transpile it for SYNTAX diagnostics, and
+// describe either the supplied definition or (with no definition) the candidate's
+// own declarations. Nothing here evaluates candidate code.
+const prepareWithoutLoad = (
+    candidate: ToolCompileCandidate,
+    definition: Tool | undefined,
+    shape: CandidateShape
+): CompiledCandidate => {
+    const captured = captureModuleCandidate(candidate, shape);
+    assertCapturedSyntax(captured);
+
+    const { dependencies, liveDependencies } = capturedDependenciesOf(captured);
+
+    if (definition !== undefined) {
+        // The definition the caller owns is the contract being checked, so the checks
+        // list says the contract and the schema were checked against THAT object. The
+        // candidate's metadata fields are ignored here, exactly as
+        // `prepareDefinition` has always ignored them for a definition registration.
+        assertToolContract(definition);
+
+        const revision = moduleRevisionOf(
+            captured,
+            dependencies,
+            metadataIdentityOf(definition),
+            liveDependencies
+        );
+        const record = moduleRecordOf(
+            captured,
+            definition.name,
+            revision,
+            dependencies,
+            liveDependencies,
+            ['transpile:syntax', 'contract:tool', 'schema:json']
+        );
+
+        return {
+            definition,
+            callerOwned: true,
+            metadata: {
+                name: definition.name,
+                description: definition.description,
+                tags: [...definition.tags],
+                ...(definition.parameters === undefined
+                    ? {}
+                    : { parameters: definition.parameters }),
+                visibility: definition.visibility
+            },
+            record,
+            revision
+        };
+    }
+
+    // No definition and no load: the module's own metadata is unknowable, so the
+    // only name available is the one the candidate declares. A candidate that
+    // declares nothing cannot be described, and that is stated as an error naming
+    // the fix rather than as a silently empty result.
+    const name = candidate.name ?? shape.expectedName;
+
+    if (name === undefined) {
+        throw new HarnessError(
+            `Tool source "${captured.entryLabel}" was compiled without loading, so its name cannot be read from the module. Pass \`name\` on the candidate, supply a \`definition\`, or use evaluate: "load" to get a validated definition.`
+        );
+    }
+
+    // A schema the caller declares IS checkable without loading anything, and when
+    // it is, `schema:json` is honest to report.
+    const parameters =
+        candidate.parameters === undefined
+            ? undefined
+            : (cloneJsonValue(candidate.parameters, name) as Record<string, unknown>);
+
+    const revision = moduleRevisionOf(
+        captured,
+        dependencies,
+        declaredMetadataIdentityOf(candidate),
+        liveDependencies
+    );
+    const checks =
+        parameters === undefined
+            ? ['transpile:syntax']
+            : ['transpile:syntax', 'schema:json'];
+    const record = moduleRecordOf(
+        captured,
+        name,
+        revision,
+        dependencies,
+        liveDependencies,
+        checks
+    );
+
+    return {
+        callerOwned: false,
+        metadata: {
+            name,
+            description: candidate.description ?? '',
+            tags: normalizeTags(candidate.tags),
+            ...(parameters === undefined ? {} : { parameters }),
+            // 'searchable' is the Tool contract's documented default, so reporting it
+            // states the value the registration would resolve to.
+            visibility: candidate.visibility ?? 'searchable'
+        },
+        record,
+        revision
+    };
+};
+
+// The one internal entry both published functions share. `definition` is threaded
+// through as a parameter (not read off the candidate) so the harness can describe a
+// definition it owns without pretending the caller passed one.
+const prepareCompiledToolSource = (
+    candidate: ToolCompileCandidate,
+    definition: Tool | undefined,
+    options: ToolSourceCompileOptions = {}
+): CompiledCandidate => {
+    // Same actionable capability error as the registration path, before any
+    // filesystem or TypeScript access.
+    source();
+
+    const mode: ToolSourceEvaluateMode = options.evaluate === 'syntax' ? 'syntax' : 'load';
+    const useCache = options.cache !== false;
+    const shape = resolveCandidateShape(candidate, {});
+
+    // A legacy function-body candidate has no module top-level code to skip: its
+    // body is compiled by the `Function` constructor and never RUN at prepare time,
+    // so both modes do identical work and report identical checks. Route it to the
+    // single existing operation instead of re-implementing the body's bounds here.
+    if (isFunctionBodyCandidate(shape)) {
+        const prepared = prepareToolCandidate(candidate, {});
+
+        return {
+            definition: prepared.tool,
+            callerOwned: false,
+            metadata: {
+                name: prepared.tool.name,
+                description: prepared.tool.description,
+                tags: [...prepared.tool.tags],
+                ...(prepared.tool.parameters === undefined
+                    ? {}
+                    : { parameters: prepared.tool.parameters }),
+                visibility: prepared.tool.visibility
+            },
+            record: prepared.record,
+            revision: prepared.revision
+        };
+    }
+
+    // A supplied definition selects the no-load path in EITHER mode: the reason a
+    // caller hands one over is to avoid evaluating the module again (issue 0003).
+    const noLoad = mode === 'syntax' || definition !== undefined;
+
+    // Only a candidate whose bytes the caller supplied is cacheable; see the cache
+    // block for why a disk-path candidate is deliberately excluded.
+    const cacheable = useCache && candidate.moduleText !== undefined;
+    const key = cacheable ? compileCacheKeyOf(candidate, definition, mode) : undefined;
+
+    if (key !== undefined) {
+        const cached = compileCacheRead(key);
+
+        if (cached !== undefined) {
+            // A cache hit replaces the derived DATA only. The definition the caller
+            // supplied stays the caller's own object, so a hit can never hand one
+            // host another host's tool identity.
+            return definition === undefined
+                ? cached
+                : { ...cached, definition, callerOwned: true };
+        }
+    }
+
+    const prepared = noLoad
+        ? prepareWithoutLoad(candidate, definition, shape)
+        : (() => {
+              // evaluate: 'load', no supplied definition — the full operation, and
+              // the same one a registration performs.
+              const captured = captureModuleCandidate(candidate, shape);
+              let exports: Record<string, unknown>;
+
+              try {
+                  exports = evaluateModule(captured.entry, captured.evaluation);
+              } catch (error) {
+                  if (error instanceof HarnessError) throw error;
+                  throw new HarnessError(
+                      `Tool source "${captured.entryLabel}" could not be loaded: ${toErrorInfo(error).message}`,
+                      { cause: error }
+                  );
+              }
+
+              const selected = selectToolExport(exports, captured.expectedName);
+              const compiled = cloneToolDefinition(selected.definition);
+
+              // Candidate overrides apply exactly as they do on registration, so the
+              // metadata, the schema and the revision all describe the same thing.
+              if (candidate.name !== undefined) compiled.name = candidate.name;
+              if (candidate.description !== undefined)
+                  compiled.description = candidate.description;
+              if (candidate.tags !== undefined) {
+                  (compiled as unknown as { tags: string[] }).tags = normalizeTags(candidate.tags);
+              }
+              if (candidate.visibility !== undefined)
+                  compiled.visibility = candidate.visibility;
+              if (candidate.parameters !== undefined) {
+                  compiled.parameters = cloneJsonValue(
+                      candidate.parameters,
+                      compiled.name
+                  ) as Record<string, unknown>;
+              }
+
+              assertToolContract(compiled);
+
+              const { dependencies, liveDependencies } = capturedDependenciesOf(captured);
+              const revision = moduleRevisionOf(
+                  captured,
+                  dependencies,
+                  metadataIdentityOf(compiled),
+                  liveDependencies
+              );
+              const record = moduleRecordOf(
+                  captured,
+                  compiled.name,
+                  revision,
+                  dependencies,
+                  liveDependencies,
+                  ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
+              );
+
+              return {
+                  definition: compiled,
+                  callerOwned: false,
+                  metadata: {
+                      name: compiled.name,
+                      description: compiled.description,
+                      tags: [...compiled.tags],
+                      ...(compiled.parameters === undefined
+                          ? {}
+                          : { parameters: compiled.parameters }),
+                      visibility: compiled.visibility
+                  },
+                  record,
+                  revision
+              };
+          })();
+
+    if (key !== undefined) compileCacheWrite(key, prepared);
+
+    return prepared;
+};
+
+// Compile and validate a TypeScript/JavaScript tool module from source text with NO
+// harness and NO registry involved, and publish nothing (issue 0002). The result is
+// the inspectable half of a compiled candidate: metadata, the existing
+// content-addressed `revision`, the existing honest `checks` list, and a callable
+// `definition` that is registered nowhere.
+//
+// This is the published answer to "is this tool definition valid?" for a host that
+// keeps its own tool registry. What it does NOT do:
+//   - it never claims semantic type checking — `checks` is the whole claim, and
+//     `ts.transpileModule` is syntax-only (docs/runtime-tools.md);
+//   - `evaluate: 'syntax'` never runs candidate top-level code, so a validation
+//     endpoint can answer about untrusted source without its side effects. In that
+//     mode the metadata reported is the CANDIDATE's, and `definition` is absent
+//     unless the caller supplied one;
+//   - it changes nothing about registration: the kernel keeps its own uncached
+//     compile, so replacements still change `revision` and `toolSource()` still
+//     reports the installed revision.
+export const compileToolSourceModule = (
+    candidate: ToolCompileCandidate,
+    options: ToolSourceCompileOptions = {}
+): CompiledToolSourceModule => {
+    const prepared = prepareCompiledToolSource(candidate, candidate.definition, options);
+    const metadata = prepared.metadata;
+    // A compile-produced definition is cloned per call; a caller-supplied one is
+    // returned untouched, because that object is the identity the caller owns.
+    const definition =
+        prepared.definition === undefined || prepared.callerOwned
+            ? prepared.definition
+            : cloneToolDefinition(prepared.definition);
+
+    return {
+        name: metadata.name,
+        description: metadata.description,
+        tags: [...metadata.tags],
+        // Cloned again so a caller mutating its copy cannot change what the cached
+        // record or another caller sees.
+        ...(metadata.parameters === undefined
+            ? {}
+            : {
+                  parameters: cloneJsonValue(
+                      metadata.parameters,
+                      metadata.name
+                  ) as Record<string, unknown>
+              }),
+        visibility: metadata.visibility,
+        revision: prepared.revision,
+        checks: [...prepared.record.checks],
+        ...(definition === undefined ? {} : { definition }),
+        record: cloneToolSourceRecord(prepared.record)
+    };
+};
+
+// The source record of a definition the CALLER already owns (issue 0003). A host
+// that compiles its user tools once and hands the same `Tool` to many harness
+// instances would otherwise lose the inspect/revision/source surface `toolSource()`,
+// `toolSources()` and the Tools tab are built on, so this derives the record from
+// the candidate's captured bytes WITHOUT re-evaluating the module.
+//
+// The identity comes from the definition being installed, so compiling the same
+// source text through `compileToolSourceModule` and registering the definition it
+// returned yields the SAME revision here. Validation of the definition itself stays
+// with the caller (the harness's `prepareDefinition` owns those diagnostics), which
+// is why this function only ever claims the syntax checks it actually ran.
+export const prepareToolSourceRecord = (
+    candidate: ToolRegistrationCandidate,
+    definition: Tool
+): { record: ToolSourceRecord; revision: string } => {
+    const prepared = prepareCompiledToolSource(candidate, definition, {
+        evaluate: 'syntax'
+    });
+
+    // Cloned so a cached record is never handed to two harnesses by reference: the
+    // installing registry owns whatever it stores.
+    return { record: cloneToolSourceRecord(prepared.record), revision: prepared.revision };
+};
+
 
 // Inspectable copy of a captured source record. The harness keeps the canonical
 // object in a private map; callers must not mutate it through `toolSource()`.

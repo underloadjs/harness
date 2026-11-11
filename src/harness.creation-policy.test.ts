@@ -7,6 +7,8 @@
 //   - `false` registers no model-facing tool at all, while the HOST path
 //     `harness.createTool()` keeps working;
 //   - the creation budget is a LIFETIME budget: reset() does not restore it;
+//   - the budget is PER INSTANCE (issue 0003B): N harnesses built from one
+//     configuration hold N budgets, and a configured catalogue tool never spends one;
 //   - `maxCreatedTools` is validated at construction;
 //   - runs nest at most one level deep, enforced centrally, so a tool holding the
 //     whole `context` (including a model-CREATED tool) cannot widen the
@@ -179,6 +181,51 @@ describe('creation budget', () => {
         );
     });
 
+    it('is a per-instance budget: a spent ceiling does not bind the next harness', () => {
+        // Issue 0003: the counter shares the registry's lifetime, so a second instance
+        // starts at zero, and the refused call leaves the first instance untouched.
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('hi')])) },
+            presets: false,
+            maxCreatedTools: 1
+        });
+
+        const firstCreated = writer.createTool({ ...creation, name: 'one' });
+        expect(() => writer.createTool({ ...creation, name: 'two' })).toThrow(
+            'This harness already created 1 tools; reuse an existing tool instead of creating more.'
+        );
+
+        // The refusal is a pure refusal: no half-created tool is registered, and the
+        // spent count is still exactly the budget.
+        expect(writer.tools.two).toBeUndefined();
+        expect(writer.tools.one).toBe(firstCreated);
+        expect(writer.snapshot().createdToolCount).toBe(1);
+        expect(writer.snapshot().createdTools.map((entry) => entry.name)).toEqual(['one']);
+
+        const sibling = harness({
+            agents: { writer: brain(scripted([answer('hi')])) },
+            presets: false,
+            maxCreatedTools: 1
+        });
+
+        // Nothing was published into the sibling, so nothing was spent: the same name on
+        // the same source creates cleanly, and each instance keeps its own instance.
+        const siblingCreated = sibling.createTool({ ...creation, name: 'one' });
+        expect(siblingCreated.name).toBe('one');
+        expect(sibling.tools.one).toBe(siblingCreated);
+        expect(sibling.tools.one).not.toBe(writer.tools.one);
+        expect(sibling.snapshot().createdToolCount).toBe(1);
+        expect(sibling.snapshot().createdTools.map((entry) => entry.name)).toEqual(['one']);
+
+        // The sibling's spend did not leak back into the first instance either: it still
+        // refuses at its own limit, and the message still reports 1 rather than 2.
+        expect(() => writer.createTool({ ...creation, name: 'three' })).toThrow(
+            'This harness already created 1 tools; reuse an existing tool instead of creating more.'
+        );
+        expect(writer.tools.three).toBeUndefined();
+        expect(writer.snapshot().createdToolCount).toBe(1);
+    });
+
     it('validates maxCreatedTools at construction', () => {
         expect(() =>
             harness({ agents: { writer: brain(scripted([answer('hi')])) }, maxCreatedTools: 0 })
@@ -259,5 +306,104 @@ describe('run depth authority', () => {
         );
         // The editor never ran, so it has no transcript.
         expect(editor.messages).toEqual([]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 0003B — the SCOPE of the creation budget.
+//
+// The counter belongs to ONE harness instance (src/types/index.ts, `maxCreatedTools`
+// states it; the rejected alternatives — a thread-local or process-global registry,
+// or a host-side counter — cannot survive per-instance snapshot/restore). Two things
+// follow and are pinned here:
+//   - a host that builds N instances from ONE configuration object gets N
+//     independent budgets, and nothing created in one instance is visible in another;
+//   - a configured/catalogue tool (`tools: { name: { tool, source } }`, issue 0003) is
+//     catalogue state, never a creation, so it never spends the budget — which is the
+//     shape a host uses to share reviewed tools across conversations.
+// The budget MESSAGE quotes the limit (`maxCreatedTools`), not the number created, so
+// the expected strings below are written with the limit spelled out.
+// ---------------------------------------------------------------------------
+describe('creation budget scope (issue 0003B)', () => {
+    it('is one budget per instance, not one per process', () => {
+        // ONE configuration object, TWO harnesses built from it.
+        const configuration = {
+            agents: { writer: brain(scripted([answer('hi')])) },
+            presets: false,
+            maxCreatedTools: 2
+        };
+
+        const first = harness(configuration);
+        first.createTool({ ...creation, name: 'firstOne' });
+        first.createTool({ ...creation, name: 'firstTwo' });
+        expect(() => first.createTool({ ...creation, name: 'firstThree' })).toThrow(
+            'This harness already created 2 tools; reuse an existing tool instead of creating more.'
+        );
+
+        // A SECOND instance is unaffected by the first one's spending: the budget is
+        // instance state, and so is the registry it guards.
+        const second = harness(configuration);
+        expect(second.tools.firstOne).toBeUndefined();
+        expect(second.tools.firstTwo).toBeUndefined();
+
+        second.createTool({ ...creation, name: 'secondOne' });
+        expect(second.tools.secondOne).toBeDefined();
+        second.createTool({ ...creation, name: 'secondTwo' });
+        expect(() => second.createTool({ ...creation, name: 'secondThree' })).toThrow(
+            'This harness already created 2 tools; reuse an existing tool instead of creating more.'
+        );
+
+        // Neither instance can see the other's created tool, which is what makes the
+        // per-instance budget the right guard rather than a global one.
+        expect(first.tools.secondOne).toBeUndefined();
+        expect(second.tools.firstOne).toBeUndefined();
+    });
+
+    it('is never spent by a configured catalogue tool', () => {
+        // The issue-0003 catalogue shape: a prebuilt definition beside its bytes.
+        const shared = {
+            catalogueProbe: {
+                tool: tool({
+                    name: 'catalogueProbe',
+                    description: 'Report a value.',
+                    tags: ['test', 'catalogue'],
+                    execute: () => 'catalogue'
+                }),
+                source: {
+                    moduleText: `
+export const metadata = {
+    name: 'catalogueProbe',
+    description: 'Report a value.',
+    tags: ['test', 'catalogue'],
+    parameters: { type: 'object', properties: {}, additionalProperties: false }
+};
+
+export const execute = () => 'catalogue';
+`
+                }
+            }
+        };
+
+        // Budget of ONE, and the catalogue tool arrives without touching it.
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('hi')])) },
+            presets: false,
+            maxCreatedTools: 1,
+            tools: shared
+        });
+
+        expect(writer.tools.catalogueProbe?.name).toBe('catalogueProbe');
+        // A configured entry is registered, so its name is not a creation and the
+        // instance still has its full budget of one.
+        expect(writer.toolSource('catalogueProbe')?.name).toBe('catalogueProbe');
+
+        writer.createTool({ ...creation, name: 'onlyCreation' });
+        expect(() => writer.createTool({ ...creation, name: 'secondCreation' })).toThrow(
+            'This harness already created 1 tools; reuse an existing tool instead of creating more.'
+        );
+
+        // The catalogue tool is still installed after the budget is exhausted: a
+        // refusal about creations never touches catalogue state.
+        expect(writer.tools.catalogueProbe?.name).toBe('catalogueProbe');
     });
 });

@@ -63,6 +63,10 @@
 // compare tags. They are exported for tests and for tooling that inspects a
 // schema, and are not re-exported from the package root.
 export { agent } from './agent';
+// (issue 0001 B) The structured-output codes travel with the factory that raises them:
+// a host (or the server's error mapper) classifies a rejection by `error.code` instead
+// of parsing prose, and both names are part of `agent()`'s contract.
+export { STRUCTURED_OUTPUT_INVALID_CODE, STRUCTURED_SCHEMA_INVALID_CODE } from './agent';
 export { tool, toolParameterKey, normalizeTags, DEFAULT_TOOL_MODE } from './tool';
 export { MAX_DISCOVERY_MATCHES, searchTools, selectTools } from './discovery';
 export type {
@@ -74,14 +78,20 @@ export { compileToolSource, createDynamicTool, DEFAULT_CREATED_TOOLS_LIMIT } fro
 // The synchronous module compiler behind startup/runtime source registration.
 // Exported for focused tests and for a host that wants to validate a candidate
 // without publishing it; the harness owns the only publish path.
+// `compileToolSourceModule` and `supportsToolCompilation` are ALSO the published
+// read-only compile (issue 0002) and are re-exported from the package root;
+// `prepareToolSourceRecord` stays internal and serves the harness's
+// definition-plus-source registration (issue 0003).
 export {
     TOOL_SOURCE_EXTENSION,
     TOOL_SOURCE_PACKAGE_ROOT,
     TOOL_SOURCE_ROOTS,
     cloneToolSourceRecord,
+    compileToolSourceModule,
     deleteToolSourceFile,
     discoverToolFolderSources,
     prepareToolCandidate,
+    prepareToolSourceRecord,
     readToolSourceFile,
     resolveToolFolderTarget,
     resolveToolFolders,
@@ -115,10 +125,15 @@ export type {
     ToolRegistration
 } from './tool-discovery';
 export type {
+    CompiledToolSourceModule,
     PreparedTool,
+    ToolCompileCandidate,
     ToolFolderTarget,
     ToolRegistrationCandidate,
+    ToolSourceCompileOptions,
     ToolSourceDependency,
+    ToolSourceEvaluateMode,
+    ToolSourceLiveDependency,
     ToolSourceRecord
 } from './tool-source';
 export {
@@ -275,6 +290,16 @@ export type {
     UnitClass,
     UnitFacts
 } from './context-pruning';
+// The context estimator (issue 0004): the one "will this transcript fit?" number the
+// product already measures with — `ceil(chars / 4)`, the SAME convention as the
+// frontend's context bar and the shipped `context-compaction` plugin's `contextLimit`
+// (../plugins/context-compaction.plugin.ts). Published through the root barrel so a
+// host that trims its own history gets the same figure as the pre-request guard in
+// ./agent.ts and as the UI, instead of inventing a second heuristic that disagrees
+// with both. Only the plain estimator is public: the provider-anchored hybrid
+// (`estimateContextTokensHybrid`) and its `ContextTokenAnchor` stay internal, because
+// issue 0004's proposal publishes the one helper a host needs and nothing else.
+export { estimateContextTokens } from './context-estimate';
 // Background tool scheduling (T3): one board per harness. Internal to the
 // package surface (the harness is the only owner), exported here so the harness
 // module and focused tests share one implementation.

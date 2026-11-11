@@ -119,7 +119,10 @@ describe('the shipped registry', () => {
             { name: 'workspace', title: 'Analyst', builtin: true, editable: true },
             { name: 'reviewer', title: 'Reviewer', builtin: true, editable: true },
             { name: 'planner', title: 'Manager', builtin: true, editable: true },
-            { name: 'debugger', title: 'Debugger', builtin: true, editable: true }
+            { name: 'debugger', title: 'Debugger', builtin: true, editable: true },
+            // Issue 0005-D: the tool-less card is a production entry like the roles — built-in and
+            // editable — and it trails them because it is not a role.
+            { name: 'chat', title: 'Chat', builtin: true, editable: true }
         ]);
 
         // R20.1: independent copies. No registry entry aliases a shipped template
@@ -153,7 +156,8 @@ describe('the shipped registry', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(presets.map((preset) => preset.name)).toEqual([
             'general',
@@ -162,7 +166,8 @@ describe('the shipped registry', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         // The catalogue ORDER is the `GET /harnesses` order, the picker order, and the order
         // the frontend palette assigns tones by, so the titles travel with it (presets.ts:483-494).
@@ -173,7 +178,9 @@ describe('the shipped registry', () => {
             'Analyst',
             'Reviewer',
             'Manager',
-            'Debugger'
+            'Debugger',
+            // The tool-less card's title (issue 0005-D), last like the card.
+            'Chat'
         ]);
 
         // The DEFAULT card's contract (presets.ts:178-195): `general` is the only live preset
@@ -208,6 +215,7 @@ describe('the shipped registry', () => {
             'reviewer',
             'planner',
             'debugger',
+            'chat',
             'demo',
             'flaky'
         ]);
@@ -223,6 +231,7 @@ describe('the shipped registry', () => {
             'reviewer',
             'planner',
             'debugger',
+            'chat',
             'demo',
             'flaky'
         ]);
@@ -377,6 +386,7 @@ describe('creating a harness', () => {
             'reviewer',
             'planner',
             'debugger',
+            'chat',
             'my-review'
         ]);
     });
@@ -753,7 +763,8 @@ describe('deleting a harness', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
 
         // No tombstone: a user harness is absent from the saved document as soon as
@@ -775,7 +786,8 @@ describe('deleting a harness', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(registry.find('instruct')).toBeUndefined();
 
@@ -852,6 +864,7 @@ describe('deleting a harness', () => {
             'reviewer',
             'planner',
             'debugger',
+            'chat',
             'instruct'
         ]);
     });
@@ -864,7 +877,8 @@ describe('deleting a harness', () => {
             'research',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(registry.deletedBuiltins()).toEqual(['instruct', 'workspace']);
         expect(registry.find('writer')).toBeUndefined();
@@ -880,7 +894,8 @@ describe('deleting a harness', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         expect(unmatched.deletedBuiltins()).toEqual(['retired-default']);
     });
@@ -907,6 +922,7 @@ describe('deleting a harness', () => {
             'reviewer',
             'planner',
             'debugger',
+            'chat',
             'flaky'
         ]);
 
@@ -933,6 +949,7 @@ describe('deleting a harness', () => {
             'workspace',
             'reviewer',
             'debugger',
+            'chat',
             'extra'
         ]);
         expect(registry.deletedBuiltins()).toEqual(['planner']);
@@ -947,7 +964,8 @@ describe('deleting a harness', () => {
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'chat'
         ]);
         // The restored row carries this build's shipped title: `research` is the id, and
         // Explore is what the roster pass renamed it to on the card.

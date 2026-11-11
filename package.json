@@ -94,6 +94,7 @@
         "preview:frontend": "vite preview --config src/frontend/vite.config.ts",
         "prepublishOnly": "npm run typecheck && npm run test && npm run build && npm run test:package:files && npm run test:package && npm run test:package:runtime && npm run test:package:tools",
         "test": "npm run tools:manifest:check && npm run plugins:manifest:check && vitest run",
+        "test:contract": "node --test scripts/generate-harness-contract.test.mjs",
         "test:frontend": "vitest run --config src/frontend/vitest.config.ts",
         "test:package": "node scripts/check-package-types.mjs",
         "test:package:files": "node --test scripts/package-files.test.mjs",

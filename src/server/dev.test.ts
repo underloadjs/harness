@@ -169,7 +169,10 @@ describe('standalone server launcher', () => {
                     'workspace',
                     'reviewer',
                     'planner',
-                    'debugger'
+                    'debugger',
+                    // The tool-less card (issue 0005-D) is part of the shipped catalogue a
+                    // standalone server serves, so the launcher's own listing pins it.
+                    'chat'
                 ]);
 
                 // --database-root reached startHarnessServer: a session persists.

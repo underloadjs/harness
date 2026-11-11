@@ -15,6 +15,14 @@
 // abort the run, and it gives the frame writer explicit backpressure, instead of
 // leaning on the loader's `streamSSE` helper which exposes no abort signal.
 //
+// THE PUBLISHED WRITER (issue 0006). The function that builds that Response is
+// `createHarnessSseResponse` below, exported and re-exported by `./index.ts`, so a host
+// streaming harness events from its OWN endpoint imports it instead of reading this file
+// and re-deriving the frame contract, the preamble, the header set, the backpressure rule
+// and the cancel->abort wiring. It is also the ONLY writer this package uses: the
+// standalone Node adapter (`./handler.ts`, `runHarnessSseStream`) consumes the same
+// function and pipes its body onto a `ServerResponse`.
+//
 // ACCESS CONTROL — read this before exposing the service beyond loopback.
 // The service loader installs permissive CORS (`origin: '*'`, `allowHeaders:
 // '*'`) on every app, so the standalone API's `X-Harness-Client` header is NOT a
@@ -54,9 +62,9 @@
 //   - reject a declared `content-length` over the ROUTE limit with 413 before any
 //     dispatcher work;
 //   - reject a parsed body whose serialized size exceeds the same limit with 413.
-// The route limit comes from api.ts bodyLimitFor: the submit routes (/tasks and
-// /messages) allow the shared 16 MiB MAX_SUBMIT_BODY_BYTES for base64 attachments,
-// every other route keeps the 1 MB default. A malformed body stays the dispatcher's
+// The route limit comes from api.ts bodyLimitFor: the task submit route
+// (POST /sessions/:id/tasks) is the only one that carries base64 attachments, so it alone
+// gets the shared 16 MiB MAX_SUBMIT_BODY_BYTES and every other route keeps the 1 MB default. A malformed body stays the dispatcher's
 // problem to reject (it requires an object body for action endpoints and a `parameters`
 // property for tool calls), which is what keeps a swallowed parse failure from executing a tool.
 //
@@ -179,9 +187,32 @@ const isAllowedOrigin = (origin: string, host: string | undefined): boolean => {
     return isPagesOrigin(origin);
 };
 
-// Build the canonical SSE response. Frames use the same `data: <json>\n\n`
-// encoding as the standalone server, so the existing UI parser works unchanged.
-const createSseResponse = (start: HarnessApiStream, requestSignal: AbortSignal | undefined): Response => {
+// THE PACKAGE'S ONE SSE WRITER, published from `@underload/harness/server` (issue 0006).
+// Both in-package adapters consume it — this mount returns it as `{ raw: Response }`, the
+// Node adapter pipes its body onto a `ServerResponse` — so a host writing an SSE endpoint
+// of its own has something to import instead of a third copy of the same rules.
+//
+// THE CONTRACT, exactly (pinned by src/server/sse-writer.test.ts):
+//   - `200` with `text/event-stream; charset=utf-8`, `no-cache, no-transform`,
+//     `keep-alive`, and `X-Accel-Buffering: no` so a proxy never buffers a frame;
+//   - one leading comment frame `: connected\n\n`, then `data: <json>\n\n` per item — the
+//     encoding the shipped UI parser already reads, so a UI pointed at a host endpoint
+//     needs no changes;
+//   - BACKPRESSURE: while the stream's queue is full (`desiredSize <= 0`) a frame waits
+//     for the consumer's next `pull`, so a slow client paces the run rather than buffering
+//     a whole transcript into memory;
+//   - CANCEL -> ABORT: `cancel()` (tab closed, fetch aborted) and the optional `signal`
+//     (a request signal, on runtimes that propagate one) both abort the signal handed to
+//     `start`. That wiring is the whole point of the helper: it is the only way a browser
+//     disconnect reaches a run, and the loader's `{ stream }` passthrough cannot express it.
+//     WHAT the abort means stays the dispatcher's per-route decision (R4: POST /messages
+//     cancels the run, GET /sessions/:id/events only unsubscribes) — this writer only
+//     reports that the consumer is gone.
+//
+// `start(emit, signal)` is the dispatcher's own stream arm (`HarnessApiStream`). A throw
+// from it is swallowed on purpose: the dispatcher already converts a failed run into a
+// `failed` frame, and anything that reaches here means the writer is gone.
+export const createHarnessSseResponse = (start: HarnessApiStream, signal?: AbortSignal): Response => {
     const encoder = new TextEncoder();
     const abortController = new AbortController();
 
@@ -204,8 +235,8 @@ const createSseResponse = (start: HarnessApiStream, requestSignal: AbortSignal |
     // Forward the underlying request abort (when the runtime provides one) to
     // the same controller the stream's cancel() uses.
     const onRequestAbort = (): void => stop();
-    requestSignal?.addEventListener('abort', onRequestAbort, { once: true });
-    if (requestSignal?.aborted === true) stop();
+    signal?.addEventListener('abort', onRequestAbort, { once: true });
+    if (signal?.aborted === true) stop();
 
     const write: HarnessApiEmit = async (item): Promise<void> => {
         // An aborted or cancelled stream has nowhere to write; dropping the frame
@@ -247,7 +278,7 @@ const createSseResponse = (start: HarnessApiStream, requestSignal: AbortSignal |
                 } finally {
                     closed = true;
                     release();
-                    requestSignal?.removeEventListener('abort', onRequestAbort);
+                    signal?.removeEventListener('abort', onRequestAbort);
 
                     try {
                         controller.close();
@@ -266,7 +297,7 @@ const createSseResponse = (start: HarnessApiStream, requestSignal: AbortSignal |
             // what this means per route — POST /messages cancels the run (legacy),
             // GET /sessions/:id/events only unsubscribes; the pump keeps working.
             stop();
-            requestSignal?.removeEventListener('abort', onRequestAbort);
+            signal?.removeEventListener('abort', onRequestAbort);
         }
     });
 
@@ -592,7 +623,7 @@ export const createHarnessServiceHandler = (
             };
         }
 
-        return { status: 200, raw: createSseResponse(result.start, context.req.raw?.signal) };
+        return { status: 200, raw: createHarnessSseResponse(result.start, context.req.raw?.signal) };
     };
 };
 

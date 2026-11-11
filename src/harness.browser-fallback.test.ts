@@ -64,6 +64,43 @@ describe('browser baseline fallback', () => {
         });
     });
 
+    it('installs a prebuilt catalogue tool with no source record when compilation is unavailable', async () => {
+        // Issue 0003 in the browser build: a host that compiled its tool elsewhere still
+        // gets the tool — the attachment is simply dropped, because the stubbed compiler
+        // cannot hash a module graph. Construction must not fail, and no record may be
+        // claimed for bytes this environment never read (the same boundary that keeps the
+        // baseline on prepared definitions above).
+        const definition = tool({
+            name: 'browserProbe',
+            description: 'Answer in the browser.',
+            tags: ['probe'],
+            execute: () => 'browser-probe'
+        });
+
+        const writer = harness({
+            agents: { writer: agent({ model: 'test/model', stream: scripted() }) },
+            presets: false,
+            tools: {
+                browserProbe: {
+                    tool: definition,
+                    source: { moduleText: 'export const execute = () => "browser-probe";' }
+                }
+            }
+        });
+
+        expect(writer.tools.browserProbe?.name).toBe('browserProbe');
+        expect(await writer.tools.browserProbe?.execute({ parameters: {} } as never)).toBe(
+            'browser-probe'
+        );
+        expect(writer.toolSource('browserProbe')).toBeUndefined();
+        expect(
+            writer
+                .toolSources()
+                .filter((source) => source.name === 'browserProbe')
+                .map((source) => source.revision)
+        ).toEqual([]);
+    });
+
     it('keeps runtime source registration explicitly unsupported in this environment', async () => {
         const writer = harness({
             agents: { writer: agent({ model: 'test/model', stream: scripted() }) },

@@ -120,8 +120,8 @@ const EXHAUSTED_SLOTS = [4, 5];
 const CUSTOM_HEX = '#ff6600';
 const CUSTOM_TONE: AgentColor = { slot: -1, color: CUSTOM_HEX, line: 'rgba(255, 102, 0, 0.6)' };
 
-// The seven LIVE harnesses (`presets` in src/server/harnesses/presets.ts) and the exact
-// set each one paints: primary first, then its `teamOf()` allowlist, and the exact slot
+// The seven distinct LIVE rosters the shipped cards paint (`presets` in
+// src/server/harnesses/presets.ts) and the exact set each one paints: primary first, then its `teamOf()` allowlist, and the exact slot
 // each member lands on when THAT roster is configured on an empty page. The member sets
 // and slots are measured off the module, not derived in the assertion; the live test
 // re-derives the members from production `teamOf` and requires this literal.
@@ -595,8 +595,11 @@ describe('palette shape (the largest live team fits; the catalogue may exceed it
     });
 
     it('keeps every live harness team pairwise distinct inside the eight slots', () => {
-        // The seven live cards (`presets`), in catalogue order — the fixtures are absent
-        // here, which is exactly why the catalogue is not the constraint.
+        // The eight live cards (`presets`), in catalogue order — the fixtures are absent
+        // here, which is exactly why the catalogue is not the constraint. The eighth primary
+        // repeats `general`: the tool-less `chat` card (issue 0005-D) reuses the trusted
+        // General profile instead of adding a role, so it contributes NO new roster and the
+        // `LIVE_TEAMS` list below stays the seven distinct rosters the palette has to fit.
         expect(presets.map((preset) => preset.primary)).toEqual([
             'general',
             'instruct',
@@ -604,7 +607,8 @@ describe('palette shape (the largest live team fits; the catalogue may exceed it
             'workspace',
             'reviewer',
             'planner',
-            'debugger'
+            'debugger',
+            'general'
         ]);
 
         // Member counts, per card: the Manager's team is the largest there is and lands

@@ -8,6 +8,10 @@
 //   - `createHarnessRuntime` / `getHarnessRuntime` — the lazy store+catalogue the
 //     @underload/service routes share; the service gateway owns the listener.
 //   - `createHarnessServiceHandler` — endpoint adapter, Origin gate, raw SSE.
+//   - `createHarnessSseResponse` / `runHarnessSseStream` — the package's ONE SSE writer
+//     (frame contract, preamble, `X-Accel-Buffering`, backpressure, cancel->abort) and the
+//     Node `ServerResponse` bridge over it, so a host streaming harness events from its own
+//     endpoint imports them instead of writing a third copy (issue 0006).
 //   - `createHarnessApi` / `createHarnessHandler` — transport-neutral dispatcher
 //     and the Node `http` adapter.
 //   - `SessionStore` — authoritative turns + FIFO task queue.

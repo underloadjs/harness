@@ -10,6 +10,14 @@
 // line is what keeps a brain reusable. The same agent can be driven by a writer
 // harness, a research harness, or a test.
 //
+// ONE FLOOR IS NOT POLICY (issue 0004). When `maxPromptTokens` /
+// `provider.contextWindow` is set, the agent measures the transcript it is about to
+// send with the published estimator (`core/context-estimate.ts`) and REFUSES one that
+// is too big — a typed, non-retried `context-overflow` before the request leaves. It
+// still never trims, truncates or summarises: replacement policy stays on the plugin
+// bus (`turn.before`), and the floor only catches what is still too big after policy
+// has run. With no window configured, nothing here changes.
+//
 // RETRY OWNERSHIP (R1). The agent is the ONE retry owner for model calls, at the
 // generic `request` boundary below. That placement is deliberate:
 //   - it covers EVERY transport (the built-in `openAICompatible`, a custom
@@ -27,7 +35,12 @@
 // Success ends the sequence; when the final retry fails, the ORIGINAL error of
 // that attempt is rethrown/yielded unchanged, so a caller keeps the real cause.
 // Cancellation is never an error to retry: an aborted signal (in flight or
-// during a backoff wait) ends the request immediately.
+// during a backoff wait) ends the request immediately. A context overflow is never
+// retried either (issue 0004): the guard above refuses an oversized transcript
+// before the first attempt, and a provider's own 400/413 "input too long" — the
+// `context-overflow` code the built-in transport puts on its frame — ends the
+// sequence on the attempt that produced it, because re-sending the same oversized
+// bytes answers the same way eleven times.
 //
 // Standalone use is real, and it is the reason the two methods are split:
 //
@@ -57,8 +70,18 @@
 //   - ./branch.ts     — fork identity, materialization, bounds
 //   - ../harness.ts   — the loop that drives turn() repeatedly
 
-import { HarnessError, toErrorInfo } from '../util';
-import { openAICompatible } from '../transport';
+import { HarnessError, isInstanceOf, toErrorInfo } from '../util';
+// `MAX_RESPONSE_SCHEMA_NAME_CHARS` is the gateway-side name rule the transport
+// enforces; `structured` derives its `json_schema.name` under that same cap.
+// `CONTEXT_OVERFLOW_CODE` (issue 0004) is the ONE name for "the prompt does not
+// fit": the transport raises it for a provider 400/413 size rejection, and the
+// pre-request guard below raises the same code before a request leaves, so a host
+// classifies both with one switch and the retry rule has one owner.
+import {
+    CONTEXT_OVERFLOW_CODE,
+    MAX_RESPONSE_SCHEMA_NAME_CHARS,
+    openAICompatible
+} from '../transport';
 import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
 import {
     agentBranchOf,
@@ -74,6 +97,23 @@ import { registerAgentThreader } from './thread';
 // Stable transcript addresses (context T1). A leaf module (types only), so importing it
 // here adds no cycle to the branch/thread registry chain above.
 import { assignMessageId } from './message-id';
+// (issue 0004) The pre-request floor measures with the SAME estimator the UI context
+// bar and the `context-compaction` plugin use (`ceil(chars / 4)`, dependency-free,
+// total). A leaf module — types only — so it adds no cycle, and it is the published
+// root-barrel helper a host uses to make its own decision before calling in.
+import { estimateContextTokens } from './context-estimate';
+// (issue 0001 B) Structured output reuses the SAME runtime gate a created tool's schema
+// and arguments pass, rather than a second JSON-Schema implementation:
+// `checkToolSchemaComplexity` bounds the schema at construction and
+// `validateSchemaValue` judges the answer. Also a leaf chain (util + result-budget +
+// tool), so this import adds no cycle.
+import {
+    MAX_CREATED_SCHEMA_BYTES,
+    MAX_CREATED_SCHEMA_DEPTH,
+    MAX_CREATED_SCHEMA_NODES,
+    checkToolSchemaComplexity,
+    validateSchemaValue
+} from './schema-validation';
 // The outcome storage rule (compaction T1) for the fork baseline below. Leaf module,
 // type-only imports — no cycle risk with ./branch or ./message-id.
 import { storedOutcomeEntry } from './tool-outcome';
@@ -140,12 +180,125 @@ const requireAgentColor = (name: string, value: unknown): string | undefined => 
     return color;
 };
 
+// ---------------------------------------------------------------------------
+// Structured output (issue 0001 B)
+// ---------------------------------------------------------------------------
+
+// Machine codes for the two structured-output rejections (records-engine Decision O,
+// see ../util/errors.ts): a host that has to tell "my schema is wrong" from "the
+// model answered something else" switches on the code instead of parsing prose, and
+// `HarnessError` mirrors it into `error.name`.
+//
+// Not promoted to the package root on purpose: the codes are stable strings a host
+// quotes (documented in README), and a root export would suggest a recovery API that
+// does not exist — the answer to both is "fix the schema" or "re-ask".
+export const STRUCTURED_SCHEMA_INVALID_CODE = 'structured-schema-invalid';
+export const STRUCTURED_OUTPUT_INVALID_CODE = 'structured-output-invalid';
+
+// How much of an unusable answer is quoted back in the failure message. A model that
+// ignores the format can emit megabytes, and an error message is not a transcript.
+const STRUCTURED_PREVIEW_CHARS = 160;
+
+const previewOf = (content: string): string => {
+    const flat = content.replace(/\s+/g, ' ').trim();
+
+    if (flat.length <= STRUCTURED_PREVIEW_CHARS) return flat;
+
+    return `${flat.slice(0, STRUCTURED_PREVIEW_CHARS)}…`;
+};
+
+// Gate the `structured` schema at CONSTRUCTION, with the exact bounds a model-created
+// tool's schema must pass (`checkToolSchemaComplexity` with the `MAX_CREATED_SCHEMA_*`
+// defaults). Two reasons, both already true of created tools: a schema this layer
+// walks on every answer must not be unbounded, and a schema the runtime gate cannot
+// express would silently validate everything (`validateSchemaValue` ignores keywords it
+// does not model, so an unsupported shape is a contract the host believes in but never
+// gets). `undefined` means "not configured" and stays absent.
+const requireStructuredSchema = (name: string, schema: unknown): Record<string, unknown> | undefined => {
+    if (schema === undefined) return undefined;
+
+    if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) {
+        throw new HarnessError(
+            `Agent "${name}" has an invalid \`structured\` schema: ${JSON.stringify(schema)}. ` +
+                'Pass a JSON Schema object, e.g. { type: "object", properties: { ... }, required: [ ... ] }.',
+            { code: STRUCTURED_SCHEMA_INVALID_CODE }
+        );
+    }
+
+    const check = checkToolSchemaComplexity(schema);
+
+    if (!check.valid) {
+        // `checkToolSchemaComplexity` returns fragments meant to follow "must not"
+        // ("have more than 256 schema nodes"), the same shape ./creation.ts composes
+        // for a created tool, so both surfaces read identically.
+        throw new HarnessError(
+            `Agent "${name}" \`structured\` schema must not ${check.message}. The same bounds apply to a ` +
+                `created tool schema (depth ${MAX_CREATED_SCHEMA_DEPTH}, ${MAX_CREATED_SCHEMA_NODES} nodes, ` +
+                `${MAX_CREATED_SCHEMA_BYTES} bytes).`,
+            { code: STRUCTURED_SCHEMA_INVALID_CODE }
+        );
+    }
+
+    return schema as Record<string, unknown>;
+};
+
+// The `json_schema.name` a gateway accepts (`[a-zA-Z0-9_-]{1,64}`, enforced by the
+// transport at construction). An agent name is free text — a harness may key one with
+// dots, spaces or non-ASCII labels — so it is reduced to accepted characters and
+// truncated, falling back to a stable literal when nothing survives.
+const structuredSchemaNameOf = (name: string | undefined): string => {
+    const slug = (name ?? '')
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .slice(0, MAX_RESPONSE_SCHEMA_NAME_CHARS);
+
+    return slug.length > 0 ? slug : 'structured';
+};
+
+// Judge a finished answer against the schema. Returns the parsed value or throws a
+// typed failure — it never returns a stand-in, because "the model answered something
+// else" is a fact the caller must see, not a `{}`.
+//
+// JSON parsing is STRICT (no code-fence stripping, no first-brace sniffing): the whole
+// point of a response format is a result the host parses without heuristics, so a
+// fenced answer is a provider that ignored the request and must fail loudly rather
+// than be rescued by a guess.
+const structuredAnswerOf = (name: string, schema: Record<string, unknown>, content: string): unknown => {
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(content);
+    } catch (error) {
+        throw new HarnessError(
+            `Agent "${name}" was asked for a schema-shaped answer and returned text that is not JSON` +
+                `${content.length > 0 ? `: "${previewOf(content)}"` : ' (an empty answer)'}.` +
+                ` The provider reported: ${toErrorInfo(error).message}`,
+            { code: STRUCTURED_OUTPUT_INVALID_CODE, cause: error }
+        );
+    }
+
+    const check = validateSchemaValue(schema, parsed);
+
+    if (!check.valid) {
+        throw new HarnessError(
+            `Agent "${name}" returned an answer that does not match its \`structured\` schema: ${check.message} ` +
+                `(answer: "${previewOf(content)}")`,
+            { code: STRUCTURED_OUTPUT_INVALID_CODE }
+        );
+    }
+
+    return parsed;
+};
+
 // Resolve the transport once, at construction. An explicit `stream` wins;
 // otherwise the provider block is wrapped in the built-in transport. Failing
 // here (rather than at the first prompt) means a misconfigured agent is caught
 // where it was created.
-const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
+const resolveStream = (configuration: AgentConfiguration, structured: Record<string, unknown> | undefined): HarnessStream => {
     if (configuration.stream) {
+        // A host-supplied transport owns its own wire format, so `structured` cannot
+        // reach the request body — it stays validation-only there (documented on
+        // AgentConfiguration.structured). The agent still refuses an answer that
+        // breaks the schema, which is the half a custom transport cannot do for it.
         return configuration.stream;
     }
 
@@ -155,7 +308,20 @@ const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
         );
     }
 
-    return openAICompatible(configuration.provider);
+    // `structured` reaches the wire through the SAME provider-level seam issue 0001
+    // added (`provider.responseFormat`), so the agent invents no second request field
+    // and a host that already chose a `responseFormat` keeps its own: the explicit
+    // provider value wins on the wire, and `structured` still gates the reply.
+    if (structured === undefined || configuration.provider.responseFormat !== undefined) {
+        return openAICompatible(configuration.provider);
+    }
+
+    return openAICompatible({
+        ...configuration.provider,
+        responseFormat: {
+            jsonSchema: { name: structuredSchemaNameOf(configuration.name), schema: structured }
+        }
+    });
 };
 
 // The ONE normalization point for the context-inclusion flag (`HarnessMessage.included`)
@@ -381,6 +547,47 @@ const resolveRetryPolicy = (configuration: HarnessRetryConfiguration | undefined
 const retryDelayOf = (policy: RetryPolicy, attempt: number): number =>
     policy.baseDelayMs * 2 ** (attempt - 1);
 
+// ---------------------------------------------------------------------------
+// Pre-request context floor (issue 0004)
+// ---------------------------------------------------------------------------
+
+// The resolved floor for one agent, in tokens: `undefined` means "no guard", which is
+// today's behaviour byte-for-byte. Resolved and validated HERE — at construction —
+// because a bad number is a configuration mistake and must fail on the line it was
+// written, the rule `resolveRetryPolicy` and `requireAgentColor` above follow.
+//
+// Both spellings are validated even when one is shadowed by the other, so a typo in
+// the losing field is still a construction failure rather than a silently dead setting.
+//
+// Precedence: `maxPromptTokens` (agent scope) beats `provider.contextWindow`
+// (endpoint scope) — one brain on a shared endpoint may aim lower than the window, and
+// the narrower scope is the one its author is reading.
+//
+// `provider.contextWindow` is read even when an explicit `stream` owns the wire (the
+// provider block is ignored for the REQUEST in that case, as documented). That is
+// deliberate: the floor is not a wire field, it is a decision this agent makes about
+// its own transcript, so a host on a custom transport gets the same guard.
+const requireContextWindow = (configuration: AgentConfiguration): number | undefined => {
+    const agentWindow = configuration.maxPromptTokens;
+    const providerWindow = configuration.provider?.contextWindow;
+
+    for (const [field, value] of [
+        ['maxPromptTokens', agentWindow],
+        ['provider.contextWindow', providerWindow]
+    ] as const) {
+        if (value === undefined) continue;
+
+        if (!Number.isSafeInteger(value) || value < 1) {
+            throw new HarnessError(
+                `${field} must be a positive safe integer of tokens; received ${String(value)}. ` +
+                    `It is compared against the transcript estimate from core/context-estimate.ts.`
+            );
+        }
+    }
+
+    return agentWindow ?? providerWindow;
+};
+
 // What ONE attempt accumulated. Declared outside the factory because both the
 // attempt generator and the retry wrapper return it.
 type AttemptOutcome = {
@@ -476,7 +683,26 @@ const createAgent = (
     // never enters a request, a transcript, or a snapshot.
     const color = requireAgentColor(configuration.name ?? 'agent', configuration.color);
 
-    const transport = resolveStream(configuration);
+    // Structured output (issue 0001 B). The schema is gated HERE, before the transport
+    // exists, for the same reason the color is: a schema the runtime gate cannot bound
+    // (or cannot express) is a configuration mistake, and it must fail on the line it
+    // was written instead of on the first answer. `structured` then does two things:
+    //   - it rides into the built-in transport as `provider.responseFormat` (see
+    //     `resolveStream`), and
+    //   - it becomes the acceptance test every answer of this agent must pass (see
+    //     `request`).
+    const structured = requireStructuredSchema(
+        configuration.name ?? 'agent',
+        configuration.structured
+    );
+
+    // Context floor (issue 0004). Resolved with the other setup fields, before the
+    // transport exists, so a bad window is a construction failure on the line it was
+    // written. `undefined` means no guard, and every request path below is then
+    // byte-for-byte what it was before this setting existed.
+    const contextWindow = requireContextWindow(configuration);
+
+    const transport = resolveStream(configuration, structured);
     const instructions = normalizeInstructions(configuration.instruction);
 
     // The model is mutable: a caller can switch models mid-conversation without
@@ -679,6 +905,58 @@ const createAgent = (
             return { ...message };
         });
 
+        // CONTEXT FLOOR (issue 0004). Measured on the exact array the transport is
+        // about to receive — the harness's projection when one was handed in, so a
+        // `turn.before` compaction pass has ALREADY had its chance to shrink the
+        // transcript, and this only refuses what is still too big after policy ran —
+        // and with the published estimator, i.e. the same `ceil(chars / 4)` the UI
+        // context bar and the compaction plugin use.
+        //
+        // What the floor therefore cannot see is the SAME list the estimator cannot
+        // see: the serialized tool schemas, the message framing, and attachment bytes.
+        // A request with a huge tool registry can still reach a provider 400, which is
+        // why (3) classifies the provider's answer under this very code rather than
+        // pretending the estimate is exact. The provider-anchored hybrid
+        // (`estimateContextTokensHybrid`) DOES absorb that overhead, but it needs a
+        // previous `usage` report to anchor on, so it cannot guard a first request.
+        //
+        // Why the throw sits OUTSIDE `attemptWithRetries` (like the abort boundary
+        // below it, and for the same reason): an oversized transcript is a bug in
+        // what is being sent, not a transient provider failure. Re-sending the same
+        // bytes through the whole backoff ladder answers the same way eleven times,
+        // so the retry layer must not own this decision at all.
+        //
+        // What the caller gets: `turn()` throws the coded error; `stream()` yields its
+        // usual `error` event (with `code` on the payload via `toErrorInfo`) and rolls
+        // the user message back, so nothing was appended, nothing was fetched, and the
+        // next request starts from the same clean history. `details` carries the pair
+        // for a host that has to recover, per the `HarnessError` convention.
+        if (contextWindow !== undefined) {
+            const estimatedTokens = estimateContextTokens(transcript);
+
+            if (estimatedTokens > contextWindow) {
+                throw new HarnessError(
+                    `${CONTEXT_OVERFLOW_CODE}: agent "${self.name}" would send an estimated ` +
+                        `${estimatedTokens} tokens against a ${contextWindow}-token window, so the ` +
+                        `request was not sent and is not retried. The estimate is ceil(chars / 4) ` +
+                        `over the transcript about to be sent (core/context-estimate.ts), the same ` +
+                        `number the UI context bar shows; attachment bytes and the request's ` +
+                        `tool schemas are not counted. Send less — a turn.before handler may replace ` +
+                        `the transcript, and the shipped context-compaction plugin owns that policy — ` +
+                        `or raise maxPromptTokens / provider.contextWindow.`,
+                    {
+                        code: CONTEXT_OVERFLOW_CODE,
+                        details: {
+                            estimatedTokens,
+                            contextWindow,
+                            model: requestModel,
+                            agent: self.name
+                        }
+                    }
+                );
+            }
+        }
+
         // One attempt. Its accumulators are local, so a throw discards them.
         //
         // COMPLETION IS TERMINAL FOR OUTPUT (F3). A transport `done` frame is the
@@ -733,7 +1011,11 @@ const createAgent = (
                     if (completed) {
                         if (event.type === 'error') {
                             failed = true;
-                            failure = new HarnessError(event.message);
+                            // (issue 0004) The frame's machine code rides along, so a
+                            // transport-declared overflow is still a `context-overflow`
+                            // failure here rather than an anonymous one — the retry
+                            // ladder below reads the code, not the prose.
+                            failure = new HarnessError(event.message, { code: event.code });
                         }
                         continue;
                     }
@@ -755,7 +1037,15 @@ const createAgent = (
                             // whether to re-send the request. The frame's message is
                             // the original, useful error text and is preserved
                             // verbatim.
-                            throw new HarnessError(event.message);
+                            //
+                            // (issue 0004) A frame that carries a machine `code` keeps
+                            // it on the thrown error — that is how a provider-side
+                            // `context-overflow` reaches the retry decision below
+                            // without anyone matching English prose. A frame without a
+                            // code throws exactly the codeless `HarnessError` it threw
+                            // before, so `error.name` and every existing payload are
+                            // unchanged.
+                            throw new HarnessError(event.message, { code: event.code });
 
                         case 'done':
                             stopReason = event.stopReason;
@@ -815,6 +1105,21 @@ const createAgent = (
                     // Cancellation is not an error to retry: the run stopped.
                     if (isAbortError(error, options?.signal)) throw error;
 
+                    // AN OVERFLOW IS NOT A TRANSIENT FAILURE EITHER (issue 0004). A
+                    // request the provider rejected for being too long re-sends the
+                    // same oversized bytes and answers the same way, so the backoff
+                    // ladder buys nothing — the code the transport put on the frame
+                    // (transport/openai.ts classifies a 413 and a documented 400
+                    // wording) is what ends the sequence here, on the first attempt,
+                    // with the ORIGINAL error rethrown unchanged. Classified through
+                    // `isInstanceOf`, the total guard for `instanceof` on a hostile
+                    // thrown value (../util/errors.ts); nothing matches on prose. The
+                    // agent's own pre-request refusal never reaches this branch at
+                    // all — it throws before the loop starts.
+                    if (isInstanceOf(error, HarnessError) && error.code === CONTEXT_OVERFLOW_CODE) {
+                        throw error;
+                    }
+
                     // Out of retries: the last attempt's own error is the answer.
                     if (attempt >= maxAttempts) throw error;
 
@@ -842,6 +1147,42 @@ const createAgent = (
 
         const { outcome, attempt: committedAttempt } = yield* attemptWithRetries();
 
+        // STRUCTURED GATE (issue 0001 B) — runs AFTER the retry loop and BEFORE the
+        // commit, and that placement is the whole design:
+        //
+        //   - NOT a transport retry. The provider answered successfully; re-sending the
+        //     identical request into the R1 sequence would burn a request (and an
+        //     exponential backoff) on a failure shape that will almost certainly
+        //     repeat. The host decides what to do — it is one `turn()` away, above the
+        //     agent, and it may re-ask with different instructions. A schema failure is
+        //     therefore exactly ONE transport call, whatever `retry` says.
+        //   - BEFORE `precommit` and before `messages.push`, so an invalid answer leaves
+        //     NO trace in history: `stream()` rolls its user message back like any other
+        //     failure, and `turn()` commits nothing. A later request can never replay a
+        //     turn the schema rejected.
+        //   - The answer is streamed as text while it arrives, so a consumer sees the
+        //     deltas of a rejected attempt (the same contract a failed attempt already
+        //     has) and then the `error` event / throw that voids them.
+        //
+        // Two answers are NOT judged, and both exclusions are load-bearing:
+        //   - `stopReason: 'tool_calls'` — the turn has no answer yet; the schema applies
+        //     to the final message, and a tool round that fails later still fails here.
+        //   - `stopReason: 'length'` — a truncated answer is a DIFFERENT problem than a
+        //     malformed one (the generation was cut, the model never had the chance to
+        //     close its JSON). Reporting it as a schema failure would send a host off to
+        //     fix its schema when the fix is more output tokens, so the caller keeps the
+        //     distinguishable `stopReason: 'length'` and simply gets no `structured`
+        //     value on the message.
+        let structuredValue: unknown;
+
+        if (structured !== undefined && outcome.toolCalls.length === 0 && outcome.stopReason !== 'length') {
+            structuredValue = structuredAnswerOf(
+                configuration.name ?? 'agent',
+                structured,
+                outcome.content
+            );
+        }
+
         // Pre-commit guard (harness ownership/cancellation). This is the ONLY
         // synchronous mutation point of a turn, so a caller that lost ownership
         // while the transport was in flight can stop here without a partial
@@ -860,7 +1201,11 @@ const createAgent = (
             // describe the request that ran (see requestModel above).
             model: requestModel,
             stopReason: outcome.stopReason,
-            usage: outcome.usage
+            usage: outcome.usage,
+            // Written ONLY when a value passed the gate — never `structured:
+            // undefined` — so every consumer that compares this message key-by-key
+            // still sees exactly the shape it saw before issue 0001.
+            ...(structuredValue !== undefined ? { structured: structuredValue } : {})
         };
 
         // Commit to history. reasoning is kept for replay/UI but never sent back
@@ -984,6 +1329,17 @@ const createAgent = (
                 instruction: [...instructions],
                 stream: transport,
                 retry: retryPolicy,
+                // (issue 0001 B) The same answer contract, for the same reason the
+                // retry policy is inherited: the wire field already rides in the
+                // SHARED transport, but the acceptance gate is per-agent
+                // configuration, so a branch that silently dropped it would commit
+                // answers its source would have refused.
+                ...(structured === undefined ? {} : { structured }),
+                // (issue 0004) The same context floor, re-spelled as `maxPromptTokens`
+                // because a fork carries the shared TRANSPORT and no provider block: a
+                // branch that silently dropped the window would send what its source
+                // refuses to send.
+                ...(contextWindow === undefined ? {} : { maxPromptTokens: contextWindow }),
                 // R2: the branch is the SAME identity as its source (same name, same
                 // instructions, same transport), so it carries the same swatch. A host
                 // that colored the source must not see a colorless child.
@@ -1092,6 +1448,14 @@ const createAgent = (
             // A thread is another conversation of the SAME brain, so it inherits the
             // retry policy (R1) rather than reverting to the default budget.
             retry: retryPolicy,
+            // (issue 0001 B) A thread answers like its owning agent: the schema is
+            // already in the shared transport, and this carries the gate.
+            ...(structured === undefined ? {} : { structured }),
+            // (issue 0004) And the same context floor — a thread is another
+            // conversation of the SAME brain, so it must not be the one path allowed
+            // to send an oversized request. Re-spelled as `maxPromptTokens` because
+            // the thread shares the resolved transport, not the provider block.
+            ...(contextWindow === undefined ? {} : { maxPromptTokens: contextWindow }),
             // R2: and the same identity color, for the same reason — the UI paints one
             // swatch per agent, and a thread is that agent's conversation, not a new agent.
             ...(self.color === undefined ? {} : { color: self.color })
