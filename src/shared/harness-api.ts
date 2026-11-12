@@ -3402,24 +3402,46 @@ export interface ContextBlock {
      * and a tool block whose text is a settled (including failed or cancelled) result or only the arguments of
      * a call still running. False for a `reasoning` block, which the projector mints per KIND and not per
      * decision: whether a given window's thinking actually rides is decided by the context trimmer's thinking
-     * policy (`dropOldThoughts`, and the per-entry `reasoningIncluded` flag it writes), so this field is the
-     * answer a server uses only where it cannot name the entry behind the segment - `included` on the detail
-     * read is the per-entry verdict. Stated explicitly so a bar never assumes every counted segment is prompt
-     * text.
+     * policy (`trimThoughts` + `thoughtTurns`, and the per-entry `reasoningIncluded` flag it writes), so this
+     * field is the answer a server uses only where it cannot name the entry behind the segment - `included` on
+     * the detail read is the per-entry verdict. Stated explicitly so a bar never assumes every counted segment
+     * is prompt text.
      */
     inPrompt?: boolean;
     /**
      * T7: the READER-facing inclusion axis, distinct from `inPrompt`. `true`/`false` state what the requests
-     * that follow actually carry for THIS segment - the transcript unit it is built from as switched ON or OFF
-     * for a call (a tool unit is excluded as a whole: the assistant call plus every result answering it), or,
-     * for a `reasoning` segment, whether the thinking of the ONE assistant entry that streamed this window
-     * still rides (the `reasoningIncluded` axis, trimmer uplift T7 - a withheld window's thinking is dropped
-     * from the request copy while its entry keeps travelling). ABSENT means this server could not name the
-     * entry behind the segment: no live call id behind a call, no live assistant entry carrying this EXACT
-     * recorded thinking (or more than one carrying it), an answer window that spans several entries, a system
-     * block that joins several instruction messages, or an analysis that predates this field. The block detail
-     * route states it, because that read holds BOTH the recorded event and the live transcript; `PATCH` on this
-     * same path writes it. A client never derives it.
+     * that follow actually carry for THIS segment - the transcript ENTRY it is built from as switched ON or OFF
+     * for a call (the verdict is PER ENTRY, with no cascade: excluding the assistant request entry lets its
+     * results ride as an ownerless `tool` message, and a withheld result comes back in the request as a
+     * synthetic `withheld` tool message so every emitted `tool_calls[]` stays answered), or, for a `reasoning`
+     * segment, whether the thinking of the ONE assistant entry that streamed this window still rides (the
+     * `reasoningIncluded` axis, trimmer uplift T7 - a withheld window's thinking is dropped from the request
+     * copy while its entry keeps travelling), or, for an `assistant` segment, whether the ONE assistant entry
+     * whose `content` IS these recorded answer bytes still rides (the entry axis: the same text-is-the-key join
+     * a thinking window uses, so a withheld answer dims its own answer segment the way withheld thinking dims
+     * its own window). ABSENT means there is NO addressable transcript entry behind the segment: no live call
+     * id behind a call, no live assistant entry carrying this EXACT recorded thinking (or more than one
+     * carrying it), an answer window whose recorded bytes are not the exact `content` of exactly ONE assistant
+     * entry - an answer an earlier assistant entry repeats verbatim, or an entry a host Transcript save has
+     * since removed - while a SPLIT answer is NOT abstained, because the projector mints one answer block per
+     * run of prose and each run resolves to the entry that streamed it, a system block that joins several
+     * instruction messages, or an analysis that predates this field. ABSENT is never SYNTHESIZED: a producer
+     * that cannot name the entry states nothing rather than guessing, which is why a reader draws such a
+     * segment opaque with no control offered. The block detail route states it, because that read holds BOTH
+     * the recorded event and the live transcript; `PATCH` on this same path writes it. A client never derives
+     * it. ONE FIELD NAME, TWO HONEST GRANULARITIES, and they differ in exactly ONE case (the in-repo model
+     * src/shared/turn-display.ts `ContextBlock.included` is the authority and states the same rule; this schema
+     * is its verbatim wire alias). The BLOCK DETAIL read (./api.ts `getSessionTurnBlock`) answers the ENTRY
+     * this segment resolves to, per entry — that is the verdict the dialog's chip switches, and the one `PATCH`
+     * on this path writes. The DISPLAY read (./api.ts `getSessionTurnDisplay`, which stamps the figure through
+     * `contextSegmentIncludedOf`) answers the SEGMENT the lane paints: a tool's request and its answer are ONE
+     * segment while this field is ONE boolean, so a segment is `false` only when NOTHING of it reaches the
+     * prompt any more — a truncated request whose result still travels reads `true` on the lane and `false` on
+     * the detail read, and the two figures are honest about different things. The write is live: `PATCH` on
+     * this path publishes ONE `context:set { included }` op carrying the SEGMENT figure (./api.ts
+     * `patchSessionTurnBlock`), so the bar dims on the frame of the click and the display read that follows
+     * cannot un-dim it. The write receipt carries the per-ENTRY figure instead, because that is the verdict the
+     * next detail read publishes for the same segment.
      */
     included?: boolean;
     /** Recorded event range the block's text is served from, so the lazy answer is reproducible after a restart. */
@@ -3545,11 +3567,15 @@ export interface TurnBlockDetailResponse {
 export interface PatchTurnBlockRequest {
     /**
      * The segment's OWN prompt axis, resolved through the join that can name this segment's entry. For a `tool`
-     * segment it is the WHOLE unit this segment belongs to: `false` stores the flag core keeps only as a
-     * literal `false` (src/core/agent.ts `withIncluded`), and `true` removes it, which is how a reader switches
-     * a segment back on. For a `reasoning` segment the same field addresses that entry's THINKING, because
-     * thinking is what rides in the prompt for a thinking window — it is the same figure this path's `GET`
-     * publishes as `included`, so the write mirrors the read.
+     * segment it addresses the ONE transcript ENTRY behind that segment — never the unit around it. `false`
+     * stores the flag core keeps only as a literal `false` (src/core/agent.ts `withIncluded`), `true` removes
+     * it, which is how a reader switches a segment back on, and NOTHING fans out to a sibling: a policy that
+     * wants a whole exchange out of the requests writes each entry it names. Provider pairing survives without
+     * a cascade because the projection answers every emitted `tool_calls[]` slot — a withheld request entry
+     * lets its results ride as an ownerless `tool` message, and a withheld result is replaced in the request by
+     * a synthetic `withheld` tool message (src/harness.ts `projectTranscript`). For a `reasoning` segment the
+     * same field addresses that entry's THINKING, because thinking is what rides in the prompt for a thinking
+     * window — it is the same figure this path's `GET` publishes as `included`, so the write mirrors the read.
      */
     included?: boolean;
     /**
@@ -3578,9 +3604,16 @@ export interface TurnBlockWriteReceipt {
     block_id: string;
     /**
      * The verdict the NEXT block-detail read publishes for this segment, read back AFTER the write: for a tool
-     * segment the unit's state (`false` only when the unit is excluded, because that is what the exclusion
-     * switched - one verdict for the call and every result answering it); for a `reasoning` segment the
-     * thinking axis, which is the only thing that segment's prompt state can mean.
+     * segment the state of the ONE entry behind it (`false` only when THAT entry is excluded — the write is per
+     * entry with no cascade, so a withheld request entry still lets its results ride and a withheld result is
+     * answered by a synthetic `withheld` tool message); for a `reasoning` segment the thinking axis, which is
+     * the only thing that segment's prompt state can mean. This figure is the DETAIL read's granularity — per
+     * entry, the one the chip switched. The lane answers at the SEGMENT granularity (see
+     * `ContextBlock.included`): a tool request and its answer are ONE segment, so a round whose request entry
+     * alone was switched off still reads `true` on the bar, and the live `context:set { included }` op this
+     * write publishes carries THAT segment figure rather than this one. A client that repaints a bar from this
+     * field would dim a segment part of which is still in the prompt; it never has to, because the op already
+     * carries the bar's figure.
      */
     included: boolean;
     /**

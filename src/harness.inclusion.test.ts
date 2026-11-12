@@ -10,19 +10,26 @@
 //   1. DEFAULT IS BYTE-IDENTICAL. Absent means included, and re-enabling DELETES
 //      the key, so `included` never appears in a projection, a snapshot or a
 //      provider payload unless somebody turned a turn off.
-//   2. The unit of exclusion is a whole tool-call block: an assistant message
-//      with non-empty `toolCalls` plus every `tool` message matching one of its
-//      call ids. `false` on ANY member withholds the entire block — its results
-//      and its request-only pending placeholders — because a partial block is
-//      not a valid OpenAI-compatible request (src/transport/openai.ts pairing).
+//   2. THE UNIT OF EXCLUSION IS ONE TRANSCRIPT ENTRY (R8). A flag on an assistant
+//      entry removes ONLY that entry: its committed results keep riding in the
+//      request as ownerless `tool` messages, because an answer the model already
+//      has is worth keeping even when its request is switched off. A flag on a tool
+//      RESULT removes only that result and replaces it, in the slot it occupied,
+//      with a request-only `status: 'withheld'` placeholder, so an emitted
+//      `tool_calls[]` entry always has exactly one answer (src/harness.ts
+//      `projectTranscript`, and src/transport/openai.ts emits tool messages without
+//      validating pairing either way).
 //   3. Filtering is request-only: `agent.messages` keeps every entry, in place,
 //      with its flag, so the change is reversible.
-//   4. The projection stays pair-clean: no orphan result, no missing result, and
-//      the surviving blocks keep CALL ORDER.
-//   5. (Stage 1b) `entries` is the CANONICAL list with LIVE, per-unit `included`;
-//      `setIncluded()` is a canonical write that cascades to the whole unit, takes
-//      effect in the SAME model request, survives into later turns, persists
-//      through snapshot/restore, and never stores `true`.
+//   4. Pairing has two halves now: a withheld RESULT keeps the projection
+//      pair-clean (the placeholder answers the call, siblings untouched), while a
+//      withheld REQUEST deliberately leaves its results ownerless — the oracle
+//      below names them, and that leak IS the feature. Surviving blocks keep CALL
+//      ORDER.
+//   5. (Stage 1b) `entries` is the CANONICAL list with LIVE, per-ENTRY `included`;
+//      `setIncluded()` is a canonical write of exactly ONE entry, takes effect in
+//      the SAME model request, survives into later turns, persists through
+//      snapshot/restore, and never stores `true`.
 //   6. (Stage 1b) An explicit transcript (setTranscript / a returned `transcript`)
 //      outranks that re-projection and is sanitized; a bad index, a foreign entry
 //      and an entry made stale by `replaceHistory()` all throw without writing.
@@ -120,8 +127,11 @@ const shape = (messages: readonly HarnessMessage[]): string[] =>
 // The strict pairing oracle (R3 of src/harness.background.test.ts, applied to a
 // single projected list): after every assistant message that requests tools, the
 // next messages must be exactly one tool message per call, in call order, with
-// no other role in between; every tool message must belong to such a run. An
-// excluded unit that leaked one result would show up here as an orphan.
+// no other role in between; every tool message must belong to such a run. Under
+// per-entry inclusion (R8) this oracle has two readings: a withheld RESULT must
+// still report NO issue (the placeholder answers the call), while a withheld
+// REQUEST reports each of its riding results here as an orphan — the exact figure
+// the tests below pin for that case.
 const pairIssues = (messages: readonly HarnessMessage[]): string[] => {
     const issues: string[] = [];
     const claimed = new Set<number>();
@@ -162,6 +172,22 @@ const pairIssues = (messages: readonly HarnessMessage[]): string[] => {
 // contains the word at all means a `true` leaked into a request.
 const carriesFlag = (messages: readonly HarnessMessage[]): boolean =>
     JSON.stringify(messages).includes('included');
+
+// The request-only answer a withheld tool RESULT leaves in the slot the real result
+// occupied (src/harness.ts `projectTranscript`, the `withheldResultCallIds` branch).
+// Quoted once here so every assertion below pins the SAME byte-exact content, and a
+// wording change in production fails loudly instead of passing a fuzzy check.
+const withheldContent = (callId: string, name: string): string =>
+    JSON.stringify({
+        status: 'withheld',
+        callId,
+        name,
+        note: 'The result of this tool call is withheld from your context, so its content is not available to you. The call already finished; do not re-run it just because the answer is missing.'
+    });
+
+// The same message in `shape()` spelling, for the projection lists asserted below.
+const withheldShape = (callId: string, name: string): string =>
+    `tool:${callId}:${withheldContent(callId, name)}`;
 
 // Branch ids come from a sequence shared by every harness in the process, so the
 // same scenario run twice differs ONLY by that number. Normalizing it turns a
@@ -213,7 +239,8 @@ const echoTool = (name: string, output: string) =>
     });
 
 // An ASYNC tool that stays pending until the test settles it — the only way to
-// observe a request-time placeholder and prove an excluded unit emits none.
+// observe a request-time placeholder and prove a switched-off REQUEST entry emits
+// none of it.
 const gatedTool = (name: string, gate: Promise<string>) =>
     tool({
         description: `Gated test tool ${name}.`,
@@ -576,32 +603,42 @@ describe('context inclusion — standalone messages', () => {
 // ---------------------------------------------------------------------------
 
 describe('context inclusion — tool-call units', () => {
-    it('withholds the assistant message AND its result when the block is disabled', async () => {
+    it('withholds ONLY the disabled request entry and lets its answer keep riding', async () => {
         const { writer, seen } = await settledRun();
 
         (writer.agent.messages[1] as HarnessMessage).included = false;
         await writer('again');
 
-        // No assistant `toolCalls` entry and no orphan `tool` message.
+        // R8: one entry, one flag. Switching the REQUEST off drops the assistant
+        // `toolCalls` entry alone — no block, and no placeholder invented for a call
+        // whose answer already exists — while the committed result stays in the
+        // request as a top-level `tool` message (src/harness.ts `projectTranscript`
+        // skips exactly the flagged entry and nothing next to it).
         expect(shape(seen[seen.length - 1])).toEqual([
             'user:go',
+            'tool:a1:A',
             'assistant:after alpha:',
             'user:again'
         ]);
-        expect(pairIssues(seen[seen.length - 1])).toEqual([]);
+        // The one deliberate pairing leak: a riding result with no owning block. The
+        // oracle names it, and the transport emits it unchanged
+        // (src/transport/openai.ts builds `tool` messages without validating pairing).
+        expect(pairIssues(seen[seen.length - 1])).toEqual(['orphan tool#1: a1']);
         expect(shape(writer.agent.messages)).toEqual([
             'user:go',
             'assistant::a1',
             'tool:a1:A',
             'assistant:after alpha:',
             'user:again',
-            // The second run committed its own answer, and the whole disabled
-            // block is still in canonical history at its original position.
+            // The second run committed its own answer, and BOTH entries of the
+            // switched-off request are still in canonical history at their original
+            // positions: the flag never deletes and never reaches the result.
             'assistant:after alpha:'
         ]);
+        expect(writer.agent.messages[2].included).toBeUndefined();
     });
 
-    it('withholds the whole unit when only ONE result of a parallel block is disabled', async () => {
+    it('withholds ONE result of a parallel block, answers its call with the placeholder, and leaves the sibling result', async () => {
         const { writer, seen } = await settledRun('go', [
             calls(call('a1', 'alpha'), call('b1', 'beta')),
             answer('both done')
@@ -610,21 +647,37 @@ describe('context inclusion — tool-call units', () => {
         const before = shape(seen[seen.length - 1]);
         expect(before).toEqual(['user:go', 'assistant::a1|b1', 'tool:a1:A', 'tool:b1:B']);
 
-        // Disabling one RESULT is a statement about its unit, not about one row:
-        // keeping the assistant with a half-answered `tool_calls[]` is what every
-        // strict provider rejects.
+        // A RESULT flag is a statement about that one entry (R8). The block still has to
+        // answer both calls — an emitted `tool_calls[]` entry with no following `tool`
+        // message is what a strict provider rejects — so the withheld slot is filled
+        // with the request-only `status: 'withheld'` placeholder, in place, while the
+        // sibling result is emitted exactly as it always was.
         (writer.agent.messages[3] as HarnessMessage).included = false;
         await writer('again');
 
         expect(shape(seen[seen.length - 1])).toEqual([
             'user:go',
+            'assistant::a1|b1',
+            'tool:a1:A',
+            withheldShape('b1', 'beta'),
             'assistant:both done:',
             'user:again'
         ]);
+        // A withheld RESULT is the pair-clean half of the contract: the call is
+        // answered, so nothing is orphaned.
         expect(pairIssues(seen[seen.length - 1])).toEqual([]);
+        // The placeholder is request-only: canonical history still holds the real
+        // result content, only flagged.
+        const result = writer.agent.messages[3] as Extract<HarnessMessage, { role: 'tool' }>;
+        expect({ content: result.content, toolCallId: result.toolCallId, name: result.name, included: result.included }).toEqual({
+            content: 'B',
+            toolCallId: 'b1',
+            name: 'beta',
+            included: false
+        });
     });
 
-    it('leaves the other units intact and in call order when one of several blocks is disabled', async () => {
+    it('leaves the other blocks intact and in call order when one block is disabled, its two answers riding on', async () => {
         const { writer, seen } = await settledRun('go', [
             calls(call('a1', 'alpha'), call('a2', 'alpha2')),
             calls(call('b1', 'beta'), call('b2', 'beta2')),
@@ -650,25 +703,35 @@ describe('context inclusion — tool-call units', () => {
         (writer.agent.messages[1] as HarnessMessage).included = false;
         await writer('again');
 
-        // The surviving block keeps BOTH results in CALL order; the disabled one
-        // takes its two results with it.
+        // The surviving block keeps BOTH results in CALL order. The disabled REQUEST
+        // loses only its own entry: its two answers ride on, above the surviving
+        // block, which is exactly what makes a truncated request cheaper than a
+        // deleted unit (R8).
         expect(shape(seen[seen.length - 1])).toEqual([
             'user:go',
+            'tool:a1:A',
+            'tool:a2:A2',
             'assistant::b1|b2',
             'tool:b1:B',
             'tool:b2:B2',
             'assistant:all done:',
             'user:again'
         ]);
-        expect(pairIssues(seen[seen.length - 1])).toEqual([]);
+        expect(pairIssues(seen[seen.length - 1])).toEqual([
+            'orphan tool#1: a1',
+            'orphan tool#2: a2'
+        ]);
         expect(carriesFlag(seen[seen.length - 1])).toBe(false);
     });
 
-    it('withholds a result that sits outside its assistant block (restored or hand-edited history)', async () => {
+    it('switches exactly one entry even when a result sits outside its assistant block (restored or hand-edited history)', async () => {
         // A canonical transcript may hold a result NON-contiguously: restore, a
         // host edit, or a delivery that landed after another turn committed the
-        // interlude. The unit rule must still take that result with its block,
-        // otherwise it would ride into every later request as an orphan.
+        // interlude. Per-entry inclusion (R8) has no adjacency rule to break — the
+        // flag moves the one entry it is on and nothing else, wherever its partner
+        // happens to sit. Both flag positions are pinned below: the assistant entry
+        // leaves and its detached answer rides on; the answer leaves and its block
+        // gets the withheld placeholder even across the interlude.
         const seededHistory = (): HarnessMessage[] => [
             { role: 'user', content: 'go' },
             { role: 'assistant', content: '', toolCalls: [call('c1', 'alpha')] },
@@ -718,14 +781,44 @@ describe('context inclusion — tool-call units', () => {
         });
         await writer('again');
 
-        // No assistant block, no placeholder for it, and the detached result is
-        // gone with its unit instead of becoming an orphan.
-        expect(shape(flagged[0])).toEqual(['user:go', 'assistant:interlude:', 'user:again']);
-        expect(pairIssues(flagged[0])).toEqual([]);
+        // Flagging the ASSISTANT entry: no block, no placeholder for it, and the
+        // detached result is NOT taken with it — it rides on, orphaned, exactly as the
+        // unflagged baseline projected it. One entry moved.
+        expect(shape(flagged[0])).toEqual(['user:go', 'assistant:interlude:', 'tool:c1:R', 'user:again']);
+        expect(pairIssues(flagged[0])).toEqual(['orphan tool#2: c1']);
         expect(carriesFlag(flagged[0])).toBe(false);
+
+        // Flagging the detached RESULT instead: the block keeps its request entry and
+        // must still answer it, so the call is answered by the withheld placeholder —
+        // found by CALL ID, not by adjacency (src/harness.ts `withheldResultCallIds`
+        // scans the whole transcript before the block walk).
+        const resultFlagged: HarnessMessage[][] = [];
+        const resultDisabled = seededHistory();
+        resultDisabled[3].included = false;
+        const reader = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    messages: resultDisabled,
+                    stream: scripted([answer('ok')], resultFlagged)
+                })
+            },
+            presets: false
+        });
+        await reader('again');
+
+        expect(shape(resultFlagged[0])).toEqual([
+            'user:go',
+            'assistant::c1',
+            withheldShape('c1', 'alpha'),
+            'assistant:interlude:',
+            'user:again'
+        ]);
+        expect(pairIssues(resultFlagged[0])).toEqual([]);
+        expect(carriesFlag(resultFlagged[0])).toBe(false);
     });
 
-    it('emits no pending placeholder for a disabled unit whose call is still running', async () => {
+    it('suppresses the placeholder of a switched-off request entry and lets the landed answer ride', async () => {
         vi.useFakeTimers();
 
         const gate = deferred<string>();
@@ -772,12 +865,11 @@ describe('context inclusion — tool-call units', () => {
         gate.resolve('A-done');
         await flush();
 
-        // With the unit disabled there is no assistant block left to answer, so
-        // neither the placeholder NOR the real result may be emitted — and no
-        // orphan may take their place.
-        expect(shape(seen[2])).toEqual(['user:go', 'assistant:waiting:']);
-        expect(seen[2].some((message) => message.role === 'tool')).toBe(false);
-        expect(pairIssues(seen[2])).toEqual([]);
+        // R8: the flag is on the REQUEST entry, so no block is emitted and there is
+        // nothing to answer — the pending placeholder is gone with its block, while
+        // the answer that has now landed rides on alone.
+        expect(shape(seen[2])).toEqual(['user:go', 'tool:a1:A-done', 'assistant:waiting:']);
+        expect(pairIssues(seen[2])).toEqual(['orphan tool#1: a1']);
 
         await flush();
         expect(state.status).toBe('resolved');
@@ -820,7 +912,7 @@ describe('context inclusion — provider wire mapping', () => {
         return JSON.parse(String(init.body)) as Record<string, unknown>;
     };
 
-    it('maps a filtered transcript onto a pair-complete provider payload with no flag field', async () => {
+    it('maps a filtered transcript onto the provider payload: kept block pair-complete, withheld request answers riding, no flag field', async () => {
         const { writer, seen } = await settledRun('go', [
             calls(call('a1', 'alpha'), call('a2', 'alpha2')),
             calls(call('b1', 'beta'), call('b2', 'beta2')),
@@ -837,10 +929,16 @@ describe('context inclusion — provider wire mapping', () => {
 
         const body = await sendToProvider(seen[seen.length - 1]);
 
-        // The exact provider payload: the surviving block keeps both answers in
-        // call order, and the withheld block left no `tool_call_id` behind.
+        // The exact provider payload. The surviving block keeps both answers in call
+        // order and stays pair-complete; the switched-off REQUEST leaves its own
+        // `tool_calls` entry out while BOTH of its answers ride on under their own
+        // `tool_call_id` — the transport validates nothing here, it maps what the
+        // projection handed it (src/transport/openai.ts), which is what makes the
+        // per-entry flag (R8) observable on the wire rather than at the model.
         expect(body.messages).toEqual([
             { role: 'user', content: 'go' },
+            { role: 'tool', tool_call_id: 'a1', content: 'A' },
+            { role: 'tool', tool_call_id: 'a2', content: 'A2' },
             {
                 role: 'assistant',
                 content: '',
@@ -852,6 +950,39 @@ describe('context inclusion — provider wire mapping', () => {
             { role: 'tool', tool_call_id: 'b1', content: 'B' },
             { role: 'tool', tool_call_id: 'b2', content: 'B2' },
             { role: 'assistant', content: 'all done' },
+            { role: 'user', content: 'again' }
+        ]);
+        expect(JSON.stringify(body)).not.toContain('included');
+    });
+
+    it('sends a withheld result as the one tool message that answers its call, beside an untouched sibling', async () => {
+        // The wire half of the placeholder contract: the provider gets EXACTLY one tool
+        // message per `tool_calls[]` entry, in call order — the withheld slot filled by the
+        // `status: 'withheld'` payload, the kept slot carrying the real answer. Nothing in
+        // the payload mentions the flag (src/transport/openai.ts maps role/content/id only).
+        const { writer, seen } = await settledRun('go', [
+            calls(call('a1', 'alpha'), call('a2', 'alpha2')),
+            answer('both done')
+        ], { alpha: echoTool('alpha', 'A'), alpha2: echoTool('alpha2', 'A2') });
+
+        (writer.agent.messages[3] as HarnessMessage).included = false;
+        await writer('again');
+
+        const body = await sendToProvider(seen[seen.length - 1]);
+
+        expect(body.messages).toEqual([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                tool_calls: [
+                    { id: 'a1', type: 'function', function: { name: 'alpha', arguments: '{}' } },
+                    { id: 'a2', type: 'function', function: { name: 'alpha2', arguments: '{}' } }
+                ]
+            },
+            { role: 'tool', tool_call_id: 'a1', content: 'A' },
+            { role: 'tool', tool_call_id: 'a2', content: withheldContent('a2', 'alpha2') },
+            { role: 'assistant', content: 'both done' },
             { role: 'user', content: 'again' }
         ]);
         expect(JSON.stringify(body)).not.toContain('included');
@@ -877,8 +1008,9 @@ const turnBeforePlugin = (
 });
 
 // The canonical transcript every control test starts from: a seeded system
-// instruction, a standalone user turn, ONE complete tool unit, and a final answer.
-// All enabled, so each test flips exactly one member and asserts the unit consequence.
+// instruction, a standalone user turn, ONE complete tool call (request entry plus
+// result entry), and a final answer. All enabled, so each test flips exactly ONE
+// ENTRY and asserts that entry's own consequence — nothing else moves (R8).
 const seededTranscript = (): HarnessMessage[] => [
     { role: 'system', content: 'Write.' },
     { role: 'user', content: 'question' },
@@ -962,10 +1094,11 @@ const entryWith = (
 };
 
 describe('context inclusion — the turn.before control surface (Stage 1b)', () => {
-    it('lists every canonical entry with EFFECTIVE unit inclusion while messages stays the filtered projection', async () => {
+    it('lists every canonical entry with its OWN live inclusion while messages stays the filtered projection', async () => {
         const seed = seededTranscript();
-        // A standalone disabled turn AND one disabled RESULT: the assistant that
-        // asked for it is off too, although its own flag was never written.
+        // A standalone disabled turn AND one disabled RESULT. The assistant that asked
+        // for that result reports `included: true` — its own flag was never written,
+        // and R8 removed the inheritance (src/harness.ts, the entry `included` getter).
         seed[1].included = false;
         seed[3].included = false;
 
@@ -1001,7 +1134,8 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
 
         // `entries` is the CANONICAL list — the two turns a projection cannot show are
         // still here — in canonical order, with the system instruction as an entry like
-        // any other. `included` answers for the UNIT, not for the member.
+        // any other. `included` is THAT ENTRY's live verdict (R8): entry 2 stays `true`
+        // even though its result is off, and no member of anything inherits anything.
         expect(
             entries.map((entry) => ({
                 index: entry.index,
@@ -1012,7 +1146,7 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         ).toEqual([
             { index: 0, included: true, role: 'system', content: 'Write.' },
             { index: 1, included: false, role: 'user', content: 'question' },
-            { index: 2, included: false, role: 'assistant', content: '' },
+            { index: 2, included: true, role: 'assistant', content: '' },
             { index: 3, included: false, role: 'tool', content: 'A' },
             { index: 4, included: true, role: 'assistant', content: 'answered' },
             { index: 5, included: true, role: 'user', content: 'go' }
@@ -1031,14 +1165,19 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         });
 
         // `messages` keeps its existing contract: the filtered, flag-free projection…
+        // the surviving request entry is STILL emitted (its own flag is on) and answers
+        // its call with the withheld placeholder in the slot the off result vacated.
         expect(entrySnapshots[0].messages).toStrictEqual([
             { role: 'system', content: 'Write.' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }] },
+            { role: 'tool', content: withheldContent('c1', 'alpha'), toolCallId: 'c1', name: 'alpha' },
             { role: 'assistant', content: 'answered' },
             { role: 'user', content: 'go' }
         ]);
         expect(carriesFlag(entrySnapshots[0].messages)).toBe(false);
         // …and it is exactly what the provider received.
         expect(seen[0]).toEqual(entrySnapshots[0].messages);
+        expect(pairIssues(seen[0])).toEqual([]);
     });
 
     it('setIncluded on a user entry removes it from the SAME request, and the next turn still withholds it', async () => {
@@ -1082,24 +1221,25 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         expect(pairIssues(seen[1])).toEqual([]);
     });
 
-    it('setIncluded on an assistant index disables the WHOLE unit and flags every member of it', async () => {
+    it('setIncluded on an assistant index writes that ONE entry and leaves its result unflagged', async () => {
         const { writer, seen } = await controlRun({
             seed: seededTranscript(),
-            plugins: [turnBeforePlugin('disable-unit', (context) => context.setIncluded(2, false))]
+            plugins: [turnBeforePlugin('disable-request', (context) => context.setIncluded(2, false))]
         });
 
-        // Assistant and result are both gone from this request, and the transcript the
-        // provider sees is still pair-clean.
+        // Only the request entry left the request (R8): the answer the model already
+        // has keeps riding, which is why the pair oracle now reports it as an orphan.
         expect(seen[0]).toStrictEqual([
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'question' },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
             { role: 'assistant', content: 'answered' },
             { role: 'user', content: 'go' }
         ]);
-        expect(pairIssues(seen[0])).toEqual([]);
+        expect(pairIssues(seen[0])).toEqual(['orphan tool#2: c1']);
 
-        // Cascading is mandatory: the target was the assistant (a numeric index, the
-        // other accepted form) and its result is flagged as well.
+        // ONE canonical write, addressed by numeric index: the assistant carries the
+        // flag and its result carries NOTHING — no cascade, no inherited verdict.
         expect(withoutIds(writer.agent.messages[2])).toStrictEqual({
             role: 'assistant',
             content: '',
@@ -1110,16 +1250,15 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             role: 'tool',
             content: 'A',
             toolCallId: 'c1',
-            name: 'alpha',
-            included: false
+            name: 'alpha'
         });
 
         // Nothing else gained a key, and no key is ever `true`.
-        expect(writer.agent.messages.filter((message) => message.included === false)).toHaveLength(2);
+        expect(writer.agent.messages.filter((message) => message.included === false)).toHaveLength(1);
         expect(JSON.stringify(writer.agent.messages)).not.toContain('"included":true');
     });
 
-    it('setIncluded on a tool result takes the OWNING unit out of the same request', async () => {
+    it('setIncluded on a tool result withholds ONLY that answer and fills its slot with the placeholder', async () => {
         const { writer, seen } = await controlRun({
             seed: seededTranscript(),
             plugins: [
@@ -1129,21 +1268,25 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             ]
         });
 
+        // The request entry stays (its own flag is untouched) and its call is still
+        // answered — by the request-only `status: 'withheld'` message, so no provider
+        // can reject the pairing.
         expect(seen[0]).toStrictEqual([
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'question' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }] },
+            { role: 'tool', content: withheldContent('c1', 'alpha'), toolCallId: 'c1', name: 'alpha' },
             { role: 'assistant', content: 'answered' },
             { role: 'user', content: 'go' }
         ]);
         expect(pairIssues(seen[0])).toEqual([]);
 
-        // Owner resolution runs BOTH ways: the plugin targeted the answer, and the
-        // assistant that requested that call is flagged with it, so no later turn can
-        // emit a `tool_calls[]` entry with a missing result.
+        // The write moved the answer and ONLY the answer: the owning assistant keeps
+        // its verdict, which is the whole point of addressing one entry per call
+        // (src/harness.ts `writeIncluded`).
         expect(withoutIds(writer.agent.messages[2])).toStrictEqual({
             role: 'assistant',
             content: '',
-            included: false,
             toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
         });
         expect(withoutIds(writer.agent.messages[3])).toStrictEqual({
@@ -1155,9 +1298,11 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         });
     });
 
-    it('resolves unit membership by CALL ID, not adjacency, and leaves an ownerless result alone', async () => {
+    it('finds a NON-adjacent result by CALL ID, writes only it, and leaves an ownerless result alone', async () => {
         // A restored or hand-edited transcript can hold the answer NON-contiguously,
-        // plus an orphan result whose owning block is gone entirely.
+        // plus an orphan result whose owning block is gone entirely. Membership is by
+        // CALL ID for the PROJECTION (which slot gets the placeholder) and never for the
+        // WRITE, which is one entry deep.
         const seed: HarnessMessage[] = [
             { role: 'user', content: 'oldest' },
             { role: 'assistant', content: '', toolCalls: [call('c9', 'alpha')] },
@@ -1177,50 +1322,62 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             ]
         });
 
-        // The assistant three rows away is part of the SAME unit (it owns call `c9`),
-        // so it reports the effective `false`; the orphan answers `gone`, which nobody
-        // requested, so it is its own unit and stays enabled.
+        // Only the targeted row reports `false`. The assistant three rows away keeps its
+        // own verdict, and the orphan nobody requested is simply another entry.
         expect(contexts[0].entries.map((entry) => entry.included)).toEqual([
             true,
-            false,
+            true,
             true,
             false,
             true,
             true
         ]);
 
-        // Both members left the request; the orphan stayed, exactly as it would have
-        // without the flag — the oracle names it, proving the write changed only the
-        // targeted unit.
+        // The block stays and answers its call from three rows away — the withheld scan
+        // runs over the WHOLE transcript, not just the contiguous run
+        // (src/harness.ts `withheldResultCallIds`). The orphan is untouched, exactly as
+        // it would have been without the flag: the oracle names it and only it.
         expect(seen[0]).toStrictEqual([
             { role: 'user', content: 'oldest' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c9', name: 'alpha', arguments: '{}' }] },
+            { role: 'tool', content: withheldContent('c9', 'alpha'), toolCallId: 'c9', name: 'alpha' },
             { role: 'assistant', content: 'interlude' },
             { role: 'tool', content: 'ORPHAN', toolCallId: 'gone', name: 'alpha' },
             { role: 'user', content: 'go' }
         ]);
-        expect(pairIssues(seen[0])).toEqual(['orphan tool#2: gone']);
+        expect(pairIssues(seen[0])).toEqual(['orphan tool#4: gone']);
 
-        expect(writer.agent.messages[1].included).toBe(false);
+        expect(writer.agent.messages[1].included).toBeUndefined();
         expect(writer.agent.messages[3].included).toBe(false);
         expect(writer.agent.messages[4].included).toBeUndefined();
     });
 
-    it('re-including a unit puts it back in the SAME request and deletes the key instead of writing true', async () => {
+    it('re-including ONE entry puts it back in the SAME request and deletes the key instead of writing true', async () => {
         const seed = seededTranscript();
         seed[2].included = false;
         seed[3].included = false;
 
         const { writer, seen } = await controlRun({
             seed,
-            plugins: [turnBeforePlugin('re-enable', (context) => context.setIncluded(2, true))]
+            plugins: [turnBeforePlugin('re-enable-request', (context) => context.setIncluded(2, true))]
         });
 
-        // The unit is back in the request this very hook belongs to.
-        expect(seen[0]).toStrictEqual(seededRequest('go'));
+        // Only the entry the hook named comes back (R8). The request entry is in again
+        // and must answer its call, and the result the hook did NOT name is still off —
+        // so its slot holds the placeholder rather than the real answer.
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }] },
+            { role: 'tool', content: withheldContent('c1', 'alpha'), toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
         expect(pairIssues(seen[0])).toEqual([]);
 
-        // Canonical state: the key is GONE from both members (never `true`), so the
-        // transcript is byte-identical to one that was never disabled.
+        // Canonical state: the re-enabled entry's key is GONE (never `true`), so that
+        // entry is byte-identical to one that was never disabled, while the other entry
+        // keeps the flag this hook never touched.
         expect(withoutIds(writer.agent.messages[2])).toStrictEqual({
             role: 'assistant',
             content: '',
@@ -1230,12 +1387,78 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             role: 'tool',
             content: 'A',
             toolCallId: 'c1',
-            name: 'alpha'
+            name: 'alpha',
+            included: false
         });
-        expect(JSON.stringify([writer.agent.messages, seen])).not.toContain('included');
+        expect(JSON.stringify(writer.agent.messages)).not.toContain('"included":true');
     });
 
-    it('suppresses a pending placeholder for a unit the hook disables on that same request', async () => {
+    it('re-including the RESULT entry emits the real answer again while the request entry stays out', async () => {
+        // The mirror image of the case above, and the per-entry half of the reversibility
+        // contract: each member is restored by its own write, one at a time.
+        const seed = seededTranscript();
+        seed[2].included = false;
+        seed[3].included = false;
+
+        const { writer, seen } = await controlRun({
+            seed,
+            plugins: [turnBeforePlugin('re-enable-result', (context) => context.setIncluded(3, true))]
+        });
+
+        // The request entry is still off, so no block is emitted; the answer is back and
+        // rides on alone.
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+        expect(pairIssues(seen[0])).toEqual(['orphan tool#2: c1']);
+        expect(seen[0].some((message) => message.content === withheldContent('c1', 'alpha'))).toBe(false);
+
+        // Only the entry the hook named lost its key.
+        expect(withoutIds(writer.agent.messages[2])).toStrictEqual({
+            role: 'assistant',
+            content: '',
+            included: false,
+            toolCalls: [{ id: 'c1', name: 'alpha', arguments: '{}' }]
+        });
+        expect(withoutIds(writer.agent.messages[3])).toStrictEqual({
+            role: 'tool',
+            content: 'A',
+            toolCallId: 'c1',
+            name: 'alpha'
+        });
+    });
+
+    it('takes both entries through two writes for whole-unit exclusion, byte-for-byte as one cascading write did', async () => {
+        // A plugin that wants the WHOLE call gone (compaction is the real caller) gets it
+        // by writing every member — the same projection the old cascading `setIncluded`
+        // produced from one write, and now an explicit one-write-per-entry contract
+        // (src/plugins/context-compaction.plugin.ts is that caller).
+        const { writer, seen } = await controlRun({
+            seed: seededTranscript(),
+            plugins: [
+                turnBeforePlugin('exclude-both', (context) => {
+                    context.setIncluded(2, false);
+                    context.setIncluded(3, false);
+                })
+            ]
+        });
+
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'user', content: 'question' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+        expect(pairIssues(seen[0])).toEqual([]);
+        expect(carriesFlag(seen[0])).toBe(false);
+        expect(writer.agent.messages.filter((message) => message.included === false)).toHaveLength(2);
+    });
+
+    it('suppresses a pending placeholder when the hook switches off its request entry on that same request', async () => {
         vi.useFakeTimers();
 
         const gate = deferred<string>();
@@ -1258,7 +1481,7 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
             presets: false,
             plugins: [
                 turnBeforePlugin('disable-pending', (context) => {
-                    // Turn 3 re-reads the unit state through `entries` (captured inside
+                    // Turn 3 re-reads the ENTRY states through `entries` (captured inside
                     // the handler — `entries` is a lazy per-round view, so a control
                     // test reads it while its round is running).
                     if (context.iteration === 3) includedAtRound3 = context.entries.map((entry) => entry.included);
@@ -1299,14 +1522,16 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         gate.resolve('A-done');
         await flush();
 
-        // The exclusion keeps holding once the real result lands: the unit is still
-        // gone, and the entry that arrived later was never flagged itself.
+        // The exclusion keeps holding once the real result lands, and the entry that
+        // arrived later was never flagged itself: it rides on, orphaned, beside the
+        // answer of the round that waited for it.
         expect(seen[2]).toStrictEqual([
             { role: 'user', content: 'go' },
+            { role: 'tool', content: 'A-done', toolCallId: 'a1', name: 'alpha' },
             { role: 'assistant', content: 'waiting' }
         ]);
-        expect(pairIssues(seen[2])).toEqual([]);
-        expect(includedAtRound3).toEqual([true, false, false, true]);
+        expect(pairIssues(seen[2])).toEqual(['orphan tool#1: a1']);
+        expect(includedAtRound3).toEqual([true, false, true, true]);
         expect(withoutIds(writer.agent.messages[1])).toStrictEqual({
             role: 'assistant',
             content: '',
@@ -1440,18 +1665,18 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
 
                     observations = {
                         questionBefore: entries[1].included,
-                        unitBefore: entries[2].included,
+                        requestBefore: entries[2].included,
                         resultBefore: entries[3].included
                     };
 
                     context.setIncluded(entries[1], false);
                     // The SAME entry object, re-read: live, not a stale snapshot.
                     observations.questionAfterSelf = entries[1].included;
-                    // An unrelated unit is unaffected by that write.
-                    observations.otherUnitStillOn = entries[2].included;
+                    // An unrelated entry is unaffected by that write.
+                    observations.otherEntryStillOn = entries[2].included;
 
-                    // Targeting a RESULT cascades to its owner, and the owner's entry
-                    // answers immediately.
+                    // Targeting a RESULT moves ONLY that entry (R8): the owning assistant
+                    // re-reads its own verdict, which the write never touched.
                     context.setIncluded(entries[3], false);
                     observations.assistantAfterResult = entries[2].included;
                     observations.resultAfterResult = entries[3].included;
@@ -1461,11 +1686,11 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
 
         expect(withoutIds(observations)).toEqual({
             questionBefore: true,
-            unitBefore: true,
+            requestBefore: true,
             resultBefore: true,
             questionAfterSelf: false,
-            otherUnitStillOn: true,
-            assistantAfterResult: false,
+            otherEntryStillOn: true,
+            assistantAfterResult: true,
             resultAfterResult: false
         });
     });
@@ -1957,17 +2182,20 @@ describe('context inclusion — turn.before refinements', () => {
         ]);
 
         // Nothing moved until the accepted call: before it EVERY entry was on, after it
-        // exactly one unit is off.
+        // exactly ONE ENTRY is off — the write names one entry, and its result keeps
+        // riding (R8).
         expect(applied.slice(0, 6)).toEqual([true, true, true, true, true, true]);
-        expect(applied.slice(6)).toEqual([true, true, false, false, true, true]);
+        expect(applied.slice(6)).toEqual([true, true, false, true, true, true]);
 
         expect(seen[0]).toStrictEqual([
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'question' },
+            { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
             { role: 'assistant', content: 'answered' },
             { role: 'user', content: 'go' }
         ]);
-        expect(writer.agent.messages.filter((message) => message.included === false)).toHaveLength(2);
+        expect(pairIssues(seen[0])).toEqual(['orphan tool#2: c1']);
+        expect(writer.agent.messages.filter((message) => message.included === false)).toHaveLength(1);
     });
 
     it('reports the real bounds of the live transcript, computed from the transcript itself', async () => {
@@ -2340,9 +2568,9 @@ describe('context control — entry editing (pipeline T3)', () => {
                 turnBeforePlugin('result-editor', (context) => {
                     const result = entryWith(context, 'A');
 
-                    // T3.1: content is what a result may change. Rewriting it does NOT
-                    // cascade to the unit — a unit is a PAIRING question and an edit
-                    // cannot move a pairing key.
+                    // T3.1: content is what a result may change. An edit moves ONLY this
+                    // entry's text — R8 made every write one entry deep, and an edit
+                    // could not move a pairing key even when the runtime did cascade.
                     context.edit(result, { content: 'rewritten result' });
                 })
             ]
@@ -2513,7 +2741,7 @@ describe('context control — entry editing (pipeline T3)', () => {
             'turn.before edit cannot change `toolCalls` on an assistant message: a patch may not change tool-call membership — unit resolution and provider pairing both key on call ids.',
             'turn.before edit cannot change `role` on a user message: a role is not text; a patch cannot turn one entry into another.',
             'turn.before edit cannot change `attachments` on a user message: attachments are validated bytes, not text.',
-            'turn.before edit cannot change `included` on a user message: inclusion is a different axis and switches the WHOLE unit; use setIncluded.',
+            'turn.before edit cannot change `included` on a user message: inclusion is a different axis and switches ONE entry at a time; use setIncluded.',
             'turn.before edit needs a string for `content` on a user message; received 12.',
             'turn.before edit needs a string for `content` on a user message; received null.',
             'turn.before edit needs a string for `content` on a user message; received undefined.',
@@ -3610,8 +3838,9 @@ describe('context inclusion — the engine core trims nothing (uplift T1 / H1)',
 // identity. Neither of them runs the plugin that now owns trimming. Part F invariant 1 says a
 // tool unit leaves the context WHOLE or not at all, whatever switch admitted it, and asks for
 // that to be green on a block with one withheld and one kept call — through the REAL built-in,
-// in a REAL run, so the write path (`turn.before` -> `setIncluded(leader, false)` -> the
-// request built from the canonical projection) is what is under test, not a fake api's log.
+// in a REAL run, so the write path (`turn.before` -> one `setIncluded(member, false)` per
+// member, R8 -> the request built from the canonical projection) is what is under test, not a
+// fake api's log.
 //
 // The transcript is deliberately the two shapes T4 makes adjacent:
 //   * a MIXED block (one `failed` answer and one healthy one) — a documented KEEP under every
@@ -3620,8 +3849,9 @@ describe('context inclusion — the engine core trims nothing (uplift T1 / H1)',
 //     default outcome set, the generalisation too) withholds, because a later unit answered the
 //     same tool with a `completed` result.
 // That adjacency is the pairing hazard: the withheld unit's leader and its result sit between
-// two KEPT units, and a cascade that leaked one of them would produce either an orphan `tool`
-// message or an assistant block with a missing answer — both of which `pairIssues` catches.
+// two KEPT units, and a pass that wrote only HALF of it would produce either an orphan `tool`
+// message (request off, answer riding) or an assistant block answered by the `withheld`
+// placeholder — both of which `pairIssues` and the shape list below catch.
 //
 // Settings are pinned through `pluginSettings` rather than trusted to ambient defaults, so the
 // switches that produce this request are part of the fixture (F5: settings are process-wide and
@@ -3690,7 +3920,15 @@ describe('context inclusion — the trimmer withholds a whole unit beside a kept
         const { writer, seen } = await runTrimmed({
             enabled: true,
             dropSupersededToolCalls: true,
-            dropInvalidToolCallsOnceAnswered: true,
+            // `trimInvalidTools` is the current spelling of the old
+            // `dropInvalidToolCallsOnceAnswered`, and every tool rule now carries its own
+            // TOOL-TURN horizon. Both horizons are pinned at 0 here: this fixture's failed unit
+            // has exactly one newer tool turn above it, so the shipped defaults (2) would
+            // protect it and the pass would report nothing. The shipped values are pinned in
+            // src/plugin/context-trimmer.test.ts.
+            trimInvalidTools: true,
+            supersededTurns: 0,
+            invalidToolTurns: 0,
             invalidOutcomes: 'failed,rejected'
         });
 
@@ -3738,7 +3976,9 @@ describe('context inclusion — the trimmer withholds a whole unit beside a kept
             'assistant:settled:'
         ]);
         // Exactly the withheld unit carries the key — the leader AND its result, because the
-        // cascade is what keeps the request pair-clean — and `true` is never stored.
+        // trimmer writes every member of the unit it withholds
+        // (src/plugins/context-trimmer.plugin.ts `applyTrimPlan`) and both halves flagged is
+        // what keeps the request pair-clean — and `true` is never stored.
         expect(
             canonical
                 .map((message, index) => ({ index, included: message.included }))
@@ -3753,7 +3993,9 @@ describe('context inclusion — the trimmer withholds a whole unit beside a kept
         const { writer, seen } = await runTrimmed({
             enabled: true,
             dropSupersededToolCalls: true,
-            dropInvalidToolCallsOnceAnswered: true,
+            trimInvalidTools: true,
+            supersededTurns: 0,
+            invalidToolTurns: 0,
             invalidOutcomes: 'failed,rejected'
         });
 
@@ -3791,7 +4033,12 @@ describe('context inclusion — the trimmer withholds a whole unit beside a kept
         const { seen } = await runTrimmed({
             enabled: true,
             dropSupersededToolCalls: false,
-            dropInvalidToolCallsOnceAnswered: false,
+            // Both tool rules off (the current spelling of that control), with the horizons
+            // pinned exactly as the two cases above, so the untouched request below is provably
+            // the switches and not a horizon.
+            trimInvalidTools: false,
+            supersededTurns: 0,
+            invalidToolTurns: 0,
             invalidOutcomes: 'failed,rejected'
         });
 
@@ -3873,7 +4120,8 @@ describe('context inclusion — the thinking flag resolves out of the projection
     // `controlRun` plus a settings provider, which a thinking fixture HERE cannot do without: the
     // auto-discovered built-ins load in every case in this file (a host plugin only REPLACES a
     // built-in it names, src/plugin/host.ts), so the shipped trimmer is live unless a provider
-    // turns it off — and its `dropOldThoughts` default is `turn`. A fixture that reads that
+    // turns it off — and its thought axis ships ON with a 2-entry horizon (`trimThoughts: true`,
+    // `thoughtTurns: 2`). A fixture that reads that
     // implicitly is a fixture whose request was produced by a switch it never named (F5).
     // Only the trimmer's keys are pinned; every other (plugin, key) returns `undefined`, which is the
     // harness's signal to use the DECLARED default (src/plugin/settings.ts reads through this
@@ -3919,7 +4167,8 @@ describe('context inclusion — the thinking flag resolves out of the projection
 
     // A harness that restores a document and continues it, with the shipped trimmer OFF. The case
     // below is about the RESTORED FLAG resolving out of the projection on its own — with no provider
-    // the auto-loaded built-in (default tier `turn`) would flag the other closed turns too, and the
+    // the auto-loaded built-in (thought axis ON, newest 2 thoughts protected) would flag the other
+    // entries' thinking too, and the
     // request would no longer name one decision.
     const restoreTarget = (seen: HarnessMessage[][], reply: string) =>
         harness({
@@ -4056,8 +4305,9 @@ describe('context inclusion — the thinking flag resolves out of the projection
     });
 
     it('addresses one entry by index, by messageId and by entry, refuses every other role, and never cascades', async () => {
-        // A tool unit whose LEADER carries thinking — the shape where a cascade would be visible,
-        // because `setIncluded` on this same entry would have taken the result with it.
+        // A tool unit whose LEADER carries thinking — the shape where a per-entry write is
+        // most visible: the thinking axis moves this entry's `reasoning` alone, while the
+        // inclusion axis on this same entry takes the REQUEST alone and lets the result ride.
         const unitSeed = (): HarnessMessage[] => [
             { role: 'user', content: 'question' },
             { role: 'assistant', content: '', toolCalls: [call('c1', 'alpha')], reasoning: 'planning the c1 call' },
@@ -4286,32 +4536,42 @@ describe('context inclusion — the thinking flag resolves out of the projection
         expect(JSON.stringify(normalizer.snapshot()).match(/reasoningIncluded/g)).toHaveLength(1);
     });
 
-    it('runs the shipped `turn` policy over thinking: every closed turn loses its thinking, the open turn keeps its own, and the request stays pair-clean', async () => {
-        // THE POLICY, end to end: no hand-driven write here at all — the built-in's tier rule
-        // produced these flags. The tool switches are pinned OFF so thinking is the ONLY thing this
-        // pass can withhold, which makes the request difference unambiguous.
+    it('runs the shipped thought horizon: the newest thought travels, every older one loses its thinking, and the request stays pair-clean', async () => {
+        // THE POLICY, end to end: no hand-driven write here at all — the built-in's horizon rule
+        // produced these flags. The tool switches are pinned OFF so thinking is the ONLY thing
+        // this pass can withhold, which makes the request difference unambiguous.
+        //
+        // The axis is a toggle plus a THOUGHT-ENTRY horizon now
+        // (src/plugins/context-trimmer.plugin.ts `trimThoughts` / `thoughtTurns`: N protects the
+        // N newest thought ENTRIES, 0 protects nothing), which is not the retired
+        // `off|turn|all` tier. `thoughtTurns: 1` is the horizon that protects exactly the newest
+        // thought, which inside a tool loop is the OPEN turn's — and outside one, as in request 1
+        // below, it is the newest seeded thought.
         const policy = {
             enabled: true,
             dropSupersededToolCalls: false,
-            dropInvalidToolCallsOnceAnswered: false,
-            dropOldThoughts: 'turn'
+            trimInvalidTools: false,
+            trimThoughts: true,
+            thoughtTurns: 1
         };
 
         const { writer, seen } = await thinkingRun({ seed: thinkingSeed(), turns: TOOL_TURNS, settings: policy });
 
-        // Request 1: both seeded assistant entries sit at or before the last user entry (the run's
-        // own `go`), so both are CLOSED turns and neither sends its thinking. Nothing else moved.
+        // Request 1: no thought of this run exists yet, so the NEWEST thought in the transcript is
+        // the second seeded answer's — that one travels, and the older one goes. The entry itself
+        // travels either way: the thinking axis removes a key, never a row.
         expect(seen[0]).toStrictEqual([
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'question' },
             { role: 'assistant', content: 'first answer' },
             { role: 'user', content: 'second question' },
-            { role: 'assistant', content: 'second answer' },
+            { role: 'assistant', content: 'second answer', reasoning: 'the second thought' },
             { role: 'user', content: 'go' }
         ]);
 
-        // Request 2: the run's OWN assistant entry — the open turn — keeps its thinking, in the same
-        // request that still omits both closed turns'.
+        // Request 2: the run's OWN assistant entry has landed, so IT is the newest thought, the
+        // seeded one that travelled a moment ago is now older, and the pass catches up — the
+        // horizon is re-derived from the transcript every round, not remembered.
         expect(seen[1]).toStrictEqual([
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'question' },
@@ -4330,8 +4590,9 @@ describe('context inclusion — the thinking flag resolves out of the projection
         expect(seen.map(pairIssues)).toEqual([[], []]);
         expect(seen.map(carriesFlag)).toEqual([false, false]);
 
-        // Canonical: the two closed turns are flagged, the open turn is not, and every thinking TEXT
-        // is still stored — the flag is a switch, not a deletion.
+        // Canonical after run 1: the two seeded thoughts are flagged (the second one only once the
+        // run's own thought displaced it) and the OPEN turn's thought is not. Every thinking TEXT is
+        // still stored — the flag is a switch, not a deletion.
         expect(
             writer.agent.messages.map((message, index) => ({
                 index,
@@ -4350,15 +4611,15 @@ describe('context inclusion — the thinking flag resolves out of the projection
             { index: 8, thinking: 'the final thought', flag: undefined }
         ]);
 
-        // A SECOND RUN makes everything from the first run a CLOSED turn, and the policy re-derives
-        // it: the thinking of the entry that was OPEN a moment ago (indexes 6 and 8) leaves now, and
-        // nothing that was flagged is un-flagged. This is the re-derive claim from the spec — the
-        // rule is a function of the transcript, not a note the plugin keeps.
+        // A SECOND RUN makes a new thought the newest one (index 8, the answer run 1 ended with), so
+        // the horizon moves with it: the entry that was protected a moment ago (index 6) is flagged
+        // now, and nothing that was flagged is ever un-flagged. This is the re-derive claim from the
+        // spec — the rule is a function of the transcript, not a note the plugin keeps.
         await writer('again');
 
-        // The request the second run's first iteration sent, in full: the four closed turns travel
-        // WITHOUT their thinking, the entries themselves (including the tool-call block and its
-        // answer) travel unchanged, and the new `again` prompt is last.
+        // The request the second run's first iteration sent, in full: every thought but the newest
+        // travels WITHOUT its thinking, the entries themselves (including the tool-call block and
+        // its answer) travel unchanged, and the new `again` prompt is last.
         const third = seen[2];
 
         expect(third).toStrictEqual([
@@ -4370,15 +4631,15 @@ describe('context inclusion — the thinking flag resolves out of the projection
             { role: 'user', content: 'go' },
             { role: 'assistant', content: '', toolCalls: [call('c1', 'alpha')] },
             { role: 'tool', content: 'A', toolCallId: 'c1', name: 'alpha' },
-            { role: 'assistant', content: 'settled' },
+            { role: 'assistant', content: 'settled', reasoning: 'the final thought' },
             { role: 'user', content: 'again' }
         ]);
         expect(pairIssues(third)).toEqual([]);
         expect(carriesFlag(third)).toBe(false);
 
-        // Exactly FOUR flagged entries now — 2, 4, 6 and 8 — and the second run's own answer (index
-        // 10, the new OPEN turn) is not among them. The scripted stream's last frame is what this run
-        // replays, so it answers in one iteration and the transcript stops at index 10.
+        // Exactly THREE flagged entries now — 2, 4 and 6. The newest thought (index 8) and the
+        // second run's own answer (index 10, which the replayed frame gives no thinking at all) are
+        // not among them.
         expect(seen).toHaveLength(3);
         expect(
             writer.agent.messages.map((message, index) => ({
@@ -4394,12 +4655,12 @@ describe('context inclusion — the thinking flag resolves out of the projection
             { index: 5, flag: undefined },
             { index: 6, flag: false },
             { index: 7, flag: undefined },
-            { index: 8, flag: false },
+            { index: 8, flag: undefined },
             { index: 9, flag: undefined },
             { index: 10, flag: undefined }
         ]);
-        // And the text of every one of those four withheld thoughts is still in canonical state: the
-        // policy withheld replay, not the record.
+        // And the text of every one of those three withheld thoughts is still in canonical state:
+        // the policy withheld replay, not the record.
         expect(
             writer.agent.messages.filter(
                 (message, index) =>
@@ -4407,21 +4668,21 @@ describe('context inclusion — the thinking flag resolves out of the projection
                     typeof message.reasoning === 'string' &&
                     message.reasoning.length > 0
             ).map((message) => message.reasoning)
-        ).toEqual(['the first thought', 'the second thought', 'planning the c1 call', 'the final thought']);
+        ).toEqual(['the first thought', 'the second thought', 'planning the c1 call']);
     });
 
-    it('with the tier off, the identical transcript and run send every recorded thought and store no flag at all', async () => {
-        // THE CONTROL for the case above — H2's first half in a real run: `dropOldThoughts: "off"`
-        // is the engine's posture, so this request is the one the harness sent before this axis
-        // existed, key for key.
+    it('with the thought axis off, the identical transcript and run send every recorded thought and store no flag at all', async () => {
+        // THE CONTROL for the case above — H2's first half in a real run: `trimThoughts: false`
+        // is the engine's posture when the axis is switched off, so this request is the one the
+        // harness sent before this axis existed, key for key.
         const { writer, seen } = await thinkingRun({
             seed: thinkingSeed(),
             turns: TOOL_TURNS,
             settings: {
                 enabled: true,
                 dropSupersededToolCalls: false,
-                dropInvalidToolCallsOnceAnswered: false,
-                dropOldThoughts: 'off'
+                trimInvalidTools: false,
+                trimThoughts: false
             }
         });
 
@@ -4448,13 +4709,13 @@ describe('context inclusion — the thinking flag resolves out of the projection
     // 13.1 — THE TIER ON THE WIRE (trimmer uplift H4, end to end)
     // -------------------------------------------------------------------
     // The two halves of the thought policy have lived in two files: §13 above pins what the
-    // PROJECTION does with a tier's flags (`withoutWithheldReasoning` drops the `reasoning` KEY
-    // from one request copy and moves nothing else), and src/transport/openai.test.ts pins what
+    // PROJECTION does with the horizon's flags (`withoutWithheldReasoning` drops the `reasoning`
+    // KEY from one request copy and moves nothing else), and src/transport/openai.test.ts pins what
     // the TRANSPORT does with a projected entry (emit `reasoning_content` iff that entry carries
     // a non-empty `reasoning`, omit it entirely otherwise). What neither file can show alone is
-    // the PAIRING — that the tier a real `turn.before` pass decided is the tier the provider
-    // actually receives. The tier→wire link was previously only IMPLIED by the two suites
-    // describing the same shape in the same words.
+    // the PAIRING — that the thought policy a real `turn.before` pass decided is the policy the
+    // provider actually receives. The policy→wire link was previously only IMPLIED by the two
+    // suites describing the same shape in the same words.
     //
     // So this case runs the shipped chain with nothing substituted:
     //   1. the auto-discovered `context-trimmer` BUILT-IN (no host plugin, no hand-driven
@@ -4514,21 +4775,32 @@ describe('context inclusion — the thinking flag resolves out of the projection
         function: { name, arguments: '{}' }
     });
 
-    // The same settings every tier run uses, with the tier omitted when `tier` is undefined —
-    // which is how the shipped DEFAULT is exercised, because an unlisted key resolves to the
-    // declared descriptor value (src/plugin/settings.ts), i.e. `dropOldThoughts: 'turn'`.
-    const tierSettings = (tier?: string): Record<string, boolean | string | number> => ({
+    // The same settings every thought-policy run uses, with the thought axis named explicitly —
+    // the trimmer replaced the retired `off|turn|all` tier with a toggle plus a THOUGHT-ENTRY
+    // horizon (src/plugins/context-trimmer.plugin.ts `trimThoughts` + `thoughtTurns`, where N
+    // protects the N NEWEST thought entries and 0 protects nothing). So the arms below are:
+    //   'turn' -> `thoughtTurns: 1`, the newest thought only — inside a tool loop that is the
+    //             entry the run itself just committed;
+    //   'all'  -> `thoughtTurns: 0`, nothing protected, every recorded thought withheld;
+    //   'off'  -> `trimThoughts: false`, the axis switched off;
+    //   omitted -> the SHIPPED DEFAULTS (`trimThoughts: true`, `thoughtTurns: 2`), because an
+    //             unlisted key resolves to the declared descriptor value (src/plugin/settings.ts).
+    const tierSettings = (tier?: 'turn' | 'all' | 'off'): Record<string, boolean | string | number> => ({
         enabled: true,
         dropSupersededToolCalls: false,
-        dropInvalidToolCallsOnceAnswered: false,
-        ...(tier === undefined ? {} : { dropOldThoughts: tier })
+        trimInvalidTools: false,
+        ...(tier === undefined
+            ? {}
+            : tier === 'off'
+              ? { trimThoughts: false }
+              : { trimThoughts: true, thoughtTurns: tier === 'turn' ? 1 : 0 })
     });
 
-    it('puts the tier on the wire: `turn` echoes only the open turn, `all` is byte-identical to the pre-echo request, and `off` echoes every recorded thought (uplift H4)', async () => {
-        // One tier's TOOL-LOOP continuation, all the way to the provider payload. The projection
-        // assertions are the pair-clean invariants FIRST: if a tier moved a key, the pairing
-        // oracle fails here instead of hiding inside a byte diff.
-        const wireOf = async (tier?: string): Promise<Record<string, unknown>> => {
+    it('puts the thought policy on the wire: horizon 1 echoes only the newest thought, horizon 0 echoes none, off echoes every recorded thought (uplift H4)', async () => {
+        // One setting's TOOL-LOOP continuation, all the way to the provider payload. The projection
+        // assertions are the pair-clean invariants FIRST: if the policy moved a key, the oracle
+        // fails here instead of hiding inside a byte diff.
+        const wireOf = async (tier?: 'turn' | 'all' | 'off'): Promise<Record<string, unknown>> => {
             const { seen } = await thinkingRun({ seed: thinkingSeed(), turns: TOOL_TURNS, settings: tierSettings(tier) });
 
             expect(seen).toHaveLength(2);
@@ -4540,7 +4812,7 @@ describe('context inclusion — the thinking flag resolves out of the projection
             return wireBodyOf(seen[1]);
         };
 
-        // --- `turn`: exactly ONE echoed entry — the OPEN turn — and neither CLOSED turn. ------
+        // --- horizon 1: exactly ONE echoed entry — the newest thought — and every older one. ----
         const turn = await wireOf('turn');
 
         expect(JSON.stringify(turn.messages)).toBe(
@@ -4560,21 +4832,40 @@ describe('context inclusion — the thinking flag resolves out of the projection
                 { role: 'tool', tool_call_id: 'c1', content: 'A' }
             ])
         );
-        // The closed turns' field is ABSENT, never `""` (a strict provider reads an empty string
+        // The older turns' field is ABSENT, never `""` (a strict provider reads an empty string
         // as a thinking block whose content is missing), and the total is exactly the number of
-        // entries this tier left eligible — so a per-entry omission cannot be confused with a
+        // entries this horizon left eligible — so a per-entry omission cannot be confused with a
         // whole-request one.
         expect(wireMessagesOf(turn)[2]).not.toHaveProperty('reasoning_content');
         expect(wireMessagesOf(turn)[4]).not.toHaveProperty('reasoning_content');
         expect(JSON.stringify(turn).match(/reasoning_content/g)).toHaveLength(1);
 
-        // THE SHIPPED DEFAULT IS THIS TIER: the identical run with `dropOldThoughts` never
-        // supplied lands on the same bytes, so the payload above is the out-of-the-box wire.
+        // THE SHIPPED DEFAULT IS THE HORIZON AT 2: the identical run with `trimThoughts` and
+        // `thoughtTurns` never supplied protects the TWO newest thoughts — the run's own entry and
+        // the seeded answer one above it — and strips every older one. That is the out-of-the-box
+        // wire, and it is one echoed entry wider than the `turn` arm above.
         const byDefault = await wireOf(undefined);
 
-        expect(JSON.stringify(byDefault.messages)).toBe(JSON.stringify(turn.messages));
+        expect(JSON.stringify(byDefault.messages)).toBe(
+            JSON.stringify([
+                { role: 'system', content: 'Write.' },
+                { role: 'user', content: 'question' },
+                { role: 'assistant', content: 'first answer' },
+                { role: 'user', content: 'second question' },
+                { role: 'assistant', content: 'second answer', reasoning_content: 'the second thought' },
+                { role: 'user', content: 'go' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    reasoning_content: 'planning the c1 call',
+                    tool_calls: [wireCall('c1', 'alpha')]
+                },
+                { role: 'tool', tool_call_id: 'c1', content: 'A' }
+            ])
+        );
+        expect(JSON.stringify(byDefault).match(/reasoning_content/g)).toHaveLength(2);
 
-        // --- `all`: the pre-T8 payload, byte for byte. ---------------------------------------
+        // --- `all` (horizon 0): the pre-T8 payload, byte for byte. ------------------------------
         const all = await wireOf('all');
 
         // Declared in wire key order, because `JSON.stringify` of both sides compares BYTES:
@@ -4597,7 +4888,7 @@ describe('context inclusion — the thinking flag resolves out of the projection
         // body, on any role.
         expect(JSON.stringify(all)).not.toContain('reasoning');
 
-        // --- `off`: every recorded thought is echoed, in place. ------------------------------
+        // --- `off` (the axis switched off): every recorded thought is echoed, in place. ---------
         const off = await wireOf('off');
 
         expect(JSON.stringify(off.messages)).toBe(

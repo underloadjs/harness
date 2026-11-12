@@ -38,6 +38,13 @@
 //      asserted below, so a "fix" that ships an `events` array or a base64 `data` field on
 //      the bar fails here.
 //
+//   5. R7 (T4a) ADDS ONE OPTIONAL KEY, `included`. It is the reader-facing inclusion verdict
+//      the bar DIMS a segment from, and the copy rule is the same as every other optional field:
+//      published -> copied, unpublished -> left ABSENT (absent is "no transcript entry behind
+//      this segment", not "included" and not "excluded"). The closed key-set assertions below are
+//      for segments whose producer never stamped it, so they stay as they were and the R7 case is
+//      asserted on its own.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts src/frontend/display-project-blocks.test.ts
 
 import type { ContextBlock as WireContextBlock, TurnSection as WireTurnSection } from '../shared/harness-api';
@@ -188,6 +195,42 @@ describe('projectBlock - the record the route actually transports', () => {
 
         expect(projectBlock(routeOf(toolWithoutFlag)).inPrompt).toBe(true);
         expect(projectBlock(routeOf(reasoningWithoutFlag)).inPrompt).toBe(false);
+    });
+
+    it('passes the reader-facing inclusion through, and only when the wire stated it (R7)', () => {
+        // The projection half of the bar's dim state. `ui/context-bar.ts` renders and words a
+        // segment from this field, so the wire value has to survive the copy — and an UNPUBLISHED
+        // one has to stay ABSENT: absent means "this server could not name the transcript entry
+        // behind the segment" (../shared/turn-display.ts:588-593), and a client that defaulted it
+        // would dim every segment no producer ever judged.
+        expect(projectBlock(routeOf({ ...toolBlock, included: false })).included).toBe(false);
+        expect(projectBlock(routeOf({ ...reasoningBlock, included: true })).included).toBe(true);
+        expect(projectBlock(routeOf(toolBlock)).included).toBeUndefined();
+        expect(projectBlock(routeOf(toolBlock))).not.toHaveProperty('included');
+
+        // ONE key joins the closed metadata set, exactly the one, and only for a segment the
+        // server actually judged. The two `Object.keys` pins above stay green ON PURPOSE: their
+        // fixtures are segments the producer never stamped, and the R7 case is asserted here
+        // rather than folded into them so "absent" keeps its own evidence.
+        expect(Object.keys(projectBlock(routeOf({ ...toolBlock, included: false }))).sort()).toEqual([
+            'argsChars',
+            'at',
+            'chars',
+            'durationMs',
+            'endedAt',
+            'eventFrom',
+            'eventTo',
+            'id',
+            // Default sort is code-unit order, which puts the capital P of `inPrompt` first.
+            'inPrompt',
+            'included',
+            'kind',
+            'name',
+            'resultChars',
+            'sectionId',
+            'state',
+            'turnId'
+        ]);
     });
 
     it('leaves an unrecorded time unknown instead of inventing a zero', () => {

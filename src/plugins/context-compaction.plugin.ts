@@ -214,8 +214,9 @@
 //      whole question) are compatible by construction: the trimmer mutates context through
 //      exactly two controls, both inside `applyTrimPlan` in
 //      src/plugins/context-trimmer.plugin.ts, and BOTH are called with the literal `false` —
-//      `setIncluded(entry, false)` withholds a tool unit (the first axis; the runtime cascades
-//      the leader's whole unit, ../types `HarnessTurnBeforeContext.setIncluded`) and
+//      `setIncluded(entry, false)` withholds one entry from the request (the first axis; the
+//      runtime writes exactly the entry named, ../types
+//      `HarnessTurnBeforeContext.setIncluded`) and
 //      `setReasoningIncluded(entry, false)` withholds one assistant entry's THINKING from its
 //      request copy (the second axis, uplift T6). Neither one re-ENABLES anything: `true` is
 //      never passed anywhere in that plugin, so this pass never sees an entry or a thought come
@@ -770,12 +771,28 @@ export type HarnessCompactionAction = (
 // Writing NOTHING is the common case and it is free: no flag write means no
 // `agent_message` notification, which means no whole-document save (T4.4).
 //
-// Every write goes through `context.setIncluded(entry, false)`, which cascades the unit:
-// the assistant message that asked for the calls, every result of that block, and its
-// request-only placeholders (../types `HarnessContextEntry.included`). That is why pruning
-// can never leave the provider with a half-answered `tool_calls[]` (T3.4), and why this
-// action never has to think about pairing — the projection oracle in
-// src/harness.inclusion.test.ts is what pins it.
+// Every write goes through `context.setIncluded(entry, false)`, and since R8 that call moves
+// EXACTLY ONE canonical entry — so this action writes every member of the unit the plan named
+// (`PruneCandidate.members`: the assistant message that asked for the calls, then every result
+// answering one of them, leader first). With both halves flagged, the projection has nothing
+// left to emit for the unit: no half-answered `tool_calls[]` and no orphan result (T3.4), and
+// the projection oracle in src/harness.inclusion.test.ts is what pins it. A pass that wrote
+// only the leader would withhold the request and keep the failed answer riding — a saving the
+// diagnostic would claim and the request would not deliver.
+//
+// THE WRITE SET IS PER MEMBER, AND THE TRIMMER MAKES THAT LOAD-BEARING (2026-11-13 review)
+// ----------------------------------------------------------------------------------------
+// The write set is the unit's members MINUS the ones already withheld, so this writer can never
+// undo another plugin's flag. That matters now that the context trimmer has its truncate axis: it
+// withholds a tool unit's REQUEST entry only and deliberately leaves the tool RESULTS in the
+// request (src/plugins/context-trimmer.plugin.ts `planTruncatedRequests`, whose `members` is one
+// entry deep). The result is a HALF-withheld unit — and a half-withheld unit is still compaction's
+// business, because the failed answer is still riding and still costs tokens. The plan therefore
+// tests idempotence per member, not per unit (../core/context-pruning.ts `includedMembersOf`), and
+// names only the surviving entries here; the reported `tokens` are measured over that same set, so
+// the diagnostic cannot claim a saving the request does not show. A unit whose EVERY member is
+// already withheld is still skipped, so a second pass over an unchanged transcript keeps writing
+// nothing at all (T4.3/T4.4).
 //
 // An implementation that later calls `replaceHistory()` must re-state the newest turn:
 // `replaceHistory` replaces the WHOLE committed transcript, including the prompt this run
@@ -852,18 +869,33 @@ export async function executeCompaction(
     }));
 
     for (const candidate of plan.candidates) {
-        // Located by index rather than reused from the plan, so a `replaceHistory()` from a
-        // LATER handler in this same round cannot make this write address a stale entry: if
-        // the unit the plan named is no longer in the transcript, the entry is absent and the
-        // write is skipped. (An entry from an EARLIER handler is still refused by
-        // `setIncluded` itself; this is the mirror-image hazard.)
-        const entry = entries.find((candidate2) => candidate2.index === candidate.leaderIndex);
+        // EVERY STILL-SENT MEMBER, not just the leader (R8). `setIncluded` writes exactly one
+        // canonical entry, so a prune that stopped at the leader would leave the failed RESULT
+        // riding in every later request — compaction would report a saving it did not make. The
+        // member list is the plan's own WRITE SET, leader first, derived from the same grouping
+        // the plan matched on (./core/context-pruning.ts `groupUnits`), and it already EXCLUDES
+        // the entries another writer silenced: a unit whose REQUEST the context trimmer truncated
+        // lists its surviving results only. That exclusion is what keeps the two plugins honest
+        // about the same transcript — compaction prunes whole units, and it never puts back a
+        // request the trimmer withheld.
+        for (const memberIndex of candidate.members) {
+            // Located by index rather than reused from the plan, so a `replaceHistory()` from a
+            // LATER handler in this same round cannot make this write address a stale entry: if
+            // the entry the plan named is no longer in the transcript, it is absent and the
+            // write is skipped. (An entry from an EARLIER handler is still refused by
+            // `setIncluded` itself; this is the mirror-image hazard.)
+            const entry = entries.find((lookedUp) => lookedUp.index === memberIndex);
 
-        if (entry === undefined) continue;
+            if (entry === undefined) continue;
+            // Belt and braces on the plan's write set: `false` is the only stored spelling of
+            // "withheld", so writing it again would fire a persistence notification and a save
+            // for a write that changes nothing (T4.4). A round's `entries` snapshot can only go
+            // stale in the `true -> false` direction — nothing in this build re-enables an entry
+            // — so skipping here can never leave a live entry in the request.
+            if (entry.included === false) continue;
 
-        // One write per unit; the cascade does the rest. `false` is the only stored spelling
-        // of "withheld", so a second pass over the same transcript changes nothing at all.
-        context.setIncluded(entry, false);
+            context.setIncluded(entry, false);
+        }
     }
 
     // T4.5 — the pass report. One line per pruned unit inside ONE diagnostic, because a
@@ -1298,7 +1330,9 @@ export const createContextCompactionPasses = (
 
             if (entry === undefined) continue;
 
-            // One write per unit; the cascade widens a tool-call block to its results.
+            // One write per ENTRY, and `range.disabled` already names every entry in the
+            // withheld range (leader and results alike), so per-entry writes need no member
+            // expansion here — unlike the prune pass, which plans UNITS.
             context.setIncluded(entry, false);
         }
 

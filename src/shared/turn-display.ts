@@ -557,7 +557,7 @@ export type ContextBlock = {
      * block with `inPrompt: false`), because a compiled bar folds one TURN's events and
      * never sees a transcript. For a `reasoning` block it is therefore NOT a claim about
      * whether this thinking rides in the next request — that is decided per entry, per
-     * policy, by the context trimmer's thinking policy (`dropOldThoughts`) and the
+     * policy, by the context trimmer's thinking policy (`trimThoughts` + `thoughtTurns`) and the
      * `reasoningIncluded` flag it writes (trimmer uplift T6/T7). Where the server CAN
      * name the entry behind the segment, `included` below is the verdict; `inPrompt` is
      * what a client falls back to when it cannot. Tracked explicitly so a bar never
@@ -570,37 +570,69 @@ export type ContextBlock = {
      * the requests that follow. Deliberately NOT folded into `inPrompt`: `inPrompt` is the
      * projector's static per-kind fallback verdict, while this is the state the reader
      * controls from the segment dialog and the state `turn.before setIncluded` /
-     * `turn.before setReasoningIncluded` write from a plugin (src/harness.ts:8523-8567 and
-     * :8821-8861).
+     * `turn.before setReasoningIncluded` write from a plugin (src/harness.ts:8887-8934 and
+     * :8955-8999).
      *
-     * Tri-state, mirroring core's storage rule (`src/core/agent.ts:161-207` persists only
+     * Tri-state, mirroring core's storage rule (`src/core/agent.ts:327-396` persists only
      * a literal `false` and drops the key otherwise):
      *   - `false`  — the axis THIS segment resolves to is switched OFF. For a tool segment
-     *     that is the exclusion unit: `projectTranscript` drops the whole tool-call unit
-     *     around it (src/harness.ts:6576-6612), so this states the EFFECT of the cascade,
-     *     not one message's flag. For a `reasoning` segment it is the THINKING axis: the one
+     *     that is the ONE canonical message behind it, never a unit: `projectTranscript` skips
+     *     only the flagged entry (src/harness.ts:6751-6790 — the per-entry verdict, with no
+     *     promotion step and no cascade), so a withheld request entry lets its results ride as
+     *     an ownerless `tool` message and a withheld result is answered in the request by a
+     *     synthetic `withheld` tool message (src/harness.ts:6791-6862). For a `reasoning`
+     *     segment it is the THINKING axis: the one
      *     assistant entry that streamed this window carries `reasoningIncluded: false`, so its
      *     entry still travels but its thinking is omitted from the projection copy
      *     (src/core/agent.ts `withoutWithheldReasoning`) — the entry is not excluded and its
-     *     answer text is unaffected.
+     *     answer text is unaffected. For an `assistant` segment it is the ENTRY axis: the one
+     *     assistant entry whose `content` IS these recorded answer bytes carries `included: false`,
+     *     so a withheld answer dims its own answer segment the way withheld thinking dims its own
+     *     window — one segment, one entry, so bar and dialog cannot disagree (the join is
+     *     `transcriptEntryOfAnswer`; the asymmetry a reader can see on one bar is that withholding an
+     *     ENTRY drops its answer while the thinking window beside it still answers `true`, because
+     *     that is a different flag the write never touches).
      *   - `true`   — the axis resolves and is switched on, which is what lets the dialog
      *     offer the toggle BACK rather than showing a dead end;
-     *   - ABSENT   — this server could not name the transcript entry behind the segment
-     *     (no live entry carries this exact recorded thinking, or two or more do — thinking
-     *     has no id of its own, so its recorded bytes ARE its identity and an ambiguous match
-     *     names nothing; an answer window spans many entries; a system block joins several
-     *     messages; or the opening event carries no call id), so a renderer states the policy
-     *     and offers no control.
+     *   - ABSENT   — this server could not name ONE transcript entry behind the segment: the
+     *     recorded bytes are the identity of an un-ided segment, so a match that is not UNIQUE
+     *     names nothing. That is a thinking window or an ANSWER WINDOW whose exact bytes no single
+     *     assistant entry holds (an answer an earlier assistant entry repeats verbatim, or an entry
+     *     a host Transcript save has since removed) — for an answer the join is the same
+     *     text-is-the-key rule the thinking join uses (src/server/api.ts `transcriptEntryOfAnswer`,
+     *     FIX C), and a SPLIT answer is NOT on this list, because the projector mints one answer
+     *     block per run of prose and each run resolves to the entry that streamed it; a system block
+     *     joins several messages with no one entry to name; or the opening event carries no call id.
+     *     A renderer then states the policy and offers no control.
      *
-     * Published by the block detail route (src/server/api.ts `getSessionTurnBlock`), the
-     * one read that has BOTH the recorded event and the live transcript in hand; the
-     * display tree carries it when a producer states it, and `display-project.ts` copies
-     * it only when the wire stated it (never a local guess).
+     * Published by TWO reads, from the same joins, and neither one guesses:
+     *   - the display read (src/server/api.ts `getSessionTurnDisplay` → the join in
+     *     `contextSegmentIncludedOf`), because a lane is painted BEFORE anything is clicked —
+     *     this is what lets the bar dim an out-of-context segment on first paint (R7's
+     *     `opacity: 0.2`, ../frontend/view-context.ts `contextBarSegmentAlphaOf`); and
+     *   - the block detail read (src/server/api.ts `getSessionTurnBlock`), the read a click
+     *     makes, which holds BOTH the recorded event and the live transcript in hand.
+     *
+     * ONE FIELD, TWO HONEST GRANULARITIES, and they differ in exactly one case. The detail read
+     * states the verdict of the ENTRY this segment names (that is what the dialog's chip
+     * switches). The display read states the verdict of the SEGMENT, and a tool's request and its
+     * answer are ONE segment while this field is ONE boolean — so a round whose request entry is
+     * withheld while its result entry still rides (the per-entry write above) is a segment part of
+     * which is still in the prompt: the bar says `true` (opaque) and the dialog says `false`
+     * (that entry is switched off). `false` is therefore reserved for a segment NOTHING of reaches
+     * the prompt any more, which is the rule the shipped reader relies on
+     * (../frontend/view-context.ts `contextBlockIsExcluded`).
+     *
+     * The live counterpart is ONE `context:set` patch the block write emits
+     * (src/server/api.ts `patchSessionTurnBlock`, `patch: { included }`, carrying the SEGMENT's
+     * figure so the bar and the next display read cannot disagree). `display-project.ts` copies
+     * the field only when the wire stated it (never a local guess), and `undefined` on the wire
+     * still means "this producer said nothing", never "unknown" as a value.
      */
     included?: boolean;
     /** `tool` only: the settled state, verbatim `StepDisplayState`. Absent until the
      *  call settles, and never re-derived by the renderer from `isError` (the same
-     *  authority rule as `DisplayStep.outcome`, line 572). */
+     *  authority rule as `DisplayStep.outcome`, :804-806 below in this file). */
     state?: StepDisplayState;
     /** First recorded event index whose bytes compose this block (the `tool_call`,
      *  the first `reasoning`/`text` delta of the window). Absent for a block with no
@@ -626,6 +658,23 @@ export type ContextBlock = {
  * segment to another row. Every count is a
  * full replacement, not a delta: the projector sends the settled figure, so a client
  * accumulates nothing.
+ *
+ * `included` is the ONE non-count key: it is the live, reader-facing verdict
+ * (`ContextBlock.included`, line 567), the state the segment dialog writes and a plugin
+ * writes through `turn.before setIncluded` / `turn.before setReasoningIncluded`. It is
+ * patchable precisely BECAUSE it is the only figure on a block that can change after the
+ * reader (or a plugin) has acted on it, and the bar's dim state (R7) must follow that
+ * change without a re-mint. THE SERVER IS A PRODUCER OF IT, not the fold: the projector
+ * never mints this key (a compiled bar cannot see a transcript), so the only frame that
+ * carries it is the one the segment write publishes
+ * (src/server/api.ts `patchSessionTurnBlock`), and the value it states is the SEGMENT's
+ * verdict — the same figure the next display read publishes. The tri-state is preserved by
+ * omission, exactly like every other optional key here: a patch that names no `included`
+ * leaves the block's value (including leaving it ABSENT), and a patch CANNOT publish
+ * "unknown" again — there is no `included: null` in this vocabulary, because `undefined` is
+ * what "this frame said nothing about inclusion" means on the wire (./harness-stream.ts:197:
+ * "a key the patch omits is unchanged"). So a block whose entry stops being nameable goes
+ * back to absent through a `context:remove` + `context:add` pair, never through a patch.
  */
 export type ContextBlockPatch = {
     name?: string;
@@ -634,6 +683,14 @@ export type ContextBlockPatch = {
     argsChars?: number;
     resultChars?: number;
     inPrompt?: boolean;
+    /**
+     * R7 (T4a): the reader-facing inclusion axis, as a live patch — see the note above this
+     * type. `false` is the ONLY value that dims a segment, because ABSENT means "no
+     * transcript entry behind this segment / unknown" (line 588), not "withheld"; `true`
+     * re-states that the axis is switched on, which is what lets the dim come back off when a
+     * reader includes the block again.
+     */
+    included?: boolean;
     at?: number;
     endedAt?: number;
     durationMs?: number;

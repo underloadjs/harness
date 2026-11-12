@@ -232,8 +232,11 @@ import { AgentStateError } from './harnesses/agent-state';
 import type { AgentProfilePatch } from './harnesses/agent-state';
 import { writeHarnessAgentRecords } from './persistence';
 import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
-import { SessionError, SessionStore, validateAttachmentsForSubmit } from './sessions';
+import { SessionError, SessionStore, recordedStreamText, validateAttachmentsForSubmit } from './sessions';
 import type { EnqueuedTask, SessionRecord, ThreadLaneInfo } from './sessions';
+// R7 (T4b): the display-route inclusion stamp writes the bar's own field, so it is typed with the
+// bar's own model (the fold's output type, which is what `projector.display()` returns).
+import type { ContextBlock, TurnSection } from '../shared/turn-display';
 // Issue 0005 (C): the seed on `POST /sessions` is validated by the ONE transcript reader the
 // runtime and snapshot restore already enforce (`readHarnessMessages`, src/core/snapshot.ts), and
 // it lands in the entry agent's DEFAULT conversation, whose id prefix is `THREAD_AGENT_PREFIX`
@@ -759,23 +762,23 @@ export const bodyLimitFor = (method: string, pathname: string, mount: string): n
 //
 // WHY THIS JOIN LIVES HERE. `included` is a fact about a CONVERSATION: it sits on a
 // `HarnessMessage` in a thread's transcript (src/types/index.ts:173-270), and
-// `projectTranscript` drops the whole flagged tool unit when a request is built
-// (src/harness.ts:6421-6460). A context-bar SEGMENT is a fact about a TURN: the projector
+// `projectTranscript` drops exactly the FLAGGED ENTRY when a request is built
+// (../harness.ts `projectTranscript`). A context-bar SEGMENT is a fact about a TURN: the projector
 // compiled it out of that turn's recorded events (src/server/turn-projector.ts:2160 and
 // :2322) and never sees a transcript. Neither record names the other, so the block detail
 // route — the one read holding BOTH — does the mapping, at read time. Read time matters:
 // the projector's compiled display is a CACHE, and a flag moved by a plugin's
-// `turn.before setIncluded` (src/harness.ts:8528) or by another browser tab moves no
+// `turn.before setIncluded` (../harness.ts `setIncluded`) or by another browser tab moves no
 // event, so a cached bar would keep answering with yesterday's inclusion forever.
 //
-// THE ONE RULE (unit axis). A segment is unit-addressable exactly when the event that
+// THE ONE RULE (entry axis). A segment is entry-addressable exactly when the event that
 // OPENS it names a tool-call id that a live transcript still carries. That single rule
 // states every case without a per-kind table:
 //   - a `tool` segment opens on its `tool_call` (or, for a result-only record, its
 //     `tool_result`), and the call id is exactly what pairs the assistant entry with its
-//     results, so the exclusion unit resolves;
+//     results, so the entry join resolves to the entry that OWNS the call;
 //   - a `reasoning` or answer window's opening delta carries prose, not an id, so the
-//     unit axis resolves NOTHING for it (an answer window still streams several
+//     entry axis resolves NOTHING for it (an answer window still streams several
 //     assistant entries, and switching "this answer" off would mean guessing which
 //     entries the reader meant);
 //   - a `system` block joins N instruction entries into ONE segment, and a `user` prompt
@@ -785,8 +788,8 @@ export const bodyLimitFor = (method: string, pathname: string, mount: string): n
 // thought-addressable exactly when the thinking text THIS segment answers with is the
 // `reasoning` of EXACTLY ONE live assistant entry. That is the thought-side analogue of
 // the rule above, and it exists because the trimmer uplift put a writable flag beside the
-// thinking (`reasoningIncluded`, src/types/index.ts:213-236, written by `turn.before
-// setReasoningIncluded`, src/harness.ts:8821): the projector's reasoning block carries no
+// thinking (`reasoningIncluded`, src/types/index.ts:223-246, written by `turn.before
+// setReasoningIncluded`, src/harness.ts:8955-8999): the projector's reasoning block carries no
 // id of its own — the block id is `kind` plus the OPENING EVENT INDEX — so the recorded
 // bytes are the only identity it has, and the flag lives on the entry whose `reasoning`
 // field IS those bytes. Requiring exactly one match is what keeps the verdict honest: two
@@ -795,13 +798,20 @@ export const bodyLimitFor = (method: string, pathname: string, mount: string): n
 // both axes: uplift T7 gives the thinking its join, not every prose window, so a `text`
 // delta keeps the old ABSENT verdict.
 //
-// The unit is built by the rule `transcriptUnits` already states (src/harness.ts:625-665):
-// the assistant entry owning the call, plus EVERY `tool` entry answering one of that
-// entry's calls. Exclusion is per unit because provider tool-call pairing breaks if one
-// half travels without the other — the same reason the core resolver cascades. Thinking
-// deliberately does NOT cascade (`setReasoningIncluded` addresses one entry): the flag
-// removes one entry's thinking from its projection copy, which is no one else's pairing
-// problem (src/harness.ts:8804-8816).
+// THE ENTRY ONE SEGMENT ADDRESSES (per entry since R8, no unit fan-out). A recorded call id
+// resolves to the assistant entry that OWNS the call — the entry that asked for it and whose
+// `tool_calls[]` the recorded arguments belong to. A result whose owner is gone (a host edit,
+// a restored document) has no owner to name, so it IS its entry. Exclusion means exactly that
+// entry leaves the next request: switching a tool segment off withholds its REQUEST, and the
+// recorded answer keeps riding as an ownerless result — the same shape a hand-edited transcript
+// already produces, and what the transport accepts, because it field-selects a `tool` message
+// and validates nothing about its owner (../transport/openai.ts `wireMessage`). A reader who
+// wants the whole exchange out of the prompt switches both segments; nothing here moves two
+// entries for one click any more, because a click must have one honest verdict behind it.
+//
+// The THINKING axis was always per-entry (`setReasoningIncluded` addresses one entry and never
+// cascaded): the flag removes one entry's thinking from its projection copy, which is no one
+// else's pairing problem (../harness.ts `setReasoningIncluded`).
 
 /** The tool-call id recorded on the event that OPENS one segment, or undefined when the
  *  record cannot name one. */
@@ -826,16 +836,17 @@ export const blockCallIdOf = (
 };
 
 /**
- * The transcript UNIT one call id belongs to, or undefined when this transcript has no
- * entry for it. `transcriptUnits` (src/harness.ts:625-665) for a single address: call ids
- * are conversation-unique (`assertToolCallIds`), so the first owning assistant entry IS
- * the only one, and an orphan result — its owner is gone, e.g. a host edit — keeps its own
- * single-entry unit exactly as the core resolver leaves it.
+ * The transcript ENTRY one call id belongs to, or undefined when this transcript has no
+ * entry for it. Per entry, not per unit (R8): the entry is the assistant entry whose
+ * `toolCalls` carries the id — the request the recorded call is part of — and call ids are
+ * conversation-unique (`assertToolCallIds`), so that owner IS the only one. An orphan result
+ * (its owner is gone, e.g. a host edit) has no request entry to name, so it is its own
+ * entry, exactly as the core projection treats it.
  */
-export const transcriptUnitOfCall = (
+export const transcriptEntryOfCall = (
     messages: readonly HarnessMessage[],
     callId: string
-): readonly HarnessMessage[] | undefined => {
+): HarnessMessage | undefined => {
     // A type PREDICATE, not a cast: the assistant member is the only one of the
     // `HarnessMessage` union carrying `toolCalls`, and the predicate is what keeps the
     // compiler inside that member instead of widening `owner` back to the union.
@@ -844,18 +855,10 @@ export const transcriptUnitOfCall = (
             message.role === 'assistant' && (message.toolCalls ?? []).some((call) => call.id === callId)
     );
 
-    if (owner === undefined) {
-        const orphan = messages.find((message) => message.role === 'tool' && message.toolCallId === callId);
+    if (owner !== undefined) return owner;
 
-        return orphan === undefined ? undefined : [orphan];
-    }
-
-    const callIds = new Set((owner.toolCalls ?? []).map((call) => call.id));
-
-    return [
-        owner,
-        ...messages.filter((message) => message.role === 'tool' && callIds.has(message.toolCallId))
-    ];
+    // No owner: the only entry that can carry this call id is the result itself.
+    return messages.find((message) => message.role === 'tool' && message.toolCallId === callId);
 };
 
 /** The recorded thinking text ONE `reasoning` segment answers with, read off the block
@@ -902,14 +905,75 @@ export const transcriptEntryOfReasoning = (
     return found;
 };
 
-/** A structural COPY of `messages` with ONE entry's thinking flag written; the input is
- *  never mutated, exactly like `messagesWithUnitInclusion` above.
+/** The recorded ANSWER text ONE `assistant` segment shows — the concatenated `text` deltas of
+ *  the block's own event range — or undefined when this segment is not an answer window (or the
+ *  record holds no bytes for it).
  *
- *  THE STORAGE RULE IS CORE'S, mirrored from `setReasoningIncluded` (src/harness.ts
- *  :8839-8848) and `withoutWithheldReasoning` (src/core/agent.ts): a literal `false` is
+ *  R5 review, FIX C: this is the third identity the dialog and the bar needed, stated the way the
+ *  thinking identity is stated. An answer window has no call id (`blockCallIdOf` is the tool
+ *  kind's, and the projector mints an answer from `text` deltas, never from a `tool_call`), so the
+ *  entry join could never name it; its bytes ARE its identity, read through the SAME
+ *  ./sessions.ts `recordedStreamText` the block detail answers its `text` pane with. That is the
+ *  rule, not a convenience: two derivations of "this segment's recorded answer" would let the bar
+ *  and the dialog resolve two different entries for one segment, which is the one thing the
+ *  `included` figure cannot survive. */
+export const blockAnswerTextOf = (
+    turn: SessionTurn,
+    block: { kind?: string; eventFrom?: number; eventTo?: number }
+): string | undefined =>
+    block.kind === 'assistant' && typeof block.eventFrom === 'number' && typeof block.eventTo === 'number'
+        ? recordedStreamText(turn, 'text', block.eventFrom, block.eventTo)
+        : undefined;
+
+/** The ONE live assistant entry whose `content` is exactly this recorded answer text, or
+ *  undefined when the transcript names none OR names more than one.
+ *
+ *  THE SAME GUARD AS THE THINKING JOIN, for the same reason (see `transcriptEntryOfReasoning`
+ *  above): `included` is a verdict about ONE entry, so an entry the server cannot single out
+ *  stays ABSENT (../shared/turn-display.ts `ContextBlock.included`) rather than guessed at.
+ *
+ *  WHY AN EXACT COMPARISON IS ENOUGH, AND WHERE IT STOPS. The projector mints ONE answer block per
+ *  RUN of prose, not per turn — `closeWriters` detaches the text writer at every request boundary
+ *  and the `record.text === undefined` branch opens a fresh block for the next run
+ *  (src/server/turn-projector.ts:2124-2160) — so a turn that streamed text, called a tool, then
+ *  streamed more text produced TWO segments over TWO ranges, each one exactly one entry's
+ *  `content`, and BOTH resolve, each to the entry that streamed it. Per-run blocks are what make an
+ *  exact-bytes match a per-entry match. What the comparison cannot resolve is an entry the
+ *  transcript cannot single out: the same answer text twice in one conversation (two candidates,
+ *  and a `find` that preferred the newest would be picking a flag rather than reading one), or an
+ *  answer whose entry a host Transcript save has since removed. Both answer `undefined`. A
+ *  withheld entry keeps its `content` (the flag moves the entry out of the PROJECTION, never out of
+ *  the document), so the join keeps naming the same entry after the switch is thrown and the
+ *  dialog can read the verdict BACK. */
+export const transcriptEntryOfAnswer = (
+    messages: readonly HarnessMessage[],
+    text: string
+): Extract<HarnessMessage, { role: 'assistant' }> | undefined => {
+    if (text.length === 0) return undefined;
+
+    let found: Extract<HarnessMessage, { role: 'assistant' }> | undefined;
+
+    for (const message of messages) {
+        if (message.role !== 'assistant' || message.content !== text) continue;
+
+        // A SECOND candidate ends the search: two entries carrying the same answer text is a
+        // server that cannot say which one this segment streamed.
+        if (found !== undefined) return undefined;
+
+        found = message;
+    }
+
+    return found;
+};
+
+/** A structural COPY of `messages` with ONE entry's thinking flag written; the input is
+ *  never mutated, exactly like `messagesWithInclusion` below.
+ *
+ *  THE STORAGE RULE IS CORE'S, mirrored from `setReasoningIncluded` (../harness.ts) and
+ *  `withoutWithheldReasoning` (../core/agent.ts): a literal `false` is
  *  the ONLY stored value and switching the thinking back on REMOVES the key, so an
  *  unflagged transcript stays byte-identical forever and a document diff never shows a
- *  change that did not happen. Unlike `included`, NOTHING cascades: the write lands on
+ *  change that did not happen. Nothing cascades on either axis now (R8): the write lands on
  *  the one assistant entry, its `reasoning` text is never touched, and its `included`
  *  axis is never touched — the entry keeps travelling, only its thinking stops riding. */
 export const messagesWithReasoningInclusion = (
@@ -928,31 +992,30 @@ export const messagesWithReasoningInclusion = (
         return copy;
     });
 
-/** A structural COPY of `messages` with one unit's flag written; the input is never
- *  mutated, so the caller's live transcript stays untouched until the store installs it. */
-export const messagesWithUnitInclusion = (
+/** A structural COPY of `messages` with ONE entry's flag written; the input is never
+ *  mutated, so the caller's live transcript stays untouched until the store installs it.
+ *
+ *  ONE entry only (R8): no unit fan-out, no sibling result moves with the click. Core's
+ *  storage rule is mirrored exactly — `writeIncluded` (../harness.ts) and `withIncluded`
+ *  (../core/agent.ts) keep a literal `false` as the ONLY stored value, and switching an entry
+ *  back on REMOVES the key. Writing `included: true` would put a value on the wire that the
+ *  snapshot reader drops, and a document diff would show a change that never happened.
+ */
+export const messagesWithInclusion = (
     messages: readonly HarnessMessage[],
-    unit: readonly HarnessMessage[],
+    entry: HarnessMessage,
     included: boolean
-): HarnessMessage[] => {
-    const members = new Set(unit);
-
-    return messages.map((message) => {
+): HarnessMessage[] =>
+    messages.map((message) => {
         const copy = { ...message } as HarnessMessage & { included?: boolean };
 
-        if (!members.has(message)) return copy;
+        if (message !== entry) return copy;
 
-        // Core's storage rule, mirrored from `writeIncluded` (src/harness.ts:8366-8378) and
-        // `withIncluded` (src/core/agent.ts:194): a literal `false` is the ONLY stored value,
-        // and switching a unit back on REMOVES the key. Writing `included: true` would put a
-        // value on the wire that the snapshot reader drops, and a document diff would show a
-        // change that never happened.
         if (included) delete copy.included;
         else copy.included = false;
 
         return copy;
     });
-};
 
 // ---------------------------------------------------------------------------
 // Creation
@@ -1572,15 +1635,16 @@ export const createHarnessApi = ({
     ];
 
     /**
-     * T7: the conversation and the transcript unit ONE context segment's text is built from
-     * (`blockCallIdOf` + `transcriptUnitOfCall` above), or undefined when no live entry
-     * answers the recorded call id.
+     * T7: the conversation and the ONE transcript entry a context segment's text is built
+     * from (`blockCallIdOf` + `transcriptEntryOfCall` above), or undefined when no live entry
+     * answers the recorded call id. One entry, never a unit (R8) — the read, the write and the
+     * receipt all resolve through here, so the chip and the transcript cannot disagree.
      */
-    const blockUnitOf = (
+    const blockEntryOf = (
         record: SessionRecord,
         turn: SessionTurn,
         block: { kind?: string; eventFrom?: number }
-    ): { threadId: string; callId: string; messages: HarnessMessage[]; unit: readonly HarnessMessage[] } | undefined => {
+    ): { threadId: string; callId: string; messages: HarnessMessage[]; entry: HarnessMessage } | undefined => {
         const callId = blockCallIdOf(turn.events, block);
 
         if (callId === undefined) return undefined;
@@ -1593,9 +1657,9 @@ export const createHarnessApi = ({
             if (record.invalidThreads.has(threadId)) continue;
 
             const messages = transcriptMessagesOf(record, threadId);
-            const unit = transcriptUnitOfCall(messages, callId);
+            const entry = transcriptEntryOfCall(messages, callId);
 
-            if (unit !== undefined) return { threadId, callId, messages, unit };
+            if (entry !== undefined) return { threadId, callId, messages, entry };
         }
 
         return undefined;
@@ -1633,16 +1697,214 @@ export const createHarnessApi = ({
         return undefined;
     };
 
-    /** The unit's effective inclusion, spelled the way the plugin API spells
-     *  `HarnessContextEntry.included` (src/harness.ts:8350): every member on, or it is off. */
-    const unitIncludedOf = (unit: readonly HarnessMessage[]): boolean =>
-        unit.every((message) => message.included !== false);
+    /**
+     * THE THIRD JOIN (R5 review, FIX C): the conversation and the ONE assistant entry an
+     * `assistant` segment's ANSWER was streamed by, or undefined when the recorded bytes name
+     * none — not an answer window, no recorded bytes, no live entry whose `content` is exactly
+     * those bytes, or more than one entry is.
+     *
+     * WHY IT WAS MISSING, AND WHY IT IS HONEST NOW. An answer window is the text half of an
+     * assistant entry, so the call-id join could never name it and every verdict about it stayed
+     * ABSENT: the bar offered no dim for a turn's whole answer, the chip offered no switch, and a
+     * reader who withheld an answer from the prompt saw nothing move. The thinking join already
+     * proved the pattern for a window with no id — the recorded bytes ARE the identity, compared
+     * exactly and refused on ambiguity (`transcriptEntryOfAnswer`) — and the same
+     * `recordedStreamText` this uses is the one the block detail's `text` pane answers with, so
+     * the bar, the dialog and the write all name one entry.
+     *
+     * WHAT STAYS ABSENT, deliberately: an answer whose text an earlier assistant entry repeats
+     * verbatim (two candidates, and the join refuses rather than preferring one — a bar that put a
+     * toggle on whichever entry a `find` reached first would be inventing a verdict), and an answer
+     * whose entry is no longer in the transcript at all (a host Transcript save can delete it while
+     * the turn record keeps its events). Both are the transcript declining to name one entry, and
+     * the surfaces then state the policy the way they did before this join existed — never a
+     * borrowed flag. A split answer is NOT one of them: the projector mints one answer block per
+     * run of prose, so each run resolves to the entry that streamed it and each gets its own switch
+     * (`transcriptEntryOfAnswer` above, and ./view.test.ts pins both runs).
+     */
+    const blockAnswerOf = (
+        record: SessionRecord,
+        turn: SessionTurn,
+        block: { kind?: string; eventFrom?: number; eventTo?: number }
+    ): { threadId: string; messages: HarnessMessage[]; entry: Extract<HarnessMessage, { role: 'assistant' }> } | undefined => {
+        const text = blockAnswerTextOf(turn, block);
+
+        if (text === undefined) return undefined;
+
+        for (const threadId of threadCandidatesOf(record, turn)) {
+            if (record.invalidThreads.has(threadId)) continue;
+
+            const messages = transcriptMessagesOf(record, threadId);
+            const entry = transcriptEntryOfAnswer(messages, text);
+
+            if (entry !== undefined) return { threadId, messages, entry };
+        }
+
+        return undefined;
+    };
+
+    /** The entry's own inclusion, spelled the way the plugin API spells
+     *  `HarnessContextEntry.included` (../harness.ts `createEntries`): the flag is per entry
+     *  (R8), so this is a one-entry read — no "every member on, or it is off" rule any more. */
+    const entryIncludedOf = (entry: HarnessMessage): boolean => entry.included !== false;
 
     /** The SAME tri-state spelling on the thinking axis: the flag's absence means the
      *  thinking rides in the requests that follow, and only a literal `false` withholds it
-     *  (src/types/index.ts:213-236, written by src/harness.ts:8839-8848). */
+     *  (src/types/index.ts:223-246, written by src/harness.ts:8955-8999). */
     const thoughtIncludedOf = (entry: Extract<HarnessMessage, { role: 'assistant' }>): boolean =>
         entry.reasoningIncluded !== false;
+
+    /**
+     * R7 (T4b): the LIVE verdict of ONE context segment — does what this segment SHOWS still ride
+     * in the requests that follow — spelled exactly the way the bar reads it
+     * (../shared/turn-display.ts `ContextBlock.included`, and the single client rule
+     * ../frontend/view-context.ts `contextBlockIsExcluded`: only a literal `false` dims).
+     *
+     * WHY IT IS JOINED AND NOT FOLDED: the compiled bar is a fold of one TURN's events and never
+     * sees a transcript, so the projector can only mint its static per-kind `inPrompt`
+     * (./turn-projector.ts). The verdict below is a fact about the CONVERSATION's committed
+     * entries, read at request time through the same three joins the block detail route uses
+     * (`blockEntryOf` for a recorded call, `blockThoughtOf` for recorded thinking, `blockAnswerOf`
+     * for a recorded answer), which is what makes a reader's toggle, another tab's toggle, and a
+     * plugin's `setIncluded` all show up on the next read of the bar with no compiled-cache
+     * staleness.
+     *
+     * THE THREE VERDICTS (the tri-state is the whole point — the client treats ABSENT as
+     * "unknown", NOT as "excluded", so defaulting it would dim most of every bar on a false
+     * claim, ../frontend/view-context.ts:348-375):
+     *   - ABSENT (`undefined`) — no transcript entry stands behind this segment at all, or the
+     *     transcript cannot SINGLE one out. That is every `system` block (N instruction entries,
+     *     one segment), the `user` prompt (no opening event, hence no call id) and a `steer`; a
+     *     thinking window whose bytes match no entry or several entries; and an ANSWER window whose
+     *     recorded bytes single out no ONE assistant entry — an answer an earlier assistant entry
+     *     repeats verbatim, or an answer whose entry a host Transcript save has since removed
+     *     (../shared/turn-display.ts `ContextBlock.included` documents the same list; a SPLIT
+     *     answer is not on it, because the projector mints one answer block per run of prose and
+     *     each run resolves to the entry that streamed it — `transcriptEntryOfAnswer`). The
+     *     renderer states the policy and offers no control, so this function must NEVER invent a
+     *     boolean here — not `true` and not `false`;
+     *   - `true` — the axis resolves and is switched ON;
+     *   - `false` — the axis resolves and is switched OFF, and ONLY for a segment nothing of
+     *     reaches the prompt any more (see the tool rule below).
+     *
+     * WHICH AXIS, PER KIND (mirrors the read/write pair, ./api.ts `getSessionTurnBlock` and
+     * `patchSessionTurnBlock`, so the bar, the chip and the transcript state one figure):
+     *   - a `reasoning` block names no call, so the entry join answers nothing for it and the
+     *     THINKING axis decides — the flag T6 put beside the thinking (`reasoningIncluded`) lives
+     *     on the one assistant entry whose `reasoning` field IS these recorded bytes;
+     *   - an `assistant` block names no call either, and its recorded answer bytes are the identity
+     *     that resolves the ENTRY (FIX C) — the same text-is-the-key rule the thinking join uses,
+     *     with the same refusal on ambiguity, so a withheld answer now dims the way a withheld
+     *     thinking window does;
+     *   - every other block is decided by the ENTRY the segment resolves to, per entry and with no
+     *     unit cascade (R8 removed the fan-out).
+     *
+     * THE TOOL RULE (why a withheld REQUEST does not dim the segment): a tool's request and its
+     * response are ONE bar segment (`argsChars` + `resultChars` on the same block,
+     * ../shared/turn-display.ts `chars`) while `included` is ONE boolean, so a half-included round
+     * cannot be drawn half-dimmed — the shipped client states this as a deliberate limitation
+     * (../frontend/view-context.ts:367-373: "producers publish `false` only for a unit nothing of
+     * reaches the prompt"). R8 made the write per entry, and `projectTranscript` lets a withheld
+     * request's RESULT ride as an ownerless entry (../harness.ts:6751-6856). So a tool segment is
+     * `false` ONLY when every entry behind it is withheld: the request alone, or the result alone,
+     * still leaves bytes of this segment in the prompt, and those answer `true` (opaque).
+     */
+    const contextSegmentIncludedOf = (
+        record: SessionRecord,
+        turn: SessionTurn,
+        block: ContextBlock
+    ): boolean | undefined => {
+        if (block.kind === 'reasoning') {
+            // THE SEGMENT'S VERDICT IS THE THINKING AXIS, and nothing else — the ratified rule
+            // (../shared/turn-display.ts `ContextBlock.included`), and pinned from both sides in
+            // ./view.test.ts. It is worth stating what that means next to FIX C's answer join,
+            // because the pair is visible on one bar: when an ENTRY leaves the request, the answer
+            // window beside this one goes OFF (its `content` is really gone) while this window keeps
+            // answering ON, because the thinking flag was never touched. That is not a drift
+            // between the two surfaces — it is two axes each stating its own flag, and the reason
+            // the bar may not invent a merged verdict (a "nothing of this entry rides" boolean would
+            // be a third figure the write does not move).
+            // The segment's identity is its recorded bytes (a thinking window carries no id of its
+            // own, ./turn-projector.ts mints its block id from the OPENING EVENT INDEX), and the
+            // bytes come from the same reader the block detail route uses — one derivation, so the
+            // bar and the dialog cannot resolve two different entries for one segment.
+            const text = recordedStreamText(turn, 'reasoning', block.eventFrom, block.eventTo);
+
+            if (text === undefined) return undefined;
+
+            const thought = blockThoughtOf(record, turn, { kind: block.kind, text });
+
+            return thought === undefined ? undefined : thoughtIncludedOf(thought.entry);
+        }
+
+        // ONE JOIN PER KIND, in the same order the read and the write dispatch (the doc above is
+        // the rule): a recorded CALL for a tool segment, recorded ANSWER BYTES for an answer
+        // window (FIX C). `blockEntryOf` answers nothing for a kind that mints no call id, which
+        // is why the two can share one variable — and why an unresolved segment of ANY kind still
+        // answers `undefined` rather than a boolean.
+        const target = block.kind === 'assistant' ? blockAnswerOf(record, turn, block) : blockEntryOf(record, turn, block);
+
+        // No entry behind the segment: NO verdict. This is the case the client calls
+        // "unaddressable", and it is where a fabricated `true` would be as wrong as a `false`.
+        if (target === undefined) return undefined;
+
+        if (target.entry.included !== false) return true;
+
+        // THE OTHER HALF OF A TOOL SEGMENT. `transcriptEntryOfCall` prefers the OWNING assistant
+        // entry, so reaching here means the request is withheld; the recorded answer is a separate
+        // entry (the tool message for this call id — the lookup `transcriptEntryOfCall` itself
+        // falls back to when no owner survives) and it keeps travelling, which keeps the result
+        // bytes of THIS segment in the prompt. Same for the mirror case: an orphan result the
+        // reader switched off while its owner's request still rides. The `in` test is the type
+        // guard that the ANSWER join (which carries no call id) cannot reach this branch at all:
+        // an answer window is one entry, and there is no sibling of it to keep riding.
+        if (block.kind === 'tool' && 'callId' in target) {
+            const sibling = target.messages.find(
+                (message) => message.role === 'tool' && message.toolCallId === target.callId && message !== target.entry
+            );
+
+            if (sibling !== undefined && sibling.included !== false) return true;
+        }
+
+        return false;
+    };
+
+    /**
+     * R7 (T4b): the turn's compiled bar with the live verdict on every segment that HAS one —
+     * the stamp the display route applies so the lane knows, on FIRST PAINT, which segments are
+     * out of the context (the dim is `opacity: 0.2`, decided by the shipped reader rule from
+     * `included === false`).
+     *
+     * NOT A REWRITE of the fold: `inPrompt`, every count, stamp and identity field is the
+     * projector's own figure, byte-identical, and only the ONE field this file owns is added. A
+     * segment whose verdict is ABSENT is returned untouched (the fold's object is reused), so the
+     * tree carries no `included` key at all for a policy/unknown segment — the shape
+     * ../frontend/display-project.ts copies only when the wire stated it. A segment whose verdict
+     * already matches is left alone too, which keeps this a no-op allocation for the common case.
+     */
+    const displaySectionsWithInclusionOf = (
+        record: SessionRecord,
+        turn: SessionTurn,
+        sections: TurnSection[]
+    ): TurnSection[] =>
+        sections.map((section) => {
+            const context = section.context;
+
+            if (context === undefined || context.length === 0) return section;
+
+            let moved = false;
+            const blocks = context.map((block) => {
+                const verdict = contextSegmentIncludedOf(record, turn, block);
+
+                if (verdict === undefined || block.included === verdict) return block;
+
+                moved = true;
+
+                return { ...block, included: verdict };
+            });
+
+            return moved ? { ...section, context: blocks } : section;
+        });
 
     // ---- root / health / config -------------------------------------------------
 
@@ -4538,7 +4800,10 @@ export const createHarnessApi = ({
         const record = requireSession(ctx.params.session_id);
         const turnId = ctx.params.turn_id;
 
-        requireTurn(record, turnId);
+        // Kept (not discarded): the inclusion stamp below joins each segment against THIS turn's
+        // record — the recorded call id and the recorded thinking bytes are the join's inputs — and
+        // `turn.events` is the live record, exactly like the two detail reads use it.
+        const turn = requireTurn(record, turnId);
 
         const projector = store.peekTurnProjector(record, turnId);
 
@@ -4554,6 +4819,14 @@ export const createHarnessApi = ({
         const response: TurnDisplayResponse = {
             display: {
                 ...display,
+                // R7 (T4b): the bar the lane paints. Every figure stays the projector's own; the
+                // ONE thing added here is the live `included` verdict per segment, joined at read
+                // time from the conversation's committed entries. This is what makes the dim
+                // correct on FIRST PAINT — the fold cannot carry it (it never sees a transcript)
+                // and the projector's per-kind `inPrompt` is a fallback, not a verdict. A segment
+                // the join cannot name keeps NO key, which is what the reader shows as opaque with
+                // no control (../frontend/view-context.ts `contextBlockIsExcluded`).
+                sections: displaySectionsWithInclusionOf(record, turn, display.sections),
                 // One counter per comparison: the tree is a pure fold of the turn record, so
                 // its revision IS the turn's (the contract defines `turn_display` that way).
                 revision: events.getRevision('turn', turnKey(record.id, turnId))
@@ -4612,26 +4885,47 @@ export const createHarnessApi = ({
             ctx.params.block_id
         ) as unknown as TurnBlockDetailResponse['block'];
 
-        // T7: the reader-facing inclusion state, published here and nowhere else. The
-        // projector cannot carry it — the flag is a fact about the CONVERSATION's transcript
-        // while the compiled bar is a fold of one TURN's events — so it is joined at read
-        // time, which is also what makes a plugin's `setIncluded` (or another tab's toggle)
-        // visible on the next click instead of hiding behind a stale compiled cache. ABSENT
-        // when NEITHER join resolves an entry: the client then keeps its per-kind `inPrompt`
-        // verdict and shows no control (../shared/turn-display.ts `included`).
-        const target = blockUnitOf(record, turn, block);
+        // T7: the reader-facing inclusion state — the PER-ENTRY figure the segment dialog's chip
+        // switches, published here for the clicked segment. The projector cannot carry it (the flag
+        // is a fact about the CONVERSATION's transcript while the compiled bar is a fold of one
+        // TURN's events), so it is joined at read time, which is also what makes a plugin's
+        // `setIncluded` (or another tab's toggle) visible on the next click instead of hiding
+        // behind a stale compiled cache. ABSENT when NO join resolves an entry — for a call, for a
+        // thinking window, or for an answer window (FIX C added the third join, so the turn's
+        // answer is a switchable segment whenever its recorded bytes single out one assistant
+        // entry): the client then keeps its per-kind `inPrompt` verdict and shows no control
+        // (../shared/turn-display.ts `included`).
+        //
+        // HOW THIS DIFFERS FROM THE BAR (R7/T4b), which publishes the same field name from the
+        // SAME joins in the display read (`contextSegmentIncludedOf`, applied by
+        // `getSessionTurnDisplay`): the bar answers for the WHOLE SEGMENT, this route answers for
+        // the ENTRY this chip switches. They are the same figure in every case but one — a tool
+        // round whose recorded call is resolved and whose request entry is withheld while its
+        // result entry still rides (R8 per-entry write, ../harness.ts `projectTranscript` letting
+        // the answer travel as an ownerless entry). The dialog then honestly says "this entry is
+        // switched off", while the bar honestly says "bytes of this segment are still in the
+        // prompt", because a tool's request and answer are ONE segment and the client can only
+        // draw it whole (../frontend/view-context.ts `contextBlockIsExcluded`, and the live
+        // `context:set` this write emits below carries the BAR's figure for exactly that reason).
+        // R5 review, FIX C: the ANSWER join takes its place in this chain rather than a new field
+        // beside it. An `assistant` segment mints no call id, so this route used to answer `absent`
+        // for every turn's whole answer — no chip, nothing to click — even though the recorded
+        // bytes name one assistant entry whenever the answer streamed in one run. Same rule as the
+        // thinking join below: exact bytes, one entry or none, never a borrowed flag.
+        const target = block.kind === 'assistant' ? blockAnswerOf(record, turn, block) : blockEntryOf(record, turn, block);
 
         // Uplift T7 (F8): the thinking axis. A `reasoning` segment names no call, so the
-        // unit join answers nothing for it and the thought join gets its turn — the flag
-        // T6 added lives on the entry that streamed this thinking, so this is the ONE read
-        // that can say whether a model's own prior thinking rides in the requests that
-        // follow. The static per-kind `inPrompt: false` stays on the block UNTOUCHED: it is
-        // the fallback verdict for a server that cannot name the entry, not a claim about
-        // the segment class (../shared/turn-display.ts `inPrompt`).
+        // entry join answers nothing for it and the thought join gets its turn — the flag
+        // T6 added lives on the entry that streamed this thinking, so this is the read that
+        // can say whether a model's own prior thinking rides in the requests that follow (the
+        // bar stamps the same axis off the same join, `contextSegmentIncludedOf`). The static
+        // per-kind `inPrompt: false` stays on the block UNTOUCHED: it is the fallback verdict
+        // for a server that cannot name the entry, not a claim about the segment class
+        // (../shared/turn-display.ts `inPrompt`).
         const thought = target === undefined ? blockThoughtOf(record, turn, block) : undefined;
         const verdict =
             target !== undefined
-                ? unitIncludedOf(target.unit)
+                ? entryIncludedOf(target.entry)
                 : thought !== undefined
                   ? thoughtIncludedOf(thought.entry)
                   : undefined;
@@ -4646,31 +4940,35 @@ export const createHarnessApi = ({
     // T7 (R6/R7), extended by trimmer uplift T7: the ONE write the segment dialog makes,
     // which now reaches TWO canonical axes:
     //   - `included` — the segment's OWN prompt axis, written the way core's `setIncluded`
-    //     writes it (the whole tool-call unit, in place, `false` the only stored value);
+    //     writes it (ONE entry, in place, `false` the only stored value — R8 removed the
+    //     unit fan-out, so a click moves exactly the entry this segment names);
     //   - `reasoningIncluded` — the THINKING axis, written the way core's
-    //     `setReasoningIncluded` writes it (ONE assistant entry, NO cascade, `false` the only
-    //     stored value, src/harness.ts:8821-8861).
+    //     `setReasoningIncluded` writes it (ONE assistant entry, `false` the only stored
+    //     value, ../harness.ts `setReasoningIncluded`).
     //
     // WHY ITS OWN ROUTE AND NOT THE WHOLE-DOCUMENT PUT. `PUT .../transcript` replaces every
     // entry from a document the CLIENT read earlier, so a toggle would be a cross-modal
     // read-modify-write: a run committing a result, or a plugin's own `setIncluded`, landing
     // in between would be silently rewritten by the client's stale copy (a tool result
     // committed mid-dialog is exactly that). This route names the ENTRY, reads the transcript
-    // itself at the moment of the write, and moves ONE flag on ONE unit (or one entry), so
+    // itself at the moment of the write, and moves ONE flag on ONE entry, so
     // there is no window to lose anything in. The shipped semantics still apply end to end:
     // the flag is installed through `updateThreadTranscript` — the same validation, the same
     // running refusal, the same durable-before-response rule, the same `transcript.updated`
     // signal — and written exactly the way core writes it.
     //
     // WHICH ENTRY A FIELD MEANS (one rule, mirroring the read): a field resolves through the
-    // join that can name THIS segment's entry — `included` through the unit join for a call,
+    // join that can name THIS segment's entry — `included` through the entry join for a call,
     // through the thought join for a thinking window (for a thinking window, what rides in the
-    // prompt IS its thinking, which is why the read publishes its `included` from that flag);
+    // prompt IS its thinking, which is why the read publishes its `included` from that flag), and
+    // through the ANSWER join for an answer window, where the recorded answer bytes name the one
+    // assistant entry whose `content` they are (R5 review, FIX C — what rides in the prompt IS
+    // that content, so the entry flag is the segment's figure and the bar dims with it);
     // `reasoningIncluded` names the thinking axis EXPLICITLY and resolves only through the
-    // thought join. Since a `reasoning` window has no call id and every other segment has no
-    // recorded thinking text, AT MOST ONE join can ever resolve for one block, so one body
-    // moves one document. A segment whose requested axis names no live entry is refused 409,
-    // exactly as before this change.
+    // thought join. The three joins are keyed on mutually exclusive evidence — a call id, recorded
+    // `reasoning` bytes, recorded `text` bytes — so AT MOST ONE join can ever resolve for one
+    // block, and one body moves one document. A segment whose requested axis names no live entry
+    // is refused 409, exactly as before this change.
     const patchSessionTurnBlock: Handler = async (ctx) => {
         const record = requireSession(ctx.params.session_id);
         const turn = requireTurn(record, ctx.params.turn_id);
@@ -4679,8 +4977,8 @@ export const createHarnessApi = ({
         requireKnownFields(body, ['included', 'reasoningIncluded']);
 
         // AT LEAST ONE axis, then every axis present STRICTLY a boolean — the same strictness
-        // core's own controls apply to their arguments (src/harness.ts:8542 for `setIncluded`,
-        // :8827 for `setReasoningIncluded`): `'false'` and `0` are typos on this surface, not
+        // core's own controls apply to their arguments (src/harness.ts:8887-8934 for `setIncluded`,
+        // :8955-8999 for `setReasoningIncluded`): `'false'` and `0` are typos on this surface, not
         // values to coerce, and every check happens before anything is written.
         if (body.included === undefined && body.reasoningIncluded === undefined) {
             throw new HttpError(400, 'A context segment write requires at least one of "included" and "reasoningIncluded".');
@@ -4701,16 +4999,21 @@ export const createHarnessApi = ({
         // WHICH AXIS EACH FIELD ADDRESSES, for this segment. On a thinking segment BOTH fields
         // mean the thinking axis, because the only flag that decides whether a thinking window
         // rides in the next request is that entry's `reasoningIncluded`; on any other segment
-        // `included` means the exclusion unit behind the recorded call, and `reasoningIncluded`
+        // `included` means the ONE entry behind the recorded call (R8 — the assistant entry that
+        // asked for it, or the result itself when its owner is gone), and `reasoningIncluded`
         // names an axis this segment's recorded bytes cannot reach.
         const isThinkingSegment = block.kind === 'reasoning';
-        const unitRequested = !isThinkingSegment && body.included !== undefined;
+        const entryRequested = !isThinkingSegment && body.included !== undefined;
         const thinkingRequested = isThinkingSegment || body.reasoningIncluded !== undefined;
-        const unitTarget = unitRequested ? blockUnitOf(record, turn, block) : undefined;
+        const entryTarget = entryRequested
+            ? block.kind === 'assistant'
+                ? blockAnswerOf(record, turn, block)
+                : blockEntryOf(record, turn, block)
+            : undefined;
         const thoughtTarget = thinkingRequested ? blockThoughtOf(record, turn, block) : undefined;
 
         // EACH REQUESTED AXIS IS CHECKED ON ITS OWN, the thinking axis first: on a segment that
-        // records a call, a body naming both axes must REFUSE rather than write the unit and drop
+        // records a call, a body naming both axes must REFUSE rather than write the entry and drop
         // the field that cannot land — half a receipt would misstate what the click did. A segment
         // whose requested axis names no live entry is a 409, not a quiet no-op: the reader is
         // looking at a real segment whose field cannot be written to it, and 404 would claim the
@@ -4722,23 +5025,29 @@ export const createHarnessApi = ({
             );
         }
 
-        if (unitRequested && unitTarget === undefined) {
+        if (entryRequested && entryTarget === undefined) {
+            // TWO JOINS CAN FAIL HERE and they fail for different reasons, so the sentence names
+            // the one that did: a call that is not in the transcript, versus an answer the answer
+            // join could not single out (FIX C). The tool wording is byte-identical to what this
+            // route has always answered, pinned by ./view.test.ts.
             throw new HttpError(
                 409,
-                `Context segment "${block.id}" has no transcript entry to switch: the call it recorded is not in this conversation's transcript.`
+                block.kind === 'assistant'
+                    ? `Context segment "${block.id}" has no transcript entry to switch: the recorded answer is not the exact content of one assistant entry in this conversation's transcript.`
+                    : `Context segment "${block.id}" has no transcript entry to switch: the call it recorded is not in this conversation's transcript.`
             );
         }
 
-        // THE WRITE: one structural copy of one conversation's transcript, one flag. The
-        // explicit field decides the thinking axis (`reasoningIncluded` NAMES it), and on a
-        // thinking segment the two fields address the same entry — so a body carrying both can
-        // only ever state one verdict, and it is the explicit one.
+        // THE WRITE: one structural copy of one conversation's transcript, one flag on one
+        // entry. The explicit field decides the thinking axis (`reasoningIncluded` NAMES it),
+        // and on a thinking segment the two fields address the same entry — so a body carrying
+        // both can only ever state one verdict, and it is the explicit one.
         const thinkingValue = typeof body.reasoningIncluded === 'boolean' ? body.reasoningIncluded : (body.included as boolean);
         const patched =
-            unitTarget !== undefined
-                ? messagesWithUnitInclusion(unitTarget.messages, unitTarget.unit, body.included as boolean)
+            entryTarget !== undefined
+                ? messagesWithInclusion(entryTarget.messages, entryTarget.entry, body.included as boolean)
                 : messagesWithReasoningInclusion(thoughtTarget!.messages, thoughtTarget!.entry, thinkingValue);
-        const target = unitTarget ?? thoughtTarget!;
+        const target = entryTarget ?? thoughtTarget!;
 
         // Async because it is durable before the response (./sessions.ts
         // `updateThreadTranscript`); a RUNNING conversation refuses from inside it with 409,
@@ -4748,13 +5057,21 @@ export const createHarnessApi = ({
 
         // Read the state BACK instead of echoing the request: the receipt is then the PERSISTED
         // verdict, so the dialog paints what the server holds (R6: no optimistic state), even if
-        // the entry moved between the click and the write. A unit re-resolves through its call
+        // the entry moved between the click and the write. An entry re-resolves through its call
         // id; a thinking entry re-resolves through the SAME recorded thinking text, which it
         // keeps carrying whatever its flag says — T6 withholds thinking from the PROJECTION COPY
-        // only (src/core/agent.ts `withoutWithheldReasoning`), never from the canonical entry.
+        // only (../core/agent.ts `withoutWithheldReasoning`), never from the canonical entry. An
+        // ANSWER entry re-resolves through its `content` for exactly the same reason (FIX C): the
+        // flag moves the entry out of the request, never out of the document, so the join keeps
+        // naming it and the receipt states the figure the next read will publish.
         const live = store.liveSession(record.id);
         const liveMessages = transcriptMessagesOf(live, target.threadId);
-        const afterUnit = unitTarget === undefined ? undefined : transcriptUnitOfCall(liveMessages, unitTarget.callId);
+        const afterEntry =
+            entryTarget === undefined
+                ? undefined
+                : 'callId' in entryTarget
+                  ? transcriptEntryOfCall(liveMessages, entryTarget.callId)
+                  : blockAnswerOf(live, turn, block)?.entry;
         const afterThought = thoughtTarget === undefined ? undefined : (blockThoughtOf(live, turn, block) ?? thoughtTarget);
         const key = threadKey(record.id, target.threadId);
         const revision = events.getRevision('transcript', key);
@@ -4776,18 +5093,61 @@ export const createHarnessApi = ({
         });
 
         // The receipt states the figures a reader can act on: `included` is the verdict the
-        // NEXT detail read publishes for THIS segment — the unit's for a call, the thinking's
+        // NEXT detail read publishes for THIS segment — the entry's for a call, the thinking's
         // for a thinking window, from the same join, so the chip and the read cannot disagree —
         // and `reasoning_included` is the thinking axis itself, reported whenever this block
         // names a thinking entry. On a thinking segment the two are the same figure by
         // construction; on a tool segment only `included` exists, exactly as before.
         const included =
-            afterUnit !== undefined
-                ? unitIncludedOf(afterUnit)
+            afterEntry !== undefined
+                ? entryIncludedOf(afterEntry)
                 : afterThought !== undefined
                   ? thoughtIncludedOf(afterThought.entry)
-                  : (unitTarget !== undefined ? unitIncludedOf(unitTarget.unit) : thoughtIncludedOf(thoughtTarget!.entry));
+                  : (entryTarget !== undefined ? entryIncludedOf(entryTarget.entry) : thoughtIncludedOf(thoughtTarget!.entry));
         const reasoningIncluded = afterThought === undefined ? undefined : thoughtIncludedOf(afterThought.entry);
+
+        // R7 (T4b): THE LIVE REPAINT, so the lane dims without a reload. The write above is a
+        // transcript write, and the store's own signal for it (`transcript.updated`,
+        // ./sessions.ts `updateThreadTranscript`) names only a CONVERSATION — a bar segment is
+        // addressed by turn and block, so only this route, which holds both, can announce the
+        // segment's new verdict. One frame, one op, the same emission pattern the recorder's
+        // `display.ops` signal uses above (all three turn counters move together, because the
+        // contract defines the display and event revisions to EQUAL the owning turn's).
+        //
+        // THE FIGURE IS THE BAR'S, not the receipt's. `included` below in the receipt is the
+        // per-entry verdict the chip switched; the op carries the SEGMENT verdict from
+        // `contextSegmentIncludedOf`, i.e. exactly what the NEXT display read of this turn
+        // publishes, so the dim a click produces cannot be undone by the refresh that follows it.
+        // For a tool round that means a withheld REQUEST keeps the segment OPAQUE while its answer
+        // still travels — the half-segment limitation the shipped reader already states
+        // (../frontend/view-context.ts `contextBlockIsExcluded`) — and for a thinking window it
+        // means the dim lands on the same frame as the write. ABSENT (no entry) is not patchable
+        // and is not announced: a `context:set` has no way to say "unknown" again, and this route
+        // has already refused any write whose axis names no entry.
+        const barVerdict = contextSegmentIncludedOf(live, turn, block);
+
+        if (barVerdict !== undefined) {
+            const displayKey = resourceKeyOf('turn_display', turnKey(record.id, turn.id));
+
+            events.bumpRevision('turn', turnKey(record.id, turn.id));
+            events.bumpRevision('turn_display', turnKey(record.id, turn.id));
+            events.bumpRevision('turn_events', turnKey(record.id, turn.id));
+
+            events.publish({
+                kind: 'display.ops',
+                resources: [displayKey],
+                target: displayKey,
+                ops: [
+                    {
+                        op: 'context:set',
+                        turnId: turn.id,
+                        sectionId: block.sectionId,
+                        blockId: block.id,
+                        patch: { included: barVerdict }
+                    }
+                ]
+            });
+        }
 
         const receipt: TurnBlockWriteReceipt = {
             session_id: record.id,

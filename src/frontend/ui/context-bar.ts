@@ -52,6 +52,25 @@
 // row 1 — which is the flat order for any bar whose lanes are monotonic (all lanes are, since
 // a lane is assigned at mint time and never rewritten).
 //
+// THE DIM STATE (R7, T4a — "not in the context any more")
+// -------------------------------------------------------
+// A block can leave the prompt after it was recorded: the reader excludes it from the segment
+// dialog, or a plugin writes `turn.before setIncluded` / `setReasoningIncluded`. The verdict is
+// the tri-state `ContextBlock.included` (../../shared/turn-display.ts:567-600), it reaches this
+// client through ../display-project.ts (a producer that publishes it) and through a
+// `context:set` patch (a reader or plugin that changes it), and ./view-context.ts
+// `contextBlockIsExcluded` is the ONE place it is read: `false` dims, `true` and ABSENT (no
+// transcript entry behind the segment = unknown) paint normally.
+//
+// The rendering is transparency and NOTHING else — 0.2 in canvas mode (`globalAlpha` through
+// `contextBarSegmentAlphaOf`, which also fades this mode's in-segment name so the two renderers
+// still agree, since DOM mode fades the label with its button) and `opacity: 0.2` in DOM mode
+// (`data-included='false'`, the figure `CONTEXT_BAR_EXCLUDED_ALPHA` mirrors). A dimmed segment is
+// still a segment: same hit box, same column aim, same Enter/Space, same roving tabindex, same
+// hover and focus outline. `styles.css` carries no `pointer-events`, no `display` and no
+// `[data-included]` colour rule, and the words say it too — `contextBarSegmentTitleOf` keeps the
+// model's `not replayed into the prompt` clause on it, which is what a screen reader hears.
+//
 // THE BAR NEVER FETCHES (R8)
 // --------------------------
 // Rendering reads nothing but the block metadata. A request happens when the reader
@@ -77,11 +96,14 @@ import {
     CONTEXT_BAR_TONE_STYLES,
     contextBarLaneLabelOf,
     contextBarLaneTagOf,
+    contextBarSegmentAlphaOf,
     contextBarSegmentAt,
     contextBarShowsLaneTagsOf,
     contextBarStatsOf,
     contextBarSummaryOf,
     contextBarToneOf,
+    contextBlockIsExcluded,
+    contextBlockIsWithheld,
     contextSegmentLabelOf,
     contextSegmentTitleOf,
     formatContextCharCount,
@@ -112,9 +134,10 @@ export const CONTEXT_BAR_DOM_LABEL_LIMIT = 12;
 // `../view-context.ts` mints ONE trailing clause for every block the server marks
 // `inPrompt !== true`: "not replayed into the prompt". For a TOOL block that is a fact the
 // projector earned. For a REASONING block it is the projector's STATIC per-kind verdict
-// (`../server/turn-projector.ts` stamps the whole class `inPrompt: false`), and once
-// `dropOldThoughts` exists that sentence stops being a property of the class: under the
-// shipped default tier (`turn`) the OPEN turn's thinking IS replayed into the prompt, so the
+// (`../server/turn-projector.ts` stamps the whole class `inPrompt: false`), and the trimmer's
+// thinking policy (`trimThoughts` + `thoughtTurns`) decides per ENTRY, so that sentence stops
+// being a property of the class: under the shipped default (trim on, horizon 2) the two newest
+// thoughts ARE replayed into the prompt, so the
 // bar would be stating a falsehood on a per-segment absolute it cannot see.
 //
 // The bar CANNOT resolve a per-entry verdict — one activation is the only request it ever
@@ -142,16 +165,33 @@ export const CONTEXT_BAR_THINKING_NOTE = 'replay decided by the thinking policy'
  * `contextSegmentTitleOf` (that trailing clause), so asking for the in-prompt form and
  * appending the note here is the whole substitution. No string surgery, no duplicated
  * figures, nothing that could drift from the model's own numbers.
+ *
+ * R7 (T4a) adds ONE condition to that guard: a segment the server marked `included: false`
+ * keeps the model's ABSOLUTE. The substitution exists because the bar cannot tell which side of
+ * the thinking policy a thinking segment fell on — and `included: false` IS that answer, named
+ * per entry by the producer that can see the transcript (../../shared/turn-display.ts:578-585: for
+ * a thinking segment it is the THINKING axis, the entry itself still travelling). Saying "this
+ * replay is decided by a policy" when the server has already decided it would be the bar
+ * hiding a fact it is holding, so the dimmed segment's own words say what the dim shows:
+ * `not replayed into the prompt`. A published `included: true` changes nothing here — the
+ * policy note stays the honest wording for a thinking segment whose inclusion the bar cannot
+ * see per-FRAME, and the bar's own F8/H5 pins below stay byte-identical.
  */
 export const contextBarSegmentTitleOf = (block: ContextBlock): string => {
-    if (block.kind !== 'reasoning' || block.inPrompt === true) return contextSegmentTitleOf(block);
+    // `(A && !B) || B` is `A || B`: the two guards below are the ORIGINAL condition
+    // (`inPrompt === true` or a published `included: false`) stated through the shared
+    // predicate, with the `contextBlockIsExcluded` term kept explicit because a switched-off
+    // thinking window is the answer the policy note was waiting for and never gets re-worded.
+    if (block.kind !== 'reasoning' || !contextBlockIsWithheld(block) || contextBlockIsExcluded(block))
+        return contextSegmentTitleOf(block);
 
     return `${contextSegmentTitleOf({ ...block, inPrompt: true })} · ${CONTEXT_BAR_THINKING_NOTE}`;
 };
 
 /** Position + the bar's title: the label one segment carries in DOM mode and in the live region. */
 export const contextBarSegmentLabelOf = (block: ContextBlock, index: number, total: number): string => {
-    if (block.kind !== 'reasoning' || block.inPrompt === true) return contextSegmentLabelOf(block, index, total);
+    if (block.kind !== 'reasoning' || !contextBlockIsWithheld(block) || contextBlockIsExcluded(block))
+        return contextSegmentLabelOf(block, index, total);
 
     // Same substitution, applied one level up: `contextSegmentLabelOf` owns the "N of M" prefix,
     // so re-using it keeps the position wording in the model instead of copying it here.
@@ -159,18 +199,25 @@ export const contextBarSegmentLabelOf = (block: ContextBlock, index: number, tot
 };
 
 /**
- * True when EVERY byte the server marked `inPrompt !== true` belongs to a thinking segment.
+ * True when EVERY withheld byte belongs to a thinking segment.
  *
- * That is the only case in which the bar's aggregate figure may take the policy wording: a
- * byte that is un-in-prompt for a NON-thinking reason (today only a withheld tool unit could
- * be, and the projector does not stamp one) really is absent from the request, so a mixed
+ * That is the only case in which the bar's aggregate figure may take the policy wording: a byte
+ * that is unreplayed for a NON-thinking reason really is absent from the request, so a mixed
  * strip keeps the model's literal count and stays honest.
+ *
+ * R5 review, FIX A moved this test onto `contextBlockIsWithheld` rather than `inPrompt` alone,
+ * and that is load-bearing, not tidiness: the aggregate figure now also counts a segment a reader
+ * SWITCHED off (`included: false` on an entry the projector calls replayed — a tool request today,
+ * an answer window the moment src/server/api.ts can name its entry), and a predicate that still
+ * looked only at `inPrompt` would call those bytes thinking-only and re-word them as "the thinking
+ * policy decides". A switch is not a policy. Every non-thinking withheld segment now vetoes the
+ * substitution on its own, which is what the F8/H5 rule always meant.
  */
 const unpromptedBytesAreThinkingOnly = (model: ContextBarModel): boolean => {
     if (model.unpromptedChars <= 0) return false;
 
     for (const block of model.blocks) {
-        if (block.inPrompt !== true && block.kind !== 'reasoning') return false;
+        if (contextBlockIsWithheld(block) && block.kind !== 'reasoning') return false;
     }
 
     return true;
@@ -494,7 +541,18 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
 
         for (const segment of tracks.segments) {
             const tone = contextBarToneOf(segment.block);
-            const style = CONTEXT_BAR_TONE_STYLES[tone];
+            // R7 (T4a): ONE figure decides this segment's transparency — the model's
+            // `contextBarSegmentAlphaOf`, which is 0.2 when the block is out of the context the
+            // model is sent and the tone's own alpha otherwise (1, or 0.45 unsettled). The DOM
+            // mode gets the identical number from `.context-bar-segment[data-included='false']`;
+            // both come from `CONTEXT_BAR_EXCLUDED_ALPHA`, so they cannot drift (T27/R28).
+            const alpha = contextBarSegmentAlphaOf(segment.block);
+            // The dim also has to reach the NAME in this mode: in DOM mode the label is a CHILD of
+            // the dimmed button, so CSS opacity fades it automatically, and a full-alpha label
+            // over a 0.2 bar would be the one place the two renderers disagreed. Every other tone
+            // keeps its label at full alpha exactly as before, so the running tone's 0.45 bar is
+            // untouched (this is the dim state, not a tone change).
+            const labelAlpha = contextBlockIsExcluded(segment.block) ? alpha : 1;
             // C2: the band this segment's ROW occupies inside the (possibly taller) canvas.
             // One row means offset 0 and the whole canvas height, so every rectangle below is
             // the one this painter drew before lanes existed; the guard is only for a
@@ -508,7 +566,7 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
             const barHeight = Math.max(1, Math.min(segment.heightPx, band.heightPx));
             const top = band.offsetY + band.heightPx - barHeight;
 
-            context.globalAlpha = style.alpha;
+            context.globalAlpha = alpha;
             context.fillStyle = colorOf(tone);
             context.fillRect(segment.x, top, segment.width, barHeight);
             context.globalAlpha = 1;
@@ -523,10 +581,12 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
             ) {
                 // The label is painted in the track colour: the segment IS the background,
                 // so one constant stays readable on every tone.
+                context.globalAlpha = labelAlpha;
                 context.fillStyle = CONTEXT_BAR_ON_SEGMENT_TEXT;
                 context.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
                 context.textBaseline = 'middle';
                 context.fillText(segment.block.name, segment.x + 6, top + barHeight / 2);
+                context.globalAlpha = 1;
             }
 
             // Focus and hover share one highlight, so the keyboard and the pointer cannot
@@ -771,6 +831,20 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
                 button.dataset.kind = segment.block.kind;
                 button.dataset.tone = contextBarToneOf(segment.block);
                 button.dataset.state = segment.block.state ?? '';
+                // R7 (T4a): the DIM state, as a HOOK rather than a colour. Tri-state, spelled the
+                // way `data-state` above spells its absence: `''` means "no transcript entry
+                // behind this segment / unknown" and takes NO styling, `'true'` is the server
+                // naming the inclusion, `'false'` is the only value `styles.css` dims
+                // (`[data-included='false'] { opacity: 0.2 }`, the same figure
+                // `CONTEXT_BAR_EXCLUDED_ALPHA` paints in canvas mode).
+                //
+                // TRANSPARENCY ONLY, deliberately: nothing here is a `disabled` attribute, a
+                // `hidden` attribute, a `pointer-events` rule or a tabindex change, so a dimmed
+                // segment keeps its click, its Enter/Space, its place in the roving tab order and
+                // its hover/focus ring — the reader can still open the detail of a block the model
+                // is no longer being sent, which is the whole point of showing it faded rather
+                // than gone.
+                button.dataset.included = segment.block.included === undefined ? '' : String(segment.block.included);
                 button.dataset.chars = String(segment.chars);
                 button.dataset.durationMs = contextDurationAttr(segment.block);
                 // R27: which axis is which, per segment. `durationKnown='false'` is the strip's

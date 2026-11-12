@@ -483,9 +483,11 @@ describe('GET /v1/harness/plugins', () => {
             expect(setting).not.toHaveProperty('description');
         }
 
-        // The third row: `context-trimmer` (R5, and the 2026-11-10 switch split). Same closed
-        // key set, and `values` is the projection of ITS declared keys — which is the whole
-        // switch surface, twelve keys — and still leaks nothing from the other two plugins.
+        // The third row: `context-trimmer` (R5, and the 2026-11-13 three-option clean-up). Same
+        // closed key set, and `values` is the projection of ITS declared keys — which is the whole
+        // switch surface, seventeen keys: `enabled`, three toggle+horizon pairs, two whole-unit rules
+        // with their own horizon, the two string tiers and the three economy numbers — and still leaks
+        // nothing from the other two plugins.
         expect(page.body.items[2]).toEqual({
             name: 'context-trimmer',
             title: 'Context Trimmer',
@@ -499,7 +501,10 @@ describe('GET /v1/harness/plugins', () => {
             enabled: true,
             // Declared order is the row order the pane renders, and EVERY number publishes its
             // bounds: the PATCH edge only refuses an out-of-range value the plugin published a
-            // bound for, so a missing `max` is a hole in the write edge (T3b).
+            // bound for, so a missing `max` is a hole in the write edge (T3b). The rows that still
+            // carry a hint mirror the plugin's own declared copy (`TRIMMER.settings`), and the
+            // eight that no longer declare one carry NO `description` key here — the loop after
+            // this assertion is what pins that split, because `toEqual` alone cannot.
             settings: [
                 {
                     key: 'enabled',
@@ -509,20 +514,85 @@ describe('GET /v1/harness/plugins', () => {
                     description: TRIMMER.settings?.find((setting) => setting.key === 'enabled')?.description
                 },
                 {
-                    key: 'dropSupersededToolCalls',
-                    label: 'Drop superseded tool calls',
+                    key: 'trimInvalidTools',
+                    label: 'Automatic Trim invalid tools',
                     type: 'boolean',
                     default: true,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropSupersededToolCalls')?.description
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'trimInvalidTools')?.description
                 },
                 {
-                    key: 'dropInvalidToolCallsOnceAnswered',
-                    label: 'Drop invalid tool calls once answered',
+                    key: 'invalidToolTurns',
+                    label: 'Invalid tools · trim after (tool turns)',
+                    type: 'number',
+                    default: 2,
+                    min: 0,
+                    max: 4096,
+                    step: 1,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'invalidToolTurns')?.description
+                },
+                {
+                    key: 'trimThoughts',
+                    label: 'Automatic Trim thoughts',
                     type: 'boolean',
-                    default: true,
+                    default: true
+                },
+                {
+                    key: 'thoughtTurns',
+                    label: 'Thoughts · trim after (thoughts)',
+                    type: 'number',
+                    default: 2,
+                    min: 0,
+                    max: 4096,
+                    step: 1
+                },
+                {
+                    key: 'truncateToolRequests',
+                    label: 'Automatic Truncate Tool Request',
+                    type: 'boolean',
+                    default: false,
                     description: TRIMMER.settings?.find(
-                        (setting) => setting.key === 'dropInvalidToolCallsOnceAnswered'
+                        (setting) => setting.key === 'truncateToolRequests'
                     )?.description
+                },
+                {
+                    key: 'truncateTurns',
+                    label: 'Truncate tool requests after (tool turns)',
+                    type: 'number',
+                    default: 2,
+                    min: 0,
+                    max: 4096,
+                    step: 1
+                },
+                {
+                    key: 'dropSupersededToolCalls',
+                    label: 'Automatic Trim superseded tools',
+                    type: 'boolean',
+                    default: true
+                },
+                {
+                    key: 'supersededTurns',
+                    label: 'Superseded tools · trim after (tool turns)',
+                    type: 'number',
+                    default: 2,
+                    min: 0,
+                    max: 4096,
+                    step: 1
+                },
+                {
+                    key: 'dropDuplicateCalls',
+                    label: 'Automatic Trim duplicate tools',
+                    type: 'boolean',
+                    default: false,
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropDuplicateCalls')?.description
+                },
+                {
+                    key: 'duplicateTurns',
+                    label: 'Duplicate tools · trim after (tool turns)',
+                    type: 'number',
+                    default: 2,
+                    min: 0,
+                    max: 4096,
+                    step: 1
                 },
                 {
                     key: 'invalidOutcomes',
@@ -532,35 +602,11 @@ describe('GET /v1/harness/plugins', () => {
                     description: TRIMMER.settings?.find((setting) => setting.key === 'invalidOutcomes')?.description
                 },
                 {
-                    key: 'dropOldThoughts',
-                    label: 'Drop old thinking',
-                    type: 'string',
-                    default: 'turn',
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropOldThoughts')?.description
-                },
-                {
-                    key: 'thoughtKeepUnits',
-                    label: 'Earlier units that keep thinking',
-                    type: 'number',
-                    default: 0,
-                    min: 0,
-                    max: 32,
-                    step: 1,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'thoughtKeepUnits')?.description
-                },
-                {
                     key: 'supersedeMatch',
                     label: 'Supersession match',
                     type: 'string',
                     default: 'name',
                     description: TRIMMER.settings?.find((setting) => setting.key === 'supersedeMatch')?.description
-                },
-                {
-                    key: 'dropDuplicateCalls',
-                    label: 'Drop duplicate tool calls',
-                    type: 'boolean',
-                    default: false,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropDuplicateCalls')?.description
                 },
                 {
                     key: 'minTokens',
@@ -579,8 +625,7 @@ describe('GET /v1/harness/plugins', () => {
                     default: 0,
                     min: 0,
                     max: 1000000,
-                    step: 50,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'minThoughtChars')?.description
+                    step: 50
                 },
                 {
                     key: 'safetyUnits',
@@ -589,8 +634,7 @@ describe('GET /v1/harness/plugins', () => {
                     default: 0,
                     min: 0,
                     max: 4096,
-                    step: 1,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'safetyUnits')?.description
+                    step: 1
                 },
                 {
                     key: 'maxUnits',
@@ -605,19 +649,56 @@ describe('GET /v1/harness/plugins', () => {
             ],
             values: {
                 enabled: true,
+                trimInvalidTools: true,
+                invalidToolTurns: 2,
+                trimThoughts: true,
+                thoughtTurns: 2,
+                truncateToolRequests: false,
+                truncateTurns: 2,
                 dropSupersededToolCalls: true,
-                dropInvalidToolCallsOnceAnswered: true,
-                invalidOutcomes: 'failed,rejected',
-                dropOldThoughts: 'turn',
-                thoughtKeepUnits: 0,
-                supersedeMatch: 'name',
+                supersededTurns: 2,
                 dropDuplicateCalls: false,
+                duplicateTurns: 2,
+                invalidOutcomes: 'failed,rejected',
+                supersedeMatch: 'name',
                 minTokens: 0,
                 minThoughtChars: 0,
                 safetyUnits: 0,
                 maxUnits: 0
             }
         });
+
+        // THE HINT SHAPE ON THE WIRE (the 2026-11-13 trimmer copy trim). The deep-equal above is not
+        // enough to pin WHICH rows stopped explaining themselves: `toEqual` cannot tell an absent key
+        // from a key holding `undefined`, and `pluginSettingOf` (src/server/api.ts) deliberately
+        // omits an undeclared `description` rather than emitting one. So the nine rows that still
+        // carry operator-facing copy are asserted against the plugin's own declared string, and the
+        // other eight must emit NO `description` key at all — the shape Context Compacting has
+        // always had, and what the pane renders as no `.plugin-setting-hint`
+        // (src/frontend/main.ts `buildSettingField`). The exact copy text is pinned in
+        // src/plugin/context-trimmer.test.ts, which owns it.
+        const hinted = [
+            'enabled',
+            'trimInvalidTools',
+            'invalidToolTurns',
+            'truncateToolRequests',
+            'dropDuplicateCalls',
+            'invalidOutcomes',
+            'supersedeMatch',
+            'minTokens',
+            'maxUnits'
+        ];
+
+        for (const setting of page.body.items[2].settings) {
+            if (hinted.indexOf(setting.key) === -1) {
+                expect(setting).not.toHaveProperty('description');
+                continue;
+            }
+
+            expect(setting.description).toBe(
+                TRIMMER.settings?.find((declared) => declared.key === setting.key)?.description
+            );
+        }
     });
 
     it('filters with `q` and pages with `limit` like every other collection', async () => {
@@ -855,30 +936,38 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
     // garbage tier value must be ACCEPTED here — a 400 would strand an operator who edited the
     // document by hand — and the plugin must then say which documented value it ran with. The
     // acceptance half is here; the naming half is
-    // `src/plugin/context-trimmer.test.ts` › 'T3b: a garbage tier value is used as the
-    // documented fallback and named in the pass report', which drives the SAME three values
-    // through a live harness.
-    it('200s a garbage value for every trimmer tier, storing it verbatim', async () => {
+    // `src/plugin/context-trimmer.test.ts` › 'reports every fallback clause in DECLARED order when
+    // both string tiers are wrong at once', which drives the SAME values through a live harness.
+    //
+    // The 2026-11-13 clean-up left exactly TWO string tiers: `invalidOutcomes` and `supersedeMatch`.
+    // `dropOldThoughts` (off|turn|all) is gone, replaced by the `trimThoughts` boolean plus the
+    // `thoughtTurns` horizon, so a bogus thinking value is now a TYPE error rather than a tier the
+    // plugin resolves — the horizon half of that surface is pinned by the number table below.
+    it('200s a garbage value for every trimmer string tier, storing it verbatim', async () => {
         const runtime = createRuntime();
 
         const patched = await patchSettings(runtime, 'context-trimmer', {
             invalidOutcomes: 'bogus',
-            dropOldThoughts: 'sometimes',
             supersedeMatch: 'loose'
         });
 
         expect(patched.status).toBe(200);
-        // The row answers the EFFECTIVE map: the three submitted strings, every other key at its
+        // The row answers the EFFECTIVE map: the two submitted strings, every other key at its
         // declared default. Nothing is normalised away — `string` means any string.
         expect(patched.body.plugin.values).toEqual({
             enabled: true,
+            trimInvalidTools: true,
+            invalidToolTurns: 2,
+            trimThoughts: true,
+            thoughtTurns: 2,
+            truncateToolRequests: false,
+            truncateTurns: 2,
             dropSupersededToolCalls: true,
-            dropInvalidToolCallsOnceAnswered: true,
-            invalidOutcomes: 'bogus',
-            dropOldThoughts: 'sometimes',
-            thoughtKeepUnits: 0,
-            supersedeMatch: 'loose',
+            supersededTurns: 2,
             dropDuplicateCalls: false,
+            duplicateTurns: 2,
+            invalidOutcomes: 'bogus',
+            supersedeMatch: 'loose',
             minTokens: 0,
             minThoughtChars: 0,
             safetyUnits: 0,
@@ -887,23 +976,28 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(pluginsOf(runtime).snapshot()).toEqual({
             'context-trimmer': {
                 invalidOutcomes: 'bogus',
-                dropOldThoughts: 'sometimes',
                 supersedeMatch: 'loose'
             }
         });
 
-        // The descriptors themselves still publish the documented defaults as reset targets.
+        // The descriptors themselves still publish the documented defaults as reset targets, in the
+        // declared order the pane renders — each horizon immediately after the toggle it windows.
         expect(
             patched.body.plugin.settings.map((setting: { key: string; default: unknown }) => [setting.key, setting.default])
         ).toEqual([
             ['enabled', true],
+            ['trimInvalidTools', true],
+            ['invalidToolTurns', 2],
+            ['trimThoughts', true],
+            ['thoughtTurns', 2],
+            ['truncateToolRequests', false],
+            ['truncateTurns', 2],
             ['dropSupersededToolCalls', true],
-            ['dropInvalidToolCallsOnceAnswered', true],
-            ['invalidOutcomes', 'failed,rejected'],
-            ['dropOldThoughts', 'turn'],
-            ['thoughtKeepUnits', 0],
-            ['supersedeMatch', 'name'],
+            ['supersededTurns', 2],
             ['dropDuplicateCalls', false],
+            ['duplicateTurns', 2],
+            ['invalidOutcomes', 'failed,rejected'],
+            ['supersedeMatch', 'name'],
             ['minTokens', 0],
             ['minThoughtChars', 0],
             ['safetyUnits', 0],
@@ -912,31 +1006,88 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
     });
 
     // ...while a NUMBER IS refused here, because every one of them publishes `min`/`max`. This
-    // is the whole point of publishing bounds on a new knob: nonsense never reaches a turn.
+    // is the whole point of publishing bounds on a new knob: nonsense never reaches a turn. The
+    // five new horizons publish 0..4096 for exactly that reason — an unbounded horizon would let
+    // `thoughtTurns: 1e9` through the API and silently switch the rule off.
     it("400s a trimmer number outside the bounds it published, before it can reach a turn's policy", async () => {
         const runtime = createRuntime();
 
-        expect(await patchSettings(runtime, 'context-trimmer', { thoughtKeepUnits: 33 })).toEqual({
+        // A horizon above its published ceiling is refused rather than clamped, and the message
+        // names the bound the descriptor publishes.
+        for (const [key, value] of [
+            ['invalidToolTurns', 4097],
+            ['thoughtTurns', 4097],
+            ['truncateTurns', 4097],
+            ['supersededTurns', 4097],
+            ['duplicateTurns', 4097],
+            ['maxUnits', 4097]
+        ]) {
+            expect(await patchSettings(runtime, 'context-trimmer', { [key]: value })).toEqual({
+                status: 400,
+                body: {
+                    error: {
+                        message: `"${key}" of plugin "context-trimmer" must be at most 4096; ${value} was submitted.`
+                    }
+                },
+                headers: {}
+            });
+        }
+
+        // And below the floor: a NEGATIVE horizon would mean "protect nothing, and then some", which
+        // the pane cannot render, so 0 is the hard floor for every horizon and for the two economy
+        // numbers.
+        for (const key of [
+            'invalidToolTurns',
+            'thoughtTurns',
+            'truncateTurns',
+            'supersededTurns',
+            'duplicateTurns',
+            'safetyUnits',
+            'maxUnits',
+            'minTokens',
+            'minThoughtChars'
+        ]) {
+            expect(await patchSettings(runtime, 'context-trimmer', { [key]: -1 })).toEqual({
+                status: 400,
+                body: {
+                    error: {
+                        message: `"${key}" of plugin "context-trimmer" must be at least 0; -1 was submitted.`
+                    }
+                },
+                headers: {}
+            });
+        }
+
+        // The ceiling is inclusive: 4096 is accepted, and 0 (the "protect nothing" value) is
+        // accepted too. A SECOND runtime holds these, so the refusal proof below still measures a
+        // store that has never seen a write.
+        const accepted = createRuntime();
+
+        expect((await patchSettings(accepted, 'context-trimmer', { thoughtTurns: 4096 })).status).toBe(200);
+        expect((await patchSettings(accepted, 'context-trimmer', { invalidToolTurns: 0 })).status).toBe(200);
+        expect(pluginsOf(accepted).snapshot()).toEqual({
+            'context-trimmer': { invalidToolTurns: 0, thoughtTurns: 4096 }
+        });
+
+        // A boolean asked for as a string that is not the word `true`/`false` is a type error, not a
+        // truthiness question — the three toggles that replaced the old tier strings are booleans now.
+        expect(await patchSettings(runtime, 'context-trimmer', { trimThoughts: 'on' })).toEqual({
             status: 400,
             body: {
                 error: {
-                    message: '"thoughtKeepUnits" of plugin "context-trimmer" must be at most 32; 33 was submitted.'
+                    message: '"trimThoughts" of plugin "context-trimmer" must be true or false (it is declared "boolean").'
                 }
             },
             headers: {}
         });
 
-        expect(await patchSettings(runtime, 'context-trimmer', { maxUnits: 4097 })).toEqual({
+        expect(await patchSettings(runtime, 'context-trimmer', { thoughtTurns: 'soon' })).toEqual({
             status: 400,
             body: {
-                error: { message: '"maxUnits" of plugin "context-trimmer" must be at most 4096; 4097 was submitted.' }
+                error: {
+                    message: '"thoughtTurns" of plugin "context-trimmer" must be a finite number (it is declared "number").'
+                }
             },
-            headers: {}
-        });
-
-        expect(await patchSettings(runtime, 'context-trimmer', { minTokens: -1 })).toEqual({
-            status: 400,
-            body: { error: { message: '"minTokens" of plugin "context-trimmer" must be at least 0; -1 was submitted.' } },
             headers: {}
         });
 

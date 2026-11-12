@@ -132,11 +132,19 @@ export type HarnessToolCall = {
 //     materialization (src/core/branch.ts `copyMessage`) whitelist keys per role,
 //     so both list `included` explicitly or a flagged transcript fails to load.
 //
-// The exclusion UNIT is the whole tool-call block: an assistant message with
-// non-empty `toolCalls` plus every `tool` message matching one of those call ids.
-// If ANY member says `false` the ENTIRE unit is withheld — dropping a single
-// result would leave a `tool_calls[]` entry with no answer (or an orphan result),
-// which the strict pairing contract of an OpenAI-compatible transport rejects.
+// INCLUSION IS PER ENTRY (R8). `false` withholds THE ENTRY IT CARRIES — never a group of
+// them. For a tool-call turn that means the assistant entry carrying `toolCalls` and each
+// `tool` result answering one of its calls are THREE separate switches, and a policy may
+// withhold the request while the answer keeps riding (the context trimmer's "truncate tool
+// request" option is exactly that). The cost is stated rather than hidden: a result whose
+// request entry is withheld travels as an ownerless tool message, which is what a hand-edited
+// or restored transcript already produced and what an OpenAI-compatible transport accepts
+// (src/transport/openai.ts `wireMessage` field-selects a `tool` message and validates no
+// pairing). The projection keeps every EMITTED `tool_calls[]` fully answered by switching a
+// withheld result's slot for a request-only placeholder, so a strict provider is never handed
+// a half-answered block. A caller that wants a whole exchange out of the context — the
+// old unit behaviour — writes every member itself; src/core/context-pruning.ts `groupUnits`
+// is where that grouping lives now.
 //
 // THE SECOND AXIS — `reasoningIncluded?: boolean`, the assistant variant only (trimmer
 // uplift T6). It follows the SAME storage rules as `included` (absent = included, only
@@ -206,9 +214,11 @@ export type HarnessMessage =
           toolCalls?: HarnessToolCall[];
           // Kept out of the wire payload; retained so a UI can replay a turn.
           reasoning?: string;
-          // Withholds this entry from the model request (see the block comment on
-          // the union). For a tool-call turn the flag covers the WHOLE unit: this
-          // message, every matching result, and its pending placeholders.
+          // Withholds THIS entry from the model request (see the block comment on
+          // the union). For a tool-call turn that is the request entry only: the results
+          // answering these calls carry their own flag and keep riding unless they say
+          // otherwise, and an answered call whose result is withheld keeps its slot with a
+          // request-only `withheld` placeholder so the emitted block stays pairable.
           included?: boolean;
           // THE SECOND AXIS (trimmer uplift T6): withhold this entry's THINKING from the
           // model request while the entry itself still travels. Same storage convention as
@@ -235,9 +245,9 @@ export type HarnessMessage =
           // `included`).
           reasoningIncluded?: boolean;
           // Stable transcript address for THIS turn (see the block comment on the
-          // union), and therefore for the whole tool-call UNIT it opens: an id on the
-          // assistant entry addresses its results too, through `setIncluded`'s unit
-          // cascade.
+          // union). It addresses this entry and nothing else: `setIncluded(id, …)` switches
+          // the request entry, and the results answering its calls have ids of their own
+          // (minted by src/harness.ts `insertToolMessage`) to be addressed separately.
           messageId?: string;
       }
     | {
@@ -291,10 +301,12 @@ export type HarnessMessage =
           // PLACEHOLDER carries no outcome either — it is not a committed result, and the
           // placeholder text is structural, not a classification.
           outcome?: HarnessToolOutcome;
-          // Withholds this RESULT from the model request. It is a UNIT member, not
-          // a standalone choice: `false` on any result drops the assistant message
-          // that asked for it, that result, and every other result of the same
-          // call block (see the block comment on the union).
+          // Withholds THIS RESULT from the model request (R8). It is an entry-level
+          // switch, not a statement about the block: the assistant entry that asked for this
+          // call keeps travelling, and so do the sibling results. What the projection emits
+          // in this call's place is a request-only `withheld` placeholder, so an emitted
+          // `tool_calls[]` entry is never left without an answer (see the block comment on
+          // the union).
           included?: boolean;
           // Stable transcript address for THIS result (see the block comment on the
           // union). It is minted at insertion (src/harness.ts `insertToolMessage`), so
@@ -3884,7 +3896,7 @@ export type Harness = {
     //     shorter than `expectedLength`                 → HarnessError, NOTHING mutated;
     //   - an entry that would change a committed position's `role`, or move its `messageId`
     //     when both sides carry one                      → HarnessError, NOTHING mutated.
-    //     Role is what provider tool-call pairing and the exclusion unit resolve on, and a
+    //     Role is what provider tool-call pairing and the entry join resolve on, and a
     //     `messageId` is a turn's address (it is how `setIncluded` names an entry from another
     //     round), so neither may move under a text edit.
     //
@@ -4416,12 +4428,12 @@ export interface HarnessContextEntry {
     // entry must not grow a `messageId: undefined` key a `toStrictEqual` consumer would
     // have to special-case. Address those by entry.
     readonly messageId?: string;
-    // EFFECTIVE unit inclusion: `false` when this entry, or ANY other member of its
-    // unit, is disabled. A unit is a standalone message, or a whole tool-call block
-    // (an assistant message with non-empty `toolCalls` plus every `tool` message in
-    // the transcript answering one of those calls, contiguous or spliced in later) —
-    // exactly the unit `projectTranscript` filters, so a hook never has to reason
-    // about provider pairing itself.
+    // THIS ENTRY's inclusion, live (R8): `false` exactly when this entry carries the flag,
+    // and nothing else. It says NOTHING about the rest of the tool-call block — an assistant
+    // request entry and the results answering it are separate switches, each with its own
+    // entry, which is what lets a policy drop an old tool request and keep its answer. A
+    // caller that wants the whole exchange withheld reads the members it cares about (a
+    // grouping is available at src/core/context-pruning.ts `groupUnits`) and writes each one.
     //
     // This is a LIVE view of canonical state, not a snapshot: `setIncluded` followed
     // by re-reading `entry.included` answers what the transcript says NOW, and a
@@ -4477,7 +4489,7 @@ export type HarnessTurnBeforeContext = {
     // `threadId`.
     branchId?: string;
     // The PROJECTED transcript (committed history plus a placeholder for every
-    // still-running tool call, with every disabled unit already filtered out) — the
+    // still-running tool call, with every disabled entry already filtered out) — the
     // array the provider was about to receive WHEN THIS HANDLER WAS ENTERED. It is a
     // plain value and stays stable for the whole handler, which is the contract
     // src/harness.plugin.test.ts pins ("the hook sees exactly the projected transcript
@@ -4510,12 +4522,17 @@ export type HarnessTurnBeforeContext = {
     // return the same array, and its entries stay usable for `setIncluded`), and built
     // anew for EVERY handler, so a second hook sees the state the first one left.
     readonly entries: readonly HarnessContextEntry[];
-    // Switch one transcript entry — or, when it belongs to a tool-call block, the
-    // WHOLE block — off or on for the model. `false` stores `included: false`;
+    // Switch ONE canonical transcript entry off or on for the model (R8). `false` stores
+    // `included: false`;
     // `true` REMOVES the key, because only `false` is ever stored (an unflagged
     // transcript stays byte-identical, and re-enabling is the exact inverse of
-    // disabling). Targeting any member of a unit addresses every member of it, so a
-    // request never ends up with a half-answered `tool_calls[]` or an orphan result.
+    // disabling). The write never fans out: targeting the assistant entry of a tool-call
+    // block withholds that REQUEST, and the results answering it keep riding (as ownerless
+    // entries — see `HarnessMessage` above), while targeting one result withholds only that
+    // result and leaves its call's slot to the request-only `withheld` placeholder. Nothing
+    // in the projection can therefore hand a strict provider a half-answered
+    // `tool_calls[]`; what it CAN hand it is a result whose request left — that is the
+    // feature, and it is what the context trimmer's request truncation asks for.
     //
     // THE SAME REQUEST SEEPS IT: after the hook round, a run whose inclusion state
     // changed is re-projected before the provider call, unless a handler supplied an
@@ -4548,7 +4565,7 @@ export type HarnessTurnBeforeContext = {
     // are refused rather than coerced, because coercing them silently inverts the
     // caller's intent (a truthy string used to RE-ENABLE). The value is checked after
     // the target and before anything is written, so a rejected call never leaves a
-    // half-applied unit.
+    // half-applied write.
     //
     // TARGETS — three, and the first two are the shipped ones, unchanged:
     //   - an ENTRY from this round (`context.entries[i]`) — resolved by message
@@ -4558,7 +4575,9 @@ export type HarnessTurnBeforeContext = {
     //   - a `messageId` STRING (context T1.5) — the durable address, looked up by id in
     //     this agent's transcript, so it resolves in a LATER round of the same
     //     conversation, after `restore()`, and even after a `replaceHistory()` that kept
-    //     the entry. It names the SAME UNIT, so the cascade rule is identical. An id
+    //     the entry. It names the SAME ENTRY in a later round as it did in this one (R8:
+    //     `setIncluded` writes one entry, never a unit), so an id-based pass is idempotent
+    //     across rounds. An id
     //     that is no longer in the transcript is refused like a stale entry, with the
     //     cure named. A fork's round resolves the ids its source carries, because a fork
     //     COPIES ids (T1.4) — lookup is always scoped to the one transcript this run
@@ -4587,8 +4606,9 @@ export type HarnessTurnBeforeContext = {
     // `reasoning` on a projected entry is the wire signal, and the transport's echo decision
     // keys off exactly that presence check.
     //
-    // NO UNIT CASCADE, unlike `setIncluded`. Thinking belongs to exactly ONE message, so the
-    // write addresses exactly that entry — targeting the assistant entry of a tool-call block
+    // NO UNIT CASCADE on either axis (R8 made `setIncluded` per-entry too, so the two
+    // controls now differ only in what they change, not in what they address). Thinking
+    // belongs to exactly ONE message: targeting the assistant entry of a tool-call block
     // does not touch its results, and no result can carry this flag.
     //
     // ASSISTANT ENTRIES ONLY. A non-assistant target is refused the way `edit` refuses
@@ -4622,8 +4642,8 @@ export type HarnessTurnBeforeContext = {
     // WHAT A PATCH MAY NAME (role-safe by construction, T3.1):
     //   - `content`   — every role. For `system`/`user`/`assistant` this is the text the
     //     model reads. For a `tool` RESULT it is the answer text, and it is the ONLY
-    //     thing editable there: `toolCallId` and `name` are the PAIRING KEYS the unit
-    //     resolver and the transport both trust (src/harness.ts `transcriptUnits`,
+    //     thing editable there: `toolCallId` and `name` are the PAIRING KEYS the projection
+    //     and the transport both trust (src/harness.ts `projectTranscript`,
     //     src/transport/openai.ts `wireMessage`), so a patch that touches them is
     //     refused rather than re-paired.
     //   - `reasoning` — `assistant` only. It is the model's own thinking text; the
@@ -4632,10 +4652,10 @@ export type HarnessTurnBeforeContext = {
     //
     // WHAT IS REFUSED: any other key (`role`, `toolCalls`, `toolCallId`, `name`,
     // `attachments`) and `included`. A structural edit could change `toolCalls`
-    // MEMBERSHIP, which would split an assistant block from its results — the exact bug
-    // the exclusion unit exists to prevent (R2) — and attachments are validated bytes,
-    // not text. `included` is refused here because it is a different axis with a
-    // different rule (it cascades to the whole unit): use `setIncluded`. An empty patch
+    // MEMBERSHIP, which would leave results pointing at a call that is no longer
+    // there — the pairing every provider checks. `included` is refused here because it is
+    // a different axis with a different rule (it switches one entry in and out of the
+    // request rather than re-wording it): use `setIncluded`. An empty patch
     // is refused too, because "I edited nothing" is nearly always a typo in the key.
     //
     // ALL-OR-NOTHING, like `setIncluded` (T3.2): the entry is resolved and the patch is

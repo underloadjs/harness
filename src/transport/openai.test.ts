@@ -303,7 +303,7 @@ describe('openAICompatible', () => {
     });
 
     // ---------------------------------------------------------------------------
-    // Trimmer uplift T8 — the thoughts tiers made visible on the wire.
+    // Trimmer uplift T8 — the thinking policy made visible on the wire.
     //
     // NOT TESTED AGAINST REAL PROVIDERS (task brief Part K): no live DeepSeek, Kimi
     // or Anthropic round-trip was observed for `reasoning_content`. Every case here
@@ -311,19 +311,19 @@ describe('openAICompatible', () => {
     // produces — the vendors' acceptance of that shape is vendor documentation as
     // read 2026-11-10, not a measurement.
     //
-    // The tier DECISION is not the transport's: `dropOldThoughts` writes
-    // `reasoningIncluded: false` on canonical state (the `context-trimmer` built-in
-    // in `plugins/`) and `core/agent.ts` `withoutWithheldReasoning` resolves that
-    // flag OUT of the request copy, dropping the `reasoning` key entirely
+    // The policy DECISION is not the transport's: `trimThoughts` + `thoughtTurns`
+    // write `reasoningIncluded: false` on canonical state (the `context-trimmer`
+    // built-in in `plugins/`) and `core/agent.ts` `withoutWithheldReasoning` resolves
+    // that flag OUT of the request copy, dropping the `reasoning` key entirely
     // (`src/harness.inclusion.test.ts` §13 owns that contract). A projected entry
     // therefore reaches this transport with either a non-empty `reasoning` string or
-    // no `reasoning` key at all, and each tier below is written as the projected
-    // shape it produces:
-    //   `turn` (default) — the open turn's entries carry `reasoning`, every closed
-    //       turn's entry carries none;
-    //   `all`            — no entry carries `reasoning`, which is the byte-identity
-    //       case against the pre-T8 wire;
-    //   `off`            — every entry carries its thinking.
+    // no `reasoning` key at all, and each policy setting below is written as the
+    // projected shape it produces:
+    //   `trimThoughts: true` + `thoughtTurns: N` (default 2) — the N newest THOUGHT
+    //       entries carry `reasoning`, every older thought's entry carries none;
+    //   `thoughtTurns: 0`    — every thought is eligible, so no entry carries
+    //       `reasoning`, which is the byte-identity case against the pre-T8 wire;
+    //   `trimThoughts: false` — every entry carries its thinking.
     // ---------------------------------------------------------------------------
 
     // A first model step has no committed assistant entry in front of it, so the
@@ -345,7 +345,7 @@ describe('openAICompatible', () => {
         expect(JSON.stringify(body)).not.toContain('reasoning');
     });
 
-    // The `turn` tier's open-turn shape, mid tool loop: every assistant entry the
+    // The open-turn shape under the shipped thinking policy, mid tool loop: every assistant entry the
     // loop has committed keeps its thinking, so every one of them is echoed, in
     // place, with the text verbatim.
     it('echoes every open-turn thinking block on a tool-loop continuation', async () => {
@@ -397,8 +397,9 @@ describe('openAICompatible', () => {
         ]);
     });
 
-    // The `turn` tier's closed-turn shape: the projection EMITS the entry — same
-    // slot, same `content`, same `tool_calls`, so pairing is untouched — with the
+    // A withheld entry's shape (what the thinking policy writes for a thought past the
+    // horizon): the projection EMITS the entry — same slot, same `content`, same
+    // `tool_calls`, so pairing is untouched — with the
     // `reasoning` key resolved out. The field must be ABSENT, never `""`.
     it('omits reasoning_content for a closed turn whose thinking was withheld', async () => {
         const fetchMock = stubFetch(['data: [DONE]\n\n']);
@@ -485,7 +486,8 @@ describe('openAICompatible', () => {
         expect(JSON.stringify(body)).not.toContain('reasoning');
     });
 
-    // The `dropOldThoughts: 'all'` equivalence, stated as a byte comparison: with no
+    // The `trimThoughts: true` + `thoughtTurns: 0` equivalence (every thought eligible, so
+    // nothing echoed), stated as a byte comparison: with no
     // thinking anywhere in the projected transcript the payload is exactly what this
     // transport sent before the echo existed — same keys, same KEY ORDER. The
     // expected payload is declared in wire key order, because `JSON.stringify` of

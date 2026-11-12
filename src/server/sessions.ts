@@ -1209,7 +1209,13 @@ const recordedEventAt = (turn: SessionTurn, index: number | undefined): HarnessE
 // The concatenated `delta` bytes of the recorded events in [from..to] of one kind —
 // exactly how a streamed answer or think window was built, so the lazy detail returns
 // the same text the projector counted (and never a preview).
-const recordedStreamText = (
+//
+// EXPORTED for R7 (T4b): the display route stamps the thinking axis onto every `reasoning`
+// segment of a turn's bar (./api.ts `contextSegmentIncludedOf`), and it can only resolve the
+// entry that streamed a window through the SAME bytes the block detail answers with. Two
+// derivations of "this segment's recorded thinking" would let the bar and the dialog name
+// different entries for one segment; this one function is what keeps them on one entry.
+export const recordedStreamText = (
     turn: SessionTurn,
     type: 'text' | 'reasoning',
     from: number | undefined,

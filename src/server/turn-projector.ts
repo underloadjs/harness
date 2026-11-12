@@ -2205,12 +2205,17 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                             // (uplift T7/F8). This bar folds one TURN's events and never
                             // sees a transcript, so it cannot know whether THIS window's
                             // thinking rides in the next request: what decides that is the
-                            // context trimmer's thinking policy (`dropOldThoughts`, and the
-                            // per-entry `reasoningIncluded` flag it writes — T6/T8), which
-                            // withholds a CLOSED turn's thinking and keeps the OPEN turn's.
-                            // The value stays here because a client needs an answer when the
-                            // server cannot name the entry behind the segment; where it can,
-                            // the block detail read publishes the real verdict in `included`
+                            // context trimmer's thinking policy (`trimThoughts`, with its
+                            // `thoughtTurns` horizon — src/plugins/context-trimmer.plugin.ts
+                            // — and the per-entry `reasoningIncluded` flag it writes, T6),
+                            // which withholds a SUPERSEDED window's thinking and keeps a
+                            // recent one's. The value stays here because a client needs an
+                            // answer when the server cannot name the entry behind the
+                            // segment; where it can, BOTH reads that hold the transcript
+                            // publish the real verdict in `included` — the block detail read
+                            // (the chip) and the display read (the lane's dim, R7/T4b,
+                            // ./api.ts `contextSegmentIncludedOf`). Nothing here joins: the
+                            // fold stays a pure function of this turn's events.
                             // (../shared/turn-display.ts `inPrompt`).
                             inPrompt: false,
                             eventFrom: index,

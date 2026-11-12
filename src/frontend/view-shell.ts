@@ -413,6 +413,7 @@ export const createDisplayPlane = (options: DisplayPlaneOptions): DisplayPlane =
             // "everything loaded" policy. Ids the document does not hold are ignored
             // (a stale scroll event cannot request a row that is not on screen).
             const only = turnIds === undefined ? undefined : new Set(turnIds);
+
             const missing = document.turns
                 // Newest first: the tail is what the reader sees without scrolling.
                 .filter((row) => document.displays[row.id] === undefined && !active.tracked(row.id))
@@ -736,6 +737,13 @@ export const observeView = async (
         // `catalogue.updated`, `config.updated`: a pane that is showing the affected
         // resource re-reads it itself (./main.ts and the panels own those reads), so
         // the observer forwards nothing. Message bodies never ride the stream.
+        //
+        // T9 (R7) records the ONE case that is not merely "not forwarded" but never
+        // delivered here at all: `transcript.updated` is a THREAD-scope kind
+        // (../server/stream/protocol.ts:73-86, and the broker refuses it for any other
+        // scope via `isKindPublishedTo`, ../server/stream/broker.ts:487). The pane that
+        // consumes it is the followed thread's own subscription (`observeThread`
+        // `onTranscript` below), and that is where ./main.ts now arms the lane repaint.
     };
 
     sub = client.subscribe({
@@ -1005,7 +1013,15 @@ export const observeTurn = async (
 //   `thread.upsert`      → the whole roster row → `onThread` (one card repaints)
 //   `transcript.updated` → the transcript moved → `onTranscript` (re-read THAT document,
 //                          bounded to one thread: this is the frame the all-threads
-//                          fan-out used to pay for on every open)
+//                          fan-out used to pay for on every open). T9 (R7): ./main.ts also
+//                          arms ONE coalesced display re-read there, so a host transcript
+//                          write dims and un-dims the lane segments whose `included` stamp the
+//                          write moved — the flags have no frame of their own
+//                          (../harness.ts `setIncluded` → the store's silent
+//                          `noteStateChange`, src/server/sessions.ts:3307). The pass is not
+//                          scoped to this thread: scoping would skip any row whose `threadId`
+//                          the wire never stated, and under-dimming a lane the reader is
+//                          looking at is the failure that must not happen.
 //   a drop, a gap, a refused cursor, or a re-registration with an expired replay window
 //                        → `onResync` (the caller re-reads what it is showing)
 //

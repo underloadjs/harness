@@ -7501,6 +7501,10 @@ body.is-resizing-rail {
    running tool faded green, reasoning amber, prompt/instructions/answer neutral. The
    tone is never the only signal: every segment carries its state in words through
    `aria-label` and `title`, which is what forced-colors mode falls back to below.
+   Beside the tones sits ONE state, `data-included='false'` (R7/T4a): this segment's recorded
+   bytes are NOT in the context the model is sent, so it paints at 20% opacity — transparency
+   only, no colour of its own, and it keeps every one of its click, keyboard and focus
+   affordances (see the rule itself for why its POSITION in the sheet matters).
    ========================================================================= */
 
 .context-bar-host {
@@ -7617,6 +7621,37 @@ body.is-resizing-rail {
 
 .context-bar-segment[data-tone='neutral'] {
     background: var(--text);
+}
+
+/* R7 (T4a): THE DIM STATE — a segment whose bytes are NOT in the context the model is sent.
+   "80% opacity" from the request means 0.2 here: almost transparent, so a block the reader
+   excluded (or a plugin withheld, or a thinking window the trimmer dropped) visibly stops being
+   part of the prompt, while staying fully aimable.
+
+   Three things about this rule are load-bearing and pinned by `context-bar-style.test.ts`:
+
+   1. THE NUMBER MATCHES THE CANVAS. `view-context.ts` `CONTEXT_BAR_EXCLUDED_ALPHA` is 0.2 and
+      canvas mode paints `globalAlpha` from `contextBarSegmentAlphaOf`, so the one figure lives
+      in the model and both renderers resolve it. There is no colour rule here on purpose: the
+      tone table above still owns the colour, and transparency is the only new visual language.
+
+   2. THE ORDER WINS THE CASCADE. This ships AFTER the per-tone rules at the SAME specificity
+      (class + attribute), which is what lets it override the `running` tone's `opacity: 0.45` —
+      CSS cannot multiply two opacities on ONE element, so the cascade decides and the loser has
+      to be the earlier rule. A dimmed running call therefore reads at exactly 0.2 in DOM mode,
+      the same figure the canvas caps its 0.45 to.
+
+   3. TRANSPARENCY IS ALL IT DOES. No `pointer-events`, no `display`, no `visibility`, no
+      `cursor`, no `filter`. The element stays in the tab order (the roving `tabIndex` is set in
+      `ui/context-bar.ts`, untouched), still takes the click, and the two rules below still
+      resolve: `:hover` and `[data-focused='true']` sit after this one, set only `outline`, and
+      so paint their ring over a dimmed segment exactly as over a normal one (the ring rides the
+      element's own 20% opacity — fainter, never absent).
+
+   Forced-colors mode keeps it: `opacity` is transparency, not one of the colours that mode
+   rewrites, so the dim survives a high-contrast palette while the tones may not. */
+.context-bar-segment[data-included='false'] {
+    opacity: 0.2;
 }
 
 .context-bar-segment:hover {

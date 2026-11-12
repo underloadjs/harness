@@ -1295,12 +1295,19 @@ export const getBlockDetail = (id: string, turnId: string, blockId: string): Pro
     ).then((body) => body.block);
 
 // `PATCH .../turns/{t}/blocks/{b}` (T7) — the ONE write the segment dialog makes: switch
-// this segment's transcript unit into, or out of, the requests that follow. It is NOT the
+// this segment's transcript ENTRY into, or out of, the requests that follow. It is NOT the
 // whole-document transcript PUT: a dialog holds a segment, not a document, and sending a
 // document back would re-write every entry the conversation committed since the dialog was
-// opened. The route reads the transcript itself, moves ONE flag on ONE unit (the call plus
-// every result answering it — provider pairing is why the cascade exists), and answers the
-// state it PERSISTED, so the caller repaints from the server rather than from its click.
+// opened. The route reads the transcript itself, moves ONE flag on ONE ENTRY (R8 removed the
+// unit cascade: a tool request entry and the results answering it are separate entries with
+// separate flags, and provider pairing survives WITHOUT a fan-out because the projection
+// answers every emitted `tool_calls[]` slot — a withheld request lets its results ride as an
+// ownerless `tool` message, a withheld result comes back as a synthetic `withheld` one), and
+// answers the state it PERSISTED, so the caller repaints from the server rather than from its
+// click. The receipt's `included` is that ENTRY's verdict; the bar's live `context:set` frame
+// carries the SEGMENT's figure (../server/api.ts `contextSegmentIncludedOf`), so a round whose
+// request alone was switched off repaints opaque — see ../shared/turn-display.ts
+// `ContextBlock.included` for the two granularities.
 export const patchBlockInclusion = (
     id: string,
     turnId: string,

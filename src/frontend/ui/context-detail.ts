@@ -50,8 +50,9 @@
 // from, and a screen reader never sees a glyph.
 //
 // The inclusion chip is a `<button aria-pressed>` and its own row of behaviour: click, await
-// the route, repaint from the RECEIPT (never from the click — a tool unit can move under the
-// dialog while the request is out), and on a refusal state the failure IN the body using the
+// the route, repaint from the RECEIPT (never from the click — the entry this chip addresses can
+// move under the dialog while the request is out), and on a refusal state the failure IN the
+// body using the
 // note vocabulary the payload failure already uses, with the persisted chip untouched.
 //
 // Cross-references:
@@ -94,9 +95,9 @@ export type BlockDetailStatus = 'cached' | 'loading' | 'full' | 'error' | 'unwir
 
 /**
  * T7: the inclusion write (../api.ts `patchBlockInclusion`, route
- * `PATCH .../turns/{t}/blocks/{b}`). It resolves the state the server PERSISTED — the whole
- * tool-call unit's verdict — never the value it was handed, because the dialog paints from
- * the answer rather than from the click.
+ * `PATCH .../turns/{t}/blocks/{b}`). It resolves the state the server PERSISTED — that ONE
+ * transcript entry's own verdict (R8: a tool request and its results switch independently) —
+ * never the value it was handed, because the dialog paints from the answer rather than the click.
  */
 export type BlockInclusionWriteInput = {
     turnId: string;
@@ -278,7 +279,10 @@ const STATE_FACTS: Readonly<Record<StepDisplayState, { tone: BlockDetailTone; gl
  *     from the requests that follow, and this verdict WINS over any per-kind reading, because it
  *     is the one state a human set (../shared/turn-display.ts documents the tri-state). For a
  *     `reasoning` segment this is the THINKING axis: the entry keeps travelling, its thinking
- *     stops riding (trimmer uplift T7);
+ *     stops riding (trimmer uplift T7). For a `tool` segment the sentence has to name WHICH HALF
+ *     is out, because the entry verdict and the segment verdict are two different figures there
+ *     (`TOOL_WITHHELD_CHIP_TEXT` below, R5 review FIX B); every other kind states the plain
+ *     exclusion.
  *   - `included === true` — the same control switched the other way, phrased as the positive
  *     "in the prompt" so the pair reads as one switch rather than as two different questions;
  *   - ABSENT — a different question again: the server could not name ONE transcript entry
@@ -288,14 +292,78 @@ const STATE_FACTS: Readonly<Record<StepDisplayState, { tone: BlockDetailTone; gl
  *         verdict is a claim about THAT segment class and stays exactly as it was;
  *       * a `reasoning` window: `inPrompt: false` is NOT a claim about the class any more.
  *         Whether a window's thinking rides in the next request is decided per entry by the
- *         context trimmer's thinking policy (`dropOldThoughts` and the `reasoningIncluded`
- *         flag it writes, T6/T8): a CLOSED turn's thinking is withheld under the shipped
- *         default while the OPEN turn's is sent, and `off` sends all of it. So the chip states
+ *         context trimmer's thinking policy (`trimThoughts` + `thoughtTurns`, and the
+ *         `reasoningIncluded` flag it writes, T6/T8): under the shipped default the TWO newest
+ *         thoughts are sent while every older window's thinking is withheld, and
+ *         `trimThoughts: false` sends all of it. So the chip states
  *         WHERE the decision lives instead of stating a verdict it cannot have — and it says
  *         no absolute, because an absolute about thinking is what this fix removed.
  */
+/**
+ * The chip's words when a TOOL segment's verdict is `false` (R5 review, FIX B).
+ *
+ * WHY THIS KIND NEEDS ITS OWN SENTENCE. The dialog answers for ONE TRANSCRIPT ENTRY and the bar
+ * answers for ONE SEGMENT, and a tool is where those two granularities visibly come apart: the
+ * segment covers the request AND the response (`argsChars` + `resultChars` on one block) while
+ * `included` is one boolean on the OWNING entry, and the server declines to call such a segment
+ * withheld because half of it still rides (src/server/api.ts `contextSegmentIncludedOf`, the tool
+ * rule). Both figures are right at the same moment — the entry read answers `included: false` and
+ * the display read of the same turn publishes `included: true` for the same block id, and
+ * src/server/view.test.ts pins exactly that pair — so the only thing the client can fix is the
+ * WORDS: the old chip promised "excluded from context" while the lane stayed opaque and the
+ * recorded result kept reaching the model. A reader who clicked it saw a fact line contradict the
+ * strip under it, and no sentence anywhere said which of the two had moved.
+ *
+ * WHAT THE CLICK ACTUALLY DOES, in the chip's own terms: one transcript entry leaves the requests
+ * that follow, and it is the entry that ASKED for the call. The recorded response is a separate
+ * entry that this switch does not touch (the dialog cannot switch it either — the segment resolves
+ * to its owner, and `blockEntryOf` has one join), and it keeps travelling as an ownerless result.
+ * So "request excluded" is the whole claim, and "response still sent" is the half the reader would
+ * otherwise have to discover from the unchanged lane. Getting the whole round out is the
+ * context trimmer's job — it writes each member's flag itself (src/harness.ts `setIncluded` per
+ * entry), and only then does the segment's own verdict go `false`, the lane dim, and this chip
+ * take the general wording below again.
+ */
+const TOOL_WITHHELD_CHIP_TEXT = 'request excluded — response still sent';
+
+/**
+ * The tooltip's sentence for a TOOL segment (same reason as `TOOL_WITHHELD_CHIP_TEXT` above, in
+ * the longer form a hover can afford), in BOTH directions of the switch.
+ *
+ * WHY `on` NEEDED THE SAME CORRECTION AS `off` (R5 review, FIX B). The general promise — "exclude
+ * this segment from the requests that follow" — is a claim about the SEGMENT, and for a tool the
+ * click cannot deliver it: it moves the ONE entry that asked for the call, while the recorded
+ * response is a separate entry that keeps travelling (src/server/api.ts `patchSessionTurnBlock` →
+ * `blockEntryOf`, one join, and `projectTranscript` lets the orphaned result ride,
+ * src/harness.ts:6751-6856). So the hover stated an outcome the lane then contradicted — the strip
+ * stayed opaque, because the segment's own verdict really is `true` — which is the same mismatch
+ * the old chip label had, just read before the click instead of after it. Naming the half that
+ * moves is honest in both directions and costs the reader nothing on every other kind, which keeps
+ * its one-line promise byte-identical.
+ */
+const inclusionTooltipOf = (block: ContextBlock): string => {
+    if (block.included === true) {
+        if (block.kind === 'tool')
+            return 'Exclude this request entry from the requests that follow. This switch moves ONE transcript entry — the one that asked for the call — and the recorded response is a separate entry that keeps reaching the model either way, so the bar keeps this segment opaque while the request is out.';
+
+        return 'Exclude this segment from the requests that follow';
+    }
+
+    if (block.kind === 'tool')
+        return 'Replay this request entry in the requests that follow. This switch moves ONE transcript entry — the one that asked for the call — and the recorded response is a separate entry that keeps reaching the model either way, so the bar keeps this segment opaque while the request is out.';
+
+    return 'Include this segment in the requests that follow';
+};
+
 const inclusionFactOf = (block: ContextBlock): BlockDetailFact => {
     if (block.included === false) {
+        // THE ONE KIND THAT CANNOT USE THE PLAIN EXCLUSION. Everything else the server publishes
+        // a verdict for is a segment whose bytes ALL ride or ALL stop riding (a thinking window
+        // withholds exactly its own thinking, and the segment IS that thinking), so "excluded from
+        // context" is a true sentence about the segment there and stays byte-identical.
+        if (block.kind === 'tool')
+            return { fact: 'prompt', text: TOOL_WITHHELD_CHIP_TEXT, tone: 'danger', glyph: '✕' };
+
         return { fact: 'prompt', text: 'excluded from context', tone: 'danger', glyph: '✕' };
     }
 
@@ -599,7 +667,7 @@ export const openBlockDetail = (options: BlockDetailOptions): BlockDetailDialog 
 
     /**
      * T7: the toggle itself. Await the server, THEN paint — no optimistic state, because the
-     * unit this click addresses may already have moved (a plugin's `setIncluded`, another
+     * entry this click addresses may already have moved (a plugin's `setIncluded`, another
      * tab, a run that committed the result in between), and the receipt is the verdict the
      * transcript actually holds.
      */
@@ -691,9 +759,11 @@ export const openBlockDetail = (options: BlockDetailOptions): BlockDetailDialog 
         // `aria-pressed` states which way the switch is set: PRESSED means this segment IS
         // in the prompt, which is the affirmative reading of the chip's own label.
         button.setAttribute('aria-pressed', block.included === true ? 'true' : 'false');
-        button.title = block.included === true
-            ? 'Exclude this segment from the requests that follow'
-            : 'Include this segment in the requests that follow';
+        // FIX B: the promise a click makes is kind-aware, because on a tool the click moves one
+        // request entry while the recorded response keeps riding — a tooltip that promised "this
+        // segment" over there is what made the chip and the strip look like they disagreed. See
+        // `inclusionTooltipOf`.
+        button.title = inclusionTooltipOf(block);
         button.disabled = busy;
         button.addEventListener('click', () => void toggleInclusion());
 

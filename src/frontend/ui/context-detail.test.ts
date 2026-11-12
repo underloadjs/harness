@@ -148,6 +148,26 @@ const settled = (): Promise<void> => new Promise((resolve) => setTimeout(resolve
 // the dialog must not conflate any two of them.
 const switchedDetail = (included: boolean): TurnBlockDetail => ({ ...toolDetail(), included });
 
+/**
+ * THE TOOL SEGMENT'S OWN WORDS FOR `included: false` (R5 review, FIX B), stated once here as
+ * literals so the chip and the tooltip can only move deliberately.
+ *
+ * WHY A TOOL NEEDS ITS OWN SENTENCE, AND WHAT THE TWO FIGURES ARE. The dialog switches ONE
+ * transcript entry — the assistant entry that ASKED for the call — while a segment covers the
+ * request AND the response, and the server publishes the two granularities apart on purpose
+ * (src/server/view.test.ts, "dims a lane segment only when nothing of it reaches the prompt any
+ * more", pins the pair on one turn at one moment: the block-detail read answers `included: false`
+ * while the display read of the same turn publishes `true` for the same block id, because the
+ * recorded response is a separate entry that keeps reaching the model). The old wording promised
+ * "excluded from context" into that pair, so the fact line contradicted the still-opaque strip under
+ * it and no sentence anywhere said which half had moved. These two strings are the fix, and the
+ * test below pins them AGAINST the pair rather than in isolation.
+ */
+const TOOL_OFF_CHIP_TEXT = 'request excluded — response still sent';
+const TOOL_OFF_TOOLTIP_TEXT =
+    'Replay this request entry in the requests that follow. This switch moves ONE transcript entry — the one that asked for the call — and the recorded response is a separate entry that keeps reaching the model either way, so the bar keeps this segment opaque while the request is out.';
+const GENERAL_OFF_TOOLTIP_TEXT = 'Include this segment in the requests that follow';
+
 // Uplift T7 (F8): the same three verdicts on a THINKING window, where the field addresses the
 // entry's `reasoningIncluded` flag rather than an exclusion unit (../server/api.ts
 // `getSessionTurnBlock` joins it through the recorded thinking text). Three answers, and the
@@ -498,13 +518,17 @@ describe('the inclusion switch', () => {
         expect(inclusionChip()?.querySelector('.block-detail-fact-glyph')?.getAttribute('aria-hidden')).toBe('true');
         on.close();
 
-        // OFF: the reader's OWN exclusion, phrased as what it is, danger tone and a cross, and
-        // not pressed. A screen reader gets `excluded from context, not pressed, button`.
+        // OFF: the reader's OWN exclusion, danger tone, a cross, and not pressed. A screen reader
+        // gets `request excluded — response still sent, not pressed, button` — the claim of the
+        // label, not of a decoration (the glyph beside it is `aria-hidden`).
         const off = openBlockDetail({ block: meta({ included: false }), turnId: 't1', sessionId: 's1' });
 
         expect(inclusionChip()?.tagName).toBe('BUTTON');
         expect(inclusionChip()?.getAttribute('aria-pressed')).toBe('false');
-        expect(chipText()).toBe('excluded from context');
+        // THE TOOL WORDING, not the general one (FIX B): this fixture is a tool block, and a
+        // tool's OFF state is a per-entry fact, so the chip names the entry. The thinking
+        // window below keeps the general sentence, because there the segment IS the axis.
+        expect(chipText()).toBe(TOOL_OFF_CHIP_TEXT);
         expect(inclusionChip()?.dataset.tone).toBe('danger');
         expect(inclusionChip()?.querySelector('.block-detail-fact-glyph')?.textContent).toBe('✕');
         off.close();
@@ -528,6 +552,66 @@ describe('the inclusion switch', () => {
             true,
             true
         ]);
+    });
+
+    // FIX B: THE WORDS AGAINST THE TWO FIGURES, AT ONE MOMENT. The server publishes two true
+    // answers about one tool segment and both are on the screen at the same time — the entry the
+    // dialog switches (`included: false` on the assistant entry that asked for the call) and the
+    // segment the bar paints (`included: true`, because the recorded response is a SEPARATE entry
+    // that keeps travelling; src/server/api.ts `contextSegmentIncludedOf`, the tool rule). The pair
+    // is pinned server-side in src/server/view.test.ts ("dims a lane segment only when nothing of it
+    // reaches the prompt any more", and the one `display.ops` frame that test pins carrying `true`);
+    // this pins the only thing the client can fix — that the chip's sentence
+    // names the ENTRY, and that the tooltip says what the click does to the response instead of
+    // promising the segment. A non-tool segment keeps the general sentence: there, the segment IS
+    // the entry's bytes, so "excluded from context" is true of what the reader is looking at.
+    it('says which half a tool switch moves, and leaves every other kind the general sentence', () => {
+        const off = openBlockDetail({ block: meta({ included: false }), turnId: 't1', sessionId: 's1' });
+        const chip = inclusionChip() as HTMLButtonElement;
+
+        expect(chip.getAttribute('aria-pressed')).toBe('false');
+        expect(chip.title).toBe(TOOL_OFF_TOOLTIP_TEXT);
+        expect(chip.querySelector('.block-detail-fact-text')?.textContent).toBe(TOOL_OFF_CHIP_TEXT);
+        // THE PROMISE MADE FROM THE ON SIDE MOVES TOO, for this kind only (FIX B, second half). The
+        // general sentence promised the SEGMENT would leave the prompt; the click moves the one entry
+        // that asked for the call, and the lane stays opaque because the recorded response keeps
+        // riding — so the hover stated an outcome the strip underneath contradicted. Every other kind
+        // keeps the plain promise below, where the segment really is the entry's bytes.
+        off.close();
+
+        const on = openBlockDetail({ block: meta({ included: true }), turnId: 't1', sessionId: 's1' });
+
+        expect((inclusionChip() as HTMLButtonElement).title).toBe(
+            'Exclude this request entry from the requests that follow. This switch moves ONE transcript entry — the one that asked for the call — and the recorded response is a separate entry that keeps reaching the model either way, so the bar keeps this segment opaque while the request is out.'
+        );
+        expect(inclusionChip()?.querySelector('.block-detail-fact-text')?.textContent).toBe('in the prompt');
+        on.close();
+
+        // THE SAME `included: false` ON A KIND WHERE THE SEGMENT IS THE ENTRY: no special wording,
+        // and the general tooltip. Today that is a thinking window or an answer window
+        // (../server/api.ts `blockAnswerOf`, FIX C — one entry, and its bytes ARE the segment); a
+        // blanket re-wording here would have quietly implied the half-round problem exists where it
+        // does not.
+        const answer = openBlockDetail({
+            block: meta({ kind: 'assistant', id: '0-assistant-3', name: 'answer', argsChars: undefined, resultChars: undefined, included: false }),
+            turnId: 't1',
+            sessionId: 's1'
+        });
+
+        expect(inclusionChip()?.querySelector('.block-detail-fact-text')?.textContent).toBe('excluded from context');
+        expect((inclusionChip() as HTMLButtonElement).title).toBe(GENERAL_OFF_TOOLTIP_TEXT);
+        expect(inclusionChip()?.dataset.tone).toBe('danger');
+        answer.close();
+
+        // AND THE MODEL RULE IS UNCHANGED by any of this: switchability is "the server named an
+        // entry", never "the chip has kind-specific words". FIX B touched wording only, so the
+        // control's existence still follows the published verdict alone.
+        expect([
+            meta({ included: false }),
+            meta({ included: true }),
+            meta({ kind: 'assistant', id: '0-assistant-3', included: false }),
+            meta()
+        ].map(blockInclusionIsSwitchable)).toEqual([true, true, true, false]);
     });
 
     // Uplift T7 (F8): the same control on a THINKING window, where `included` is that entry's
@@ -609,7 +693,7 @@ describe('the inclusion switch', () => {
         expect(writer.inputs).toEqual([{ sessionId: 's1', turnId: 't1', blockId: '0-tool-7', included: false }]);
         expect(loader.inputs).toHaveLength(1);
         expect(inclusionChip()?.getAttribute('aria-pressed')).toBe('false');
-        expect(chipText()).toBe('excluded from context');
+        expect(chipText()).toBe(TOOL_OFF_CHIP_TEXT);
         expect(inclusionChip()?.dataset.tone).toBe('danger');
         expect(inclusionChip()?.querySelector('.block-detail-fact-glyph')?.textContent).toBe('✕');
         // Nothing failed, so the refusal line is absent, and the recorded halves are still on
@@ -695,7 +779,7 @@ describe('the inclusion switch', () => {
         (inclusionChip() as HTMLButtonElement).click();
         await settled();
 
-        expect(chipText()).toBe('excluded from context');
+        expect(chipText()).toBe(TOOL_OFF_CHIP_TEXT);
         expect(inclusionNoteText()).toBeNull();
         again.close();
     });
@@ -748,14 +832,14 @@ describe('the inclusion switch', () => {
 
         await settled();
 
-        expect(chipText()).toBe('excluded from context');
+        expect(chipText()).toBe(TOOL_OFF_CHIP_TEXT);
         expect(inclusionChip()?.getAttribute('aria-pressed')).toBe('false');
 
         // The bar re-published the SAME segment, and its own model never carries the field.
         // Silence means "no news", not "back on": the chip may not flip itself into the prompt.
         handle.refresh(meta());
 
-        expect(chipText()).toBe('excluded from context');
+        expect(chipText()).toBe(TOOL_OFF_CHIP_TEXT);
         expect(inclusionChip()?.getAttribute('aria-pressed')).toBe('false');
         expect(inclusionChip()?.dataset.tone).toBe('danger');
 

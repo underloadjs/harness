@@ -13,7 +13,7 @@
 // of the same conversation.
 //
 // It is an ADDITIONAL target, never a replacement — index and object-identity
-// resolution stay exactly as shipped (src/harness.ts `resolveUnit`), because they are
+// resolution stay exactly as shipped (src/harness.ts `resolveMessage`), because they are
 // already tested behaviour and removing them is a breaking change to a shipped surface.
 //
 // THE SHAPE: `msg-<n>`, one number per transcript
@@ -48,7 +48,7 @@
 //   - ./agent.ts                — the canonical creation points (seed, appends, commit)
 //   - ./snapshot.ts             — the persisted allowlists + backfill-on-read
 //   - ./branch.ts               — fork/branch copies (ids are carried, never re-minted)
-//   - ../harness.ts             — `insertToolMessage`, `transcriptUnits`, `setIncluded`
+//   - ../harness.ts             — `insertToolMessage`, `resolveMessage`, `setIncluded`
 
 import type { HarnessMessage } from '../types';
 

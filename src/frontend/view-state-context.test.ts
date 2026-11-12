@@ -12,9 +12,15 @@
 // inserted node, because the same ops array is replayed against the DOM after this reducer has
 // mutated the tree, and an R23 tail frame streams a prose node (`insert` empty, then `append`).
 //
+// R7 (T4a) adds `included` to the `context:set` whitelist: it is the one non-count field on a
+// block, and the only figure that can move AFTER the segment is on screen (the segment dialog's
+// toggle, or `turn.before setIncluded`). The pins below are the tri-state — `false` dims the bar,
+// `true` un-dims it, and a patch that omits the key leaves it exactly as it was, INCLUDING
+// leaving it absent.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts view-state-context.test.ts
 
-import type { ContextBlock, DisplayNode, TurnDisplay, TurnDisplayOp, TurnSection } from '../shared/turn-display';
+import type { ContextBlock, ContextBlockPatch, DisplayNode, TurnDisplay, TurnDisplayOp, TurnSection } from '../shared/turn-display';
 import { applyOpToDisplay, applyOpsToActivity } from './view-state';
 import { describe, expect, it } from 'vitest';
 
@@ -90,6 +96,52 @@ describe('context:add', () => {
         expect(display.sections[0].context).toEqual([block({ chars: 1204 })]);
     });
 
+    it('keeps a stamped included:false through a re-delivered add that restates nothing (FIX E)', () => {
+        // The bar's verdict is the ONE field the tree holds WITHOUT the frame that minted it: the
+        // display route joins it live from the transcript (src/server/api.ts `contextSegmentIncludedOf`)
+        // and a toggle republishes it as a `context:set` patch. A re-delivered `context:add` for the
+        // SAME id (a replay after a reconnect, a `turn:start` of the same turn, a display rebuild that
+        // keeps the turn's id) carries the projector's COMPILED fold, which mints no verdict at all —
+        // so a plain slot assignment dropped the verdict and the segment un-dimmed with nothing left to
+        // switch, and no repaint brought it back until some later display read happened to re-stamp it.
+        const withheld = block({ id: '0-tool-7', included: false });
+        const display = displayOf([section({ context: [withheld] })]);
+
+        expect(apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block() })).toBe(true);
+
+        // Byte-for-byte the withheld record, not a fresh copy of the fold.
+        expect(display.sections[0].context).toEqual([withheld]);
+    });
+
+    it('obeys a re-delivered add that DOES state the verdict, in both directions', () => {
+        // Carrying the verdict over is not sticky local state: a frame that names `included` replaces
+        // it wholesale, exactly like every other field on the record. `true` un-dims (the entry is back
+        // in the requests that follow), an explicit `false` wins over a tree still saying ON, and a
+        // frame that omits the key again leaves the stated verdict standing.
+        const display = displayOf([section({ context: [block({ included: false })] })]);
+
+        apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block({ included: true }) });
+        expect(display.sections[0].context).toEqual([block({ included: true })]);
+
+        apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block() });
+        expect(display.sections[0].context).toEqual([block({ included: true })]);
+
+        apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block({ included: false }) });
+        expect(display.sections[0].context).toEqual([block({ included: false })]);
+    });
+
+    it('invents no verdict for a block id the tree has never held', () => {
+        // The carry-over is per id, read from the slot it would replace. A first-seen id has nothing
+        // to preserve, and `undefined` is the contract's spelling of "this producer said nothing"
+        // (../shared/turn-display.ts `ContextBlock.included`) — never a value this reducer invents.
+        const display = displayOf([section({ context: [block({ included: false })] })]);
+
+        apply(display, { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: block({ id: '0-tool-12' }) });
+
+        expect(display.sections[0].context).toEqual([block({ included: false }), block({ id: '0-tool-12' })]);
+        expect(display.sections[0].context?.[1].included).toBeUndefined();
+    });
+
     it('drops when the frame names a section this client never adopted', () => {
         const display = displayOf([section()]);
 
@@ -103,6 +155,53 @@ describe('context:add', () => {
 // ---------------------------------------------------------------------------
 
 describe('context:set', () => {
+    it('keeps a withheld thinking window withheld while a later patch grows its count', () => {
+        // THE PATCH THAT MOVES `chars` MUST NOT MOVE THE VERDICT. A `reasoning` block's `included: false`
+        // is the THINKING axis (../shared/turn-display.ts `ContextBlock.included`), and the frame that
+        // closes the window — `context:set { chars, eventTo, endedAt }` — names no inclusion field at
+        // all. This is the same drop FIX E closed on the `context:add` path, one op later in the stream:
+        // a count-only patch that silently cleared the verdict would un-dim a window the trimmer (or the
+        // reader) had just switched off, with nothing on screen left to switch.
+        const window = block({
+            kind: 'reasoning',
+            id: '0-thinking',
+            name: undefined,
+            state: undefined,
+            chars: 40,
+            argsChars: undefined,
+            resultChars: undefined,
+            eventTo: undefined,
+            endedAt: undefined,
+            included: false
+        });
+        const display = displayOf([section({ context: [window] })]);
+
+        expect(
+            apply(display, {
+                op: 'context:set',
+                turnId: 't1',
+                sectionId: 't1:0',
+                blockId: '0-thinking',
+                patch: { chars: 96, eventTo: 12, endedAt: T + 900 } satisfies ContextBlockPatch
+            })
+        ).toBe(true);
+
+        expect(display.sections[0].context).toEqual([
+            block({
+                kind: 'reasoning',
+                id: '0-thinking',
+                name: undefined,
+                state: undefined,
+                chars: 96,
+                argsChars: undefined,
+                resultChars: undefined,
+                eventTo: 12,
+                endedAt: T + 900,
+                included: false
+            })
+        ]);
+    });
+
     it('applies every patchable field and nothing else', () => {
         const display = displayOf([section({ context: [block()] })]);
 
@@ -111,12 +210,54 @@ describe('context:set', () => {
             turnId: 't1',
             sectionId: 't1:0',
             blockId: '0-tool-7',
-            patch: { name: 'read_file', state: 'error', chars: 90, argsChars: 30, resultChars: 60, inPrompt: false, at: T + 10, endedAt: T + 910, eventTo: 12 }
+            patch: { name: 'read_file', state: 'error', chars: 90, argsChars: 30, resultChars: 60, inPrompt: false, included: false, at: T + 10, endedAt: T + 910, eventTo: 12 }
         });
 
         expect(display.sections[0].context).toEqual([
-            block({ name: 'read_file', state: 'error', chars: 90, argsChars: 30, resultChars: 60, inPrompt: false, at: T + 10, endedAt: T + 910, eventTo: 12 })
+            block({ name: 'read_file', state: 'error', chars: 90, argsChars: 30, resultChars: 60, inPrompt: false, included: false, at: T + 10, endedAt: T + 910, eventTo: 12 })
         ]);
+    });
+
+    it('applies `included` as a live verdict, and never guesses one (R7)', () => {
+        // The field this patch key EXISTS for: a reader excluding a block from the segment dialog,
+        // or a plugin writing `turn.before setIncluded`, mutates a segment that is already on
+        // screen. The bar's dim state (R7) reads exactly this value, so the reducer has to move it
+        // and NOTHING else — no default, no derivation, no re-mint.
+        const display = displayOf([section({ context: [block()] })]);
+
+        expect(apply(display, { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-tool-7', patch: { included: false } })).toBe(true);
+        expect(display.sections[0].context).toEqual([block({ included: false })]);
+
+        // A patch naming NO `included` leaves the verdict alone: that is the wire's "this frame said
+        // nothing about inclusion" (../shared/harness-stream.ts:197 — "a key the patch omits is
+        // unchanged"), and it is what every other live frame of the same turn sends.
+        apply(display, { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-tool-7', patch: { chars: 90 } });
+        expect(display.sections[0].context).toEqual([block({ included: false, chars: 90 })]);
+
+        // `true` is the reader including the block again — the dim comes back off, and the value
+        // stays PUBLISHED (the dialog has something to offer because the server named the axis).
+        apply(display, { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-tool-7', patch: { included: true } });
+        expect(display.sections[0].context).toEqual([block({ included: true, chars: 90 })]);
+
+        // THE WIRE FORM of "no verdict": `JSON.stringify` drops an `undefined` key, so a producer
+        // that cannot name the entry ships a patch WITHOUT the key. The `!== undefined` guard is
+        // what keeps that frame from silently switching the block OFF.
+        const wirePatch = JSON.parse(JSON.stringify({ chars: 42, included: undefined })) as ContextBlockPatch;
+
+        expect(Object.keys(wirePatch).sort()).toEqual(['chars']);
+        apply(display, { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-tool-7', patch: wirePatch });
+        expect(display.sections[0].context).toEqual([block({ included: true, chars: 42 })]);
+
+        // And a block the server never stamped stays WITHOUT the key: absent is "unknown", and a
+        // reducer that defaulted it to `true` would hand every segment a verdict nothing wrote.
+        const unnamed = displayOf([section({ context: [block()] })]);
+
+        apply(unnamed, { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-tool-7', patch: { state: 'error' } });
+        expect(unnamed.sections[0].context?.[0]).not.toHaveProperty('included');
+        expect(unnamed.sections[0].context).toEqual([block({ state: 'error' })]);
+
+        // A patch for a block this client never adopted is still a miss, `included` or not.
+        expect(apply(display, { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: 'nope', patch: { included: false } })).toBe(false);
     });
 
     it('treats every figure as a full replacement, never a delta', () => {

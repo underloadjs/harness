@@ -597,11 +597,33 @@ export const applyOpToDisplay = (
 
             const blocks = ensureContext(section);
             const index = blocks.findIndex((block) => block.id === op.block.id);
+            // The verdict the tree already holds for this id, read BEFORE the replacement below
+            // overwrites the slot (FIX E); `undefined` is the contract's spelling of "none".
+            const previousIncluded = index >= 0 ? blocks[index].included : undefined;
 
             if (index >= 0) {
                 // A re-delivered add replaces the segment in place rather than appending
                 // a duplicate: the id is the identity (see `node:insert` above).
-                blocks[index] = op.block;
+                //
+                // FIX E: the replacement keeps a stamped inclusion verdict the incoming frame
+                // does not restate. `included` is the ONE field on this record that the tree
+                // carries WITHOUT the frame that minted it: the display route joins it live
+                // from the transcript (src/server/api.ts `displaySectionsWithInclusionOf`), then
+                // a toggle publishes it as a `context:set` patch, and the patcher writes it onto
+                // the block (the `context:set` case below). A re-delivered `context:add` for the
+                // SAME segment carries the projector's compiled fold — a fresh `turn:start` of the
+                // same turn, a replayed frame after a reconnect, a display rebuild that keeps the
+                // turn's id — and that fold mints no verdict at all, so a plain assignment dropped
+                // a reader's `included: false` and the segment un-dimmed with nothing to switch
+                // and no repaint to bring it back until the next display read happened to re-stamp
+                // it. Carrying the verdict over is not "keeping stale state": an incoming frame
+                // that DOES state a verdict (including an explicit `undefined`, the contract's
+                // spelling of "no verdict", ../shared/turn-display.ts `ContextBlock.included`)
+                // replaces it wholesale, exactly like every other field on the record.
+                blocks[index] =
+                    previousIncluded !== undefined && op.block.included === undefined
+                        ? { ...op.block, included: previousIncluded }
+                        : op.block;
 
                 return true;
             }
@@ -626,6 +648,13 @@ export const applyOpToDisplay = (
             if (patch.argsChars !== undefined) block.argsChars = patch.argsChars;
             if (patch.resultChars !== undefined) block.resultChars = patch.resultChars;
             if (patch.inPrompt !== undefined) block.inPrompt = patch.inPrompt;
+            // R7 (T4a): the READER-facing inclusion verdict, the one this patch exists to carry
+            // live (`../shared/turn-display.ts` `ContextBlockPatch.included`). ABSENT in the
+            // patch means "this frame said nothing about inclusion" and leaves the block's value
+            // exactly as it was — including leaving it ABSENT, which the bar reads as "unknown",
+            // never as excluded. A literal `false` is therefore the only value that can dim a
+            // segment, and this reducer never derives, defaults, or re-derives one.
+            if (patch.included !== undefined) block.included = patch.included;
             if (patch.at !== undefined) block.at = patch.at;
             if (patch.endedAt !== undefined) block.endedAt = patch.endedAt;
             if (patch.eventTo !== undefined) block.eventTo = patch.eventTo;

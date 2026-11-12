@@ -325,8 +325,8 @@ const wireMessage = (message: HarnessMessage, policy: AttachmentPolicy): Record<
                 content: message.content
             };
 
-            // THE THINKING ECHO — trimmer uplift T8, the half of `dropOldThoughts`
-            // that makes the `turn` tier real on the wire.
+            // THE THINKING ECHO — trimmer uplift T8, the half of the shipped thinking policy
+            // (`trimThoughts` + `thoughtTurns`) that makes that policy real on the wire.
             //
             // The POLICY is not here: the projection already ran it. An entry whose
             // thinking was withheld is still emitted in the request, but its
@@ -336,8 +336,9 @@ const wireMessage = (message: HarnessMessage, policy: AttachmentPolicy): Record<
             // `reasoningIncluded` flag. So the transport's whole rule is "echo what
             // is present": a projected entry that still has a non-empty `reasoning`
             // string is, by construction, thinking the policy left eligible — the
-            // open turn's under the default `turn` tier, everything under `off`,
-            // nothing under `all` (which withholds every entry and therefore
+            // newest `thoughtTurns` (shipped default 2) thought entries under
+            // `trimThoughts: true`, every entry with the switch off, and nothing once
+            // the horizon is 0 (which makes every thought eligible and therefore
             // reproduces the pre-T8 wire byte-for-byte).
             //
             // `reasoning_content` is the DeepSeek-compatible spelling, the same one

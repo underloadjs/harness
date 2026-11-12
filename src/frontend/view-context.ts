@@ -241,6 +241,27 @@ export const CONTEXT_BAR_TONE_STYLES: Readonly<Record<ContextBarTone, ContextBar
     neutral: { color: '#d8deea', cssVar: '--text', alpha: 1 }
 };
 
+/**
+ * R7 (T4a) — the ONE dim state: the alpha of a segment whose bytes are NOT in the context
+ * sent to the model. "80% opacity" from the request resolves to `0.2`, i.e. almost
+ * transparent but still aimable.
+ *
+ * It is a MODEL constant, not a painter constant, for the same reason the three vertical
+ * numbers are: `styles.css` `.context-bar-segment[data-included='false']` ships the identical
+ * figure for DOM mode and `context-bar-style.test.ts` pins the two against each other, so a
+ * theme change or a tweak moves BOTH renderers together (the parity rule, T27/R28).
+ *
+ * Why a flat figure and not a product: DOM mode CANNOT multiply opacities on ONE element —
+ * `.context-bar-segment[data-tone='running']` already sets `opacity: 0.45`, and a second
+ * declaration on the same element resolves by the cascade, not by arithmetic. The dim rule wins
+ * that cascade (it ships after the tone rules at equal specificity) and therefore says exactly
+ * `0.2`, so the canvas has to say `0.2` as well or one theme change would drift the two modes.
+ * `contextBarSegmentAlphaOf` is written as a CAP for that reason: for every tone but `running`
+ * it is the same figure `tone.alpha * 0.2` would give, and for `running` (0.45) it keeps both
+ * renderers on one number instead of inventing a fourth alpha.
+ */
+export const CONTEXT_BAR_EXCLUDED_ALPHA = 0.2;
+
 // ---------------------------------------------------------------------------
 // The model
 // ---------------------------------------------------------------------------
@@ -257,7 +278,14 @@ export type ContextBarModel = {
     blocks: ContextBlock[];
     /** Sum of every segment's exact `chars` (a character total, not a token total). */
     totalChars: number;
-    /** Characters of segments the server marks `inPrompt: false` (reasoning windows). */
+    /**
+     * Recorded characters the reader is NOT getting: the sum of `chars` over every segment
+     * `contextBlockIsWithheld` names — BOTH authorities the contract publishes, the projector's
+     * static `inPrompt` claim and the live per-entry `included: false` switch (R7 + R5; the
+     * second half is the R5 review's FIX A). `ContextBlock.chars` stays the only measure (R12),
+     * and the same predicate decides one segment's own tooltip clause, so the strip's aggregate
+     * sentence and its segments cannot disagree about which bytes are missing.
+     */
     unpromptedChars: number;
     /** Segment count per kind. */
     counts: ContextBarTally;
@@ -325,6 +353,98 @@ export const contextBlockIsRunning = (block: ContextBlock): boolean =>
 export const contextBlockIsSettled = (block: ContextBlock): boolean => !contextBlockIsRunning(block);
 
 /**
+ * R7 (T4a): True when this segment is OUT of the context the model is sent — the reading of
+ * the tri-state `ContextBlock.included` (../shared/turn-display.ts:567-600), stated once here so
+ * neither renderer, nor the tooltip, nor the aggregate can disagree about what "dimmed" means.
+ *
+ * Strictly `=== false`, and that is the whole decision:
+ *   - `false` -> dim. For a tool/prose segment the WHOLE unit is withheld (that field's own
+ *     note: `projectTranscript` drops the tool-call unit around it); for a `reasoning` segment
+ *     the withheld axis is the THINKING, and its bytes are exactly what this segment shows, so
+ *     the same word ("not replayed into the prompt") is still the true one;
+ *   - `true`  -> opaque, and the state the dialog writes back when a reader re-includes it;
+ *   - ABSENT  -> opaque. It means the producer could not name the transcript entry behind the
+ *     segment (turn-display.ts:588-593), which is "unknown", NOT "excluded" — defaulting it to
+ *     excluded would dim most of every bar on a false claim.
+ *
+ * `inPrompt` is deliberately NOT consulted: it is the projector's STATIC per-KIND fallback
+ * (turn-display.ts:555-565) and a `reasoning` block is `inPrompt: false` by class even when its
+ * thinking really does ride the next request. Repurposing it would dim the open turn's thinking.
+ *
+ * DELIBERATE LIMITATION (the tool request/result split, T1): a tool's request and its response
+ * are ONE segment (`argsChars` + `resultChars`, turn-display.ts:529-546) and `included` is ONE
+ * boolean, so a partially-included tool — arguments truncated, response still in the prompt —
+ * cannot be drawn half-dimmed. The verdict follows the field: producers publish `false` only for
+ * a unit nothing of reaches the prompt, and a tool whose response still travels arrives with
+ * `true`/absent and stays opaque. If the server ever needs a per-part verdict it needs a
+ * per-part field, not a smarter renderer.
+ */
+export const contextBlockIsExcluded = (block: ContextBlock): boolean => block.included === false;
+
+/**
+ * Does what this segment SHOWS stay out of the requests that follow? This is the question the
+ * bar's withheld-characters TOTAL answers (R5 review, FIX A), and it is a WIDER question than
+ * the dimmer's `contextBlockIsExcluded` above — which is why it is a second function rather
+ * than a change to the first. The dim answers "may this ONE segment be painted dim?", where only
+ * a `false` claim about THIS segment is strong enough to grey out pixels; the total answers "how
+ * many recorded bytes is the reader NOT getting?", where the projector's static per-kind claim is
+ * evidence as well, and a number that omits a withheld segment is a lie of the same kind.
+ *
+ * TWO AUTHORITIES, ONE CLAUSE — the same pair `contextSegmentTitleOf` already prints for ONE
+ * segment (that function's trailing clause, R7 / T4a), which is the whole point of routing the
+ * aggregate through here instead of writing a second rule:
+ *   — `inPrompt !== true` — the projector's static per-kind verdict, stamped in
+ *     src/server/turn-projector.ts `blockFrom`. Every producer marks a withheld `user` entry this
+ *     way (src/harness.ts `createEntries` marks a lane turn's opening event, a steer and a note
+ *     alike), so a turn's `user` segment sits unreplayed with NO `included` at all — the server
+ *     has no entry to switch and publishes no verdict (src/server/view.test.ts pins that segment
+ *     'unaddressable'). A total that counted only the switch announced "3 characters not replayed
+ *     into the prompt" about a strip holding 1,481 of those bytes in that very segment, so the
+ *     reader's arithmetic on the sentence was wrong by the size of the prompt.
+ *   — `included === false` — the LIVE per-entry verdict, joined from the transcript at read time
+ *     (src/server/api.ts `displaySectionsWithInclusionOf`). This is the half FIX A is after: a
+ *     segment the projector calls replayed can still be switched off entry by entry, and until now
+ *     the total missed every one of those while the segment's own tooltip said it out loud.
+ *
+ * THE CASE THAT LOOKS LIKE AN OVER-COUNT AND IS NOT: an OPEN thinking window carries
+ * `inPrompt: false` beside a published `included: true`. The class claim is true of the PROJECTOR
+ * (`reasoning` is never part of the block it stamps) while the live verdict says the bytes ride,
+ * so this predicate calls the segment withheld on the projector's word — the same verdict the
+ * segment's own tooltip reaches, and not a silent one: the bar re-words its aggregate clause to
+ * `CONTEXT_BAR_THINKING_NOTE` whenever every withheld byte belongs to a thinking segment
+ * (./ui/context-bar.ts `unpromptedBytesAreThinkingOnly`), which is the F8/H5 rule that keeps "the
+ * thinking policy decides" from ever being announced as "not replayed". A strip that mixes
+ * thinking with a switched-off entry keeps the literal wording, and that predicate has to consult
+ * THIS function rather than `inPrompt` alone or the mix would take the policy wording by accident.
+ *
+ * THE ONE CASE THIS UNDER-COUNTS, AND SAYS SO BY DOING IT: a TOOL segment whose entry is switched
+ * off while the round's answer keeps riding. Its SEGMENT verdict is `true`, not `false`
+ * (src/server/api.ts `contextSegmentIncludedOf`, the tool rule — a half-included round is still
+ * partly in the prompt and one boolean cannot draw half a segment), so the fold never sees
+ * `included: false` there and those bytes are never claimed unreplayed. The total stays the
+ * conservative one; the half-round is stated where it is decided, in the chip's own words
+ * (./ui/context-detail.ts `inclusionFactOf`).
+ */
+export const contextBlockIsWithheld = (block: ContextBlock): boolean =>
+    block.inPrompt !== true || contextBlockIsExcluded(block);
+
+/**
+ * The alpha ONE segment paints at, in BOTH renderers (R7 + the T27/R28 parity rule):
+ * `CONTEXT_BAR_EXCLUDED_ALPHA` when it is out of the context, else its tone's alpha (1, or
+ * 0.45 for a call that has not settled).
+ *
+ * The dim is a CAP (`Math.min`), never a product, so the canvas cannot drift from the single
+ * CSS declaration `styles.css` ships — see `CONTEXT_BAR_EXCLUDED_ALPHA` above for the cascade
+ * argument. Canvas mode reads this figure; DOM mode reads the `data-included` hook the bar
+ * stamps and lets CSS resolve the same number.
+ */
+export const contextBarSegmentAlphaOf = (block: ContextBlock): number => {
+    const tone = CONTEXT_BAR_TONE_STYLES[contextBarToneOf(block)].alpha;
+
+    return contextBlockIsExcluded(block) ? Math.min(tone, CONTEXT_BAR_EXCLUDED_ALPHA) : tone;
+};
+
+/**
  * Flatten one turn's context into the bar's segment list.
  *
  * `display` is the compiled tree (`TurnDisplay`), undefined while a tile has no tree.
@@ -371,7 +491,10 @@ export const contextBarOf = (display: TurnDisplay | undefined): ContextBarModel 
             counts[block.kind] += 1;
             charsByKind[block.kind] += chars;
             totalChars += chars;
-            if (block.inPrompt !== true) unpromptedChars += chars;
+            // FIX A: the withheld total follows `contextBlockIsWithheld`, the SAME two-authority
+            // rule `contextSegmentTitleOf` prints per segment, so the strip's aggregate sentence
+            // and the segment's own tooltip can never disagree about which bytes are missing.
+            if (contextBlockIsWithheld(block)) unpromptedChars += chars;
 
             // The span the record supports for THIS segment (measured `durationMs`, else the
             // open/settle pair, else nothing) — see `contextBlockDurationOf`.
@@ -508,7 +631,18 @@ export const contextSegmentTitleOf = (block: ContextBlock): string => {
     const span = contextBlockDurationOf(block);
     parts.push(span === undefined ? 'time not recorded' : formatDuration(span));
 
-    if (block.inPrompt !== true) parts.push('not replayed into the prompt');
+    // R7 (T4a): TWO authorities, ONE clause. `inPrompt !== true` is the projector's static
+    // per-kind verdict; `included === false` is the LIVE reader-facing verdict that names THIS
+    // entry (../shared/turn-display.ts:567-600). Either one is a fact about the bytes this
+    // segment shows, so both print the model's own words rather than a second phrasing that
+    // could drift — and the predicate keeps the clause singular, so a segment marked by both
+    // authorities says it once. FIX A routes this clause and the bar's withheld-character TOTAL
+    // through the SAME function (`contextBlockIsWithheld`, used by `contextBarOf` above), because
+    // one rule stated twice is exactly how a tooltip and a sentence got to disagree in the first
+    // place. `ui/context-bar.ts` still re-words this clause for a THINKING segment whose
+    // inclusion nobody has named (its own F8/H5 note); a published `included: false` is exactly
+    // the verdict that substitution was waiting for, and the bar stops substituting there.
+    if (contextBlockIsWithheld(block)) parts.push('not replayed into the prompt');
 
     return parts.join(' · ');
 };
@@ -552,10 +686,21 @@ export const contextBarStatsOf = (model: ContextBarModel): string => {
 
 /**
  * The FULL figures — count, exact character total, the recorded TIME the strip spans, how
- * many segments have none, and the honest note when the server marks part of the strip
- * `inPrompt: false`. Not printed (R24); this is the text a screen reader hears inside
- * `contextBarSummaryOf`, so losing the visible line never loses the information — and since
- * T26 (R27) it is also where the strip's two axes are stated as numbers.
+ * many segments have none, and the honest note when part of the strip is not replayed into the
+ * prompt — by either authority the contract publishes (`contextBlockIsWithheld` above: the
+ * projector's static `inPrompt` claim or a live `included: false`).
+ * Not printed (R24); this is the text a screen reader hears inside `contextBarSummaryOf`, so
+ * losing the visible line never loses the information — and since T26 (R27) it is also where the
+ * strip's two axes are stated as numbers.
+ *
+ * THE TOTAL IS THE SUM OF THE SEGMENTS THAT SAY SO. Every dimmed segment, and every segment whose
+ * tooltip ends `not replayed into the prompt`, is inside this figure by construction: the fold in
+ * `contextBarOf` adds a segment's `chars` under the ONE predicate that decides both (R5 review,
+ * FIX A — the sentence used to count only the projector's static claim, so it under-read every
+ * segment a reader had switched off, while the tooltip of that very segment said it was out). The
+ * one case this leaves out is the half-included tool round, which the server itself declines to
+ * call withheld (see `contextBlockIsWithheld` above), and the dialog chip's own words carry that
+ * case (./ui/context-detail.ts `inclusionFactOf`).
  *
  * Exact strings, pinned by ./view-context.test.ts:
  *   empty (authoritative)  `no recorded context`

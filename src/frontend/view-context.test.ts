@@ -16,6 +16,7 @@
 
 import type { ContextBlock, TurnDisplay } from '../shared/turn-display';
 import {
+    CONTEXT_BAR_EXCLUDED_ALPHA,
     CONTEXT_BAR_FALLBACK_WIDTH,
     CONTEXT_BAR_GAP_PX,
     CONTEXT_BAR_LABEL,
@@ -39,6 +40,7 @@ import {
     contextBarOf,
     contextBarReplacesChips,
     contextBarRowAt,
+    contextBarSegmentAlphaOf,
     contextBarSegmentAt,
     contextBarSharesOf,
     contextBarShowsLaneTagsOf,
@@ -47,6 +49,7 @@ import {
     contextBarToneOf,
     contextBlockCharsOf,
     contextBlockDurationOf,
+    contextBlockIsExcluded,
     contextLatestTextNodeIdOf,
     contextSegmentLabelOf,
     contextSegmentTitleOf,
@@ -326,6 +329,114 @@ describe('contextBarToneOf', () => {
 });
 
 // ---------------------------------------------------------------------------
+// THE DIM STATE (R7 / T4a) — `included` is the reader-facing inclusion axis
+// ---------------------------------------------------------------------------
+
+describe('the dim state (R7)', () => {
+    it('reads the tri-state strictly, so only a published `false` is ever an exclusion', () => {
+        // THE WHOLE DECISION, in one helper both renderers and the tooltip read.
+        //   false  -> the axis this segment resolves to is switched OFF -> dim;
+        //   true   -> switched on (and what lets the dialog offer the toggle BACK);
+        //   ABSENT -> the producer could not name the transcript entry behind the segment
+        //             (../shared/turn-display.ts:588-593). That is UNKNOWN, not excluded —
+        //             defaulting it would dim every bar the trimmer never touched.
+        expect(contextBlockIsExcluded(tool({ included: false }))).toBe(true);
+        expect(contextBlockIsExcluded(tool({ included: true }))).toBe(false);
+        expect(contextBlockIsExcluded(tool())).toBe(false);
+        expect(contextBlockIsExcluded(tool({ included: undefined }))).toBe(false);
+
+        // Every kind answers the same way: the axis is the FIELD's, not the kind's.
+        expect(contextBlockIsExcluded(think({ included: false }))).toBe(true);
+        expect(contextBlockIsExcluded(prompt({ included: false }))).toBe(true);
+
+        // A running call the server has not settled is NOT thereby excluded, and an error is
+        // not either: the tone table owns those two readings, the dim state owns this one.
+        expect(contextBlockIsExcluded(tool({ state: 'running', resultChars: undefined }))).toBe(false);
+        expect(contextBlockIsExcluded(tool({ state: 'error' }))).toBe(false);
+    });
+
+    it('dims to exactly 0.2 and never touches the tone alphas', () => {
+        // The user's "80% opacity, almost transparent" resolves to 0.2, and it is ONE number:
+        // `ui/context-bar-style.test.ts` pins `styles.css`
+        // `.context-bar-segment[data-included='false'] { opacity: 0.2 }` against this constant,
+        // so DOM mode and canvas mode cannot drift (the T27/R28 parity rule).
+        expect(CONTEXT_BAR_EXCLUDED_ALPHA).toBe(0.2);
+
+        // Opaque exactly as before, per tone: 1 for everything but a call that has not settled.
+        expect(contextBarSegmentAlphaOf(tool())).toBe(1);
+        expect(contextBarSegmentAlphaOf(tool({ state: 'error' }))).toBe(1);
+        expect(contextBarSegmentAlphaOf(think())).toBe(1);
+        expect(contextBarSegmentAlphaOf(prompt())).toBe(1);
+        expect(contextBarSegmentAlphaOf(tool({ state: 'running', resultChars: undefined }))).toBe(0.45);
+
+        // Dimmed: every tone lands on 0.2 — the figure DOM mode resolves, not a product of the
+        // two, because CSS cannot multiply opacities on ONE element and the canvas must agree.
+        expect(contextBarSegmentAlphaOf(tool({ included: false }))).toBe(0.2);
+        expect(contextBarSegmentAlphaOf(tool({ state: 'error', included: false }))).toBe(0.2);
+        expect(contextBarSegmentAlphaOf(think({ included: false }))).toBe(0.2);
+        expect(contextBarSegmentAlphaOf(prompt({ included: false }))).toBe(0.2);
+        // The running tone is the one tone whose own alpha (0.45) is BELOW 1, and a dimmed
+        // running call still lands on 0.2: the dim CAPS, so both renderers say one number.
+        expect(contextBarSegmentAlphaOf(tool({ state: 'running', resultChars: undefined, included: false }))).toBe(0.2);
+
+        // `true` restores the tone alpha exactly — the dim comes back off when a reader
+        // re-includes the block, and no tone alpha is permanently lost on the way.
+        expect(contextBarSegmentAlphaOf(tool({ state: 'running', resultChars: undefined, included: true }))).toBe(0.45);
+
+        // The dim is strictly fainter than every tone, which is what makes it readable as a
+        // change rather than as a fourth colour.
+        for (const style of Object.values(CONTEXT_BAR_TONE_STYLES)) expect(CONTEXT_BAR_EXCLUDED_ALPHA).toBeLessThan(style.alpha);
+    });
+
+    it('folds the withheld total from BOTH authorities, the same pair the segments state (R5 review, FIX A)', () => {
+        const model = contextBarOf(displayOf([section('t1:0', [prompt(), think(), tool(), tool({ id: '0-tool-9', included: false })])]));
+
+        expect(model.totalChars).toBe(1546 + 1204);
+        // THE TOTAL IS THE SEGMENTS THAT SAY SO, and both authorities count: the thinking window
+        // on the PROJECTOR's static claim (`inPrompt: false`, 300) and the switched-off tool on the
+        // ENTRY's live verdict (`included: false`, 1,204). The old expectation here was 300 with the
+        // comment "the withheld figure is a per-segment fact, not a strip-level total" — that
+        // reasoning is what FIX A retired, because the same 1,204 bytes were simultaneously being
+        // announced by the segment's own tooltip as `not replayed into the prompt` while the strip's
+        // sentence left them out of its arithmetic. One predicate
+        // (`contextBlockIsWithheld`, used by `contextBarOf` AND by `contextSegmentTitleOf`) now
+        // decides both, so the tooltip and the total cannot disagree by construction.
+        expect(model.unpromptedChars).toBe(300 + 1204);
+        expect(model.counts).toEqual({ user: 1, system: 0, reasoning: 1, assistant: 0, tool: 2 });
+        expect(model.charsByKind).toEqual({ user: 42, system: 0, reasoning: 300, assistant: 0, tool: 1204 + 1204 });
+
+        // THE SWITCH IS WHAT MOVES IT. The same four blocks with the tool's inclusion left unnamed
+        // by the server total 300 again: `undefined` is "no verdict", never "excluded", so the
+        // static authority alone is what remains (../shared/turn-display.ts `ContextBlock.included`,
+        // and the single client rule `contextBlockIsExcluded` the dim follows).
+        const unnamed = contextBarOf(displayOf([section('t1:0', [prompt(), think(), tool(), tool({ id: '0-tool-9' })])]));
+
+        expect(unnamed.totalChars).toBe(model.totalChars);
+        expect(unnamed.unpromptedChars).toBe(300);
+
+        // A `true` restores it exactly as it restores the pixels: an entry the server names as
+        // travelling contributes nothing to the withheld total, whatever its kind.
+        expect(contextBarOf(displayOf([section('t1:0', [tool({ id: '0-tool-9', included: true })])])).unpromptedChars).toBe(0);
+
+        // AND THE KEY SET DID NOT MOVE. FIX A deliberately widened the MEANING of
+        // `unpromptedChars` rather than minting a second figure beside it, so every consumer that
+        // pins this model's shape — the closed-key-set pins in this file and the display-project
+        // copies in ./display-project-blocks.test.ts — keeps its exact key set.
+        expect(Object.keys(model)).toEqual([
+            'turnId',
+            'available',
+            'blocks',
+            'totalChars',
+            'unpromptedChars',
+            'counts',
+            'charsByKind',
+            'totalDurationMs',
+            'durationsUnknown'
+        ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
 // Labels: name, type, time taken, character count — and never the word "token"
 // ---------------------------------------------------------------------------
 
@@ -356,6 +467,41 @@ describe('contextSegmentTitleOf', () => {
         // A non-tool block marked not-in-prompt still gets the honest note.
         expect(contextSegmentTitleOf(prompt({ inPrompt: false }))).toBe(
             'prompt · user · 42 characters · time not recorded · not replayed into the prompt'
+        );
+    });
+
+    it('says the same words for a segment the reader withheld (R7) — once, either authority', () => {
+        // THE POINT OF THIS PIN. `included: false` is the LIVE verdict that names THIS entry
+        // (../shared/turn-display.ts:567-600), and a tool unit excluded for the next request
+        // carries `inPrompt: true`, because the projector's static rule cannot see the
+        // exclusion. A bar that only read `inPrompt` would paint a withheld call exactly like a
+        // replayed one. The wording is the model's OWN clause — no new phrasing to drift.
+        expect(contextSegmentTitleOf(tool({ included: false }))).toBe(
+            'read · tool · ok · 1,204 characters · args 20 + result 1,184 · 800ms · not replayed into the prompt'
+        );
+        expect(contextSegmentTitleOf(prompt({ included: false }))).toBe(
+            'prompt · user · 42 characters · time not recorded · not replayed into the prompt'
+        );
+
+        // A segment the server named and switched ON says nothing: `true` is not a verdict
+        // about absence, and an absent field is not one either (the cases above).
+        expect(contextSegmentTitleOf(tool({ included: true }))).toBe(
+            'read · tool · ok · 1,204 characters · args 20 + result 1,184 · 800ms'
+        );
+
+        // BOTH authorities at once still print the clause ONCE — the model has exactly one
+        // trailing clause and the two conditions are joined, not concatenated.
+        expect(contextSegmentTitleOf(think({ included: false }))).toBe(
+            'reasoning · reasoning · 300 characters · 1.2s · not replayed into the prompt'
+        );
+        expect(contextSegmentTitleOf(think({ inPrompt: true, included: false }))).toBe(
+            'reasoning · reasoning · 300 characters · 1.2s · not replayed into the prompt'
+        );
+
+        // The accessible name carries it too, because it is the model's string with a position
+        // prefix (`ui/context-bar.ts` adds nothing to it).
+        expect(contextSegmentLabelOf(tool({ included: false }), 0, 3)).toBe(
+            '1 of 3 · read · tool · ok · 1,204 characters · args 20 + result 1,184 · 800ms · not replayed into the prompt'
         );
     });
 

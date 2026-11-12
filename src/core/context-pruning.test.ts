@@ -18,7 +18,11 @@
 //      transcript produces no candidates at all — which is what makes "no write, no
 //      notification, no save" true (T4.4's durability premise);
 //   5. the token accounting, measured with the package estimator and asserted as an EXACT
-//      number, so the floor is a number an operator can reason about rather than a vibe.
+//      number, so the floor is a number an operator can reason about rather than a vibe;
+//   6. the PER-MEMBER write set (section 3b): a unit whose REQUEST another plugin already
+//      withheld is still planable, its candidate names ONLY the members still being sent, and its
+//      token figure is that write set's — the half state the context trimmer's truncate axis
+//      creates must not become unprunable, and must not be double-counted.
 //
 // Determinism note: every expected value below is hand-derived from the fixture — indices
 // from the layout, outcomes from the messages, tokens from `estimateContextTokens`'
@@ -35,6 +39,7 @@ import {
     planContextPruning,
     resolvesPrunedFailure
 } from './context-pruning';
+import type { PrunePlan } from './context-pruning';
 import { toolCallFingerprint } from './argument-fingerprint';
 import type { HarnessContextEntry, HarnessMessage, HarnessToolOutcome } from '../types';
 
@@ -106,9 +111,11 @@ const messagesOf = (specs: readonly Spec[]): HarnessMessage[] => {
 };
 
 // The entries `turn.before` hands a compactor: one per canonical message, in canonical
-// order, each carrying the EFFECTIVE inclusion of its unit. `disabled` names a unit by the
-// index of its ASSISTANT leader — the same addressing `setIncluded` cascades, spelled out
-// independently here so the grouping the policy mirrors is cross-checked by the fixture.
+// order, each carrying ITS OWN inclusion (`HarnessContextEntry.included` is per entry since
+// R8). `disabled` names a unit by the index of its ASSISTANT leader and turns off EVERY
+// member of it — which is what the shipped writer does now (it iterates
+// `PruneCandidate.members` because `setIncluded` writes one entry), and it keeps this
+// fixture an independent statement of the grouping the policy mirrors.
 const entriesOf = (specs: readonly Spec[], disabled: readonly number[] = []): HarnessContextEntry[] => {
     const messages = messagesOf(specs);
     const leaderOfCall = new Map<string, number>();
@@ -159,6 +166,38 @@ const planOf = (
     disabled: readonly number[] = [],
     options: Partial<typeof NO_GUARDS> = {}
 ) => planContextPruning(entriesOf(specs, disabled), { ...NO_GUARDS, ...options });
+
+// Withhold EXACTLY the named ENTRIES, which is the shape a per-entry writer leaves behind.
+// `entriesOf(specs, leaders)` turns a whole unit off at once — what the shipped compaction writer
+// does, because it iterates `PruneCandidate.members` — while this helper can stop at ONE entry,
+// which is what the context trimmer's truncate axis does to a tool unit: the assistant REQUEST
+// off, the tool RESULTS on (../plugins/context-trimmer.plugin.ts `planTruncatedRequests`).
+const withWithheld = (
+    entries: readonly HarnessContextEntry[],
+    indices: readonly number[]
+): HarnessContextEntry[] =>
+    entries.map((entry) =>
+        indices.indexOf(entry.index) === -1
+            ? entry
+            : ({ ...entry, included: false } as HarnessContextEntry)
+    );
+
+// Feed one pass's WRITE SET back as transcript state, the way `setIncluded` does it: exactly the
+// entries the plan named become withheld, nothing else. Re-planning over the result is a real
+// SECOND PASS over the transcript the first pass produced — the only way to prove T4.3's
+// idempotence rather than restating it.
+const applyPass = (
+    entries: readonly HarnessContextEntry[],
+    plan: PrunePlan
+): HarnessContextEntry[] => {
+    const written = new Set<number>();
+
+    for (const candidate of plan.candidates) {
+        for (const index of candidate.members) written.add(index);
+    }
+
+    return withWithheld(entries, [...written]);
+};
 
 // One line, in the shape the policy is asked to produce, so the assertions below read as
 // the rule rather than as an object dump.
@@ -601,6 +640,38 @@ describe('planContextPruning — what no pass may touch', () => {
         expect(second.belowFloor).toBe(false);
     });
 
+    it('finishes a unit whose RESULT alone was withheld — only the member still sent is written', () => {
+        // R8: the flag is per entry, so a pass that stopped halfway (or a reader who switched one
+        // answer off from the UI) leaves a unit with the leader ON and the answer OFF. Compaction
+        // owns WHOLE-UNIT pruning, so it completes the withholding rather than treating the unit
+        // as handled — and it writes only the leader, never the entry that is already off.
+        const halfPruned = withWithheld(entriesOf(FAILED_THEN_ANSWERED), [2]);
+
+        // The unit-level figure still says "not fully sent"; that figure is about the unit, and
+        // it is no longer what decides whether a pass may plan it.
+        expect(groupUnits(halfPruned)[1].included).toBe(false);
+        expect(planContextPruning(halfPruned, NO_GUARDS).candidates.map((c) => c.members)).toEqual(
+            [[1]]
+        );
+
+        // And the same holds in the other half state: whatever the pass finds still travelling is
+        // what it writes, so one more pass on an unchanged transcript is a no-op either way.
+        const requestTrimmed = withWithheld(entriesOf(FAILED_THEN_ANSWERED), [1]);
+
+        expect(planContextPruning(requestTrimmed, NO_GUARDS).candidates.map((c) => c.members)).toEqual(
+            [[2]]
+        );
+
+        for (const entries of [halfPruned, requestTrimmed]) {
+            const first = planContextPruning(entries, NO_GUARDS);
+            const second = planContextPruning(applyPass(entries, first), NO_GUARDS);
+
+            expect(second.candidates).toEqual([]);
+            expect(second.withheldTokens).toBe(0);
+            expect(second.belowFloor).toBe(false);
+        }
+    });
+
     it('protects the last N UNITS, counted from the end (T4.2)', () => {
         const specs: readonly Spec[] = [
             { user: 'go' },
@@ -663,8 +734,9 @@ describe('planContextPruning — what no pass may touch', () => {
     });
 
     it('treats an orphan tool result as its own unit and never as a candidate', () => {
-        // Its block is gone (a host `replaceHistory()`), so it classifies `unanswered`:
-        // the grouping mirrors the runtime, and the write cascade is the runtime's anyway.
+        // Its block is gone (a host `replaceHistory()`), so it classifies `unanswered`: the
+        // grouping mirrors the runtime's pairing, and the WRITE SET is the writer's now — R8
+        // removed the runtime's flag cascade, so a plan names entries and nothing fans out.
         const units = groupUnits(entriesOf([
             { user: 'go' },
             { result: { id: 'ghost', name: 'read', content: 'boom', outcome: 'failed' } }
@@ -672,6 +744,137 @@ describe('planContextPruning — what no pass may touch', () => {
 
         expect(units.map((unit) => unit.kind)).toEqual(['standalone', 'standalone']);
         expect(units[1].members.map((member) => member.index)).toEqual([1]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. THE PER-MEMBER WRITE SET — a unit whose REQUEST another pass already truncated
+//
+// WHY THIS SECTION EXISTS (the 2026-11-13 review)
+// The context trimmer has an axis that withholds a tool unit's assistant REQUEST and deliberately
+// leaves its tool RESULTS in the request (`../plugins/context-trimmer.plugin.ts`
+// `planTruncatedRequests`, whose `members` is one entry deep). That produces a HALF-WITHHELD unit.
+// When idempotence was tested at the unit (`unit.included`, the conjunction over members), such a
+// unit read as "already handled" and `planContextPruning` skipped it — so its surviving failed
+// ANSWER rode in every request for the rest of the conversation, and neither writer would name it
+// again. These cases pin the fix: the skip is per member, the write set is the still-sent half, and
+// the token figure is that write set's.
+describe('planContextPruning — the per-member write set (a request-trimmed unit)', () => {
+    // The state the trimmer's truncate write leaves behind: index 1 (the assistant request) off,
+    // index 2 (the failed result) still sent, the answering unit untouched.
+    const requestTrimmed = (): HarnessContextEntry[] =>
+        withWithheld(entriesOf(FAILED_THEN_ANSWERED), [1]);
+
+    it('plans the unit and names ONLY the surviving result (a + b)', () => {
+        const plan = planContextPruning(requestTrimmed(), NO_GUARDS);
+        const readKey = toolCallFingerprint('read', '{"path":"a.ts"}');
+
+        // (a) it is planned at all, and (b) the write set is exactly the still-included member:
+        // `[2]`, never the leader the trimmer already silenced — so the writer that iterates this
+        // list cannot put the request back. The REPORT still identifies the unit by its leader and
+        // its resolver, because that is what an operator recognises.
+        expect(plan.candidates).toEqual([
+            {
+                leaderIndex: 1,
+                leaderMessageId: 'msg-2',
+                members: [2],
+                outcomes: ['failed'],
+                keys: [readKey],
+                resolverIndex: 3,
+                resolverMessageId: 'msg-4',
+                tokens: 7
+            }
+        ]);
+        expect(groupUnits(requestTrimmed())[1].members.map((member) => member.included)).toEqual([
+            false,
+            true
+        ]);
+    });
+
+    it('reports the saving of what it withholds, not of the whole unit (d)', () => {
+        // 7 tokens is the RESULT alone: 23 content chars + the 4-char tool name = 27 of the
+        // fixture's 102 characters, so ceil(102/4) - ceil(75/4) = 26 - 19 = 7. The whole unit is
+        // worth 12 (asserted above in section 2), and the difference — the leader's own 5 — is
+        // text that left the prompt on an EARLIER turn, by the trimmer, and must not be claimed
+        // by this pass.
+        const plan = planContextPruning(requestTrimmed(), NO_GUARDS);
+
+        expect(plan.withheldTokens).toBe(7);
+        expect(plan.candidates[0].tokens).toBe(7);
+        expect(plan.belowFloor).toBe(false);
+        expect(plan.consideredUnits).toBe(4);
+
+        // Cross-check the number against the estimator itself, so it is derived and not read back
+        // out of production: this is exactly the delta the plan is contractually measuring.
+        const messages = requestTrimmed().map((entry) => entry.message);
+
+        expect(
+            estimateContextTokens(messages) -
+                estimateContextTokens(messages.filter((_, index) => index !== 2))
+        ).toBe(7);
+
+        // And the floor judges THAT figure: a request-trimmed unit whose surviving answer is worth
+        // 7 is refused by a floor of 8 (cache churn for nothing), and taken by one of 7.
+        expect(planContextPruning(requestTrimmed(), { ...NO_GUARDS, minTokens: 8 }).belowFloor).toBe(
+            true
+        );
+        expect(
+            planContextPruning(requestTrimmed(), { ...NO_GUARDS, minTokens: 7 }).candidates.map(
+                (candidate) => candidate.members
+            )
+        ).toEqual([[2]]);
+    });
+
+    it('is idempotent: the second pass over the transcript it produced writes nothing (c)', () => {
+        const entries = requestTrimmed();
+        const first = planContextPruning(entries, NO_GUARDS);
+
+        expect(first.candidates.map((candidate) => candidate.members)).toEqual([[2]]);
+
+        // The state the NEXT round actually sees: entry 2 withheld as well, so the unit is now
+        // FULLY excluded — which is the only state the idempotence skip may fire on.
+        const after = applyPass(entries, first);
+
+        expect(after.map((entry) => entry.included)).toEqual([true, false, false, true, true, true]);
+
+        const second = planContextPruning(after, NO_GUARDS);
+
+        expect(second.candidates).toEqual([]);
+        expect(second.withheldTokens).toBe(0);
+        expect(second.belowFloor).toBe(false);
+
+        // A third pass, for the "nothing ever accumulates" claim: no writes, no notification, no
+        // save, forever (T4.4's durability premise).
+        expect(planContextPruning(applyPass(after, second), NO_GUARDS).candidates).toEqual([]);
+    });
+
+    it('still keeps a unit whose EVERY member is withheld', () => {
+        // The preserved half of T4.3: per-member idempotence is not "plan it again", it is "plan it
+        // while anything of it is still sent". A fully-withheld unit is invisible, exactly as
+        // before, and that is what keeps a second pass free of writes.
+        const fullyWithheld = withWithheld(entriesOf(FAILED_THEN_ANSWERED), [1, 2]);
+
+        expect(planContextPruning(fullyWithheld, NO_GUARDS).candidates).toEqual([]);
+    });
+
+    it('does not widen what may be pruned: a truncated RESOLVER still resolves nothing', () => {
+        // The rule the review left alone, pinned so it cannot be mistaken for the same oversight:
+        // a resolver is believed only while it is WHOLLY in the prompt. Its request going off
+        // (index 3, results still on) means this pass prunes nothing — the conservative direction,
+        // and the operator's "only prune when the resolution rule genuinely matched".
+        const resolverTruncated = withWithheld(entriesOf(FAILED_THEN_ANSWERED), [3]);
+
+        expect(groupUnits(resolverTruncated)[2].kind).toBe('answered');
+        expect(groupUnits(resolverTruncated)[2].included).toBe(false);
+        expect(planContextPruning(resolverTruncated, NO_GUARDS).candidates).toEqual([]);
+
+        // Turning the resolver's request back on makes the match fire again, which is the whole
+        // point of the stricter gate: the answer has to be visibly ANSWERING something.
+        expect(
+            planContextPruning(entriesOf(FAILED_THEN_ANSWERED), NO_GUARDS).candidates.map(
+                (candidate) => candidate.resolverIndex
+            )
+        ).toEqual([3]);
     });
 });
 
@@ -788,6 +991,31 @@ describe('groupUnits', () => {
         expect(units[2].members.map((member) => member.index)).toEqual([2]);
         expect(units[0].kind).toBe('standalone');
         expect(units[1].kind).toBe('answered');
+    });
+
+    it('switches `included` per ENTRY: the unit figure is the conjunction over members (R8)', () => {
+        const entries = entriesOf(FAILED_THEN_ANSWERED);
+        // The failed unit of the shared fixture: leader #1 (the assistant request) plus its
+        // result #2.
+        const failedUnit = (list: readonly HarnessContextEntry[]) => groupUnits(list)[1];
+        const withFlag = (index: number): HarnessContextEntry[] =>
+            entries.map((entry) => (entry.index === index ? ({ ...entry, included: false } as HarnessContextEntry) : entry));
+
+        expect(failedUnit(entries).members.map((member) => member.index)).toEqual([1, 2]);
+
+        // Baseline: every member on means the unit is sent.
+        expect(failedUnit(entries).included).toBe(true);
+        // The leader's own flag, alone...
+        expect(failedUnit(withFlag(1)).included).toBe(false);
+        // ...and the RESULT's own flag, alone, answer the same way. `entry.included` stays
+        // per entry (a consumer reads the one it cares about); the unit figure exists only so
+        // a policy can ask the unit-level question honestly.
+        expect(failedUnit(withFlag(2)).included).toBe(false);
+        expect(failedUnit(withFlag(2)).members[1].included).toBe(false);
+        expect(failedUnit(withFlag(2)).members[0].included).toBe(true);
+
+        // A flag on a DIFFERENT unit says nothing about this one.
+        expect(failedUnit(withFlag(3)).included).toBe(true);
     });
 
     it('pins the fingerprint format the plan reports', () => {

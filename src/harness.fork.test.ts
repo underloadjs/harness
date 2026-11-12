@@ -453,7 +453,7 @@ describe('threadFork runtime', () => {
         expect(writer.branch(record.branchId)?.messages.length).toBeGreaterThan(0);
     });
 
-    it('carries the context-inclusion flag into a branch transcript and keeps the disabled unit off the branch request', async () => {
+    it('carries the context-inclusion flag into a branch transcript and keeps each disabled entry off the branch request', async () => {
         const seen: HarnessStreamRequest[] = [];
 
         const entry = brain(
@@ -529,14 +529,21 @@ describe('threadFork runtime', () => {
         ]);
         expect(JSON.stringify(record.messages)).not.toContain('"included":true');
 
-        // (2) The branch's own provider request runs through the same projection, so
-        //     the disabled standalone turn and the ENTIRE disabled unit are absent —
-        //     and the surviving pending-call pair stays exact.
+        // (2) The branch's own provider request runs through the same projection, so the
+        //     disabled standalone turn and the disabled REQUEST entry are absent — while the
+        //     result that answers the switched-off call keeps riding, exactly as it does on the
+        //     root side (R8: one flag, one entry). The surviving pending-call pair stays exact.
         const branchRequest = seen.find((request) => latestUser(request) === 'inspect');
         expect(branchRequest).toBeDefined();
         expect(branchRequest!.messages).toEqual([
             { role: 'system', content: 'SYS' },
             { role: 'user', content: 'seed' },
+            {
+                role: 'tool',
+                content: 'ok',
+                toolCallId: `call_${branchId}_1`,
+                name: 'tasks'
+            },
             { role: 'user', content: 'root input' },
             {
                 role: 'assistant',
@@ -553,7 +560,10 @@ describe('threadFork runtime', () => {
             },
             { role: 'user', content: 'inspect' }
         ]);
-        expect(pairIssues(branchRequest!.messages)).toEqual([]);
+        // The one deliberate leak: a riding result with no owning block. It is the SAME shape
+        // the root transcript's projection produces for the same flag, so a branch cannot be a
+        // second, stricter projection.
+        expect(pairIssues(branchRequest!.messages)).toEqual([`orphan tool#2: call_${branchId}_1`]);
         expect(JSON.stringify(branchRequest!.messages)).not.toContain('included');
 
         // (3) Forking never mutates the source: both disabled entries are still in

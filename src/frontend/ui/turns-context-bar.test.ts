@@ -503,7 +503,7 @@ describe('one bar per turn', () => {
         // mistake this strip for a context-window gauge.
         // The TRAILING clause names the thinking POLICY rather than an absolute (uplift F8/H5):
         // all 200 un-in-prompt characters here belong to the `reasoning` block, and the bar
-        // re-words that one count because `dropOldThoughts` decides it per ENTRY while the
+        // re-words that one count because `trimThoughts` + `thoughtTurns` decide it per ENTRY while the
         // projector marks the whole class — ./context-bar.ts `contextBarAccessibleNameOf`.
         expect(bar.getAttribute('aria-label')).toBe(
             'context bar: width is time taken, height is recorded characters · 5 segments · 1,574 characters' +
@@ -668,6 +668,44 @@ describe('a running turn', () => {
         expect(segments[0].dataset.tone).toBe('error');
         expect(segments[0].dataset.chars).toBe('90');
         expect(tile().querySelectorAll('.tool')).toHaveLength(0);
+    });
+
+    it('dims and un-dims a segment on a frame that moves only `included` (R7)', () => {
+        // THE LIVE HALF. A reader excluding the block in the segment dialog, or a plugin writing
+        // `turn.before setIncluded`, sends a `context:set` naming ONE field on a segment that is
+        // already on screen: view-state.ts applies it, the tile re-syncs, and the bar's DOM hook
+        // follows — no re-mint, no remove+add, no second bar. A dim state that only appeared on a
+        // fresh `context:add` would never move while the reader watched.
+        const view = documentOf([summary()], { t1: [rootSection({ context: [block()] })] });
+        const { board, tile } = mount();
+        board.upsertView(summary(), view).renderDisplay((view.displays as Record<string, TurnDisplay>).t1);
+
+        // Nothing published inclusion yet, so the segment carries the UNKNOWN spelling and CSS
+        // dims nothing (`[data-included='false']` is the only dimming selector).
+        expect(blocksOf(tile()).map((node) => node.dataset.included)).toEqual(['']);
+
+        frame(board, view, 't1', [{ op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-tool-7', patch: { included: false } }]);
+
+        const dimmed = blocksOf(tile())[0];
+
+        expect(dimmed.dataset.included).toBe('false');
+        expect(dimmed.dataset.blockId).toBe('0-tool-7');
+        // The dim is ALL that moved: same tone, same characters, same tab stop, same bar.
+        expect(dimmed.dataset.tone).toBe('ok');
+        expect(dimmed.dataset.chars).toBe('28');
+        expect(dimmed.tabIndex).toBe(0);
+        expect(tile().querySelectorAll('.context-bar')).toHaveLength(1);
+        // ...and the words follow the transparency, in the tile's own rendering.
+        expect(dimmed.title).toBe('read · tool · ok · 28 characters · args 10 + result 18 · 800ms · not replayed into the prompt');
+
+        // Including it again clears the hook, so `[data-included='false']` stops matching.
+        frame(board, view, 't1', [{ op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-tool-7', patch: { included: true } }]);
+
+        const lit = blocksOf(tile())[0];
+
+        expect(lit.dataset.included).toBe('true');
+        expect(lit.title).toBe('read · tool · ok · 28 characters · args 10 + result 18 · 800ms');
+        expect(tile().querySelectorAll('.context-bar')).toHaveLength(1);
     });
 
     it('converts a tile that had already painted cards into the bar exactly once', () => {

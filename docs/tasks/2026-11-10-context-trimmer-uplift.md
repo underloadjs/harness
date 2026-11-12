@@ -536,7 +536,11 @@ request.
 ## Part F — Invariants a switch must not break
 
 1. **Pair-atomicity.** A tool unit is withheld whole, or not at all
-   (`src/harness.ts:6576-6612`). The oracle: `wireIssues`/`pairIssues` stays empty (the same
+   (`src/harness.ts:6576-6612`). "Whole" is EVERY member that is still being sent: a unit whose
+   REQUEST an earlier `truncateToolRequests` pass already withheld is COMPLETED by the next
+   whole-unit write rather than skipped — the Update section at the end of this file — and no pass
+   ever re-enables the half another writer silenced.
+   The oracle: `wireIssues`/`pairIssues` stays empty (the same
    check `src/plugin/context-trimmer.test.ts:983-1072` already borrows from
    `src/harness.inclusion.test.ts`).
 2. **Withhold-only within a session.** No switch may re-enable an entry an earlier turn withheld
@@ -1119,7 +1123,40 @@ What the columns actually say (this part is a finding, not a fixture artefact):
   it). None of those four was observable from a scripted provider, so none is claimed above.
 
 
-## Update (2026-11-11)
+## Update (2026-11-13)
+
+**The whole-unit rules are per MEMBER (T10, and the same fix in compaction's rule 5).** Part B1's
+predicate row — "(1) still `included` (idempotence)" — described candidacy at `unit.included`, the
+conjunction over every member of the unit. That was load-bearing against a state this plugin creates
+for itself: `truncateToolRequests` writes the assistant REQUEST alone, so the unit's failed RESULT
+goes on riding, the conjunction reads `false`, and the invalid / superseded / duplicate rules never
+looked at the unit again. With both horizons at their declared `2` the two axes compare the SAME tool
+turns, so whichever fired first kept the other from ever acting — the junk answer the
+`trimInvalidTools` promise is about rode in every later request. The rule now is:
+
+- **Eligibility and the write set are both per member** (`includedMembersOf` in
+  `src/plugins/context-trimmer.plugin.ts`, mirroring the private helper in
+  `src/core/context-pruning.ts`). A pass skips a unit only when NOTHING is left to write, so the
+  idempotence guarantee (Part D.5: no flag, no notification, no save, no diagnostic on a re-run) is
+  exactly as strong as it was, and the half-withheld half stays reachable. The mirror half state
+  (a result off, the request still on) is COMPLETED rather than skipped, and no axis ever re-enables
+  an entry another writer silenced.
+- **The precedence orders the writes of ONE pass; it is not a permanent claim on a unit.** A unit that
+  truncated on an earlier turn is still trimmable, and the rule that finishes it owns the record:
+  `data.units[].requestAlreadyWithheld: true`, the line's ` (request already withheld)` clause,
+  `data.truncated` empty, and `policy.fired` without `truncateToolRequests` for a write this pass did
+  not make. `minTokens` measures the same write set, so the request text is never billed twice.
+- **The RESOLVER gate stays unit-level, deliberately.** A unit that is not fully included still
+  resolves nothing: withholding a failure on the strength of an answer the model cannot see would drop
+  both halves, and relaxing that gate would widen what leaves the context rather than just decide
+  where the write lands. The same conservatism is core's `UnitFacts.included` note.
+
+Pinned by `context-trimmer plan (planTrimmedUnits)` → "finishes a unit whose REQUEST an earlier pass
+already withheld, per rule" (all three rules plus both half states), the economy knob case "bills a
+pass for the members it WITHHOLDS, never for the whole unit", and the two `executeTrimming` cases
+that assert one write, the completion attribution and the disjoint `units` / `truncated` lists in
+`src/plugin/context-trimmer.test.ts`.
+
 
 Anchor re-pointing only: T1–T9 plus T3b are landed, the Measurements section stands, and no code was
 touched in this pass. What follows is where the anchors quoted by Parts B, G and J now sit — each

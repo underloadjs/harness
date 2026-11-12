@@ -23,10 +23,20 @@
 //
 // F8 / uplift H5 pins the WORDING SPLIT on the un-in-prompt clause: a REASONING segment says
 // `replay decided by the thinking policy` (the projector marks that whole class
-// `inPrompt: false` per KIND, while `dropOldThoughts` decides per ENTRY), and every other
+// `inPrompt: false` per KIND, while `trimThoughts` + `thoughtTurns` decide per ENTRY), and every other
 // un-in-prompt segment keeps the model's absolute byte-for-byte. ./context-bar.ts carries the
 // argument for why the bar cannot resolve a per-entry verdict; the pins below are the exact
 // strings, both modes.
+//
+// R7 (T4a) adds the ONE dim state: a segment whose `included` is the literal `false` paints at
+// 0.2 in BOTH modes — `globalAlpha: 0.2` in the recording fake here, `opacity: 0.2` in
+// `styles.css` (pinned by ./context-bar-style.test.ts against the same
+// `CONTEXT_BAR_EXCLUDED_ALPHA`). `true` and ABSENT paint normally, because absent means "no
+// transcript entry behind this segment / unknown", not "withheld". The pins below are therefore
+// mostly about what DOES NOT change: the same rectangle in the same colour, the same roving
+// `tabIndex`, the same click and Enter activation, the same focus ring at full alpha, and a
+// tooltip/`aria-label` that says `not replayed into the prompt` instead of inventing a second
+// phrasing.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/context-bar.test.ts
 
@@ -137,10 +147,26 @@ const mount = (blocks: ContextBlock[] | undefined, options: Parameters<typeof mo
 
 type Paint = { x: number; y: number; width: number; height: number; fill: string; alpha: number };
 
-const fakeContext = (): { context: CanvasRenderingContext2D; paints: Paint[]; texts: unknown[]; outlines: unknown[]; transforms: unknown[] } => {
+// R7 (T4a): the in-segment NAME is painted at its own alpha, so the recording keeps it separate
+// from `texts` (which every existing assertion compares as exact 3-tuples). DOM mode fades the
+// label with its button automatically — CSS opacity applies to the element's children — and this
+// is the canvas' half of that parity promise.
+type PaintRecording = {
+    context: CanvasRenderingContext2D;
+    paints: Paint[];
+    texts: unknown[];
+    textAlphas: number[];
+    outlines: unknown[];
+    outlineAlphas: number[];
+    transforms: unknown[];
+};
+
+const fakeContext = (): PaintRecording => {
     const paints: Paint[] = [];
     const texts: unknown[] = [];
+    const textAlphas: number[] = [];
     const outlines: unknown[] = [];
+    const outlineAlphas: number[] = [];
     const transforms: unknown[] = [];
 
     const context = {
@@ -155,7 +181,9 @@ const fakeContext = (): { context: CanvasRenderingContext2D; paints: Paint[]; te
         setTransform: (...args: unknown[]) => {
             paints.length = 0;
             texts.length = 0;
+            textAlphas.length = 0;
             outlines.length = 0;
+            outlineAlphas.length = 0;
             transforms.length = 0;
             transforms.push(args);
         },
@@ -163,11 +191,21 @@ const fakeContext = (): { context: CanvasRenderingContext2D; paints: Paint[]; te
         fillRect: (x: number, y: number, width: number, height: number) => {
             paints.push({ x, y, width, height, fill: String(context.fillStyle), alpha: context.globalAlpha });
         },
-        strokeRect: (...args: unknown[]) => outlines.push(args),
-        fillText: (...args: unknown[]) => texts.push(args)
+        // R7: the focus/hover ring must stay at FULL alpha over a dimmed bar, which is the one
+        // place the canvas is deliberately BRIGHTER than DOM mode (a CSS `outline` rides its
+        // element's opacity and cannot be lifted out of it) — recorded so the parity claim is
+        // testable rather than aspirational.
+        strokeRect: (...args: unknown[]) => {
+            outlines.push(args);
+            outlineAlphas.push(context.globalAlpha);
+        },
+        fillText: (...args: unknown[]) => {
+            texts.push(args);
+            textAlphas.push(context.globalAlpha);
+        }
     } as unknown as CanvasRenderingContext2D;
 
-    return { context, paints, texts, outlines, transforms };
+    return { context, paints, texts, textAlphas, outlines, outlineAlphas, transforms };
 };
 
 const stubCanvas = (): ReturnType<typeof fakeContext> => {
@@ -234,8 +272,9 @@ describe('context bar, DOM mode', () => {
     it('says the thinking POLICY on a thinking segment, and keeps the absolute everywhere else (uplift F8 / H5)', () => {
         // WHY THIS IS THE PIN. `../view-context.ts` prints one clause for EVERY block the server
         // marks `inPrompt !== true`, and `../server/turn-projector.ts` mints that flag for the
-        // whole REASONING CLASS. Once `dropOldThoughts` exists (shipped default `turn`, which
-        // replays the OPEN turn's thinking) that clause is no longer a property of the class,
+        // whole REASONING CLASS. The trimmer's thinking policy (`trimThoughts` + `thoughtTurns`;
+        // the shipped default replays the two newest thoughts, whatever turn they sit in) decides
+        // per ENTRY, so that clause is no longer a property of the class,
         // and the bar has no per-entry verdict to read — only the block-detail route can name
         // the entry behind a segment. So the bar states the policy for thinking, and keeps the
         // fact for every segment that is un-in-prompt for a real reason.
@@ -267,6 +306,150 @@ describe('context bar, DOM mode', () => {
         expect(bar.element.getAttribute('aria-label')).toBe(
             'context bar: width is time taken, height is recorded characters · 3 segments · 190 characters' +
                 ' · 2.4s of recorded time · 140 characters not replayed into the prompt'
+        );
+    });
+
+    // R7 (T4a) — "a segment that is not in the context should have 80% opacity ... they can
+    // still be clicked as normally". DOM mode carries the dim as ONE data hook that
+    // `styles.css` resolves to `opacity: 0.2` (`context-bar-style.test.ts` pins the figure and
+    // its place in the cascade); the button itself has to stay the same button.
+    it('marks the dim state as a hook and dims nothing else about the segment (R7)', () => {
+        const dimmed = [block({ id: '0-tool-out', included: false }), block({ id: '0-tool-in', included: true })];
+        const plain = [block({ id: '0-tool-out' }), block({ id: '0-tool-in' })];
+
+        const a = Array.from(mount(dimmed).element.querySelectorAll<HTMLButtonElement>('.context-bar-segment'));
+        const b = Array.from(mount(plain).element.querySelectorAll<HTMLButtonElement>('.context-bar-segment'));
+
+        // TRI-STATE, spelled the way `data-state` above spells its absence: `''` is "the server
+        // could not name the entry behind this segment", which is UNKNOWN and must NOT dim.
+        expect(a.map((button) => button.dataset.included)).toEqual(['false', 'true']);
+        expect(b.map((button) => button.dataset.included)).toEqual(['', '']);
+
+        // The dim is a HOOK, not a rebuild. Everything the reader (and the stylesheet) aims with
+        // is identical to the same block unmarked: the roving tab stop, the focus flag, the
+        // enabled- and visibility-ness of the control, and every figure and box the model sized.
+        const shape = (button: HTMLButtonElement) => ({
+            type: button.type,
+            className: button.className,
+            tone: button.dataset.tone,
+            state: button.dataset.state,
+            chars: button.dataset.chars,
+            durationMs: button.dataset.durationMs,
+            durationKnown: button.dataset.durationKnown,
+            heightPx: button.dataset.heightPx,
+            heightShare: button.dataset.heightShare,
+            flexGrow: button.style.flexGrow,
+            flexBasis: button.style.flexBasis,
+            height: button.style.height,
+            tabIndex: button.tabIndex,
+            focused: button.dataset.focused,
+            disabled: button.disabled,
+            hidden: button.hidden,
+            ariaDisabled: button.getAttribute('aria-disabled'),
+            labelElements: button.querySelectorAll('.context-bar-segment-name').length
+        });
+
+        expect(shape(a[0])).toEqual(shape(b[0]));
+        expect(shape(a[0]).tabIndex).toBe(0);
+        expect(shape(a[1]).tabIndex).toBe(-1);
+
+        // The ONLY difference is the words, and they say the truth the transparency shows.
+        expect(a[0].title).toBe('read · tool · ok · 1,204 characters · args 20 + result 1,184 · 800ms · not replayed into the prompt');
+        expect(a[0].getAttribute('aria-label')).toBe(
+            '1 of 2 · read · tool · ok · 1,204 characters · args 20 + result 1,184 · 800ms · not replayed into the prompt'
+        );
+        expect(a[1].title).toBe('read · tool · ok · 1,204 characters · args 20 + result 1,184 · 800ms');
+    });
+
+    it('activates a dimmed segment exactly like a lit one: click, Enter, focus and arrows (R7)', () => {
+        const blocks = [block({ id: 'a' }), block({ id: 'dim', name: 'bash', included: false }), block({ id: 'c' })];
+        const activated: ContextBarActivateInput[] = [];
+        const bar = mount(blocks, { onActivate: (input) => activated.push(input) });
+        const buttons = Array.from(bar.element.querySelectorAll<HTMLButtonElement>('.context-bar-segment'));
+        const dim = buttons[1];
+
+        expect(dim.dataset.included).toBe('false');
+
+        // The click still activates THIS segment, with its own provenance and index.
+        dim.click();
+        expect(activated).toEqual([{ block: blocks[1], index: 1, total: 3, source: 'pointer' }]);
+
+        // And it still takes the keyboard's place: the click aimed there, so it is now the tab
+        // stop and the current segment, exactly as an unlit one would be.
+        expect(bar.focused()).toBe(1);
+        expect(buttons.map((button) => button.tabIndex)).toEqual([-1, 0, -1]);
+        expect(dim.dataset.focused).toBe('true');
+
+        // Enter/Space on a dimmed segment is one activation, from the keyboard.
+        dim.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        expect(activated[1]).toEqual({ block: blocks[1], index: 1, total: 3, source: 'keyboard' });
+        expect(activated).toHaveLength(2);
+
+        // Focus-in moves the aim too — nothing about the dim state routes focus past a segment.
+        buttons[2].focus();
+        expect(bar.focused()).toBe(2);
+        dim.focus();
+        expect(bar.focused()).toBe(1);
+        expect(dim.dataset.focused).toBe('true');
+
+        // Arrows WALK through the dimmed segment rather than over it, and it is reachable as the
+        // bar's first tab stop when it is the first segment.
+        const first = [block({ id: 'dim', included: false }), block({ id: 'lit' })];
+        const walked = mount(first);
+        const walkedButtons = Array.from(walked.element.querySelectorAll<HTMLButtonElement>('.context-bar-segment'));
+
+        expect(walkedButtons.map((button) => button.tabIndex)).toEqual([0, -1]);
+
+        walkedButtons[0].focus();
+        walkedButtons[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+        expect(walked.focused()).toBe(1);
+        expect(document.activeElement).toBe(walkedButtons[1]);
+
+        walkedButtons[1].dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+        expect(walked.focused()).toBe(0);
+        expect(document.activeElement).toBe(walkedButtons[0]);
+    });
+
+    it('keeps the withheld words on a dimmed segment in DOM mode, thinking included (R7)', () => {
+        // A TOOL whose unit the reader withheld: the projector's static rule still says
+        // `inPrompt: true`, so ONLY `included` can tell the reader the truth — and the bar prints
+        // the model's own clause rather than inventing a phrasing that could drift from it.
+        const withheldTool = block({ id: '0-tool-out', name: 'bash', included: false });
+        // A REASONING window the thinking policy dropped: `contextBarSegmentTitleOf` normally
+        // softens this clause to `replay decided by the thinking policy`, because the bar cannot
+        // see a per-entry verdict. A published `included: false` IS that verdict, so the softening
+        // stops and the segment states what the dim shows.
+        const withheldThinking = block({ id: '0-reasoning-out', kind: 'reasoning', name: 'reasoning', chars: 100, inPrompt: false, included: false });
+        // The SAME thinking window with the field ABSENT keeps the policy wording byte for byte.
+        const unnamedThinking = block({ id: '0-reasoning-unknown', kind: 'reasoning', name: 'reasoning', chars: 100, inPrompt: false });
+
+        const bar = mount([withheldTool, withheldThinking, unnamedThinking]);
+        const buttons = Array.from(bar.element.querySelectorAll<HTMLButtonElement>('.context-bar-segment'));
+
+        expect(buttons[0].title).toBe('bash · tool · ok · 1,204 characters · args 20 + result 1,184 · 800ms · not replayed into the prompt');
+        expect(buttons[1].title).toBe('reasoning · reasoning · 100 characters · 800ms · not replayed into the prompt');
+        expect(buttons[2].title).toBe('reasoning · reasoning · 100 characters · 800ms · replay decided by the thinking policy');
+
+        // The absolute never becomes a claim about the ENTRY: `not replayed` is about the bytes
+        // this segment shows (for thinking, the axis that is off is the thinking — the entry keeps
+        // travelling, and the dialog is the surface that says so with the full detail).
+        expect(buttons[1].title).not.toContain('never');
+        expect(buttons[1].getAttribute('aria-label')).toBe(
+            '2 of 3 · reasoning · reasoning · 100 characters · 800ms · not replayed into the prompt'
+        );
+
+        // THE AGGREGATE NAME FOLLOWS THE SEGMENTS (R5 review, FIX A). The claim this test used to
+        // pin — that `included` does not move `unpromptedChars`, so a withheld tool with
+        // `inPrompt: true` adds no clause — is the exact under-statement FIX A removed: the strip
+        // announced 2 segments and 1,244 characters while 1,204 of them were sitting in a segment
+        // whose OWN tooltip (the line above) said `not replayed into the prompt`. Both renderings
+        // now come from `contextBlockIsWithheld`, and because this strip's withheld bytes belong to a
+        // TOOL segment, `unpromptedBytesAreThinkingOnly` refuses the policy substitution and the
+        // literal sentence is the one that prints — a switch is not a policy.
+        const strip = mount([block({ id: 'a', kind: 'user', name: 'prompt', chars: 40 }), withheldTool]);
+
+        expect(strip.element.getAttribute('aria-label')).toBe(
+            'context bar: width is time taken, height is recorded characters · 2 segments · 1,244 characters · 1.6s of recorded time · 1,204 characters not replayed into the prompt'
         );
     });
 
@@ -639,6 +822,117 @@ describe('context bar, canvas mode', () => {
         expect(fake.paints).toEqual([
             { x: 0, y: 0, width: 600, height: CONTEXT_BAR_MAX_TRACK_HEIGHT_PX, fill: '#4ade80', alpha: 0.45 }
         ]);
+    });
+
+    // R7 (T4a) — the canvas half of the dim state. DOM mode gets `opacity: 0.2` from
+    // `.context-bar-segment[data-included='false']`; this mode has no cascade to ask, so the
+    // painter multiplies nothing and reads `contextBarSegmentAlphaOf` instead. The fixture is the
+    // SAME three segments the parity section below feeds to DOM mode, so the 0.2 asserted here is
+    // provably the 0.2 that sheet ships.
+    it('dims an out-of-context segment to 0.2 and leaves every other segment alone (R7)', () => {
+        const dimmed = THREE.map((entry, position) => (position === 2 ? { ...entry, included: false } : entry));
+
+        const lit = stubCanvas();
+        mount(THREE);
+        const faded = stubCanvas();
+        mount(dimmed);
+
+        // UNCHANGED, exactly as the tone table says: neutral 1, reasoning 1 (its `inPrompt: false`
+        // is the projector's static flag and does NOT dim it), error 1.
+        expect(lit.paints).toEqual([
+            { x: 0, y: 24, width: 8, height: 12, fill: '#d8deea', alpha: 1 },
+            { x: 10, y: 12, width: 294, height: 24, fill: '#fbbf24', alpha: 1 },
+            { x: 306, y: 0, width: 294, height: 36, fill: '#f87171', alpha: 1 }
+        ]);
+
+        // DIMMED: the same rectangle in the same colour at 0.2. Geometry, hue and the strip's box
+        // are byte-identical — the ONLY difference in the whole frame is one alpha.
+        expect(faded.paints).toEqual([
+            { x: 0, y: 24, width: 8, height: 12, fill: '#d8deea', alpha: 1 },
+            { x: 10, y: 12, width: 294, height: 24, fill: '#fbbf24', alpha: 1 },
+            { x: 306, y: 0, width: 294, height: 36, fill: '#f87171', alpha: 0.2 }
+        ]);
+        expect(faded.paints.map((paint) => [paint.x, paint.y, paint.width, paint.height])).toEqual(
+            lit.paints.map((paint) => [paint.x, paint.y, paint.width, paint.height])
+        );
+    });
+
+    it('caps the running tone at the dim alpha, and fades the label with its bar (R7)', () => {
+        // `running` is the one tone whose own alpha (0.45) is not 1. CSS cannot multiply the two
+        // on one element, so the DOM rule wins by source order and lands on 0.2; the canvas CAPS
+        // to the same figure rather than inventing a fourth alpha (0.45 * 0.2 = 0.09) that DOM
+        // mode could never reproduce.
+        const running = stubCanvas();
+        mount([block({ state: 'running' })]);
+        const runningDimmed = stubCanvas();
+        mount([block({ state: 'running', included: false })]);
+
+        expect(running.paints.map((paint) => paint.alpha)).toEqual([0.45]);
+        expect(runningDimmed.paints.map((paint) => paint.alpha)).toEqual([0.2]);
+        expect(runningDimmed.paints.map((paint) => paint.fill)).toEqual(running.paints.map((paint) => paint.fill));
+
+        // The in-segment NAME fades with its bar. In DOM mode the label is a CHILD of the dimmed
+        // button, so CSS opacity takes it along automatically; a full-alpha name over a 0.2 bar
+        // would be the one spot the two renderers disagreed. Every other tone keeps its name at
+        // full alpha exactly as before, so the running tone's label is untouched.
+        const labelled = stubCanvas();
+        mount([block({ included: false })]);
+
+        expect(labelled.texts).toEqual([['read', 6, CONTEXT_BAR_MAX_TRACK_HEIGHT_PX / 2]]);
+        expect(labelled.textAlphas).toEqual([0.2]);
+
+        const plain = stubCanvas();
+        mount([block()]);
+
+        expect(plain.texts).toEqual([['read', 6, CONTEXT_BAR_MAX_TRACK_HEIGHT_PX / 2]]);
+        expect(plain.textAlphas).toEqual([1]);
+
+        // The CURRENT-segment ring is the deliberate exception: it paints at FULL alpha over a
+        // dimmed bar, so the keyboard never loses its anchor to a transparency. DOM mode cannot
+        // match this (an `outline` rides its element's own opacity and cannot be lifted out of
+        // it), and `context-bar-style.test.ts` pins that the hover and focus rules still resolve
+        // — a stated, one-directional parity difference, not a regression.
+        const focused = stubCanvas();
+        const bar = mount([block({ included: false })]);
+        bar.setFocused(0);
+
+        expect(focused.outlines).toEqual([[1, 1, 598, CONTEXT_BAR_MAX_TRACK_HEIGHT_PX - 2]]);
+        expect(focused.outlineAlphas).toEqual([1]);
+    });
+
+    it('states the withheld words on a dimmed segment in canvas mode too (R7)', () => {
+        // The live region and the hover title are canvas mode's only wording surfaces, so the
+        // honest sentence has to reach them the same way it reaches a DOM button.
+        stubCanvas();
+        const bar = mount(THREE.map((entry, position) => (position === 2 ? { ...entry, included: false } : entry)));
+        const live = bar.element.querySelector('.context-bar-live') as HTMLElement;
+        bar.setFocused(2);
+
+        expect(bar.element.title).toBe('bash · tool · error · 300 characters · args 20 + result 1,184 · 800ms · not replayed into the prompt');
+        expect(live.textContent).toBe(
+            '3 of 3 · bash · tool · error · 300 characters · args 20 + result 1,184 · 800ms · not replayed into the prompt'
+        );
+        // The OPTION LIST (the screen reader's browse surface) carries it per segment, so the
+        // transparency is never the only place the fact lives.
+        expect(
+            Array.from(bar.element.querySelectorAll('.context-bar-option')).map((option) => option.textContent)
+        ).toEqual([
+            '1 of 3 · prompt · user · 100 characters · time not recorded',
+            '2 of 3 · reasoning · reasoning · 200 characters · 800ms · replay decided by the thinking policy',
+            '3 of 3 · bash · tool · error · 300 characters · args 20 + result 1,184 · 800ms · not replayed into the prompt'
+        ]);
+        // THE MIXED STRIP KEEPS THE LITERAL SENTENCE (R5 review, FIX A). Before the fix the total
+        // saw only the thinking window (200 bytes, all thinking) and re-worded the aggregate as the
+        // thinking policy — while the dimmed tool beside it was already saying `not replayed into
+        // the prompt` about its own 300 bytes, bytes the sentence never counted. Now the total is
+        // 500 across BOTH authorities, `unpromptedBytesAreThinkingOnly` sees a non-thinking withheld
+        // segment and refuses the substitution, and the group's name states the plain figure. The
+        // per-segment policy wording above stays byte-identical: the substitution that is about to be
+        // withdrawn from the AGGREGATE is still the honest sentence for the ONE window it describes.
+        expect(bar.element.getAttribute('aria-label')).toBe(
+            'context bar: width is time taken, height is recorded characters · 3 segments · 600 characters' +
+                ' · 1.6s of recorded time · 1 segment has no recorded time · 500 characters not replayed into the prompt'
+        );
     });
 
     it('scales the backing store by the device ratio and paints in CSS pixels', () => {

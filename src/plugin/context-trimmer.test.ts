@@ -66,6 +66,7 @@ import {
     executeTrimming,
     metadata,
     planTrimmedUnits,
+    planTruncatedRequests,
     planWithheldThoughts,
     setup,
     TRIMMER_DEFAULT_SETTINGS,
@@ -165,7 +166,7 @@ const TRIMMABLE_CANDIDATE: TrimCandidate = {
     outcomes: ['failed'],
     invalidOutcomes: ['failed'],
     names: ['read'],
-    admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered'],
+    admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools'],
     firedBy: 'dropSupersededToolCalls',
     resolverIndex: 3,
     resolverMessageId: 'msg-4'
@@ -186,10 +187,29 @@ type FakeApi = {
 // A complete `HarnessPluginApi` whose every control except a settings read and the diagnostic
 // channel THROWS. `createAgent`, `addTool`, `snapshot`, `threads.*`, `enableTool`, `async.*`
 // and `settings.setOwn` being untouched is therefore proven by the fixture, not promised.
+//
+// THE HORIZONS ARE SEEDED TO 0 here for exactly the reason `settingsWith` zeroes them for the pure
+// plans below: the writer and trigger tables pin WHICH entries get a flag and what the report says,
+// on two- and three-turn fixtures that the declared horizon of 2 would protect entirely. The read
+// set is unaffected (every switch is read every turn whatever is stored), and the tables that care
+// about the horizon values set their own. A table that wants the DECLARED horizons passes
+// `atDeclaredHorizons: true`, which leaves the seed out so the values read as the shipped ones.
+const NO_HORIZON: Record<string, number> = {
+    invalidToolTurns: 0,
+    supersededTurns: 0,
+    duplicateTurns: 0,
+    truncateTurns: 0,
+    thoughtTurns: 0
+};
+
 const createFakeApi = (stored: Record<string, unknown> = {}): FakeApi => {
     const touches: string[] = [];
     const diagnostics: HarnessPluginDiagnosticReport[] = [];
-    const values: Record<string, unknown> = { ...stored };
+    const { atDeclaredHorizons, ...values_ } = stored;
+    const values: Record<string, unknown> =
+        atDeclaredHorizons === true
+            ? { ...values_ }
+            : { ...NO_HORIZON, ...values_ };
 
     const skip = (name: string): never => {
         touches.push(name);
@@ -272,44 +292,69 @@ const createFakeApi = (stored: Record<string, unknown> = {}): FakeApi => {
 // per turn. Pinned as one list in every fast-path assertion below, so a switch that ships
 // without being consulted — or one consulted twice a turn — fails, and so does a switch that
 // leaks in front of the guards (a branch round, an internal agent or a disabled plugin still
-// cost what invariant 5 promises: one read, or none).
+// cost what invariant 5 promises: one read, or none). A HORIZON is read immediately after the
+// toggle it belongs to, which is the same order the descriptors declare and the pane renders.
 const TURN_READS: readonly string[] = [
     'settings.boolean:enabled',
+    'settings.boolean:trimInvalidTools',
+    'settings.number:invalidToolTurns',
+    'settings.boolean:trimThoughts',
+    'settings.number:thoughtTurns',
+    'settings.boolean:truncateToolRequests',
+    'settings.number:truncateTurns',
     'settings.boolean:dropSupersededToolCalls',
-    'settings.boolean:dropInvalidToolCallsOnceAnswered',
-    'settings.string:invalidOutcomes',
-    'settings.string:dropOldThoughts',
-    'settings.number:thoughtKeepUnits',
-    'settings.string:supersedeMatch',
+    'settings.number:supersededTurns',
     'settings.boolean:dropDuplicateCalls',
+    'settings.number:duplicateTurns',
+    'settings.string:invalidOutcomes',
+    'settings.string:supersedeMatch',
     'settings.number:minTokens',
     'settings.number:minThoughtChars',
     'settings.number:safetyUnits',
     'settings.number:maxUnits'
 ];
 
-// The `data.policy` block of a pass that ran on the declared defaults: every switch as it was
-// resolved, every tier next to the value that was submitted (identical here — nothing fell
-// back), and `fired`, the two switches that both account for a shipped-rule withholding.
+// The `data.policy` block of a pass that ran on the writer tables' BASELINE: every switch as it was
+// resolved, EVERY HORIZON next to the rule it windows (0 here, because `createFakeApi` opens the
+// horizons — see the note there), every tier next to the value that was submitted (identical here —
+// nothing fell back), the precedence the axes ran in, and `fired`, the switches that account for a
+// shipped-rule withholding. The DECLARED values of the horizons are pinned by
+// `DECLARED_DEFAULT_POLICY` below, which a pass over a long-enough transcript reports verbatim.
 const DEFAULT_POLICY = {
     dropSupersededToolCalls: true,
-    dropInvalidToolCallsOnceAnswered: true,
+    supersededTurns: 0,
+    trimInvalidTools: true,
+    invalidToolTurns: 0,
     invalidOutcomes: 'failed/rejected',
     invalidOutcomesSubmitted: 'failed,rejected',
     invalidOutcomesFallback: false,
-    dropOldThoughts: 'turn',
-    dropOldThoughtsSubmitted: 'turn',
-    dropOldThoughtsFallback: false,
+    trimThoughts: true,
+    thoughtTurns: 0,
+    truncateToolRequests: false,
+    truncateTurns: 0,
     supersedeMatch: 'name',
     supersedeMatchSubmitted: 'name',
     supersedeMatchFallback: false,
     dropDuplicateCalls: false,
-    thoughtKeepUnits: 0,
+    duplicateTurns: 0,
     minTokens: 0,
     minThoughtChars: 0,
     safetyUnits: 0,
     maxUnits: 0,
-    fired: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered']
+    precedence: 'whole-unit trim > truncate request > withhold thinking',
+    fired: ['dropSupersededToolCalls', 'trimInvalidTools']
+};
+
+// The same block with NOTHING overridden at all: every horizon at its declared 2. `atDeclaredHorizons`
+// leaves the baseline seed out of the fake's store, so the numbers in the report are the shipped
+// ones, and the fixture below is long enough that the oldest unit is still outside the horizon.
+const DECLARED_DEFAULT_POLICY = {
+    ...DEFAULT_POLICY,
+    supersededTurns: 2,
+    invalidToolTurns: 2,
+    thoughtTurns: 2,
+    truncateTurns: 2,
+    duplicateTurns: 2
 };
 
 const ONE_USER_TURN: readonly HarnessMessage[] = [{ role: 'user', content: 'question' }];
@@ -418,6 +463,68 @@ const createFakeTurn = (input: FakeTurnInput): HarnessTurnBeforeContext => {
     return context;
 };
 
+// THE STALE-SNAPSHOT SIMULATOR — the writer's own race window (the 2026-11-13 review).
+//
+// The plan reads `context.entries` THREE times (src/plugins/context-trimmer.plugin.ts `planOf`:
+// the whole-unit walk, the truncate walk, the thinking walk) and the writer reads it a FOURTH time,
+// after the handler's `await context.pause()` (src/plugins/context-trimmer.plugin.ts
+// `createContextTrimmerHandler`). A mid-round `replaceHistory()` lands in exactly that gap, and it
+// REPLACES the message list — so the stale side is a different list, not a mutated one, which is
+// what makes re-locating an entry by INDEX observable instead of accidental.
+//
+// `strictReasoning` replaces the thinking control with the real runtime's role refusal
+// (src/harness.ts `setReasoningIncluded` THROWS on a non-assistant target: "only an assistant entry
+// carries reasoning"), so a thinking write that lands on the wrong turn FAILS the test loudly
+// rather than being recorded as an innocent call.
+//
+// The `reads()` counter is asserted by both tests that use this helper: it pins that the plan really
+// saw `planned` (three reads) and the writer really saw `stale` (the fourth), so neither test can
+// pass by running both halves against the same list.
+const withStaleEntries = (
+    base: HarnessTurnBeforeContext,
+    planned: HarnessContextEntry[],
+    stale: HarnessContextEntry[],
+    strictReasoning?: { calls: string[] }
+): { context: HarnessTurnBeforeContext; reads: () => number } => {
+    let reads = 0;
+
+    const context: HarnessTurnBeforeContext = {
+        ...base,
+        ...(strictReasoning === undefined
+            ? {}
+            : {
+                  setReasoningIncluded: (target: HarnessContextEntry | number | string, included: unknown): void => {
+                      const entry =
+                          typeof target === 'number'
+                              ? stale.find((lookedUp) => lookedUp.index === target)
+                              : typeof target === 'string'
+                                ? stale.find((lookedUp) => lookedUp.messageId === target)
+                                : target;
+
+                      if (entry.message.role !== 'assistant') {
+                          throw new Error(
+                              `setReasoningIncluded landed on a ${entry.message.role} message (index ${entry.index}).`
+                          );
+                      }
+
+                      strictReasoning.calls.push(`setReasoningIncluded:${entry.index}:${String(included)}`);
+                      // Only `false` is storage, exactly like the shipped control.
+                      (entry.message as { reasoningIncluded?: boolean }).reasoningIncluded = false;
+                  }
+              })
+    };
+
+    Object.defineProperty(context, 'entries', {
+        get: (): HarnessContextEntry[] => {
+            reads += 1;
+
+            return reads <= 3 ? planned : stale;
+        }
+    });
+
+    return { context, reads: () => reads };
+};
+
 // ---------------------------------------------------------------------------
 // A1 — the rule, as a pure plan
 // ---------------------------------------------------------------------------
@@ -425,7 +532,7 @@ const createFakeTurn = (input: FakeTurnInput): HarnessTurnBeforeContext => {
 describe('context-trimmer plan (planTrimmedUnits)', () => {
     it('A1: withholds the failed unit a later success of the same tool name answered', () => {
         // The exact candidate, including the durable addresses of BOTH halves of the pair.
-        expect(planTrimmedUnits(entriesFrom(TRIMMABLE))).toEqual([TRIMMABLE_CANDIDATE]);
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({}))).toEqual([TRIMMABLE_CANDIDATE]);
     });
 
     it('A1: a `rejected` call is as superseded as a `failed` one', () => {
@@ -437,7 +544,7 @@ describe('context-trimmer plan (planTrimmedUnits)', () => {
             result('c2', 'read', 'export const b = 2;')
         ];
 
-        expect(planTrimmedUnits(entriesFrom(messages))).toEqual([
+        expect(planTrimmedUnits(entriesFrom(messages), settingsWith({}))).toEqual([
             { ...TRIMMABLE_CANDIDATE, outcomes: ['rejected'], invalidOutcomes: ['rejected'] }
         ]);
     });
@@ -454,7 +561,7 @@ describe('context-trimmer plan (planTrimmedUnits)', () => {
             result('c2', 'read', 'contents')
         ];
 
-        expect(planTrimmedUnits(entriesFrom(messages))).toEqual([TRIMMABLE_CANDIDATE]);
+        expect(planTrimmedUnits(entriesFrom(messages), settingsWith({}))).toEqual([TRIMMABLE_CANDIDATE]);
     });
 
     it('A2: keeps every shape that has no included later answer', () => {
@@ -531,8 +638,69 @@ describe('context-trimmer plan (planTrimmedUnits)', () => {
     });
 
     it('A2: an already-excluded candidate is skipped, so a re-run proposes nothing', () => {
-        // The whole failed unit withheld (leader AND result, as the runtime cascade leaves it).
-        expect(planTrimmedUnits(entriesFrom(TRIMMABLE, [1, 2]))).toEqual([]);
+        // The whole failed unit withheld (leader AND result — what a whole-unit trim, or compaction,
+        // leaves behind, since R8 makes the flag per entry). NOTHING of the unit is being sent, so the
+        // write set is empty and the idempotence skip fires.
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE, [1, 2]), settingsWith({}))).toEqual([]);
+    });
+
+    it('A2: finishes a unit whose REQUEST an earlier pass already withheld, per rule', () => {
+        // THE DEFECT THIS PINS (T10). `truncateToolRequests` writes ONE entry — the assistant REQUEST
+        // — so the unit's failed RESULT is still being sent while `unit.included` (the conjunction
+        // over every member) reads false. Testing candidacy at that unit-level flag made such a unit
+        // invisible to the invalid, superseded and duplicate rules FOREVER, and with both horizons at
+        // their declared 2 the two axes sit on the SAME horizon: whichever one fired first kept the
+        // junk result riding in every later request, which is exactly what "invalid tools more than 2
+        // tool turns ago are trimmed" promises not to do.
+        const requestGone = entriesFrom(TRIMMABLE, [1]);
+
+        // The RESULT (2) is the only member left to write; the leader (1) is named as the unit's
+        // identity and never re-enabled.
+        const SURVIVING_RESULT = {
+            index: 1,
+            members: [2],
+            outcomes: ['failed'],
+            invalidOutcomes: ['failed'],
+            names: ['read'],
+            resolverIndex: 3
+        };
+
+        // Rule 1, `dropSupersededToolCalls`, on its own.
+        expect(
+            planShape(planTrimmedUnits(requestGone, settingsWith({ trimInvalidTools: false })))
+        ).toEqual([{ ...SURVIVING_RESULT, firedBy: 'dropSupersededToolCalls', admittedBy: ['dropSupersededToolCalls'] }]);
+
+        // Rule 2, `trimInvalidTools`, on its own — the switch the operator-facing promise names.
+        expect(
+            planShape(planTrimmedUnits(requestGone, settingsWith({ dropSupersededToolCalls: false })))
+        ).toEqual([{ ...SURVIVING_RESULT, firedBy: 'trimInvalidTools', admittedBy: ['trimInvalidTools'] }]);
+
+        // Rule 3, `dropDuplicateCalls`, on its own, and fingerprint-matched whatever `supersedeMatch`
+        // says (the fixture is a retry of the EXACT work, so the stricter matcher still matches).
+        expect(
+            planShape(
+                planTrimmedUnits(
+                    entriesFrom(SAME_ARGS, [1]),
+                    settingsWith({
+                        dropSupersededToolCalls: false,
+                        trimInvalidTools: false,
+                        dropDuplicateCalls: true
+                    })
+                )
+            )
+        ).toEqual([{ ...SURVIVING_RESULT, firedBy: 'dropDuplicateCalls', admittedBy: ['dropDuplicateCalls'] }]);
+
+        // (b) THE SECOND PASS WRITES NOTHING. Applying the write set above leaves every member of the
+        // unit withheld, which is the state the skip is about: no candidate, so no flag, no
+        // notification, no save and no diagnostic.
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE, [1, 2]), settingsWith({}))).toEqual([]);
+
+        // THE MIRROR HALF STATE (a host switched one RESULT off, or a pass stopped midway) is completed
+        // the same way rather than skipped: the request is what is still being sent, and the next pass
+        // finishes the unit. Nothing is ever re-enabled on the way.
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE, [2]), settingsWith({}))).toEqual([
+            { ...TRIMMABLE_CANDIDATE, members: [1] }
+        ]);
     });
 
     it('A2: a standalone message and an orphan result are never candidates', () => {
@@ -566,7 +734,7 @@ describe('context-trimmer plan (planTrimmedUnits)', () => {
         ];
 
         expect(
-            planTrimmedUnits(entriesFrom(messages)).map((candidate) => ({
+            planTrimmedUnits(entriesFrom(messages), settingsWith({})).map((candidate) => ({
                 leaderIndex: candidate.leaderIndex,
                 members: candidate.members,
                 outcomes: candidate.outcomes,
@@ -595,7 +763,7 @@ describe('context-trimmer plan (planTrimmedUnits)', () => {
             result('c3', 'read', 'ok')
         ];
 
-        expect(planTrimmedUnits(entriesFrom(mixed))).toEqual([]);
+        expect(planTrimmedUnits(entriesFrom(mixed), settingsWith({}))).toEqual([]);
 
         // Both names answered by one later unit -> the SAME fixture now trims, so the keep
         // above is provably the rule and not an accident of the builder. The two names are
@@ -675,8 +843,21 @@ const planShape = (plan: readonly TrimCandidate[]) =>
 // case is what keeps "everything else is at its default" part of the fixture: a new switch lands in
 // `TRIMMER_DEFAULT_SETTINGS` and every case below inherits its default, so a case can never be
 // passing because of a switch it never meant to turn on.
+//
+// THE HORIZONS ARE ZEROED HERE, ON PURPOSE. Every table in this file that asks WHICH unit a rule
+// picks runs against a two- or three-tool-turn fixture, and a default horizon of 2 protects the two
+// newest turns — so the predicate tables would all be empty and would prove nothing. `0` is the
+// documented "protect nothing" value, which leaves each table testing exactly the rule it names. The
+// horizon itself is pinned by its own tables (`the horizon windows each tool rule...`), which set
+// their own values and are the only place the declared 2 is asserted, and by the defaults tables
+// that use `TRIMMER_DEFAULT_SETTINGS` directly.
 const settingsWith = (overrides: Partial<TrimmerSettings>): TrimmerSettings => ({
     ...TRIMMER_DEFAULT_SETTINGS,
+    invalidToolTurns: 0,
+    supersededTurns: 0,
+    duplicateTurns: 0,
+    truncateTurns: 0,
+    thoughtTurns: 0,
     ...overrides
 });
 
@@ -763,8 +944,8 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                         outcomes: ['failed'],
                         invalidOutcomes: ['failed'],
                         names: ['read'],
-                        firedBy: 'dropInvalidToolCallsOnceAnswered',
-                        admittedBy: ['dropInvalidToolCallsOnceAnswered'],
+                        firedBy: 'trimInvalidTools',
+                        admittedBy: ['trimInvalidTools'],
                         resolverIndex: 3
                     }
                 ]
@@ -786,8 +967,8 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                         outcomes: ['rejected'],
                         invalidOutcomes: ['rejected'],
                         names: ['read'],
-                        firedBy: 'dropInvalidToolCallsOnceAnswered',
-                        admittedBy: ['dropInvalidToolCallsOnceAnswered'],
+                        firedBy: 'trimInvalidTools',
+                        admittedBy: ['trimInvalidTools'],
                         resolverIndex: 3
                     }
                 ]
@@ -803,10 +984,10 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                         outcomes: ['failed'],
                         invalidOutcomes: ['failed'],
                         names: ['read'],
-                        firedBy: 'dropInvalidToolCallsOnceAnswered',
+                        firedBy: 'trimInvalidTools',
                         // The whole default set is named, so the generalisation and the shipped
                         // classifier agree on this unit — the equivalence the header claims.
-                        admittedBy: ['dropInvalidToolCallsOnceAnswered'],
+                        admittedBy: ['trimInvalidTools'],
                         resolverIndex: 3
                     }
                 ]
@@ -825,8 +1006,8 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                         outcomes: ['cancelled'],
                         invalidOutcomes: ['cancelled'],
                         names: ['read'],
-                        firedBy: 'dropInvalidToolCallsOnceAnswered',
-                        admittedBy: ['dropInvalidToolCallsOnceAnswered'],
+                        firedBy: 'trimInvalidTools',
+                        admittedBy: ['trimInvalidTools'],
                         resolverIndex: 3
                     }
                 ]
@@ -862,8 +1043,8 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                         outcomes: ['cancelled', 'failed'],
                         invalidOutcomes: ['cancelled', 'failed'],
                         names: ['read', 'write'],
-                        firedBy: 'dropInvalidToolCallsOnceAnswered',
-                        admittedBy: ['dropInvalidToolCallsOnceAnswered'],
+                        firedBy: 'trimInvalidTools',
+                        admittedBy: ['trimInvalidTools'],
                         // Both names are answered by DIFFERENT later units (c3 answers `read` at 4,
                         // c4 answers `write` at 6); the line names the earliest.
                         resolverIndex: 4
@@ -891,8 +1072,8 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                         outcomes: ['completed'],
                         invalidOutcomes: ['empty'],
                         names: ['read'],
-                        firedBy: 'dropInvalidToolCallsOnceAnswered',
-                        admittedBy: ['dropInvalidToolCallsOnceAnswered'],
+                        firedBy: 'trimInvalidTools',
+                        admittedBy: ['trimInvalidTools'],
                         resolverIndex: 3
                     }
                 ]
@@ -941,8 +1122,8 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                         outcomes: ['cancelled', 'completed'],
                         invalidOutcomes: ['cancelled', 'empty'],
                         names: ['read', 'write'],
-                        firedBy: 'dropInvalidToolCallsOnceAnswered',
-                        admittedBy: ['dropInvalidToolCallsOnceAnswered'],
+                        firedBy: 'trimInvalidTools',
+                        admittedBy: ['trimInvalidTools'],
                         resolverIndex: 4
                     }
                 ]
@@ -996,7 +1177,7 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
 
         for (const shape of shapes) {
             for (const dropSupersededToolCalls of [true, false]) {
-                for (const dropInvalidToolCallsOnceAnswered of [true, false]) {
+                for (const trimInvalidTools of [true, false]) {
                     for (const invalidOutcomes of outcomeSets) {
                         for (const supersedeMatch of ['name', 'fingerprint'] as const) {
                             for (const dropDuplicateCalls of [true, false]) {
@@ -1006,7 +1187,7 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                                     entriesFrom(shape.messages),
                                     settingsWith({
                                         dropSupersededToolCalls,
-                                        dropInvalidToolCallsOnceAnswered,
+                                        trimInvalidTools,
                                         invalidOutcomes,
                                         supersedeMatch,
                                         dropDuplicateCalls
@@ -1033,8 +1214,8 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
         // keeps for the same reasons they always were, and the one shape the shipped rule did trim
         // still trims with the same candidate it produced before T4.
         expect(planShape(planTrimmedUnits(entriesFrom(mixedUnit(result('c1', 'read', 'boom', 'failed')))))).toEqual([]);
-        expect(planShape(planTrimmedUnits(entriesFrom(UNANSWERED)))).toEqual([]);
-        expect(planTrimmedUnits(entriesFrom(TRIMMABLE))).toEqual([TRIMMABLE_CANDIDATE]);
+        expect(planShape(planTrimmedUnits(entriesFrom(UNANSWERED), settingsWith({})))).toEqual([]);
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({}))).toEqual([TRIMMABLE_CANDIDATE]);
         expect(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({}))).toEqual([TRIMMABLE_CANDIDATE]);
     });
 
@@ -1053,8 +1234,8 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
                 outcomes: ['failed', 'rejected'],
                 invalidOutcomes: ['failed', 'rejected'],
                 names: ['read', 'write'],
-                firedBy: 'dropInvalidToolCallsOnceAnswered',
-                admittedBy: ['dropInvalidToolCallsOnceAnswered'],
+                firedBy: 'trimInvalidTools',
+                admittedBy: ['trimInvalidTools'],
                 resolverIndex: 4
             }
         ]);
@@ -1072,7 +1253,7 @@ describe('context-trimmer plan — invalidOutcomes (T4)', () => {
             result('c3', 'read', 'contents')
         ];
 
-        expect(planShape(planTrimmedUnits(entriesFrom(partlyAnswered)))).toEqual([]);
+        expect(planShape(planTrimmedUnits(entriesFrom(partlyAnswered), settingsWith({})))).toEqual([]);
     });
 });
 
@@ -1106,7 +1287,7 @@ const CANDIDATE_SHAPE = {
     invalidOutcomes: ['failed'],
     names: ['read'],
     firedBy: 'dropSupersededToolCalls',
-    admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered'],
+    admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools'],
     resolverIndex: 3
 };
 
@@ -1206,7 +1387,7 @@ describe('context-trimmer plan — supersedeMatch (T4)', () => {
                 invalidOutcomes: ['failed', 'rejected'],
                 names: ['read', 'write'],
                 firedBy: 'dropSupersededToolCalls',
-                admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered'],
+                admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools'],
                 resolverIndex: 4
             }
         ]);
@@ -1222,7 +1403,7 @@ describe('context-trimmer plan — supersedeMatch (T4)', () => {
         expect(
             planShape(planTrimmedUnits(entriesFrom(SAME_ARGS, [3, 4]), settingsWith({ supersedeMatch: 'fingerprint' })))
         ).toEqual([]);
-        expect(planShape(planTrimmedUnits(entriesFrom(SAME_ARGS, [3, 4])))).toEqual([]);
+        expect(planShape(planTrimmedUnits(entriesFrom(SAME_ARGS, [3, 4]), settingsWith({})))).toEqual([]);
     });
 });
 
@@ -1248,13 +1429,13 @@ describe('context-trimmer plan — dropDuplicateCalls (T4)', () => {
 
         // OFF (the default) is the shipped posture: a unit whose answer the model read and used
         // stays in the request.
-        expect(planShape(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS)))).toEqual([]);
+        expect(planShape(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({})))).toEqual([]);
     });
 
     it('runs alone with both supersession switches off, and never on a name-only match', () => {
         const duplicateOnly = settingsWith({
             dropSupersededToolCalls: false,
-            dropInvalidToolCallsOnceAnswered: false,
+            trimInvalidTools: false,
             dropDuplicateCalls: true
         });
 
@@ -1283,7 +1464,7 @@ describe('context-trimmer plan — dropDuplicateCalls (T4)', () => {
                     entriesFrom(DIFFERENT_ARGS),
                     settingsWith({
                         dropSupersededToolCalls: false,
-                        dropInvalidToolCallsOnceAnswered: false,
+                        trimInvalidTools: false,
                         dropDuplicateCalls: true,
                         supersedeMatch: 'name'
                     })
@@ -1298,7 +1479,7 @@ describe('context-trimmer plan — dropDuplicateCalls (T4)', () => {
         // EXACT re-run to do it.
         const duplicateOnly = settingsWith({
             dropSupersededToolCalls: false,
-            dropInvalidToolCallsOnceAnswered: false,
+            trimInvalidTools: false,
             dropDuplicateCalls: true
         });
 
@@ -1328,7 +1509,7 @@ describe('context-trimmer plan — dropDuplicateCalls (T4)', () => {
         ).toEqual([
             {
                 ...CANDIDATE_SHAPE,
-                admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered', 'dropDuplicateCalls']
+                admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools', 'dropDuplicateCalls']
             }
         ]);
     });
@@ -1464,11 +1645,11 @@ describe('context-trimmer economy knobs (T5)', () => {
 
         // `minThoughtChars` never gates a TOOL write either, however large it is.
         expect(planTrimmedUnits(entriesFrom(TWO_TRIMMABLE), settingsWith({ minThoughtChars: 1000000 }))).toEqual(
-            planTrimmedUnits(entriesFrom(TWO_TRIMMABLE))
+            planTrimmedUnits(entriesFrom(TWO_TRIMMABLE), settingsWith({}))
         );
 
         // Both candidates, oldest first, with every knob at 0.
-        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TWO_TRIMMABLE)))).toEqual([1, 3]);
+        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TWO_TRIMMABLE), settingsWith({})))).toEqual([1, 3]);
         expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TWO_TRIMMABLE), settingsWith({ minTokens: 0, safetyUnits: 0, maxUnits: 0 })))).toEqual([1, 3]);
     });
 
@@ -1509,7 +1690,7 @@ describe('context-trimmer economy knobs (T5)', () => {
                 invalidOutcomes: ['failed'],
                 names: ['read'],
                 firedBy: 'dropSupersededToolCalls',
-                admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered'],
+                admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools'],
                 // The answer sits INSIDE the protected tail (unit 3), and still counts.
                 resolverIndex: 5
             }
@@ -1565,7 +1746,7 @@ describe('context-trimmer economy knobs (T5)', () => {
     });
 
     it('the economy gates apply to the duplicate rule as well, and never to thinking', () => {
-        const settings = settingsWith({ dropDuplicateCalls: true, dropSupersededToolCalls: false, dropInvalidToolCallsOnceAnswered: false });
+        const settings = settingsWith({ dropDuplicateCalls: true, dropSupersededToolCalls: false, trimInvalidTools: false });
 
         // Same estimator, same gates, third rule. `Temp/T45/probe2.ts` measured this unit at 7
         // estimated tokens, so the floor's edge is 7 vs 8 — the same one-token edge as the tool rule.
@@ -1573,6 +1754,34 @@ describe('context-trimmer economy knobs (T5)', () => {
         expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, minTokens: 8 })))).toEqual([]);
         expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, safetyUnits: 4 })))).toEqual([]);
         expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, maxUnits: 1 })))).toEqual([1]);
+    });
+
+    it('bills a pass for the members it WITHHOLDS, never for the whole unit (T10)', () => {
+        // THE FIGURE IS THE WRITE SET'S. `Temp/opencode-t10-trimmer/tokens3.ts` measured this fixture
+        // with the SAME estimator the context bar uses: the whole failed unit is 13 estimated tokens,
+        // its REQUEST alone is 5 and its RESULT alone is 8. So once the truncate axis has taken the
+        // request on an earlier turn, the pass that finishes the unit is worth EIGHT — billing it the
+        // unit's 13 would count the same 5 tokens twice, once on the turn the request left and again on
+        // the turn that only withholds the answer.
+        const requestGone = entriesFrom(TRIMMABLE, [1]);
+
+        // The fresh unit: the floor passes AT 13 and rejects the whole plan one token above it.
+        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ minTokens: 13 })))).toEqual([1]);
+        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ minTokens: 14 })))).toEqual([]);
+
+        // The SAME unit after its request left: the edge moved down by exactly the request's 5 tokens,
+        // which is only possible because the plan measures the surviving result and nothing else.
+        expect(leaderIndexesOf(planTrimmedUnits(requestGone, settingsWith({ minTokens: 8 })))).toEqual([1]);
+        expect(leaderIndexesOf(planTrimmedUnits(requestGone, settingsWith({ minTokens: 9 })))).toEqual([]);
+
+        // And the candidate that clears the 8-token floor names only the entry it withholds, so the
+        // figure the floor judged and the write the plugin performs are the SAME list.
+        expect(
+            planTrimmedUnits(requestGone, settingsWith({ minTokens: 8 })).map((candidate) => ({
+                index: candidate.leaderIndex,
+                members: candidate.members
+            }))
+        ).toEqual([{ index: 1, members: [2] }]);
     });
 
     it('a below-floor pass writes nothing at all: no flag, no park, no diagnostic', async () => {
@@ -1605,7 +1814,7 @@ describe('context-trimmer economy knobs (T5)', () => {
         const atFloorCalls: string[] = [];
 
         await executeTrimming(atFloor.api, createFakeTurn({ api: atFloor.api, calls: atFloorCalls, entries: entriesFrom(TRIMMABLE) }));
-        expect(atFloorCalls).toEqual(['setIncluded:1:false']);
+        expect(atFloorCalls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(atFloor.diagnostics).toHaveLength(1);
 
         const above = createFakeApi({ minTokens: 14 });
@@ -1624,7 +1833,7 @@ describe('context-trimmer economy knobs (T5)', () => {
 
         // The cap bit (one unit of two) and the report says so: the policy block carries the values
         // that produced THIS plan, not the declared defaults.
-        expect(calls).toEqual(['setIncluded:1:false']);
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(policyOf(diagnostics[0])).toMatchObject({ minTokens: 5, safetyUnits: 2, maxUnits: 1 });
         // The line is the shipped wording — the unit is the shape the shipped rule has always
         // named, so the generalisation changed nothing about it (the resolver is `msg-6`, the third
@@ -1653,8 +1862,8 @@ describe('context-trimmer report — which switch a line names (T4 / D4 #1)', ()
                 stored: { dropSupersededToolCalls: false, invalidOutcomes: 'cancelled' },
                 messages: unitThenAnswer(result('c1', 'read', 'stopped', 'cancelled')),
                 message:
-                    'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [cancelled] read answered by msg-4 via dropInvalidToolCallsOnceAnswered',
-                fired: ['dropInvalidToolCallsOnceAnswered']
+                    'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [cancelled] read answered by msg-4 via trimInvalidTools',
+                fired: ['trimInvalidTools']
             },
             {
                 // `empty` is the one value read off the TEXT: the line reports what the pass JUDGED
@@ -1664,8 +1873,8 @@ describe('context-trimmer report — which switch a line names (T4 / D4 #1)', ()
                 stored: { dropSupersededToolCalls: false, invalidOutcomes: 'empty' },
                 messages: unitThenAnswer(result('c1', 'read', '   ')),
                 message:
-                    'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [empty] read answered by msg-4 via dropInvalidToolCallsOnceAnswered',
-                fired: ['dropInvalidToolCallsOnceAnswered']
+                    'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [empty] read answered by msg-4 via trimInvalidTools',
+                fired: ['trimInvalidTools']
             },
             {
                 // A duplicate re-run withholds a unit whose answers the model READ, so the line
@@ -1698,7 +1907,7 @@ describe('context-trimmer report — which switch a line names (T4 / D4 #1)', ()
                 case: entry.case,
                 reported: 1,
                 message: entry.message,
-                calls: ['setIncluded:1:false'],
+                calls: ['setIncluded:1:false', 'setIncluded:2:false'],
                 fired: entry.fired
             });
         }
@@ -1711,23 +1920,26 @@ describe('context-trimmer report — which switch a line names (T4 / D4 #1)', ()
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(unitThenAnswer(result('c1', 'read', '   '))) }));
 
         expect(diagnostics[0].data).toEqual({
-            // The thinking side is always part of the report, even when it wrote nothing (T6):
-            // a host diffs ONE shape across turns, so "no thinking this pass" is an empty list
-            // rather than a missing key.
+            // The thinking and truncate sides are ALWAYS part of the report, even when they wrote
+            // nothing: a host diffs ONE shape across turns, so "no thinking this pass" and "no
+            // request truncated this pass" are empty lists rather than missing keys.
             thoughts: [],
+            truncated: [],
             units: [
                 {
                     index: 1,
                     messageId: 'msg-2',
                     members: [1, 2],
+                    // The whole unit was still being sent, so this pass DID write the request entry.
+                    requestAlreadyWithheld: false,
                     // RECORDS `completed`, JUDGED `empty` — the pair that makes a withheld stub
                     // distinguishable from a withheld zero-hit search.
                     outcomes: ['completed'],
                     invalidOutcomes: ['empty'],
                     names: ['read'],
                     supersededBy: 'msg-4',
-                    firedBy: 'dropInvalidToolCallsOnceAnswered',
-                    admittedBy: ['dropInvalidToolCallsOnceAnswered']
+                    firedBy: 'trimInvalidTools',
+                    admittedBy: ['trimInvalidTools']
                 }
             ],
             policy: {
@@ -1735,7 +1947,7 @@ describe('context-trimmer report — which switch a line names (T4 / D4 #1)', ()
                 dropSupersededToolCalls: false,
                 invalidOutcomes: 'empty',
                 invalidOutcomesSubmitted: 'empty',
-                fired: ['dropInvalidToolCallsOnceAnswered']
+                fired: ['trimInvalidTools']
             }
         });
     });
@@ -1754,9 +1966,11 @@ describe('context-trimmer action (executeTrimming)', () => {
 
         await expect(executeTrimming(api, context)).resolves.toBeUndefined();
 
-        // ONE write, on the LEADER. The cascade covers the result, so the policy never names
-        // a member (and never rewrites the transcript).
-        expect(calls).toEqual(['setIncluded:1:false']);
+        // TWO writes — one per MEMBER of the withheld unit, the leader and its own result. R8
+        // removed the runtime's cascade, so the policy names every entry it wants out of the
+        // request (and never rewrites the transcript beyond those flags). The answering unit
+        // (entries 3 and 4) stays on.
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(entries[1].included).toBe(false);
         expect(entries[3].included).toBe(true);
         expect(entries[4].included).toBe(true);
@@ -1771,25 +1985,146 @@ describe('context-trimmer action (executeTrimming)', () => {
                 '#1 msg-2 [failed] read answered by msg-4'
         );
         expect(diagnostics[0].data).toEqual({
-            // The thinking side is always part of the report, even when it wrote nothing (T6):
-            // a host diffs ONE shape across turns, so "no thinking this pass" is an empty list
-            // rather than a missing key.
+            // The thinking and truncate sides are ALWAYS part of the report, even when they wrote
+            // nothing: a host diffs ONE shape across turns, so "no thinking this pass" and "no
+            // request truncated this pass" are empty lists rather than missing keys.
             thoughts: [],
+            truncated: [],
             units: [
                 {
                     index: 1,
                     messageId: 'msg-2',
                     members: [1, 2],
+                    requestAlreadyWithheld: false,
                     outcomes: ['failed'],
                     invalidOutcomes: ['failed'],
                     names: ['read'],
                     supersededBy: 'msg-4',
                     firedBy: 'dropSupersededToolCalls',
-                    admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered']
+                    admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools']
                 }
             ],
             policy: DEFAULT_POLICY
         });
+    });
+
+    it('A1: finishes an already-truncated unit with ONE write, and attributes the completion to the trim rule', async () => {
+        // THE STATE `truncateToolRequests` LEAVES BEHIND: the REQUEST entry (1) is withheld and the
+        // failed RESULT (2) rides on. The truncate axis stays ON here, with a horizon of one tool turn
+        // — the answering unit (3) is the newest tool turn, so it is protected and the axis has
+        // nothing to write for a reason a reader can check. That is what turns "the report does not
+        // double-count this decision" into an assertion rather than an artefact of a switch being off.
+        const { api, touches, diagnostics } = createFakeApi({ truncateToolRequests: true, truncateTurns: 1 });
+        const calls: string[] = [];
+        const entries = entriesFrom(TRIMMABLE, [1]);
+
+        await expect(executeTrimming(api, createFakeTurn({ api, calls, entries }))).resolves.toBeUndefined();
+
+        // ONE write, on the surviving RESULT. The leader already carried the flag, so the writer does
+        // not touch it again: re-writing `false` would fire a persistence notification and a
+        // whole-document save for a write that changes nothing, and no axis here ever stores `true`.
+        expect(calls).toEqual(['setIncluded:2:false']);
+        expect(entries[1].included).toBe(false);
+        expect(entries[2].included).toBe(false);
+        expect(entries[3].included).toBe(true);
+        expect(entries[4].included).toBe(true);
+        expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
+
+        // The unit is still NAMED by its leader (the readable, durable identity) and the line says the
+        // request was already gone, so the same `#1` cannot be misread as a truncation this pass did.
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer withheld 1 superseded tool unit(s): ' +
+                '#1 msg-2 [failed] read answered by msg-4 (request already withheld)'
+        );
+        expect(diagnostics[0].data).toEqual({
+            thoughts: [],
+            // THE TRUNCATE SECTION STAYS EMPTY: this pass wrote no truncation, so the decision that
+            // belongs to an EARLIER turn is not reported again and `policy.fired` cannot name the
+            // truncate switch for a write it did not make (see the `truncateToolRequests: true` in
+            // the policy block right below — the switch was on, and it still did not fire).
+            truncated: [],
+            units: [
+                {
+                    index: 1,
+                    messageId: 'msg-2',
+                    members: [2],
+                    requestAlreadyWithheld: true,
+                    outcomes: ['failed'],
+                    invalidOutcomes: ['failed'],
+                    names: ['read'],
+                    supersededBy: 'msg-4',
+                    // The whole-unit rule owns this record: it withheld the last piece of the unit,
+                    // whoever truncated the request on the turn before.
+                    firedBy: 'dropSupersededToolCalls',
+                    admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools']
+                }
+            ],
+            policy: { ...DEFAULT_POLICY, truncateToolRequests: true, truncateTurns: 1 }
+        });
+
+        // THE SECOND PASS WRITES AND REPORTS NOTHING. The same live entries, one turn later: the unit
+        // has no member left to withhold, so the plan is empty — no flag write, therefore no
+        // notification and no save, and no diagnostic line either.
+        const writes = calls.length;
+        const reads = touches.length;
+
+        await expect(executeTrimming(api, createFakeTurn({ api, calls, entries }))).resolves.toBeUndefined();
+
+        expect(calls.slice(writes)).toEqual([]);
+        expect(diagnostics).toHaveLength(1);
+        expect(touches.slice(reads)).toEqual(TURN_READS);
+
+        // NOTHING IS DELETED — flags only. Canonical history still carries the request, its result and
+        // the answering unit, so a host or the UI can switch each entry back on.
+        expect(entries).toHaveLength(TRIMMABLE.length);
+        expect(entries[1].message as Extract<HarnessMessage, { role: 'assistant' }>).toMatchObject({
+            content: '',
+            toolCalls: [{ id: 'c1', name: 'read', arguments: '{"path":"a.ts"}' }]
+        });
+        expect((entries[2].message as Extract<HarnessMessage, { role: 'tool' }>).content).toBe(
+            'Tool "read" failed: EACCES'
+        );
+    });
+
+    it('A1: one pass that finishes an old truncation AND truncates a fresh request bills each entry once', async () => {
+        // THE CROSS-AXIS HALF of the same promise. `truncateTurns: 0` (the fake's baseline) makes the
+        // truncate axis eligible for BOTH tool turns: the one whose request an earlier pass already
+        // took (unit #1 — nothing left for that axis to do) and the answering turn (#3). The whole-unit
+        // rule runs first and finishes #1, and the truncate axis writes #3. One transcript position,
+        // one decision, one record — the two lists must not overlap.
+        const { api, diagnostics } = createFakeApi({ truncateToolRequests: true, truncateTurns: 0 });
+        const calls: string[] = [];
+        const entries = entriesFrom(TRIMMABLE, [1]);
+
+        await expect(executeTrimming(api, createFakeTurn({ api, calls, entries }))).resolves.toBeUndefined();
+
+        // Two writes: the surviving RESULT of the finished unit, then the REQUEST of the fresh one. The
+        // already-off leader (#1) is never re-written, and #4 — the answer the model keeps — is the one
+        // entry of the answering unit that stays on.
+        expect(calls).toEqual(['setIncluded:2:false', 'setIncluded:3:false']);
+        expect(entries.map((entry) => entry.included)).toEqual([true, false, false, false, true, true]);
+
+        const data = diagnostics[0].data as {
+            units: { index: number; members: number[]; requestAlreadyWithheld: boolean }[];
+            truncated: { index: number; results: number[] }[];
+            policy: { fired: string[] };
+        };
+
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer withheld 1 superseded tool unit(s): ' +
+                '#1 msg-2 [failed] read answered by msg-4 (request already withheld)' +
+                ' | context-trimmer truncated 1 tool request(s): #3 msg-4 read results kept #4'
+        );
+
+        // THE TWO LISTS ARE DISJOINT. `#1` is a completion (its write set is the result) and `#3` is a
+        // truncation (its write set is the request, its result listed as kept) — neither entry appears
+        // on both sides, so the pass cannot bill the same text twice.
+        expect(data.units.map((unit) => ({ index: unit.index, members: unit.members, requestAlreadyWithheld: unit.requestAlreadyWithheld }))).toEqual([
+            { index: 1, members: [2], requestAlreadyWithheld: true }
+        ]);
+        expect(data.truncated).toEqual([{ index: 3, messageId: 'msg-4', names: ['read'], results: [4], firedBy: 'truncateToolRequests' }]);
+        expect(data.policy.fired).toEqual(['dropSupersededToolCalls', 'trimInvalidTools', 'truncateToolRequests']);
     });
 
     it('A2: writes and reports nothing when nothing was superseded', async () => {
@@ -1818,7 +2153,12 @@ describe('context-trimmer action (executeTrimming)', () => {
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries }));
 
-        expect(calls).toEqual(['setIncluded:0:false', 'setIncluded:2:false']);
+        expect(calls).toEqual([
+            'setIncluded:0:false',
+            'setIncluded:1:false',
+            'setIncluded:2:false',
+            'setIncluded:3:false'
+        ]);
 
         const data = diagnostics[0].data as { units: { index: number }[] };
 
@@ -1898,10 +2238,51 @@ describe('context-trimmer action (executeTrimming)', () => {
         const after: string[] = [];
 
         await executeTrimming(api, createFakeTurn({ api, calls: after, entries: entriesFrom(TRIMMABLE) }));
-        expect(after).toEqual(['setIncluded:1:false']);
+        expect(after).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(diagnostics).toHaveLength(1);
     });
+
+    // THE THIRD WRITE LOOP, SAME RACE (2026-11-13 review). The whole-unit loop is the one that
+    // already re-checked the live flag; it now runs the same shared validity check as the other two,
+    // so an index that lands on a role this axis cannot name (a REQUEST entry or a RESULT) is skipped
+    // rather than written. The plan's write set is [1,2]; index 1 has moved to a `user` entry in the
+    // replaced transcript, so exactly one flag lands — and the unit is still REPORTED, because the
+    // unit really did leave the request.
+    it('a whole-unit member that went stale inside the pause window is skipped, and the rest lands', async () => {
+        const { api, diagnostics } = createFakeApi();
+        const calls: string[] = [];
+        const planned = entriesFrom(TRIMMABLE);
+        const stale = entriesFrom([
+            { role: 'user', content: 'go' },
+            { role: 'user', content: 'moved' },
+            result('c1', 'read', 'Tool "read" failed: EACCES', 'failed'),
+            call('c2', 'read', '{"path":"b.ts"}'),
+            result('c2', 'read', 'export const b = 2;'),
+            { role: 'assistant', content: 'done' }
+        ]);
+        const { context, reads } = withStaleEntries(
+            createFakeTurn({ api, calls, entries: planned }),
+            planned,
+            stale
+        );
+
+        await executeTrimming(api, context);
+
+        expect(calls).toEqual(['setIncluded:2:false']);
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4'
+        );
+        expect(
+            (
+                diagnostics[0].data as {
+                    units: { members: readonly number[]; requestAlreadyWithheld: boolean }[];
+                }
+            ).units.map((unit) => [unit.members, unit.requestAlreadyWithheld])
+        ).toEqual([[[1, 2], false]]);
+        expect(reads()).toBe(4);
+    });
 });
+
 
 // ---------------------------------------------------------------------------
 // The policy switches (the 2026-11-10 split): gating, independence, and what a pass reports
@@ -1941,7 +2322,7 @@ describe('context-trimmer policy switches', () => {
     it('with BOTH tool switches off nothing is withheld, reported, touched or parked', async () => {
         const { api, touches, diagnostics } = createFakeApi({
             dropSupersededToolCalls: false,
-            dropInvalidToolCallsOnceAnswered: false
+            trimInvalidTools: false
         });
         const calls: string[] = [];
         const entries = entriesFrom(TRIMMABLE);
@@ -1959,7 +2340,7 @@ describe('context-trimmer policy switches', () => {
         // into a promise. A second fake keeps the read list above readable.
         const { api: handlerApi, touches: handlerTouches } = createFakeApi({
             dropSupersededToolCalls: false,
-            dropInvalidToolCallsOnceAnswered: false
+            trimInvalidTools: false
         });
         const handlerCalls: string[] = [];
         const handler = createContextTrimmerHandler(handlerApi);
@@ -1975,31 +2356,31 @@ describe('context-trimmer policy switches', () => {
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(TRIMMABLE) }));
 
-        expect(calls).toEqual(['setIncluded:1:false']);
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4'
         );
 
         const policy = policyOf(diagnostics[0]);
 
-        expect(policy.fired).toEqual(['dropInvalidToolCallsOnceAnswered']);
+        expect(policy.fired).toEqual(['trimInvalidTools']);
         expect(policy.dropSupersededToolCalls).toBe(false);
         expect(policy.invalidOutcomes).toBe('failed/rejected');
     });
 
-    it('`dropInvalidToolCallsOnceAnswered: false` leaves the shipped rule as the only tool policy', async () => {
-        const { api, diagnostics } = createFakeApi({ dropInvalidToolCallsOnceAnswered: false });
+    it('`trimInvalidTools: false` leaves the shipped rule as the only tool policy', async () => {
+        const { api, diagnostics } = createFakeApi({ trimInvalidTools: false });
         const calls: string[] = [];
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(TRIMMABLE) }));
 
         // Independent in the other direction: the shipped switch alone still withholds the pair.
-        expect(calls).toEqual(['setIncluded:1:false']);
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
 
         const policy = policyOf(diagnostics[0]);
 
         expect(policy.fired).toEqual(['dropSupersededToolCalls']);
-        expect(policy.dropInvalidToolCallsOnceAnswered).toBe(false);
+        expect(policy.trimInvalidTools).toBe(false);
     });
 
     it('`invalidOutcomes` narrows what counts as invalid once the shipped switch is off', async () => {
@@ -2018,9 +2399,9 @@ describe('context-trimmer policy switches', () => {
 
         await executeTrimming(trimmed.api, createFakeTurn({ api: trimmed.api, calls: trimmedCalls, entries: entriesFrom(TRIMMABLE_REJECTED) }));
 
-        expect(trimmedCalls).toEqual(['setIncluded:1:false']);
+        expect(trimmedCalls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(policyOf(trimmed.diagnostics[0]).invalidOutcomes).toBe('rejected');
-        expect(policyOf(trimmed.diagnostics[0]).fired).toEqual(['dropInvalidToolCallsOnceAnswered']);
+        expect(policyOf(trimmed.diagnostics[0]).fired).toEqual(['trimInvalidTools']);
     });
 
     it('an outcome set that resolves to NOTHING disables the generalisation', async () => {
@@ -2050,7 +2431,7 @@ describe('context-trimmer policy switches', () => {
 
         await executeTrimming(cancelled.api, createFakeTurn({ api: cancelled.api, calls: cancelledCalls, entries: entriesFrom(TRIMMABLE) }));
 
-        expect(cancelledCalls).toEqual(['setIncluded:1:false']);
+        expect(cancelledCalls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(cancelled.diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4'
         );
@@ -2066,7 +2447,7 @@ describe('context-trimmer policy switches', () => {
 
         await executeTrimming(completed.api, createFakeTurn({ api: completed.api, calls: completedCalls, entries: entriesFrom(TRIMMABLE) }));
 
-        expect(completedCalls).toEqual(['setIncluded:1:false']);
+        expect(completedCalls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(completed.diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4' +
                 ' | invalidOutcomes "completed" has unknown names; used none (the generalisation is off)'
@@ -2082,15 +2463,6 @@ describe('context-trimmer policy switches', () => {
                     invalidOutcomes: 'failed/rejected',
                     invalidOutcomesSubmitted: 'failed,rejected,bogus',
                     invalidOutcomesFallback: true
-                }
-            },
-            {
-                stored: { dropOldThoughts: 'sometimes' },
-                clause: 'dropOldThoughts "sometimes" is not a tier; used "turn"',
-                policy: {
-                    dropOldThoughts: 'turn',
-                    dropOldThoughtsSubmitted: 'sometimes',
-                    dropOldThoughtsFallback: true
                 }
             },
             {
@@ -2119,10 +2491,9 @@ describe('context-trimmer policy switches', () => {
         }
     });
 
-    it('reports every fallback clause in DECLARED order when all three tiers are wrong at once', async () => {
+    it('reports every fallback clause in DECLARED order when both string tiers are wrong at once', async () => {
         const { api, diagnostics } = createFakeApi({
             invalidOutcomes: 'nope',
-            dropOldThoughts: 'sometimes',
             supersedeMatch: 'loose'
         });
         const calls: string[] = [];
@@ -2132,7 +2503,6 @@ describe('context-trimmer policy switches', () => {
         expect(diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4' +
                 ' | invalidOutcomes "nope" has unknown names; used none (the generalisation is off)' +
-                ' | dropOldThoughts "sometimes" is not a tier; used "turn"' +
                 ' | supersedeMatch "loose" is not a matcher; used "name"'
         );
         expect(policyOf(diagnostics[0]).fired).toEqual(['dropSupersededToolCalls']);
@@ -2140,7 +2510,6 @@ describe('context-trimmer policy switches', () => {
 
     it('a tier that only differs in case or spacing is normalised WITHOUT a fallback clause', async () => {
         const { api, diagnostics } = createFakeApi({
-            dropOldThoughts: '  TURN ',
             supersedeMatch: 'Fingerprint ',
             invalidOutcomes: ' Failed , REJECTED '
         });
@@ -2153,15 +2522,13 @@ describe('context-trimmer policy switches', () => {
         // proof that the normalised matcher is really the one in force, not the fallback.
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(TRIMMABLE_SAME_ARGS) }));
 
-        expect(calls).toEqual(['setIncluded:1:false']);
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         // Normalisation is not a substitution: nothing was dropped, so nothing is complained
         // about, and the USED values are the canonical spellings.
         expect(diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4'
         );
         expect(policyOf(diagnostics[0])).toMatchObject({
-            dropOldThoughts: 'turn',
-            dropOldThoughtsFallback: false,
             supersedeMatch: 'fingerprint',
             supersedeMatchFallback: false,
             invalidOutcomes: 'failed/rejected',
@@ -2169,17 +2536,19 @@ describe('context-trimmer policy switches', () => {
         });
     });
 
-    it('reports the economy and thoughts knobs in every pass report, and the two that gate nothing stay inert', async () => {
+    it('reports the economy and thoughts knobs in every pass report, and the ones that gate nothing stay inert', async () => {
         // The report half, at values that gate NOTHING: `minTokens: 0` and `safetyUnits: 0` are the
-        // pass-throughs, `maxUnits: 1` cannot bite a one-candidate pass, and `minThoughtChars` is the
-        // thinking twin this pass never applies (the estimator does not count `reasoning`). A
-        // superseded unit still leaves, so a reader can tell "off" from "not implemented" and the
-        // declared defaults never leak into the block.
+        // pass-throughs, `maxUnits: 1` cannot bite a one-candidate pass, `minThoughtChars` is the
+        // thinking twin this pass never applies (the estimator does not count `reasoning`), and
+        // `thoughtTurns: 7` protects more thoughts than this fixture has. A superseded unit still
+        // leaves, so a reader can tell "off" from "not implemented" and the declared defaults never
+        // leak into the block.
         const { api, diagnostics } = createFakeApi({
-            dropOldThoughts: 'all',
-            thoughtKeepUnits: 4,
+            thoughtTurns: 7,
             supersedeMatch: 'fingerprint',
             dropDuplicateCalls: true,
+            truncateToolRequests: true,
+            truncateTurns: 9,
             minTokens: 0,
             minThoughtChars: 2000,
             safetyUnits: 0,
@@ -2189,10 +2558,12 @@ describe('context-trimmer policy switches', () => {
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(TRIMMABLE_SAME_ARGS) }));
 
-        expect(calls).toEqual(['setIncluded:1:false']);
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(policyOf(diagnostics[0])).toMatchObject({
-            dropOldThoughts: 'all',
-            thoughtKeepUnits: 4,
+            trimThoughts: true,
+            thoughtTurns: 7,
+            truncateToolRequests: true,
+            truncateTurns: 9,
             supersedeMatch: 'fingerprint',
             dropDuplicateCalls: true,
             minTokens: 0,
@@ -2210,7 +2581,7 @@ describe('context-trimmer policy switches', () => {
 
         expect({ minThoughtChars: 1000000, calls: inertCalls, reported: inertDiagnostics.length }).toEqual({
             minThoughtChars: 1000000,
-            calls: ['setIncluded:1:false'],
+            calls: ['setIncluded:1:false', 'setIncluded:2:false'],
             reported: 1
         });
 
@@ -2342,8 +2713,14 @@ describe('context-trimmer trigger (createContextTrimmerHandler)', () => {
         );
 
         // park -> write -> un-park, with the shipped writer: the built-in changes the
-        // transcript inside the pause window and reports it.
-        expect(calls).toEqual(['pause', 'setIncluded:1:false', 'resume']);
+        // transcript inside the pause window and reports it. TWO writes for ONE unit, because the
+        // flag is per entry (R8) and the unit's write set is its leader plus its result.
+        expect(calls).toEqual([
+            'pause',
+            'setIncluded:1:false',
+            'setIncluded:2:false',
+            'resume'
+        ]);
         expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
     });
 });
@@ -2370,6 +2747,11 @@ describe('context-trimmer metadata', () => {
         // (src/server/plugins.ts `checkValue`). `enabled` keeps its key, its label, its type
         // and its default: it is the framework's reserved master switch (src/server/plugins.ts
         // `RESERVED_ENABLED_DESCRIPTOR`), so the policy switches below are separate keys.
+        //
+        // THE ORDER IS THE PANE'S ORDER. Every HORIZON sits immediately after the toggle it
+        // windows, because the Plugins pane renders one control per descriptor in this array's
+        // order — a number separated from the switch it belongs to is a number an operator has to
+        // map by name alone.
         expect(
             metadata.settings?.map((setting: HarnessPluginSettingDescriptor) => [
                 setting.key,
@@ -2381,35 +2763,122 @@ describe('context-trimmer metadata', () => {
             ])
         ).toEqual([
             ['enabled', 'boolean', true, undefined, undefined, undefined],
+            ['trimInvalidTools', 'boolean', true, undefined, undefined, undefined],
+            ['invalidToolTurns', 'number', 2, 0, 4096, 1],
+            ['trimThoughts', 'boolean', true, undefined, undefined, undefined],
+            ['thoughtTurns', 'number', 2, 0, 4096, 1],
+            ['truncateToolRequests', 'boolean', false, undefined, undefined, undefined],
+            ['truncateTurns', 'number', 2, 0, 4096, 1],
             ['dropSupersededToolCalls', 'boolean', true, undefined, undefined, undefined],
-            ['dropInvalidToolCallsOnceAnswered', 'boolean', true, undefined, undefined, undefined],
-            ['invalidOutcomes', 'string', 'failed,rejected', undefined, undefined, undefined],
-            ['dropOldThoughts', 'string', 'turn', undefined, undefined, undefined],
-            ['thoughtKeepUnits', 'number', 0, 0, 32, 1],
-            ['supersedeMatch', 'string', 'name', undefined, undefined, undefined],
+            ['supersededTurns', 'number', 2, 0, 4096, 1],
             ['dropDuplicateCalls', 'boolean', false, undefined, undefined, undefined],
+            ['duplicateTurns', 'number', 2, 0, 4096, 1],
+            ['invalidOutcomes', 'string', 'failed,rejected', undefined, undefined, undefined],
+            ['supersedeMatch', 'string', 'name', undefined, undefined, undefined],
             ['minTokens', 'number', 0, 0, 1000000, 50],
             ['minThoughtChars', 'number', 0, 0, 1000000, 50],
             ['safetyUnits', 'number', 0, 0, 4096, 1],
             ['maxUnits', 'number', 0, 0, 4096, 1]
         ]);
 
-        // Every descriptor is UI-facing: a label and a real explanation, not a placeholder.
+        // THE THREE TOGGLE + HORIZON OPTIONS the operator is meant to see first, each horizon
+        // immediately after its toggle (the pairs above, spelled out as pairs so a reordering
+        // that separates a number from its switch fails here and not in the pane).
+        const keys = (metadata.settings ?? []).map((setting) => setting.key);
+
+        expect(keys.indexOf('truncateToolRequests') + 1).toBe(keys.indexOf('truncateTurns'));
+        expect(keys.indexOf('trimInvalidTools') + 1).toBe(keys.indexOf('invalidToolTurns'));
+        expect(keys.indexOf('trimThoughts') + 1).toBe(keys.indexOf('thoughtTurns'));
+        expect(keys.indexOf('dropSupersededToolCalls') + 1).toBe(keys.indexOf('supersededTurns'));
+        expect(keys.indexOf('dropDuplicateCalls') + 1).toBe(keys.indexOf('duplicateTurns'));
+
+        // Every descriptor is UI-facing: a real label, and a hint ONLY where the copy earns it.
+        // A declared `description` is what the generic renderer turns into a `.plugin-setting-hint`
+        // under the control (`src/frontend/main.ts` `buildSettingField`, called per descriptor by
+        // `openPluginDialog`), and Context Compacting — the row this one sits next to in the pane —
+        // declares SIX controls and ZERO descriptions. So the previous shape, "every one of the
+        // seventeen rows must explain itself in >30 characters", is the assertion that LOCKED IN
+        // the divergence, and it is replaced by the exact copy table below: eight rows now carry no
+        // description at all, and the nine that do state something the label plus `min`/`max`
+        // cannot answer (the two closed sets, the gates that no-op silently, the one horizon
+        // sentence that covers all five horizons, and the withhold-only caveat once). Pinning the
+        // table means a row that grows boilerplate back fails here, not in the pane.
+        expect(
+            (metadata.settings ?? []).map(
+                (setting: HarnessPluginSettingDescriptor) => [setting.key, setting.description ?? null]
+            )
+        ).toEqual([
+            ['enabled', 'Turns each policy off from the next turn; entries already withheld stay out.'],
+            [
+                'trimInvalidTools',
+                'Trims nothing until a later included completed call answers every tool name it called.'
+            ],
+            ['invalidToolTurns', 'Protects the newest N tool turns; 0 protects none.'],
+            ['trimThoughts', null],
+            ['thoughtTurns', null],
+            ['truncateToolRequests', 'Drops the request entry only; its tool results stay in the request.'],
+            ['truncateTurns', null],
+            ['dropSupersededToolCalls', null],
+            ['supersededTurns', null],
+            [
+                'dropDuplicateCalls',
+                'Needs an exact re-run with identical arguments; supersedeMatch does not widen it.'
+            ],
+            ['duplicateTurns', null],
+            [
+                'invalidOutcomes',
+                'Comma-separated subset of failed, rejected, cancelled, empty; empty means a blank result.'
+            ],
+            ['supersedeMatch', "'name' matches any later call of the tool; 'fingerprint' needs identical arguments."],
+            ['minTokens', 'Each tool axis must save this many tokens, or it writes nothing; thinking is never gated.'],
+            ['minThoughtChars', null],
+            ['safetyUnits', null],
+            ['maxUnits', 'Tool units one axis may withhold per pass; 0 is unbounded, not disabled.']
+        ]);
+
+        // THE COPY BUDGET, as measured numbers rather than a mood: nine hints across seventeen rows
+        // (was seventeen hints), 693 characters of hint in total (was 1,206), eight rows with no
+        // hint, and the longest clause at 89 characters. `metadata.description` is 83 characters,
+        // SHORTER than compaction's 87 — the row has to read at least as plainly as its neighbour.
+        const hints = (metadata.settings ?? [])
+            .map((setting) => setting.description)
+            .filter((description): description is string => typeof description === 'string');
+
+        expect(hints).toHaveLength(9);
+        expect(hints.reduce((total, description) => total + description.length, 0)).toBe(693);
+        expect(Math.max(...hints.map((description) => description.length))).toBe(89);
+        expect((metadata.settings ?? []).length).toBe(hints.length + 8);
+
         for (const setting of metadata.settings ?? []) {
             expect(typeof setting.label).toBe('string');
             expect(setting.label.length).toBeGreaterThan(3);
-            expect(typeof setting.description).toBe('string');
-            expect((setting.description ?? '').length).toBeGreaterThan(40);
         }
 
-        // The posture, stated by the plugin itself (T2a): the engine trims nothing, this is the
-        // one place that does, and withholding is reversible.
-        expect(metadata.description).toContain('engine core trims nothing by default');
-        expect(metadata.description).toContain('the one place trimming happens');
-        expect(metadata.description).toContain('failed or were rejected');
-        expect(metadata.description).toContain('successful call to the same tool');
-        expect(metadata.description).toContain('Nothing is deleted');
-        expect(metadata.description).toContain('switched back on');
+        // The rows that DO carry one stay one short clause: at most 90 characters, and one clause
+        // (no second sentence after a period), which is what stops a hint turning back into the
+        // multi-paragraph prose the clean-up removed.
+        for (const description of hints) {
+            expect(description.length).toBeLessThanOrEqual(90);
+            expect(description).not.toMatch(/\.\s+\S/);
+        }
+
+        // A toggle's label names the whole action the way compaction's does (`Automatic
+        // Compaction …`), so the three headline options read alike in the pane.
+        const labelOf = (key: string): string =>
+            (metadata.settings ?? []).find((setting) => setting.key === key)?.label ?? '';
+
+        expect(labelOf('trimInvalidTools')).toBe('Automatic Trim invalid tools');
+        expect(labelOf('trimThoughts')).toBe('Automatic Trim thoughts');
+        expect(labelOf('truncateToolRequests')).toBe('Automatic Truncate Tool Request');
+        expect(labelOf('invalidToolTurns')).toBe('Invalid tools · trim after (tool turns)');
+
+        // The posture, stated by the plugin itself in ONE short sentence (R1): the long form used to
+        // restate what every descriptor below already says, and 83 characters is also the number the
+        // copy budget above is measured against (compaction's is 87, so this row is not the tall one).
+        expect(metadata.description).toBe(
+            'Withholds superseded tool units, stale tool requests and thinking; deletes nothing.'
+        );
+        expect(metadata.description.match(/\./g)).toHaveLength(1);
     });
 });
 
@@ -2522,8 +2991,18 @@ const probe = (events: string[]) => ({
 const changesOf = (events: readonly HarnessStateChangeEvent[]): string[] =>
     events.map((event) => `${event.reason}:${event.agent ?? '-'}:${event.branchId ?? '-'}`);
 
+// The provider these end-to-end tables run under: ONLY the trimmer's keys answer, every other
+// (plugin, key) returns `undefined`, which is the harness's signal to fall back to the DECLARED
+// default (src/plugin/settings.ts reads through this provider).
+//
+// THE HORIZONS ARE OPENED here, for the same reason `createFakeApi` seeds them to 0: these tables
+// pin what the RUNTIME does with a decision — the pair-clean request, the flagged canonical
+// history, the park, the notification — over a two-tool-turn conversation that the shipped horizon
+// of 2 protects entirely. `the declared horizons protect the recent conversation end to end` below
+// is the table that runs at the declared values instead.
 const settingsOf = (values: Record<string, unknown>): HarnessPluginSettingsProvider => ({
-    get: (plugin, key) => (plugin === metadata.name ? values[key] : undefined)
+    get: (plugin, key) =>
+        plugin === metadata.name ? (values[key] ?? NO_HORIZON[key]) : undefined
 });
 
 describe('context-trimmer through a harness', () => {
@@ -2549,6 +3028,10 @@ describe('context-trimmer through a harness', () => {
                 })
             },
             presets: false,
+            // The horizons are opened (see `settingsOf`); the pair-clean request and the flagged
+            // canonical history are what this table pins. `the declared horizons protect the recent
+            // conversation end to end` is the table that runs at the shipped 2s.
+            pluginSettings: settingsOf({}),
             plugins: [trimmerPlugin(), probe(events)],
             report: {
                 stateChange: (event: HarnessStateChangeEvent) => {
@@ -2637,6 +3120,10 @@ describe('context-trimmer through a harness', () => {
                 })
             },
             presets: false,
+            // The horizons are opened for this table too (see `settingsOf`): what it pins is that a
+            // SECOND run re-derives the same plan, writes NOTHING and never parks again — which is
+            // only interesting once the first run did trim.
+            pluginSettings: settingsOf({}),
             plugins: [trimmerPlugin(), probe(events)]
         });
 
@@ -2726,7 +3213,7 @@ describe('context-trimmer through a harness', () => {
             presets: false,
             pluginSettings: settingsOf({
                 dropSupersededToolCalls: false,
-                dropInvalidToolCallsOnceAnswered: false
+                trimInvalidTools: false
             }),
             plugins: [trimmerPlugin(), probe(events)],
             report: {
@@ -2823,7 +3310,6 @@ describe('context-trimmer through a harness', () => {
             presets: false,
             pluginSettings: settingsOf({
                 invalidOutcomes: 'bogus',
-                dropOldThoughts: 'sometimes',
                 supersedeMatch: 'loose'
             }),
             plugins: [trimmerPlugin()],
@@ -2840,7 +3326,6 @@ describe('context-trimmer through a harness', () => {
         expect(diagnostics.map((event) => `${event.type}:${event.kind}:${event.owner}`)).toEqual([
             'plugin_diagnostic:policy:context-trimmer'
         ]);
-        expect(diagnostics[0].message).toContain('dropOldThoughts "sometimes" is not a tier; used "turn"');
         expect(diagnostics[0].message).toContain('supersedeMatch "loose" is not a matcher; used "name"');
         expect(diagnostics[0].message).toContain(
             'invalidOutcomes "bogus" has unknown names; used none (the generalisation is off)'
@@ -2851,8 +3336,6 @@ describe('context-trimmer through a harness', () => {
         expect(policy).toMatchObject({
             invalidOutcomes: '',
             invalidOutcomesSubmitted: 'bogus',
-            dropOldThoughts: 'turn',
-            dropOldThoughtsSubmitted: 'sometimes',
             supersedeMatch: 'name',
             supersedeMatchSubmitted: 'loose',
             fired: ['dropSupersededToolCalls']
@@ -2869,25 +3352,126 @@ describe('context-trimmer through a harness', () => {
         ]);
         expect(pairIssues(seen[0])).toEqual([]);
     });
+    // THE TRUNCATE PROMISE, AT THE WIRE (2026-11-13 review). Everything this axis had before this
+    // table was plan-level or fake-api-level: a recorded `setIncluded(leader, false)` and a report
+    // line naming the results. What the operator actually asked for — "actually remove tool request
+    // …, only keeping the tool response in the context" — is only answerable through a REAL harness:
+    // the request must carry the surviving RESULT as an ownerless `tool` message, the exact shape the
+    // transport maps at src/transport/openai.ts:394-398 (`{ role: 'tool', tool_call_id, content }`),
+    // and the pairing oracle borrowed from src/harness.inclusion.test.ts must report EXACTLY the one
+    // orphan the switch promises — one result whose request left, and no other half-pair.
+    it('TRUNCATE end to end: the request leaves and the response rides on as an ownerless tool message', async () => {
+        const seen: HarnessMessage[][] = [];
+        const events: string[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    messages: SEED,
+                    stream: scripted([answer('settled')], seen)
+                })
+            },
+            tools: {
+                alpha: tool({
+                    description: 'Echo tool alpha.',
+                    tags: ['test'],
+                    visibility: 'core',
+                    execute: () => 'A'
+                })
+            },
+            presets: false,
+            // Horizons open (see `settingsOf`), truncate asked for. The shipped tool rules stay on, so
+            // the failed unit still leaves WHOLE — which is what makes the truncate candidate here the
+            // ANSWERING unit, the one whose result has to survive the loss of its own call.
+            pluginSettings: settingsOf({ truncateToolRequests: true }),
+            plugins: [trimmerPlugin(), probe(events)],
+            report: {
+                diagnostic: (event: HarnessDiagnosticEvent) => {
+                    diagnostics.push(event);
+                }
+            }
+        });
+
+        await writer('go');
+
+        // THE REQUEST the provider is handed. Unit 0 (the failed call plus its result) is withheld
+        // whole, the answering REQUEST entry is withheld ALONE, and its result is the only tool
+        // message left — ownerless, because no assistant entry in this request asks for `c2`.
+        expect(seen[0]).toEqual([
+            { role: 'user', content: 'question' },
+            { role: 'tool', content: 'A', toolCallId: 'c2', name: 'alpha' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+
+        // THE ONE ORPHAN, and only it. `pairIssues` is the oracle that fails a half-emitted unit, so
+        // this asserts both halves of the promise at once: the switch left exactly one unclaimed
+        // result (the feature), and the whole-unit trim leaked no pair of its own.
+        expect(pairIssues(seen[0])).toEqual(['orphan tool#1: c2']);
+
+        // NOTHING WAS DELETED: every canonical entry is still in place, and the flag sits on exactly
+        // the three entries this pass wrote — the failed unit's two, and the request alone. The
+        // surviving result carries NO flag, which is the difference between a truncation and a trim.
+        expect(shape(writer.agent.messages)).toEqual([
+            'user:question',
+            'assistant::c1',
+            'tool:c1:Tool "alpha" failed: boom',
+            'assistant::c2',
+            'tool:c2:A',
+            'assistant:answered:',
+            'user:go',
+            'assistant:settled:'
+        ]);
+        expect(withoutIds(writer.agent.messages[3])).toStrictEqual({
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'c2', name: 'alpha', arguments: '{"path":"b.ts"}' }],
+            included: false
+        });
+        expect((writer.agent.messages[4] as { included?: boolean }).included).toBeUndefined();
+        expect(writer.agent.messages.filter((message) => message.included === false)).toHaveLength(3);
+        // `false` remains the only stored spelling, so an operator can still switch all three back.
+        expect(JSON.stringify(writer.agent.messages)).not.toContain('"included":true');
+
+        // One pass, one park, one report — and the report's truncate section names the result that
+        // stays, with the canonical index the request-level assertion above just confirmed.
+        expect(events).toEqual(['paused', 'resumed']);
+        expect(diagnostics.map((event) => `${event.type}:${event.kind}:${event.owner}`)).toEqual([
+            'plugin_diagnostic:policy:context-trimmer'
+        ]);
+        expect(diagnostics[0].message).toContain('context-trimmer truncated 1 tool request(s):');
+        expect(diagnostics[0].message).toContain('results kept #4');
+        expect(
+            (diagnostics[0].data as { truncated: { index: number; results: number[] }[] }).truncated.map(
+                (row) => [row.index, row.results]
+            )
+        ).toEqual([[3, [4]]]);
+    });
 });
 
 // ---------------------------------------------------------------------------
-// T6 — THE THINKING RULE: the tier table, the writes, the report, and the two floors
+// T6 — THE THINKING RULE: the horizon, the writes, the report, and the two floors
 // ---------------------------------------------------------------------------
 //
-// `dropOldThoughts` is the second axis: it withholds the model's own recorded thinking while the
-// entry itself keeps travelling. The write is the per-entry FLAG `reasoningIncluded: false`
-// (../types `HarnessTurnBeforeContext.setReasoningIncluded`), never a text edit, and the projection
-// resolves the flag by omitting `reasoning` from that entry's request copy — the shape assertions
-// for that live in src/harness.inclusion.test.ts, where a real run and a real transport are
-// available. What THIS section pins is the POLICY and the WRITES: which entries a tier selects,
-// what `thoughtKeepUnits` rescues, what each floor rejects, what one pass writes and reports, and
-// that the thinking side and the tool side never gate each other.
+// `trimThoughts` is the second axis (with `thoughtTurns` as its horizon): it withholds the model's
+// own recorded thinking while the entry itself keeps travelling. The write is the per-entry FLAG
+// `reasoningIncluded: false` (../types `HarnessTurnBeforeContext.setReasoningIncluded`), never a text
+// edit, and the projection resolves the flag by omitting `reasoning` from that entry's request copy —
+// the shape assertions for that live in src/harness.inclusion.test.ts, where a real run and a real
+// transport are available. What THIS section pins is the POLICY and the WRITES: which entries the
+// horizon selects, what each floor rejects, what one pass writes and reports, and that the thinking
+// side and the tool side never gate each other. (The pre-uplift shape this section used to pin — the
+// `dropOldThoughts` off|turn|all tier and its `thoughtKeepUnits` rescue — is gone: the horizon
+// answers "which thinking" in one number, and it IS the recent-N protection.)
 //
-// THE BOUNDARY IS THE LAST `user` ENTRY, not `iteration`. Every assistant entry after it is the
-// OPEN turn (the run is still building it) and keeps its thinking under `turn`; everything at or
-// before it is a CLOSED turn. The fixtures below therefore place their user entries deliberately,
-// and each expected list says which side of that line every entry sits on.
+// THE HORIZON COUNTS THOUGHTS, newest-first, not turns and not units: `thoughtTurns: 2` protects the
+// two newest recorded thoughts, and `0` reaches the open turn's thinking too. THE LAST `user` ENTRY is
+// still the turn boundary, and still REPORTED (`turn: 'open' | 'closed'` on every candidate, because
+// the operator's line says which turn a write came out of) — it no longer GATES anything, so the
+// fixtures below place their user entries deliberately and each expected list says which side of that
+// line every entry sits on.
 
 // An assistant entry that CARRIES thinking of exactly `chars` characters. Every character figure
 // asserted in this section is one of these literals — never a count taken back off an implementation
@@ -2928,124 +3512,169 @@ const THOUGHTS: readonly HarnessMessage[] = [
 ];
 
 // The readable form of a thinking plan: exactly the fields a table case is about. `chars` stays in
-// it because the floors are measured over it, and `turn` stays in it because the tier boundary is
-// the single most confusing thing about this switch for an operator reading a report.
+// it because the floor is measured over it; `turn` and `turnsAgo` stay in it because they are what
+// an operator reads to find out WHICH thought left and HOW old it was — the two numbers the report
+// line carries, and the only way to tell "the current turn's thinking" from "something from last
+// week" without opening the transcript.
 const thoughtShape = (plan: readonly ThoughtCandidate[]) =>
     plan.map((candidate) => ({
         index: candidate.entryIndex,
         messageId: candidate.entryMessageId,
         turn: candidate.turn,
+        turnsAgo: candidate.turnsAgo,
         chars: candidate.chars,
         firedBy: candidate.firedBy,
-        tier: candidate.tier
+        horizon: candidate.horizon
     }));
 
-describe('context-trimmer thinking plan (planWithheldThoughts, T6)', () => {
-    it('tier "off" has no thinking write at all, whatever else is configured', () => {
-        // Every position, every rescue setting, the whole transcript: `off` is the engine's
-        // posture, so no flag exists to write (H2's independence starts here).
-        for (const thoughtKeepUnits of [0, 1, 2, 5]) {
+describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
+    it('the switch off has no thinking write at all, whatever else is configured', () => {
+        // Every horizon, every floor, the whole transcript: off is the engine's posture, so no flag
+        // exists to write (the independence from the tool switches starts here).
+        for (const thoughtTurns of [0, 1, 2, 5]) {
             expect(
                 thoughtShape(
-                    planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ dropOldThoughts: 'off', thoughtKeepUnits }))
+                    planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ trimThoughts: false, thoughtTurns }))
                 )
             ).toEqual([]);
         }
 
-        expect(thoughtShape(planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ dropOldThoughts: 'off', minThoughtChars: 1 }))))
-            .toEqual([]);
+        expect(
+            thoughtShape(
+                planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ trimThoughts: false, minThoughtChars: 1 }))
+            )
+        ).toEqual([]);
     });
 
-    it('tier "turn" — the DEFAULT — takes every closed turn and leaves the open one alone', () => {
-        const plan = planWithheldThoughts(entriesFrom(THOUGHTS));
+    it('the horizon protects the N newest thoughts — the N / N+1 boundary, exactly', () => {
+        // `ago` over THOUGHTS: entry 6 is the newest thought (0), 3 is the one above it (1), 1 is
+        // two above (2). A horizon of N admits `ago >= N`, so each row is one entry different, and
+        // the step from N to N+1 moves EXACTLY the thought that sits at `ago === N`.
+        const table: Array<[number, number[]]> = [
+            [0, [1, 3, 6]],
+            [1, [1, 3]],
+            [2, [1]],
+            [3, []],
+            [5, []],
+            // A nonsense horizon is "protect nothing", the same reading every other number edge in
+            // this plugin gives a -1 or a NaN.
+            [-5, [1, 3, 6]],
+            [Number.NaN, [1, 3, 6]]
+        ];
 
-        // Exact candidate objects, hardcoded from the fixture: 1 and 3 sit at or before the last
-        // user entry (index 5), 6 sits after it and is the open turn.
+        for (const [thoughtTurns, indexes] of table) {
+            expect(
+                planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns })).map(
+                    (candidate) => candidate.entryIndex
+                )
+            ).toEqual(indexes);
+        }
+    });
+
+    it('the DEFAULT horizon leaves the two newest thoughts alone, open turn included', () => {
+        const plan = planWithheldThoughts(entriesFrom(THOUGHTS), TRIMMER_DEFAULT_SETTINGS);
+
+        // Exact candidate objects, hardcoded from the fixture: entry 1 is the only thought two or
+        // more thoughts old. `turn` is report context, not a rule — it says which side of the last
+        // user entry the entry sits on — and `turnsAgo` plus `horizon` are the comparison itself.
         expect(plan).toEqual([
             {
                 entryIndex: 1,
                 entryMessageId: 'msg-2',
                 turn: 'closed',
+                turnsAgo: 2,
                 chars: 10,
-                firedBy: 'dropOldThoughts',
-                tier: 'turn'
-            },
-            {
-                entryIndex: 3,
-                entryMessageId: 'msg-4',
-                turn: 'closed',
-                chars: 20,
-                firedBy: 'dropOldThoughts',
-                tier: 'turn'
+                firedBy: 'trimThoughts',
+                horizon: 2
             }
         ]);
-        // Same answer through the readable form, so a table failure names the fields a reader cares
-        // about rather than the whole candidate.
-        expect(thoughtShape(plan)).toEqual([
-            { index: 1, messageId: 'msg-2', turn: 'closed', chars: 10, firedBy: 'dropOldThoughts', tier: 'turn' },
-            { index: 3, messageId: 'msg-4', turn: 'closed', chars: 20, firedBy: 'dropOldThoughts', tier: 'turn' }
-        ]);
-        // The declared default IS `turn`, so the table above is the shipped behaviour.
-        expect(TRIMMER_DEFAULT_SETTINGS.dropOldThoughts).toBe('turn');
-        expect(thoughtShape(planWithheldThoughts(entriesFrom(THOUGHTS), TRIMMER_DEFAULT_SETTINGS))).toEqual(
-            thoughtShape(plan)
-        );
-    });
-
-    it('tier "all" takes the open turn too, and still skips an entry with no thinking', () => {
-        expect(
-            thoughtShape(planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ dropOldThoughts: 'all' })))
-        ).toEqual([
-            { index: 1, messageId: 'msg-2', turn: 'closed', chars: 10, firedBy: 'dropOldThoughts', tier: 'all' },
-            { index: 3, messageId: 'msg-4', turn: 'closed', chars: 20, firedBy: 'dropOldThoughts', tier: 'all' },
-            // Entry 4 has no `reasoning` key at all, so there is nothing to withhold and no flag is
-            // written — and `thoughtKeepUnits` counts entries like this one NOT at all.
-            { index: 6, messageId: 'msg-7', turn: 'open', chars: 30, firedBy: 'dropOldThoughts', tier: 'all' }
+        // The declared default IS 2, which is why the current turn's thinking (thought `ago` 0) is
+        // safe out of the box without a separate tier for it.
+        expect(TRIMMER_DEFAULT_SETTINGS.thoughtTurns).toBe(2);
+        expect(thoughtShape(planWithheldThoughts(entriesFrom(THOUGHTS)))).toEqual([
+            {
+                index: 1,
+                messageId: 'msg-2',
+                turn: 'closed',
+                turnsAgo: 2,
+                chars: 10,
+                firedBy: 'trimThoughts',
+                horizon: 2
+            }
         ]);
     });
 
-    it('thoughtKeepUnits rescues the N newest thinking entries, and only those', () => {
-        const table: Array<[TrimmerSettings['dropOldThoughts'], number, number[]]> = [
-            // `turn`: the candidate list is [1, 3], so keep-1 drops 3 and keep-2 empties it.
-            ['turn', 0, [1, 3]],
-            ['turn', 1, [1]],
-            ['turn', 2, []],
-            // A rescue bigger than the list is the same answer as an exact one — no clamping bug,
-            // and nothing negative-indexes.
-            ['turn', 5, []],
-            // `all`: the candidate list is [1, 3, 6] — keep-1 is exactly "the open turn keeps its
-            // thinking again", which is the documented use of this switch.
-            ['all', 0, [1, 3, 6]],
-            ['all', 1, [1, 3]],
-            ['all', 2, [1]],
-            ['all', 3, []],
-            ['all', 32, []]
+    it('the horizon counts THOUGHT ENTRIES — not turns, not units, not `iteration`', () => {
+        // One CLOSED turn carrying three thoughts in a row (a multi-call turn: the block, a second
+        // block, and a plain message), then the boundary user entry, then the open turn's thought.
+        // A knob counting TURNS would see 2 turns and protect all three thoughts; a knob counting
+        // UNITS would see the tool units; this one sees 4 thoughts.
+        const MANY: readonly HarnessMessage[] = [
+            { role: 'user', content: 'open' },
+            think('a', 10),
+            think('b', 20),
+            think('c', 30),
+            { role: 'user', content: 'next' },
+            think('open', 40)
         ];
 
-        for (const [tier, thoughtKeepUnits, indexes] of table) {
-            const plan = planWithheldThoughts(
-                entriesFrom(THOUGHTS),
-                settingsWith({ dropOldThoughts: tier, thoughtKeepUnits })
-            );
-
-            expect(plan.map((candidate) => candidate.entryIndex)).toEqual(indexes);
-        }
-
-        // The rescue counts ONLY entries with thinking: entry 4 has none, so under `all` a keep-1
-        // rescues entry 6 and not entry 4 — a plan that counted 4 would report a write on it.
+        // Thoughts: 5 (ago 0), 3 (1), 2 (2), 1 (3). Horizon 2 therefore admits 1 and 2 only.
         expect(
-            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ dropOldThoughts: 'all', thoughtKeepUnits: 1 }))
-                .map((candidate) => candidate.entryIndex)
-        ).toEqual([1, 3]);
+            planWithheldThoughts(entriesFrom(MANY), settingsWith({ thoughtTurns: 2 })).map(
+                (candidate) => ({ index: candidate.entryIndex, turnsAgo: candidate.turnsAgo })
+            )
+        ).toEqual([
+            { index: 1, turnsAgo: 3 },
+            { index: 2, turnsAgo: 2 }
+        ]);
+
+        // And the rank map does NOT renumber when a flag is written: the same transcript with entry
+        // 5 already flagged reaches the same verdicts, which is the idempotence proof in numbers.
+        const flagged = entriesFrom(MANY);
+
+        (flagged[5].message as { reasoningIncluded?: boolean }).reasoningIncluded = false;
+
+        expect(
+            planWithheldThoughts(flagged, settingsWith({ thoughtTurns: 2 })).map((candidate) => ({
+                index: candidate.entryIndex,
+                turnsAgo: candidate.turnsAgo
+            }))
+        ).toEqual([
+            { index: 1, turnsAgo: 3 },
+            { index: 2, turnsAgo: 2 }
+        ]);
+
+        // `iteration` cannot express any of this: the fake turn reports `iteration: 1` for the whole
+        // conversation, while the ranks above are conversation-level positions.
+    });
+
+    it('an entry with no thinking, and an entry whose thinking is already flagged, are never candidates', () => {
+        // Entry 4 has no `reasoning` key at all: flagging it would be a write, a notification and a
+        // save for zero effect.
+        expect(
+            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0 })).map(
+                (candidate) => candidate.entryIndex
+            )
+        ).toEqual([1, 3, 6]);
+
+        // An EMPTY reasoning string is the same case one level down: nothing to remove.
+        expect(
+            planWithheldThoughts(
+                entriesFrom([{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a', reasoning: '' }]),
+                settingsWith({ thoughtTurns: 0 })
+            )
+        ).toEqual([]);
     });
 
     it('a second pass over an already-flagged transcript has no candidate left, and neither has a restored one', () => {
         const entries = entriesFrom(THOUGHTS);
 
-        // Pass one through the policy: 1 and 3.
-        const first = planWithheldThoughts(entries).map((candidate) => candidate.entryIndex);
+        // Pass one through the policy: every thought, horizon open.
+        const first = planWithheldThoughts(entries, settingsWith({ thoughtTurns: 0 })).map(
+            (candidate) => candidate.entryIndex
+        );
 
-        expect(first).toEqual([1, 3]);
+        expect(first).toEqual([1, 3, 6]);
 
         // The write, applied the way the runtime applies it — on the canonical MESSAGE object, which
         // is what `entries` hands out.
@@ -3053,112 +3682,153 @@ describe('context-trimmer thinking plan (planWithheldThoughts, T6)', () => {
             (entries[index].message as { reasoningIncluded?: boolean }).reasoningIncluded = false;
         }
 
-        expect(planWithheldThoughts(entries)).toEqual([]);
+        expect(planWithheldThoughts(entries, settingsWith({ thoughtTurns: 0 })).length).toBe(0);
 
         // A RESTART, modelled exactly: a fresh entry list (no in-process state survives) whose
-        // messages carry the flags the first process wrote. Re-deriving finds the same two entries
-        // already flagged and proposes nothing, so a continued session writes no duplicate flags.
+        // messages carry the flags the first process wrote. Re-deriving finds all three already
+        // flagged and proposes nothing, so a continued session writes no duplicate flags.
         const restored = entriesFrom(
             THOUGHTS.map((message, index) =>
-                index === 1 || index === 3 ? { ...message, reasoningIncluded: false } : message
+                index === 1 || index === 3 || index === 6 ? { ...message, reasoningIncluded: false } : message
             )
         );
 
-        expect(planWithheldThoughts(restored)).toEqual([]);
+        expect(planWithheldThoughts(restored, settingsWith({ thoughtTurns: 0 }))).toEqual([]);
     });
 
-    it('skips an entry the model never sees, an entry with empty thinking, and an entry this pass already excludes', () => {
-        // `entry.included === false` is the LIVE, effective flag of the whole unit: an entry that is
-        // not in the request cannot have its thinking removed from it, so a flag would cost a write
-        // and change nothing (and the next pass after a re-enable picks it up).
+    it('skips an entry the model never sees and an entry this pass already excludes', () => {
+        // `entry.included === false` is the live per-entry flag: an entry that is not in the request
+        // cannot have its thinking removed from it, so a flag would cost a write and change nothing
+        // (and the next pass after a re-enable picks it up).
         expect(
             thoughtShape(
-                planWithheldThoughts(entriesFrom(THOUGHTS, [3]), settingsWith({ dropOldThoughts: 'all' }))
+                planWithheldThoughts(entriesFrom(THOUGHTS, [3]), settingsWith({ thoughtTurns: 0 }))
             )
         ).toEqual([
-            { index: 1, messageId: 'msg-2', turn: 'closed', chars: 10, firedBy: 'dropOldThoughts', tier: 'all' },
-            { index: 6, messageId: 'msg-7', turn: 'open', chars: 30, firedBy: 'dropOldThoughts', tier: 'all' }
+            {
+                index: 1,
+                messageId: 'msg-2',
+                turn: 'closed',
+                turnsAgo: 2,
+                chars: 10,
+                firedBy: 'trimThoughts',
+                horizon: 0
+            },
+            {
+                index: 6,
+                messageId: 'msg-7',
+                turn: 'open',
+                turnsAgo: 0,
+                chars: 30,
+                firedBy: 'trimThoughts',
+                horizon: 0
+            }
         ]);
 
-        // An EMPTY reasoning string is the same case one level down: nothing to remove.
-        expect(
-            planWithheldThoughts(
-                entriesFrom([{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a', reasoning: '' }]),
-                settingsWith({ dropOldThoughts: 'all' })
-            )
-        ).toEqual([]);
-
-        // (3b) The tool side is withholding entry 1's whole unit THIS pass, so its thinking leaves
-        // with it: no flag, and — the part that matters — no characters counted toward the floor.
+        // The TOOL side is withholding entry 1's whole unit THIS pass, so its thinking leaves with
+        // it: no flag, and — the part that matters — no characters counted toward the floor.
         expect(
             planWithheldThoughts(
                 entriesFrom(THOUGHTS),
-                settingsWith({ dropOldThoughts: 'all' }),
+                settingsWith({ thoughtTurns: 0 }),
                 new Set([1, 2])
             ).map((candidate) => candidate.entryIndex)
         ).toEqual([3, 6]);
-    });
 
-    it('a transcript with no user entry has no closed turn, so only "all" writes — and never by index arithmetic', () => {
-        const noUser = entriesFrom([think('one', 10), think('two', 20)]);
-
-        // Every entry is after "the last user entry", which does not exist (-1), so under `turn`
-        // there is nothing closed to withhold. This is the conservative reading, and it is what
-        // makes the rule safe on a transcript whose turn structure the plugin cannot see.
-        expect(planWithheldThoughts(noUser)).toEqual([]);
+        // The rank map is unchanged by that skip, so the two remaining candidates still report the
+        // ages the transcript says they have.
         expect(
-            planWithheldThoughts(noUser, settingsWith({ dropOldThoughts: 'all' })).map((candidate) => ({
-                index: candidate.entryIndex,
-                turn: candidate.turn
-            }))
+            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0 }), new Set([1, 2])).map(
+                (candidate) => ({ index: candidate.entryIndex, turnsAgo: candidate.turnsAgo })
+            )
         ).toEqual([
-            { index: 0, turn: 'open' },
-            { index: 1, turn: 'open' }
+            { index: 3, turnsAgo: 1 },
+            { index: 6, turnsAgo: 0 }
         ]);
     });
 
-    it('minThoughtChars rejects the thinking side BELOW the floor, over what the rescue leaves, and 0 is inert', () => {
-        // The would-be total under `turn` is 10 + 20 = 30 characters.
+    it('a transcript with no user entry is ALL one turn, and the horizon still decides — never index arithmetic', () => {
+        const noUser = entriesFrom([think('one', 10), think('two', 20)]);
+
+        // There is no last user entry, so both entries are the open turn and BOTH are reportable as
+        // `open`. The horizon, not a tier, is what keeps the newest one.
+        expect(planWithheldThoughts(noUser, settingsWith({ thoughtTurns: 2 }))).toEqual([]);
         expect(
-            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ minThoughtChars: 31 })).map(
+            planWithheldThoughts(noUser, settingsWith({ thoughtTurns: 1 })).map((candidate) => ({
+                index: candidate.entryIndex,
+                turn: candidate.turn,
+                turnsAgo: candidate.turnsAgo
+            }))
+        ).toEqual([{ index: 0, turn: 'open', turnsAgo: 1 }]);
+    });
+
+    it('minThoughtChars rejects the thinking side BELOW the floor, over what the horizon leaves, and 0 is inert', () => {
+        // The would-be total with the horizon open is 10 + 20 + 30 = 60 characters.
+        expect(
+            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0, minThoughtChars: 61 })).map(
                 (candidate) => candidate.entryIndex
             )
         ).toEqual([]);
         // Exactly at the floor is NOT below it, so the pass writes — the boundary is `chars < floor`.
         expect(
-            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ minThoughtChars: 30 })).map(
+            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0, minThoughtChars: 60 })).map(
                 (candidate) => candidate.entryIndex
             )
-        ).toEqual([1, 3]);
-        // ORDER: tier → rescue → floor. With keep-1 the would-be total is 10, so a floor of 11
-        // rejects a pass the unrescued 30 would have cleared.
+        ).toEqual([1, 3, 6]);
+        // ORDER: horizon → floor. The shipped 2-thought horizon leaves only the 10-character entry
+        // in play, so a floor of 11 rejects a pass the OPEN horizon would have cleared — the floor
+        // measures what would ACTUALLY be written, never the transcript's whole thinking.
         expect(
             planWithheldThoughts(
                 entriesFrom(THOUGHTS),
-                settingsWith({ dropOldThoughts: 'turn', thoughtKeepUnits: 1, minThoughtChars: 11 })
+                settingsWith({ thoughtTurns: 2, minThoughtChars: 11 })
             )
         ).toEqual([]);
         expect(
             planWithheldThoughts(
                 entriesFrom(THOUGHTS),
-                settingsWith({ dropOldThoughts: 'turn', thoughtKeepUnits: 1, minThoughtChars: 10 })
+                settingsWith({ thoughtTurns: 2, minThoughtChars: 10 })
             ).map((candidate) => candidate.entryIndex)
         ).toEqual([1]);
-        // 0 (the shipped default) measures nothing at all, and a 1-character thinking entry still
-        // writes with the floor off. (`all`, because that entry is the OPEN turn — the boundary, not
-        // the floor, is what decides that one.)
+        // An entry this pass already excludes contributes NOTHING to that total (the tool side took
+        // it whole): with entry 6 gone the would-be total is 10 + 20 = 30, not the transcript's 60.
         expect(
             planWithheldThoughts(
-                entriesFrom([{ role: 'user', content: 'q' }, think('tiny', 1)]),
-                settingsWith({ dropOldThoughts: 'all', minThoughtChars: 0 })
+                entriesFrom(THOUGHTS),
+                settingsWith({ thoughtTurns: 0, minThoughtChars: 51 }),
+                new Set([6])
             ).map((candidate) => candidate.entryIndex)
-        ).toEqual([1]);
+        ).toEqual([]);
+        // The same floor WITHOUT the exclusion clears, which is the proof the removed entry was
+        // subtracted rather than merely left unflagged.
+        expect(
+            planWithheldThoughts(
+                entriesFrom(THOUGHTS),
+                settingsWith({ thoughtTurns: 0, minThoughtChars: 51 })
+            ).map((candidate) => candidate.entryIndex)
+        ).toEqual([1, 3, 6]);
+        // Exactly at the reduced total writes.
+        expect(
+            planWithheldThoughts(
+                entriesFrom(THOUGHTS),
+                settingsWith({ thoughtTurns: 0, minThoughtChars: 30 }),
+                new Set([6])
+            ).map((candidate) => candidate.entryIndex)
+        ).toEqual([1, 3]);
+        // 0 (the shipped default) measures nothing at all, and a 1-character thinking entry still
+        // writes with the floor off.
+        expect(
+            planWithheldThoughts(
+                entriesFrom([think('tiny', 1)]),
+                settingsWith({ thoughtTurns: 0, minThoughtChars: 0 })
+            ).map((candidate) => candidate.entryIndex)
+        ).toEqual([0]);
         // A nonsense floor behaves as 0, like every other number edge in this plugin.
         expect(
             planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ minThoughtChars: -5 })).map(
                 (candidate) => candidate.entryIndex
             )
-        ).toEqual([1, 3]);
+        ).toEqual([1, 3, 6]);
     });
 
     it('minTokens NEVER gates the thinking side, at any value (the estimator does not count reasoning)', () => {
@@ -3166,34 +3836,50 @@ describe('context-trimmer thinking plan (planWithheldThoughts, T6)', () => {
 
         // The plan function does not read the token floor at all: an unreachable one leaves the
         // thinking plan identical to the default one, character for character.
-        expect(
-            planWithheldThoughts(entries, settingsWith({ minTokens: 1000000 }))
-        ).toEqual(planWithheldThoughts(entries));
+        expect(planWithheldThoughts(entries, settingsWith({ minTokens: 1000000 }))).toEqual(
+            planWithheldThoughts(entries, settingsWith({}))
+        );
 
         // And the TOOL side is gated by exactly that value on the same transcript shape, so the two
         // floors really are two separate measurements (the proof deferred from T5).
         expect(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ minTokens: 1000000 }))).toEqual([]);
-        expect(planTrimmedUnits(entriesFrom(TRIMMABLE), TRIMMER_DEFAULT_SETTINGS)).toHaveLength(1);
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE), TRIMMER_DEFAULT_SETTINGS)).toHaveLength(0);
     });
 });
 
 // ---------------------------------------------------------------------------
 // T6 — the thinking WRITES and the one-diagnostic REPORT
 // ---------------------------------------------------------------------------
-
-// The `data.thoughts` entries of a `turn` pass over THOUGHTS, spelled out once because three cases
-// below need them and each one is a line the operator reads: the entry, its durable id, WHICH TURN
-// it belongs to, and the characters the flag removes.
+// The `data.thoughts` entries of a pass over THOUGHTS with the horizon OPEN (what `createFakeApi`
+// seeds — see the note there), spelled out once because half the cases below need them and each one
+// is a line the operator reads: the entry, its durable id, WHICH TURN it belongs to, how many
+// THOUGHTS old it was, and the characters the flag removes. `horizon` is the value the age was
+// compared against, so a reader can re-derive the decision from the record alone.
 const THOUGHTS_REPORT = [
-    { index: 1, messageId: 'msg-2', turn: 'closed', chars: 10, firedBy: 'dropOldThoughts', tier: 'turn' },
-    { index: 3, messageId: 'msg-4', turn: 'closed', chars: 20, firedBy: 'dropOldThoughts', tier: 'turn' }
+    { index: 1, messageId: 'msg-2', turn: 'closed', turnsAgo: 2, chars: 10, firedBy: 'trimThoughts', horizon: 0 },
+    { index: 3, messageId: 'msg-4', turn: 'closed', turnsAgo: 1, chars: 20, firedBy: 'trimThoughts', horizon: 0 },
+    { index: 6, messageId: 'msg-7', turn: 'open', turnsAgo: 0, chars: 30, firedBy: 'trimThoughts', horizon: 0 }
 ];
 
-// The one message a `turn` pass over THOUGHTS writes, hardcoded from the format and the fixture —
-// the byte-identity claim for the thinking section, in the same style as A1's for the tool section.
+// The one message that pass writes, hardcoded from the format and the fixture — the byte-identity
+// claim for the thinking section, in the same style as A1's for the tool section. The age is counted
+// in THOUGHTS (entry 6 is 0 old, 3 is 1 old, 1 is 2 old) and the figure is characters, never tokens:
+// the estimator does not count reasoning, so a token figure here would be a number the pass cannot
+// compute.
 const THOUGHTS_MESSAGE =
-    'context-trimmer withheld 2 thinking entry(s): ' +
-    '#1 msg-2 closed 10 chars via dropOldThoughts=turn; #3 msg-4 closed 20 chars via dropOldThoughts=turn';
+    'context-trimmer withheld 3 thinking entry(s): ' +
+    '#1 msg-2 closed 2 thoughts old 10 chars via trimThoughts=0; ' +
+    '#3 msg-4 closed 1 thoughts old 20 chars via trimThoughts=0; ' +
+    '#6 msg-7 open 0 thoughts old 30 chars via trimThoughts=0';
+
+// The SAME transcript at the shipped horizon (2 thoughts): only the oldest entry is old enough, and
+// the line says so with `2 thoughts old` next to `trimThoughts=2` — the age and the bound that
+// accepted it, side by side.
+const DECLARED_THOUGHTS_MESSAGE =
+    'context-trimmer withheld 1 thinking entry(s): #1 msg-2 closed 2 thoughts old 10 chars via trimThoughts=2';
+// A COPY with the shipped horizon in it — the shared row above must stay untouched, because half the
+// tables below compare against it with `horizon: 0`.
+const DECLARED_THOUGHTS_REPORT = [{ ...THOUGHTS_REPORT[0], horizon: 2 }];
 
 // The tool rule AND the thinking rule on one transcript, so the two axes can be pinned inside ONE
 // pass — one pause window, one diagnostic, one report:
@@ -3203,7 +3889,7 @@ const THOUGHTS_MESSAGE =
 //   3 assistant TOOL BLOCK, 20 chars of thinking  ← the answering unit (a KEEP), CLOSED
 //   4 tool    c2 completed
 //   5 user    'now'                                ← THE BOUNDARY
-//   6 assistant, 30 chars of thinking              OPEN — `turn` must not touch it
+//   6 assistant, 30 chars of thinking              OPEN — protected by the horizon, not by the tier
 const THOUGHTS_AND_UNIT: readonly HarnessMessage[] = [
     { role: 'user', content: 'question' },
     callThinking('c1', 'read', '{"path":"a.ts"}', 10),
@@ -3214,22 +3900,45 @@ const THOUGHTS_AND_UNIT: readonly HarnessMessage[] = [
     think('open', 30)
 ];
 
+// The `units` record of a baseline pass over THOUGHTS_AND_UNIT — the same object three tables below
+// have to match byte for byte, and the shape the whole-unit axis has always shipped.
+const UNIT_RECORD = {
+    index: 1,
+    messageId: 'msg-2',
+    members: [1, 2],
+    // The pass wrote the unit's REQUEST entry too (nothing was pre-withheld), which is the baseline
+    // every completion case below is the contrast against.
+    requestAlreadyWithheld: false,
+    outcomes: ['failed'],
+    invalidOutcomes: ['failed'],
+    names: ['read'],
+    supersededBy: 'msg-4',
+    firedBy: 'dropSupersededToolCalls',
+    admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools']
+};
+
 describe('context-trimmer thinking writes and report (T6)', () => {
-    it('writes the flag on exactly the closed entries and reports one thinking-only pass', async () => {
+    it('writes the flag on exactly the eligible entries and reports one thinking-only pass', async () => {
         const { api, touches, diagnostics } = createFakeApi();
         const calls: string[] = [];
         const entries = entriesFrom(THOUGHTS);
 
         await expect(executeTrimming(api, createFakeTurn({ api, calls, entries }))).resolves.toBeUndefined();
 
-        // One write per candidate, oldest first, and NOTHING else touched — no `setIncluded`, no
-        // `edit`, no `replaceHistory`, no `setTranscript`.
-        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
-        // The WRITE is the flag, on the canonical message, and only `false` is ever stored: the open
-        // turn (6) and the thinking-less entry (4) are untouched, and no entry gained `true`.
+        // One write per candidate, canonical order, and NOTHING else touched — no `setIncluded`, no
+        // `edit`, no `replaceHistory`, no `setTranscript`. The thinking-less entry (4) is not in it:
+        // flagging it would be a write, a notification and a save for zero effect.
+        expect(calls).toEqual([
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
+        // The WRITE is the flag, on the canonical message, and only `false` is ever stored: no entry
+        // gained `true`, which is what keeps a later restore exact.
         expect((entries[1].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
         expect((entries[3].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
-        expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
+        expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
+        expect((entries[4].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
         expect(calls.every((call) => call.endsWith(':false'))).toBe(true);
         // The THINKING TEXT SURVIVES the write — the flag is not an edit, which is what keeps this
         // plugin's "nothing is deleted, it can be switched back on" promise true for thinking.
@@ -3239,17 +3948,42 @@ describe('context-trimmer thinking writes and report (T6)', () => {
         expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
 
         expect(diagnostics).toHaveLength(1);
-        // NO tool section on a thinking-only pass — the section is conditional, so the message a
-        // tool-only pass has always written stays byte-identical.
+        // NO tool section and NO truncate section on a thinking-only pass — both are conditional, so
+        // the message a tool-only pass has always written stays byte-identical.
         expect(diagnostics[0].message).toBe(THOUGHTS_MESSAGE);
         expect(diagnostics[0].data).toEqual({
             units: [],
+            truncated: [],
             thoughts: THOUGHTS_REPORT,
             // `fired` names the ONE switch that accounts for these writes — and only it. Without the
-            // plan-is-empty guard, `[].every` would have reported all three tool switches as fired
-            // for units that do not exist in this pass.
-            policy: { ...DEFAULT_POLICY, fired: ['dropOldThoughts'] }
+            // plan-is-empty guard, `[].every` would have reported every tool switch as fired for
+            // units that do not exist in this pass.
+            policy: { ...DEFAULT_POLICY, fired: ['trimThoughts'] }
         });
+    });
+
+    it('the DEFAULT horizon reaches exactly the entries older than two thoughts, end to end', async () => {
+        // Nothing overridden: the shipped 2-thought horizon, which is the posture an operator gets
+        // without touching the pane. `createFakeApi` opens the horizons for the predicate tables, so
+        // this table asks for the declared ones.
+        const { api, diagnostics } = createFakeApi({ atDeclaredHorizons: true });
+        const calls: string[] = [];
+        const entries = entriesFrom(THOUGHTS);
+
+        await executeTrimming(api, createFakeTurn({ api, calls, entries }));
+
+        // The two newest thoughts (entries 3 and 6, ranks 1 and 0) keep riding; the 2-thoughts-old
+        // one goes. The OPEN turn is not special here — entry 6 survives because of its rank, and a
+        // 3rd-from-newest open-turn thought would go with the horizon at 2.
+        expect(calls).toEqual(['setReasoningIncluded:1:false']);
+        expect((entries[3].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
+        expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0].message).toBe(DECLARED_THOUGHTS_MESSAGE);
+        expect((diagnostics[0].data as { thoughts: unknown[] }).thoughts).toEqual(DECLARED_THOUGHTS_REPORT);
+        // Every horizon in the record is the shipped 2 — the report is the operator's only way to
+        // learn what bound produced the line they are reading.
+        expect(policyOf(diagnostics[0])).toEqual({ ...DECLARED_DEFAULT_POLICY, fired: ['trimThoughts'] });
     });
 
     it('is idempotent: a second pass over the transcript it just wrote writes, notifies, saves and reports NOTHING', async () => {
@@ -3260,71 +3994,72 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         await executeTrimming(api, context);
 
-        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        expect(calls).toEqual([
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
         expect(diagnostics).toHaveLength(1);
 
         // Same round, same transcript, settings unchanged. The fake flips the very field the policy
         // re-reads, so this is the real re-derive, not a fake that forgot.
         await executeTrimming(api, context);
 
-        expect(calls).toHaveLength(2);
+        expect(calls).toHaveLength(3);
         expect(diagnostics).toHaveLength(1);
         // The only thing the second round cost was the settings reads — no write, no notification,
         // and therefore no save, and no diagnostic.
         expect(touches).toEqual([...TURN_READS, 'report.diagnostic', ...TURN_READS]);
     });
 
-    it('runs as "turn" and SAYS SO when the tier submitted is not a tier, and still writes only the closed turns', async () => {
-        const { api, touches, diagnostics } = createFakeApi({ dropOldThoughts: 'sometimes' });
+    it('a number switch submitted as anything else runs the DECLARED horizon and adds no clause', async () => {
+        // The string tiers own the fallback clause (`invalidOutcomes`, `supersedeMatch`). A horizon is
+        // a NUMBER, and a non-number resolves to the declared default in the read itself — so the
+        // pass runs the shipped 2 and the message carries no complaint, exactly like `minTokens: -5`.
+        const { api, touches, diagnostics } = createFakeApi({ thoughtTurns: 'sometimes' });
         const calls: string[] = [];
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS) }));
 
-        // Behaviour: `turn`.
-        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        // Behaviour: the declared horizon 2, i.e. the oldest thought only.
+        expect(calls).toEqual(['setReasoningIncluded:1:false']);
         expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
         expect(diagnostics).toHaveLength(1);
-
-        // Report: BOTH what was submitted and what ran, appended as the fallback clause in the one
-        // message — the thinking section first, then the clause, joined by ' | '.
-        expect(diagnostics[0].message).toBe(`${THOUGHTS_MESSAGE} | dropOldThoughts "sometimes" is not a tier; used "turn"`);
-
-        const data = diagnostics[0].data as {
-            thoughts: unknown[];
-            policy: Record<string, unknown>;
-        };
-
-        expect(data.thoughts).toEqual(THOUGHTS_REPORT);
-        expect(data.policy).toMatchObject({
-            dropOldThoughts: 'turn',
-            dropOldThoughtsSubmitted: 'sometimes',
-            dropOldThoughtsFallback: true,
-            fired: ['dropOldThoughts']
+        // The line names `trimThoughts=2`, the value that RAN, and nothing else.
+        expect(diagnostics[0].message).toBe(DECLARED_THOUGHTS_MESSAGE);
+        expect((diagnostics[0].data as { thoughts: Array<{ horizon: number }> }).thoughts).toEqual(
+            DECLARED_THOUGHTS_REPORT
+        );
+        // Only the switch that was mis-submitted resolves to its declared value — the other horizons
+        // are the opened baseline this fake seeds, and the report says so next to each rule.
+        expect(policyOf(diagnostics[0])).toEqual({
+            ...DEFAULT_POLICY,
+            thoughtTurns: 2,
+            fired: ['trimThoughts']
         });
-        // The candidate list itself carries the RESOLVED tier, so a per-entry line can never name a
-        // value the pass did not run with.
-        expect((data.thoughts as Array<{ tier: string }>).map((thought) => thought.tier)).toEqual([
-            'turn',
-            'turn'
-        ]);
     });
 
     it('minTokens cannot suppress a thinking write at any value, while the same floor still empties the tool side', async () => {
         // The estimator never counts `reasoning` (../core/context-estimate.ts), so a token floor
-        // shared with the thinking writes would silently disable `dropOldThoughts` above 0 — the
-        // proof deferred from T5, and the reason the two floors are two measurements.
+        // shared with the thinking writes would silently disable `trimThoughts` above 0 — the proof
+        // deferred from T5, and the reason the two floors are two measurements.
         const { api, diagnostics } = createFakeApi({ minTokens: 1000000 });
         const calls: string[] = [];
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS) }));
 
-        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        expect(calls).toEqual([
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
         expect(diagnostics).toHaveLength(1);
         expect(diagnostics[0].message).toBe(THOUGHTS_MESSAGE);
 
         // Same fixture with a TOOL candidate next to it: the unreachable floor drops the unit write
         // and every thinking write survives — including the leader's own, which the same pass no
-        // longer excludes from the request (rule (3b) reads the plan, not the settings).
+        // longer excludes from the request (rule (3b) reads the PLAN, not the settings, and the plan
+        // is empty once the token gate has spoken).
         const toolFloor = createFakeApi({ minTokens: 1000000 });
         const toolCalls: string[] = [];
 
@@ -3333,33 +4068,37 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api: toolFloor.api, calls: toolCalls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
         );
 
-        expect(toolCalls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        expect(toolCalls).toEqual([
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
         expect((toolFloor.diagnostics[0].data as { units: unknown[] }).units).toEqual([]);
         expect(
-            (toolFloor.diagnostics[0].data as { thoughts: Array<{ index: number; chars: number }> }).thoughts
-        ).toEqual([
-            { index: 1, messageId: 'msg-2', turn: 'closed', chars: 10, firedBy: 'dropOldThoughts', tier: 'turn' },
-            { index: 3, messageId: 'msg-4', turn: 'closed', chars: 20, firedBy: 'dropOldThoughts', tier: 'turn' }
-        ]);
+            (toolFloor.diagnostics[0].data as { thoughts: unknown[] }).thoughts
+        ).toEqual(THOUGHTS_REPORT);
         expect((toolFloor.diagnostics[0].data as { policy: { fired: string[] } }).policy.fired).toEqual([
-            'dropOldThoughts'
+            'trimThoughts'
         ]);
     });
 
     it('minThoughtChars bites at the pass level, and the TOOL side is untouched by it', async () => {
-        // Above the 30 characters this pass would remove: nothing at all happens — no flag, no
+        // Above the 60 characters this pass would remove: nothing at all happens — no flag, no
         // notification, no save, no diagnostic.
-        const high = createFakeApi({ minThoughtChars: 31 });
+        const high = createFakeApi({ minThoughtChars: 61 });
         const highCalls: string[] = [];
 
-        await executeTrimming(high.api, createFakeTurn({ api: high.api, calls: highCalls, entries: entriesFrom(THOUGHTS) }));
+        await executeTrimming(
+            high.api,
+            createFakeTurn({ api: high.api, calls: highCalls, entries: entriesFrom(THOUGHTS) })
+        );
 
         expect(highCalls).toEqual([]);
         expect(high.diagnostics).toEqual([]);
         expect(high.touches).toEqual([...TURN_READS]);
 
         // Exactly at the floor it writes (the comparison is `chars < floor`).
-        const exact = createFakeApi({ minThoughtChars: 30 });
+        const exact = createFakeApi({ minThoughtChars: 60 });
         const exactCalls: string[] = [];
 
         await executeTrimming(
@@ -3367,11 +4106,17 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api: exact.api, calls: exactCalls, entries: entriesFrom(THOUGHTS) })
         );
 
-        expect(exactCalls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        expect(exactCalls).toEqual([
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
 
         // THE INDEPENDENCE, in the other direction: a floor that suppresses the thinking side leaves
         // the tool rule's message BYTE-IDENTICAL to A1's — no empty section, no trailing separator.
-        const mixed = createFakeApi({ minThoughtChars: 21 });
+        // The thinking total on this transcript is 20 + 30 = 50 characters (the unit leader is
+        // already leaving whole, so its thinking contributes nothing), and 51 is above it.
+        const mixed = createFakeApi({ minThoughtChars: 51 });
         const mixedCalls: string[] = [];
 
         await executeTrimming(
@@ -3379,30 +4124,18 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api: mixed.api, calls: mixedCalls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
         );
 
-        // The unit still leaves, and it is the ONLY thing the pass reports: the thinking side's one
-        // candidate is 20 characters, under the 21-character floor.
-        expect(mixedCalls).toEqual(['setIncluded:1:false']);
+        // The unit still leaves, and it is the ONLY thing the pass reports.
+        expect(mixedCalls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(mixed.diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4'
         );
         expect(mixed.diagnostics[0].data).toEqual({
-            units: [
-                {
-                    index: 1,
-                    messageId: 'msg-2',
-                    members: [1, 2],
-                    outcomes: ['failed'],
-                    invalidOutcomes: ['failed'],
-                    names: ['read'],
-                    supersededBy: 'msg-4',
-                    firedBy: 'dropSupersededToolCalls',
-                    admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered']
-                }
-            ],
+            units: [UNIT_RECORD],
+            truncated: [],
             thoughts: [],
             // The policy block echoes the settings the pass RAN with, so the moved floor is part of
-            // the record even though the thinking side wrote nothing.
-            policy: { ...DEFAULT_POLICY, minThoughtChars: 21 }
+            // the record even though the thinking side wrote nothing — and `fired` says so too.
+            policy: { ...DEFAULT_POLICY, minThoughtChars: 51 }
         });
     });
 
@@ -3415,46 +4148,43 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
         );
 
-        // Tool write first, then the thinking write — one pause window around both (the trigger
-        // section below pins the park itself).
-        expect(calls).toEqual(['setIncluded:1:false', 'setReasoningIncluded:3:false']);
+        // Unit writes first (leader, then result), then the thinking writes — one pause window around
+        // all of them (the trigger section below pins the park itself). The unit leader's OWN
+        // thinking is not flagged: it leaves with the entry, and flagging it would only inflate the
+        // character figure the floor is measured against.
+        expect(calls).toEqual([
+            'setIncluded:1:false',
+            'setIncluded:2:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
 
         expect(diagnostics).toHaveLength(1);
         expect(diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4' +
-                ' | context-trimmer withheld 1 thinking entry(s): #3 msg-4 closed 20 chars via dropOldThoughts=turn'
+                ' | context-trimmer withheld 2 thinking entry(s):' +
+                ' #3 msg-4 closed 1 thoughts old 20 chars via trimThoughts=0;' +
+                ' #6 msg-7 open 0 thoughts old 30 chars via trimThoughts=0'
         );
 
-        const data = diagnostics[0].data as { units: unknown[]; thoughts: unknown[]; policy: { fired: string[] } };
+        const data = diagnostics[0].data as {
+            units: unknown[];
+            truncated: unknown[];
+            thoughts: unknown[];
+            policy: { fired: string[] };
+        };
 
-        expect(data.units).toEqual([
-            {
-                index: 1,
-                messageId: 'msg-2',
-                members: [1, 2],
-                outcomes: ['failed'],
-                invalidOutcomes: ['failed'],
-                names: ['read'],
-                supersededBy: 'msg-4',
-                firedBy: 'dropSupersededToolCalls',
-                admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered']
-            }
-        ]);
-        expect(data.thoughts).toEqual([
-            { index: 3, messageId: 'msg-4', turn: 'closed', chars: 20, firedBy: 'dropOldThoughts', tier: 'turn' }
-        ]);
+        expect(data.units).toEqual([UNIT_RECORD]);
+        expect(data.truncated).toEqual([]);
+        expect(data.thoughts).toEqual([THOUGHTS_REPORT[1], THOUGHTS_REPORT[2]]);
         // Declared order, both axes named: the two tool switches that account for the unit, then the
-        // thinking switch that accounts for the flag.
-        expect(data.policy.fired).toEqual([
-            'dropSupersededToolCalls',
-            'dropInvalidToolCallsOnceAnswered',
-            'dropOldThoughts'
-        ]);
+        // thinking switch that accounts for the flags.
+        expect(data.policy.fired).toEqual(['dropSupersededToolCalls', 'trimInvalidTools', 'trimThoughts']);
     });
 
-    it('dropOldThoughts "off" leaves the tool rule BYTE-IDENTICAL, and the tool switches off leave the thinking rule running', async () => {
+    it('trimThoughts off leaves the tool rule BYTE-IDENTICAL, and the tool switches off leave the thinking rule running', async () => {
         // H2 in both directions, on the SAME transcript.
-        const off = createFakeApi({ dropOldThoughts: 'off' });
+        const off = createFakeApi({ trimThoughts: false });
         const offCalls: string[] = [];
 
         await executeTrimming(
@@ -3462,33 +4192,24 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api: off.api, calls: offCalls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
         );
 
-        expect(offCalls).toEqual(['setIncluded:1:false']);
+        expect(offCalls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(off.diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4'
         );
         expect(off.diagnostics[0].data).toEqual({
-            units: [
-                {
-                    index: 1,
-                    messageId: 'msg-2',
-                    members: [1, 2],
-                    outcomes: ['failed'],
-                    invalidOutcomes: ['failed'],
-                    names: ['read'],
-                    supersededBy: 'msg-4',
-                    firedBy: 'dropSupersededToolCalls',
-                    admittedBy: ['dropSupersededToolCalls', 'dropInvalidToolCallsOnceAnswered']
-                }
-            ],
+            units: [UNIT_RECORD],
+            truncated: [],
             thoughts: [],
-            // Same rule as above: the block names the tier that RAN, and `off` is what ran.
-            policy: { ...DEFAULT_POLICY, dropOldThoughts: 'off', dropOldThoughtsSubmitted: 'off' }
+            // Same rule as above: the block names the resolved value of every switch, and `off` is
+            // what ran. The horizon is reported next to it even though nothing consulted it.
+            policy: { ...DEFAULT_POLICY, trimThoughts: false }
         });
 
         // The other half: both TOOL switches off, thinking still withheld, and the tool section gone.
+        // With no unit leaving, the leader's thinking is a candidate again — 60 characters this time.
         const toolOff = createFakeApi({
             dropSupersededToolCalls: false,
-            dropInvalidToolCallsOnceAnswered: false
+            trimInvalidTools: false
         });
         const toolCalls: string[] = [];
 
@@ -3497,17 +4218,23 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api: toolOff.api, calls: toolCalls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
         );
 
-        expect(toolCalls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        expect(toolCalls).toEqual([
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
         expect(toolOff.diagnostics[0].message).toBe(
-            'context-trimmer withheld 2 thinking entry(s): ' +
-                '#1 msg-2 closed 10 chars via dropOldThoughts=turn; #3 msg-4 closed 20 chars via dropOldThoughts=turn'
+            'context-trimmer withheld 3 thinking entry(s): ' +
+                '#1 msg-2 closed 2 thoughts old 10 chars via trimThoughts=0; ' +
+                '#3 msg-4 closed 1 thoughts old 20 chars via trimThoughts=0; ' +
+                '#6 msg-7 open 0 thoughts old 30 chars via trimThoughts=0'
         );
-        expect(
-            (toolOff.diagnostics[0].data as { policy: { fired: string[] } }).policy.fired
-        ).toEqual(['dropOldThoughts']);
+        expect((toolOff.diagnostics[0].data as { policy: { fired: string[] } }).policy.fired).toEqual([
+            'trimThoughts'
+        ]);
     });
 
-    it('is withhold-only: flipping the tier to "off" mid-session stops writes and restores nothing', async () => {
+    it('is withhold-only: flipping the switch off mid-session stops writes and restores nothing', async () => {
         const { api, setSetting, diagnostics } = createFakeApi();
         const calls: string[] = [];
         const entries = entriesFrom(THOUGHTS);
@@ -3515,23 +4242,28 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         await executeTrimming(api, context);
 
-        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        expect(calls).toEqual([
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
         expect(diagnostics).toHaveLength(1);
 
         // An operator moves the switch between turns. `api.settings` is LIVE by contract
         // (../plugin/settings.ts), so the next round runs the new value with no restart.
-        setSetting('dropOldThoughts', 'off');
+        setSetting('trimThoughts', false);
 
         await executeTrimming(api, context);
 
-        expect(calls).toHaveLength(2);
+        expect(calls).toHaveLength(3);
         expect(diagnostics).toHaveLength(1);
 
-        // And the flags the earlier turn wrote are STILL there: `off` stops new writes and restores
+        // And the flags the earlier turn wrote are STILL there: `false` stops new writes and restores
         // nothing (F invariant 2). That is only true because the decision lives on the ENTRY — a
         // per-round decision the plugin had to remember would have evaporated with the round.
         expect((entries[1].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
         expect((entries[3].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
+        expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
     });
 
     it('reads no policy and writes no flag on a branch round or with the plugin disabled', async () => {
@@ -3559,7 +4291,12 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         await executeTrimming(
             disabled.api,
-            createFakeTurn({ api: disabled.api, calls: disabledCalls, entries: entriesFrom(THOUGHTS), guardEntries: true })
+            createFakeTurn({
+                api: disabled.api,
+                calls: disabledCalls,
+                entries: entriesFrom(THOUGHTS),
+                guardEntries: true
+            })
         );
 
         expect(disabledCalls).toEqual([]);
@@ -3567,15 +4304,13 @@ describe('context-trimmer thinking writes and report (T6)', () => {
         expect(disabled.touches).toEqual(['settings.boolean:enabled']);
     });
 
-    it('takes the ASYNC path for a thinking-only pass and the SYNC one when the tier is off', async () => {
+    it('takes the ASYNC path for a thinking-only pass and the SYNC one when the switch is off', async () => {
         const handler = createContextTrimmerHandler(createFakeApi().api);
         const { api } = createFakeApi();
         const calls: string[] = [];
 
         // A pass that writes thinking is a real trim: a promise, and the park/trim/unpark triple.
-        const writing = handler(
-            createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS) })
-        );
+        const writing = handler(createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS) }));
 
         expect(writing).toBeInstanceOf(Promise);
         await writing;
@@ -3583,12 +4318,13 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             'pause',
             'setReasoningIncluded:1:false',
             'setReasoningIncluded:3:false',
+            'setReasoningIncluded:6:false',
             'resume'
         ]);
 
         // The same transcript with the switch off: `undefined`, no park, no microtask — the fast path
         // that keeps the shipped turn cost unchanged now has to account for BOTH axes.
-        const offApi = createFakeApi({ dropOldThoughts: 'off' });
+        const offApi = createFakeApi({ trimThoughts: false });
         const offCalls: string[] = [];
 
         expect(
@@ -3597,5 +4333,857 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             )
         ).toBeUndefined();
         expect(offCalls).toEqual([]);
+    });
+
+    // A STALE THINKING WRITE (2026-11-13 review). The writer re-locates a candidate by INDEX, and an
+    // index is a SNAPSHOT (../types `HarnessContextEntry.index` — a mid-round `replaceHistory()`
+    // invalidates every one captured before it) while the handler awaits `pause()` before writing.
+    // Two ways that goes wrong, and both are answered by the shared re-check (`writableEntryOf`)
+    // rather than by a catch:
+    //   - the index lands on a NON-ASSISTANT message, where `setReasoningIncluded` THROWS
+    //     (src/harness.ts:8971-8975) — before the guard, that throw took the WHOLE pass report with
+    //     it, because the bus is fail-open and the writer never reached its `api.report`;
+    //   - the entry's thinking was flagged by somebody else inside the window, so the write is
+    //     `false` → `false`: one persistence notification and one save for a change that happened on
+    //     somebody else's turn.
+    it('a stale thinking index is skipped, and an already-flagged entry is not written twice', async () => {
+        const { api, diagnostics, touches } = createFakeApi();
+        const calls: string[] = [];
+        // What the plan sees: three thoughts, all eligible at the open horizon (ranks 2, 1 and 0).
+        const planned = entriesFrom([
+            { role: 'user', content: 'go' },
+            think('one', 3),
+            call('c1', 'read', '{"path":"a.ts"}'),
+            result('c1', 'read', 'contents'),
+            think('two', 4),
+            think('three', 5)
+        ]);
+        // What the transcript actually holds when the writer runs: index 1 is now a TOOL message (an
+        // entry that cannot carry thinking), index 4 already carries the flag, and only index 5 is
+        // still this pass's business.
+        const stale = entriesFrom([
+            { role: 'user', content: 'go' },
+            result('c9', 'read', 'moved'),
+            call('c1', 'read', '{"path":"a.ts"}'),
+            result('c1', 'read', 'contents'),
+            { ...think('two', 4), reasoningIncluded: false },
+            think('three', 5)
+        ]);
+        const { context, reads } = withStaleEntries(
+            createFakeTurn({ api, calls, entries: planned }),
+            planned,
+            stale,
+            { calls }
+        );
+
+        await executeTrimming(api, context);
+
+        // Exactly ONE flag, and no throw. `withStaleEntries` installs the runtime's own role refusal,
+        // so a write on index 1 fails this test loudly instead of being recorded as a call.
+        expect(calls).toEqual(['setReasoningIncluded:5:false']);
+        expect(diagnostics).toHaveLength(1);
+        // The report names the one entry this pass wrote, with the age and horizon the PLAN measured:
+        // the plan's snapshot is the transcript the operator's horizon was compared against, and the
+        // skipped entries are reported as neither written nor withheld.
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer withheld 1 thinking entry(s): #5 msg-6 open 0 thoughts old 5 chars via trimThoughts=0'
+        );
+        expect((diagnostics[0].data as { thoughts: unknown[] }).thoughts).toEqual([
+            { index: 5, messageId: 'msg-6', turn: 'open', turnsAgo: 0, chars: 5, firedBy: 'trimThoughts', horizon: 0 }
+        ]);
+        expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
+        // The fixture, pinned: three plan reads, one writer read.
+        expect(reads()).toBe(4);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE TRUNCATE AXIS — the request goes, the answer stays
+// ---------------------------------------------------------------------------
+
+// `truncateToolRequests` is the only switch in this plugin that acts on ONE entry of a unit while
+// the unit keeps riding, so the fixture is the same `TRIMMABLE` shape read as units:
+//   0 user       'go'
+//   1 assistant  TOOL BLOCK c1  ← unit 0's leader: the request
+//   2 tool       c1 `failed`    ← unit 0's answer — MUST still be sent
+//   3 assistant  TOOL BLOCK c2  ← unit 1's leader (the answering unit), also old enough
+//   4 tool       c2 completed   ← unit 1's answer
+//   5 assistant  'done'
+// Both units are 0 and 1 tool-turns old, so an OPEN horizon (0) makes both eligible; the trim axis
+// takes unit 0 whole first, which is the precedence the plan documents.
+describe('context-trimmer truncate tool requests (planTruncatedRequests)', () => {
+    it('is OFF by default: the switch has to be asked for, and nothing else changes when it is', () => {
+        // The declared default is `false`, and the honest comparison is the same transcript with the
+        // whole-unit switches turned OFF — otherwise the trim's own candidates hide what this switch
+        // on its own would do. Ages here: unit 0 is 1 tool turn old, unit 1 is 0 old, so an OPEN
+        // horizon (0) makes both eligible.
+        const bothOff = settingsWith({ dropSupersededToolCalls: false, trimInvalidTools: false });
+
+        expect(planTruncatedRequests(entriesFrom(TRIMMABLE), bothOff)).toEqual([]);
+        expect(
+            planTruncatedRequests(entriesFrom(TRIMMABLE), { ...bothOff, truncateToolRequests: true })
+        ).toEqual([
+            {
+                leaderIndex: 1,
+                leaderMessageId: 'msg-2',
+                members: [1],
+                results: [2],
+                names: ['read'],
+                firedBy: 'truncateToolRequests'
+            },
+            {
+                leaderIndex: 3,
+                leaderMessageId: 'msg-4',
+                members: [3],
+                results: [4],
+                names: ['read'],
+                firedBy: 'truncateToolRequests'
+            }
+        ]);
+
+        // And the plan is the ONLY thing that moves: the unit plan is character-for-character the same
+        // with the switch on, so a host cannot get a truncate that disturbs the trim it already had.
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ truncateToolRequests: true }))).toEqual(
+            planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({}))
+        );
+    });
+
+    it('names the leader ONLY, and `results` are the entries that keep riding', () => {
+        // Both whole-unit switches off, so neither unit is trimmed and the truncate is the sole
+        // writer: each leader goes, each result stays. `members: [leader]` is the write set, and
+        // `results` is the promise in the setting's description.
+        expect(
+            planTruncatedRequests(
+                entriesFrom(TRIMMABLE),
+                settingsWith({ truncateToolRequests: true, dropSupersededToolCalls: false, trimInvalidTools: false })
+            )
+        ).toEqual([
+            {
+                leaderIndex: 1,
+                leaderMessageId: 'msg-2',
+                members: [1],
+                results: [2],
+                names: ['read'],
+                firedBy: 'truncateToolRequests'
+            },
+            {
+                leaderIndex: 3,
+                leaderMessageId: 'msg-4',
+                members: [3],
+                results: [4],
+                names: ['read'],
+                firedBy: 'truncateToolRequests'
+            }
+        ]);
+
+        // The write set is exactly one entry per candidate, while the trim candidate over the same
+        // transcript carries both members — the two axes are not the same decision spelled twice.
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({}))[0].members).toEqual([1, 2]);
+    });
+
+    // THE REPORT LIST IS THE STILL-SENT HALF (2026-11-13 review). `results kept #…` in the pass line
+    // and `data.truncated[].results` both claim "these entries are STILL being sent", so a result
+    // that is already withheld must not be listed — while the PAIRING GUARD keeps counting every
+    // COMMITTED result, because a unit whose results have all gone is still a unit whose stale
+    // question can leave, and a unit with no results at all still may not.
+    it('`results` names only the results the model is still receiving', () => {
+        const settings = settingsWith({
+            truncateToolRequests: true,
+            dropSupersededToolCalls: false,
+            trimInvalidTools: false
+        });
+
+        // Unit 0's result was switched off by hand (a host, or the UI — it is the same flag); unit 1
+        // is intact. Both requests are still eligible; only the first one's list has to change.
+        expect(planTruncatedRequests(entriesFrom(TRIMMABLE, [2]), settings)).toEqual([
+            {
+                leaderIndex: 1,
+                leaderMessageId: 'msg-2',
+                members: [1],
+                // EMPTY, not `[2]`: entry 2 is already excluded, so naming it would report a result
+                // the provider is not receiving.
+                results: [],
+                names: ['read'],
+                firedBy: 'truncateToolRequests'
+            },
+            {
+                leaderIndex: 3,
+                leaderMessageId: 'msg-4',
+                members: [3],
+                results: [4],
+                names: ['read'],
+                firedBy: 'truncateToolRequests'
+            }
+        ]);
+
+        // Every result of both units withheld: the candidates survive (the guard is about the
+        // provider's pairing, and it reads ROLES) with empty lists. A withheld result is not the same
+        // shape as NO result, and this is the line that proves the two were not conflated.
+        expect(
+            planTruncatedRequests(entriesFrom(TRIMMABLE, [2, 4]), settings).map((candidate) => [
+                candidate.leaderIndex,
+                candidate.results
+            ])
+        ).toEqual([
+            [1, []],
+            [3, []]
+        ]);
+
+        // The guard itself, unchanged: the unanswered unit has no committed result to keep, so its
+        // request stays whatever the flags say.
+        expect(
+            planTruncatedRequests(
+                entriesFrom([
+                    { role: 'user', content: 'go' },
+                    call('c1', 'read', '{"path":"a.ts"}'),
+                    call('c2', 'read', '{"path":"b.ts"}'),
+                    result('c2', 'read', 'contents')
+                ]),
+                settings
+            ).map((candidate) => candidate.leaderIndex)
+        ).toEqual([2]);
+    });
+
+    it('the HORIZON is tool turns: 0 truncates every answered request, 1 keeps the newest, 2 keeps both', () => {
+        // Ages on this transcript: unit 0 is 1 tool turn old (the newest tool turn is unit 1's), and
+        // unit 1 is 0 old. The N / N+1 boundary is therefore `truncateTurns: 1` — the newest request
+        // is protected, the one above it is not.
+        const bothOff = { truncateToolRequests: true, dropSupersededToolCalls: false, trimInvalidTools: false };
+
+        for (const truncateTurns of [0, 1, 2]) {
+            expect(
+                planTruncatedRequests(
+                    entriesFrom(TRIMMABLE),
+                    settingsWith({ ...bothOff, truncateTurns })
+                ).map((candidate) => [candidate.leaderIndex, candidate.results])
+            ).toEqual(truncateTurns === 0 ? [[1, [2]], [3, [4]]] : truncateTurns === 1 ? [[1, [2]]] : []);
+        }
+
+        // A nonsense number behaves as 0 (the read resolves it), so the widest horizon is the safe
+        // one rather than a silent no-op.
+        expect(
+            planTruncatedRequests(
+                entriesFrom(TRIMMABLE),
+                settingsWith({ ...bothOff, truncateTurns: -5 })
+            ).map((candidate) => candidate.leaderIndex)
+        ).toEqual([1, 3]);
+    });
+
+    it('a unit the whole-unit trim already took is never ALSO truncated — the precedence, in the plan', () => {
+        // The precedence is trim > truncate, and the mechanism is the shared `removedEntries` set the
+        // plan passes in. Unit 0 leaves WHOLE (both entries), so its request is not in the truncate
+        // list; unit 1's request is.
+        const trimmedEntries = new Set([1, 2]);
+
+        expect(
+            planTruncatedRequests(entriesFrom(TRIMMABLE), settingsWith({ truncateToolRequests: true }), trimmedEntries)
+                .map((candidate) => candidate.leaderIndex)
+        ).toEqual([3]);
+
+        // The same call with the 2-turn horizon DECLARED protects unit 1's request as well, so the
+        // shipped posture writes no truncate line on a two-unit transcript at all.
+        expect(
+            planTruncatedRequests(
+                entriesFrom(TRIMMABLE),
+                { ...TRIMMER_DEFAULT_SETTINGS, truncateToolRequests: true },
+                trimmedEntries
+            )
+        ).toEqual([]);
+
+        // And a leader that is already withheld is not a candidate: re-deciding an entry the model
+        // never sees would report a truncate that changes nothing.
+        const alreadyGone = entriesFrom(TRIMMABLE).map((entry) =>
+            entry.index === 1 ? ({ ...entry, included: false } as HarnessContextEntry) : entry
+        );
+
+        expect(
+            planTruncatedRequests(alreadyGone, settingsWith({ truncateToolRequests: true, truncateTurns: 0 }))
+                .map((candidate) => candidate.leaderIndex)
+        ).toEqual([3]);
+    });
+
+    it('a unit with nothing to keep is never truncated — the results have to STAY somewhere', () => {
+        // An UNANSWERED request is the case the switch must refuse: dropping the request of a call
+        // whose result has not landed yet would break the pair the provider validates, and dropping
+        // it after the result lands is what `results` exists to prove is safe.
+        const unanswered: readonly HarnessMessage[] = [
+            { role: 'user', content: 'go' },
+            call('c1', 'read', '{"path":"a.ts"}'),
+            { role: 'assistant', content: 'done' }
+        ];
+
+        expect(
+            planTruncatedRequests(
+                entriesFrom(unanswered),
+                settingsWith({ truncateToolRequests: true, truncateTurns: 0 })
+            )
+        ).toEqual([]);
+
+        // A tool unit whose committed result belongs to a DIFFERENT call id (the orphan case the unit
+        // grouper leaves standalone) is refused for the same reason.
+        const orphan: readonly HarnessMessage[] = [
+            { role: 'user', content: 'go' },
+            call('c1', 'read', '{"path":"a.ts"}'),
+            result('cX', 'read', 'nobody asked'),
+            { role: 'assistant', content: 'done' }
+        ];
+
+        expect(
+            planTruncatedRequests(entriesFrom(orphan), settingsWith({ truncateToolRequests: true, truncateTurns: 0 }))
+        ).toEqual([]);
+    });
+
+    it('the economy gates run on the truncate axis too, and they are PER AXIS, not shared', () => {
+        // Both whole-unit switches off, so the truncate is the only writer and its gates are the only
+        // ones in play. `maxUnits` caps candidates per pass: 1 keeps the OLDEST request (the plan is
+        // ordered oldest-first), which is the same rule the trim follows.
+        const bothOff = { truncateToolRequests: true, dropSupersededToolCalls: false, trimInvalidTools: false };
+
+        expect(
+            planTruncatedRequests(entriesFrom(TRIMMABLE), settingsWith({ ...bothOff, maxUnits: 1 })).map(
+                (candidate) => candidate.leaderIndex
+            )
+        ).toEqual([1]);
+
+        // `minTokens` gates the truncate exactly as it gates the trim, on the same transcript.
+        expect(
+            planTruncatedRequests(entriesFrom(TRIMMABLE), settingsWith({ ...bothOff, minTokens: 1000000 }))
+        ).toEqual([]);
+
+        // PROOF THAT THE GATES ARE PER AXIS: the trim writes nothing (its token gate is shut) while
+        // the truncate, on its own pass through its own gate at a value the trim never sees, still
+        // acts. A single shared gate would have emptied both.
+        expect(
+            planTruncatedRequests(
+                entriesFrom(TRIMMABLE),
+                settingsWith({ ...bothOff, minTokens: 0, maxUnits: 0 })
+            ).map((candidate) => candidate.leaderIndex)
+        ).toEqual([1, 3]);
+    });
+
+    it('writes ONE setIncluded per request and reports its own section, naming the results that stay', async () => {
+        const { api, touches, diagnostics } = createFakeApi({
+            truncateToolRequests: true,
+            dropSupersededToolCalls: false,
+            trimInvalidTools: false
+        });
+        const calls: string[] = [];
+        const entries = entriesFrom(TRIMMABLE);
+
+        await executeTrimming(api, createFakeTurn({ api, calls, entries }));
+
+        // Exactly the two leaders — the RESULT entries (2 and 4) are never touched, and no third
+        // write exists. `false` only, as everywhere in this plugin.
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:3:false']);
+        expect(entries[2].included).toBe(true);
+        expect(entries[4].included).toBe(true);
+        expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
+
+        expect(diagnostics).toHaveLength(1);
+        // Its OWN section — a reader must be able to tell a truncated request from a withheld unit
+        // without opening the transcript, and `results kept` is the diffable promise.
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer truncated 2 tool request(s): #1 msg-2 read results kept #2;' +
+                ' #3 msg-4 read results kept #4'
+        );
+        expect(diagnostics[0].data).toEqual({
+            units: [],
+            truncated: [
+                { index: 1, messageId: 'msg-2', names: ['read'], results: [2], firedBy: 'truncateToolRequests' },
+                { index: 3, messageId: 'msg-4', names: ['read'], results: [4], firedBy: 'truncateToolRequests' }
+            ],
+            thoughts: [],
+            // `truncateToolRequests` is on and it accounts for every line, so `fired` names it — and
+            // the two whole-unit switches that are OFF in this case (they had to be, or the trim would
+            // have taken unit 0 first) are reported off, exactly as the pass ran them.
+            policy: {
+                ...DEFAULT_POLICY,
+                dropSupersededToolCalls: false,
+                trimInvalidTools: false,
+                truncateToolRequests: true,
+                fired: ['truncateToolRequests']
+            }
+        });
+    });
+
+    // THE LINE ADMITS WHEN NOTHING IS LEFT RIDING (2026-11-13 review). With every result of a unit
+    // already withheld, the old line still printed `results kept #2` — an index the model had stopped
+    // receiving, which is the opposite of what that clause promises. `none` is the honest tail, and
+    // the request still leaves, because dropping a stale question over an exchange whose answers are
+    // already gone is a saving on its own.
+    it('reports `results kept none` when every result of the truncated unit is already withheld', async () => {
+        const { api, touches, diagnostics } = createFakeApi({
+            truncateToolRequests: true,
+            dropSupersededToolCalls: false,
+            trimInvalidTools: false
+        });
+        const calls: string[] = [];
+        const entries = entriesFrom(TRIMMABLE, [2, 4]);
+
+        await executeTrimming(api, createFakeTurn({ api, calls, entries }));
+
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:3:false']);
+        expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
+
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer truncated 2 tool request(s): #1 msg-2 read results kept none;' +
+                ' #3 msg-4 read results kept none'
+        );
+        expect(diagnostics[0].data).toEqual({
+            units: [],
+            truncated: [
+                { index: 1, messageId: 'msg-2', names: ['read'], results: [], firedBy: 'truncateToolRequests' },
+                { index: 3, messageId: 'msg-4', names: ['read'], results: [], firedBy: 'truncateToolRequests' }
+            ],
+            thoughts: [],
+            policy: {
+                ...DEFAULT_POLICY,
+                dropSupersededToolCalls: false,
+                trimInvalidTools: false,
+                truncateToolRequests: true,
+                fired: ['truncateToolRequests']
+            }
+        });
+    });
+
+    // THE STALE WRITE (2026-11-13 review): the handler awaits `context.pause()` between the plan and
+    // this writer, and `setIncluded` writes and reports UNCONDITIONALLY (src/harness.ts:8915-8933).
+    // A request entry that stopped being sent inside that window must therefore be skipped — a
+    // `false` → `false` write is a persistence notification and a whole-document save for a change
+    // that did not happen, and the candidate would also land in the `truncated` section, reporting a
+    // truncation this pass never made.
+    it('a request that went stale inside the pause window is neither written nor reported', async () => {
+        const { api, touches, diagnostics } = createFakeApi({
+            truncateToolRequests: true,
+            dropSupersededToolCalls: false,
+            trimInvalidTools: false
+        });
+        const calls: string[] = [];
+        // What the plan sees: both requests still being sent, so both are candidates.
+        const planned = entriesFrom(TRIMMABLE);
+        // What the transcript holds when the writer runs: the first request has been switched off in
+        // the meantime, the second is untouched.
+        const stale = entriesFrom(TRIMMABLE, [1]);
+        const { context, reads } = withStaleEntries(
+            createFakeTurn({ api, calls, entries: planned }),
+            planned,
+            stale
+        );
+
+        await executeTrimming(api, context);
+
+        expect(calls).toEqual(['setIncluded:3:false']);
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer truncated 1 tool request(s): #3 msg-4 read results kept #4'
+        );
+        expect((diagnostics[0].data as { truncated: unknown[] }).truncated).toEqual([
+            { index: 3, messageId: 'msg-4', names: ['read'], results: [4], firedBy: 'truncateToolRequests' }
+        ]);
+        expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
+        // The fixture, pinned: three reads for the plan, one for the writer. If the plan ever walks
+        // the list again, this fails here instead of quietly comparing one list against itself.
+        expect(reads()).toBe(4);
+    });
+
+    // THE FLOOR IS THE SILENT HALF of the headline toggle (2026-11-13 review). `minTokens` runs PER
+    // AXIS, and the figures below are the shipped estimator's own over THIS transcript: the truncate
+    // write set [1,3] is worth 10 tokens and the whole-unit write set [1,2] is worth 13. Context
+    // Compacting ships its floor at 200 — a scale a trimmer operator copies without thinking — and at
+    // that value a short conversation's truncate pass writes NOTHING while the switch stays on.
+    it('a realistic `minTokens` floor silences the truncate axis while the switch stays on', () => {
+        const truncateOnly = settingsWith({
+            truncateToolRequests: true,
+            dropSupersededToolCalls: false,
+            trimInvalidTools: false
+        });
+
+        // THE EXACT BOUNDARY of this axis's own saving: 10 is at the floor, 11 is under it, and
+        // under it the WHOLE pass is rejected (no candidate, so no flag, no notification, no save,
+        // no diagnostic line).
+        expect(
+            planTruncatedRequests(entriesFrom(TRIMMABLE), { ...truncateOnly, minTokens: 10 }).map(
+                (candidate) => candidate.leaderIndex
+            )
+        ).toEqual([1, 3]);
+        expect(planTruncatedRequests(entriesFrom(TRIMMABLE), { ...truncateOnly, minTokens: 11 })).toEqual([]);
+        expect(planTruncatedRequests(entriesFrom(TRIMMABLE), { ...truncateOnly, minTokens: 200 })).toEqual([]);
+
+        // PER AXIS, not shared, and the two axes can disagree at the SAME settings: at 11 the truncate
+        // write set (10 tokens) is refused while the whole-unit write set (13 tokens) still goes.
+        // (Both plans are called standalone here, so neither sees the other's `trimmedEntries` — the
+        // precedence is `planOf`'s, and the point being pinned is the floor, not the precedence.)
+        const bothOn = settingsWith({ minTokens: 11 });
+
+        expect(planTrimmedUnits(entriesFrom(TRIMMABLE), bothOn).map((candidate) => candidate.members)).toEqual([
+            [1, 2]
+        ]);
+        expect(
+            planTruncatedRequests(entriesFrom(TRIMMABLE), bothOn).map((candidate) => candidate.leaderIndex)
+        ).toEqual([]);
+
+        // And at the declared 0 both axes run, which is the shipped posture: no floor, no surprise.
+        expect(
+            planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({})).map((candidate) => candidate.members)
+        ).toEqual([[1, 2]]);
+        expect(
+            planTruncatedRequests(entriesFrom(TRIMMABLE), settingsWith({ truncateToolRequests: true })).map(
+                (candidate) => candidate.leaderIndex
+            )
+        ).toEqual([1, 3]);
+    });
+
+    it('three axes, one diagnostic, in the order they RAN', async () => {
+        // A transcript where all three axes have work: the failed unit goes whole (trim), the
+        // answering unit's request goes (truncate), and its thinking goes (thinking). The sections are
+        // in run order — trim, truncate, thinking — joined by the same ' | ' the fallback clauses
+        // use, so one operator reading one line can attribute every entry.
+        const { api, diagnostics } = createFakeApi({ truncateToolRequests: true });
+        const calls: string[] = [];
+
+        await executeTrimming(
+            api,
+            createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
+        );
+
+        expect(calls).toEqual([
+            'setIncluded:1:false',
+            'setIncluded:2:false',
+            'setIncluded:3:false',
+            'setReasoningIncluded:6:false'
+        ]);
+        // Entry 3 is the truncated leader, and its thinking is NOT flagged: the entry itself leaves the
+        // request, so a flag on it would be a second write for zero effect and would inflate the
+        // character figure `minThoughtChars` is measured against. Rule (3b) reads the whole REMOVE
+        // set of the pass — trim members and truncate leaders alike — not just the unit plan.
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4' +
+                ' | context-trimmer truncated 1 tool request(s): #3 msg-4 read results kept #4' +
+                ' | context-trimmer withheld 1 thinking entry(s):' +
+                ' #6 msg-7 open 0 thoughts old 30 chars via trimThoughts=0'
+        );
+        // The record keeps the three axes in three lists: `units` (whole units), `truncated` (one
+        // request entry plus the results that stay) and `thoughts` (one flagged entry) — a reader can
+        // attribute every entry to exactly one decision without opening the transcript.
+        const data = diagnostics[0].data as { units: unknown[]; truncated: unknown[]; thoughts: unknown[] };
+
+        expect(data.units).toEqual([UNIT_RECORD]);
+        expect(data.truncated).toEqual([
+            { index: 3, messageId: 'msg-4', names: ['read'], results: [4], firedBy: 'truncateToolRequests' }
+        ]);
+        expect(data.thoughts).toEqual([THOUGHTS_REPORT[2]]);
+        expect(policyOf(diagnostics[0])).toMatchObject({
+            truncateToolRequests: true,
+            truncateTurns: 0,
+            precedence: 'whole-unit trim > truncate request > withhold thinking',
+            fired: ['dropSupersededToolCalls', 'trimInvalidTools', 'truncateToolRequests', 'trimThoughts']
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE TOOL HORIZONS — R2/R4: each whole-unit rule has its own tool-turn window
+// ---------------------------------------------------------------------------
+
+// Four tool turns, oldest first. `toolTurnAgoOf` counts TOOL TURNS (units whose leader carries
+// calls), newest = 0, so the ages below are 3, 2, 1 and 0 — enough to put a rule's N and N+1 on
+// different sides of the line twice over.
+//
+// TURN_AGES is the supersede/invalid fixture: two ALL-`failed` units (entries 1 and 5, so
+// `kind === 'candidate'`), each answered by a later same-name success (3 and 7). Ages: 1 → 3,
+// 3 → 2, 5 → 1, 7 → 0.
+//   0 user       'start'
+//   1 assistant  call c1 read {"p":1}   ← ago 3  `candidate` (failed)
+//   2 tool       c1 `failed`
+//   3 assistant  call c2 read {"p":2}   ← ago 2  `answered` — the resolver of unit 1
+//   4 tool       c2 completed
+//   5 assistant  call c3 read {"p":3}   ← ago 1  `candidate` (failed)
+//   6 tool       c3 `failed`
+//   7 assistant  call c4 read {"p":4}   ← ago 0  `answered` — the resolver of unit 5
+//   8 tool       c4 completed
+const TURN_AGES: readonly HarnessMessage[] = [
+    { role: 'user', content: 'start' },
+    call('c1', 'read', '{"p":1}'),
+    result('c1', 'read', 'Tool "read" failed: EACCES', 'failed'),
+    call('c2', 'read', '{"p":2}'),
+    result('c2', 'read', 'first contents'),
+    call('c3', 'read', '{"p":3}'),
+    result('c3', 'read', 'Tool "read" failed: EACCES', 'failed'),
+    call('c4', 'read', '{"p":4}'),
+    result('c4', 'read', 'second contents')
+];
+
+// The duplicate fixture: THREE byte-identical calls (same name, same arguments) plus a fourth of a
+// different tool, so the fingerprint matcher has a chain to collapse. Ages as above.
+//   1 assistant call c1 read {"path":"a.ts"} → failed     ← ago 3, a duplicate of 5's work
+//   3 assistant call c2 read {"path":"a.ts"} → completed  ← ago 2, a duplicate of 5's work
+//   5 assistant call c3 read {"path":"a.ts"} → completed  ← ago 1, the NEWEST copy — the keeper
+//   7 assistant call c4 beta {}             → completed   ← ago 0, different work
+const TURN_DUPES: readonly HarnessMessage[] = [
+    { role: 'user', content: 'start' },
+    call('c1', 'read', '{"path":"a.ts"}'),
+    result('c1', 'read', 'Tool "read" failed: EACCES', 'failed'),
+    call('c2', 'read', '{"path":"a.ts"}'),
+    result('c2', 'read', 'first contents'),
+    call('c3', 'read', '{"path":"a.ts"}'),
+    result('c3', 'read', 'second contents'),
+    call('c4', 'beta', '{}'),
+    result('c4', 'beta', 'beta contents')
+];
+
+// The leader indices of a plan, oldest first — the only figure these tables vary.
+const leadersOf = (plan: readonly { leaderIndex: number }[]): number[] =>
+    plan.map((candidate) => candidate.leaderIndex);
+
+describe('context-trimmer tool rules with per-rule horizons (R2/R4)', () => {
+    it('invalidToolTurns: a failed unit becomes eligible only once N newer tool turns sit above it', () => {
+        // One rule in play, so the horizon is the only variable. Ages: entry 1 is 3 tool turns old,
+        // entry 5 is 1 old. The sweep is the whole ladder — 0 protects nothing, 1 still lets the
+        // 1-old one go, 2 is the first value that protects it, 4 is the first that protects the 3-old
+        // one too. Each N and its N+1 sit on opposite sides, which is the contract the descriptor
+        // states (`Protects the newest N tool turns; 0 protects none.`).
+        for (const invalidToolTurns of [0, 1, 2, 3, 4]) {
+            expect(
+                leadersOf(
+                    planTrimmedUnits(
+                        entriesFrom(TURN_AGES),
+                        settingsWith({
+                            trimInvalidTools: true,
+                            invalidToolTurns,
+                            dropSupersededToolCalls: false,
+                            dropDuplicateCalls: false
+                        })
+                    )
+                )
+            ).toEqual(
+                invalidToolTurns <= 1 ? [1, 5] : invalidToolTurns <= 3 ? [1] : []
+            );
+        }
+
+        // The horizon is a TOOL-TURN count, not a unit or entry count: the two failed units sit four
+        // transcript entries apart and the window still measures the turns between them.
+        expect(
+            leadersOf(
+                planTrimmedUnits(
+                    entriesFrom(TURN_AGES),
+                    settingsWith({ trimInvalidTools: true, dropSupersededToolCalls: false, invalidToolTurns: 2 })
+                )
+            )
+        ).toEqual([1]);
+    });
+
+    it('supersededTurns: the answering turn is never dropped, and the answered one goes at its own bound', () => {
+        // The shipped rule's own horizon, swept the same way. Only the two `candidate` units can be
+        // superseded (an `answered` unit is a RESOLVER, not a candidate), and both need a later
+        // same-name success to exist — which is why entry 7, the newest turn, can never leave: it has
+        // nothing above it to answer it.
+        for (const supersededTurns of [0, 1, 2, 3, 4]) {
+            expect(
+                leadersOf(
+                    planTrimmedUnits(
+                        entriesFrom(TURN_AGES),
+                        settingsWith({
+                            dropSupersededToolCalls: true,
+                            supersededTurns,
+                            trimInvalidTools: false,
+                            dropDuplicateCalls: false
+                        })
+                    )
+                )
+            ).toEqual(supersededTurns <= 1 ? [1, 5] : supersededTurns <= 3 ? [1] : []);
+        }
+
+        // The horizon cannot invent a candidate: with nothing answering the failed unit, no horizon
+        // value at all moves the rule (`0` opens the window, and the predicate still refuses).
+        const unanswered: readonly HarnessMessage[] = [
+            { role: 'user', content: 'start' },
+            call('c1', 'read', '{"p":1}'),
+            result('c1', 'read', 'Tool "read" failed: EACCES', 'failed')
+        ];
+
+        expect(
+            leadersOf(
+                planTrimmedUnits(
+                    entriesFrom(unanswered),
+                    settingsWith({ supersededTurns: 0, trimInvalidTools: false, dropDuplicateCalls: false })
+                )
+            )
+        ).toEqual([]);
+    });
+
+    it('duplicateTurns: the newest copy is the keeper, and the horizon decides how far down the chain it reaches', async () => {
+        // Ages here: entry 1 is 3 old, 3 is 2 old, 5 is 1 old, 7 is 0 old. The three identical `read`
+        // calls collapse to the newest one (entry 5), so the candidates are 1 (ago 3) and 3 (ago 2) —
+        // and the KEEPER survives every horizon value, including 0, because it has no later copy to be
+        // superseded by, not because the window protects it.
+        for (const duplicateTurns of [0, 1, 2, 3, 4]) {
+            expect(
+                leadersOf(
+                    planTrimmedUnits(
+                        entriesFrom(TURN_DUPES),
+                        settingsWith({
+                            dropDuplicateCalls: true,
+                            duplicateTurns,
+                            trimInvalidTools: false,
+                            dropSupersededToolCalls: false
+                        })
+                    )
+                )
+            ).toEqual(duplicateTurns <= 2 ? [1, 3] : duplicateTurns <= 3 ? [1] : []);
+        }
+
+        // The keeper is provably still in the request: with the window open the pass writes the two
+        // older copies and NOTHING else, so entry 5 and its result keep riding.
+        const { api } = createFakeApi({
+            dropDuplicateCalls: true,
+            trimInvalidTools: false,
+            dropSupersededToolCalls: false
+        });
+        const calls: string[] = [];
+        const entries = entriesFrom(TURN_DUPES);
+
+        await executeTrimming(api, createFakeTurn({ api, calls, entries }));
+
+        expect(calls).toEqual([
+            'setIncluded:1:false',
+            'setIncluded:2:false',
+            'setIncluded:3:false',
+            'setIncluded:4:false'
+        ]);
+        expect(entries[5].included).toBe(true);
+        expect(entries[6].included).toBe(true);
+    });
+
+    it('the horizons are SEPARATE knobs: opening one rule leaves its neighbours shut', () => {
+        // The same transcript, three settings, three different plans. This is the whole point of one
+        // horizon per toggle instead of a single shared window: an operator who trusts the invalid-tools
+        // rule but not the duplicate rule can say so per rule.
+        const settings = {
+            supersededOnly: settingsWith({ supersededTurns: 0, trimInvalidTools: false, dropDuplicateCalls: false }),
+            invalidOnly: settingsWith({ invalidToolTurns: 0, dropSupersededToolCalls: false, dropDuplicateCalls: false }),
+            duplicatesOnly: settingsWith({
+                dropDuplicateCalls: true,
+                duplicateTurns: 0,
+                trimInvalidTools: false,
+                dropSupersededToolCalls: false
+            })
+        };
+
+        expect(leadersOf(planTrimmedUnits(entriesFrom(TURN_AGES), settings.supersededOnly))).toEqual([1, 5]);
+        expect(leadersOf(planTrimmedUnits(entriesFrom(TURN_AGES), settings.invalidOnly))).toEqual([1, 5]);
+        expect(leadersOf(planTrimmedUnits(entriesFrom(TURN_DUPES), settings.duplicatesOnly))).toEqual([1, 3]);
+
+        // A neighbour's horizon cannot leak: `supersededTurns: 9` shuts the shipped rule while
+        // `invalidToolTurns: 0` still lets the same unit go through the invalid rule — the unit is
+        // withheld either way, and `firedBy` proves which rule did it.
+        const split = settingsWith({ supersededTurns: 9, invalidToolTurns: 0, dropDuplicateCalls: false });
+        const plan = planTrimmedUnits(entriesFrom(TURN_AGES), split);
+
+        expect(leadersOf(plan)).toEqual([1, 5]);
+        expect(plan.map((candidate) => [candidate.firedBy, candidate.admittedBy])).toEqual([
+            ['trimInvalidTools', ['trimInvalidTools']],
+            ['trimInvalidTools', ['trimInvalidTools']]
+        ]);
+
+        // And the reverse: an open supersede window with the invalid rule shut still takes the same
+        // two units, attributed to the shipped rule.
+        const flipped = settingsWith({ supersededTurns: 0, trimInvalidTools: false, dropDuplicateCalls: false });
+
+        expect(
+            planTrimmedUnits(entriesFrom(TURN_AGES), flipped).map((candidate) => [
+                candidate.leaderIndex,
+                candidate.firedBy
+            ])
+        ).toEqual([
+            [1, 'dropSupersededToolCalls'],
+            [5, 'dropSupersededToolCalls']
+        ]);
+    });
+
+    it('the DECLARED horizons (all 2) protect the two newest tool turns, end to end and in the report', async () => {
+        // Nothing overridden — the posture an operator gets from a fresh install. Of the two failed
+        // units, only the 3-turns-old one is old enough to leave; the 1-turn-old failure is protected
+        // by every one of the declared windows, and the report says so with `2` next to each rule.
+        const { api, touches, diagnostics } = createFakeApi({ atDeclaredHorizons: true });
+        const calls: string[] = [];
+
+        await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(TURN_AGES) }));
+
+        // One unit, leader first then its result — the whole-unit write set the runtime requires.
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
+        expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4'
+        );
+        expect(diagnostics[0].data).toEqual({
+            units: [
+                {
+                    index: 1,
+                    messageId: 'msg-2',
+                    members: [1, 2],
+                    requestAlreadyWithheld: false,
+                    outcomes: ['failed'],
+                    invalidOutcomes: ['failed'],
+                    names: ['read'],
+                    supersededBy: 'msg-4',
+                    firedBy: 'dropSupersededToolCalls',
+                    admittedBy: ['dropSupersededToolCalls', 'trimInvalidTools']
+                }
+            ],
+            truncated: [],
+            thoughts: [],
+            // EVERY horizon is the shipped 2 — the operator reading this record can re-derive the
+            // decision for the unit that left AND for the one that stayed.
+            policy: DECLARED_DEFAULT_POLICY
+        });
+
+        // The same transcript with the windows OPEN writes both failures — the difference between the
+        // two plans is the horizons and nothing else.
+        const opened = createFakeApi();
+        const openedCalls: string[] = [];
+
+        await executeTrimming(
+            opened.api,
+            createFakeTurn({ api: opened.api, calls: openedCalls, entries: entriesFrom(TURN_AGES) })
+        );
+
+        expect(openedCalls).toEqual([
+            'setIncluded:1:false',
+            'setIncluded:2:false',
+            'setIncluded:5:false',
+            'setIncluded:6:false'
+        ]);
+        // Same shape of record, every horizon at 0 — the two records side by side ARE the R2 proof.
+        expect(policyOf(opened.diagnostics[0])).toEqual(DEFAULT_POLICY);
+    });
+
+    it('a nonsense horizon number resolves to the declared 2 — the bounds belong to the pane, not the pass', async () => {
+        // The read resolves a non-number to the descriptor default; nothing is clamped in the pass
+        // itself (a value above `max` still acts, which is what the PATCH edge in
+        // `src/server/plugins-api.test.ts` pins at the API boundary). A NEGATIVE number is a number,
+        // so it arrives as-is — and `ago >= -1` is true for every unit, i.e. a negative window is
+        // OPEN, which is the safe direction: it removes more, it never silently disables a rule.
+        expect(
+            leadersOf(
+                planTrimmedUnits(
+                    entriesFrom(TURN_AGES),
+                    settingsWith({ supersededTurns: -1, trimInvalidTools: false, dropDuplicateCalls: false })
+                )
+            )
+        ).toEqual([1, 5]);
+
+        const { api, diagnostics } = createFakeApi({
+            supersededTurns: 'soon',
+            trimInvalidTools: false,
+            dropDuplicateCalls: false
+        });
+        const calls: string[] = [];
+
+        await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(TURN_AGES) }));
+
+        // The declared 2 → the 1-turn-old failure is protected, the 3-turns-old one leaves.
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
+        expect(policyOf(diagnostics[0])).toMatchObject({ supersededTurns: 2 });
     });
 });

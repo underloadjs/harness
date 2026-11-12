@@ -333,9 +333,13 @@ export const projectBlock = (block: WireContextBlock): ContextBlock => {
         // T7: the reader-facing inclusion, copied when a producer published it and left
         // ABSENT otherwise. Absent is not "included": it means "no transcript entry behind
         // this segment" (../shared/turn-display.ts:541), and a client that defaulted it to
-        // `true` would hand every segment a toggle for a flag nothing can write. The bar
-        // itself ignores this field; the segment dialog is what acts on it
-        // (./ui/context-detail.ts), and today the block detail route is the only producer.
+        // `true` would hand every segment a toggle for a flag nothing can write. TWO surfaces
+        // read it now, and both read it through `view-context.ts` `contextBlockIsExcluded`, so
+        // "dimmed" has exactly one meaning: the segment dialog offers the toggle, and the bar
+        // DIMS the segment (R7/T4a — `data-included='false'` + `opacity: 0.2` in DOM mode,
+        // `globalAlpha` 0.2 in canvas mode). A `context:set` patch carrying `included` moves
+        // it live through ./view-state.ts, and the tile repaints from the same frame, so the
+        // dim follows a reader's or a plugin's change without a re-mint.
         ...(block.included === undefined ? {} : { included: block.included })
     };
 };

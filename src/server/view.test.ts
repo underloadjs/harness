@@ -179,6 +179,43 @@ const singlePreset = (name = 'one'): HarnessPreset =>
         })
     );
 
+// A turn that streams prose, calls a tool, then streams prose AGAIN. One preset, two data shapes,
+// and both matter to the answer join (R5 review, FIX C): distinct texts make the two runs resolve
+// to two different entries (the projector mints one answer block per run, src/server/turn-projector.ts
+// `closeWriters` + the `record.text === undefined` branch), while the SAME text twice puts two
+// candidates in one conversation and the join refuses. Same tool round as `toolRoundPreset` so the
+// recorded call still executes — only the prose placement and wording differ.
+const twoRunPreset = (name = 'splitter', firstText = 'part one', secondText = 'part two'): HarnessPreset =>
+    presetOf(name, (settings, progress) =>
+        harness({
+            agents: {
+                [name]: agent({
+                    model: settings.model,
+                    instruction: 'You are a scripted test agent.',
+                    stream: requestStream([
+                        [
+                            { type: 'text', agent: name, delta: firstText },
+                            {
+                                type: 'done',
+                                stopReason: 'tool_calls',
+                                toolCalls: [{ id: 'call-1', name: 'tasks', arguments: JSON.stringify({ tasks: [{ text: 'a task' }] }) }],
+                                usage: { input: 500, output: 20, total: 520 }
+                            }
+                        ],
+                        [
+                            { type: 'text', delta: secondText },
+                            { type: 'done', stopReason: 'stop', toolCalls: [], usage: { input: 620, output: 25, total: 645 } }
+                        ]
+                    ]),
+                    tools: ['task']
+                })
+            },
+            primary: name,
+            presets: false,
+            report: { progress }
+        })
+    );
+
 // A store over an injected catalogue, optionally durable under `root`. The restart
 // path is the same one ./runtime.ts uses: load the document, hand it to a new store.
 const storeOf = (presets: HarnessPreset[], root?: string): SessionStore => {
@@ -1025,7 +1062,7 @@ describe('the canonical session surface (R3)', () => {
         const created = await store.create('worker');
         const turn = await runTurn(store, created.id, 'do the work');
         // The LIVE record, not the snapshot: the assertions below read the transcript through
-        // the harness seam the route itself writes through (./api.ts `blockUnitOf` +
+        // the harness seam the route itself writes through (./api.ts `blockEntryOf` +
         // `updateThreadTranscript`), which is the seam the NEXT model request is built from.
         const record = store.liveSession(created.id);
         const events = record.turns[0].events;
@@ -1051,11 +1088,18 @@ describe('the canonical session surface (R3)', () => {
 
         /**
          * What one segment says about inclusion: the published boolean, or `unaddressable`
-         * when the property is ABSENT. Absent is the load-bearing case — the instruction and
-         * the prompt are seeded by the core, and an ANSWER has no single transcript entry of
-         * its own (it is the text half of an assistant leader split across two events), so the
-         * bar mints segments whose inclusion nobody can switch. The dialog renders no control
-         * for them, which is why `true` and "absent" may not be conflated.
+         * when the property is ABSENT. Absent is still a load-bearing case — the instruction set
+         * and the prompt are seeded by the core and join N entries / no entry at all, so the bar
+         * mints segments whose inclusion nobody can switch. The dialog renders no control for
+         * them, which is why `true` and "absent" may not be conflated.
+         *
+         * THE ANSWER SEGMENT IS NO LONGER ONE OF THEM (R5 review, FIX C). Its recorded `text`
+         * bytes ARE an identity the server can resolve — the one assistant entry whose `content`
+         * is exactly those bytes — so this route now answers a boolean for it and the chip has
+         * something to switch. It stays `unaddressable` only when the transcript declines to
+         * single out an entry: an answer streamed across a tool round (two runs of deltas, no
+         * single entry's `content`), or an answer an earlier entry repeats. Both cases are pinned
+         * in their own test below, so the join's REFUSAL is as tested as its success.
          */
         const publishedInclusion = async (blockId: string) => {
             const read = await call(api, 'GET', route(blockId));
@@ -1069,8 +1113,11 @@ describe('the canonical session surface (R3)', () => {
 
         expect(await publishedInclusion('0-system-instructions')).toBe('unaddressable');
         expect(await publishedInclusion('0-user-prompt')).toBe('unaddressable');
-        expect(await publishedInclusion(`0-assistant-${textIndex}`)).toBe('unaddressable');
         expect(await publishedInclusion(toolId)).toBe(true);
+
+        // THE ANSWER, JOINED (FIX C): one assistant entry streamed `finished` in one run, so this
+        // segment names it and the route states the entry's verdict instead of abstaining.
+        expect(await publishedInclusion(`0-assistant-${textIndex}`)).toBe(true);
 
         // OFF, and the receipt is the write's own verdict read BACK off the record: the dialog
         // repaints from THIS body rather than guessing, so a refusal leaves the chip exactly
@@ -1091,16 +1138,19 @@ describe('the canonical session surface (R3)', () => {
             }
         });
 
-        // The durable consequence, at the seam the core folds into the next request: the
-        // round's LEADER and the result that answers its call are flagged together, and nothing
-        // else moves — same entries, same ids, same text, `included: false` as the only
-        // difference. `false` is the only value ever stored, the way core's own `turn.before`
-        // control writes it (../harness.ts `writeIncluded`).
+        // The durable consequence, at the seam the core folds into the next request: the entry
+        // the segment recorded is the ONE entry the route addresses — for a call block that is
+        // the assistant entry that OWNS the recorded call id — and nothing else moves. Same
+        // entries, same ids, same text, `included: false` as the only difference; the RESULT
+        // entry keeps travelling, and answers its call with the request-only withheld
+        // placeholder (R8, ../harness.ts `projectTranscript`). `false` is the only value ever
+        // stored, the way core's own `turn.before` control writes it (../harness.ts
+        // `writeIncluded`).
         expect(record.harness.threadMessages(threadId)).toStrictEqual([
             { role: 'system', content: WORKER_INSTRUCTION, messageId: 'msg-1' },
             { role: 'user', content: 'do the work', messageId: 'msg-2' },
             { role: 'assistant', content: '', toolCalls: [{ id: 'call-1', name: 'tasks', arguments: args }], included: false, messageId: 'msg-3' },
-            { role: 'tool', content: result, toolCallId: 'call-1', name: 'tasks', included: false, messageId: 'msg-4' },
+            { role: 'tool', content: result, toolCallId: 'call-1', name: 'tasks', messageId: 'msg-4' },
             { role: 'assistant', content: 'finished', messageId: 'msg-5' }
         ]);
 
@@ -1152,20 +1202,33 @@ describe('the canonical session surface (R3)', () => {
         // ledger, which this write does not touch; a segment that stopped riding in the prompt
         // is still the same number of recorded characters, and the dialog is where the switch
         // shows up.
+        //
+        // R7 (T4b) adds the ONE field this write decides, joined at read time (./api.ts
+        // `displaySectionsWithInclusionOf`), and this is the case that keeps it honest: the TOOL
+        // segment answers `true`, not `false`. The click moved ONE entry — the request (R8) — and
+        // its committed answer keeps riding as an ownerless entry (../harness.ts
+        // `projectTranscript`), so bytes of this segment are still in the prompt while the dialog's
+        // chip states the per-entry OFF. A tool's request and answer are ONE segment, so the
+        // segment verdict is ON. The two segments with no transcript entry behind them still carry
+        // NO key — absent is "unknown", never a fabricated verdict
+        // (../frontend/view-context.ts `contextBlockIsExcluded`) — while the ANSWER segment now
+        // carries the entry's own verdict, because its recorded bytes single out one assistant
+        // entry (R5 review, FIX C). It says ON here: the click moved the tool's entry, and per
+        // entry nothing else moved.
         const context = ((await call(api, 'GET', displayRoute)).json.display as { sections: { context: Record<string, unknown>[] }[] })
             .sections[0].context;
 
         expect(context.map((segment) => [segment.id, segment.chars, segment.inPrompt, segment.included])).toEqual([
             ['0-system-instructions', WORKER_INSTRUCTION.length, true, undefined],
             ['0-user-prompt', 11, true, undefined],
-            [toolId, args.length + result.length, true, undefined],
-            [`0-assistant-${textIndex}`, 8, true, undefined]
+            [toolId, args.length + result.length, true, true],
+            [`0-assistant-${textIndex}`, 8, true, true]
         ]);
         expect(JSON.stringify(record.turns[0].events)).toBe(ledger);
 
         // A segment with no addressable entry REFUSES rather than answering a quiet no-op —
         // the alternative is a chip that looks like it worked and changed nothing.
-        for (const blockId of ['0-system-instructions', '0-user-prompt', `0-assistant-${textIndex}`]) {
+        for (const blockId of ['0-system-instructions', '0-user-prompt']) {
             const refusal = await call(api, 'PATCH', route(blockId), { included: false });
 
             expect(refusal.status).toBe(409);
@@ -1194,6 +1257,221 @@ describe('the canonical session surface (R3)', () => {
         expect((await call(api, 'PATCH', toolRoute, { nope: true })).json).toEqual({
             error: { message: 'Unknown field "nope". Allowed fields: included, reasoningIncluded.' }
         });
+    });
+
+    // -----------------------------------------------------------------------
+    // R5 review, FIX C: the ANSWER window is a segment the server CAN address. A thinking window
+    // proved the pattern for a segment with no call id — the recorded bytes ARE the identity,
+    // compared exactly, refused on ambiguity (src/server/api.ts `transcriptEntryOfReasoning`) — and
+    // an answer window carries recorded `text` bytes the same way, so the same join now names the
+    // one assistant entry whose `content` is exactly those bytes. What that unlocks, in order
+    // below: the detail read states a verdict (a chip appears where there was none), the write is
+    // accepted, the LANE dims (the display read stamps the segment verdict, and one live frame
+    // carries it), and the entry's own `content` is what keeps the verdict readable BACK after the
+    // switch. What stays ABSENT is the transcript declining to single out an entry — an answer
+    // streamed across a tool round, or an answer an earlier entry repeats — and those refusals are
+    // pinned here too, because a join that silently borrowed somebody else's flag would be worse
+    // than the silence it replaced.
+    // -----------------------------------------------------------------------
+
+    it('switches a turn answer through its own segment route, and abstains when no single entry answers it', async () => {
+        const store = storeOf([toolRoundPreset()]);
+        const api = apiOf(store);
+        const created = await store.create('worker');
+        const turn = await runTurn(store, created.id, 'do the work');
+        const record = store.liveSession(created.id);
+        const threadId = turn.threadId as string;
+        const events = record.turns[0].events;
+        const textIndex = events.findIndex((event) => event.type === 'text');
+        const answerId = `0-assistant-${textIndex}`;
+        const answerRoute = `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/${answerId}`;
+        // The recorded ledger: like the tool route, this write moves a FLAG and nothing else.
+        const ledger = JSON.stringify(events);
+
+        // THE READ, on both surfaces. The detail route answers for the ENTRY this chip switches;
+        // the display route answers for the SEGMENT, and for an answer window the two are the same
+        // figure — one entry, and its `content` IS the segment — which is what makes the dim and
+        // the chip agree instead of the tool round's documented split.
+        expect((await call(api, 'GET', answerRoute)).json.block).toMatchObject({ kind: 'assistant', inPrompt: true, included: true });
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual([
+            ['0-system-instructions', 'unaddressable'],
+            ['0-user-prompt', 'unaddressable'],
+            [`0-tool-${events.findIndex((event) => event.type === 'tool_call')}`, true],
+            [answerId, true]
+        ]);
+
+        // THE THINKING AXIS IS NOT THIS SEGMENT'S: an answer window records no `reasoning` bytes,
+        // so the field cannot land here, and the write refuses rather than moving the thinking of
+        // an entry the answer join happens to name.
+        const thoughtRefusal = await call(api, 'PATCH', answerRoute, { reasoningIncluded: false });
+
+        expect(thoughtRefusal.status).toBe(409);
+        expect((await call(api, 'GET', answerRoute)).json.block).toMatchObject({ included: true });
+
+        // OFF, and the receipt is the PERSISTED figure re-read through the same content join (the
+        // flag moves the entry out of the request, never out of the document, so the join keeps
+        // naming it — the same reason the thinking receipt re-reads through its thinking text).
+        const hub = hubFramesOf(api);
+        const off = await call(api, 'PATCH', answerRoute, { included: false });
+
+        hub.unsubscribe();
+
+        expect(off.status).toBe(200);
+        expect(off.json).toMatchObject({ block_id: answerId, included: false, thread_id: threadId });
+        expect(Object.hasOwn(off.json, 'reasoning_included')).toBe(false);
+        expect((await call(api, 'GET', answerRoute)).json.block).toMatchObject({ included: false });
+
+        // THE LANE, which is the half that was missing: the answer's bytes are out of the request,
+        // so the SEGMENT verdict is `false`, and the one live frame this write emits carries that
+        // figure (not merely the receipt's), so the dim the click produces survives the refresh
+        // that follows it.
+        expect(hub.frames.filter((frame) => frame.kind === 'display.ops').flatMap((frame) => frame.ops ?? [])).toEqual([
+            {
+                op: 'context:set',
+                turnId: turn.id,
+                sectionId: `${turn.id}:0`,
+                blockId: answerId,
+                patch: { included: false }
+            }
+        ]);
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual([
+            ['0-system-instructions', 'unaddressable'],
+            ['0-user-prompt', 'unaddressable'],
+            [`0-tool-${events.findIndex((event) => event.type === 'tool_call')}`, true],
+            [answerId, false]
+        ]);
+
+        // ONE ENTRY MOVED. The tool's request entry, its result entry, the instruction entries and
+        // the prompt entry keep travelling — per entry, no cascade (R8) — and the recorded ledger
+        // is byte-identical, because `included` is a flag beside the bytes, not one of them. The
+        // withheld one is the assistant entry that streamed the answer, and it is named by position
+        // as well as by flag: `false` is the only spelling, `undefined` the only spelling of "on".
+        const transcript = record.harness.threadMessages(threadId);
+
+        expect(transcript.map((message) => [message.role, message.included])).toEqual([
+            ['system', undefined],
+            ['user', undefined],
+            ['assistant', undefined],
+            ['tool', undefined],
+            ['assistant', false]
+        ]);
+        expect(JSON.stringify(record.turns[0].events)).toBe(ledger);
+
+        // AND BACK AGAIN, with no latch: the verdict is a fact about the transcript at read time.
+        const on = await call(api, 'PATCH', answerRoute, { included: true });
+
+        expect(on.status).toBe(200);
+        expect(on.json).toMatchObject({ included: true });
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual([
+            ['0-system-instructions', 'unaddressable'],
+            ['0-user-prompt', 'unaddressable'],
+            [`0-tool-${events.findIndex((event) => event.type === 'tool_call')}`, true],
+            [answerId, true]
+        ]);
+    });
+
+    it('gives a split answer one switch per run, and none at all when entries repeat the same answer', async () => {
+        // A turn that streamed text, called a tool, then streamed more text. The projector closes
+        // its text writer at the request boundary (src/server/turn-projector.ts `closeWriters` +
+        // the `record.text === undefined` branch that mints a FRESH answer block per run), so a
+        // split answer is TWO segments over TWO event ranges — and the answer join resolves each
+        // one to the entry that streamed IT. That is the strongest form of the rule: per-run
+        // blocks mean an exact-bytes match is per-ENTRY, so two runs of one turn get two switches
+        // and one flag each, rather than the whole answer being hostage to one entry or abstaining.
+        const splitStore = storeOf([twoRunPreset()]);
+        const splitApi = apiOf(splitStore);
+        const splitSession = await splitStore.create('splitter');
+        const splitTurn = await runTurn(splitStore, splitSession.id, 'work in two');
+        const splitEvents = splitStore.liveSession(splitSession.id).turns[0].events;
+        const splitAnswerIds = ((): string[] => {
+            const seen: string[] = [];
+
+            for (const [index, event] of splitEvents.entries()) {
+                if (event.type !== 'text') continue;
+
+                const id = `0-assistant-${index}`;
+                if (!seen.includes(id)) seen.push(id);
+            }
+
+            return seen;
+        })();
+
+        // The two runs open at events 1 and 6 (text, tool_call, tool_result, text), and the bar
+        // mints one answer block per run — pinned here so the literals below are read off this
+        // fixture rather than guessed at.
+        expect(splitAnswerIds).toEqual(['0-assistant-1', '0-assistant-6']);
+
+        const splitRoute = (blockId: string) => `/v1/harness/sessions/${splitSession.id}/turns/${splitTurn.id}/blocks/${blockId}`;
+
+        // BOTH RUNS ADDRESSABLE, both ON: `part one` is the first assistant entry's `content` and
+        // `part two` the last one's, and neither string belongs to the other entry.
+        const splitVerdicts: unknown[] = [];
+
+        for (const id of splitAnswerIds) {
+            const read = await call(splitApi, 'GET', splitRoute(id));
+
+            expect(read.status).toBe(200);
+            expect(read.json.block).toMatchObject({ kind: 'assistant', inPrompt: true });
+            splitVerdicts.push((read.json.block as Record<string, unknown>).included);
+        }
+
+        expect(splitVerdicts).toEqual([true, true]);
+
+        // ONE FLAG EACH. Withholding the first run leaves the second travelling, which the entry
+        // rule makes visible on the bar rather than guessing at: this is the per-entry semantics of
+        // R8 applied to a segment that previously had no verdict at all.
+        const first = await call(splitApi, 'PATCH', splitRoute(splitAnswerIds[0]), { included: false });
+
+        expect(first.status).toBe(200);
+        expect(first.json).toMatchObject({ block_id: splitAnswerIds[0], included: false });
+        expect((await call(splitApi, 'GET', splitRoute(splitAnswerIds[1]))).json.block).toMatchObject({ included: true });
+        expect(await barVerdictsOf(splitApi, splitSession.id, splitTurn.id)).toEqual([
+            ['0-system-instructions', 'unaddressable'],
+            ['0-user-prompt', 'unaddressable'],
+            // The bar's order is the RECORDED order, so the prose that streamed before the call is
+            // its own segment ahead of the tool, and the closing answer sits after it — each with
+            // its own verdict, which is the point of the per-run block.
+            ['0-assistant-1', false],
+            [`0-tool-${splitEvents.findIndex((event) => event.type === 'tool_call')}`, true],
+            ['0-assistant-6', true]
+        ]);
+
+        // THE OTHER SHAPE, which is the guard's whole point: TWO runs that streamed the SAME text,
+        // so two assistant entries in this conversation carry that `content` and the server cannot
+        // say which one a given segment streamed. `transcriptEntryOfAnswer` refuses on the second
+        // candidate (the thinking join's rule, `transcriptEntryOfReasoning`) rather than preferring
+        // the newest match — a bar that put a toggle on whichever entry a `find` reached first would
+        // be inventing a verdict, and the dialog's chip would switch a flag the segment never
+        // showed. One conversation, not two turns: the join is scoped to the conversation the turn
+        // belongs to (./api.ts `threadCandidatesOf`), and two submits each get their own
+        // conversation, which this fixture's shape makes explicit by keeping both entries in one.
+        const twinStore = storeOf([twoRunPreset('twinline', 'again', 'again')]);
+        const twinApi = apiOf(twinStore);
+        const twinSession = await twinStore.create('twinline');
+        const twinTurn = await runTurn(twinStore, twinSession.id, 'say it twice');
+        const twinRead = await barVerdictsOf(twinApi, twinSession.id, twinTurn.id);
+        const twinAnswerVerdicts = twinRead.filter((entry) => String(entry[0]).startsWith('0-assistant-'));
+
+        expect(twinAnswerVerdicts).toEqual([
+            ['0-assistant-1', 'unaddressable'],
+            ['0-assistant-6', 'unaddressable']
+        ]);
+
+        const twinRefusal = await call(twinApi, 'PATCH', `/v1/harness/sessions/${twinSession.id}/turns/${twinTurn.id}/blocks/0-assistant-1`, {
+            included: false
+        });
+
+        expect(twinRefusal.status).toBe(409);
+        expect(twinRefusal.json).toEqual({
+            error: {
+                message: `Context segment "0-assistant-1" has no transcript entry to switch: the recorded answer is not the exact content of one assistant entry in this conversation's transcript.`
+            }
+        });
+
+        // And the detail read abstains with the bar, from the same join: no key, so the dialog shows
+        // no control and nothing dims — the tri-state the contract carries for exactly this case
+        // (../shared/turn-display.ts `ContextBlock.included`).
+        expect(Object.hasOwn((await call(twinApi, 'GET', `/v1/harness/sessions/${twinSession.id}/turns/${twinTurn.id}/blocks/0-assistant-6`)).json.block as object, 'included')).toBe(false);
     });
 
     // -----------------------------------------------------------------------
@@ -1239,6 +1517,46 @@ describe('the canonical session surface (R3)', () => {
         return segments;
     };
 
+    /**
+     * R7 (T4b): the bar EXACTLY as the display route serves it — `id -> the verdict it publishes`,
+     * with `'unaddressable'` for a segment that carries NO `included` key. This is the payload the
+     * lane paints from, so a `false` here is the ONLY thing that dims a segment
+     * (../frontend/view-context.ts `contextBlockIsExcluded` reads a strict `=== false`; absent is
+     * "no transcript entry behind this segment", which the bar draws opaque).
+     *
+     * WHY THE ROUTE AND NOT THE STORE: `store.getView(...).displays[turnId]` is the raw fold, and
+     * the fold never carries `included` (./turn-projector.ts folds one TURN's events and cannot
+     * see a transcript). Every assertion about what the LANE knows therefore goes through this
+     * read, which is the read the visualiser makes when it paints a turn
+     * (../frontend/api.ts `readTurnDisplay`).
+     */
+    const barVerdictsOf = async (
+        api: (request: HarnessApiRequest) => Promise<HarnessApiResult>,
+        sessionId: string,
+        turnId: string
+    ): Promise<unknown[][]> => {
+        const read = await call(api, 'GET', `/v1/harness/sessions/${sessionId}/turns/${turnId}/display`);
+
+        expect(read.status).toBe(200);
+
+        const sections = (read.json.display as { sections: { context: Record<string, unknown>[] }[] }).sections;
+
+        return sections[0].context.map((segment) => [
+            segment.id,
+            Object.hasOwn(segment, 'included') ? segment.included : 'unaddressable'
+        ]);
+    };
+
+    /** One hub frame per live change the API published, for the assertions on the live repaint. */
+    const hubFramesOf = (api: ReturnType<typeof apiOf>) => {
+        const frames: { kind: string; ops?: { op: string; turnId?: string; sectionId?: string; blockId?: string; patch?: unknown }[] }[] = [];
+        const unsubscribe = api.events.subscribe((frame) => {
+            frames.push(frame as unknown as (typeof frames)[number]);
+        });
+
+        return { frames, unsubscribe };
+    };
+
     it('publishes a real verdict for a thinking segment and switches only its thinking', async () => {
         const THINKING = 'first the path, then the max';
         const store = storeOf([thinkingPreset('thinker', THINKING)]);
@@ -1255,11 +1573,13 @@ describe('the canonical session surface (R3)', () => {
 
         expect(threadId).toBe('thread-1');
 
-        // THE VERDICT, PUBLISHED. This entry carries no `reasoningIncluded` key — the shipped
-        // `dropOldThoughts: 'turn'` default keeps the OPEN turn's thinking — and an absent flag
-        // means the thinking rides, so the segment states `true`. `inPrompt: false` is still
-        // there, untouched: it is the projector's static fallback for a server that cannot name
-        // the entry, not this server's answer (../shared/turn-display.ts `inPrompt`).
+        // THE VERDICT, PUBLISHED. This entry carries no `reasoningIncluded` key: the thinking
+        // policy (`trimThoughts`, with its `thoughtTurns` horizon — src/plugins/context-trimmer
+        // .plugin.ts) writes that flag at the START of a LATER round, and this conversation has had
+        // no later round. An absent flag means the thinking rides, so the segment states `true`.
+        // `inPrompt: false` is still there, untouched: it is the projector's static fallback for a
+        // server that cannot name the entry, not this server's answer
+        // (../shared/turn-display.ts `inPrompt`).
         const before = await call(api, 'GET', blockRoute);
 
         expect(before.status).toBe(200);
@@ -1439,10 +1759,10 @@ describe('the canonical session surface (R3)', () => {
         const argsIndex = events.findIndex((event) => event.type === 'tool_call');
         const toolRoute = `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/0-tool-${argsIndex}`;
 
-        // The tool segment keeps its own axis exactly as it was — one verdict for the call and
-        // every result answering it — and a thinking flag written WHERE THERE IS NO RECORDED
-        // THINKING refuses instead of silently moving the unit. `reasoningIncluded` resolves only
-        // through the thought join, and this segment's bytes are an id plus a result.
+        // The tool segment keeps its own axis exactly as it was — the ONE entry its recorded call
+        // resolves to, per entry with no unit fan-out (R8) — and a thinking flag written WHERE THERE
+        // IS NO RECORDED THINKING refuses instead of silently moving an entry. `reasoningIncluded`
+        // resolves only through the thought join, and this segment's bytes are an id plus a result.
         expect((await call(api, 'GET', toolRoute)).json.block).toMatchObject({ kind: 'tool', inPrompt: true, included: true });
 
         const refusal = await call(api, 'PATCH', toolRoute, { reasoningIncluded: false });
@@ -1454,7 +1774,7 @@ describe('the canonical session surface (R3)', () => {
             }
         });
 
-        // A body that names BOTH axes on this segment still refuses: the unit write does not get
+        // A body that names BOTH axes on this segment still refuses: the entry write does not get
         // to run alongside a field that cannot land, because half a receipt is a lie about what
         // the click did.
         expect((await call(api, 'PATCH', toolRoute, { included: false, reasoningIncluded: false })).status).toBe(409);
@@ -1467,6 +1787,199 @@ describe('the canonical session surface (R3)', () => {
         expect(off.status).toBe(200);
         expect(Object.hasOwn(off.json, 'reasoning_included')).toBe(false);
         expect(off.json).toMatchObject({ block_id: `0-tool-${argsIndex}`, included: false });
+    });
+
+    // -----------------------------------------------------------------------
+    // R7 (T4b): the LANE's own verdict. The bar dims an out-of-context segment to `opacity: 0.2`
+    // (../frontend/styles.css `[data-included='false']` and the canvas cap in
+    // ../frontend/view-context.ts `contextBarSegmentAlphaOf`), and a lane is painted BEFORE
+    // anything is clicked — so the join has to happen on the DISPLAY read, not only on the segment
+    // detail a click makes. Below: the segment rule (`false` only when NOTHING of a segment
+    // reaches the prompt, `true` when it resolves and travels, NO key when the transcript cannot
+    // name an entry) and the one live frame the write emits so the lane repaints without a reload.
+    // -----------------------------------------------------------------------
+
+    it('dims a lane segment only when nothing of it reaches the prompt any more', async () => {
+        const store = storeOf([toolRoundPreset()]);
+        const api = apiOf(store);
+        const created = await store.create('worker');
+        const turn = await runTurn(store, created.id, 'do the work');
+        const record = store.liveSession(created.id);
+        const threadId = turn.threadId as string;
+        const events = record.turns[0].events;
+        const argsIndex = events.findIndex((event) => event.type === 'tool_call');
+        const textIndex = events.findIndex((event) => event.type === 'text');
+        const toolId = `0-tool-${argsIndex}`;
+        const blockRoute = `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/${toolId}`;
+        /** The bar with one stated verdict for the tool segment. The three segments that resolve
+         *  no transcript entry keep their honest absence in EVERY case below. */
+        const barWith = (verdict: unknown) => [
+            ['0-system-instructions', 'unaddressable'],
+            ['0-user-prompt', 'unaddressable'],
+            [toolId, verdict],
+            // FIX C: the answer segment resolves through the ANSWER join and says ON, and it keeps
+            // saying ON in every case below — switching the tool's request entry moves the tool's
+            // entry alone, not the entry that streamed the answer (R8, per entry, no cascade).
+            [`0-assistant-${textIndex}`, true]
+        ];
+
+        // NOTHING IS SWITCHED OFF YET. The tool segment resolves its entry and says ON; the other
+        // three say NOTHING, because the instruction set joins N entries, the prompt has no opening
+        // event to name a call by, and the answer is the text half of an assistant entry. That is
+        // where a boolean would be invented rather than read, and the lane would paint the lie.
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual(barWith(true));
+
+        // THE HALF-INCLUDED ROUND, which is what a single click actually produces (R8 made the
+        // write per ENTRY, and `projectTranscript` lets the answer of a withheld request ride as an
+        // ownerless result, ../harness.ts:6751-6856). The segment covers request AND answer, so it
+        // is still partly in the prompt and stays OPAQUE.
+        const hub = hubFramesOf(api);
+        const off = await call(api, 'PATCH', blockRoute, { included: false });
+
+        hub.unsubscribe();
+
+        expect(off.status).toBe(200);
+        expect(off.json).toMatchObject({ included: false });
+
+        // The dialog still gets the truth about the entry it switched, on the same turn.
+        expect((await call(api, 'GET', blockRoute)).json.block).toMatchObject({ included: false });
+
+        // ONE frame, ONE op, addressed to the clicked segment — and it carries the BAR's figure
+        // (ON), not the receipt's (OFF), so the state a click paints is the state the next display
+        // read of this turn publishes. A patch of `false` here would dim the segment and then
+        // un-dim it on the next refresh.
+        expect(hub.frames.filter((frame) => frame.kind === 'display.ops').flatMap((frame) => frame.ops ?? [])).toEqual([
+            {
+                op: 'context:set',
+                turnId: turn.id,
+                sectionId: `${turn.id}:0`,
+                blockId: toolId,
+                patch: { included: true }
+            }
+        ]);
+
+        // The three turn counters move together, exactly as the `display.ops` signal's own fan-out
+        // does (./api.ts): a client comparing a display revision against a turn read has ONE figure.
+        const turnKeyOfThisTurn = `${created.id}:${turn.id}`;
+
+        expect(api.events.getRevision('turn_display', turnKeyOfThisTurn)).toBe(api.events.getRevision('turn', turnKeyOfThisTurn));
+        expect(api.events.getRevision('turn_events', turnKeyOfThisTurn)).toBe(api.events.getRevision('turn', turnKeyOfThisTurn));
+
+        // A fresh read agrees with the frame it just saw.
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual(barWith(true));
+
+        // THE ONLY SHAPE OF `false` THE LANE DIMS ON: every entry behind the segment withheld. A
+        // policy that wants a whole exchange out of the prompt writes each member itself (the flag
+        // is per entry), so this is what a "drop this round entirely" pass leaves behind — the same
+        // segment flips, and no other segment moves with it.
+        const withheld = record.harness.threadMessages(threadId).map((message) => (message.role === 'tool' ? { ...message, included: false } : message));
+
+        await store.updateThreadTranscript(created.id, threadId, withheld);
+
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual(barWith(false));
+
+        // AND BACK AGAIN, without a latch: one entry travelling is enough to make the segment
+        // opaque, because the verdict is a fact about the transcript at read time.
+        const travelling = record.harness.threadMessages(threadId).map((message) => ({ ...message }));
+
+        for (const message of travelling) delete message.included;
+
+        await store.updateThreadTranscript(created.id, threadId, travelling);
+
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual(barWith(true));
+    });
+
+    it('reports the thinking axis for a reasoning segment and announces it live', async () => {
+        const THINKING = 'first the path, then the max';
+        const store = storeOf([thinkingPreset('thinker', THINKING)]);
+        const api = apiOf(store);
+        const created = await store.create('thinker');
+        const turn = await runTurn(store, created.id, 'ponder this');
+        const record = store.liveSession(created.id);
+        const threadId = turn.threadId as string;
+        const events = record.turns[0].events;
+        const textIndex = events.findIndex((event) => event.type === 'text');
+        const block = thinkingSegments(store, created.id, turn.id)[0];
+        const blockRoute = `/v1/harness/sessions/${created.id}/turns/${turn.id}/blocks/${block.id}`;
+        /** The bar with one stated verdict for the thinking segment. The two segments that resolve
+         *  no entry keep their honest absence through EVERY case below — one window's thinking
+         *  being withheld says nothing about the instruction set or the answer. */
+        const barWith = (verdict: unknown, answer: unknown = true) => [
+            ['0-system-instructions', 'unaddressable'],
+            ['0-user-prompt', 'unaddressable'],
+            [block.id, verdict],
+            // FIX C: the answer segment resolves through the ANSWER join and says ON — and it
+            // moves on the ENTRY axis only, which is exactly the distinction this test is about.
+            // A withheld THINKING leaves it ON (the entry still travels); a withheld ENTRY flips it
+            // OFF (its text really is out of the prompt), while the thinking window next to it
+            // stays ON on its own axis. Two segments, one entry, two axes, one figure each.
+            [`0-assistant-${textIndex}`, answer]
+        ];
+
+        // FIRST PAINT, no click anywhere: this window's thinking rides in the requests that
+        // follow, so the segment is ON — although the projector minted `inPrompt: false` for the
+        // whole class of thinking windows. The lane dims on the joined verdict, never on that
+        // static per-kind fallback (../shared/turn-display.ts `inPrompt`).
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual(barWith(true));
+
+        // THE AXIS, PROVEN FROM THE OTHER SIDE FIRST. Switch the ENTRY off and leave its thinking
+        // alone: the entry stops travelling (so its answer text leaves the prompt), and this
+        // segment STILL says ON, because a thinking window resolves only through the thought join
+        // and that axis is switched on. Had the verdict come from the entry flag — the mistake this
+        // case exists to catch — it would answer OFF. THE ANSWER SEGMENT OF THE SAME ENTRY DOES
+        // answer OFF (the third value below), and that is the join working, not drifting: the
+        // segment shows the entry's `content`, the entry left the request, so its bytes are gone
+        // from the prompt. One entry, two segments, two axes, one figure each — pinned side by
+        // side rather than explained away (R5 review, FIX C).
+        const excluded = record.harness.threadMessages(threadId).map((message) =>
+            message.role === 'assistant' ? { ...message, included: false } : message
+        );
+
+        await store.updateThreadTranscript(created.id, threadId, excluded);
+
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual(barWith(true, false));
+
+        // Restore the entry, so the write below is the only thing that has moved.
+        const restored = record.harness.threadMessages(threadId).map((message) => ({ ...message }));
+
+        for (const message of restored) delete message.included;
+
+        await store.updateThreadTranscript(created.id, threadId, restored);
+
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual(barWith(true));
+
+        // NOW THE THINKING AXIS ITSELF — the flag the trimmer's thinking policy writes. The ENTRY
+        // keeps travelling with no `included` key at all (its answer and its position in the
+        // request are untouched, ../core/agent.ts `withoutWithheldReasoning` omits the thinking from
+        // the projection COPY only), yet the SEGMENT is out of the context: what this segment shows
+        // IS the thinking.
+        const hub = hubFramesOf(api);
+        const off = await call(api, 'PATCH', blockRoute, { reasoningIncluded: false });
+
+        hub.unsubscribe();
+
+        expect(off.status).toBe(200);
+        expect(off.json).toMatchObject({ included: false, reasoning_included: false });
+
+        const entry = record.harness.threadMessages(threadId)[2] as Record<string, unknown>;
+
+        expect(entry).toEqual({ role: 'assistant', content: 'answered', reasoning: THINKING, reasoningIncluded: false, messageId: 'msg-3' });
+        expect(Object.hasOwn(entry, 'included')).toBe(false);
+
+        // THE DISPLAY PAYLOAD after the write: `false` on the wire for exactly this segment, which
+        // is the figure both renderers turn into `opacity: 0.2`, and nothing else moved.
+        expect(await barVerdictsOf(api, created.id, turn.id)).toEqual(barWith(false));
+
+        // THE LIVE FRAME, same figure as the read, so the lane repaints without a reload.
+        expect(hub.frames.filter((frame) => frame.kind === 'display.ops').flatMap((frame) => frame.ops ?? [])).toEqual([
+            {
+                op: 'context:set',
+                turnId: turn.id,
+                sectionId: `${turn.id}:0`,
+                blockId: block.id,
+                patch: { included: false }
+            }
+        ]);
     });
 });
 

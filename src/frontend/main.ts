@@ -5320,6 +5320,11 @@ type Instance = {
     // adopted (see `carryDisplays`). A mismatch means the cache was invalidated since, so the
     // trees the last document painted must not survive into the next one.
     treeGeneration?: number;
+    // T9 (R7): the ONE pending lane repaint for this conversation (see
+    // `scheduleDisplayRefresh`). One entry per instance, re-armed by every signal that
+    // arrives before it fires — that re-arm IS the coalescing — and released when it runs,
+    // when the conversation is released, and when the page goes away.
+    displayRefresh?: DisplayRefreshPass;
 };
 
 const instances = new Map<string, Instance>();
@@ -6081,6 +6086,17 @@ const applyHarnessRemoved = (name: string): void => {
             stopWatching();
             stopPolling();
         }
+
+        // FIX D: a harness can be deleted while its lane dim pass is PENDING, and the timer is
+        // per-instance housekeeping like the two subscriptions above — it must die with the
+        // instance, not with the tile that happens to be focused. Without this the timer outlives
+        // the map entry, and `runDisplayRefresh` then runs against a disposed document: the stale
+        // guard inside it compares `instance.sessionId` (which a disposed instance still reports),
+        // so it proceeds to `renderDocument` and `instance.plane?.ensureVisible` on a board whose
+        // trees and observer bindings are already gone — the one work the conversation switch and
+        // the page teardown at ./main.ts's unload path both take care to cancel.
+        cancelDisplayRefresh(instance);
+
         instance.view.dispose();
         instances.delete(name);
     }
@@ -10525,22 +10541,230 @@ const reloadTurnTree = (instance: Instance, sessionId: string, turnId: string): 
 //     that settles cannot turn into 25 reads per frame;
 //   - only through `reloadTurnTree`, which is one bounded identified read and a stale guard —
 //     the same recovery the turn subscription's own `onResync` uses.
-const refreshUnopenedTree = (instance: Instance, turnId: string): void => {
+//
+// T9 (R7): returns whether THIS call actually started the re-read. The settle path in
+// `applyOpsFrame` hands the answer to `scheduleDisplayRefresh` as the exclusion, so the lane
+// pass below never re-reads a tree the settling row is already re-reading.
+const refreshUnopenedTree = (instance: Instance, turnId: string): boolean => {
     const view = instance.compiled;
     const sessionId = instance.sessionId;
 
-    if (view === undefined || sessionId === undefined) return;
+    if (view === undefined || sessionId === undefined) return false;
 
     const budget = instance.reloadedTrees;
 
     if (budget === undefined || budget.sessionId !== sessionId) {
         instance.reloadedTrees = { sessionId, ids: new Set<string>([turnId]) };
     } else {
-        if (budget.ids.has(turnId)) return;
+        if (budget.ids.has(turnId)) return false;
         budget.ids.add(turnId);
     }
 
     reloadTurnTree(instance, sessionId, turnId);
+
+    return true;
+};
+
+// ---------------------------------------------------------------------------
+// T9 (R7): the live lane dim — the coalesced display re-read
+// ---------------------------------------------------------------------------
+
+// WHY A RE-READ IS THE ONLY HOOK THE TRIMMER HAS. The shipped context trimmer
+// (../plugins/context-trimmer.plugin.ts) withholds entries at `turn.before` through the
+// context-port setter (`../harness.ts` `setIncluded` → `reportCanonicalWrite` → the store's
+// `noteStateChange`, src/server/sessions.ts:3307). That write is durable and COMPLETELY
+// SILENT on the wire: the state-change observer snapshots and saves without publishing a
+// frame, `transcript.updated` is minted only inside `updateThreadTranscript`
+// (src/server/sessions.ts:9273), and even then the broker routes that kind to the `thread`
+// scope alone (src/server/stream/protocol.ts:73-86 + `isKindPublishedTo`,
+// src/server/stream/broker.ts:487). The figure the lane prints (`ContextBlock.included`) is
+// stamped per read (src/server/api.ts `contextSegmentIncludedOf`), so with no frame to
+// patch it, the only honest repaint is a fresh read of the tree that carries it.
+//
+// WHICH SIGNALS COUNT. One live fact says "the flags may have moved": a `turn` row SETTLING
+// on the session subscription (`applyOpsFrame`). It is the frame that every client of the
+// session receives, open tile or no tile, open card or no card, and it arrives exactly when
+// the run whose `turn.before` pass wrote the flags has finished — so it is the only signal
+// THAT covers the trimmer at all. `transcript.updated` was the other candidate (it is what the
+// operator's own Transcript save publishes, and ./view-shell.ts `observeThread` already turns it
+// into `onTranscript`), and it was REJECTED as the lane signal for two proven reasons: it reaches
+// only subscriptions on THAT thread (protocol.ts:73-86 + `isKindPublishedTo`,
+// src/server/stream/broker.ts:487), so a client with no card open for it never sees it, and it
+// says nothing at all about a trimmer write. It still arms the pass when it arrives — a host
+// transcript write really does move the flags behind the segments — but it cannot be the signal
+// the feature is built on.
+//
+// THE BOUND, stated because a naive listener would refetch per signal. One pass per
+// CONTEXT_REFRESH_DELAY_MS window, trailing-edge: a burst of N settling rows costs ONE pass,
+// never N. A pass reads at most the rows the board reports as on screen (`visibleTurnIds`, the
+// same set `DisplayPlane.ensureVisible` is allowed to ask trees for, T24) AND that already have a
+// painted tree, and it goes back through that same plane queue — 4 reads in flight, deduped,
+// generation- and stale-guarded — so the ceiling is the number of lanes on screen per coalesced
+// window, and the settle path's own immediate re-read of a row it has never opened
+// (`refreshUnopenedTree`) is EXCLUDED so no tile is read twice for one signal. A conversation
+// that is merely idle, or a session the reader is not looking at, costs nothing at all: no
+// signal, no pass, no read.
+//
+// WHY THE PAINT IS A SNAPSHOT, AND STAYS ONE (R5 review, FIX D — read this before reporting a
+// stale lane as a bug). The figure the lane prints is stamped PER READ
+// (src/server/api.ts `contextSegmentIncludedOf`), and the only live facts that say "the flags may
+// have moved" are a row settling and a thread's transcript frame. So while a run is IN FLIGHT the
+// lane shows the verdicts as of the last read: a `turn.before` pass that has already withheld
+// entries for the turn now streaming cannot announce itself, and neither can a mid-run Transcript
+// save (`../plugins/context-trimmer.plugin.ts` writes through the silent state-change observer,
+// and `transcript.updated` reaches only subscriptions on that thread). That is the accepted cost
+// of "no new server push" — the sentence the strip prints is true of the last read, not of the
+// request the model is composing right now, and a reader who needs the live figure re-reads the
+// tree (a reload, or opening the tile, which reads through the plane).
+const CONTEXT_REFRESH_DELAY_MS = 150;
+
+// THE WINDOW NEEDS A CEILING, NOT ONLY A LENGTH (FIX D). Re-arming IS the coalescing, and the
+// re-arm is unconditional, so a signal stream that never gaps for 150ms never fires the pass —
+// a conversation streaming turn after turn, or a host writing transcript rows in a tight loop,
+// holds the pending pass open indefinitely and the lane sits un-repainting while signals pile up.
+// A burst is bounded by bounding the WAIT rather than the count: past this deadline the next
+// signal runs the pass inline instead of postponing it, so the worst case a reader waits for a
+// verdict is the deadline, and a sustained burst costs at most ONE pass per deadline window
+// (150ms of coalescing followed by one read, every 600ms) — the same pass, the same row ceiling,
+// just no longer deferrable. 4x the window is deliberately coarse: ordinary row-to-row gaps stay
+// fully coalesced, and only a genuinely continuous stream pays the extra read.
+const CONTEXT_REFRESH_MAX_WAIT_MS = 600;
+
+type DisplayRefreshPass = {
+    // The conversation this pass belongs to; a pending pass for another one is dropped.
+    sessionId: string;
+    // The re-armed trailing timer. Re-arming (rather than ignoring) IS the coalescing.
+    timer: number;
+    // The stamp this window OPENED (its first signal), which is what the deadline above measures
+    // from. Deliberately not the timer's own expiry: a re-arm resets the expiry, and the bug this
+    // field exists to prevent is exactly a re-arm chain that never ends.
+    startedAt: number;
+    // Rows whose tree the settle path is ALREADY re-reading immediately, so this pass must not
+    // read them a second time for the same signal.
+    exceptTurnIds: Set<string>;
+};
+
+// Drop one painted tree from the document AND un-mark the loader, so the next `ensureVisible`
+// re-reads exactly this row through the plane's own capped queue. Deleting the tree is safe
+// while the read is open: a tile whose document momentarily stops carrying its display keeps
+// the flow it already painted (./ui/turns.ts `reconcileView` — "a rows-only document must not
+// wipe a tile that is already painted"), so the lane never blinks between the two states.
+const unloadDisplay = (instance: Instance, view: SessionView, turnId: string): void => {
+    if (view.displays !== undefined && typeof view.displays === 'object') delete view.displays[turnId];
+    instance.plane?.forget(turnId);
+};
+
+// ONE pass: re-read the painted trees of the rows this reader is looking at.
+const runDisplayRefresh = (instance: Instance, pass: DisplayRefreshPass): void => {
+    // Stale guard: the reader left this conversation (or the document is gone) while the
+    // window was open, and a tree for a conversation nobody is showing repaints nothing.
+    if (instance.sessionId !== pass.sessionId) return;
+
+    const view = renderDocument(instance);
+
+    if (view === undefined) return;
+
+    // The board's own report of what is on screen — the SAME set `ensureVisible` below is
+    // allowed to ask trees for, so this pass can never widen the read surface of a scroll.
+    const onScreen = new Set(instance.view.visibleTurnIds());
+    const stale: string[] = [];
+
+    for (const row of summariesOf(view)) {
+        if (pass.exceptTurnIds.has(row.id) || !onScreen.has(row.id)) continue;
+
+        // WHY EVERY LANE ON SCREEN AND NOT JUST THE RUN'S: the fold the trimmer performs writes
+        // `included` into the conversation's SHARED transcript, so every turn of that
+        // conversation re-derives its lane from the same withheld entries — that is precisely
+        // what R7 reports as "previously submitted tiles dim". The ops delta that carries the
+        // settling row does not say which thread the row belongs to, and a pass scoped by a guess
+        // would silently skip the lanes the reader is looking at; widening it costs reads, never
+        // correctness, and the ceiling below is still one read per painted lane.
+
+        // Nothing painted means nothing to repaint: the row's FIRST read (the plane's, when it
+        // scrolls in or opens) is already the current one, so claiming it here would be a
+        // second read of a tree the reader has never seen.
+        if (view.displays === undefined || typeof view.displays !== 'object' || view.displays[row.id] === undefined)
+            continue;
+
+        stale.push(row.id);
+    }
+
+    if (stale.length === 0) return;
+
+    for (const turnId of stale) unloadDisplay(instance, view, turnId);
+
+    // The pump is the plane's: newest-first is not needed here (these are already painted),
+    // and the answer lands on the same document and repaints through `repaintPlane`, which is
+    // how the bar re-derives `data-included` from the fresh `included` stamps.
+    instance.plane?.ensureVisible(stale);
+};
+
+// Re-arm the trailing edge of the window. The pass object itself is the identity check below:
+// a released or superseded pass must not read anything.
+const armDisplayRefresh = (instance: Instance, pass: DisplayRefreshPass): void => {
+    pass.timer = window.setTimeout(() => {
+        // Superseded by a session switch or a newer pass: drop silently.
+        if (instance.displayRefresh !== pass) return;
+
+        instance.displayRefresh = undefined;
+        runDisplayRefresh(instance, pass);
+    }, CONTEXT_REFRESH_DELAY_MS);
+};
+
+// Arm (or re-arm) the ONE pending pass for this conversation. Re-arming IS the coalescing: a
+// later signal inside the window replaces the timer and only WIDENS the pass — a row the settle
+// path is already re-reading stays excluded, and never the other way round.
+const scheduleDisplayRefresh = (instance: Instance, scope: { exceptTurnId?: string } = {}): void => {
+    const sessionId = instance.sessionId;
+
+    if (sessionId === undefined) return;
+
+    const pending = instance.displayRefresh;
+
+    if (pending !== undefined && pending.sessionId === sessionId) {
+        window.clearTimeout(pending.timer);
+
+        if (scope.exceptTurnId !== undefined) pending.exceptTurnIds.add(scope.exceptTurnId);
+
+        // FIX D: the coalescing window has a DEADLINE as well as a length. Past it, this signal
+        // RUNS the pass inline rather than re-arming it, because an unbounded re-arm chain is how
+        // a continuously streaming conversation could starve the repaint entirely — see
+        // `CONTEXT_REFRESH_MAX_WAIT_MS` above. Releasing the slot BEFORE running matters: the pass
+        // object is the identity guard `runDisplayRefresh` and the timer callback both compare
+        // against, and a signal that arrives inside the read this call starts must open a fresh
+        // window rather than re-run the one already in flight.
+        if (Date.now() - pending.startedAt >= CONTEXT_REFRESH_MAX_WAIT_MS) {
+            instance.displayRefresh = undefined;
+            runDisplayRefresh(instance, pending);
+
+            return;
+        }
+
+        armDisplayRefresh(instance, pending);
+
+        return;
+    }
+
+    const pass: DisplayRefreshPass = {
+        sessionId,
+        timer: 0,
+        startedAt: Date.now(),
+        exceptTurnIds: new Set(scope.exceptTurnId === undefined ? [] : [scope.exceptTurnId])
+    };
+
+    instance.displayRefresh = pass;
+    armDisplayRefresh(instance, pass);
+};
+
+// Release a pending pass (a conversation switch, a delete, the page going away). The timer
+// is cancelled outright: a read for a conversation the reader left is work nobody sees.
+const cancelDisplayRefresh = (instance: Instance): void => {
+    const pending = instance.displayRefresh;
+
+    if (pending === undefined) return;
+
+    window.clearTimeout(pending.timer);
+    instance.displayRefresh = undefined;
 };
 
 // T52: one bounded ROW re-read for the turn a submit receipt names, deduped per conversation
@@ -10807,7 +11031,17 @@ const syncThreadFollow = (
             // `transcript.updated`: the committed document moved. One bounded re-read of
             // THIS thread — that is the whole payload class the session fan-out used to
             // pay for on every open.
-            onTranscript: (id) => void loader.refresh(id),
+            //
+            // T9 (R7): the same frame is also a live fact for the lanes — a host transcript write
+            // (`PATCH/PUT …/transcript`) moves the inclusion flags of the entries behind them — so
+            // it arms the coalesced display pass too. The pass is deliberately NOT scoped to this
+            // conversation: scoping would skip any row whose `threadId` the wire never stated, and
+            // under-dimming the lanes the reader is looking at is the failure this feature exists
+            // to fix, while widening costs reads only (the ceiling is the plane's own).
+            onTranscript: (id) => {
+                void loader.refresh(id);
+                scheduleDisplayRefresh(instance);
+            },
             // Lost position (a drop, a gap, a refused cursor, or a re-registered baseline
             // whose replay window expired): the document this surface shows is re-read, so
             // the pane converges without a page refresh (R4).
@@ -11746,6 +11980,22 @@ const stopWatching = (): void => {
     watch = undefined;
 };
 
+// The statuses that END a turn, spelled from the ONE contract this frame carries
+// (../shared/turn-display.ts `TurnRecordStatus` = `src/shared/harness-api.ts`
+// `SessionTurnStatus`, which src/server/protocol.ts stamps on a `turn` row op): done, error,
+// cancelled. R5 review, FIX D replaced a `status !== 'running'` test with this enumeration, and
+// the difference is not cosmetic — the union also holds `queued`, which is a turn that has NOT
+// started, so "not running" and "settled" are different facts. A `turn:new` for a row the server
+// queued (a steer accepted into a lane that is still streaming, a batch submit, a lane parked
+// behind a running one) used to take this branch, and all three of its effects are wrong for a
+// row that has not run: it claimed the trimmer's `turn.before` writes had landed for a pass that
+// has not happened yet, it spent the once-per-conversation budget of `refreshUnopenedTree` on a
+// tree nobody has watched change, and — the visible one — the settle branch SKIPS
+// `applyOpsToActivity`, so the frame's own event deltas were dropped and the agent's activity
+// ring lost the opening events of the very turn that queued.
+const turnStatusIsSettled = (status: unknown): boolean =>
+    status === 'done' || status === 'error' || status === 'cancelled';
+
 // Apply one projected ops frame to this instance's document and DOM (T24).
 //
 // Split out of `onViewItem` because TWO subscriptions now deliver ops: the session
@@ -11828,9 +12078,9 @@ const applyOpsFrame = (
     // ops this frame names. A frame that ENDS a turn instead recomputes from the
     // document, because the row it just upserted is now the authority for what is
     // still running (and a `view` frame does the same in `applyView`).
-    const settlesTurn = (item.ops ?? []).some(
-        (op) => op.op === 'turn' && op.summary.status !== 'running'
-    );
+    // `rowOp` names the parameter to dodge the `op` callback parameter the `summaryOp` lookup
+    // above already binds in this same scope.
+    const settlesTurn = (item.ops ?? []).some((rowOp) => rowOp.op === 'turn' && turnStatusIsSettled(rowOp.summary.status));
 
     // T44: a settling row for a turn this instance is NOT streaming. `display.ops` rides the
     // `turn` scope only (../shared/harness-stream.ts:201) and `followTurnFlow` holds ONE
@@ -11838,10 +12088,19 @@ const applyOpsFrame = (
     // flow: its tree, loaded once at open time, is stale by construction the moment the row
     // settles. One bounded re-read of THAT tree (the turn scope's own full state, never a
     // history snapshot or a window re-read) closes the gap the focused subscriber leaves.
-    if (settlesTurn && instance.turnWatch?.turnId !== item.turnId) refreshUnopenedTree(instance, item.turnId);
+    //
+    // T9 (R7): the same settling row is also the only live fact that says a `turn.before`
+    // plugin's inclusion writes have landed (see `scheduleDisplayRefresh` above). It arms ONE
+    // coalesced pass over the OTHER on-screen tiles — the ones whose lanes the trimmer just
+    // withheld — and this row is EXCLUDED from that pass exactly when the immediate re-read
+    // below covers it, so no tile is read twice for one frame.
+    if (settlesTurn) {
+        const settledNow =
+            instance.turnWatch?.turnId !== item.turnId && refreshUnopenedTree(instance, item.turnId);
 
-    if (settlesTurn) refreshActivity(instance);
-    else {
+        scheduleDisplayRefresh(instance, settledNow ? { exceptTurnId: item.turnId } : {});
+        refreshActivity(instance);
+    } else {
         applyOpsToActivity(instance.activity, before, item.turnId, item.ops ?? []);
         if (current === instance) paintAgentRings(instance.activity);
     }
@@ -12165,6 +12424,11 @@ const releaseSessionState = (instance: Instance): void => {
     // would refuse its first live patch.
     instance.threadRowMarks = undefined;
     instance.transcripts = undefined;
+
+    // T9 (R7): a pending lane pass belongs to the conversation being released — its reads
+    // are addressed by turn ids minted inside one session, and a tree for a conversation the
+    // reader left must not arrive and repaint the new one's rows.
+    cancelDisplayRefresh(instance);
 
     instance.view.paintOlder();
 };
@@ -13303,6 +13567,9 @@ window.addEventListener('pagehide', () => {
         stopThreadFollow(instance);
         instance.threadWatches = undefined;
         instance.transcripts = undefined;
+        // T9 (R7): no lane pass may outlive the page either — a re-armed timer would fire a
+        // display read the reader will never see.
+        cancelDisplayRefresh(instance);
         instance.view.dispose();
     }
 

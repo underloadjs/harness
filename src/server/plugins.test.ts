@@ -435,28 +435,42 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
             mode: 'summarize'
         });
         expect(plugins.values('async-ping')).toEqual({ intervalMs: 600000 });
-        // The third built-in, as of the 2026-11-10 switch split: `enabled` (the key the
-        // framework owns, so the row's switch and its Rule-0 read are one value) plus the eleven
-        // policy switches declared by `src/plugins/context-trimmer.plugin.ts`. EVERY default is
-        // spelled out — this is the map the Plugins pane renders and the plugin reads on a host
-        // that has stored nothing, so a default that moves without a test noticing is a
-        // behaviour change nobody approved.
+        // The third built-in, as of the 2026-11-13 clean-up: `enabled` (the key the framework owns,
+        // so the row's switch and its Rule-0 read are one value) plus the sixteen policy switches
+        // declared by `src/plugins/context-trimmer.plugin.ts` — three toggle+horizon pairs (invalid
+        // tools, thoughts, truncate tool requests), the two whole-unit rules with their own horizons,
+        // and the four bounds/economy numbers. EVERY default is spelled out — this is the map the
+        // Plugins pane renders and the plugin reads on a host that has stored nothing, so a default
+        // that moves without a test noticing is a behaviour change nobody approved. The horizons
+        // default to 2 (the newest two tool turns / thoughts are always protected); the shipped
+        // posture is that every toggle except `truncateToolRequests` is on.
+        //
+        // The 2026-11-13 rename (`dropInvalidToolCallsOnceAnswered`→`trimInvalidTools`,
+        // `dropOldThoughts`+`thoughtKeepUnits`→`trimThoughts`+`thoughtTurns`, plus the five new
+        // horizon keys) has NO migration: a stored override under a retired key is simply ignored,
+        // and a host that had customised the trimmer gets the declared defaults below until it
+        // re-picks them in the pane.
         expect(plugins.values('context-trimmer')).toEqual({
             enabled: true,
+            trimInvalidTools: true,
+            invalidToolTurns: 2,
+            trimThoughts: true,
+            thoughtTurns: 2,
+            truncateToolRequests: false,
+            truncateTurns: 2,
             dropSupersededToolCalls: true,
-            dropInvalidToolCallsOnceAnswered: true,
-            invalidOutcomes: 'failed,rejected',
-            dropOldThoughts: 'turn',
-            thoughtKeepUnits: 0,
-            supersedeMatch: 'name',
+            supersededTurns: 2,
             dropDuplicateCalls: false,
+            duplicateTurns: 2,
+            invalidOutcomes: 'failed,rejected',
+            supersedeMatch: 'name',
             minTokens: 0,
             minThoughtChars: 0,
             safetyUnits: 0,
             maxUnits: 0
         });
         // `snapshot()` is the OVERRIDE map, not the effective map: nothing has been written, so
-        // twelve new descriptors seed no overrides at all.
+        // seventeen new descriptors seed no overrides at all.
         expect(plugins.snapshot()).toEqual({});
     });
 

@@ -744,8 +744,12 @@ describe('R3 lane propagation: a lane replica delivers or skips a plugin pass on
 
         // Written before the first dispatch, the only moment a lane can learn the value. Both
         // cases store an EXPLICIT boolean, so the override map crosses in both directions and
-        // neither run is the "no provider at all" default.
-        await store.updatePluginSettings('context-trimmer', { enabled });
+        // neither run is the "no provider at all" default. `supersededTurns: 0` pins the horizon
+        // the fixture needs: the trimmer's tool rules now count TOOL TURNS above a unit and
+        // protect the newest N (default 2, src/plugins/context-trimmer.plugin.ts), and this
+        // transcript has exactly one newer tool turn above the failed block — so the shipped
+        // default would protect it and this case would measure a horizon, not the switch.
+        await store.updatePluginSettings('context-trimmer', { enabled, supersededTurns: 0 });
 
         // `timeNow` is searchable: both calls have to EXECUTE (the resolver only counts when it
         // completed), so it goes into the session's enabled set on the canonical harness BEFORE

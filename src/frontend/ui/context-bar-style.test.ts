@@ -33,6 +33,12 @@
 //   - T27 (R1a/R1b): ONE shared body-height token for both tail kinds, the thinking body
 //     windowed by nothing (its box scrolls the whole round), and the call's two panes laid out
 //     inside that same viewport.
+//   - R7 (T4a): the ONE dim state — `.context-bar-segment[data-included='false']` carries exactly
+//     `opacity: 0.2`, the same figure `view-context.ts` `CONTEXT_BAR_EXCLUDED_ALPHA` paints with,
+//     and it ships AFTER the tone rules so it outranks `running`'s 0.45 (one element cannot
+//     multiply two opacities); it declares nothing else, so a withheld segment keeps its click,
+//     its tab stop, its box and its colour, and the `:hover` and `[data-focused='true']` rules
+//     that follow it still paint their rings.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/context-bar-style.test.ts
 
@@ -40,6 +46,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import {
+    CONTEXT_BAR_EXCLUDED_ALPHA,
     CONTEXT_BAR_GAP_PX,
     CONTEXT_BAR_LINE_HEIGHT_PX,
     CONTEXT_BAR_MAX_HEIGHT_LINES,
@@ -160,6 +167,77 @@ it('maps every tone to the palette entry the canvas falls back to', () => {
     // The state signal is never colour alone: focus is an outline, in both modes.
     expect(blockOf(".context-bar-segment[data-focused='true'] {")).toContain('outline: 2px solid var(--accent);');
     expect(blockOf('.context-bar:focus-visible {')).toContain('outline: 2px solid var(--accent);');
+});
+
+// R7 (T4a): THE ONE DIM STATE. A segment whose bytes are not in the context sent to the model is
+// almost transparent — and that is the ONLY thing that changes about it. jsdom cannot cascade, so
+// the properties that make this work are pinned from the source text: the figure (against the
+// model constant the canvas paints with), the POSITION that wins the cascade, and the absence of
+// everything that would take the segment out of the reader's reach.
+it('dims an out-of-context segment to the canvas alpha, and dims nothing the reader aims with', () => {
+    const dimmed = blockOf(".context-bar-segment[data-included='false'] {");
+
+    // 1. THE FIGURE IS THE MODEL'S. `view-context.ts` `CONTEXT_BAR_EXCLUDED_ALPHA` is what canvas
+    //    mode paints `globalAlpha` from; the sheet has to ship the same number or one theme tweak
+    //    drifts the two renderers apart (the T27/R28 parity rule the gap and box tokens use).
+    expect(dimmed).toContain(`opacity: ${CONTEXT_BAR_EXCLUDED_ALPHA};`);
+    expect(CONTEXT_BAR_EXCLUDED_ALPHA).toBe(0.2);
+    // Fainter than EVERY tone, including `running`'s 0.45, so the state reads as a change and not
+    // as a fourth colour — and `opacity`, never a colour, is what carries it.
+    for (const style of Object.values(CONTEXT_BAR_TONE_STYLES)) expect(CONTEXT_BAR_EXCLUDED_ALPHA).toBeLessThan(style.alpha);
+
+    // 2. THE ORDER WINS THE CASCADE. `.context-bar-segment[data-tone='running']` already declares
+    //    an opacity on the SAME element at the SAME specificity, and CSS cannot multiply the two.
+    //    Later-wins is what makes a dimmed running call land on 0.2 in DOM mode — the figure the
+    //    canvas caps it to — so the dim rule must ship after every tone rule.
+    const toneOrder = ['ok', 'error', 'running', 'reasoning', 'neutral'];
+    for (const tone of toneOrder) expect(css.indexOf(`.context-bar-segment[data-tone='${tone}'] {`)).toBeLessThan(css.indexOf(".context-bar-segment[data-included='false'] {"));
+
+    // 3. TRANSPARENCY ONLY. A property on this rule that is NOT `opacity` is the segment losing
+    //    its click, its tab stop, its box or its colour: `pointer-events: none` would send every
+    //    activation past it, `display`/`visibility` would delete the aim target, `filter` would
+    //    add a second visual language, and a colour would compete with the tone table.
+    expect(dimmed.trim()).toBe('opacity: 0.2;');
+    for (const forbidden of ['pointer-events', 'display', 'visibility', 'filter', 'background', 'color', 'cursor', 'transition', 'animation']) {
+        expect(dimmed).not.toContain(forbidden);
+    }
+
+    // 4. HOVER AND FOCUS STILL RESOLVE. Both rules sit AFTER the dim rule, so neither can be
+    //    outranked, and neither declares an `opacity` that could fight it — the ring is dimmed
+    //    along with its element (CSS opacity is element-wide and an `outline` cannot escape it),
+    //    but it is still THERE, which is the difference between "faded and current" and "gone".
+    expect(css.indexOf(".context-bar-segment:hover {")).toBeGreaterThan(css.indexOf(".context-bar-segment[data-included='false'] {"));
+    expect(css.indexOf(".context-bar-segment[data-focused='true'] {")).toBeGreaterThan(css.indexOf(".context-bar-segment[data-included='false'] {"));
+
+    const hover = blockOf('.context-bar-segment:hover {');
+    const focus = blockOf(".context-bar-segment[data-focused='true'] {");
+
+    expect(hover).toContain('outline: 1px solid var(--text);');
+    expect(focus).toContain('outline: 2px solid var(--accent);');
+    expect(hover).not.toContain('opacity');
+    expect(focus).not.toContain('opacity');
+    expect(hover).not.toContain('pointer-events');
+    expect(focus).not.toContain('pointer-events');
+
+    // 5. THE BASE RULE STILL OFFERS THE CONTROL. `cursor: pointer` is the "you can click this"
+    //    promise, and the segment sheet carries no `pointer-events` anywhere — the lane-tag
+    //    overlay is the only element in this section allowed to opt out of pointer hits.
+    const base = blockOf('.context-bar-segment {');
+
+    expect(base).toContain('cursor: pointer;');
+    expect(base).not.toContain('pointer-events');
+    expect(base).not.toContain('opacity');
+
+    // 6. FORCED COLORS KEEPS IT. That mode rewrites COLOURS, and `opacity` is not one of them, so
+    //    the dim survives a high-contrast palette; the per-segment boundary the mode needs is
+    //    already on the base segment rule, dimmed or not.
+    const forced = atRulesOf('@media (forced-colors: active)');
+    const forcedStart = forced.indexOf('.context-bar-segment {');
+    const forcedRule = forced.slice(forcedStart, forced.indexOf('}', forcedStart) + 1);
+
+    expect(forcedRule).toContain('forced-color-adjust: none;');
+    expect(forcedRule).toContain('outline: 1px solid CanvasText;');
+    expect(forcedRule).not.toContain('opacity');
 });
 
 it('keeps the accessible option list and live region clipped, not hidden', () => {

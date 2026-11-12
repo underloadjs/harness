@@ -1395,11 +1395,14 @@ describe('context-compaction action (executeCompaction)', () => {
 
         await expect(executeCompaction(api, context)).resolves.toBeUndefined();
 
-        // ONE write, on the LEADER of the failed unit. The answering unit is untouched, and
-        // the runtime's own cascade takes care of the result message (T3.4), so the policy
-        // never has to name every member.
-        expect(calls).toEqual(['setIncluded:1:false']);
+        // EVERY member of the failed unit, leader first. Since R8 the runtime flag moves ONE
+        // canonical entry (`src/harness.ts` `writeIncluded`), so a prune that stopped at the
+        // leader would withhold the request and leave the failed ANSWER riding — a saving the
+        // report below claims and the request would not deliver. The answering unit (3, 4) is
+        // untouched either way.
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(entries[1].included).toBe(false);
+        expect(entries[2].included).toBe(false);
         expect(entries[3].included).toBe(true);
         expect(entries[4].included).toBe(true);
 
@@ -1574,7 +1577,9 @@ describe('context-compaction action (executeCompaction)', () => {
 
         await executeCompaction(api, createFakeTurn({ api, estimatedTokens: 500, calls, entries }));
 
-        expect(calls).toEqual(['setIncluded:1:false']);
+        // The one shape that prunes writes BOTH of its entries (R8: one flag write per entry,
+        // so the failed answer really leaves the request).
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
     });
 
     it('refuses a pass under minTokens, and says why instead of being silent', async () => {
@@ -1603,18 +1608,93 @@ describe('context-compaction action (executeCompaction)', () => {
         await executeCompaction(api, context);
         await executeCompaction(api, context);
 
-        // ONE write total, and ONE report total: the second pass sees the live flag, proposes
-        // nothing, and therefore notifies nothing (no save, no cache churn — T4.3/T4.4).
-        expect(calls).toEqual(['setIncluded:1:false']);
+        // TWO writes total, and ONE report total: the second pass sees the live per-entry flags
+        // and finds the unit FULLY withheld — every member of it already off, so its write set
+        // (`context-pruning.includedMembersOf`) is empty and the pass proposes nothing. Nothing is
+        // written, so nothing is notified and nothing is saved (no save, no cache churn —
+        // T4.3/T4.4).
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
+        expect(diagnostics).toHaveLength(1);
+    });
+
+    it('finishes a unit whose REQUEST the trimmer already truncated, and bills only what it withholds', async () => {
+        // THE HALF STATE THE TRUNCATE AXIS CREATES (the 2026-11-13 review). Entry 1 — the
+        // assistant REQUEST — is already withheld (src/plugins/context-trimmer.plugin.ts
+        // `planTruncatedRequests` writes that one entry and leaves the results), entry 2 is the
+        // FAILED RESULT still riding in the request, and entries 3/4 are the later identical call
+        // that answers it. Under the old unit-level idempotence test this unit read as "already
+        // handled" and compaction never planned it again: the failed answer stayed in the prompt
+        // for the life of the conversation.
+        const { api, diagnostics } = createFakeApi(100, { minTokens: 10, safetyTurns: 0 });
+        const calls: string[] = [];
+        const entries = prunableEntries([1]);
+        const context = createFakeTurn({ api, estimatedTokens: 500, calls, entries });
+
+        await executeCompaction(api, context);
+
+        // (a) THE UNIT IS PLANNED, and (b) EXACTLY THE STILL-INCLUDED MEMBER IS WRITTEN: one write,
+        // for entry 2. The leader is not touched, so compaction cannot resurrect a request the
+        // trimmer withheld, and the answering unit (3, 4) is untouched as always.
+        expect(calls).toEqual(['setIncluded:2:false']);
+        expect(entries[1].included).toBe(false);
+        expect(entries[2].included).toBe(false);
+        expect(entries[3].included).toBe(true);
+        expect(entries[4].included).toBe(true);
+
+        // (d) THE SAVING IS WHAT WAS ACTUALLY WITHHELD. The report still NAMES the unit by its
+        // leader — that is the identity an operator recognises, and the T4.5 "what answered it"
+        // half is unchanged — but the figure is 231, the result on its own, not the 236 the whole
+        // unit is worth (asserted byte-exact above). The leader's 5 tokens left the prompt on the
+        // trimmer's turn; claiming them here would bill the same text twice. 231 is the 944-char
+        // unit minus the leader's 19 characters: 925 chars of result (921 of text + the 4-char
+        // name) over the estimator's 4 chars/token, with its single rounding over the transcript.
+        expect(diagnostics).toHaveLength(1);
+        expect(diagnostics[0].message).toContain('withheld 1 superseded tool unit(s)');
+        expect(diagnostics[0].message).toContain('~231 estimated tokens');
+        expect(diagnostics[0].message).toContain('#1 msg-2 [failed] answered by msg-4');
+
+        const data = diagnostics[0].data as { withheldTokens: number; units: { tokens: number; index: number }[] };
+
+        expect(data.withheldTokens).toBe(231);
+        expect(data.units[0].index).toBe(1);
+        expect(data.units[0].tokens).toBe(231);
+
+        // The floor judges the SAME figure, so the smaller saving is what an operator's `minTokens`
+        // has to beat: 232 refuses this pass, 231 takes it (`>=`).
+        for (const [minTokens, expected] of [
+            [232, []],
+            [231, ['setIncluded:2:false']]
+        ] as const) {
+            const gated = createFakeApi(100, { minTokens, safetyTurns: 0 });
+            const gatedCalls: string[] = [];
+
+            await executeCompaction(
+                gated.api,
+                createFakeTurn({
+                    api: gated.api,
+                    estimatedTokens: 500,
+                    calls: gatedCalls,
+                    entries: prunableEntries([1])
+                })
+            );
+
+            expect(gatedCalls).toEqual([...expected]);
+        }
+
+        // (c) IDEMPOTENT: the pass above completed the withholding, so the unit is now fully off
+        // and a SECOND pass over the live flags writes nothing new and reports nothing.
+        await executeCompaction(api, context);
+
+        expect(calls).toEqual(['setIncluded:2:false']);
         expect(diagnostics).toHaveLength(1);
     });
 
     it('honours safetyTurns as a horizon from the END of the transcript', async () => {
         // The fixture has 4 units; the candidate is unit #1 and the resolver unit #2.
         for (const [safetyTurns, expected] of [
-            [0, ['setIncluded:1:false']],
+            [0, ['setIncluded:1:false', 'setIncluded:2:false']],
             // A horizon of 2 protects units #2 and #3, so the candidate is still reachable...
-            [2, ['setIncluded:1:false']],
+            [2, ['setIncluded:1:false', 'setIncluded:2:false']],
             // ...and a horizon of 4 protects the candidate too, so nothing is pruned at all.
             [4, []]
         ] as const) {
@@ -1673,15 +1753,25 @@ describe('context-compaction action (executeCompaction)', () => {
             createFakeTurn({ api, estimatedTokens: 5000, calls, entries })
         );
 
+        // Eight withheld units = SIXTEEN writes: the plan caps at 8 UNITS, and R8 makes each
+        // unit a leader write plus its result write, oldest first.
         expect(calls).toEqual([
             'setIncluded:1:false',
+            'setIncluded:2:false',
             'setIncluded:5:false',
+            'setIncluded:6:false',
             'setIncluded:9:false',
+            'setIncluded:10:false',
             'setIncluded:13:false',
+            'setIncluded:14:false',
             'setIncluded:17:false',
+            'setIncluded:18:false',
             'setIncluded:21:false',
+            'setIncluded:22:false',
             'setIncluded:25:false',
-            'setIncluded:29:false'
+            'setIncluded:26:false',
+            'setIncluded:29:false',
+            'setIncluded:30:false'
         ]);
 
         const data = diagnostics[0].data as { maxUnits: number; units: { index: number }[] };
@@ -1704,8 +1794,9 @@ describe('context-compaction action (executeCompaction)', () => {
         );
 
         // `annotate` is not built, so the reversible writer is used — and the report says so
-        // rather than letting an operator believe their setting took effect.
-        expect(calls).toEqual(['setIncluded:1:false']);
+        // rather than letting an operator believe their setting took effect. The write set is
+        // the unit's members either way (R8).
+        expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(diagnostics[0].message).toContain('mode exclude, setting mode annotate');
         expect(diagnostics[0].data).toMatchObject({ mode: 'exclude', requestedMode: 'annotate' });
     });
@@ -1768,8 +1859,9 @@ describe('context-compaction action (executeCompaction)', () => {
         );
 
         // park -> prune -> un-park, in that order: `executeCompaction` is the DEFAULT action,
-        // so the shipped built-in changes the transcript inside the pause window.
-        expect(calls).toEqual(['pause', 'setIncluded:1:false', 'resume']);
+        // so the shipped built-in changes the transcript inside the pause window. The prune is
+        // one write per MEMBER of the unit it withholds (R8), inside the same single pause.
+        expect(calls).toEqual(['pause', 'setIncluded:1:false', 'setIncluded:2:false', 'resume']);
         expect(touches).toEqual([...TRIGGER_READS, ...POLICY_READS, 'report.diagnostic']);
     });
 
@@ -2104,7 +2196,9 @@ describe('context-compaction action (executeCompaction)', () => {
         ]);
 
         // The provider request that went out carries the ANSWERS and the tail, and never a
-        // half-answered block: the cascade kept pairing intact (T3.4's oracle, in the shape
+        // half-answered block. Pairing holds because this pass writes its WHOLE write set —
+        // every member of a pruned unit gets its own flag, per the list above — not because the
+        // runtime fans one flag out: R8 removed that cascade (the oracle is T3.4's, in the shape
         // this file can see — the request itself).
         const request = seen[seen.length - 1].messages;
 
@@ -3188,8 +3282,17 @@ describe('context-compaction summarize flow (T9)', () => {
             mode: 'summarize'
         };
 
+        // THE TRIMMER ARM, pinned rather than ambient: the shipped `supersededTurns` horizon
+        // counts TOOL TURNS above a unit and protects the newest N (default 2), and this
+        // fixture's failed unit has exactly one newer tool turn above it — so under the shipped
+        // default the trimmer never looks at it and the D1 interaction has nothing to measure.
+        // Horizon 0 is the same rule with its protection switched off; the default itself is
+        // pinned in src/plugin/context-trimmer.test.ts.
+        const trimmerStored: Record<string, number | string | boolean> = { supersededTurns: 0 };
+
         return {
-            get: (plugin, key) => (plugin === 'context-compaction' ? stored[key] : undefined)
+            get: (plugin, key) =>
+                plugin === 'context-compaction' ? stored[key] : plugin === 'context-trimmer' ? trimmerStored[key] : undefined
         };
     };
 
@@ -4011,8 +4114,9 @@ describe('context-compaction display lane (C1)', () => {
             })
         );
 
-        // A real prune pass ran (the one superseded unit was withheld, on its leader)...
-        expect(calls).toEqual(['pause', 'setIncluded:1:false', 'resume']);
+        // A real prune pass ran (the one superseded unit was withheld — leader AND result,
+        // because one flag write moves one entry now)...
+        expect(calls).toEqual(['pause', 'setIncluded:1:false', 'setIncluded:2:false', 'resume']);
         // ...and it never asked for a lane, let alone raised one.
         expect(fake.lanes.size).toBe(0);
         expect(laneTouches(fake.touches)).toEqual([]);
@@ -4211,11 +4315,13 @@ describe('context-compaction × context-trimmer overlap (uplift T9)', () => {
 
     // The provider BOTH built-ins see: compaction's numbers are stored, and every trimmer key
     // falls through as `undefined`, i.e. its DECLARED default (`enabled` true,
-    // `dropSupersededToolCalls` true, `dropInvalidToolCallsOnceAnswered` true,
-    // `invalidOutcomes` "failed,rejected", `supersedeMatch` "name", `dropDuplicateCalls` false,
-    // `dropOldThoughts` "turn", and every economy knob 0). That is precisely the fresh-install
-    // posture an operator gets from `GET /plugins`, which is what makes the numbers below the
-    // shipped behaviour rather than a fixture arrangement.
+    // `trimInvalidTools` true with `invalidToolTurns` 2, `trimThoughts` true with
+    // `thoughtTurns` 2, `truncateToolRequests` false with `truncateTurns` 2,
+    // `dropSupersededToolCalls` true with `supersededTurns` 2, `dropDuplicateCalls` false with
+    // `duplicateTurns` 2, `invalidOutcomes` "failed,rejected", `supersedeMatch` "name", and the
+    // four economy knobs `minTokens`/`minThoughtChars`/`safetyUnits`/`maxUnits` all 0). That is
+    // precisely the fresh-install posture an operator gets from `GET /plugins`, which is what
+    // makes the numbers below the shipped behaviour rather than a fixture arrangement.
     const bothPassesAt = (
         values: Record<string, number | string | boolean>
     ): HarnessPluginSettingsProvider => ({
@@ -4262,8 +4368,14 @@ describe('context-compaction × context-trimmer overlap (uplift T9)', () => {
     // redundant-but-harmless rather than a second eviction.
     it('has both rules select the same unit, at either matcher', () => {
         const entries = prunableEntries();
+        // The shipped `supersededTurns` horizon (default 2 tool turns) protects this fixture's
+        // unit — there is exactly one newer tool turn above it — so the overlap is pinned with
+        // the horizon switched OFF (`0`): the same rule, one step later on the timeline. The
+        // shipped default is pinned in src/plugin/context-trimmer.test.ts, and the arm below
+        // keeps every other switch at its declared default.
+        const NO_HORIZON: TrimmerSettings = { ...TRIMMER_DEFAULT_SETTINGS, supersededTurns: 0 };
         const fingerprint: TrimmerSettings = {
-            ...TRIMMER_DEFAULT_SETTINGS,
+            ...NO_HORIZON,
             supersedeMatch: 'fingerprint'
         };
 
@@ -4284,7 +4396,7 @@ describe('context-compaction × context-trimmer overlap (uplift T9)', () => {
             }
         ];
 
-        expect(trimmerPlan(TRIMMER_DEFAULT_SETTINGS)).toEqual(SAME_TRIMMER_CANDIDATE);
+        expect(trimmerPlan(NO_HORIZON)).toEqual(SAME_TRIMMER_CANDIDATE);
         expect(trimmerPlan(fingerprint)).toEqual(SAME_TRIMMER_CANDIDATE);
 
         // Compaction's own policy over the same entries, with its gates opened to the fixture's
@@ -4306,7 +4418,14 @@ describe('context-compaction × context-trimmer overlap (uplift T9)', () => {
         // Both dispatch orders, because "exactly one pass" must not be an artefact of which hook
         // the bus happens to run first. The shipped order is the first arm.
         for (const order of ['compaction-first', 'trimmer-first'] as const) {
-            const { api, diagnostics } = createFakeApi(100, { minTokens: 10, safetyTurns: 0 });
+            // `supersededTurns: 0` for the trimmer arm — the shared fake api is one flat store,
+            // and the shipped 2-tool-turn horizon would protect this fixture's unit so the
+            // overlap would never happen (see the case above for the same pin).
+            const { api, diagnostics } = createFakeApi(100, {
+                minTokens: 10,
+                safetyTurns: 0,
+                supersededTurns: 0
+            });
             const calls: string[] = [];
             const entries = prunableEntries();
             const context = createFakeTurn({ api, estimatedTokens: 500, calls, entries });
@@ -4319,17 +4438,27 @@ describe('context-compaction × context-trimmer overlap (uplift T9)', () => {
                 await executeCompaction(api, context);
             }
 
-            // EXACTLY ONE WRITE, from one pass. `calls` records every mutation control, so a
-            // second pass that planned the same unit again would append a second
-            // `setIncluded:1:false` here — and a pass that touched the thinking axis would add a
-            // `setReasoningIncluded:*`. Neither happens: each pass reads the LIVE unit flag
-            // (`context-pruning.groupUnits` → `unit.included`, and `planTrimmedUnits` step (1)),
-            // so the second one finds the unit withheld and proposes nothing.
-            expect(calls).toEqual(['setIncluded:1:false']);
+            // EXACTLY ONE PASS WRITING, and since R8 one pass writing a unit means one write
+            // per MEMBER of it. `calls` records every mutation control, so a second pass that
+            // planned the same unit again would append `setIncluded:1:false` twice here — and a
+            // pass that touched the thinking axis would add a `setReasoningIncluded:*`. Neither
+            // happens: each pass re-reads the LIVE per-entry flags, and the skip is PER MEMBER —
+            // both writers compute their write set as the unit's members MINUS the entries already
+            // withheld (`src/core/context-pruning.ts` `includedMembersOf`, mirrored by
+            // `src/plugins/context-trimmer.plugin.ts` `includedMembersOf`) and propose a unit only
+            // when that list is NON-EMPTY (the trimmer's `planTrimmedUnits` step (1), core's rule 5).
+            // Both members are off here, so the second pass has nothing left to write. It is NOT the
+            // unit-level conjunction `unit.included` doing that work: it reads `false` as soon as ANY
+            // member is withheld, and a unit whose request an earlier truncation took must stay
+            // trimmable — which is why the test above compares per-member write sets, not that flag.
+            expect(calls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
 
-            // The unit is withheld (the leader here — the runtime's `writeIncluded` cascade takes
-            // the results, src/harness.ts ~8523), and its resolver is untouched.
+            // The unit is withheld — BOTH of its entries, because the runtime no longer
+            // cascades (src/harness.ts `writeIncluded`), and compaction writes its whole write
+            // set (src/plugins/context-compaction.plugin.ts `candidate.members`). The resolver
+            // is untouched.
             expect(entries[1].included).toBe(false);
+            expect(entries[2].included).toBe(false);
             expect(entries[3].included).toBe(true);
             expect(entries[4].included).toBe(true);
 

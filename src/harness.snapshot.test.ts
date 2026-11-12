@@ -922,7 +922,7 @@ describe('snapshot persistence of the context-inclusion flag', () => {
         expect(JSON.stringify(buildSession().snapshot())).not.toContain('included');
     });
 
-    it('persists `included: false`, restores it byte-for-byte, and keeps withholding the unit after a restart', async () => {
+    it('persists `included: false`, restores it byte-for-byte, and keeps withholding that ONE entry after a restart', async () => {
         const snapshot = clone(flaggedSession().snapshot());
 
         // `snapshot()` runs the SAME reader `restore()` enforces, so the flagged
@@ -943,13 +943,28 @@ describe('snapshot persistence of the context-inclusion flag', () => {
         target.restore(snapshot);
         expect(target.snapshot()).toEqual(snapshot);
 
-        // The restored flag is LIVE state: the next request withholds the whole
-        // unit and nothing else, while the transcript keeps it.
+        // The restored flag is LIVE state, and since R8 it is the ONE entry it was written
+        // on: the request keeps the assistant `toolCalls` entry (its own flag was never
+        // written) and answers that call with the request-only `status: 'withheld'`
+        // placeholder, in the slot the disabled result vacated
+        // (../harness.ts `projectTranscript`). Nothing else moved.
         await target('continue');
 
         expect(seen[seen.length - 1].messages).toEqual([
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'seed question' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'bulk01', arguments: '{}' }] },
+            {
+                role: 'tool',
+                toolCallId: 'c1',
+                name: 'bulk01',
+                content: JSON.stringify({
+                    status: 'withheld',
+                    callId: 'c1',
+                    name: 'bulk01',
+                    note: 'The result of this tool call is withheld from your context, so its content is not available to you. The call already finished; do not re-run it just because the answer is missing.'
+                })
+            },
             { role: 'assistant', content: 'seed answer' },
             { role: 'user', content: 'continue' }
         ]);
