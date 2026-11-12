@@ -9,11 +9,17 @@ tool loop for you.
 yarn add @underload/harness
 ```
 
-Zero runtime dependencies for the library and the browser client. Node 18+ (`fetch`
-is the default transport). The package declares no runtime dependencies beyond `dotenv`
-and `typescript` — `dotenv` by the Node entries' `.env` loader, `typescript` by the
-tool-source compiler (`src/core/tool-source.ts`); both are external, not bundled, and the
-browser build reaches neither (see [npm Publishing](#npm-publishing)).
+The harness core has no runtime dependencies of its own, and Node 18+ is enough
+(`fetch` is the default transport). What the package DOES declare in `dependencies` is
+exactly what its published sources import: `dotenv` (the Node entries' `.env` loader),
+`typescript` (the tool-source compiler, `src/core/tool-source.ts`), and `dompurify`,
+`marked` and `highlight.js` (the browser markdown renderer,
+`src/frontend/ui/markdown.ts`). Because the package ships source rather than a bundle,
+"only the browser uses it" cannot make a package dev-only: an installed host that imports
+`./frontend` really resolves those three. `vite` is a `peerDependency` (`^8`) for the
+deployable app surface (`build:frontend` / `dev:frontend`, and the module runner the
+worker entries load through). Nothing is inlined — every dependency stays the dependency's
+own published artifact (see [npm Publishing](#npm-publishing)).
 
 ## Usage
 
@@ -295,39 +301,57 @@ exported.
 
 ### TypeScript consumers
 
-The published declarations are ESM and are post-processed at build time
-(`scripts/fix-declaration-specifiers.mjs`) so every relative specifier carries its
-`.js` name. Node's resolver — and therefore `moduleResolution: "node16" |
-"nodenext"` — requires that, so a NodeNext consumer needs no `paths` or shims:
+The package publishes **TypeScript source**, so there is no declaration build and no
+`.d.ts` tree: the `types` condition of every subpath names the same `src/*.ts` file the
+runtime loads, and a consumer's editor and `tsc` read that source directly.
+
+Those sources use extensionless relative specifiers (`./harness`, `./ui/turns`) the way a
+bundler-resolution codebase does, so the supported consumer mode is
+`moduleResolution: "bundler"` — what Vite, Vitest, vite-node and every bundler consumer
+in this workspace already uses:
 
 ```jsonc
-{ "compilerOptions": { "module": "NodeNext", "moduleResolution": "NodeNext" } }
+{ "compilerOptions": { "module": "ESNext", "moduleResolution": "bundler" } }
 ```
+
+`moduleResolution: "node16" | "nodenext"` is NOT supported: it requires every relative
+specifier to carry its output extension, which the published source does not, so it fails
+with TS2834 (the ruling, and what an emitted `.d.ts` used to pay for it, is recorded in
+`scripts/check-package-types.ts:44-53`).
 
 Types follow the same environment split as the runtime:
 
 | Consumer | Resolves | Compiler needs |
 |---|---|---|
-| Node | `dist/index.d.ts` (library + shared + server + client) | `lib` with `DOM` (client signatures) and `types: ["node"]` (server API) |
-| Browser (`customConditions: ["browser"]`) | `dist/browser.d.ts` (library + shared + client) | `lib` with `DOM`; no Node types |
-| `@underload/harness/frontend` | `dist/frontend/index.d.ts` | `lib` with `DOM` |
-| `@underload/harness/server` | `dist/server/index.d.ts` | `types: ["node"]` |
+| Node | `src/index.ts` (library + shared + server + client) | `lib` with `DOM` (client signatures) and `types: ["node"]` (server API) |
+| Browser (`customConditions: ["browser"]`) | `src/browser.ts` (library + shared + client) | `lib` with `DOM`; `types: ["vite/client"]` |
+| `@underload/harness/frontend` | `src/frontend/index.ts` | `lib` with `DOM`; `types: ["vite/client"]` |
+| `@underload/harness/server` | `src/server/index.ts` | `types: ["node"]` |
+
+Type-checking source instead of a trimmed declaration surface costs two settings, both
+deliberate: `types: ["vite/client"]` because `src/frontend/api.ts` reads `import.meta.env`
+(whose type that ambient declaration provides), and `skipLibCheck: true` because the
+source graph reaches third-party `.d.ts` files through `typescript`, `ws` and `marked`.
+The harness code is still type-checked in full — it is `.ts`, so it is in the program.
 
 The Node root re-exports the browser client, so its DOM signatures make the `DOM`
 lib necessary even in a Node program — an accepted consequence of "the root exposes
 everything". Import a subpath when you want the narrower surface (or no DOM at all).
 
-`yarn build && yarn test:package` type-checks a real NodeNext consumer **and** a real
-`customConditions: ["browser"]` consumer against the built package, and asserts the
-browser declaration graph never reaches the Node server surface.
-`yarn test:package:runtime` then *runs* the built artifact: the `.env` loader, a
-durable `createHarnessRuntime({ root })`, and `startHarnessServer` on an ephemeral
-loopback port (health, harness index, session POST, clean close).
-`prepublishOnly` runs both.
+`yarn test:package` type-checks a real `moduleResolution: Bundler` consumer **and** a
+real `customConditions: ["browser"]` consumer against a copied published install (the
+package inside a scratch `node_modules`, so the manifest's resolution is what is tested,
+never a `paths` alias), and walks the published browser source graph to prove it reaches
+neither the Node root nor the server barrel. `yarn test:package:runtime` then *runs* that
+same copied install: the `.env` loader, a durable `createHarnessRuntime({ root })`, and
+`startHarnessServer` on an ephemeral loopback port (the `/v1/harness` mount, the paged
+harness index, a session POST, clean close). `yarn test:package:tools` drives the whole
+self-modifying-tool scenario through the copied `src/index.ts`. `prepublishOnly` runs
+them all.
 
 **Browser note.** Importing the browser root (or `./frontend`) evaluates no Node
-graph: `dist/underload-harness.browser.mjs` statically reaches only the library,
-shared and client chunks. The package tools are a documented Node-only exception —
+graph: `src/browser.ts` statically reaches only the library, shared and client modules.
+The package tools are a documented Node-only exception —
 `read`/`write`/`edit`/`glob`/`grep`/`files`, `shell`, `gitDiff` and
 `syntax` are lazy chunks (`import()`) whose bodies use `node:fs`, `node:vm` and
 `node:child_process`. They are exported (the root is the same library surface) but a
@@ -364,11 +388,11 @@ tools/
 
 Tests sit next to the module they cover and reach the published surface through the
 package specifiers — the bare `@underload/harness` and its published subpaths (e.g.
-`@underload/harness/shared`), never a hand-written path into `dist/`. There is
-deliberately **no `resolve.alias`** in `vitest.config.ts`: every one of those
-specifiers resolves through `package.json` `exports.development`, which maps the
-`development` condition (what Vite/Vitest/vite-node select in dev and test mode)
-onto the raw TypeScript entries under `src/`. So `vitest run` needs no build, and a
+`@underload/harness/shared`), never a hand-written path into a build directory: there is
+no build directory, because the package publishes `src/*.ts`. There is
+deliberately **no `resolve.alias`** in `vitest.config.ts`: every published condition
+already names the raw TypeScript entry under `src/`, so the manifest targets — not an
+alias table — are what make `vitest run` build-free, and a
 test can never assert a stale bundle. `src/structure.test.ts` pins the manifest,
 the config, and the `tsconfig.json` `paths` mirror against each other.
 
@@ -1130,9 +1154,10 @@ time a tool is called. A row the generated manifest does not know yet is compile
 from its editable source on first call instead of failing on a missing label (T24),
 so a new preset is executable before the manifest is regenerated. Constructing a
 harness or listing the catalogue therefore costs no Node built-ins, and a model that
-never asks for `shell` never loads it. The published build turns each branch
-into a chunk next to `dist/underload-harness.mjs`; all of `dist/` is shipped, and
-`inlineDynamicImports` must stay off or the split is undone.
+never asks for `shell` never loads it. Because the published shape IS this source
+tree, every branch stays an `import()` of its own `*.tool.ts` file: the split is
+inherent to the sources rather than something a bundler produces, so an installed
+package costs the same nothing until a call needs the body.
 
 **The file tools are batched.** `read`, `write`, `edit`, and `files`
 each declare exactly ONE array property (`paths` / `files` / `edits` / `ops`), so the
@@ -2327,7 +2352,7 @@ regardless of cwd, so in a workspace checkout that is
 | `HARNESS_DEV_API` | **Vite only** (`src/frontend/vite-proxy.ts`, read when the UI's dev/preview config loads): the mount the `/v1/harness` proxy forwards to. Default `http://127.0.0.1:5000/v1/harness`; the point it at the standalone launcher with `http://127.0.0.1:5181/v1/harness`. No server or CLI entry reads it |
 | `HARNESS_WORKER_IDLE_MS`, `HARNESS_MAX_LANE_WORKERS`, `HARNESS_WORKER_HANDSHAKE_MS`, `HARNESS_WORKER_ENTRY` | Server only: the lane-worker bounds and entry file for `worker` execution (same section; every value is validated, and a bad one aborts startup) |
 | `HARNESS_IO_EXECUTION` | Server only: `inline` (default) or `worker` — runs the database checkpoint and the event journal on one IO worker thread instead of on the request loop. See [Off-loop durability](#off-loop-durability-ioexecution-worker) |
-| `HARNESS_IO_WORKER_ENTRY` | Server only: explicit IO worker entry file; otherwise `dist/underload-harness.io-worker.mjs`, else the source entry (dev/test) |
+| `HARNESS_IO_WORKER_ENTRY` | Server only: explicit IO worker entry file; unset resolves the package's own source entry (`src/server/workers/io-worker.ts`) |
 
 `fetch` and `download` need **no** key: `webfetch: true` registers the native
 page GET on a keyless host and declares it core (R9-R11), and `download` is an
@@ -2764,7 +2789,8 @@ serving disabled and starts no Vite or UI. It accepts `--port`, `--host`, and
 `@underload/service`; there is deliberately no generic `serve`/`start` alias.
 
 To run the UI against that standalone API instead of the service, point Vite's
-proxy mount at it (a shell variable, read by `vite.config.ts`):
+proxy mount at it (a shell variable, read by `src/frontend/vite.config.ts` through
+`src/frontend/vite-proxy.ts`):
 
 ```bash
 HARNESS_DEV_API=http://127.0.0.1:5181/v1/harness yarn dev:frontend
@@ -3358,18 +3384,21 @@ shape on upgrade, and a worker session answers exactly the same HTTP surface.
 | `HARNESS_WORKER_IDLE_MS` | `120000` | reclaim a lane worker after this much idle time (`0` = keep it until the session goes). 0–3600000 |
 | `HARNESS_MAX_LANE_WORKERS` | `16` | upper bound on concurrently live lane workers — each owns a full harness replica, so this is the memory guard. 1–64 |
 | `HARNESS_WORKER_HANDSHAKE_MS` | `60000` | bound on worker import + build + capability report. 1000–600000 |
-| `HARNESS_WORKER_ENTRY` | unset | explicit worker entry file; otherwise `dist/underload-harness.worker.mjs`, else the source entry (dev/test) |
+| `HARNESS_WORKER_ENTRY` | unset | explicit worker entry file; unset resolves the package's own source entry (`src/server/workers/lane-worker.ts`) |
 
 Values are **validated, not coerced**: `HARNESS_WORKER_IDLE_MS=12s` aborts startup
 naming the variable and the accepted range, because an approximated runtime is the
 one thing this mode may not do.
 
-The lane worker is a published entry point — `@underload/harness/worker`, built as
-`dist/underload-harness.worker.mjs` by `yarn build` (`vite.config.ts`, `package.json`
-`exports`). Resolve order is: the configured `workerEntry`, the built bundle, the
-source module. A cold lane measures ~1.6–2.4 s in source mode (it rebuilds the
-harness, recompiles created-tool sources and restores the snapshot) and less against
-`dist/`; reclaim is always safe because the next turn rebuilds from committed state.
+The lane worker is a published entry point — `@underload/harness/worker`, which is
+`src/server/workers/lane-worker.ts` itself (`package.json` `exports`). Resolve order is:
+the configured `workerEntry` (a missing file aborts startup naming the variable), then the
+package's own source module (`src/server/workers/lane-host.ts:160-186`). The thread loads
+that TypeScript through Vite's module runner (`src/server/workers/worker-boot.mjs`), so
+there is no built bundle to try first and no Node flag to add. A cold lane measures
+~1.6–2.4 s in source mode (it rebuilds the harness, recompiles created-tool sources and
+restores the snapshot), and reclaim is always safe because the next turn rebuilds from
+committed state.
 
 Branch state is deliberately absent from snapshot v2 (a `harness.branch` listing belongs
 to the run that created it), which is exactly why worker mode refuses `threadFork` rather
@@ -3440,7 +3469,7 @@ handles, and reports every operation that never received a durability receipt.
 | Variable | Default | Meaning |
 |---|---|---|
 | `HARNESS_IO_EXECUTION` | `inline` | `inline` or `worker`; any other value aborts startup |
-| `HARNESS_IO_WORKER_ENTRY` | unset | explicit IO worker entry file; otherwise the built `dist/underload-harness.io-worker.mjs`, else the source entry (dev/test) |
+| `HARNESS_IO_WORKER_ENTRY` | unset | explicit IO worker entry file; unset resolves the package's own source entry (`src/server/workers/io-worker.ts`) |
 
 The cost that stays on the main thread, honestly: building the record (the authority
 owns the state) and the structured clone `postMessage` performs on each frame — one
@@ -3449,8 +3478,11 @@ document per checkpoint. A checkpoint frame is therefore bounded by `maxFrameByt
 that number back, so a permanently oversized database fails loudly and stops paying the
 clone. Off-loading is a bounded cost moved off the loop, not a zero-cost win.
 
-The IO worker is a published entry point — `@underload/harness/io-worker`, built as
-`dist/underload-harness.io-worker.mjs` (`vite.config.ts`, `package.json` `exports`).
+The IO worker is a published entry point — `@underload/harness/io-worker`, which is
+`src/server/workers/io-worker.ts` itself (`package.json` `exports`). Unset, the client
+resolves that specifier through the package's own manifest (`src/server/workers/io-client.ts:342-362`);
+the thread loads it through the plain-JS bootstrap `src/server/workers/worker-boot.mjs`
+and the harness Vite module runner, so no build step and no Node flag is involved.
 Because the manifest says `"sideEffects": false`, the entry calls `startIoWorker()`
 explicitly: an entry that merely imported its loop compiled to a bundle that answered
 no frames at all.
@@ -3461,7 +3493,7 @@ FIFO queue, the handshake gate, and the numbered integration contract at the bot
 the file), `src/server/workers/io-worker.ts` and `io-worker-loop.ts` (the thread),
 `src/server/sessions.ts` (the worker branches — search for `this.io`),
 `src/server/io-worker-bridge.test.ts` (store + standalone-server proofs, including the
-built bundle), and `src/server/workers/io-client.test.ts` (ordering, barriers, error
+off-thread durability round trip), and `src/server/workers/io-client.test.ts` (ordering, barriers, error
 close, and byte identity with the inline writer).
 
 ### Threads in the browser UI (R5/R6/R7)
@@ -4328,7 +4360,8 @@ aliased to `VITE_*`.
 yarn test              # vitest run (library + server + shared)
 yarn test:frontend     # vitest run --config src/frontend/vitest.config.ts (UI, jsdom)
 yarn typecheck         # tsc --noEmit
-yarn build             # library + server + client entries -> dist/
+yarn build             # regenerate the TWO generated catalogues (harness-tools.manifest.json
+                       # + the plugin manifest) — nothing is compiled, see npm Publishing
 yarn build:frontend    # the UI application -> src/frontend/dist (standalone/deploy base)
 yarn cli --list        # CLI preset catalogue
 yarn dev:frontend      # Vite UI on all interfaces, dual-stack (LAN + localhost), /v1/harness -> the service on :5000
@@ -4342,83 +4375,85 @@ yarn build:harness-ui  # repo root: rebuild just the gateway UI (/harness/ base)
 The package is publishable to npm as `@underload/harness`.
 
 ```bash
-yarn build      # browser entry, then the SIX Node ESM entries (index / server / frontend /
-                # shared / worker / io-worker) + their .d.ts tree -> dist/
+yarn build      # harness-tools.manifest.json + the plugin manifest, and nothing else:
+                # the package publishes `src/*.ts`, so there is no bundle and no `.d.ts`
+                # tree to produce before a release
 yarn publish    # prepublishOnly runs, in order: typecheck -> test -> build ->
                 # test:package:files -> test:package -> test:package:runtime -> test:package:tools
 ```
 
 - **The library barrel is stable: `src/harness.ts`.** It is the published library
   barrel (`harness()` / `agent()` / `tool()` plus every public type), which the Node root
-  `src/index.ts` re-exports — and `src/index.ts` is the entry the published package
-  resolves: `main`/`module`/`types` point at it (`package.json:6-8`), `exports` serves it
-  under the `development` condition (`package.json:17`), and the `node`/`import`/`default`
-  answer is the built `dist/underload-harness.mjs` (`package.json:18-20`, the
-  **Entries and conditions** bullet below). The bare `@underload/harness` specifier in tests resolves
-  through `package.json` `exports.development` onto those `src/` TypeScript entries —
-  `vitest.config.ts` has **no `resolve.alias`**, so a test can never assert a stale bundle
-  (the full note is under [TypeScript consumers](#typescript-consumers)). JS is bundled by
-  Vite into `dist/underload-harness.mjs`; declarations are emitted to `dist/index.d.ts`.
+  `src/index.ts` re-exports — and `src/index.ts` IS the entry the published package
+  resolves: `main`/`module`/`types` point at it (`package.json:6-8`) and every `exports`
+  condition names a `src/*.ts` file, so an installed host loads the same file a workspace
+  run edits. The bare `@underload/harness` specifier in tests resolves through those same
+  conditions — `vitest.config.ts` has **no `resolve.alias`**, so a test can never assert a
+  stale bundle (the full note is under [TypeScript consumers](#typescript-consumers)).
+  Nothing is bundled and nothing is emitted: there is no JS build of the library and no
+  declaration step.
 - **The JavaScript application also lives under `src/`, next to the library:**
   `src/server` (HTTP API, sessions, the WebSocket stream, catalogue presets, CLI, discovered service
   routes), `src/frontend` (browser client + app shell) and `src/shared` (helpers
-  both trees evaluate). Each has its own barrel that becomes a published entry, and the
-  Node build emits **six** entries in all: those three, `index`, and the two worker
+  both trees evaluate). Each barrel is a published entry: the root `.` (Node), the root's
+  nested `browser` group, `./server`, `./frontend`, `./shared`, plus the two worker
   EXECUTABLES — `./worker` (`src/server/workers/lane-worker.ts`) and `./io-worker`
-  (`src/server/workers/io-worker.ts`), spawned as processes rather than imported as APIs
-  (`vite.config.ts:141-160`). The browser entry is built separately, before them
-  (`vite.config.ts:184-191`).
-- **Entries and conditions.** `exports` maps the root to `dist/underload-harness.mjs`
-  for `node`/`import` (library + shared + server + client); only the `development`
-  condition — what Vite/Vitest/vite-node select — maps it to `src/index.ts`
-  (CORRECTED IN PLACE 2026-11-11: this sentence used to say the root maps to
-  `src/index.ts` for `node`/`import`; that is `package.json:17`'s `development`
-  condition, while `:18-20` maps `node`/`import`/`default` to the built bundle). The
-  `browser` condition (`package.json:11-15`) maps to `src/browser.ts`
-  under `development` and to `dist/underload-harness.browser.mjs` by default
-  (library + shared + client, never the server tree). `./server`,
-  `./frontend` and `./shared` expose each layer on its own. Every condition
-  declares an **explicit `types` target**; nothing relies on implicit `.d.ts`
-  sibling resolution.
-- **Lazy preset chunks.** Each preset's implementation is a dynamic import (see
-  `src/tools/catalogue.ts` → `src/tools/descriptors.ts`, which owns both loaders), so
-  the build emits one chunk per tool next to the
-  entry (`read-*.js`, `gitDiff-*.js`, …). The entry keeps no `node:` import
-  and no static link to those chunks. `build.lib` must stay ESM-only and must not
-  set `inlineDynamicImports`, which would fold every implementation back into the
-  entry. A `.tool.ts` that is newer than the generated manifest has no chunk yet; the
-  catalogue compiles it from its editable source instead (`prepareToolCandidate`), so
-  the Node surface stays honest while `yarn tools:manifest` is only needed for the
-  browser build.
-- `package.json` `files` ships all of `dist/` (entry, `.d.ts` tree, and the chunks) **and
-  `src/`** — the sources the `development` condition resolves to — with tests, specs,
-  snapshots, `src/frontend/dist`, and nested `node_modules`/`.vite` excluded
-  (`package.json:59-70`), so a consumer's `import { read }` still resolves its body after
-  publishing.
+  (`src/server/workers/io-worker.ts`), spawned as threads rather than imported as APIs.
+  Publishing is by manifest only (`package.json` `exports` + `files`) — `src/structure.test.ts`
+  pins every published condition against the file it names, so neither side can drift.
+- **Entries and conditions.** `exports` maps the root to `src/browser.ts` under the
+  nested `browser` group (`types` + `default`) and to `src/index.ts` under `types` +
+  `default` (library + shared + server + client). (CORRECTED IN PLACE 2026-11-12: this
+  section used to document a `development` condition that mapped each entry onto its
+  `src/` barrel while `node`/`import`/`default` answered from `dist/`. A source-only
+  package has no dev-vs-built fork to express, so the condition is gone and every shipped
+  condition names the source.) `./server`, `./frontend`, `./shared`, `./worker` and
+  `./io-worker` expose each layer on its own, and every condition declares an **explicit
+  `types` target** — the same `.ts` file the runtime loads, because there is no emitted
+  `.d.ts` for anything to resolve implicitly to.
+- **Lazy preset modules, not chunks.** Each preset's implementation is a dynamic import
+  (see `src/tools/catalogue.ts` → `src/tools/descriptors.ts`, which owns both loaders), so
+  constructing a harness or listing the catalogue loads no Node built-ins. In Node the
+  catalogue scans the tools root live; the generated `harness-tools.manifest.json` is what
+  the browser bundle uses, because a bundle cannot scan. A `.tool.ts` newer than the
+  manifest is compiled from its editable source (`prepareToolCandidate`), so the Node
+  surface stays honest while `yarn tools:manifest` is only needed to refresh the browser
+  catalogue — and `typecheck`/`test` run `--check`, so a stale catalogue fails the build
+  instead of silently omitting a tool.
+- `package.json` `files` ships `src` — every `.ts` source, the two hand-written ambient
+  `.d.ts` files, the UI assets (`index.html`, the three `.css` files), the OpenAPI
+  document and the one permitted plain-JS file (`src/server/workers/worker-boot.mjs`,
+  the worker-thread bootstrap) — with tests, specs, snapshots, `src/frontend/dist`, and
+  nested `node_modules`/`.vite` excluded (`package.json:40-50`). `scripts/package-files.ts`
+  resolves that list to the exact packed set, `scripts/package-files.test.ts` pins it, and
+  `yarn test:package` refuses the release if any built artifact (`.mjs`/`.cjs`/`.js`/`.map`
+  or an emitted `foo.d.ts` twin of `foo.ts`) lands inside it.
 - `package.json` points `main` / `module` / `types` at `./src/index.ts`
-  (`package.json:6-8`); inside `exports` every shipped condition points at `dist/` except
-  `development`, which maps each entry onto its `src/` barrel. Tooling configs and tests
-  never reach npm.
-- **UI-only packages are devDependencies.** `marked`, `dompurify`,
-  `highlight.js`, and `jsdom` are used only by `src/frontend/` (browser client and
-  its jsdom tests), so they stay in `devDependencies`. The UI application build
-  (`yarn build:frontend`) lands in `src/frontend/dist` for a static host or the
-  standalone server, not in the published `dist/`.
-- **`dotenv` and `typescript` are the only runtime dependencies, and both are external**
-  (`package.json:121-124`). `dotenv` is CommonJS
-  (`require('fs')`/`require('path')`), so bundling it into the ESM output left
-  rolldown with a `require` an ESM module cannot run — the built
-  `loadEnvironmentFile()` threw and took `startHarnessServer()` with it. It is
-  externalised in `vite.config.ts` and declared in `dependencies`; only the server
-  entry imports it. `typescript` is in `dependencies` for the same reason: the tool-source
-  compiler imports it at RUN time (`src/core/tool-source.ts:246`), so it stays external and
-  ships with the package (`vite.config.ts:60-76`). `yarn test:package:runtime` fails the
-  release if that breaks again.
+  (`package.json:6-8`); inside `exports` **every** shipped condition points at a `src/`
+  entry, so there is no condition a consumer can fall through into a missing build
+  output. Tooling configs and tests never reach npm.
+- **Dependency split is decided by what the published SOURCE imports, not by which layer
+  is prettier.** `dotenv` (server `.env` loader) and `typescript` (the tool-source compiler
+  imports it at RUN time, `src/core/tool-source.ts`) are `dependencies`, and
+  `dompurify`, `highlight.js` and `marked` joined them because `src/frontend/ui/markdown.ts`
+  imports them: a source-only publish means an installed consumer that evaluates the
+  client tree really needs those packages resolvable (there is no bundle that could have
+  inlined them). `jsdom` stays a `devDependency` — only tests import it. Nothing is
+  "externalised" any more because nothing is bundled; a consumer's own bundler decides
+  that, and `yarn test:package:runtime` fails the release if any declared specifier does
+  not resolve from a copied install.
+- **`vite` is a `peerDependency` (`^8`) as well as a `devDependency`.** The deployable
+  surface still runs Vite: `build:frontend` / `dev:frontend` load `src/frontend/vite.config.ts`,
+  and the worker entries are loaded through Vite's module runner
+  (`src/server/workers/worker-runner.ts`, started with `configFile: false`). A host that
+  spawns those entries has to provide Vite, which is what a peer declaration says; the
+  library core (`harness()` / `agent()` / `tool()`) imports no Vite at all; the peer covers the
+  app/worker surface that does (`package.json:106-108`).
 - `sideEffects: false` + `exports` make the package tree-shakeable.
 - **`.env` is never bundled.** Package-relative paths are resolved by
   `src/server/package-root.ts` (a walk up to `package.json`), not by
   `new URL('<neighbouring file>', import.meta.url)`: Vite rewrites that pattern and
-  would inline the file — including real provider keys — into `dist/`. Keep it that
+  would inline the file — including real provider keys — into a bundle. Keep it that
   way when adding new package-relative paths.
 - `publishConfig.access` is `public`, so the scoped package publishes
   publicly to the npm registry.

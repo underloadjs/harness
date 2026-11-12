@@ -100,6 +100,52 @@ const SETTINGS = {
 // Constructing a preset routes no events, so this sink stays empty.
 const progress: HarnessProgress = async () => undefined;
 
+// THE WALL-CLOCK BUDGET FOR THE HARNESS-BUILDING TESTS (7 of them, marked below).
+//
+// WHY ONE TEST HERE IS THE MOST EXPENSIVE THING IN THIS FILE
+// `preset.create()` builds a REAL harness, and every build re-transpiles the whole
+// shared toolbox: `createToolboxHarness` passes the 15-entry `SHARED_TOOL_SOURCES`
+// map as `toolSources` (./toolbox.ts:600-602), and the registration kernel
+// deliberately recompiles every entry — plus its captured local dependency graph —
+// for EVERY registration (../../core/tool-source.ts:81-88, "Fresh identity: every
+// registration evaluates a NEW module graph. Compiled JS is not cached across
+// registrations"; `prepareToolCandidate` never consults the compile cache,
+// tool-source.ts:86-88). Measured from one uncontended process
+// (`vite-node`, 15 sources per registration): 414 ms for the first build, then a
+// FLAT ~205-240 ms per build, and a SECOND pass over the same presets is the same
+// speed — so there is no cache to warm and the cost is linear in builds, not cold-start.
+//
+// THE BODIES HAVE NOTHING TO REMOVE: each loop builds one harness per preset because
+// the assertion is per-preset (that is what "identical on every team preset" means),
+// and the loops run 6-16 builds. Per-test baselines, this file focused and alone
+// (24 passed, 15.46 s of tests): 1700 / 1644 / 1516 / 2706 / 2722 / 1340 / 1457 ms.
+// The whole file, alone, is 15.46 s; the 15 s `testTimeout` in ../../vitest.config.ts:42
+// is a per-TEST budget written for millisecond tests.
+//
+// WHY IT STILL TIMES OUT IN THE PACKAGE RUN
+// The suite is pure CPU with nothing to interleave, and turbo runs `test` at
+// `--concurrency=4` while each package's own vitest pool already spreads over all 16
+// cores — tens of CPU-bound workers on 16 cores. Wall time then scales with the
+// oversubscription, and the same test measured three different budgets in three
+// configurations: 1700 ms alone -> 5644 ms (3.3x) inside the 191-file package run ->
+// 23 565 ms (13.9x, the run that failed at the 15 s wall). The two 2.7-3.1 s tests
+// here reached 9907 ms and 10139 ms in that same package run, i.e. only 1.5x clear of
+// the wall, which is why the timeout moved between runs instead of sitting on one
+// test. Same-class precedent in this repo: packages/underload/service/vitest.config.ts:10-11
+// raises that package's budget for exactly this starvation.
+//
+// WHY THE BUDGET IS PER TEST AND NOT PACKAGE-WIDE (60 000 ms)
+// 13.9x is the worst observed inflation, so any test whose uncontended cost passes
+// ~1 080 ms can reach a 15 s wall; that is exactly the seven tests marked below, and
+// the next-slowest test in this file is 606 ms (8.4 s even at 13.9x, so 2.5x clear)
+// — no other test here needs a lift. 60 000 ms is 19-45x the uncontended baseline of
+// the tests it covers and 2.5x the single worst contended observation (23 565 ms):
+// it absorbs the measured starvation without hiding a hang, which a build would have
+// to spin for a full minute to trigger. Keeping the package-wide budget at 15 s means
+// the other 190 files keep their existing hang watchdog — this is the narrowest change
+// that fits, not a licence to be slow.
+const HARNESS_BUILD_TIMEOUT = 60_000;
+
 // Production names resolve through `findPreset` (whose default catalogue is `presets`,
 // the shipped list). The two TEST fixtures are not in that list any more — they are
 // injected objects from ./fixture-presets.test-support.ts — so the lookup falls back to
@@ -553,7 +599,8 @@ describe('one toolbox, different agents', () => {
             'toolCancel',
             'timeNow'
         ]);
-    });
+        // 8 harness builds (6 TEAMED + both fixtures) — see HARNESS_BUILD_TIMEOUT.
+    }, HARNESS_BUILD_TIMEOUT);
 
     it('omits delegate from the default card while every other row stays identical', () => {
         // THE load-bearing difference, pinned in both key states: `subagents: []` means
@@ -785,7 +832,8 @@ describe('one toolbox, different agents', () => {
         // catalogue is where a keyless host learns it exists but is unconfigured.
         // fetch is the documented exception: native fetch is keyless.
         expect(registeredTools('instruct')).not.toContain('search');
-    });
+        // 7 harness builds (6 TEAMED + the keyless re-check) — see HARNESS_BUILD_TIMEOUT.
+    }, HARNESS_BUILD_TIMEOUT);
 
     it('excludes testFlaky from the shared toolbox and the real presets', () => {
         vi.stubEnv('EXA_API_KEY', '');
@@ -794,7 +842,8 @@ describe('one toolbox, different agents', () => {
         expect(SHARED_TOOL_NAMES).not.toContain('testFlaky');
         for (const name of REAL) expect(registeredTools(name)).not.toContain('testFlaky');
         expect(registeredTools('flaky')).toContain('testFlaky');
-    });
+        // 8 harness builds (all 7 REAL + flaky) — see HARNESS_BUILD_TIMEOUT.
+    }, HARNESS_BUILD_TIMEOUT);
 
     it('marks the five everyday file tools core and leaves files discoverable', () => {
         vi.stubEnv('EXA_API_KEY', '');
@@ -913,7 +962,9 @@ describe('one toolbox, different agents', () => {
         // opts out (webfetch disabled) gets the opposite, and catalogue.test.ts pins
         // that pairing.
         expect(describeHarness(presetOf('instruct'), configured).coreTools).toContain('fetch');
-    });
+        // 16 harness builds (8 names x 2 key states, via coreNamesAtRuntime) — the slowest
+        // test in this file at 2706 ms uncontended; see HARNESS_BUILD_TIMEOUT.
+    }, HARNESS_BUILD_TIMEOUT);
 
     it('gives each real preset distinct instructions and the right subagents', () => {
         const instructions = REAL.map((name) => instructionOf(name, name));
@@ -962,7 +1013,9 @@ describe('one toolbox, different agents', () => {
             ['planner', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'], ['planner', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
             ['debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer'], ['debugger', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']]
         ]);
-    });
+        // ~15 harness builds (7 instructionOf + 7 roster + summarizer prompt) — 2722 ms
+        // uncontended, the joint-slowest test here; see HARNESS_BUILD_TIMEOUT.
+    }, HARNESS_BUILD_TIMEOUT);
 
     it('composes one shared delegation line for the team roles, and none on the default card', () => {
         // The six roles that may delegate all compose the SAME line (no per-role
@@ -1042,7 +1095,8 @@ describe('one toolbox, different agents', () => {
         expect(enums[5][1]).toEqual(['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']);
 
         expect(presetOf('general').create(SETTINGS, progress).tools.delegate).toBeUndefined();
-    });
+        // 7 harness builds (6 TEAMED + the default-card re-check) — see HARNESS_BUILD_TIMEOUT.
+    }, HARNESS_BUILD_TIMEOUT);
 
     it('seeds the trusted profile instruction and guidelines into the runtime', () => {
         const research = presetOf('research').create(SETTINGS, progress);
@@ -1143,5 +1197,6 @@ describe('summarize under one shared toolbox', () => {
         for (const name of ['general', 'demo', 'flaky']) {
             expect(presetOf(name).create(SETTINGS, progress).agents.summarizer).toBeUndefined();
         }
-    });
+        // 9 harness builds (6 TEAMED + 3 without a summarizer) — see HARNESS_BUILD_TIMEOUT.
+    }, HARNESS_BUILD_TIMEOUT);
 });

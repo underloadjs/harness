@@ -453,7 +453,7 @@ describe('generated manifest parity (R9)', () => {
         // Re-render in-process from the SAME scan + renderer the generator uses. That
         // is the strongest deterministic check available without a subprocess, and it
         // is exactly what `--check` compares.
-        const { renderManifest } = await import('../../scripts/tool-manifest-render.mjs');
+        const { renderManifest } = await import('../../scripts/tool-manifest-render.ts');
         const { scanToolMetadata } = await import('./tool-scan');
 
         const fresh = scanToolMetadata({ includePresets: true }).filter(
@@ -500,7 +500,7 @@ describe('generated manifest parity (R9)', () => {
 
     it('rejects an unknown label instead of resolving something else', async () => {
         await expect(loadDiscoveredTool('tools/nope/nope.tool.ts')).rejects.toThrow(
-            'No generated tool loader for "tools/nope/nope.tool.ts". Regenerate with: npx vite-node scripts/generate-tool-manifest.mjs'
+            'No generated tool loader for "tools/nope/nope.tool.ts". Regenerate with: yarn vite-node scripts/generate-tool-manifest.ts'
         );
     });
 });

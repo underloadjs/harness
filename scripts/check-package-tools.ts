@@ -6,18 +6,19 @@
 // exercises the INSTALLED package shape instead:
 //
 //   published `files` -> copied package under repository Temp/
-//   copied `dist/` entry -> the production runtime (no source import, no rebuild)
-//   copied `src/` tree   -> the editable tool sources a deployed agent inspects
+//   copied `src/index.ts` entry -> the production runtime (no rebuild, no bundle)
+//   the same copied `src/` tree -> the editable tool sources a deployed agent inspects
 //
 // The scenario edits real files in the copied `src/` tree, registers them through
 // the ORDINARY model-facing `toolRegistry` tool via `harness.executeTool`, invokes
 // the installed revision, replaces it repeatedly (including editing a local helper
-// only), and finally drives one scripted model turn that registers and then calls a
-// tool without any discovery round.
+// only), and finally drives a scripted model conversation that discovers
+// `toolRegistry`, registers a tool through it, and calls that tool on the very next
+// request without a second discovery round.
 //
 // WHAT IT ASSERTS (acceptance map)
 // --------------------------------
-//   §2/§8  published source ships beside dist; TypeScript is a runtime dependency.
+//   §2/§8  the published source IS the package (no build layer); TypeScript is a runtime dependency.
 //   §3/§5  every captured tool context receives the exact same harness reference;
 //          agents, conversation state, and harness memory survive replacement.
 //   §5     successful registration is a completion barrier and publishes metadata,
@@ -31,12 +32,14 @@
 //   §7     tool-to-tool calls resolve through H.callTool at CALL time, so a later
 //          definition is observed (no fixed imported implementation).
 //   §11    the registering agent can call a newly registered tool on the next
-//          model request without toolRequest/discovery.
+//          model request without a second toolRequest/discovery round (the core
+//          `toolRegistry` itself needs the first one: it is searchable since R9-R11).
 //
 // WHAT IT DOES NOT DO
 // -------------------
-// - It does not build, typecheck, or run the repository test suite. Run it after
-//   `yarn build`; a stale dist fails the production-entry check loudly.
+// - It does not build, typecheck, or run the repository test suite. Nothing has to be
+//   built first: the entry it imports is the published source itself, and a packed
+//   tree that lost an entry fails loudly before the scenario runs.
 // - It does not perform a clean `npm pack` + `npm install --omit=dev`. Runtime
 //   dependencies are linked from the already-installed node_modules so no network
 //   is required; the output states this explicitly. A clean production install is
@@ -45,18 +48,22 @@
 //   `transpile:syntax`; this script asserts that exact report.
 //
 // USAGE
-//     node scripts/check-package-tools.mjs                 # after yarn build
-//     node scripts/check-package-tools.mjs --scratch <dir> --keep
+//     yarn vite-node scripts/check-package-tools.ts           # no build step needed
+//     yarn vite-node scripts/check-package-tools.ts --scratch <dir> --keep
 //
-// Scratch always lives under repository-root Temp/ (see ./scratch.mjs), and
+// Scratch always lives under repository-root Temp/ (see ./scratch.ts), and
 // TEMP/TMP/TMPDIR are redirected there for this process and any child.
 //
 // Cross-references:
-//   - ./package-files.mjs        — published-file resolution + copy helper
-//   - ./scratch.mjs              — repository Temp scratch root
-//   - ./check-package-runtime.mjs — non-self-modifying package smoke
+//   - ./package-files.ts        — published-file resolution + copy helper
+//   - ./scratch.ts              — repository Temp scratch root
+//   - ./check-package-runtime.ts — non-self-modifying package smoke
 //   - ../src/core/tool-source.ts — compiler and source-record contract
 //   - ../src/harness.ts          — registerTool/executeTool/callTool kernel
+//   - ../src/harness.ts:1899     — visibleCoreTools: only 'core' definitions are declared
+//   - ../src/harness.ts:2228     — a newly registered searchable tool is enabled at once
+//   - ../src/tools/runtime/toolRegistry.tool.ts — the searchable row the model must
+//                                  discover before it may call the registry
 //   - ../src/tools/runtime/toolRegistry.tool.ts — ordinary registration tool
 
 import assert from 'node:assert/strict';
@@ -75,16 +82,19 @@ import {
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-    BUILD_ROOT,
     EDITABLE_SOURCE_ROOT,
     PACKAGE_ROOT,
     copyPublishedPackage,
+    isBuiltArtifact,
     publishedFiles,
     readPackageManifest
-} from './package-files.mjs';
-import { applyScratchEnvironment, resolveScratchRoot } from './scratch.mjs';
+} from './package-files.ts';
+import { applyScratchEnvironment, resolveScratchRoot } from './scratch.ts';
 
-const DIST_ENTRY = path.join(PACKAGE_ROOT, BUILD_ROOT, 'underload-harness.mjs');
+// The production entry of a source-only publish IS the published source entry: `main`
+// and `exports["."].default` both name `src/index.ts`, so there is no built artifact to
+// resolve ahead of the tree and nothing to `yarn build` before this scenario runs.
+const SOURCE_ENTRY = path.join(PACKAGE_ROOT, EDITABLE_SOURCE_ROOT, 'index.ts');
 const EXPECTED_CHECKS = ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json'];
 // Known shipped source entries. The runtime list is the harness-owned core
 // surface (src/tools/runtime/, moved out of the old top-level `runtime-tools/`
@@ -175,13 +185,13 @@ const REGISTRY_V3_PATH = `${FIXTURE_ROOT}/registry-v3.ts`;
 const REGISTRY_CHILD_PATH = `${FIXTURE_ROOT}/registry-child.ts`;
 const REGISTRY_BROKEN_PATH = `${FIXTURE_ROOT}/registry-broken.ts`;
 
-const fail = (message) => {
+const fail = (message: string): never => {
     console.error(`package tools: ${message}`);
     process.exit(1);
 };
 
-if (!existsSync(DIST_ENTRY)) {
-    fail('dist/ has no production entry - run `yarn build` first');
+if (!existsSync(SOURCE_ENTRY)) {
+    fail(`${EDITABLE_SOURCE_ROOT}/index.ts — the entry every consumer resolves — is missing`);
 }
 
 const scratchRoot = resolveScratchRoot({ kind: 'package-tools' });
@@ -190,15 +200,16 @@ const keep = process.argv.includes('--keep');
 const work = mkdtempSync(path.join(scratchRoot, 'run-'));
 const packageRoot = path.join(work, 'package');
 const copiedSourceRoot = path.join(packageRoot, EDITABLE_SOURCE_ROOT);
-// The scenario imports THIS entry, not <package>/dist: the copied package is the
-// installed layout under test, and its sibling src/ is the editable source root.
-const copiedDistEntry = path.join(packageRoot, BUILD_ROOT, path.basename(DIST_ENTRY));
+// The scenario imports THIS entry, not the repository tree: the copied package is the
+// installed layout under test, and inside it `src/` is BOTH the production entry and the
+// editable source root a deployed agent rewrites — one directory, not a built twin.
+const copiedEntry = path.join(copiedSourceRoot, 'index.ts');
 
-// Result bookkeeping mirrors check-package-runtime.mjs: every assertion runs
+// Result bookkeeping mirrors check-package-runtime.ts: every assertion runs
 // inside a check, so one failure is reported and the remaining checks still
 // produce evidence instead of crashing the process on an unhandled rejection.
-const results = [];
-const check = async (name, fn) => {
+const results: Array<{ name: string; ok: boolean; error?: string }> = [];
+const check = async (name: string, fn: () => unknown): Promise<void> => {
     try {
         const detail = await fn();
         results.push({ name, ok: true });
@@ -210,7 +221,9 @@ const check = async (name, fn) => {
 };
 
 // Return the rejection reason; a resolved action is itself a failed expectation.
-const rejectionOf = async (action) => {
+// `any` on purpose: callers assert on `.message`/`.code` of whatever the kernel threw,
+// and the shape differs per failure mode (transpile diagnostic, load error, contract error).
+const rejectionOf = async (action: () => Promise<unknown>): Promise<any> => {
     try {
         await action();
     } catch (error) {
@@ -219,7 +232,7 @@ const rejectionOf = async (action) => {
     throw new Error('expected the registration to fail, but it resolved');
 };
 
-const writeSource = (relative, text) => {
+const writeSource = (relative: string, text: string): string => {
     const target = path.join(copiedSourceRoot, relative);
     assert.ok(target.startsWith(copiedSourceRoot + path.sep), `fixture escaped src/: ${relative}`);
     mkdirSync(path.dirname(target), { recursive: true });
@@ -237,7 +250,7 @@ const writeSource = (relative, text) => {
 // both. Every implementation records the context it actually received in a global
 // sink so the host test (not the tool) decides whether identity was preserved.
 
-const probeSource = (entryComment = '') => `// Editable fixture entry for scripts/check-package-tools.mjs.
+const probeSource = (entryComment = '') => `// Editable fixture entry for scripts/check-package-tools.ts.
 import { tool } from '../core';
 import { helperTag, probeRevision } from './helper';
 
@@ -297,13 +310,13 @@ export const probe = tool({
 });
 ${entryComment}`;
 
-const helperSource = (version) => `// Local helper captured with the editable entry revision.
+const helperSource = (version: number): string => `// Local helper captured with the editable entry revision.
 export const probeRevision = ${version};
 export const helperTag = 'helper-v${version}';
 // helper edit ${version}
 `;
 
-const nestedSource = (version) => `// Editable sibling resolved through the LIVE registry, never imported.
+const nestedSource = (version: number): string => `// Editable sibling resolved through the LIVE registry, never imported.
 import { tool } from '../core';
 
 export const nested = tool({
@@ -365,7 +378,7 @@ export const modelProbe = tool({
 // Replacement registries are ordinary editable modules. They delegate to the
 // kernel method, never to the currently registered model-facing tool (that would
 // recurse through the tool being replaced).
-const registrySource = (version) => `// Replacement toolRegistry fixture V${version}.
+const registrySource = (version: number): string => `// Replacement toolRegistry fixture V${version}.
 import { TOOL_REGISTRY_METADATA } from '../core/metadata';
 import type { HarnessToolRegistrationCandidate, ToolContext } from '../types';
 
@@ -437,10 +450,12 @@ const copied = copyPublishedPackage({
 
 // npm always includes the root manifest; copyPublishedPackage models `files`, so
 // write package.json explicitly. Without it, module resolution and package-root
-// discovery from dist/ would not reflect an installed package.
+// discovery from the installed copy would not reflect a real install.
 copyFileSync(path.join(PACKAGE_ROOT, 'package.json'), path.join(packageRoot, 'package.json'));
 
-const findInstalledDependency = (dependency) => {
+// Walks up from the package root to the installed copy of a runtime dependency
+// (hoisted workspace installs put it in an ancestor `node_modules`).
+const findInstalledDependency = (dependency: string): string => {
     let current = PACKAGE_ROOT;
 
     while (true) {
@@ -472,9 +487,9 @@ console.log(
     `package tools: copied ${published.length} published file(s); linked runtime dependencies ${dependencyNames.join(', ')}; clean production install NOT performed`
 );
 
-// Fixture files are written into the COPIED src/ tree, which is what the copied
-// dist/ entry resolves as its editable source root. The repository source tree is
-// never modified and never imported by this script.
+// Fixture files are written into the COPIED src/ tree, which is the same tree the
+// copied production entry loads and compiles at registration time. The repository
+// source tree is never modified and never imported by this script.
 writeSource(HELPER_PATH, helperSource(1));
 writeSource(PROBE_PATH, probeSource());
 writeSource(NESTED_PATH, nestedSource(1));
@@ -488,22 +503,52 @@ writeSource(REGISTRY_BROKEN_PATH, 'export const toolRegistry = (\n');
 // Production entry
 // ---------------------------------------------------------------------------
 
-await check('published shape ships editable src beside built dist', () => {
+await check('published shape is editable source, with the entry the manifest names', () => {
     const sourceEntry = path.join(copiedSourceRoot, 'index.ts');
     const registrySourcePath = path.join(copiedSourceRoot, 'tools', 'runtime', 'toolRegistry.tool.ts');
 
     assert.ok(existsSync(sourceEntry), 'copied src/index.ts is missing');
     assert.ok(existsSync(registrySourcePath), 'copied src/tools/runtime/toolRegistry.tool.ts is missing');
-    assert.ok(existsSync(copiedDistEntry), 'copied dist production entry is missing');
-    assert.equal(path.dirname(copiedSourceRoot), path.dirname(path.join(packageRoot, BUILD_ROOT)));
+    // The production entry and the editable source root are the SAME directory: this is
+    // the source-only contract, and the scenario below depends on it (it edits the
+    // copied src tree and then executes what the entry loaded).
+    assert.equal(copiedEntry, sourceEntry, 'the production entry is not the published source entry');
+
+    // "with the entry the manifest names" is the contract, so read the manifest rather
+    // than trusting the constant above: this scenario imports the copied FILE, so a root
+    // condition that regressed to `./dist/underload-harness.mjs` or an emitted
+    // `./dist/index.d.ts` would install a path no consumer can load while every runtime
+    // assertion here still passed. Four targets: the nested `browser` group's types +
+    // default, then the Node `types` + `default` the scenario imports through.
+    const collectTargets = (conditions: unknown): string[] =>
+        Object.entries((conditions ?? {}) as Record<string, unknown>).flatMap(([, value]) =>
+            typeof value === 'string' ? [value] : collectTargets(value)
+        );
+
+    const rootTargets = collectTargets(manifest.exports?.['.']);
+    assert.deepEqual(
+        rootTargets,
+        ['./src/browser.ts', './src/browser.ts', './src/index.ts', './src/index.ts'],
+        `the root export conditions do not name the published source entry (collected: ${rootTargets.join(', ')})`
+    );
+    assert.deepEqual(
+        [manifest.main, manifest.module, manifest.types],
+        ['./src/index.ts', './src/index.ts', './src/index.ts'],
+        'the legacy main/module/types fields do not name the published source entry'
+    );
 
     const publishedTests = copied.filter((file) => /\.(?:test|spec)\.(?:ts|tsx)$/.test(file));
     assert.deepEqual(publishedTests, [], 'test files were published as source');
 
+    // A built artifact in the install would mean a stale bundle is answering instead of
+    // the sources this scenario edits.
+    const built = copied.filter((file) => isBuiltArtifact(file, new Set(copied)));
+    assert.deepEqual(built, [], `the install carries a built artifact: ${built.join(', ')}`);
+
     return {
         files: copied.length,
-        source: `${EDITABLE_SOURCE_ROOT}/index.ts`,
-        dist: `${BUILD_ROOT}/${path.basename(DIST_ENTRY)}`
+        entry: `${EDITABLE_SOURCE_ROOT}/index.ts`,
+        source: `${EDITABLE_SOURCE_ROOT}/`
     };
 });
 
@@ -516,9 +561,11 @@ await check('TypeScript is a resolvable runtime dependency of the copied package
     // Read the linked dependency's manifest directly: package `exports` maps are
     // allowed to hide package.json, and the dependency version is packaging
     // evidence this check reports rather than behaviour under test.
-    const typescriptDirectory = linkedDependencies.find(
-        (entry) => entry.dependency === 'typescript'
-    ).target;
+    // The manifest declares `typescript` as a runtime dependency; asserting the link
+    // exists keeps the strict-mode `.target` read honest if that ever changes.
+    const typescriptLink = linkedDependencies.find((entry) => entry.dependency === 'typescript');
+    assert.ok(typescriptLink, 'typescript is not among the linked runtime dependencies');
+    const typescriptDirectory = typescriptLink.target;
     const version = JSON.parse(
         readFileSync(path.join(typescriptDirectory, 'package.json'), 'utf8')
     ).version;
@@ -533,15 +580,20 @@ await check('TypeScript is a resolvable runtime dependency of the copied package
     };
 });
 
-let production;
-let writer;
-let H;
+// The three long-lived handles the scenario threads through every check. All three come
+// from the COPIED published source (`src/index.ts`), which this script imports through
+// an untyped `import()`, so they stay `any`: the assertions below are runtime behaviour
+// checks, and `H` alone is read at 100+ call sites (`H.callTool`, `H.toolSource`,
+// `H.tools.*`, ...).
+let production: any;
+let writer: any;
+let H: any;
 
 try {
-    // Import the COPIED production entry. Importing the repository dist would let
+    // Import the COPIED production entry. Importing the repository source would let
     // package-root discovery fall back to the repository src tree and would not
     // prove the installed shape works.
-    production = await import(pathToFileURL(copiedDistEntry).href);
+    production = await import(pathToFileURL(copiedEntry).href);
     assert.equal(typeof production.agent, 'function', 'production entry does not export agent');
     assert.equal(typeof production.harness, 'function', 'production entry does not export harness');
 } catch (error) {
@@ -551,21 +603,52 @@ try {
 // Capture sink shared with every dynamically loaded fixture. The fixture modules
 // run in this process (the kernel evaluates them with new Function); this is an
 // observation channel for the check, not part of the public tool contract.
-const captures = [];
-globalThis.__UNDERLOAD_TOOL_CHECK__ = captures;
+// Each entry is one fixture's `{ name, context, ... }` registration capture.
+const captures: any[] = [];
+(globalThis as any).__UNDERLOAD_TOOL_CHECK__ = captures;
 
 // One scripted model turn sequence, fully offline:
-//   1. register modelProbe through the ordinary core toolRegistry;
-//   2. call modelProbe on the NEXT request without toolRequest/discovery;
-//   3. finish with text.
+//   1. discover/enable `toolRegistry` through the always-declared `toolRequest`;
+//   2. register modelProbe through that now-enabled toolRegistry;
+//   3. call modelProbe on the NEXT request, with NO second discovery round;
+//   4. finish with text.
 // Requests are recorded so the check can assert what the model was actually
 // offered, rather than trusting that "registration made it available".
-const modelRequests = [];
-const scriptedStream = async function* stream(request) {
+//
+// WHY THE FIRST TURN IS A DISCOVERY ROUND (not an accident of this script):
+// R9-R11 demoted eleven runtime rows, `toolRegistry` included, from declared core
+// to `visibility: 'searchable'` (src/tools/runtime/toolRegistry.tool.ts:45-49).
+// src/harness.ts `visibleCoreTools` (src/harness.ts:1899-1916) declares ONLY
+// `visibility === 'core'` definitions, and the call gate (src/harness.ts:7453-7463)
+// rejects a searchable call that the current enabled set does not contain with
+// `Tool "toolRegistry" is registered but not enabled yet.` So a published-source
+// harness that never ran toolRequest cannot have the model call toolRegistry at
+// all. Registration itself is unchanged, and a tool the model registers is
+// auto-enabled for it immediately (src/harness.ts:2228-2238), which is exactly the
+// "no second discovery round" behaviour asserted below.
+const modelRequests: any[] = [];
+const scriptedStream = async function* stream(request: any) {
     modelRequests.push(request);
     const turn = modelRequests.length;
 
     if (turn === 1) {
+        // Exact-name selector: deterministic, and independent of how many
+        // searchable fixtures the earlier host-side checks left registered.
+        yield {
+            type: 'done',
+            stopReason: 'tool_calls',
+            toolCalls: [
+                {
+                    id: 'model-discover',
+                    name: 'toolRequest',
+                    arguments: JSON.stringify({ names: ['toolRegistry'] })
+                }
+            ]
+        };
+        return;
+    }
+
+    if (turn === 2) {
         yield {
             type: 'done',
             stopReason: 'tool_calls',
@@ -580,7 +663,7 @@ const scriptedStream = async function* stream(request) {
         return;
     }
 
-    if (turn === 2) {
+    if (turn === 3) {
         yield {
             type: 'done',
             stopReason: 'tool_calls',
@@ -595,7 +678,7 @@ const scriptedStream = async function* stream(request) {
         return;
     }
 
-    if (turn === 3) {
+    if (turn === 4) {
         yield { type: 'text', delta: 'model finished' };
         yield { type: 'done', stopReason: 'stop', toolCalls: [] };
         return;
@@ -612,8 +695,8 @@ try {
 }
 
 // Fail with one actionable list before running the scenario. These are the
-// contracts the kernel owner must expose for the self-modification loop; a stale
-// dist that predates the feature is the most likely cause.
+// contracts the kernel owner must expose for the self-modification loop; a packed
+// tree that predates the feature (a stale `files` payload) is the most likely cause.
 await check('production harness exposes the self-modification API', () => {
     assert.equal(typeof H.registerTool, 'function', 'H.registerTool is missing');
     assert.equal(typeof H.callTool, 'function', 'H.callTool is missing');
@@ -795,7 +878,7 @@ const BRAND_NEW_PATH = 'tools/probe-auto/brandNew.tool.ts';
 await check('a brand-new .tool.ts is discovered and loadable with no inventory edit', async () => {
     writeSource(
         BRAND_NEW_PATH,
-        `// Brand-new package entry written by scripts/check-package-tools.mjs (T21).
+        `// Brand-new package entry written by scripts/check-package-tools.ts (T21).
 import { tool } from '../../core';
 
 // TWO properties on purpose: the single-property rule would hand \`execute\` the
@@ -870,13 +953,17 @@ export default brandNew;
 // ---------------------------------------------------------------------------
 
 const initialRegistryDefinition = H.tools.toolRegistry;
-// Guard the inspection call for a stale dist: the API check above reports the
+// Guard the inspection call against a packed tree that predates the feature: the API
+// check above reports the
 // missing method, and the scenario then fails per-check instead of crashing here.
 const initialRegistryRevision =
     typeof H.toolSource === 'function' ? H.toolSource('toolRegistry')?.revision : undefined;
 
-let probeV1Definition;
-let probeV1Revision;
+// Cross-check hand-off: each scenario step publishes what the next step must compare
+// against. The definition object comes from the untyped built bundle, so it stays `any`;
+// the revision is the kernel's source-record revision number, unset until its check runs.
+let probeV1Definition: any;
+let probeV1Revision: number | undefined;
 
 await check('H.executeTool registers a shipped editable source through toolRegistry', async () => {
     const result = await H.executeTool('toolRegistry', {
@@ -900,7 +987,7 @@ await check('H.executeTool registers a shipped editable source through toolRegis
     assert.equal(source.revision, result.revision);
     assert.match(source.revision, /^[0-9a-f]{16}$/);
     assert.deepEqual(
-        source.dependencies.map((dependency) => dependency.path),
+        source.dependencies.map((dependency: any) => dependency.path),
         [HELPER_PATH]
     );
     assert.match(source.dependencies[0].text, /helper-v1/);
@@ -923,7 +1010,10 @@ await check('H.executeTool registers a shipped editable source through toolRegis
 
 await check('V1 invocation receives the exact live harness and writes harness memory', async () => {
     const result = await H.executeTool('probe', { payload: 'host-v1' });
-    const captured = captures.at(-1);
+    // Indexing, not `.at(-1)`: this package's tsconfig `lib` stops at es2015.collection,
+    // so `Array.prototype.at` is outside the checked surface while the built bundle runs
+    // on a Node that has it. Same value, and it type-checks for a published consumer.
+    const captured = captures[captures.length - 1];
 
     assert.deepEqual(result, { revision: 1, helper: 'helper-v1', payload: 'host-v1' });
     assert.ok(captured && captured.kind === 'probe');
@@ -977,8 +1067,9 @@ await check('replacing nested from the same source path is observed by a live ca
     return { nestedRevisions: [nestedV1Revision, second.revision], observed: 'nested-v2' };
 });
 
-let probeV2Definition;
-let probeV2Revision;
+// Hand-off for the helper-only edit step (same shape as the V1 pair above).
+let probeV2Definition: any;
+let probeV2Revision: number | undefined;
 
 await check('helper-only edit changes the source revision and the installed behaviour', async () => {
     // Entry text is untouched between V1 and V2; only helper.ts changes. A source
@@ -1028,7 +1119,7 @@ await check('helper-only edit changes the source revision and the installed beha
     });
 
     const invocation = await H.executeTool('probe', { payload: 'host-v3' });
-    const captured = captures.at(-1);
+    const captured = captures[captures.length - 1];
     assert.deepEqual(invocation, { revision: 2, helper: 'helper-v2', payload: 'host-v3' });
     assert.equal(captured.harness, H);
     assert.deepEqual(captured.memoryRuns, ['host-v1', 'host-v2']);
@@ -1039,8 +1130,9 @@ await check('helper-only edit changes the source revision and the installed beha
     return { revision: result.revision, helper: 'helper-v2' };
 });
 
-let probeV3Definition;
-let probeV3Revision;
+// Hand-off for the V3 edit step (same shape as the V1 pair above).
+let probeV3Definition: any;
+let probeV3Revision: number | undefined;
 
 await check('V3 edits entry and helper on the same path and preserves harness state', async () => {
     writeSource(HELPER_PATH, helperSource(3));
@@ -1077,7 +1169,7 @@ await check('V3 edits entry and helper on the same path and preserves harness st
     assert.equal(H.tools.probe.description, 'Fixture probe V3');
 
     const invocation = await H.executeTool('probe', { payload: 'host-v4' });
-    const captured = captures.at(-1);
+    const captured = captures[captures.length - 1];
     assert.deepEqual(invocation, { revision: 3, helper: 'helper-v3', payload: 'host-v4' });
     assert.equal(captured.harness, H);
     assert.equal(captured.agent, writer);
@@ -1174,33 +1266,69 @@ await check('failed registration of a NEW name creates no entry', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Model path: register through toolRegistry, then call without discovery
+// Model path: discover toolRegistry, register a tool, then call it without a
+// second discovery round
 // ---------------------------------------------------------------------------
 
-await check('scripted model registers and invokes a tool without a discovery round', async () => {
+await check('scripted model discovers toolRegistry, registers a tool, and invokes it without a second discovery round', async () => {
     const answer = await H('go');
 
     assert.equal(answer.content, 'model finished');
     assert.equal(answer.stopReason, 'stop');
     assert.deepEqual(answer.toolCalls, []);
-    assert.equal(modelRequests.length, 3);
+    assert.equal(modelRequests.length, 4);
 
-    assert.ok(
-        modelRequests[0].tools.some((declaration) => declaration.name === 'toolRegistry'),
-        'the first request did not declare the core toolRegistry tool'
-    );
-    assert.ok(
-        modelRequests[1].tools.some((declaration) => declaration.name === 'modelProbe'),
-        'modelProbe was not declared on the request immediately after registration'
+    // The declared names are part of the failure message on purpose: whether a core tool
+    // is missing entirely or was evicted by the session's enabled-tool cap changes the
+    // diagnosis, and this scenario has to say which one happened.
+    const declaredNames = (index: number): string[] => (modelRequests[index]?.tools ?? []).map((declaration: any) => declaration.name);
+    const declares = (index: number, name: string): boolean =>
+        modelRequests[index].tools.some((declaration: any) => declaration.name === name);
+
+    // Request 1: only the standing core set is declared. `toolRequest` is the entry
+    // point for everything else, and `toolRegistry` is deliberately NOT declared here
+    // (R9-R11 searchable demotion; see the scriptedStream comment above).
+    assert.equal(
+        declares(0, 'toolRequest'),
+        true,
+        `the first request did not declare the core toolRequest tool (declared: ${declaredNames(0).join(', ')})`
     );
     assert.equal(
-        modelRequests[1].tools.some((declaration) => declaration.name === 'toolRequest'),
+        declares(0, 'toolRegistry'),
+        false,
+        `toolRegistry is searchable and must not be declared before it is enabled (declared: ${declaredNames(0).join(', ')})`
+    );
+
+    // Request 2: the toolRequest enable took effect, so the registry is now declared.
+    assert.equal(
+        declares(1, 'toolRegistry'),
+        true,
+        `toolRegistry was not declared after toolRequest enabled it (declared: ${declaredNames(1).join(', ')})`
+    );
+
+    // Request 3: the tool the model just registered is declared WITHOUT another
+    // discovery round, which is the self-modification contract this check exists for.
+    assert.equal(
+        declares(2, 'modelProbe'),
+        true,
+        `modelProbe was not declared on the request immediately after registration (declared: ${declaredNames(2).join(', ')})`
+    );
+    assert.equal(
+        declares(2, 'toolRequest'),
         true,
         'the core discovery tool disappeared from the request'
     );
 
+    // Request 4: the enabled searchable set is stable across the finishing turn; the
+    // cap is per turn, so nothing may have been evicted mid-scenario.
+    assert.deepEqual(
+        declaredNames(3),
+        declaredNames(2),
+        'the declared tool set changed between the invocation turn and the finishing turn'
+    );
+
     const registration = JSON.parse(
-        writer.messages.find((message) => message.role === 'tool' && message.toolCallId === 'model-register').content
+        writer.messages.find((message: any) => message.role === 'tool' && message.toolCallId === 'model-register').content
     );
     assert.equal(registration.name, 'modelProbe');
     assert.equal(registration.created, true);
@@ -1209,17 +1337,20 @@ await check('scripted model registers and invokes a tool without a discovery rou
     assert.deepEqual(registration.checks, EXPECTED_CHECKS);
 
     const invocation = writer.messages.find(
-        (message) => message.role === 'tool' && message.toolCallId === 'model-invoke'
+        (message: any) => message.role === 'tool' && message.toolCallId === 'model-invoke'
     );
     assert.equal(invocation.name, 'modelProbe');
     assert.equal(invocation.content, '{"revision":"model-probe","payload":"from-model"}');
 
-    const captured = captures.filter((entry) => entry.kind === 'model-probe').at(-1);
+    // The discovery turn is part of the transcript, so the modelProbe fixture sees
+    // two more messages than the registration turn alone would produce.
+    const modelProbeCaptures = captures.filter((entry) => entry.kind === 'model-probe');
+    const captured = modelProbeCaptures[modelProbeCaptures.length - 1];
     assert.ok(captured, 'modelProbe did not record its execution context');
     assert.equal(captured.harness, H);
     assert.equal(captured.agent, writer);
     assert.equal(captured.agents, H.agents);
-    assert.equal(captured.messages, 4);
+    assert.equal(captured.messages, 6);
     assert.deepEqual(captured.memoryRuns, [
         'host-v1',
         'host-v2',
@@ -1229,16 +1360,16 @@ await check('scripted model registers and invokes a tool without a discovery rou
     ]);
 
     assert.deepEqual(
-        writer.messages.map((message) => message.role),
-        ['user', 'assistant', 'tool', 'assistant', 'tool', 'assistant']
+        writer.messages.map((message: any) => message.role),
+        ['user', 'assistant', 'tool', 'assistant', 'tool', 'assistant', 'tool', 'assistant']
     );
     assert.equal(writer.messages[0].content, 'go');
-    assert.equal(writer.messages[5].content, 'model finished');
+    assert.equal(writer.messages[7].content, 'model finished');
     assert.equal(H.memory.get('probe-runs').length, 5);
 
     return {
         requests: modelRequests.length,
-        declaredAfterRegistration: modelRequests[1].tools.some((tool) => tool.name === 'modelProbe'),
+        declaredAfterRegistration: declares(2, 'modelProbe'),
         result: invocation.content
     };
 });
@@ -1274,8 +1405,9 @@ await check('toolRegistry V1 replaces itself with V2 while its invocation comple
     return { from: initialRegistryRevision, to: result.revision };
 });
 
-let registryV2Definition;
-let registryV2Revision;
+// Hand-off for the registry-replacement step (same shape as the probe pairs above).
+let registryV2Definition: any;
+let registryV2Revision: number | undefined;
 
 await check('replacement registry V2 registers another tool through the harness kernel', async () => {
     registryV2Definition = H.tools.toolRegistry;
@@ -1364,10 +1496,10 @@ await check('replacement registry V2 replaces itself with V3, then V3 registers 
     assert.deepEqual(invocation, { ok: true, payload: 'child-v3' });
 
     const sources = H.toolSources();
-    assert.ok(sources.some((source) => source.name === 'toolRegistry' && source.sourcePath === REGISTRY_V3_PATH));
-    assert.ok(sources.some((source) => source.name === 'registryChild'));
-    assert.ok(sources.some((source) => source.name === 'registryChildTwo'));
-    assert.ok(sources.some((source) => source.name === 'registryChildThree'));
+    assert.ok(sources.some((source: any) => source.name === 'toolRegistry' && source.sourcePath === REGISTRY_V3_PATH));
+    assert.ok(sources.some((source: any) => source.name === 'registryChild'));
+    assert.ok(sources.some((source: any) => source.name === 'registryChildTwo'));
+    assert.ok(sources.some((source: any) => source.name === 'registryChildThree'));
 
     return {
         registry: ['tools/runtime/toolRegistry.tool.ts', REGISTRY_V2_PATH, REGISTRY_V3_PATH],
@@ -1410,8 +1542,8 @@ await check('all tool contexts saw one strict-identical harness and intact state
         'after-failures'
     ]);
     assert.deepEqual(
-        writer.messages.map((message) => message.role),
-        ['user', 'assistant', 'tool', 'assistant', 'tool', 'assistant']
+        writer.messages.map((message: any) => message.role),
+        ['user', 'assistant', 'tool', 'assistant', 'tool', 'assistant', 'tool', 'assistant']
     );
 
     const probeSource = H.toolSource('probe');

@@ -78,7 +78,7 @@
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { Worker } from 'node:worker_threads';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import {
     IO_HANDSHAKE_MS,
     IO_MAX_FRAME_BYTES,
@@ -93,28 +93,22 @@ import {
     type IoOperationKind,
     type IoReply
 } from './io-protocol';
+import { openHarnessWorkerSession } from './worker-runner';
 
-// The filename the build must emit for the IO worker entry, and the package subpath a
-// consumer addresses it by. `resolveIoWorkerEntry` owns the lookup chain and the exact
-// message an operator gets when neither exists.
-export const IO_WORKER_DIST_FILE = 'underload-harness.io-worker.mjs';
-// Matches the lane worker's published subpath shape (`"./worker"` -> 
-// dist/underload-harness.worker.mjs), so both worker entries are addressed the same way.
+// The package subpath a consumer addresses the IO worker entry by. `resolveIoWorkerEntry`
+// owns the lookup chain and the exact message an operator gets when it does not resolve.
+// There is no `dist/` filename to emit: this package publishes TypeScript source, and the
+// entry is loaded through the Vite module runner (./worker-boot.mjs), so the subpath target
+// IS the production entry.
 export const IO_WORKER_PACKAGE_SPECIFIER = '@underload/harness/io-worker';
 
-// How a resolved entry will be loaded. `source` means the `.ts` entry: Node can evaluate it
-// (type stripping) as long as the spawn adds `IO_WORKER_SOURCE_EXEC_ARGV` and the entry
-// installs its own resolver hooks (./io-worker.ts). That is what makes worker IO usable in
-// dev, under `vite-node`, and in a test run with no build - the same arrangement
-// ./lane-host.ts uses for the lane worker, so the two workers load alike.
-export type IoWorkerEntryMode = 'explicit' | 'env' | 'package' | 'built' | 'source';
+// How a resolved entry got its path. Every entry is loaded the same way now - a `.ts`
+// module through the shared Vite runner - so this records only HOW the path was chosen
+// (operator override vs package resolution vs checkout layout), which is what an operator
+// reading a `worker-entry-missing` message needs.
+export type IoWorkerEntryMode = 'explicit' | 'env' | 'package' | 'source';
 
 export type IoWorkerEntry = { path: string; mode: IoWorkerEntryMode };
-
-// The execArgv a SOURCE-mode worker needs. `persistence.ts` and `journal.ts` declare errors
-// with parameter properties (`constructor(readonly file: string, ...)`), which plain type
-// stripping refuses; the transform handles them.
-export const IO_WORKER_SOURCE_EXEC_ARGV = ['--experimental-transform-types'];
 
 // Bounded wait for the `bye` acknowledgement during `close()`. Operations complete
 // synchronously inside the worker, so `bye` arrives as soon as the frames posted ahead
@@ -286,15 +280,15 @@ export const ioWorkerEnvironment = (): { available: boolean; message?: string } 
     return { available: true };
 };
 
-// The sentence every entry failure ends with: what the build must emit, and the two
-// ways to point elsewhere. Owned here because this client is the only party that knows
-// what it looked for.
+// The sentence every entry failure ends with: what the entry has to be, and the two ways
+// to point elsewhere. Owned here because this client is the only party that knows what it
+// looked for.
 export const ioWorkerEntryHelp = (): string =>
-    `Emit the worker entry from the build (a vite library entry named "io-worker" -> dist/${IO_WORKER_DIST_FILE}, ESM, node builtins external) and map it as the package subpath "${IO_WORKER_PACKAGE_SPECIFIER}", or point HARNESS_IO_WORKER_ENTRY / the "entry" option at a built file. Without a build the client falls back to the SOURCE entry (./io-worker.ts) and spawns it with ${IO_WORKER_SOURCE_EXEC_ARGV.join(' ')}; that is the dev/test path, and it is the same arrangement ./lane-host.ts uses for the lane worker.`;
+    `Point HARNESS_IO_WORKER_ENTRY / the "entry" option at the worker entry module (the package ships it as TypeScript source at "src/server/workers/io-worker.ts", published as the package subpath "${IO_WORKER_PACKAGE_SPECIFIER}"), or unset both and let this client resolve the package's own entry. The thread loads whatever path is resolved through the harness Vite runner (./worker-boot.mjs), so no build step and no Node flag is involved.`;
 
 // Every candidate this resolver tries, in order, with the mode it would load it in.
-// Exported for the build-side check and for ./io-client.test.ts, which asserts the chain
-// instead of hoping it matches the build.
+// Exported for the packaging check and for ./io-client.test.ts, which asserts the chain
+// instead of hoping it matches the published layout.
 export const ioWorkerEntryCandidates = (): IoWorkerEntry[] => {
     const candidates: IoWorkerEntry[] = [{ path: IO_WORKER_PACKAGE_SPECIFIER, mode: 'package' }];
 
@@ -307,18 +301,10 @@ export const ioWorkerEntryCandidates = (): IoWorkerEntry[] => {
         }
     };
 
-    // BUNDLED: this module lives in <pkg>/dist/, beside the emitted worker entry.
-    add(`./${IO_WORKER_DIST_FILE}`, 'built');
-
-    // SOURCE CHECKOUT (vitest / vite-node): the package's own dist directory, three levels
-    // up from src/server/workers.
-    add(`../../../dist/${IO_WORKER_DIST_FILE}`, 'built');
-
-    // SOURCE: the entry module itself, beside this file in a checkout...
+    // SOURCE CHECKOUT and published `src/` install alike: the entry module beside this file.
+    // There is no sibling `dist/` arm and no "../src" arm - those existed for a bundled
+    // layout this package does not publish, and from here they could never resolve.
     add('./io-worker.ts', 'source');
-
-    // ...and, for an installed package whose `files` list ships src/, one directory up.
-    add('../src/server/workers/io-worker.ts', 'source');
 
     return candidates;
 };
@@ -349,7 +335,7 @@ export const resolveIoWorkerEntry = (options: { entry?: string | URL; env?: Reco
             throw new HarnessIoError('worker-entry-missing', `The configured IO worker entry does not exist: ${explicit}. ${ioWorkerEntryHelp()}`, explicit);
         }
 
-        return { path: explicit, mode: explicit.endsWith('.ts') ? 'source' : 'explicit' };
+        return { path: explicit, mode: 'explicit' };
     }
 
     const env = options.env ?? (typeof process === 'undefined' ? undefined : process.env);
@@ -361,22 +347,24 @@ export const resolveIoWorkerEntry = (options: { entry?: string | URL; env?: Reco
             throw new HarnessIoError('worker-entry-missing', `HARNESS_IO_WORKER_ENTRY points at a file that does not exist: ${fromEnv}. ${ioWorkerEntryHelp()}`, fromEnv);
         }
 
-        return { path: fromEnv, mode: fromEnv.endsWith('.ts') ? 'source' : 'env' };
+        return { path: fromEnv, mode: 'env' };
     }
 
-    // 3. The published package subpath, when the exports map carries it.
+    // 3. The published package subpath, when the exports map carries it. In this package the
+    // subpath targets TypeScript source, so this is the entry - not a stand-in for a build.
     try {
         const resolved = createRequire(import.meta.url).resolve(IO_WORKER_PACKAGE_SPECIFIER);
 
-        if (exists(resolved)) return { path: resolved, mode: resolved.endsWith('.ts') ? 'source' : 'package' };
+        if (exists(resolved)) return { path: resolved, mode: 'package' };
     } catch {
         // ERR_PACKAGE_PATH_NOT_EXPORTED / ERR_MODULE_NOT_FOUND: not published (yet), so the
         // local candidates below are the honest next step.
         tried.push(`require.resolve(${IO_WORKER_PACKAGE_SPECIFIER})`);
     }
 
-    // 4/5/6/7. The built file next to this module or in the package's dist, then the source
-    // entry. A build always wins over a source file: production runs the bundle.
+    // 4. The entry module beside this file. The chain is explicit-override first and package
+    // resolution second because those are the two ways an operator can point elsewhere; the
+    // neighbouring file is the last resort of a plain checkout.
     for (const candidate of ioWorkerEntryCandidates()) {
         if (candidate.mode === 'package') continue;
 
@@ -415,18 +403,25 @@ export const openHarnessIoClient = (options: HarnessIoClientOptions): HarnessIoC
 
     const maxFrameBytes = positiveOr(options.maxFrameBytes, IO_MAX_FRAME_BYTES);
     const maxPendingOps = atLeastZeroOr(options.maxPendingOps, 0);
-    const resolution = resolveIoWorkerEntry({ entry: options.entry, env: options.env });
-    const entry = resolution.path;
+    const { path: entry } = resolveIoWorkerEntry({ entry: options.entry, env: options.env });
 
-    const worker = new Worker(pathToFileURL(entry), {
-        // A SOURCE entry needs Node's type transform (./io-worker.ts installs the resolver
-        // hooks that go with it); a built bundle needs no execArgv at all. Same division
-        // ./lane-host.ts:315 makes for the lane worker.
-        ...(resolution.mode === 'source' ? { execArgv: [...IO_WORKER_SOURCE_EXEC_ARGV] } : {}),
+    // The thread is spawned with the plain-JS bootstrap (./worker-boot.mjs), which starts
+    // Vite's module runner and imports `entry` (`.ts`) from the process-wide runner server
+    // (./worker-runner.ts). The IO protocol is untouched: the boot marker and the frame limit
+    // are still the workerData this client has always sent, and `entry`/`port` are additive.
+    const runner = openHarnessWorkerSession(entry);
+
+    const worker = new Worker(runner.bootScript, {
         // The boot marker is what lets the loop attach a message loop only when THIS client
         // spawned it, so importing the loop from a test that itself runs in a worker thread
         // stays side-effect free.
-        workerData: { [IO_WORKER_BOOT_KEY]: IO_PROTOCOL_VERSION, maxFrameBytes }
+        workerData: {
+            entry: runner.entryUrl,
+            port: runner.transportPort,
+            [IO_WORKER_BOOT_KEY]: IO_PROTOCOL_VERSION,
+            maxFrameBytes
+        },
+        transferList: [runner.transportPort]
     });
 
     const callIds = createIoCallIds();
@@ -895,7 +890,7 @@ export const openHarnessIoClient = (options: HarnessIoClientOptions): HarnessIoC
                 hello?.reject(
                     new HarnessIoError(
                         'protocol-version',
-                        `The IO worker entry ${entry} speaks protocol version ${data.version}; this server requires ${IO_PROTOCOL_VERSION}. Rebuild the worker entry: a stale dist/ bundle against fresh sources mis-parses receipts.`,
+                        `The IO worker entry ${entry} speaks protocol version ${data.version}; this server requires ${IO_PROTOCOL_VERSION}. The entry and the server must come from the same checkout: mismatched sources mis-parse receipts.`,
                         entry
                     )
                 );
@@ -946,6 +941,10 @@ export const openHarnessIoClient = (options: HarnessIoClientOptions): HarnessIoC
 
     worker.on('exit', (code: number) => {
         clearTimeout(handshakeTimer);
+
+        // The thread is gone, so its module-runner port is dead: release it, and with the
+        // last live worker the shared Vite runner server closes too (./worker-runner.ts).
+        runner.dispose();
 
         const reported = new HarnessIoError('worker-exited', `The IO worker exited (code ${code}); its outstanding writes are not known to be durable.`, entry);
 
@@ -1230,6 +1229,10 @@ export const openHarnessIoClient = (options: HarnessIoClientOptions): HarnessIoC
                 // synchronously before its reply, so terminating now cannot cut a write
                 // in half - it can only drop work the worker was never told to do.
                 await worker.terminate().catch(() => undefined);
+
+                // The runner port belongs to this thread; nothing is served on it once the
+                // thread is terminated.
+                runner.dispose();
 
                 return { drained, failures };
             })();

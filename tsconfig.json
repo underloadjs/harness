@@ -9,17 +9,20 @@
         "target": "ESNext",
         "moduleResolution": "bundler",
         // `src/frontend/vite.config.ts` is loaded natively by Vite, which requires
-        // explicit extensions; it imports `./vite-proxy.ts`. Both compiler modes
-        // here are no-emit or declaration-only, so this is safe for the package.
+        // explicit extensions; it imports `./vite-proxy.ts`. The package publishes
+        // TypeScript source, so this config never emits — the only mode is the
+        // `tsc --noEmit` type check, and the option below requires that.
         "allowImportingTsExtensions": true,
         "jsx": "react",
         "skipLibCheck": true,
         "allowJs": true,
         "experimentalDecorators": true,
-        "declaration": true,
+        // Source-only publish (no `dist/`, no `.d.ts`): a consumer's editor and
+        // `tsc` read these `src/*.ts` files directly through the `types` conditions,
+        // so there is no declaration pipeline to run.
+        "noEmit": true,
         "esModuleInterop": true,
         "strict": true,
-        "outDir": "./dist",
         "lib": ["decorators", "dom", "es5", "scripthost", "es2015.collection"],
         "types": ["node", "vitest/globals"],
         // Tests import the package by name, never by relative path. Mirror the

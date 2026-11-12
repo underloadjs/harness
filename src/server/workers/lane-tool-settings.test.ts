@@ -85,7 +85,6 @@ import type { RunnerSettings } from '../harnesses/types';
 import type { SessionTurn } from '../protocol';
 import type { LaneBlueprintSource } from './lane-host';
 import { lanePluginSettingsProvider, laneToolSettingsProvider } from './lane-worker-loop';
-import { buildTestWorkerEntry } from './worker-test-build.test-support';
 
 // Worker mode is the deployment under test, and `blueprintFor` is only ever consumed by a
 // lane, so an inline store would assert a path no worker reads. Nothing is dispatched here,
@@ -521,14 +520,10 @@ describe('R3 parity: the scripted demo factory forwards both deployment-wide swi
 // provider was actually sent.
 // ---------------------------------------------------------------------------
 
-// The SOURCE worker entry, exactly as ./lane-worker.test.ts pins it: `dist/` is only as
-// fresh as the last build, so a bundle would let this test assert yesterday's worker. On a
-// Node build without the type transform, the Vite-built entry from
-// ./worker-test-build.test-support.ts is the same code the build would ship.
-const SOURCE_WORKER_ENTRY = fileURLToPath(new URL('./lane-worker.ts', import.meta.url));
-const SOURCE_WORKER_SUPPORTED = (process.features as { typescript?: string | false }).typescript !== false;
-const BUILT_TEST_WORKER = SOURCE_WORKER_SUPPORTED ? undefined : await buildTestWorkerEntry(SOURCE_WORKER_ENTRY);
-const WORKER_ENTRY = BUILT_TEST_WORKER?.entry ?? SOURCE_WORKER_ENTRY;
+// The worker entry, exactly as ./lane-worker.test.ts pins it: the source module, imported by
+// the thread through the Vite module runner. There is no bundle in this package's publishing
+// model, so nothing here can silently assert yesterday's worker.
+const WORKER_ENTRY = fileURLToPath(new URL('./lane-worker.ts', import.meta.url));
 
 const LANE_RUNTIME: ServerRuntimeConfiguration = {
     ...WORKER_RUNTIME,
@@ -642,8 +637,6 @@ afterAll(async () => {
     // Give every `terminate()` a tick to land, so a closing vitest pool cannot race a live
     // worker (a leaked worker keeps the process alive, which is its own failure).
     await sleep(250);
-
-    BUILT_TEST_WORKER?.dispose();
 });
 
 describe('R3 lane propagation: a worker lane omits a disabled tool from its request toolset', () => {

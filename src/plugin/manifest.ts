@@ -2,7 +2,7 @@
 //
 // Regenerate with:
 //
-//   node scripts/generate-plugin-manifest.mjs
+//   yarn vite-node scripts/generate-plugin-manifest.ts
 //
 // WHY THIS FILE EXISTS
 // --------------------
@@ -16,8 +16,8 @@
 //
 // Cross-references:
 //   - ../plugins/**/*.plugin.ts                     — the authoritative metadata owners
-//   - ../../scripts/generate-plugin-manifest.mjs    — the scanner/generator
-//   - ../../scripts/plugin-manifest-render.mjs      — this renderer
+//   - ../../scripts/generate-plugin-manifest.ts    — the scanner/generator
+//   - ../../scripts/plugin-manifest-render.ts      — this renderer
 //   - ../plugin/host.ts                             — applies BUILTIN_PLUGINS first
 
 

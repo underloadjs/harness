@@ -2,7 +2,7 @@
 //
 // WHY THIS IS A SEPARATE, PURE MODULE
 // ----------------------------------
-// `scripts/generate-tool-manifest.mjs` scans the tools tree and writes
+// `scripts/generate-tool-manifest.ts` scans the tools tree and writes
 // `src/core/tool-manifest.ts`. The parity test (`src/core/tool-discovery.test.ts`)
 // must prove the COMMITTED BYTES are current, and the cheapest honest way to do
 // that is to render the expected text in-process and compare it with the file. That
@@ -14,7 +14,7 @@
 // with the SAME descriptor list, which is what makes the check meaningful.
 //
 // Cross-references:
-//   - ../scripts/generate-tool-manifest.mjs — writes the rendered text
+//   - ../scripts/generate-tool-manifest.ts — writes the rendered text
 //   - ../src/core/tool-manifest.ts          — the generated artifact
 //   - ../src/core/tool-discovery.test.ts    — the parity assertion
 
@@ -24,7 +24,7 @@ export const MANIFEST_HEADER = `// GENERATED FILE — DO NOT EDIT (T19 / R8-R9).
 //
 // Regenerate with:
 //
-//   npx vite-node scripts/generate-tool-manifest.mjs
+//   yarn vite-node scripts/generate-tool-manifest.ts
 //
 // WHY THIS FILE EXISTS
 // --------------------
@@ -47,20 +47,26 @@ export const MANIFEST_HEADER = `// GENERATED FILE — DO NOT EDIT (T19 / R8-R9).
 //   - ../tools/**/*.tool.ts              — the authoritative metadata owners
 //   - ./tool-scan.ts                     — the AST reader that produced this file
 //   - ./metadata.ts                      — compatibility facade projecting this table
-//   - ../../scripts/generate-tool-manifest.mjs — the generator
-//   - ../../scripts/tool-manifest-render.mjs   — this renderer
+//   - ../../scripts/generate-tool-manifest.ts — the generator
+//   - ../../scripts/tool-manifest-render.ts   — this renderer
 //   - ../../tools/descriptors.ts         — the preset/runtime projections
 
 import type { BuiltinToolDescriptor } from './tool-metadata';
 
 `;
 
+// A generated row is any plain object: the scanner produces `BuiltinToolDescriptor`
+// rows and this renderer only walks `Object.entries()` of them, so the renderer stays
+// independent of the descriptor module (and of the TypeScript AST reader behind it).
+// `label` is the single required field because the generated loader switch keys on it.
+type RenderedDescriptor = { label: string } & Record<string, unknown>;
+
 // Deterministic JSON with 4-space indentation, matching the package's formatting.
 // Bare identifier keys are unquoted so the output reads like authored TypeScript.
-const renderValue = (value) =>
+const renderValue = (value: unknown): string =>
     JSON.stringify(value, null, 4).replace(/"([A-Za-z_][A-Za-z0-9_]*)":/g, '$1:');
 
-const renderDescriptor = (descriptor) => `{
+const renderDescriptor = (descriptor: RenderedDescriptor): string => `{
 ${Object.entries(descriptor)
     .map(([key, value]) => `    ${key}: ${renderValue(value).replace(/\n/g, '\n    ')}`)
     .join(',\n')}
@@ -69,16 +75,16 @@ ${Object.entries(descriptor)
 // `../tools/runtime/toolRequest.tool` from `tools/runtime/toolRequest.tool.ts`. The
 // label is package-relative on purpose; the loader is generated in src/core/, so the
 // specifier only has to be right relative to THAT file.
-export const specifierOf = (label) => `../tools/${label.replace(/^tools\//, '').replace(/\.ts$/, '')}`;
+export const specifierOf = (label: string): string => `../tools/${label.replace(/^tools\//, '').replace(/\.ts$/, '')}`;
 
 // Render the whole generated module. `descriptors` must already be filtered to
 // package rows and sorted in registration order (the caller's scan does that).
-export const renderManifest = (descriptors) => {
+export const renderManifest = (descriptors: readonly RenderedDescriptor[]): string => {
     const rows = descriptors.map(renderDescriptor).join(',\n');
 
     const loaderRows = descriptors
         .map(
-            (descriptor) =>
+            (descriptor: RenderedDescriptor) =>
                 `        case ${JSON.stringify(descriptor.label)}:\n            return import(${JSON.stringify(
                     specifierOf(descriptor.label)
                 )});`
@@ -102,7 +108,7 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
 ${loaderRows}
         default:
             return Promise.reject(
-                new Error(\`No generated tool loader for "\${label}". Regenerate with: npx vite-node scripts/generate-tool-manifest.mjs\`)
+                new Error(\`No generated tool loader for "\${label}". Regenerate with: yarn vite-node scripts/generate-tool-manifest.ts\`)
             );
     }
 };

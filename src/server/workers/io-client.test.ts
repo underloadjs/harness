@@ -1,10 +1,10 @@
 // Worker IO end to end, over a REAL worker thread (R1/R2/R4 acceptance).
 //
-// Every test here drives the coordinator-side client against an ACTUAL spawned worker:
-// the entry is built with the same vite library-build shape the build owner adds to the
-// package (see the `beforeAll` below), so the suite also proves the entry bundles
-// standalone, loads in a thread, and answers the handshake - which is precisely the
-// integration the build wiring depends on.
+// Every test here drives the coordinator-side client against an ACTUAL spawned worker running
+// the package's OWN entry: `src/server/workers/io-worker.ts`, loaded by the thread through
+// Vite's module runner (./worker-boot.mjs + ./worker-runner.ts). There is no built bundle in
+// this package's publishing model, so the suite exercises the only path that exists - which is
+// exactly the integration the build owner depends on.
 //
 // What is asserted, and why it is the acceptance list:
 //   - ordered save/journal/barrier: the queue, not the caller, guarantees a journal line
@@ -21,26 +21,20 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { build } from 'vite';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { HarnessJournal } from '../journal';
 import { HarnessPersistence, serializeHarnessDatabase } from '../persistence';
 import type { HarnessDatabase } from '../persistence';
 import {
     HarnessIoError,
-    IO_WORKER_DIST_FILE,
+    IO_WORKER_PACKAGE_SPECIFIER,
     createHarnessIoClient,
     ioWorkerEntryCandidates,
     openHarnessIoClient,
     resolveIoWorkerEntry
 } from './io-client';
 import type { HarnessIoClient, HarnessIoClientOptions } from './io-client';
-
-// A SOURCE-mode worker is plain `.ts` evaluated by Node's own TypeScript transform. A Node
-// build compiled without that transform cannot run this mode at all (the spawn's execArgv
-// cannot supply it), so the tests that pin the SOURCE entry are skipped on such a build;
-// the built-entry tests still run.
-const SOURCE_WORKER_SUPPORTED = (process.features as { typescript?: string | false }).typescript !== false;
+import { harnessRunnerServerStarted } from './worker-runner';
 
 // One directory deeper than ../journal.test.ts (src/server/workers), so the package
 // root is three levels up. Scratch still belongs in the REPO-root Temp/.
@@ -52,10 +46,11 @@ fs.mkdirSync(TEMP_ROOT, { recursive: true });
 
 const roots: string[] = [];
 const clients: HarnessIoClient[] = [];
-let buildDir = '';
 
-// The absolute path of the built worker entry, filled in by `beforeAll`.
-let entry = '';
+// The entry every suite here spawns: the package's own TypeScript entry, loaded by the
+// thread through the Vite module runner (./worker-boot.mjs). It is an explicit override only
+// so the suite is independent of the resolver chain - which its own tests assert below.
+const entry = path.resolve(__dirname, 'io-worker.ts');
 
 const tempRoot = (label: string): string => {
     const root = fs.mkdtempSync(path.join(TEMP_ROOT, `harness-io-client-${label}-`));
@@ -141,44 +136,12 @@ const openClient = async (root: string, options: Partial<HarnessIoClientOptions>
     return client;
 };
 
-beforeAll(async () => {
-    // Builds `src/server/workers/io-worker.ts` as an ESM library entry, exactly as the
-    // package build will (vite library entry name "io-worker" -> dist/<name>.mjs, node
-    // builtins external). If this fails, the worker mode cannot ship, and the message is
-    // a bundling failure rather than a test artefact.
-    buildDir = fs.mkdtempSync(path.join(TEMP_ROOT, 'harness-io-build-'));
-
-    await build({
-        configFile: false,
-        root: PACKAGE_ROOT,
-        logLevel: 'silent',
-        build: {
-            outDir: buildDir,
-            emptyOutDir: true,
-            minify: false,
-            sourcemap: false,
-            lib: {
-                entry: { 'io-worker': path.resolve(__dirname, 'io-worker.ts') },
-                formats: ['es']
-            },
-            rollupOptions: {
-                external: [/^node:/],
-                output: {
-                    entryFileNames: IO_WORKER_DIST_FILE,
-                    // The loop is a sibling CHUNK of the entry (the entry calls into it -
-                    // see ./io-worker.ts). `.mjs` keeps Node's module typing explicit
-                    // without relying on a nearby `"type": "module"`, which is what the
-                    // package's own dist does.
-                    chunkFileNames: 'io-worker-chunks/[name]-[hash].mjs'
-                }
-            }
-        }
-    });
-
-    entry = path.join(buildDir, IO_WORKER_DIST_FILE);
-
+beforeAll(() => {
+    // No build step: the entry is the module the runner imports. If this file is missing,
+    // worker IO cannot start at all, and the failure should name the entry rather than
+    // surface as a handshake timeout in every test below.
     expect(fs.existsSync(entry)).toBe(true);
-}, 120_000);
+});
 
 afterAll(async () => {
     for (const client of clients) {
@@ -186,15 +149,20 @@ afterAll(async () => {
     }
 
     for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
-
-    fs.rmSync(buildDir, { recursive: true, force: true });
 });
 
 describe('startup', () => {
-    it('spawns the built entry and speaks the protocol before doing any work', async () => {
+    it('spawns the source entry through the Vite runner and speaks the protocol before doing any work', async () => {
         const client = await openClient(tempRoot('start'));
 
         expect(client.entry).toBe(entry);
+        // AC8: proof that the thread really loaded a `.ts` entry through the Vite module
+        // runner. The entry ends in `.ts` (raw Node cannot even parse that), and the shared
+        // runner server exists - it is created ONLY by `openHarnessWorkerSession`, so a
+        // silent fallback to some other loader would leave it false while the round trip
+        // below (the handshake) still succeeded.
+        expect(entry.endsWith('.ts')).toBe(true);
+        expect(harnessRunnerServerStarted()).toBe(true);
         expect(client.isOpen()).toBe(true);
         // `hello` is a control frame, not an operation: until it is answered the client
         // has performed no work, so every operation counter is still zero (a worker that
@@ -247,14 +215,15 @@ describe('startup', () => {
             // elsewhere; a bare ENOENT would not.
             expect((error as HarnessIoError).message).toContain(missing);
             expect((error as HarnessIoError).message).toContain('HARNESS_IO_WORKER_ENTRY');
-            expect((error as HarnessIoError).message).toContain(IO_WORKER_DIST_FILE);
+            expect((error as HarnessIoError).message).toContain(IO_WORKER_PACKAGE_SPECIFIER);
         }
 
         expect(resolveIoWorkerEntry({ entry }).path).toBe(entry);
-        // An override is reported as `explicit`, and only a `.ts` path flips the spawn into
-        // source mode (the execArgv the entry's resolver hooks need).
+        // An override is reported as `explicit` whatever its extension: every entry - `.ts`
+        // or otherwise - is now loaded through the runner, so the extension no longer selects
+        // a loader (there is only one).
         expect(resolveIoWorkerEntry({ entry }).mode).toBe('explicit');
-        expect(resolveIoWorkerEntry({ entry: path.resolve(__dirname, 'io-worker.ts') }).mode).toBe('source');
+        expect(resolveIoWorkerEntry({ entry: path.resolve(__dirname, 'io-worker.ts') }).mode).toBe('explicit');
         expect(() => resolveIoWorkerEntry({ env: { HARNESS_IO_WORKER_ENTRY: path.join(root, 'gone.mjs') } })).toThrow(/HARNESS_IO_WORKER_ENTRY points at a file that does not exist/);
     });
 
@@ -288,11 +257,10 @@ describe('startup', () => {
         expect(new HarnessJournal(path.join(root, 'harness'), 'sess-early').read().events).toHaveLength(1);
     });
 
-    it.skipIf(!SOURCE_WORKER_SUPPORTED)('runs a SOURCE-mode worker, so dev and test need no build', async () => {
-        // The same acceptance path as the bundle, loaded as `src/**.ts`: the entry installs
-        // resolve hooks and the client adds `--experimental-transform-types` (the shape
-        // ./lane-host.ts already uses). If this breaks, worker IO cannot run under
-        // `vite-node`, and the built-entry fallback is the only thing keeping dev alive.
+    it('runs the .ts entry end to end, so dev and test need no build', async () => {
+        // The one load path that exists: `src/**.ts` through the runner. If this breaks,
+        // worker IO cannot run under `vite-node` (the dev path this migration exists for),
+        // and there is no built-entry fallback left to catch it.
         const root = tempRoot('source-entry');
         const sourceEntry = path.resolve(__dirname, 'io-worker.ts');
 
@@ -317,23 +285,22 @@ describe('startup', () => {
         expect(await client.close()).toEqual({ drained: 1, failures: [] });
     });
 
-    it('lists the resolution chain the build has to satisfy', () => {
+    it('lists the resolution chain a checkout and a published src/ install both satisfy', () => {
         const candidates = ioWorkerEntryCandidates();
 
         expect(candidates[0]).toEqual({ path: '@underload/harness/io-worker', mode: 'package' });
-        // The built entry next to this module, the package dist copy, and the two source
-        // spellings - in that priority order, because production must run a bundle even in
-        // a checkout that has both.
-        expect(candidates.map((candidate) => candidate.mode)).toEqual(['package', 'built', 'built', 'source', 'source']);
-        expect(candidates[2].path).toBe(path.join(PACKAGE_ROOT, 'dist', IO_WORKER_DIST_FILE));
-        expect(candidates[3].path).toBe(path.resolve(__dirname, 'io-worker.ts'));
-        expect(candidates.length).toBe(5);
+        // The published subpath, then the entry beside this module. There is no `dist/` arm:
+        // this package publishes TypeScript source, and the runner loads it directly.
+        expect(candidates.map((candidate) => candidate.mode)).toEqual(['package', 'source']);
+        expect(candidates[1].path).toBe(path.resolve(__dirname, 'io-worker.ts'));
+        expect(candidates.length).toBe(2);
     });
 
-    it.skipIf(!SOURCE_WORKER_SUPPORTED)('resolves the entry the way a checkout is laid out right now', async () => {
-        // With no override at all, either the built entry exists (and the client starts
-        // from it) or the failure names every candidate. Both are assertions; guessing
-        // one would make the suite depend on another owner's build state.
+    it('resolves the entry the way a checkout is laid out right now', async () => {
+        // With no override at all the resolver must find a real `.ts` entry (the published
+        // package subpath or the file beside `io-client.ts`) or fail naming every candidate.
+        // Both branches are assertions; hard-coding one would make the suite depend on how
+        // this repo's workspace links happen to be laid out.
         const root = tempRoot('default-entry');
 
         let resolved: string | undefined;
@@ -357,7 +324,9 @@ describe('startup', () => {
             }
         }
 
-        if (resolved !== undefined) expect(ioWorkerEntryCandidates().some((candidate) => candidate.path === resolved)).toBe(true);
+        // AC8 again, from the other side: the DEFAULT resolution is a `.ts` module - the
+        // runner's entry - not a bundle and not a flag-enabled Node mode.
+        if (resolved !== undefined) expect(resolved.endsWith(`${path.sep}io-worker.ts`)).toBe(true);
     });
 });
 

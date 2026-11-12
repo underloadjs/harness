@@ -36,9 +36,10 @@
 // ENTRY RESOLUTION (no silent inline fallback)
 // --------------------------------------------
 // `threadExecution: 'worker'` must really isolate, so the entry is resolved explicitly: the
-// operator's `workerEntry`, else the built `dist/` bundle, else the source module (dev/test,
-// where the entry installs its own resolver hooks). A missing entry is a ServerRuntimeError
-// naming both candidate paths - not a session quietly executed inline.
+// operator's `workerEntry`, else the package's own `src/server/workers/lane-worker.ts`. There is
+// no built bundle to prefer - this package publishes TypeScript source and is run through Vite,
+// so the `.ts` entry IS the production artifact. A missing entry is a ServerRuntimeError naming
+// what was looked for - not a session quietly executed inline.
 //
 // Cross-references:
 //   - ./lane-authority.ts   - the canonical state every frame is applied to
@@ -58,6 +59,7 @@ import type { IdentityLease } from './lane-identity';
 import type { LaneBlueprint, LaneCommand, LaneRegistryChange, LaneReply } from './protocol';
 import { LANE_PROTOCOL_VERSION, createSequence, describeEnvelope, isLaneEnvelope, isLaneReplyKind } from './protocol';
 import { laneWorkerEnvironment } from './capability';
+import { openHarnessWorkerSession, type HarnessWorkerSession } from './worker-runner';
 
 // Ids a lane mints locally, reserved per lane at hello. A lane that outgrows its reservation
 // asks for another with a `lease` request; 512 covers a long-lived conversation without a
@@ -152,40 +154,35 @@ export type LaneHost = {
     // Live lanes, so a deployment can prove what is isolated (and an operator can see it).
     lanes(): { sessionKey: string; role: string; epoch: number; busy: boolean }[];
     runtime: ServerRuntimeConfiguration;
-    entry(): { path: string; mode: 'explicit' | 'built' | 'source' };
+    entry(): { path: string };
 };
 
 // Resolve the worker entry once per host (it cannot move while the server runs).
 //
-// T10 finding S9: an explicit entry that NAMES a `.ts` file is the source-mode entry, whatever
-// `dist/` holds. That spelling is what lets a test (or a dev server) pin the CURRENT worker
-// code instead of a bundle built earlier - the integration suite was otherwise running the
-// worker from a stale `dist/`, where a source change is invisible until someone happens to
-// rebuild. A `.mjs` entry keeps the built-bundle contract, including its protocol check.
-const resolveEntry = (runtime: ServerRuntimeConfiguration): { path: string; mode: 'explicit' | 'built' | 'source' } => {
+// The entry is the SOURCE module, and the thread loads it through Vite's module runner
+// (./worker-boot.mjs + ./worker-runner.ts) - there is no built bundle in this package's
+// publishing model, so there is no `dist/` arm to try first and no Node flag to add.
+//
+// T10 finding S9 still applies to the override: an operator may pin an entry (a checkout
+// elsewhere, a scratch entry in a test), and that pin is honoured exactly - which is what
+// keeps the integration suite asserting the CURRENT worker code instead of an older copy.
+const resolveEntry = (runtime: ServerRuntimeConfiguration): { path: string } => {
     if (runtime.workerEntry !== undefined) {
         if (!existsSync(runtime.workerEntry)) {
             throw new ServerRuntimeError(
-                `workerEntry names "${runtime.workerEntry}", which does not exist. Build the package ("yarn build") or leave HARNESS_WORKER_ENTRY unset.`
+                `workerEntry names "${runtime.workerEntry}", which does not exist. Leave HARNESS_WORKER_ENTRY unset to use the package's own worker entry.`
             );
         }
 
-        return { path: runtime.workerEntry, mode: runtime.workerEntry.endsWith('.ts') ? 'source' : 'explicit' };
+        return { path: runtime.workerEntry };
     }
 
-    const built = packagePath('dist', 'underload-harness.worker.mjs');
-
-    if (existsSync(built)) return { path: built, mode: 'built' };
-
-    // Source mode: vitest and `vite-node` run before any build exists. The entry installs
-    // resolve hooks for the extension-less specifiers this repo uses, so a plain `new
-    // Worker(...)` under Node can evaluate the graph.
     const source = packagePath('src', 'server', 'workers', 'lane-worker.ts');
 
-    if (existsSync(source)) return { path: source, mode: 'source' };
+    if (existsSync(source)) return { path: source };
 
     throw new ServerRuntimeError(
-        `No lane-worker entry exists: neither "${built}" nor "${source}" was found. Build the package ("yarn build"), or set workerEntry / HARNESS_WORKER_ENTRY to the built worker file.`
+        `No lane-worker entry exists: "${source}" was not found. Set workerEntry / HARNESS_WORKER_ENTRY to the worker entry to load.`
     );
 };
 
@@ -254,6 +251,9 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         role: string;
         epoch: number;
         worker: Worker;
+        // The module-runner session behind this thread: its port is what lets the thread
+        // resolve and transform its `.ts` entry (./worker-runner.ts).
+        runner: HarnessWorkerSession;
         authority: LaneAuthority;
         ready: Promise<void>;
         settleReady: (error?: Error) => void;
@@ -372,9 +372,15 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
 
         // Settles when the worker thread is actually gone; every close path shares it, so a
         // turn or an invocation is never left hanging on a worker that will not answer.
+        // The runner session is released with the thread: its port is useless without the
+        // worker, and the last released session closes the shared Vite server (AC6/AC7).
         const termination = lane.worker.terminate().then(
-            () => undefined,
-            () => undefined
+            () => {
+                lane.runner.dispose();
+            },
+            () => {
+                lane.runner.dispose();
+            }
         );
 
         lane.termination = termination;
@@ -526,10 +532,20 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
             identities
         };
 
-        const worker = new Worker(entry.path, {
-            // Source mode needs Node's type transform; a built bundle needs no execArgv.
-            ...(entry.mode === 'source' ? { execArgv: ['--experimental-transform-types'] } : {}),
-            workerData: { laneEpoch: epoch, protocol: LANE_PROTOCOL_VERSION }
+        // The thread runs the plain-JS bootstrap (./worker-boot.mjs), which starts Vite's
+        // module runner and imports `entry.path` (`.ts`) from the shared parent-side server.
+        // The lane protocol is untouched: `laneEpoch`/`protocol` are still the boot marker,
+        // and `entry`/`port` are additive runner wiring on a SECOND port.
+        const runner = openHarnessWorkerSession(entry.path);
+
+        const worker = new Worker(runner.bootScript, {
+            workerData: {
+                entry: runner.entryUrl,
+                port: runner.transportPort,
+                laneEpoch: epoch,
+                protocol: LANE_PROTOCOL_VERSION
+            },
+            transferList: [runner.transportPort]
         });
 
         let settleReady: (error?: Error) => void = () => undefined;
@@ -547,6 +563,7 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
             role,
             epoch,
             worker,
+            runner,
             authority,
             ready,
             settleReady,
@@ -595,7 +612,7 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
                     if (raw.version !== LANE_PROTOCOL_VERSION) {
                         settleReady(
                             new ServerRuntimeError(
-                                `The lane worker speaks protocol v${raw.version}; this build speaks v${LANE_PROTOCOL_VERSION}. Rebuild the package so dist/ and the server agree.`
+                                `The lane worker speaks protocol v${raw.version}; this build speaks v${LANE_PROTOCOL_VERSION}. The worker entry and the server must come from the same checkout.`
                             )
                         );
                         closeWorker(lane, 'protocol-mismatch');

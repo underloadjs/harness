@@ -7,23 +7,23 @@
 // generated wiring in `src/plugin/manifest.ts`.
 //
 // This file is deliberately THIN: the discovery rules and the rendering live in
-// `./plugin-manifest-scan.mjs` and `./plugin-manifest-render.mjs`, both pure, so the
+// `./plugin-manifest-scan.ts` and `./plugin-manifest-render.ts`, both pure, so the
 // runtime test (`src/plugin/manifest.test.ts`) can re-run the exact same scanner and
 // compare bytes without spawning a subprocess. Duplicating the rules here is how a
 // generator and its parity test start to disagree.
 //
 // USAGE (from the package root):
 //
-//   node scripts/generate-plugin-manifest.mjs
-//   node scripts/generate-plugin-manifest.mjs --check
+//   yarn vite-node scripts/generate-plugin-manifest.ts
+//   yarn vite-node scripts/generate-plugin-manifest.ts --check
 //
 // `--check` exits non-zero when the committed manifest is stale. It is wired into
 // `npm test` and `npm run typecheck`, exactly like `tools:manifest:check`.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { discoverPluginEntries, PluginScanError } from './plugin-manifest-scan.mjs';
-import { renderManifest } from './plugin-manifest-render.mjs';
+import { discoverPluginEntries, PluginScanError } from './plugin-manifest-scan.ts';
+import { renderManifest } from './plugin-manifest-render.ts';
 
 const PACKAGE_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const OUTPUT = path.join(PACKAGE_ROOT, 'src', 'plugin', 'manifest.ts');
@@ -49,7 +49,7 @@ if (process.argv.includes('--check')) {
 
     if (current !== rendered) {
         console.error(
-            'src/plugin/manifest.ts is stale. Regenerate with: node scripts/generate-plugin-manifest.mjs'
+            'src/plugin/manifest.ts is stale. Regenerate with: yarn vite-node scripts/generate-plugin-manifest.ts'
         );
         process.exit(1);
     }

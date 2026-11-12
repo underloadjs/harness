@@ -62,7 +62,10 @@ jobs:
             - name: Test UI
               run: npm run test:frontend
 
-            - name: Build library
+            # `build` regenerates the two GENERATED catalogues (harness-tools.manifest.json
+            # + the plugin manifest). The package publishes `src/*.ts`, so there is no
+            # library bundle to build here.
+            - name: Generate catalogues
               run: npm run build
 
             - name: Build UI
@@ -88,8 +91,9 @@ jobs:
               if: github.event_name != 'pull_request'
               uses: actions/upload-pages-artifact@v3
               with:
-                  # The UI app build (NOT the root dist/, which is the npm
-                  # library output of `vite build` and has no index.html).
+                  # The UI app build is the only bundle here: the package publishes its
+                  # `src/*.ts` sources and has no root build output at all, so this is
+                  # also the one artifact with an `index.html` for Pages to serve.
                   path: src/frontend/dist
 
     deploy:

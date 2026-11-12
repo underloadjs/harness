@@ -1,6 +1,6 @@
 // Pure renderer for the generated plugin manifest (T-R2/R3).
 //
-// Split out of `generate-plugin-manifest.mjs` for the same reason the tool renderer
+// Split out of `generate-plugin-manifest.ts` for the same reason the tool renderer
 // is: a test can re-render in-process and compare bytes against the committed file
 // without spawning a subprocess or touching the filesystem scan.
 //
@@ -24,7 +24,7 @@
 // therefore data + wiring, with no hand-maintained inventory anywhere.
 //
 // Cross-references:
-//   - ./generate-plugin-manifest.mjs  — the scanner that produces the input list
+//   - ./generate-plugin-manifest.ts  — the scanner that produces the input list
 //   - ../src/plugin/manifest.ts       — this renderer's output
 //   - ../src/plugin/host.ts           — the consumer (applies BUILTIN_PLUGINS first)
 
@@ -32,14 +32,29 @@
 // local identifier.
 const RESERVED = new Set(['import', 'default', 'class', 'function', 'return', 'typeof', 'new']);
 
+// One discovered plugin, as the scanner produces it and as this renderer consumes it.
+// Declared here (rather than in the scanner) because the renderer is the leaf of the
+// pipeline: `plugin-manifest-scan.ts` imports `identifierOf` from this module, so the
+// entry shape lives on the side that does not import anything back.
+export type PluginManifestEntry = {
+    /** Path relative to `pluginsRoot`, forward slashes, scan order. */
+    relativePath: string;
+    /** The literal `metadata.name` the plugin declares. */
+    name: string;
+    /** Module specifier the generated manifest writes, relative to that file. */
+    importPath: string;
+    /** Camel-case identifier this renderer derives from `relativePath`. */
+    identifier: string;
+};
+
 // `context-compaction` -> `contextCompaction`, with a `_` suffix for the reserved
 // words above. Deterministic: the same path always renders the same identifiers, so
 // the committed manifest only changes when the plugin SET changes.
-export const identifierOf = (relativePath) => {
+export const identifierOf = (relativePath: string): string => {
     const stem = relativePath.replace(/\.plugin\.ts$/, '');
     const parts = stem.split(/[/._-]+/).filter(Boolean);
     const camel = parts
-        .map((part, index) =>
+        .map((part: string, index: number) =>
             index === 0
                 ? part.replace(/[^a-z0-9]/gi, '')
                 : part.charAt(0).toUpperCase() + part.slice(1).replace(/[^a-z0-9]/gi, '')
@@ -54,7 +69,7 @@ const header = `// GENERATED FILE — DO NOT EDIT.
 //
 // Regenerate with:
 //
-//   node scripts/generate-plugin-manifest.mjs
+//   yarn vite-node scripts/generate-plugin-manifest.ts
 //
 // WHY THIS FILE EXISTS
 // --------------------
@@ -68,16 +83,16 @@ const header = `// GENERATED FILE — DO NOT EDIT.
 //
 // Cross-references:
 //   - ../plugins/**/*.plugin.ts                     — the authoritative metadata owners
-//   - ../../scripts/generate-plugin-manifest.mjs    — the scanner/generator
-//   - ../../scripts/plugin-manifest-render.mjs      — this renderer
+//   - ../../scripts/generate-plugin-manifest.ts    — the scanner/generator
+//   - ../../scripts/plugin-manifest-render.ts      — this renderer
 //   - ../plugin/host.ts                             — applies BUILTIN_PLUGINS first
 `;
 
 // Renders the whole manifest file for `entries` (already in final order).
-export const renderManifest = (entries) => {
+export const renderManifest = (entries: readonly PluginManifestEntry[]): string => {
     const imports = entries
         .map(
-            (entry) =>
+            (entry: PluginManifestEntry) =>
                 `import { metadata as ${entry.identifier}Metadata, setup as ${entry.identifier}Setup } from '${entry.importPath}';`
         )
         .join('\n');

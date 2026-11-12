@@ -20,11 +20,21 @@ import { defineConfig } from 'vitest/config';
 // preset tools touch the filesystem and spawn processes, so tests exercise real
 // Node APIs rather than a DOM. The browser client has its own jsdom config at
 // src/frontend/vitest.config.ts and is excluded here.
+//
+// `scripts/**` is in scope on purpose: the packaging helpers and the contract
+// generator ship as TypeScript under scripts/, and their suites run here instead
+// of the retired `node --test` runner (root AGENTS.md bans `node --test`, so a
+// test under scripts/ has to be collected by this config). The glob is deliberately
+// narrow — only `*.test|spec.{ts,tsx}` under scripts/, never scripts/** wholesale —
+// so the generator modules themselves are not mistaken for suites. `environment`
+// stays `node` for both trees: `environment: 'node'` above is config-wide, not
+// per-include, so the script suites get the same real-Node world they had under
+// `node --test`.
 export default defineConfig({
     test: {
         environment: 'node',
         globals: true,
-        include: ['src/**/*.{test,spec}.{ts,tsx}'],
+        include: ['src/**/*.{test,spec}.{ts,tsx}', 'scripts/**/*.{test,spec}.{ts,tsx}'],
         // jsdom-only client tests live under src/frontend and run with
         // `yarn test:frontend` (src/frontend/vitest.config.ts).
         exclude: ['**/node_modules/**', '**/dist/**', 'src/frontend/**'],

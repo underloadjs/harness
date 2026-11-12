@@ -1,5 +1,5 @@
-// The generated plugin manifest and its scanner (scripts/plugin-manifest-scan.mjs,
-// scripts/plugin-manifest-render.mjs, src/plugin/manifest.ts).
+// The generated plugin manifest and its scanner (scripts/plugin-manifest-scan.ts,
+// scripts/plugin-manifest-render.ts, src/plugin/manifest.ts).
 //
 // WHY THIS TEST EXISTS
 // --------------------
@@ -22,8 +22,8 @@ import { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from './manifest';
 // those two as identical, so this file asserts the third leg — the manifest carries that
 // same prompt — without adding a fourth copy of the prose.
 import { COMPACTION_INSTRUCTION } from '../plugins/context-compaction.plugin';
-import { discoverPluginEntries, PluginScanError } from '../../scripts/plugin-manifest-scan.mjs';
-import { renderManifest } from '../../scripts/plugin-manifest-render.mjs';
+import { discoverPluginEntries, PluginScanError } from '../../scripts/plugin-manifest-scan.ts';
+import { renderManifest } from '../../scripts/plugin-manifest-render.ts';
 
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const MANIFEST_PATH = `${PACKAGE_ROOT}src/plugin/manifest.ts`;

@@ -88,7 +88,7 @@ const descriptorOf = (name: string): BuiltinToolDescriptor => {
 
     if (descriptor === undefined) {
         throw new Error(
-            `No generated tool descriptor for "${name}". Regenerate with: npx vite-node scripts/generate-tool-manifest.mjs`
+            `No generated tool descriptor for "${name}". Regenerate with: yarn vite-node scripts/generate-tool-manifest.ts`
         );
     }
 

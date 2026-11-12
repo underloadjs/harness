@@ -2,7 +2,7 @@
 //
 // Regenerate with:
 //
-//   npx vite-node scripts/generate-tool-manifest.mjs
+//   yarn vite-node scripts/generate-tool-manifest.ts
 //
 // WHY THIS FILE EXISTS
 // --------------------
@@ -25,8 +25,8 @@
 //   - ../tools/**/*.tool.ts              — the authoritative metadata owners
 //   - ./tool-scan.ts                     — the AST reader that produced this file
 //   - ./metadata.ts                      — compatibility facade projecting this table
-//   - ../../scripts/generate-tool-manifest.mjs — the generator
-//   - ../../scripts/tool-manifest-render.mjs   — this renderer
+//   - ../../scripts/generate-tool-manifest.ts — the generator
+//   - ../../scripts/tool-manifest-render.ts   — this renderer
 //   - ../../tools/descriptors.ts         — the preset/runtime projections
 
 import type { BuiltinToolDescriptor } from './tool-metadata';
@@ -2404,7 +2404,7 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
             return import("../tools/runtime/threadList.tool");
         default:
             return Promise.reject(
-                new Error(`No generated tool loader for "${label}". Regenerate with: npx vite-node scripts/generate-tool-manifest.mjs`)
+                new Error(`No generated tool loader for "${label}". Regenerate with: yarn vite-node scripts/generate-tool-manifest.ts`)
             );
     }
 };

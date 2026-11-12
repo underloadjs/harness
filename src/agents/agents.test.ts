@@ -152,7 +152,7 @@ const CONTRACT = {
 };
 
 // Measured length of the ONE composed system prompt, per profile, in registry order
-// (`npx tsx Temp/opencode/prompt-size.ts` prints this table). Exact equality (not a range):
+// (`yarn vite-node Temp/opencode/prompt-size.ts` prints this table). Exact equality (not a range):
 // growth has to be intentional, so adding a bullet to a shared guideline line is a visible
 // diff here. The seven real roles get their own, higher ceiling below.
 const PROMPT_LENGTHS = [

@@ -491,7 +491,7 @@ export const refuseNestedRuns = (replica: Harness): string[] => {
 
     if (replica.nestedRuns() !== 'refuse') {
         throw new Error(
-            'This harness build exposes no nested-run seam (harness.nestedRuns), so a lane replica cannot refuse the nested runs a tool body starts. Rebuild the worker entry (dist/underload-harness.worker.mjs) against this build, or run the session with threadExecution "inline".'
+            'This harness build exposes no nested-run seam (harness.nestedRuns), so a lane replica cannot refuse the nested runs a tool body starts. The worker entry and the server must come from the same checkout, or run the session with threadExecution "inline".'
         );
     }
 

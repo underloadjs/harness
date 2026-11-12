@@ -6,10 +6,10 @@
 //   - src/server/harness.swagger.yaml        - target contract (48 paths / 68 ops / 193 component schemas)
 //   - src/shared/harness-api.ts              - OUTPUT: resource + request/response DTO types, route table, constants
 //   - src/shared/harness-stream.ts           - OUTPUT: WebSocket frame unions + stream constants
-//   - scripts/generate-tool-manifest.mjs     - same shape of tool (plain node, `--check` mode for CI)
+//   - scripts/generate-tool-manifest.ts     - same shape of tool (vite-node, `--check` for CI)
 //
-// Run:   node scripts/generate-harness-contract.mjs
-// Check: node scripts/generate-harness-contract.mjs --check   (exit 1 when output is stale)
+// Run:   yarn vite-node --script scripts/generate-harness-contract.ts
+// Check: yarn vite-node --script scripts/generate-harness-contract.ts --check  (exit 1 if stale)
 //
 // Split rule (stable, so parallel owners can predict where a type lands):
 //   - schema name starts with `Ws`, or the name is in STREAM_EXTRA -> harness-stream.ts
@@ -77,8 +77,19 @@ const PROJECTION_DELTAS = [
     'ModelIndex: spec adds discovery metadata the legacy `protocol.ts` model does not carry.',
 ];
 
-/** Local binding used for an aliased model import (never clashes with a schema name). */
-const aliasLocal = (name) => `${ALIASES[name].as}Model`;
+// One OpenAPI/WSDL schema node as the YAML parser returns it. The projector reads a
+// moving set of keywords (`$ref`, `type`, `oneOf`, `discriminator`, `additionalProperties`,
+// per-property `description`, ...), and the spec is data rather than a checked module, so
+// the node is modelled as an open `any`-valued record: keyword lookups stay terse, and the
+// generated FILE is the artifact the tests verify byte-for-byte.
+type SchemaNode = Record<string, any>;
+
+// `ALIASES` is keyed by spec schema name, so a plain string lookup needs the cast; a name
+// that is not aliased simply resolves to `undefined`.
+const aliasOf = (name: string): { from: string; as: string } | undefined =>
+    ALIASES[name as keyof typeof ALIASES];
+
+const aliasLocal = (name: string): string => `${(aliasOf(name) as { as: string }).as}Model`;
 
 // Types whose spec description is replaced by a short note in the output header (none today).
 const INDENT = '    ';
@@ -87,12 +98,15 @@ const INDENT = '    ';
  * Load the spec
  * ------------------------------------------------------------------------- */
 
-const spec = parse(readFileSync(SPEC_PATH, 'utf8'));
-const schemas = spec.components?.schemas ?? {};
+const spec = parse(readFileSync(SPEC_PATH, 'utf8')) as {
+    components?: { schemas?: Record<string, SchemaNode>; parameters?: Record<string, any> };
+    paths?: Record<string, any>;
+};
+const schemas: Record<string, SchemaNode> = spec.components?.schemas ?? {};
 const schemaNames = Object.keys(schemas);
 
 /** True when a schema belongs in harness-stream.ts. */
-const isStreamSchema = (name) => name.startsWith('Ws') || STREAM_EXTRA.has(name);
+const isStreamSchema = (name: string): boolean => name.startsWith('Ws') || STREAM_EXTRA.has(name);
 
 // Every alias must point at a schema that actually exists, and its binding must not shadow one.
 for (const [specName, alias] of Object.entries(ALIASES)) {
@@ -105,7 +119,7 @@ for (const [specName, alias] of Object.entries(ALIASES)) {
 }
 
 /** Resolve `#/components/schemas/Foo` to `Foo`. */
-const refName = (ref) => ref.split('/').pop();
+const refName = (ref: string): string => ref.split('/').pop() ?? '';
 
 /* ---------------------------------------------------------------------------
  * Type emitter
@@ -121,7 +135,7 @@ const refName = (ref) => ref.split('/').pop();
  * pair whose members carry nothing but `required`, sitting beside the real `properties:` map) from
  * collapsing to `unknown | unknown` and silently dropping every field of the request.
  */
-function carriesType(node) {
+function carriesType(node: SchemaNode | undefined): boolean {
     if (!node) return false;
     return Boolean(
         node.$ref ??
@@ -138,22 +152,27 @@ function carriesType(node) {
 
 /** Collects every schema name referenced while emitting one definition. */
 class Emitter {
+    /** Emitted type per top-level schema: name -> Set<referenced schema names>. */
+    refs: Map<string, Set<string>>;
+    /** Reference set of the schema currently being emitted (`null` between emissions). */
+    current: Set<string> | null;
+
     constructor() {
         this.refs = new Map(); // name -> Set<referenced schema names>
         this.current = null;
     }
 
-    begin(name) {
+    begin(name: string): void {
         this.current = new Set();
         this.refs.set(name, this.current);
     }
 
-    use(name) {
+    use(name: string): void {
         this.current?.add(name);
     }
 
     /** Render a schema node as a TS type expression. `depth` drives indentation. */
-    type(node, depth = 0) {
+    type(node: SchemaNode | undefined, depth = 0): string {
         if (!node) return 'unknown';
         if (node.$ref) {
             const name = refName(node.$ref);
@@ -168,7 +187,7 @@ class Emitter {
             // Only members that carry a type join the union. A `required`-only member states a
             // rule over the SIBLING `properties` map instead, so letting it in as `unknown` would
             // absorb the whole schema (`unknown | X` is `unknown` to TS).
-            const typed = variants.filter(carriesType).map((v) => this.type(v, depth).replace(/\s+/g, ' '));
+            const typed = variants.filter(carriesType).map((v: SchemaNode) => this.type(v, depth).replace(/\s+/g, ' '));
             // Sibling `properties` fold into the result the way the `allOf` branch below already
             // folds them; ignoring them is what dropped the fields of `PatchTurnBlockRequest`.
             const extra = node.properties || node.required ? this.objectBody(node, depth + 1) : null;
@@ -187,7 +206,7 @@ class Emitter {
 
         // allOf -> intersection; a single ref collapses to that ref.
         if (node.allOf) {
-            const inner = node.allOf.map((v) => this.type(v, depth));
+            const inner = node.allOf.map((v: SchemaNode) => this.type(v, depth));
             const extra = node.properties || node.required ? this.objectBody(node, depth + 1) : null;
             const list = extra ? [...inner, extra] : inner;
             return list.length === 1 ? list[0] : list.join('\n    & ');
@@ -199,8 +218,8 @@ class Emitter {
     }
 
     /** Scalars, enums, arrays, and inline objects. */
-    baseType(node, depth) {
-        if (node.enum) return node.enum.map((v) => JSON.stringify(v)).join(' | ');
+    baseType(node: SchemaNode, depth: number): string {
+        if (node.enum) return node.enum.map((v: unknown) => JSON.stringify(v)).join(' | ');
 
         switch (node.type) {
             case 'string':
@@ -229,12 +248,12 @@ class Emitter {
     }
 
     /** Inline object literal type honouring `required` and `additionalProperties`. */
-    objectBody(node, depth) {
+    objectBody(node: SchemaNode, depth: number): string {
         const pad = INDENT.repeat(depth);
         const inner = INDENT.repeat(depth + 1);
-        const props = node.properties ?? {};
-        const required = new Set(node.required ?? []);
-        const lines = [];
+        const props: Record<string, SchemaNode> = node.properties ?? {};
+        const required = new Set<string>(node.required ?? []);
+        const lines: string[] = [];
 
         for (const [key, schema] of Object.entries(props)) {
             // Per-property `description` is normative spec prose too, so it renders here as an
@@ -279,11 +298,11 @@ class Emitter {
  * a property block at indent 4 renders to the same right edge (3 columns of `/**` + ` * ` gutter)
  * as a schema-level block does today - which keeps every existing schema-level block byte-identical.
  */
-function jsdoc(description, closedNote, indent = '') {
+function jsdoc(description?: unknown, closedNote?: string, indent = ''): string {
     const text = String(description ?? '')
         .replace(/\s+/g, ' ')
         .trim();
-    const lines = [];
+    const lines: string[] = [];
     const width = 110 - indent.length;
     if (text) {
         // Hard-wrap so the generated file stays readable in a diff.
@@ -309,7 +328,7 @@ function jsdoc(description, closedNote, indent = '') {
 const emitter = new Emitter();
 
 /** Emit one top-level schema (looked up by name) as a declaration string. */
-function emitSchema(name) {
+function emitSchema(name: string): string {
     return emitDeclaration(name, schemas[name]);
 }
 
@@ -318,8 +337,8 @@ function emitSchema(name) {
  * `schemas`) so a fixture test can drive the same rules the shipped spec goes through without
  * touching the real spec or the real output files.
  */
-function emitDeclaration(name, node) {
-    const alias = ALIASES[name];
+function emitDeclaration(name: string, node: SchemaNode): string {
+    const alias = aliasOf(name);
     if (alias) {
         // The imported binding is namespaced with a `Model` suffix so it can never collide with
         // another schema name; the exported name stays the spec's.
@@ -372,7 +391,7 @@ function emitDeclaration(name, node) {
  * Constants + route table (sourced from the spec, never hand-typed)
  * ------------------------------------------------------------------------- */
 
-const limitParam = spec.components?.parameters?.Limit?.schema ?? {};
+const limitParam: Record<string, any> = spec.components?.parameters?.Limit?.schema ?? {};
 const pageMin = limitParam.minimum ?? 1;
 const pageDefault = limitParam.default ?? 25;
 const pageMax = limitParam.maximum ?? 100;
@@ -386,8 +405,8 @@ const infoExample =
  * camelCase id for a path template. Static segments are joined; every `{param}` segment adds
  * `By<Param>` so `/harnesses` and `/harnesses/{harness_name}` never collide.
  */
-function routeKey(path) {
-    const words = [];
+function routeKey(path: string): string {
+    const words: string[] = [];
     for (const segment of path.replace(/^\/v1\/harness\/?/, '').split('/')) {
         if (!segment) continue;
         const param = segment.match(/^\{([a-z_]+)\}$/)?.[1];
@@ -400,19 +419,20 @@ function routeKey(path) {
     return words.length ? lowerFirst(words.join('')) : 'root';
 }
 
-function toPascal(snake) {
+function toPascal(snake: string): string {
     return snake
         .split(/[_-]/)
         .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
         .join('');
 }
 
-function lowerFirst(value) {
+function lowerFirst(value: string): string {
     return value.charAt(0).toLowerCase() + value.slice(1);
 }
 
 const pathIds = Object.keys(spec.paths ?? {});
-const seenKeys = new Map();
+// route id -> the path template that produced it, for the collision message.
+const seenKeys = new Map<string, string>();
 for (const p of pathIds) {
     const k = routeKey(p);
     if (seenKeys.has(k)) throw new Error(`route id collision: ${k} for ${p} and ${seenKeys.get(k)}`);
@@ -438,7 +458,7 @@ const routeBuilders = pathIds.map((path) => {
     return `    /** \`${path}\` */\n    ${routeKey(path)}: ${signature} => \`${literal}\`,`;
 });
 
-function toCamelArg(snake) {
+function toCamelArg(snake: string): string {
     const parts = snake.split('_');
     return parts
         .map((w, i) => (i === 0 ? w : w.charAt(0).toUpperCase() + w.slice(1)))
@@ -453,7 +473,8 @@ const capabilitiesExampleEntries = Object.entries(infoExample.capabilities ?? {}
 );
 
 // WsStreamLimits carries `default` per property, which is the contract value in force.
-const streamLimitsDefaults = Object.entries(schemas.WsStreamLimits?.properties ?? {})
+const streamLimitProperties: Record<string, SchemaNode> = schemas.WsStreamLimits?.properties ?? {};
+const streamLimitsDefaults = Object.entries(streamLimitProperties)
     .filter(([, s]) => s.default !== undefined)
     .map(([k, s]) => `    ${k}: ${s.default},`);
 
@@ -461,16 +482,16 @@ const subprotocol =
     spec.paths?.['/v1/harness/stream']?.get?.['x-websocket']?.subprotocol ?? 'harness.v1';
 
 /** Single-value enum literals for one schema, used to mint the closed keyword tables. */
-function enumValues(name, field) {
+function enumValues(name: string, field?: string): string[] {
     const node = schemas[name];
     if (!node) return [];
     const target = field ? node.properties?.[field] : node;
-    return (target?.enum ?? []).map((v) => JSON.stringify(v));
+    return (target?.enum ?? []).map((v: unknown) => JSON.stringify(v));
 }
 
 /** The literal discriminator tags of every member of a Ws* union, deduped, in spec order. */
-function unionTags(name, propOrder = ['type', 'kind']) {
-    const node = schemas[name] ?? {};
+function unionTags(name: string, propOrder: string[] = ['type', 'kind']): string[] {
+    const node: SchemaNode = schemas[name] ?? {};
     const disc =
         typeof node.discriminator === 'string'
             ? node.discriminator
@@ -482,9 +503,9 @@ function unionTags(name, propOrder = ['type', 'kind']) {
     if (mapping && disc) return [...new Set(Object.keys(mapping).map((k) => JSON.stringify(k)))];
 
     const variants = node.oneOf ?? node.anyOf ?? [];
-    const tags = [];
+    const tags: string[] = [];
     for (const raw of variants) {
-        const variant = raw.$ref ? schemas[refName(raw.$ref)] : raw;
+        const variant: SchemaNode | undefined = raw.$ref ? schemas[refName(raw.$ref)] : raw;
         if (!variant) continue;
         // Nested unions (e.g. WsServerMessage -> WsUpdate) carry their tags on their own
         // members, so recurse with the remaining tag names.
@@ -495,7 +516,7 @@ function unionTags(name, propOrder = ['type', 'kind']) {
         for (const prop of order) {
             const list = variant.properties?.[prop]?.enum;
             if (list?.length) {
-                tags.push(...list.map((x) => JSON.stringify(x)));
+                tags.push(...list.map((x: unknown) => JSON.stringify(x)));
                 break;
             }
         }
@@ -504,15 +525,15 @@ function unionTags(name, propOrder = ['type', 'kind']) {
 }
 
 /** Walks a nested union member and returns every discriminator tag it can produce. */
-function collectNested(variant, order) {
-    const out = [];
+function collectNested(variant: SchemaNode, order: string[]): string[] {
+    const out: string[] = [];
     for (const raw of variant.oneOf ?? variant.anyOf ?? []) {
-        const member = raw.$ref ? schemas[refName(raw.$ref)] : raw;
+        const member: SchemaNode | undefined = raw.$ref ? schemas[refName(raw.$ref)] : raw;
         if (!member) continue;
         for (const prop of order) {
             const list = member.properties?.[prop]?.enum;
             if (list?.length) {
-                out.push(...list.map((x) => JSON.stringify(x)));
+                out.push(...list.map((x: unknown) => JSON.stringify(x)));
                 break;
             }
         }
@@ -531,10 +552,10 @@ const protocolCodes = enumValues('WsProtocolError', 'code');
  * Assemble both outputs
  * ------------------------------------------------------------------------- */
 
-const GENERATED_NOTE = (outPath) =>
-    `// GENERATED by scripts/generate-harness-contract.mjs from src/server/harness.swagger.yaml.\n` +
-    `// Do not edit by hand: regenerate with \`node scripts/generate-harness-contract.mjs\`.\n` +
-    `// CI guard: \`node scripts/generate-harness-contract.mjs --check\`.\n` +
+const GENERATED_NOTE = (outPath: string): string =>
+    `// GENERATED by scripts/generate-harness-contract.ts from src/server/harness.swagger.yaml.\n` +
+    `// Do not edit by hand: regenerate with \`yarn vite-node --script scripts/generate-harness-contract.ts\`.\n` +
+    `// CI guard: \`yarn vite-node --script scripts/generate-harness-contract.ts --check\`.\n` +
     `//\n` +
     `// Contract role: the network vocabulary for the harness control plane, mounted at\n` +
     `// \${HARNESS_API_ROOT}. Every field spelling is copied from the spec verbatim: REST resources,\n` +
@@ -641,16 +662,22 @@ export function isHarnessServerFrame(value: unknown): value is WsServerMessage {
 }
 `;
 
-function buildFile(names, header, other) {
+// `other` describes the SIBLING output file: the module to import from, and the schema
+// names it owns (only those become cross-file imports).
+function buildFile(
+    names: string[],
+    header: string,
+    other: { module: string; owns: Set<string> },
+): string {
     const blocks = names.map(emitSchema);
 
     // Model imports (aliases) are hoisted into one block at the top of the file.
-    const byModule = new Map();
+    const byModule = new Map<string, string[]>();
     for (const n of names) {
-        const alias = ALIASES[n];
+        const alias = aliasOf(n);
         if (!alias) continue;
         if (!byModule.has(alias.from)) byModule.set(alias.from, []);
-        byModule.get(alias.from).push(`${alias.as} as ${aliasLocal(n)}`);
+        byModule.get(alias.from)!.push(`${alias.as} as ${aliasLocal(n)}`);
     }
     const modelImports = [...byModule.entries()]
         .sort((a, b) => a[0].localeCompare(b[0]))
@@ -661,7 +688,7 @@ function buildFile(names, header, other) {
         .join('\n');
 
     // Only import names actually referenced from the sibling file (avoids unused imports).
-    const used = new Set();
+    const used = new Set<string>();
     for (const n of names)
         for (const r of emitter.refs.get(n) ?? []) if (other.owns.has(r)) used.add(r);
     const importList = [...used].sort();
@@ -691,7 +718,7 @@ const targets = new Map([
 /**
  * True when this module is the process entry. The generator reads the spec and builds both
  * outputs at import time (read-only), but the write/exit pass below must NOT run on import:
- * `scripts/generate-harness-contract.test.mjs` imports the renderer to pin its rules, and a
+ * `scripts/generate-harness-contract.test.ts` imports the renderer to pin its rules, and a
  * stray write there would rewrite the shipped contract from a test run.
  */
 const invokedDirectly = () => {
@@ -707,7 +734,7 @@ const invokedDirectly = () => {
 /** The CLI pass: compare both outputs against disk, write when not checking, exit 1 when stale. */
 function runCli() {
     const check = process.argv.includes('--check');
-    let stale = [];
+    const stale: string[] = [];
     for (const [path, text] of targets) {
         const next = text.endsWith('\n') ? text : `${text}\n`;
         let current = '';
@@ -724,7 +751,7 @@ function runCli() {
     if (check) {
         if (stale.length) {
             console.error(
-                `harness contract types are stale: ${stale.join(', ')} - run \`node scripts/generate-harness-contract.mjs\``,
+                `harness contract types are stale: ${stale.join(', ')} - run \`yarn vite-node --script scripts/generate-harness-contract.ts\``,
             );
             process.exit(1);
         }

@@ -1,5 +1,5 @@
 // Ad-hoc verification of the read/write/edit changes against the stress-report scenarios.
-// Run: npx vite-node scripts/verify-read-fixes.mjs
+// Run: yarn vite-node scripts/verify-read-fixes.ts
 import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -11,7 +11,7 @@ const C = path.join(VERIFY_ROOT, 'c');
 rmSync(C, { recursive: true, force: true });
 mkdirSync(C, { recursive: true });
 
-let L = [];
+let L: string[] = [];
 for (let i = 1; i <= 200000; i++) L.push(`line ${i} const x${i} = fn(a,b,c); // comment ${i}`);
 writeFileSync(`${C}/big.txt`, L.join('\n') + '\n');
 writeFileSync(`${C}/a1.txt`, 'A'.repeat(40000) + '\n');
@@ -35,10 +35,13 @@ const { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult } = await import('../src
 // machine result, so the envelope is peeled exactly as the delivery boundary peels it.
 const { unwrapToolResult } = await import('../src/core/index.ts');
 
-const readContent = async (paths) => unwrapToolResult(await read(paths)).content;
+// This script drives the real tools through their public entries, so the arguments are
+// the wire-shaped input arrays the tool schema accepts (`string` path or an options
+// object, per src/tools/files/read.tool.ts) and the results are read as plain data.
+const readContent = async (paths: unknown[]): Promise<any> => unwrapToolResult(await read(paths as any)).content;
 
 let failures = 0;
-const show = (label, ok, detail) => {
+const show = (label: string, ok: unknown, detail?: string): void => {
     if (!ok) failures += 1;
     console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? '\n        ' + detail : ''}`);
 };
@@ -182,7 +185,9 @@ const show = (label, ok, detail) => {
 
     // The model's copy is the SMALLER rendering of the same facts, which is what makes it
     // safe to deliver through a transcript the harness measures (src/core/result-budget).
-    const both = unwrapToolResult(await read([`${C}/big.txt`]));
+    // `unwrapToolResult` peels the branded envelope; the machine half is the read
+    // result (`content`) and the prose half is `__toolText` surfaced as `text`.
+    const both: { text?: string; content: any } = unwrapToolResult(await read([`${C}/big.txt`]));
 
     show(
         'text  the model gets prose, and it costs no more than the JSON it replaces',
@@ -220,7 +225,8 @@ const show = (label, ok, detail) => {
     try {
         await edit([{ path: `${C}/definitely-absent.txt`, oldString: 'a', newString: 'b' }]);
     } catch (error) {
-        message = error.message;
+        // A thrown non-Error still has to produce the message under review.
+        message = error instanceof Error ? error.message : String(error);
     }
 
     show(
@@ -236,13 +242,19 @@ const show = (label, ok, detail) => {
     writeFileSync(huge, 'x'.repeat(400000) + '\nTAIL\n');
 
     let collected = '';
-    let next = { truncated: true, nextByte: 0, nextLine: 1 };
+    // Paging cursor: one read entry's continuation fields (any of them may be absent
+    // once the file is fully read), plus the `content` slice being stitched back.
+    let next: { truncated?: boolean; nextByte?: number | null; nextLine?: number | null; content?: string } = {
+        truncated: true,
+        nextByte: 0,
+        nextLine: 1
+    };
     let pages = 0;
 
     while (next.truncated && pages < 20) {
         const page = await readContent([{ path: huge, startByte: next.nextByte ?? 0, startLine: next.nextLine ?? 1 }]);
         next = page.files[0];
-        collected += next.content;
+        collected += next.content ?? '';
         pages += 1;
     }
 

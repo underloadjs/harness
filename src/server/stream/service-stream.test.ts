@@ -231,6 +231,12 @@ const readTurnStatus = async (sessionId: string, turnId: string): Promise<{ stat
     return { status: response.status, ...((await response.json()) as { turn?: { status?: string } }) };
 };
 
+// Index of the pane-unsubscribe barrier pong in the recorded frames, or -1 while it has not landed.
+// `frames` only ever grows (the socket listener appends, nothing removes), so an index found here stays
+// valid for the rest of the test, which is what lets the reader claim below sample at the very end.
+const paneBarrierIndex = (frames: Frame[], at: number): number =>
+    frames.findIndex((frame) => frame.type === 'pong' && (frame as Frame).at === at);
+
 describeService('gateway-mounted update stream', () => {
     it('upgrades on the gateway port and welcomes with the runtime epoch', async () => {
         const client = await openStream();
@@ -474,15 +480,71 @@ describeService('gateway-mounted update stream', () => {
 
         // Disconnect the pane mid-flight and prove the stream is a READER: nothing is delivered to a
         // subscription that no longer exists, and the run still finishes on its own.
+        //
+        // ------------------------------------------------------------------
+        // WHY A CAUSAL BARRIER REPLACES THE 250ms SLEEP (F11).
+        //
+        // The old shape sampled `paneFramesAtDisconnect` at the instant `socket.send` was CALLED, then
+        // slept 250ms and demanded the count be identical. `send` is not synchronous with the wire
+        // (src/server/stream/transport.ts:288-305 writes straight through only when the queue is empty,
+        // otherwise appends), so every `display.ops` frame the broker had already handed to the socket
+        // when the sample was taken is still in flight and lands AFTER the sample. The assertion was
+        // therefore a wall-clock race, not a contract check: under turbo's full-graph load the in-flight
+        // window grew past 250ms and the count read `3` where the contract produced `2`
+        // (Temp/plan-v1/logs/harness-test-run3.log:986 `expected 3 to be 2`).
+        //
+        // "The server stopped pushing to the dead pane" is a CAUSAL end state, and the protocol already
+        // supplies the barrier for it. Quoted from the production side:
+        //   - `unsubscribe` removes the subscription synchronously: broker.ts:815-817
+        //     `session.subscriptions.delete(subscriptionId); closeSubscription(subscription);`, and
+        //     `closeSubscription` sets `subscription.closed = true` (broker.ts:634-640). Fan-out at
+        //     broker.ts:611-625 iterates `session.subscriptions` and does `if (subscription.closed)
+        //     continue`, so once the unsubscribe has been processed NO pane frame can be minted
+        //     afterwards, and one thread means no `deliver` can be interleaved inside the handler.
+        //   - `ping` is answered inside the same inbound tick: connection.ts:331-334
+        //     `case 'ping': send({ type: 'pong', at: frame.at ?? clock() })`, and inbound frames are
+        //     dispatched in wire order (transport.ts:531 `socket.on('data')` -> `consume()` ->
+        //     `handleFrame` -> the synchronous `messageListeners` registered at transport.ts:583-585).
+        //     So a pong proves the server has already processed the frame sent before it - the unsubscribe.
+        //   - outbound order equals the order of the `socket.send` CALLS: transport.ts:297-304 writes
+        //     directly only when `!draining && pending.length === 0` and otherwise appends to the tail,
+        //     and `flush` (transport.ts:254-265) drains FIFO. So every pane frame minted BEFORE the
+        //     unsubscribe was also written before the pong, and therefore arrives before it.
+        //
+        // Pane frames before the pong are contract-legal in-flight traffic. Pane frames after it are
+        // the defect the claim is about, and the window now covers the whole rest of the run.
+        // ------------------------------------------------------------------
         client.send({ type: 'unsubscribe', subscription_id: 'pane' });
 
-        const paneFramesAtDisconnect = client.frames.filter((frame) => (frame as Frame).subscription_id === 'pane').length;
+        // A value this test invented, so the pong is unambiguously the echo of THIS ping: the server's
+        // own keepalive is a `heartbeat` frame (connection.ts:370), never a `pong`, and this socket has
+        // sent no other ping. Same echo contract the pong case above pins (`toEqual({ type, at })`).
+        const paneBarrierAt = 1762250009000;
 
-        // This quiet window only measures the NEGATIVE half of the claim (no late push for a dead
-        // subscription). It is deliberately not what the settle below waits on.
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        client.send({ type: 'ping', at: paneBarrierAt });
 
-        expect(client.frames.filter((frame) => (frame as Frame).subscription_id === 'pane').length).toBe(paneFramesAtDisconnect);
+        // Bounded, and the bound is a FAILURE rather than a pass-through: a missing pong means the
+        // socket stopped answering, and the reader check below would then be measuring silence.
+        const barrierArrived = await poll(() => paneBarrierIndex(client.frames, paneBarrierAt) !== -1, 8_000);
+
+        expect({
+            pong_arrived: barrierArrived,
+            // On a timeout this prints the whole conversation, which is how a dead socket is told apart
+            // from a lost ping.
+            frame_types: client.frames.map((frame) => frame.type)
+        }).toEqual({ pong_arrived: true, frame_types: expect.arrayContaining(['pong']) });
+
+        const barrierIndex = paneBarrierIndex(client.frames, paneBarrierAt);
+
+        // The pong echoes verbatim (connection.ts:333), which is what makes it usable as an ordering
+        // marker; full-object equality also pins that no other field rides along on it.
+        expect(client.frames[barrierIndex]).toEqual({ type: 'pong', at: paneBarrierAt });
+
+        // Everything the pane will ever receive has arrived by the time its pong is delivered, so the
+        // baseline is sampled AT the barrier rather than at an arbitrary point before it.
+        const paneFramesAtBarrier = client.frames.filter(
+            (frame, index) => index <= barrierIndex && (frame as Frame).subscription_id === 'pane'
+        ).length;
 
         // Deterministic settle, replacing the fixed sleep that used to read the row here: the scripted
         // run is still in flight the instant the pane unsubscribes (a 250ms wait observed `running`),
@@ -528,6 +590,31 @@ describeService('gateway-mounted update stream', () => {
         const turnReads = await Promise.all(drivenTurnIds.map(async (turnId) => await readTurnStatus(session.id, turnId)));
 
         expect(turnReads.map((read) => [read.status, read.turn?.status])).toEqual(drivenTurnIds.map(() => [200, 'done']));
+
+        // THE READER CLAIM, asserted here rather than 250ms after the `send`: from the barrier up to
+        // this line the run kept publishing (the settle poll above watched it leave `running` and reach
+        // `idle`, and every turn this test drove reached `done`), so the dead pane had the whole
+        // remainder of the run to be pushed to and must have stayed silent for all of it.
+        const latePaneFrames = client.frames.filter(
+            (frame, index) => index > barrierIndex && (frame as Frame).subscription_id === 'pane'
+        ) as Frame[];
+
+        expect({
+            // Anti-vacuity 1: the pane really had a baseline BEFORE the cut (`openPane` pins its
+            // `subscription_state`), so "nothing after the barrier" is not satisfied by a pane that
+            // never existed.
+            pane_at_barrier_min_1: paneFramesAtBarrier >= 1,
+            pane_frames_after_barrier: latePaneFrames.length,
+            late_frames: latePaneFrames.map((frame) => (frame.kind as string) ?? frame.type),
+            // Anti-vacuity 2: the socket was still open for the whole window, so the silence is the
+            // broker refusing a closed subscription and not a dropped connection.
+            socket_closed: client.closes.length > 0
+        }).toEqual({
+            pane_at_barrier_min_1: true,
+            pane_frames_after_barrier: 0,
+            late_frames: [],
+            socket_closed: false
+        });
 
         // Monotonic sequences are PER SUBSCRIPTION: each live subscription numbers its own frames
         // 1..n, so the check runs per id rather than over a merged list.

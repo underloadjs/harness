@@ -2,7 +2,7 @@
 //
 // WHY A SEPARATE MODULE
 // ---------------------
-// `generate-plugin-manifest.mjs` is a CLI: it exits the process, which makes it
+// `generate-plugin-manifest.ts` is a CLI: it exits the process, which makes it
 // untestable in-process. The discovery rules below are the part that carries the
 // contract (what counts as a plugin, what a valid name is, what order the manifest is
 // in), so they live here as a pure function that either returns entries or throws. The
@@ -28,7 +28,7 @@
 // every platform regardless of readdir order.
 import fs from 'node:fs';
 import path from 'node:path';
-import { identifierOf } from './plugin-manifest-render.mjs';
+import { identifierOf, type PluginManifestEntry } from './plugin-manifest-render.ts';
 
 export const PLUGIN_SUFFIX = '.plugin.ts';
 export const PLUGIN_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/;
@@ -36,7 +36,7 @@ export const PLUGIN_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/;
 // A scan problem is a distinct error so the CLI can print and exit while a test can
 // assert the message without matching a generic Error.
 export class PluginScanError extends Error {
-    constructor(message) {
+    constructor(message: string) {
         super(message);
         this.name = 'PluginScanError';
     }
@@ -46,8 +46,10 @@ export class PluginScanError extends Error {
 //
 // `__tests__` and dot-folders are skipped: they are test/IDE layout, not plugin
 // packages. Everything else under the root is expected to be a discoverable entry.
-export const collectPluginFiles = (pluginsRoot, relative = '') => {
-    const found = [];
+// The return annotation is required: the function recurses through its own
+// `push(...)`, which leaves the return type circular without it.
+export const collectPluginFiles = (pluginsRoot: string, relative = ''): string[] => {
+    const found: string[] = [];
 
     for (const entry of fs
         .readdirSync(path.join(pluginsRoot, relative), { withFileTypes: true })
@@ -81,7 +83,11 @@ const SETUP_EXPORT = /export\s+const\s+setup\s*(?::[^=]*)?=\s*(?:async\s*)?\(/;
 // the generated file (default: the shipped `src/plugin/manifest.ts` -> `../plugins/...`).
 // A test pointing at a fixture folder passes its own prefix, so the same scanner
 // produces the same entry shape without knowing where the manifest will land.
-export const discoverPluginEntries = (options) => {
+export const discoverPluginEntries = (options: {
+    pluginsRoot: string;
+    /** Specifier prefix for the import path, relative to the generated manifest. */
+    manifestRelative?: string;
+}): PluginManifestEntry[] => {
     const { pluginsRoot, manifestRelative = '../plugins' } = options;
 
     if (!fs.existsSync(pluginsRoot)) {
@@ -90,9 +96,9 @@ export const discoverPluginEntries = (options) => {
         throw new PluginScanError(`plugins root is missing: ${pluginsRoot}`);
     }
 
-    const entries = [];
-    const names = new Map();
-    const identifiers = new Map();
+    const entries: PluginManifestEntry[] = [];
+    const names = new Map<string, string>();
+    const identifiers = new Map<string, string>();
 
     for (const relativePath of collectPluginFiles(pluginsRoot)) {
         const text = fs.readFileSync(path.join(pluginsRoot, relativePath), 'utf8');

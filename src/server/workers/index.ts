@@ -27,8 +27,9 @@
 //   - ./lane-host.ts        - the per-store worker manager: entry resolution, spawn, hello,
 //                             event relay with acks, receipts, cancellation, crash handling,
 //                             idle reclaim, shutdown
-//   - ./lane-worker.ts      - the WORKER ENTRY (the file a Worker is spawned with); resolves
-//                             built vs source layout
+//   - ./lane-worker.ts      - the lane worker ENTRY the module runner imports (a Worker is
+//                             spawned with ./worker-boot.mjs, never with this `.ts`); its path
+//                             is resolved by ./lane-host.ts (`resolveEntry`, line 169)
 //   - ./lane-worker-loop.ts - the worker side: rebuild, capability report, runtime
 //                             interception, operation derivation, commit boundaries
 //   - ./capability.ts       - what may run in worker mode at all, per harness and per tool,
@@ -38,8 +39,14 @@
 //                             outcomes ('durable' / 'written' / 'superseded')
 //   - ./io-client.ts        - D4: the coordinator side of durability - one FIFO queue per
 //                             database root, the strict/queued split, and the handshake gate
-//   - ./io-worker.ts        - D4: the IO worker ENTRY (`@underload/harness/io-worker`), built
-//                             as the `io-worker` library entry of ../../../vite.config.ts
+//   - ./io-worker.ts        - D4: the IO worker ENTRY (published as the package subpath
+//                             `@underload/harness/io-worker` -> `src/server/workers/io-worker.ts`
+//                             in ../../../package.json). It is SOURCE, not a build product: a
+//                             thread is spawned with ./worker-boot.mjs, that bootstrap starts
+//                             Vite's `ModuleRunner`, and the runner imports this `.ts` entry
+//                             through the one shared Vite server in ./worker-runner.ts. The
+//                             coordinator resolves the path in ./io-client.ts
+//                             (`resolveIoWorkerEntry`, line 317).
 //   - ./io-worker-loop.ts   - D4: the thread body: the operation table, the held journal
 //                             handles, and `startIoWorker` (called by the entry, because the
 //                             manifest says `sideEffects: false`)
@@ -57,7 +64,11 @@
 // onto ONE targeted harness call.
 //
 // NODE-ONLY: this barrel touches `node:worker_threads` and `node:fs`. The browser entry never
-// reaches `src/server` at all (see ../../../vite.config.ts).
+// reaches `src/server` at all: the root `browser` condition group of ../../../package.json maps
+// the browser root to `src/browser.ts`, and ../../../scripts/check-package-types.ts
+// (`yarn test:package`, part of `prepublishOnly`) walks the real source graph from
+// `src/browser.ts` and fails if `src/index.ts` (the Node root) or `src/server/index.ts` (this
+// barrel's parent) ever becomes reachable from it.
 //
 // Cross-references:
 //   - ../sessions.ts   - where worker mode branches: executeTurn, executeTool, executeCommand

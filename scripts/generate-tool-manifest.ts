@@ -18,19 +18,19 @@
 // Both are DATA + generated `import()` calls. Neither is hand-edited: re-run this
 // script after adding, removing, or re-pathing a `*.tool.ts` entry.
 //
-// The RENDERING lives in `./tool-manifest-render.mjs` (pure, no scan), so the parity
+// The RENDERING lives in `./tool-manifest-render.ts` (pure, no scan), so the parity
 // test can re-render in-process without a subprocess.
 //
 // USAGE (from the package root; needs the dev dependency `vite-node`):
 //
-//   npx vite-node scripts/generate-tool-manifest.mjs
-//   npx vite-node scripts/generate-tool-manifest.mjs --check
+//   yarn vite-node scripts/generate-tool-manifest.ts
+//   yarn vite-node scripts/generate-tool-manifest.ts --check
 //
 // `--check` exits non-zero when the committed manifest is stale.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { renderManifest } from './tool-manifest-render.mjs';
+import { renderManifest } from './tool-manifest-render.ts';
 
 const PACKAGE_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const OUTPUT = path.join(PACKAGE_ROOT, 'src', 'core', 'tool-manifest.ts');
@@ -42,9 +42,18 @@ if (!fs.existsSync(TOOLS_ROOT)) {
     process.exit(1);
 }
 
-const { scanToolMetadata } = await import(
+// Rows as this script sees them: the scan module is imported by absolute path at
+// runtime (only vite-node can load it), so TypeScript has no static shape for the
+// namespace. `renderManifest` consumes any plain object that carries `label`; the real
+// rows are `BuiltinToolDescriptor` objects from `src/core/tool-scan.ts`, whose `label`
+// is always a package-relative string.
+type DescriptorRow = { label: string } & Record<string, unknown>;
+
+const { scanToolMetadata } = (await import(
     path.join(PACKAGE_ROOT, 'src', 'core', 'tool-scan.ts')
-);
+)) as {
+    scanToolMetadata: (options: { includePresets: boolean }) => DescriptorRow[];
+};
 
 // Package entries only: a folder needs a host configuration this generator does not
 // have, and the manifest is a package artifact.
@@ -62,7 +71,7 @@ if (process.argv.includes('--check')) {
 
     if (current !== rendered) {
         console.error(
-            'src/core/tool-manifest.ts is stale. Regenerate with: npx vite-node scripts/generate-tool-manifest.mjs'
+            'src/core/tool-manifest.ts is stale. Regenerate with: yarn vite-node scripts/generate-tool-manifest.ts'
         );
         process.exit(1);
     }

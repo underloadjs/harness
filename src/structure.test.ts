@@ -32,12 +32,12 @@
 //   - ../tsconfig.json            — `paths`, asserted as a mirror of the `default` targets
 //   - ../vitest.config.ts         — deliberately has NO `resolve.alias` block; every
 //     published condition already names `src/*.ts`, so no condition trick is needed
-//   - ../scripts/check-package-types.mjs — the built-package check that enforces the
-//     same rule for a published consumer (F3: every subpath needs a `./src/*.ts`
-//     runtime target)
-//   - ../tsconfig.build.json — emits dist/<entry>.d.ts for these entries
-//   - ../vite.config.ts       — the six library entries (browser root, then index/
-//     server/frontend/shared plus the `worker` lane-worker executable)
+//   - ../scripts/check-package-types.ts — the published-SOURCE check that enforces the
+//     same rule for a real consumer install (every subpath needs a `./src/*.ts`
+//     runtime target, nothing may point at `dist/`, and no built artifact may ship)
+//   - ../src/frontend/vite.config.ts — the ONE Vite config left in the package: the
+//     frontend app build (`build:frontend`). The root `vite.config.ts` retired with the
+//     library bundles, and the `retired build layer` block below pins its absence.
 //   - ./server/service-start.test.ts — the end-to-end proof that the real service
 //     gateway serves /v1/harness from the moved endpoint folder
 
@@ -75,10 +75,9 @@ const readText = (relativePath: string): string =>
 // blocks, but never inside a string literal.
 //
 // Why not the plain regex pair: ../tsconfig.json comments legitimately contain
-// `dist/*.d.ts` and `src/*.ts`, and `/\*[\s\S]*?\*\/` reads the `/*` inside
-// `dist/*.d.ts` as a block-comment opener, swallowing every `paths` entry up to the
-// `*/` of the `"**/*.ts"` glob (i.e. exactly the block this file asserts on). The
-// same pair also mangles the `"**/*.test.ts"` globs in ../tsconfig.build.json.
+// `src/*.ts` and a stale `**/dist/*` exclude entry, and `/\*[\s\S]*?\*\/` reads the
+// `/*` inside those globs as a block-comment opener, swallowing every `paths` entry
+// up to the `*/` of the `"**/*.ts"` glob (i.e. exactly the block this file asserts on).
 const stripJsonComments = (text: string): string => {
     let out = '';
     let inString = false;
@@ -278,8 +277,8 @@ describe('package layout', () => {
             },
             // D4 (R1/R2/R4): the IO-worker EXECUTABLE, published as its own subpath for the
             // same reason `./worker` is - an installed host spawns it by specifier
-            // (./workers/io-client.ts resolves exactly this pair:
-            // `IO_WORKER_PACKAGE_SPECIFIER` + `IO_WORKER_DIST_FILE`). src-only means that
+            // (./workers/io-client.ts resolves exactly this specifier:
+            // `IO_WORKER_PACKAGE_SPECIFIER`). src-only means that
             // specifier answers src/server/workers/io-worker.ts directly, so the worker a
             // host spawns is the file under test; renaming either side breaks the resolver.
             './io-worker': {
@@ -307,7 +306,7 @@ describe('package layout', () => {
         expect(manifest.types).toBe('./src/index.ts');
 
         // Source-first coverage: every published CODE subpath carries a runtime target
-        // (../scripts/check-package-types.mjs fails the release for the same omission).
+        // (../scripts/check-package-types.ts fails the release for the same omission).
         // `./package.json` is a manifest re-export and intentionally has none.
         expect(Object.keys(runtimeTargetsBySubpath)).toEqual([
             '.',
@@ -507,7 +506,7 @@ describe('package layout', () => {
         // The list is asserted as "required scripts exist, forbidden aliases do not"
         // rather than an exact key set: build/release scripts are extended by other
         // workstreams and the invariant is about launch separation, not count.
-        for (const script of ['build', 'build:types', 'cli', 'dev:frontend', 'dev:server', 'test', 'test:frontend', 'test:package', 'typecheck']) {
+        for (const script of ['build', 'cli', 'dev:frontend', 'dev:server', 'test', 'test:frontend', 'test:package', 'typecheck']) {
             expect(typeof manifest.scripts[script]).toBe('string');
         }
         for (const forbidden of ['start', 'serve', 'server']) {
@@ -672,77 +671,86 @@ describe('package layout', () => {
     });
 
     it('builds and verifies the published artifacts', () => {
-        // The declaration build is a script (two emits + specifier fix), publish runs
-        // the built-package type check AND the built-package runtime smoke: a release
-        // cannot ship declarations a NodeNext consumer cannot read, or a bundle whose
-        // own server entry cannot start.
+        // Publish runs the package type check, the suite, the manifest refresh AND all
+        // three published-shape checks: a release cannot ship a manifest that resolves
+        // to a file a real consumer install does not have, or a source tree whose own
+        // server entry cannot start.
         //
         // T21: the descriptor manifest is GENERATED from the tool entries, so `build`
         // refreshes it first and `typecheck`/`test` refuse to run against a stale one
         // (`--check`). A new `.tool.ts` therefore reaches the catalogue, the server
         // inventory and the lazy loaders without any hand-maintained table edit.
         expect(manifest.scripts['tools:manifest']).toBe(
-            'vite-node scripts/generate-tool-manifest.mjs'
+            'vite-node scripts/generate-tool-manifest.ts'
         );
         expect(manifest.scripts['tools:manifest:check']).toBe(
-            'vite-node scripts/generate-tool-manifest.mjs --check'
+            'vite-node scripts/generate-tool-manifest.ts --check'
         );
-        // R2/R3/R4: the PLUGIN manifest is generated the same way — plain `node`, because
-        // the scanner only walks files and reads literals (no TypeScript loader needed),
-        // unlike the tool scanner which imports the AST reader through vite-node.
+        // R2/R3/R4: the PLUGIN manifest is generated the same way. It used to run under plain
+        // `node` (the scanner only walks files and reads literals), but root AGENTS.md makes
+        // `vite-node` the only runner for repo code, so both manifest generators now share one
+        // spelling and every script is TypeScript.
         expect(manifest.scripts['plugins:manifest']).toBe(
-            'node scripts/generate-plugin-manifest.mjs'
+            'vite-node scripts/generate-plugin-manifest.ts'
         );
         expect(manifest.scripts['plugins:manifest:check']).toBe(
-            'node scripts/generate-plugin-manifest.mjs --check'
+            'vite-node scripts/generate-plugin-manifest.ts --check'
         );
-        expect(manifest.scripts['build']).toBe(
-            'npm run tools:manifest && npm run plugins:manifest && vite build && npm run build:types'
-        );
+        // `build` refreshes the two GENERATED manifests and nothing else. The package is
+        // published as TypeScript source, so there is no library bundle and no declaration
+        // emit to run before publish; `build:frontend` is the only Vite build left, and it
+        // builds the deployable UI through its own config (pinned next).
+        expect(manifest.scripts['build']).toBe('npm run tools:manifest && npm run plugins:manifest');
+        expect(manifest.scripts['build']).not.toContain('vite build');
+        expect(manifest.scripts['build:frontend']).toBe('vite build --config src/frontend/vite.config.ts');
         expect(manifest.scripts['typecheck']).toBe(
             'npm run tools:manifest:check && npm run plugins:manifest:check && tsc --noEmit'
         );
         expect(manifest.scripts['test']).toBe(
             'npm run tools:manifest:check && npm run plugins:manifest:check && vitest run'
         );
-        expect(manifest.scripts['build:types']).toBe('node scripts/build-declarations.mjs');
-        expect(manifest.scripts['test:package']).toBe('node scripts/check-package-types.mjs');
-        expect(manifest.scripts['test:package:runtime']).toBe('node scripts/check-package-runtime.mjs');
+        // AGENTS.md runtime policy: every launcher of a repo script is `vite-node` (a script) or
+        // `vitest` (a suite) — never raw `node`, never `node --test`.
+        // Retired with the declaration pipeline: `tsc` here is `--noEmit` only, and an
+        // installed consumer reads the published `src/*.ts` through the `types`
+        // conditions, so no script may emit a `dist/` tree or `.d.ts` files.
+        expect(manifest.scripts['build:types']).toBeUndefined();
+        expect(manifest.scripts['test:package']).toBe('vite-node scripts/check-package-types.ts');
+        expect(manifest.scripts['test:package:runtime']).toBe('vite-node scripts/check-package-runtime.ts');
         expect(manifest.scripts['test:package:files']).toBe(
-            'node --test scripts/package-files.test.mjs'
+            'vitest run scripts/package-files.test.ts'
         );
         expect(manifest.scripts['test:package:tools']).toBe(
-            'node scripts/check-package-tools.mjs'
+            'vite-node scripts/check-package-tools.ts'
         );
         expect(manifest.scripts.prepublishOnly).toBe(
             'npm run typecheck && npm run test && npm run build && npm run test:package:files && npm run test:package && npm run test:package:runtime && npm run test:package:tools'
         );
 
         for (const script of [
-            'scripts/build-declarations.mjs',
-            'scripts/fix-declaration-specifiers.mjs',
-            'scripts/check-package-types.mjs',
-            'scripts/check-package-runtime.mjs',
-            'scripts/generate-tool-manifest.mjs',
+            'scripts/check-package-types.ts',
+            'scripts/check-package-runtime.ts',
+            'scripts/generate-tool-manifest.ts',
             // R2/R3/R4: the plugin manifest pipeline — CLI, scanner, renderer. All three
             // must exist because the scanner and renderer are imported by
             // src/plugin/manifest.test.ts, not only by the CLI.
-            'scripts/generate-plugin-manifest.mjs',
-            'scripts/plugin-manifest-scan.mjs',
-            'scripts/plugin-manifest-render.mjs',
-            'tsconfig.entries.json'
+            'scripts/generate-plugin-manifest.ts',
+            'scripts/plugin-manifest-scan.ts',
+            'scripts/plugin-manifest-render.ts',
+            // AGENTS.md makes every tooling script a `.ts` file under vite-node/vitest, so the
+            // published-shape helper and BOTH ported suites must exist too: `package-files.ts`
+            // is imported by the three `check-package-*` scripts and by `package-files.test.ts`,
+            // and `generate-harness-contract.test.ts` is the vitest replacement for the retired
+            // `test:contract` `node --test` run.
+            'scripts/package-files.ts',
+            'scripts/package-files.test.ts',
+            'scripts/generate-harness-contract.ts',
+            'scripts/generate-harness-contract.test.ts',
+            'scripts/scratch.ts',
+            'scripts/verify-read-fixes.ts'
         ]) {
             expect(fs.existsSync(path.join(PACKAGE_ROOT, script))).toBe(true);
         }
-
-        // Regression guard for the build fix: the server bundle needs the BARE Node
-        // builtins and `dotenv` external. Bundled dotenv emitted `require('fs')` for a
-        // browser stub and the built `loadEnvironmentFile()` threw at runtime.
-        const viteConfig = readText('vite.config.ts');
-        expect(viteConfig).toContain("from 'node:module'");
-        expect(viteConfig).toContain('builtinModules');
-        expect(viteConfig).toContain('dotenv');
-        expect(viteConfig).toContain('external,');
     });
 });
 
@@ -1019,113 +1027,90 @@ describe('service discovery contract', () => {
     });
 });
 
-describe('declaration build', () => {
-    it('emits the inner tree without the root entries, then the entries separately', () => {
-        // Why the split: tsc references an inferred type through the shortest
-        // re-export path. With `src/index.ts` in the inner program, `Tool` in
-        // src/tools/files/*.ts emitted as `import("../..")` — the NODE ROOT — so
-        // `dist/harness.d.ts` (and the browser entry) transitively reached
-        // `dist/server/**` and its `node:http` types. Excluding the entries makes tsc
-        // reference the declaring module (`../../types`) instead.
-        const build = readConfig('tsconfig.build.json');
-        expect(build.exclude).toContain('src/index.ts');
-        expect(build.exclude).toContain('src/browser.ts');
+describe('retired build layer', () => {
+    it('keeps the whole build pipeline gone, not merely unused', () => {
+        // The package used to run THREE builds: `vite build` over six library entries
+        // (the root vite.config.ts), a two-pass declaration emit (`tsconfig.build.json`
+        // for the inner tree, `tsconfig.entries.json` for the root entries), and a
+        // post-process that rewrote emitted specifiers for a NodeNext consumer
+        // (`scripts/fix-declaration-specifiers.ts`). Publishing `src/*.ts` makes every
+        // one of them dead weight — and dead weight beside a source-only manifest is
+        // exactly how a stale `dist/` ends up answering a consumer instead of the
+        // sources the manifest claims. Each entry is therefore pinned ABSENT.
+        for (const retired of [
+            'vite.config.ts',
+            'tsconfig.build.json',
+            'tsconfig.entries.json',
+            'scripts/build-declarations.ts',
+            'scripts/fix-declaration-specifiers.ts',
+            'dist',
+            '.entries'
+        ]) {
+            expect(fs.existsSync(path.join(PACKAGE_ROOT, retired))).toBe(false);
+        }
 
-        const entries = readConfig('tsconfig.entries.json');
-        // `include: []` keeps the inherited root-level `.ts` configs out of the
-        // program (they are outside rootDir); `files` is then exactly the entries plus
-        // the ambient Vite types the client's `import.meta.env` needs.
-        expect(entries.files).toEqual(['src/index.ts', 'src/browser.ts', 'src/frontend/vite-env.d.ts']);
-        expect(entries.include).toEqual([]);
-        expect(entries.compilerOptions).toMatchObject({
-            emitDeclarationOnly: true,
-            rootDir: 'src',
-            outDir: '.entries'
-        });
+        // Nothing consumes the retired root config either: `build:frontend` and
+        // `dev:frontend` load src/frontend/vite.config.ts (pinned next), and the worker
+        // runner starts Vite with `configFile: false`
+        // (./server/workers/worker-runner.ts:78).
+        expect(fs.existsSync(path.join(PACKAGE_ROOT, 'src/frontend/vite.config.ts'))).toBe(true);
+        expect(manifest.scripts['build:frontend']).toBe('vite build --config src/frontend/vite.config.ts');
     });
 
-    it('rewrites emitted specifiers to the emitted declaration paths', async () => {
-        // Unit test of the post-process that makes the tree NodeNext-readable; it
-        // runs against a synthetic emit (created in the repo's Temp/) so the
-        // published build does not have to run here.
-        const { fixDeclarationSpecifiers } = await import('../scripts/fix-declaration-specifiers.mjs');
-        const scratch = path.join(fileURLToPath(new URL('../../../../Temp/', import.meta.url)), `harness-declarations-${process.pid}-${Date.now()}`);
-        const write = (relative: string, text: string): string => {
-            const file = path.join(scratch, relative);
-            fs.mkdirSync(path.dirname(file), { recursive: true });
-            fs.writeFileSync(file, text, 'utf8');
-            return file;
-        };
+    it('keeps the one TypeScript config no-emit', () => {
+        // One config, one mode: `typecheck` runs `tsc --noEmit`. `declaration`/`outDir`
+        // are the emit settings the retired pipeline needed, and `allowImportingTsExtensions`
+        // is only legal while nothing emits — so `noEmit: true` is the contract that keeps
+        // the `.ts`-extension import in src/frontend/vite.config.ts compiling at all.
+        expect(fs.readdirSync(PACKAGE_ROOT).filter((entry) => entry.startsWith('tsconfig'))).toEqual(['tsconfig.json']);
 
-        try {
-            // Emitted shapes: file target, directory target, `import("…")` and an
-            // already-fixed specifier (which must be verified, not doubled).
-            write('dist/a.d.ts', "export * from './b';\n");
-            write('dist/b.d.ts', "export * from './sub';\n");
-            write('dist/sub/index.d.ts', 'export declare const value: number;\n');
-            write('dist/dir/user.d.ts', 'export declare const tool: import("..").Tool;\n');
-            write('dist/index.d.ts', 'export type Tool = unknown;\n');
-            write('dist/fixed.d.ts', "export * from './b.js';\n");
-            // A comment that mentions a path must not be rewritten.
-            write('dist/comment.d.ts', "// see './b'\nexport declare const note: string;\n");
-
-            const result = fixDeclarationSpecifiers({ directory: path.join(scratch, 'dist') });
-
-            expect(result).toEqual({
-                directory: path.join(scratch, 'dist'),
-                scanned: 7,
-                rewritten: [
-                    path.join(scratch, 'dist', 'a.d.ts'),
-                    path.join(scratch, 'dist', 'b.d.ts'),
-                    path.join(scratch, 'dist', 'dir', 'user.d.ts')
-                ],
-                unresolved: []
-            });
-
-            // Exact emitted text after the fix.
-            expect(fs.readFileSync(path.join(scratch, 'dist', 'a.d.ts'), 'utf8')).toBe("export * from './b.js';\n");
-            expect(fs.readFileSync(path.join(scratch, 'dist', 'b.d.ts'), 'utf8')).toBe("export * from './sub/index.js';\n");
-            expect(fs.readFileSync(path.join(scratch, 'dist', 'dir', 'user.d.ts'), 'utf8')).toBe(
-                'export declare const tool: import("../index.js").Tool;\n'
-            );
-            // Already fixed, and the comment, are untouched.
-            expect(fs.readFileSync(path.join(scratch, 'dist', 'fixed.d.ts'), 'utf8')).toBe("export * from './b.js';\n");
-            expect(fs.readFileSync(path.join(scratch, 'dist', 'comment.d.ts'), 'utf8')).toBe(
-                "// see './b'\nexport declare const note: string;\n"
-            );
-
-            // Idempotent: a second run has nothing left to rewrite.
-            expect(fixDeclarationSpecifiers({ directory: path.join(scratch, 'dist') })).toEqual({
-                directory: path.join(scratch, 'dist'),
-                scanned: 7,
-                rewritten: [],
-                unresolved: []
-            });
-        } finally {
-            fs.rmSync(scratch, { recursive: true, force: true });
-        }
+        const config = readConfig('tsconfig.json');
+        expect(config.compilerOptions.noEmit).toBe(true);
+        expect(config.compilerOptions.declaration).toBeUndefined();
+        expect(config.compilerOptions.outDir).toBeUndefined();
     });
 
-    it('reports a specifier that resolves to nothing instead of dropping it', async () => {
-        // A silent omission would publish a declaration that cannot be resolved, so
-        // the build fails: the helper reports it and the CLI exits non-zero.
-        const { fixDeclarationSpecifiers } = await import('../scripts/fix-declaration-specifiers.mjs');
-        const scratch = path.join(fileURLToPath(new URL('../../../../Temp/', import.meta.url)), `harness-declarations-bad-${process.pid}-${Date.now()}`);
+    it('publishes source only: no built artifact, no emitted declaration twin', async () => {
+        // The same rule scripts/check-package-types.ts enforces on an installed copy,
+        // read straight off the repository tree. ../scripts/package-files.ts is the shared
+        // spelling, so the suite and the release check can never drift apart.
+        const { PERMITTED_BUILD_ARTIFACT, isBuiltArtifact, publishedFiles } = await import(
+            '../scripts/package-files.ts'
+        );
 
-        try {
-            fs.mkdirSync(path.join(scratch, 'dist'), { recursive: true });
-            fs.writeFileSync(path.join(scratch, 'dist', 'bad.d.ts'), "export * from './missing';\n", 'utf8');
+        const packed: string[] = publishedFiles();
+        expect(
+            packed.filter((file: string) => isBuiltArtifact(file, new Set(packed))),
+            'a built artifact is part of the published shape'
+        ).toEqual([]);
 
-            const result = fixDeclarationSpecifiers({ directory: path.join(scratch, 'dist') });
+        // The ONE non-TypeScript runtime file: the IO-worker bootstrap `node:worker_threads`
+        // loads with raw Node, which cannot parse this repo's TypeScript. Everything it
+        // runs is `.ts`, fetched through Vite's ModuleRunner
+        // (./server/workers/io-client.ts:408-420 + ./server/workers/worker-boot.mjs).
+        expect(PERMITTED_BUILD_ARTIFACT).toBe('src/server/workers/worker-boot.mjs');
+        expect(packed).toContain(PERMITTED_BUILD_ARTIFACT);
 
-            expect(result.unresolved).toEqual([
-                { file: path.join(scratch, 'dist', 'bad.d.ts'), specifier: './missing' }
-            ]);
-            // The original text is preserved, so the failure is visible in a diff too.
-            expect(fs.readFileSync(path.join(scratch, 'dist', 'bad.d.ts'), 'utf8')).toBe("export * from './missing';\n");
-        } finally {
-            fs.rmSync(scratch, { recursive: true, force: true });
-        }
+        // Exact non-`.ts` inventory: the bootstrap plus the deployable UI assets and the
+        // OpenAPI document. `src/frontend/dist/**` (the `build:frontend` output) is
+        // excluded from `files` by name, so it can never masquerade as published source.
+        expect(packed.filter((file: string) => !file.endsWith('.ts'))).toEqual([
+            'src/frontend/index.html',
+            'src/frontend/styles.css',
+            'src/frontend/ui/agent-dialog.css',
+            'src/frontend/ui/dialog.css',
+            'src/server/harness.swagger.yaml',
+            'src/server/workers/worker-boot.mjs'
+        ]);
+
+        // Hand-written AMBIENT declarations, not emit: a consumer needs them to
+        // type-check the published source (`import.meta.env`, and the
+        // highlight.js/lib/core subpath its own `exports` map leaves untyped). An
+        // emitted twin (`foo.d.ts` beside `foo.ts`) is what the checkers reject, and
+        // this exact list is the pin that no declaration emit lands in `src/`.
+        expect(packed.filter((file: string) => file.endsWith('.d.ts'))).toEqual([
+            'src/frontend/ui/highlight-core.d.ts',
+            'src/frontend/vite-env.d.ts'
+        ]);
     });
 });
-

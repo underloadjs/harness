@@ -59,8 +59,8 @@
 //   - ./io-client.ts      - the coordinator side: queue, coalescing, barrier, failure
 //   - ../persistence.ts   - the shared commit primitives
 //   - ../journal.ts       - `HarnessJournal`, instantiated here unchanged
-//   - ../../../vite.config.ts - where the build emits the entry; ./io-client.ts
-//                              `ioWorkerEntryCandidates` states the filename it looks for
+//   - ./worker-boot.mjs   - the plain-JS entry the thread is spawned with
+//   - ./worker-runner.ts  - the parent-side Vite server that resolves and transforms this graph
 
 import { isMainThread, parentPort, threadId, workerData, type MessagePort } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';

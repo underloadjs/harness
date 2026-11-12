@@ -4,7 +4,9 @@ node_modules/
 # Build output
 dist/
 lib/
-# Declaration-build staging (scripts/build-declarations.mjs)
+# Staging dir of the RETIRED declaration build: scripts/build-declarations.ts and
+# scripts/fix-declaration-specifiers.ts are deleted and nothing writes .entries/ any
+# more; the rule only keeps an old checkout's leftovers out of `git status`.
 .entries/
 
 # Turbo cache

@@ -65,28 +65,18 @@ import {
     nestedRunLimitationMessage,
     nestedRunRefusalMessage
 } from './capability';
-import { buildTestWorkerEntry } from './worker-test-build.test-support';
 import { startScriptedProvider } from './provider-stub.test-support';
+import { harnessRunnerServerStarted } from './worker-runner';
 
 // A cold lane builds the harness, recompiles the created-tool sources and restores the
 // snapshot: measured at ~1.6 s on this machine, so the handshake bound is generous and the
 // test timeout has to be too.
 //
-// T10 finding S9: `workerEntry` pins the SOURCE worker, and that is not cosmetic. The host
-// prefers the built bundle, and `dist/` is only as fresh as the last build, so before this the
-// integration suite was asserting the behaviour of a worker compiled earlier - a source change
-// to ./lane-worker-loop.ts was invisible to it, and the mismatch was only made loud by the
-// protocol version bump (the retired v2 bundle answered a v3 coordinator with a hello the host
-// refused). A `.ts` entry is source mode by ./lane-host.ts `resolveEntry`, which is the dev/test
-// path the host already supports.
-const SOURCE_WORKER_ENTRY = fileURLToPath(new URL('./lane-worker.ts', import.meta.url));
-
-// Source mode needs Node's own TypeScript transform. On a Node build without it, Vite
-// builds the CURRENT entry into Temp instead: the tests still run the code under test,
-// not the stale `dist/` bundle.
-const SOURCE_WORKER_SUPPORTED = (process.features as { typescript?: string | false }).typescript !== false;
-const BUILT_TEST_WORKER = SOURCE_WORKER_SUPPORTED ? undefined : await buildTestWorkerEntry(SOURCE_WORKER_ENTRY);
-const WORKER_ENTRY = BUILT_TEST_WORKER?.entry ?? SOURCE_WORKER_ENTRY;
+// T10 finding S9: `workerEntry` pins the worker module by path, and that is not cosmetic. The
+// entry IS the source (`./lane-worker.ts`), loaded through the Vite module runner
+// (./worker-boot.mjs), so the suite always asserts the behaviour of the code under test -
+// there is no bundle that could be staler than the sources.
+const WORKER_ENTRY = fileURLToPath(new URL('./lane-worker.ts', import.meta.url));
 
 const WORKER_RUNTIME: ServerRuntimeConfiguration = {
     ...DEFAULT_RUNTIME_CONFIGURATION,
@@ -153,8 +143,6 @@ afterAll(async () => {
 
     await provider.close();
 
-    BUILT_TEST_WORKER?.dispose();
-
     // The T4.1 durable roots are disposable once the stores that wrote them are closed.
     for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -183,6 +171,13 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 
 const turnOf = (session: SessionSnapshot, turnId: string): SessionTurn | undefined =>
     session.turns.find((turn) => turn.id === turnId);
+
+// How many frames a turn has recorded so far, read through the same client snapshot `settle`
+// polls. A frame only reaches this process on the host relay FROM a lane, so "more than zero"
+// is the cheap, load-free proof that a lane is mid-run — which is what the warm-up gates below
+// wait on before any lag is sampled (see the two concurrency tests).
+const framesOf = (store: SessionStore, id: string, turnId: string): number =>
+    turnOf(store.get(id), turnId)?.events.length ?? 0;
 
 // Poll until a turn leaves the running/queued states. The store settles a lane turn through
 // its own finally, so this observes the same record a client would watch.
@@ -238,6 +233,15 @@ describe('worker mode: a turn runs on its own lane', () => {
         const store = storeOf();
         const session = await store.create('general');
 
+        // THE COLD-START SAMPLER (`boot`) IS ARMED BEFORE THE FIRST DISPATCH, i.e. before any of
+        // the lane work can start, so the boot window stays sampled rather than going dark: worker
+        // spawn, `environment.init()` and the shared parent Vite server (./worker-runner.ts:74-129,
+        // :159-171) all do real CPU work in THIS process, plus one transform per module answered
+        // through `environment.fetchModule`. That work legitimately blocks the loop, so it is
+        // measured against its own generous bound (`bootWorst` below) instead of the 150 ms
+        // steady-state bar - which is the only part of the run R1's promise is actually about.
+        const boot = sampleLag();
+
         const a = await store.dispatch(session.id, 'what time is it?');
         const b = await store.dispatch(session.id, 'and once more');
 
@@ -245,17 +249,32 @@ describe('worker mode: a turn runs on its own lane', () => {
         expect(b.turn.threadId).toBeDefined();
         expect(a.turn.threadId).not.toBe(b.turn.threadId);
 
-        const lag = sampleLag();
+        // `startedAt` stays where the wall-clock bound wants it - both turns accepted - so
+        // `elapsed` below still prices the WHOLE concurrent window, cold starts included. Only the
+        // responsiveness sampler moved (see the warm-up gate).
         const startedAt = Date.now();
 
         // Observe the overlap directly rather than timing the wall clock: both lanes must be
         // reported busy by the host at the same instant, which is only possible if two workers
         // are executing. A serial execution would never show two busy lanes.
+        //
+        // The watch now runs for as long as an overlap is POSSIBLE - host exists until both turns
+        // settle - instead of a fixed 400-sample budget. `busy` is only set once a lane's
+        // handshake lands (./lane-host.ts:869-886 sets it AFTER `await lane.ready`), so on a
+        // starved machine two cold boots outlast any fixed budget: at load 44 the old budget
+        // expired at 9.6 s with neither lane ever reported busy while both turns then settled
+        // together at 13.0 s, i.e. they did run concurrently and the watch had merely stopped
+        // early. The predicate is untouched; only the arbitrary budget was replaced by the end of
+        // the run, which makes the observation strictly longer and therefore stronger.
         let overlapped = false;
+        let turnsSettled = false;
         const lanes = await hostReady(store);
 
         const watching = (async (): Promise<void> => {
-            for (let sample = 0; sample < 400 && !overlapped; sample += 1) {
+            // 5000 x 20 ms is a HANG GUARD, not a measurement window: `settle` is itself bounded
+            // at 90 s and the test at 180 s, and `turnsSettled` releases this loop the instant an
+            // overlap can no longer happen.
+            for (let sample = 0; sample < 5000 && !overlapped && !turnsSettled; sample += 1) {
                 const live = lanes.lanes().filter((lane) => lane.sessionKey === session.id);
 
                 if (live.length >= 2 && live.every((lane) => lane.busy)) overlapped = true;
@@ -264,13 +283,77 @@ describe('worker mode: a turn runs on its own lane', () => {
             }
         })();
 
-        const [turnA, turnB] = await Promise.all([settle(store, session.id, a.turn.id), settle(store, session.id, b.turn.id)]);
+        // WARM-UP GATE - the same move the sibling `burns CPU on one lane` test already makes at
+        // :427-439 (comment there: "so what is measured afterwards is a running conversation, not
+        // a cold start"). Both lanes are spawned and each conversation has recorded its FIRST
+        // frame before the strict sampler is armed. Without this, the sampler's window contains
+        // the cold lane boot (~1.6 s of real coordinator CPU per lane, :71-73) and the assertion
+        // measures module loading under turbo contention instead of the coordinator's freedom
+        // while lanes work: it failed at 179 ms and 206 ms for exactly that reason.
+        //
+        // The bound is 2000 samples - >= 40 s of wall clock even once `sleep(20)` drifts under
+        // load - so the loop can only end early because the frames arrived. A cold boot measured
+        // at 9.7 s on a 3x-oversubscribed machine would have expired the old 500-sample bound, and
+        // expiring is not "the lane never started": that is what the exact assertions below decide.
+        for (let attempt = 0; attempt < 2000; attempt += 1) {
+            if (framesOf(store, session.id, a.turn.id) > 0 && framesOf(store, session.id, b.turn.id) > 0) break;
+
+            await sleep(20);
+        }
+
+        const warmA = framesOf(store, session.id, a.turn.id);
+        const warmB = framesOf(store, session.id, b.turn.id);
+
+        // The gate really was satisfied: two lanes are mid-run and streaming, so the window below
+        // is steady-state work. A zero here means a lane never started, which invalidates every
+        // measurement in this test and is therefore a failure, not a skip.
+        expect(warmA).toBeGreaterThan(0);
+        expect(warmB).toBeGreaterThan(0);
+
+        const bootWorst = boot.stop();
+
+        // Cold-start bound: 1000 ms. Justification - the worst inter-tick gap this window has ever
+        // MEASURED here is 366 ms (a full package run) / 292 ms (under `turbo --concurrency=4`),
+        // ~5x below this bound, a cold lane's ~1.6 s is spread over many async hops rather than one
+        // spin, and the failure mode the requirement forbids is lane work running on THIS loop,
+        // which parks it for whole seconds. So the bound survives arbitrary load while staying far
+        // tighter than the multi-second stall that would make worker mode a lie.
+        expect(bootWorst).toBeLessThan(1000);
+
+        const lag = sampleLag();
+
+        // Settlement starts BEFORE the sampler stops, and its completion is what releases the
+        // overlap watch (once both turns have settled, no overlap is possible any more).
+        const settling = Promise.all([settle(store, session.id, a.turn.id), settle(store, session.id, b.turn.id)]);
+
+        // Released on EITHER outcome: `.then(f, g)` handles a rejection locally (so it creates no
+        // unhandled rejection) and stops the watch from spinning on after a failed settle, while
+        // the promise awaited below still carries that failure to the test.
+        settling.then(
+            () => {
+                turnsSettled = true;
+            },
+            () => {
+                turnsSettled = true;
+            }
+        );
+
+        const [turnA, turnB] = await settling;
 
         await watching;
 
         const worst = lag.stop();
 
         expect(overlapped).toBe(true);
+
+        // The lanes above really ran the TypeScript entry through Vite's module runner:
+        // `entry()` names the module the thread imported (a `.ts` file raw Node cannot parse
+        // at all), and the shared runner server is created ONLY by ./worker-runner.ts
+        // `openHarnessWorkerSession`. A silent fallback to some other loader would leave that
+        // flag false while everything else here still passed.
+        expect(lanes.entry().path).toBe(WORKER_ENTRY);
+        expect(WORKER_ENTRY.endsWith('.ts')).toBe(true);
+        expect(harnessRunnerServerStarted()).toBe(true);
 
         // Both turns ran to completion, and each produced its own recorded event stream:
         // events arrive through the host relay, so a recorded frame is proof the lane ran.
@@ -286,10 +369,21 @@ describe('worker mode: a turn runs on its own lane', () => {
         expect(elapsed).toBeLessThan(20_000);
         expect(turnA.events.length + turnB.events.length).toBeGreaterThan(20);
 
-        // The coordinator's loop was never parked by the lane work (the inline path would
-        // show multi-hundred-millisecond drift for a CPU burn; here the lanes are the busy
-        // parties).
+        // R1, measured on the STEADY-STATE window only: the sampler ran from the moment BOTH
+        // conversations had recorded a frame until BOTH turns settled, so every sample below was
+        // taken while two real lanes were the busy parties. The cold-start half of the run is
+        // sampled separately above (`bootWorst`), which is why the bar here is still the original
+        // 150 ms: the inline path parks this loop for multi-hundred milliseconds on a CPU burn,
+        // and steady-state lane work must never do that. Threshold unchanged on purpose - the
+        // looseness that used to make this flaky was in the WINDOW, not in the bar.
         expect(worst).toBeLessThan(150);
+
+        // Anti-vacuity guard for the reorder: the steady-state window has to be long enough to
+        // mean something. `sampleLag` ticks at 10 ms, so 20 ticks is ~200 ms of sampled steady
+        // state; the real number is hundreds, because a stubbed turn streams a full discovery +
+        // tool + answer loop for seconds. If this ever drops to ~20 the assertion above is
+        // measuring almost nothing and the warm-up gate moved too far.
+        expect(lag.ticks()).toBeGreaterThan(20);
 
         // Roster mirror: the canonical record joins the conversation to an invocation that
         // EXISTS centrally.

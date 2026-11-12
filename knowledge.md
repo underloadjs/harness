@@ -92,8 +92,9 @@ src/
   index.ts              the Node root (library + shared + server + client)
   browser.ts            the browser root (library + shared + client)
   structure.test.ts     the layout/import-safety contract (its items 1-9): the app tree
-                        lives under `src/`, package.json/exports resolve SOURCE FIRST
-                        through a `development` condition, each root entry composes only
+                        lives under `src/`, package.json/exports resolve SOURCE FIRST —
+                        every condition names a `src/*.ts` entry, so there is no
+                        dev/build fork to select — and each root entry composes only
                         the layers it may reach (the browser root never the server
                         tree), the client barrel carries no shell or stylesheet, the
                         service endpoint keeps its `service-route*.ts` contract, and the
@@ -279,7 +280,7 @@ src/
   plugin/               the programmatic extension host (four parts, one folder)
     index.ts            barrel: runPlugins, resolvePluginList, createHookBus, the two
                         settings providers, and BUILTIN_PLUGINS / BUILTIN_PLUGIN_DESCRIPTORS
-    manifest.ts         GENERATED (scripts/generate-plugin-manifest.mjs): the auto-discovered
+    manifest.ts         GENERATED (scripts/generate-plugin-manifest.ts): the auto-discovered
                         built-ins scanned out of `src/plugins`
     host.ts             precedence (built-in first, then `configuration.plugins` REPLACING
                         that name) and the per-plugin api (scoped settings + `on`)
@@ -314,7 +315,7 @@ src/shared/
   index.ts              the /shared barrel (isomorphic code only — safe in either runtime)
   origin.ts             loopback/same-origin rules (inbound gate + outbound gate)
   harness-api.ts        GENERATED from src/server/harness.swagger.yaml — the canonical REST
-                        contract types (scripts/generate-harness-contract.mjs)
+                        contract types (scripts/generate-harness-contract.ts)
   harness-stream.ts     GENERATED from the same spec — the update-stream wire vocabulary
   attachments.ts        the SINGLE attachment gate shared by composer, route, run, snapshot
                         and transport
@@ -521,58 +522,83 @@ Tests are colocated with the module they cover, and the harness's own behaviour 
 exercised through the PUBLISHED specifiers — `@underload/harness` and its
 subpaths — while an internal that is not on the public surface is imported
 relatively (e.g. `./core`, `./core/tool-outcome`, `./server/harnesses/toolbox`).
-Those specifiers resolve with NO `resolve.alias` block at all: `package.json`
-`exports.development` (the condition Vite/Vitest/vite-node select in dev and test
-mode) maps them onto the raw `src/*.ts` entries, so `vitest run` needs no build and
-can never accidentally test `dist/`; an alias here would shadow that map and let the
+Those specifiers resolve with NO `resolve.alias` block at all: the package is published
+as TypeScript source, so every condition in `package.json` `exports` already names a raw
+`src/*.ts` entry and there is no `development` condition to select — the manifest map IS
+the source map. `vitest run` therefore needs no build and can never accidentally test a
+bundle; an alias here would shadow that map and let the
 manifest and the suite drift apart (`vitest.config.ts:3-18`). `tsconfig.json`
 `paths` mirror the same six targets for editors and `tsc`, and
 `src/structure.test.ts` (items 8-9) pins manifest, config and tsconfig against each
 other. The Node suite excludes `src/frontend/**`; the jsdom client suite is
 `src/frontend/vitest.config.ts` (`yarn test:frontend`).
 
-**Declaration contract (R1 types).** The shipped `.d.ts` tree must satisfy two
-independent constraints:
+**Type-surface contract (source-only, R1 types).** There is no declaration build: the
+`types` condition of every published subpath names the same `.ts` file the runtime loads,
+so an installed consumer type-checks the sources this repository edits. Two constraints
+replaced the old `.d.ts` constraints:
 
-1. *NodeNext-clean specifiers.* `tsc` preserves the extensionless source specifiers
-   (`./harness`, `./ui/turns`), which Node ESM — and therefore
-   `moduleResolution: node16|nodenext` — rejects with TS2834. `scripts/build-declarations.mjs`
-   post-processes every emitted declaration to the `.js` name TypeScript itself
-   prescribes (`./harness.js`, `./harnesses/index.js`); an unresolvable specifier
-   fails the build instead of shipping.
-2. *Environment-matched types.* The root's `browser` condition resolves
-   `dist/browser.d.ts` (library + shared + client) and the Node/`types` path resolves
-   `dist/index.d.ts` (plus the server). `src/index.ts` and `src/browser.ts` are
-   emitted by a **separate** tsc program (`tsconfig.entries.json`): in one program,
-   tsc references inferred types through the shortest re-export path — the Node root
-   — which dragged `dist/server/**` (`node:http`) into the library and browser
-   declaration graphs. The entry declarations are pure re-export barrels, so they
-   carry no such reference.
+1. *Consumer module mode.* `tsc` reads the published sources, whose relative specifiers are
+   extensionless (`./harness`, `./ui/turns`); `moduleResolution: node16|nodenext` rejects
+   that with TS2834, so the supported consumer mode is `moduleResolution: bundler` — what
+   Vite, Vitest, vite-node and every bundler host already use. An emitted `.d.ts` tree with
+   `.js` specifiers is what used to pay the NodeNext cost, so retiring the emit retired the
+   post-process too (`scripts/build-declarations.ts` and `scripts/fix-declaration-specifiers.ts`
+   are gone). A source consumer also needs `types: ["vite/client"]` (`src/frontend/api.ts`
+   reads `import.meta.env`) and accepts `skipLibCheck: true` (the source graph reaches
+   third-party `.d.ts` files through `typescript`, `ws` and `marked`).
+2. *Environment-matched types.* The root's nested `browser` group names `src/browser.ts`
+   (library + shared + client) and the `types`/`default` pair names `src/index.ts` (plus
+   the server). The old risk lived in the emitted graph: in one tsc program the root's
+   inferred types dragged `dist/server/**` (`node:http`) into the browser declarations,
+   which is why the entries were emitted by a **separate** program
+   (`tsconfig.entries.json`). A source-only publish has no graph to emit, so the equivalent
+   proof is a source walk: `scripts/check-package-types.ts` follows the import graph of
+   `src/browser.ts` and fails if it ever reaches `src/index.ts` or `src/server/index.ts`
+   (today that walk covers 168 files and reaches neither).
 
-`scripts/check-package-types.mjs` (`yarn test:package`, part of `prepublishOnly`)
-verifies the built artifact: every export target is inside `files`, the tree is
-already specifier-fixed, the browser declaration closure reaches neither the Node
-root nor a `node:` built-in, and real NodeNext + `customConditions: ["browser"]`
-consumers type-check against a copied, published shape of the package.
+`scripts/check-package-types.ts` (`yarn test:package`, part of `prepublishOnly`) verifies
+the published SOURCE shape: every export target of every condition is inside `files` and
+resolves to a single published file, the legacy `main`/`module`/`types` trio names
+`src/index.ts`, no stale `dist/` or `.entries/` exists on disk, the packed file list
+carries no built artifact (`.mjs`/`.cjs`/`.js`/`.map`, or a `foo.d.ts` twin of `foo.ts`)
+beyond the one permitted `src/server/workers/worker-boot.mjs`, every bare specifier inside
+the published sources is a declared dependency, and real `moduleResolution: Bundler` plus
+`customConditions: ["browser"]` consumers type-check against a copied, published shape of
+the package.
 
-`scripts/check-package-runtime.mjs` (`yarn test:package:runtime`) runs the built
-artifact instead of only reading it: `loadEnvironmentFile` against a fixture (the
-dotenv path), `createHarnessRuntime({ root })` writing its database under an absolute
-temp root, and `startHarnessServer({ databaseRoot, port: 0 })` serving health, the
-harness index and a session POST before closing. It exists because the bundle is a
-browser-platform lib build: bare `require('fs')`/`require('path')` from the bundled
-CommonJS `dotenv` were replaced by an empty `__vite-browser-external` stub, so the
-built `loadEnvironmentFile()` threw `path.resolve is not a function` while imports,
-types and every source test still passed. `vite.config.ts` now externalises the bare
-Node builtins and `dotenv` (declared in `dependencies`); only the server entry
-imports it, so the browser graph is unchanged.
+`scripts/check-package-runtime.ts` (`yarn test:package:runtime`) runs that copied install
+instead of only reading it: `loadEnvironmentFile` against a fixture (the dotenv path),
+`createHarnessRuntime({ root })` writing its database under an absolute temp root,
+`startHarnessServer({ databaseRoot, port: 0 })` answering the `/v1/harness` mount (a
+session POST, the paged harness index, the retired `/api/health` path as a 404) and closing
+cleanly, plus the IO worker committing, journaling and fencing off-thread. It exists
+because "the manifest resolves" is not the same claim as "the package runs": the failure it
+was written for was `loadEnvironmentFile()` throwing `path.resolve is not a function` while
+imports, types and every source test still passed, because the lib build of that day had
+replaced bare `require('fs')`/`require('path')` from the bundled CommonJS `dotenv` with an
+empty `__vite-browser-external` stub. Nothing bundles the server any more, so the modern
+form of that same bug is a dependency that is undeclared or unresolvable in an installed
+tree — which is why `dotenv`, `typescript`, `marked`, `dompurify` and `highlight.js` are
+`dependencies` and why the source scan asserts both the specifiers and their resolution.
 
-Browser scope of the tools is a documented limitation, not a target: the browser
-entry's static graph is Node-free, but the lazy preset chunks (`read`, `shell`,
+`scripts/check-package-tools.ts` (`yarn test:package:tools`) is the end-to-end run of the
+copied source: it drives the whole self-modifying-tool loop (register, replace, fail,
+replace again, then a scripted model conversation that discovers `toolRegistry`, registers
+a tool and calls it on the very next request) through `src/index.ts` — possible only
+because the published entry and the editable tool sources are the same tree.
+
+Browser scope of the tools is a documented limitation, not a target: importing the
+browser entry evaluates no server code and no Node built-in, but the lazy preset
+modules (each preset's own `*.tool.ts`, reached by `import()` — `read`, `shell`,
 `gitDiff`, `syntax`, `write`, `glob`, `grep`, …) contain
 `node:fs`/`node:vm`/`node:child_process` because
 those tools are Node-only by design. Calling them in a browser fails at the dynamic
-import; importing the library, shared or client entries does not load them.
+import; importing the library, shared or client entries does not load them. A static
+walk of the browser SOURCE graph therefore sees those `node:` specifiers — the old
+build hid them by swapping the source compiler and splitting chunks, which is why
+`scripts/check-package-types.ts` proves the browser tree by reachability (never
+`src/index.ts`, never `src/server/index.ts`) instead of by the absence of `node:`.
 
 A consequence worth knowing: a symbol that is not exported from the root barrel
 cannot be unit-tested. That is intentional — it is the pressure that keeps the
@@ -1482,8 +1508,9 @@ when it is newer than the manifest (T24). Consequences:
 
 - importing the package (or constructing a harness, or listing the server
   catalogue) loads no `node:fs`, `node:child_process`, or `node:vm`;
-- the build emits one chunk per implementation next to the entry; `dist/` ships
-  them all, and `inlineDynamicImports` must stay off;
+- the published shape is the source tree, so every branch stays an `import()` of its own
+  `*.tool.ts` file — there is no bundling step, no chunk per implementation, and no
+  `inlineDynamicImports` flag that could undo the split;
 - the proxy keeps the `Tool` contract exactly — writable `name`, `tags`
   normalized like `tool()`, callable directly, `execute(context)` delegated — so
   harness registration and the server's direct-call path are unchanged;
@@ -3231,9 +3258,12 @@ normalizer and the exported `TOOL_UI_LIMITS`.
 
 ## Decisions worth remembering
 
-- **No runtime dependencies.** The package publishes standalone; the default
+- **No runtime dependency for the loop.** The package publishes standalone: the default
   transport is ~150 lines of SSE over global `fetch`, and `parameters` is plain
-  JSON Schema so TypeBox needs no dependency.
+  JSON Schema so TypeBox needs no dependency. What IS declared in `dependencies` is what
+  the published sources actually import — `dotenv` (server `.env` loader), `typescript`
+  (the tool-source compiler), `dompurify`/`marked`/`highlight.js` (the browser markdown
+  renderer) — because a source-only publish cannot hide an import behind a bundle.
 - **The registry key is the identity.** Both agents and tools take an optional
   `name` that the harness overwrites, so `writer: agent({...})` never repeats
   `name: 'writer'`.
@@ -3273,8 +3303,10 @@ normalizer and the exported `TOOL_UI_LIMITS`.
 - **Presets are lazy proxies, not implementations.** `src/tools/index.ts` exports
   callable `Tool`s whose metadata is static and whose body is a dynamic import.
   Building a harness, listing the catalogue, or ranking a preset therefore never
-  loads `node:fs`/`child_process`/`vm`. The trade-off is build coupling: the dist
-  must ship the per-tool chunks and must not inline dynamic imports.
+  loads `node:fs`/`child_process`/`vm`. The trade-off is packaging coupling: the
+  published tree has to carry every branch as its own editable source file (there is no
+  chunk table), and a consumer bundler that inlines dynamic imports would fold those
+  Node bodies back into the entry it ships to a browser.
 - **Created tools are compiled, not run, at registration.** `createDynamicTool`
   validates the shape and compiles the body with the host realm's `Function`
   constructor; execution happens only on call. The harness adds reserved names, a
@@ -4218,8 +4250,8 @@ The three load-bearing decisions:
      view untouched, an inline harness still receives the strict-identical live handle, and a write
      made through the view lands on the live replica (it is a guard, not a copy). Every door throws
      the named `nested-run-unsupported` error BEFORE a thread record, a transcript append or a
-     provider request exists, and the read-back in `refuseNestedRuns` turns an absent seam (a stale
-     `dist/` worker bundle) into a hello `fault`: the handshake is rejected, and there is no inline
+     provider request exists, and the read-back in `refuseNestedRuns` turns an absent seam (a
+     worker entry pinned somewhere else that predates the seam) into a hello `fault`: the handshake is rejected, and there is no inline
      fallback.
   The refusal is one formatter, so no surface can paraphrase it: `capability.ts` re-exports the
   code and words the tool-name spelling (`NESTED_RUN_TOOL_NAMES`,
@@ -4256,9 +4288,11 @@ Node-24 facts this subsystem paid for (all still true, don't re-derive them):
   that routes it through the JavaScript compiler and loses Node's type stripping;
 - a source-mode worker needs `execArgv: ['--experimental-transform-types']` for this
   repo's parameter properties;
-- an unreferenced dynamic import is shaken to an empty namespace by the bundler, so
-  the entry imports the loop AND calls `startLaneWorker()` — that call is what keeps
-  `dist/underload-harness.worker.mjs` alive;
+- an unreferenced dynamic import is shaken to an empty namespace by a bundler, so
+  the entry imports the loop AND calls `startLaneWorker()` — the manifest says
+  `"sideEffects": false`, so that explicit call is both what a bundling consumer keeps and
+  what starts the loop when the thread loads `src/server/workers/lane-worker.ts` itself
+  through `src/server/workers/worker-boot.mjs`;
 - `workerData` is read-only and a cloned `AbortSignal` arrives as `{}`, so
   cancellation is a FRAME (`interrupt`), never a signal copy;
 - the global `Worker` is undefined in this Node build; `node:worker_threads` is used.
@@ -4364,9 +4398,10 @@ source-mode entry, and byte identity with the inline writer), `io-worker.test.ts
 operation table in-process), `src/server/io-worker-bridge.test.ts` (the store and the
 standalone listener: readiness, off-loop strict writes, a failed commit that rolls back
 with the inline message, journal ordering + reload, reset/delete/dispose queueing,
-shutdown drain, and the built bundle round-trip), and
-`scripts/check-package-runtime.mjs` (the SHIPPED `dist/underload-harness.io-worker.mjs`
-handshakes, commits, journals and is re-read by the built server).
+shutdown drain, and the off-thread durability round-trip), and
+`scripts/check-package-runtime.ts` (the SHIPPED `src/server/workers/io-worker.ts` entry,
+spawned through `src/server/workers/worker-boot.mjs` from a copied published install,
+handshakes, commits, journals and is re-read by the server that same install starts).
 
 ### Agents and the harness registry
 

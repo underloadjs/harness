@@ -3,7 +3,7 @@
 //
 // ./workers/io-client.test.ts already proves the CLIENT is correct in isolation (ordering,
 // barriers, error close, byte identity with the inline writer). This file proves the other
-// half: that `SessionStore`, `startHarnessServer` and the built worker entry work TOGETHER, so
+// half: that `SessionStore`, `startHarnessServer` and the REAL worker entry work TOGETHER, so
 // a deployment that sets `ioExecution: 'worker'` really does move its durability off the
 // coordinator.
 //
@@ -17,8 +17,8 @@
 //   5. reset/delete/dispose are queued operations, ordered against the saves that follow them,
 //   6. shutdown drains the graceful document and reports what did not make it,
 //   7. a worker-written database restarts identically in a store with NO worker,
-//   8. the REAL built entry (`vite` library build, same shape as the package's dist) round-trips
-//      save / journal / reload against the store's own readers.
+//   8. the REAL entry (`src/server/workers/io-worker.ts`, the module the Vite runner imports)
+//      round-trips save / journal / reload against the store's own readers.
 //
 // Every assertion is an exact value (op counts, file listings, byte lengths, message text), not
 // a range, so a regression in either mode shows up as a wrong number rather than a shrug.
@@ -34,7 +34,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build } from 'vite';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '../harness';
 import type { HarnessPreset, HarnessProgress, HarnessStream, HarnessStreamEvent, RunnerSettings } from './harnesses/types';
@@ -52,12 +51,7 @@ import type { ServiceEndpointContext } from './service';
 import { getHarnessRuntime } from './runtime';
 import { DEFAULT_RUNTIME_CONFIGURATION } from './config';
 import type { ServerRuntimeConfiguration } from './config';
-import {
-    HarnessIoError,
-    IO_WORKER_DIST_FILE,
-    createHarnessIoClient,
-    openHarnessIoClient
-} from './workers';
+import { HarnessIoError, createHarnessIoClient, openHarnessIoClient } from './workers';
 import type { HarnessIoClient } from './workers';
 
 // Scratch belongs in the REPO-root Temp/ (../AGENTS.md), one directory per suite.
@@ -70,12 +64,12 @@ fs.mkdirSync(TEMP_ROOT, { recursive: true });
 const roots: string[] = [];
 const stores: SessionStore[] = [];
 const clients: HarnessIoClient[] = [];
-let buildDir = '';
 
-// The built worker entry, produced once by `beforeAll`. Every store below is constructed with
-// `ioEntry: entry`, so the suite exercises the SHIPPED bundle rather than the source entry (the
-// source-mode path is already covered by ./workers/io-client.test.ts).
-let entry = '';
+// The worker entry every store below is constructed with (`ioEntry: entry`): the package's own
+// TypeScript entry, which the thread loads through the Vite module runner
+// (./workers/worker-boot.mjs). There is no built bundle in this publishing model, so this IS
+// the shipped path - `./workers/io-client.test.ts` covers the same entry one level lower.
+const entry = path.resolve(__dirname, 'workers', 'io-worker.ts');
 
 const tempRoot = (label: string): string => {
     const root = fs.mkdtempSync(path.join(TEMP_ROOT, `harness-io-bridge-${label}-`));
@@ -234,39 +228,13 @@ const inlineStore = (root: string, database?: ReturnType<HarnessPersistence['loa
     return store;
 };
 
-beforeAll(async () => {
-    // The SAME library-build shape ../../../vite.config.ts now emits for the package (`entry`
-    // keyed `io-worker`, ESM, node builtins external, the loop as a sibling chunk). A bundling
-    // regression fails here with a bundler message, not a mysteriously silent worker.
-    buildDir = fs.mkdtempSync(path.join(TEMP_ROOT, 'harness-io-bridge-build-'));
-
-    await build({
-        configFile: false,
-        root: PACKAGE_ROOT,
-        logLevel: 'silent',
-        build: {
-            outDir: buildDir,
-            emptyOutDir: true,
-            minify: false,
-            sourcemap: false,
-            lib: {
-                entry: { 'io-worker': path.resolve(__dirname, 'workers', 'io-worker.ts') },
-                formats: ['es']
-            },
-            rollupOptions: {
-                external: [/^node:/],
-                output: {
-                    entryFileNames: IO_WORKER_DIST_FILE,
-                    chunkFileNames: 'io-worker-chunks/[name]-[hash].mjs'
-                }
-            }
-        }
-    });
-
-    entry = path.join(buildDir, IO_WORKER_DIST_FILE);
-
+beforeAll(() => {
+    // No library build: the thread imports this `.ts` entry through the Vite module runner, so
+    // the only thing to check up front is that the entry exists. A missing entry otherwise
+    // surfaces as a handshake timeout in every test below.
     expect(fs.existsSync(entry)).toBe(true);
-}, 180_000);
+    expect(entry.endsWith('.ts')).toBe(true);
+});
 
 afterEach(async () => {
     // Every store owns a thread. `dispose()` queues the graceful document and FIRES the drain;
@@ -283,8 +251,6 @@ afterEach(async () => {
 
 afterAll(() => {
     for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
-
-    fs.rmSync(buildDir, { recursive: true, force: true });
 });
 
 describe('startup and readiness', () => {

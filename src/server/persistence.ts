@@ -53,15 +53,15 @@
 // worker — see `HarnessDatabaseWriteOptions.owner`) so a worker staging file can never
 // collide with a coordinator one. There is still no second PROCESS and no parallel writer.
 //
-// WIRING STATUS (honest, updated 2026-11-04): the store now opens an io client whenever the
-// resolved runtime says `ioExecution: 'worker'` (./sessions.ts constructor, D4), and the build
-// emits the entry - `vite.config.ts` has an `io-worker` library entry, so
-// `dist/underload-harness.io-worker.mjs` and the `@underload/harness/io-worker` subpath exist in
-// a build (./src/structure.test.ts pins the pairing, ./../../scripts/check-package-runtime.mjs
-// spawns the shipped bundle and reads its bytes back). In that mode the primitives below run on
-// the worker thread and the coordinator never blocks on them: a strict save resolves after the
-// worker's rename receipt, a best-effort/observer checkpoint claims queue ORDER only, and journal
-// events are appended by the thread that holds the fd.
+// WIRING STATUS (honest, updated 2026-11-12): the store now opens an io client whenever the
+// resolved runtime says `ioExecution: 'worker'` (./sessions.ts constructor, D4). The entry the
+// thread runs is the TypeScript source `src/server/workers/io-worker.ts`, published as the
+// `@underload/harness/io-worker` subpath and loaded through the Vite module runner
+// (./workers/worker-runner.ts) - there is no built bundle. (./src/structure.test.ts pins the
+// subpath pairing; the packaging checker scripts are being retargeted to this shape.) In that
+// mode the primitives below run on the worker thread and the coordinator never blocks on them:
+// a strict save resolves after the worker's rename receipt, a best-effort/observer checkpoint
+// claims queue ORDER only, and journal events are appended by the thread that holds the fd.
 //
 // With the default `ioExecution: 'inline'` nothing above applies: this class remains the only
 // writer, exactly as before. `threadExecution: 'worker'` (../config.ts) is the SEPARATE promise

@@ -14,13 +14,13 @@
 //      (`packages/underload/harness/.gitignore` ignores `/Temp/`).
 //
 // `applyScratchEnvironment()` redirects this process and, therefore, every child
-// spawned afterwards (notably `tsc` from check-package-types.mjs). It never
+// spawned afterwards (notably `tsc` from check-package-types.ts). It never
 // touches machine-global environment settings.
 //
 // Cross-references:
 //   - ../../../../AGENTS.md     — repository scratch policy
-//   - ./package-files.mjs       — published-shape helper
-//   - ./check-package-types.mjs, ./check-package-runtime.mjs — consumers
+//   - ./package-files.ts       — published-shape helper
+//   - ./check-package-types.ts, ./check-package-runtime.ts — consumers
 
 import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -48,10 +48,18 @@ export const findWorkspaceRoot = (start = PACKAGE_ROOT) => {
 /**
  * Resolve and create the scratch root for one packaging check.
  *
- * @param {{ kind: string, argv?: string[], packageRoot?: string }} options
- * @returns {string} absolute scratch root
+ * `kind` is the only required input; `argv` and `packageRoot` exist so a test can
+ * drive the resolution rules without touching the real process state.
  */
-export const resolveScratchRoot = ({ kind, argv = process.argv, packageRoot = PACKAGE_ROOT }) => {
+export const resolveScratchRoot = ({
+    kind,
+    argv = process.argv,
+    packageRoot = PACKAGE_ROOT,
+}: {
+    kind: string;
+    argv?: readonly string[];
+    packageRoot?: string;
+}) => {
     const scratchArgument = argv.indexOf('--scratch');
     if (scratchArgument > 0 && argv[scratchArgument + 1] !== undefined) {
         return path.resolve(argv[scratchArgument + 1]);
@@ -66,7 +74,7 @@ export const resolveScratchRoot = ({ kind, argv = process.argv, packageRoot = PA
 // Redirect temp variables for this process and its children. There is deliberately
 // no restore: the script is the process, and any spawned `tsc` must inherit the
 // repository Temp location too.
-export const applyScratchEnvironment = (scratchRoot) => {
+export const applyScratchEnvironment = (scratchRoot: string) => {
     mkdirSync(scratchRoot, { recursive: true });
     process.env.TEMP = scratchRoot;
     process.env.TMP = scratchRoot;

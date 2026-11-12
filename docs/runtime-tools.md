@@ -4,8 +4,11 @@
 > The source implementation and package check are present, but this document
 > does not assert a passing production verification run. The release gate
 > `npm run test:package:tools` must pass after a successful build.
-> **Source of truth:** `tasks/task-harness-self-modifying-tools.md` (sections
-> 1–8 and 10).
+> **Source of truth:** this document plus `knowledge.md` and `README.md` in this
+> package, pinned by `src/harness.self-modifying.test.ts` and the production gate
+> `scripts/check-package-tools.ts`. The original requirements brief
+> (`tasks/task-harness-self-modifying-tools.md`, sections 1–8 and 10) was retired
+> from the tree once the gate went green; it remains readable in git history.
 
 ---
 
@@ -118,23 +121,28 @@ only needed for the BROWSER build, which cannot scan or parse TypeScript.
 
 ## Production source model
 
-The published package contains two siblings:
+The published package has ONE root:
 
 ```text
 <installed-package>/
-  dist/   generated production entry and chunks
-  src/    editable TypeScript source shipped for inspection and compilation
+  src/    the TypeScript source — the runtime entry points AND the editable tool entries
 ```
+
+There is no generated sibling any more: the manifest resolves every exported subpath
+straight into `src/`, so the file a consumer imports is the file this repository edits
+(`src/structure.test.ts` pins that, and `scripts/check-package-types.ts` fails the release
+if any built artifact — a `.mjs`/`.cjs`/`.js`/`.map` or an emitted `foo.d.ts` twin —
+appears in the packed tree).
 
 `sourcePath` values are resolved relative to the installed `src/` root (or may be
 absolute). `harness.toolSource(name).sourcePath` therefore reports a package-
-relative label such as `tools/runtime/toolRegistry.tool.ts`, not a generated
-`dist/` module. TypeScript is a runtime dependency of the package because the
-compiler is needed in production.
+relative label such as `tools/runtime/toolRegistry.tool.ts`, and that label names the
+same editable file in development and after install. TypeScript is a runtime dependency
+of the package because the compiler is needed in production.
 
 The package `files` allow-list includes `src` and excludes tests. The runtime
 compiler must remain able to read these editable entries after a production
-install; generated `dist/` files are not the editable source model.
+install; that read is the production model, not a fallback to a generated file.
 
 The opt-in web tools also ship independently as `tools/runtime/search.tool.ts`
 and `tools/runtime/fetch.tool.ts`; their editable provider implementations are shipped
@@ -562,13 +570,15 @@ The package check exercises the copied published package shape:
 ```powershell
 npm run test:package:tools
 # equivalent from the package root:
-node scripts/check-package-tools.mjs
+yarn vite-node scripts/check-package-tools.ts
 ```
 
 It:
 
-- copies the resolved `files` set (`dist` + editable `src`) into repository
-  `Temp/`;
+- copies the resolved `files` set — the `src/` tree, because the runtime entries and
+  the editable tool sources are the same directory — into repository `Temp/`, and
+  refuses to run the scenario if that install carries a built artifact beyond the one
+  permitted `src/server/workers/worker-boot.mjs`;
 - links the declared runtime dependencies from installed `node_modules` (no
   network; this is **not** a clean `npm install --omit=dev`);
 - imports the copied production entry and creates a scripted, offline harness;
@@ -578,13 +588,14 @@ It:
   credentials are a harness configuration concern, not a package-check network
   call);
 - edits synthetic source/helper fixtures in the copied tree at the same path,
-  registers through `toolRegistry`, invokes without discovery, replaces, and
-  checks failed-publication invariance;
+  registers through `toolRegistry`, invokes without a second discovery round,
+  replaces, and checks failed-publication invariance;
 - checks self-replacement of `toolRegistry`, live nested lookup, memory and
   conversation continuity, and strict live-harness identity.
 
 The command is wired into `package.json` as `test:package:tools` and is the last
-package check in `prepublishOnly`, after build/type/runtime package checks.
+package check in `prepublishOnly`, after the published-file list, the published-source
+type check and the published-source runtime smoke.
 
 ## Accepted risk
 

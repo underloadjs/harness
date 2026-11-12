@@ -75,14 +75,14 @@ export type ServerRuntimeConfiguration = {
     maxLaneWorkers: number;
     // Upper bound on the hello handshake (import + build + capability report).
     workerHandshakeMs: number;
-    // Explicit path to the built worker entry. When omitted the host resolves
-    // `dist/underload-harness.worker.mjs` through ./package-root.ts, which is the
-    // same source-vs-bundle resolution the static UI root uses.
+    // Explicit path to the worker entry module. When omitted the host resolves the package's
+    // own `src/server/workers/lane-worker.ts` through ./package-root.ts. Either way the
+    // thread loads it through the Vite module runner (./workers/worker-runner.ts), so this is
+    // a source path, not a built bundle.
     workerEntry?: string;
-    // D4: explicit path to the built IO worker entry (`dist/underload-harness.io-worker
-    // .mjs`). Omitted means the resolver chain in ./workers/io-client.ts
-    // (`resolveIoWorkerEntry`), which prefers the built bundle and falls back to the
-    // source entry only when no build exists.
+    // D4: explicit path to the IO worker entry module. Omitted means the resolver chain in
+    // ./workers/io-client.ts (`resolveIoWorkerEntry`). Same loading as the lane entry: the
+    // runner imports whatever path is resolved.
     ioEntry?: string;
 };
 
