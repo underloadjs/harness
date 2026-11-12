@@ -2048,10 +2048,11 @@ body.is-resizing-rail {
     color: var(--accent);
 }
 
-/* Both controls lock for states the painter knows about: switching is refused while a run
-   is in flight (`paintSessionCycle` reads `submitting || running`) and creating is refused
-   while a submit/create is in flight, before boot, or for an archived harness
-   (`paintSessionActions`). A locked control reads locked: quiet frame, no pointer, no tint. */
+/* Both controls lock for states the painter knows about: switching is refused only while a
+   submit is in its enqueue window (`paintSessionCycle` reads `submitting`) and creating is refused
+   while a submit is in flight, before boot, or for an archived harness (`paintSessionActions`). A
+   RUN locks neither — leaving a working conversation unsubscribes the observer while the server
+   keeps the queue moving. A locked control reads locked: quiet frame, no pointer, no tint. */
 .session-cycle:disabled,
 .session-new:disabled {
     border-color: var(--border);

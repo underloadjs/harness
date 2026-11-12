@@ -31,9 +31,9 @@
 //     downloaded but the model never saw it" would be a silent omission.
 //
 // COMPOSITION with `toolUi()` is order-independent: `unwrapToolResult()` peels
-// whichever brand it finds until the plain content remains, so
-// `toolMedia(toolUi(content, panels), media)` and
-// `toolUi(toolMedia(content, media), panels)` both produce the same triple.
+// whichever brand it finds — `toolText()`, `toolMedia()` or `toolUi()` — until the
+// plain content remains, so `toolMedia(toolUi(content, panels), media)` and
+// `toolUi(toolMedia(content, media), panels)` produce the same triple.
 //
 // Cross-references:
 //   - ../types                — ToolMediaEnvelope / ToolMediaDescriptor
@@ -52,6 +52,7 @@ import type {
     ToolMediaEnvelope,
     ToolUiPanel
 } from '../types';
+import { toolTextOf } from './tool-text';
 import { toolUiOf } from './tool-ui';
 
 // The brand key. A plain own-property string, exactly like `__toolUi`, so two
@@ -140,9 +141,12 @@ export type ToolResultExtraction<TContent = unknown> = {
     content: TContent;
     panels?: ToolUiPanel[];
     media?: HarnessAttachment[];
+    // The `toolText()` projection, when the tool declared one. Absent means the
+    // boundary serializes `content` exactly as it always did.
+    text?: string;
 };
 
-// Peel BOTH brands, in whatever order they are nested, until the plain content
+// Peel EVERY brand, in whatever order they are nested, until the plain content
 // remains. Looping (rather than assuming an order) is what makes
 // `toolMedia(toolUi(...))` and `toolUi(toolMedia(...))` behave identically, and
 // it terminates because every step replaces the value with that envelope's own
@@ -155,8 +159,17 @@ export const unwrapToolResult = <TContent = unknown>(
     let content: unknown = value;
     let panels: ToolUiPanel[] | undefined;
     let media: HarnessAttachment[] | undefined;
+    let text: string | undefined;
 
     for (;;) {
+        const extractedText = text === undefined ? toolTextOf(content) : undefined;
+
+        if (extractedText !== undefined) {
+            text = extractedText.text;
+            content = extractedText.content;
+            continue;
+        }
+
         const extractedMedia = media === undefined ? toolMediaOf(content, limits) : undefined;
 
         if (extractedMedia !== undefined) {
@@ -179,6 +192,7 @@ export const unwrapToolResult = <TContent = unknown>(
     return {
         content: content as TContent,
         ...(panels === undefined ? {} : { panels }),
-        ...(media === undefined ? {} : { media })
+        ...(media === undefined ? {} : { media }),
+        ...(text === undefined ? {} : { text })
     };
 };

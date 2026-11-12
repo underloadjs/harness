@@ -244,9 +244,13 @@ export {
     toolUiOf
 } from './tool-ui';
 export type { ToolUiExtraction } from './tool-ui';
+// The model-projection brand (`read`): the prose a tool puts in the transcript,
+// kept apart from the structured value the API and a UI consume.
+export { toolText, toolTextOf } from './tool-text';
+export type { ToolTextExtraction } from './tool-text';
 // Tool media (the `download` hand-off): the branded byte envelope, its unwrap,
-// the event-safe descriptor projection, and the BOTH-brand unwrapper the
-// harness and the manual API path share. Profiles live in ../shared/attachments.
+// the event-safe descriptor projection, and the ALL-BRAND unwrapper the harness
+// and the manual API path share. Profiles live in ../shared/attachments.
 export { toolMedia, toolMediaDescriptors, toolMediaOf, unwrapToolResult } from './tool-media';
 export type { ToolMediaExtraction, ToolResultExtraction } from './tool-media';
 // The persisted tool outcome (progressive-compaction T1). The three rules — store only a

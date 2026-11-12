@@ -27,7 +27,16 @@ import {
     write,
     syntax
 } from '@underload/harness';
+import { unwrapToolResult } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
+
+// A direct `read` call returns the branded envelope (core/tool-text.ts): `content` is
+// the machine result every programmatic caller and the server's manual-execute response
+// get, `__toolText` is the prose the TRANSCRIPT gets. These assertions are about the
+// machine view, so they unwrap with the same call the server makes - and the harness
+// test below pins the prose half, which is where the projection actually lands.
+const readResult = async (paths: unknown): Promise<Record<string, unknown>> =>
+    unwrapToolResult<Record<string, unknown>>(await (read as unknown as (p: unknown) => unknown)(paths)).content;
 import { MODEL_TOOL_RESULT_BUDGET_BYTES } from '../core/result-budget';
 
 // read's aggregate budget is DERIVED from the model-facing wire cap (see
@@ -154,7 +163,7 @@ describe('syntax', () => {
 
         // A missing path is now a not-found ENTRY (R1), so "the code did not run" is
         // proven by the ENOENT error on that entry instead of a thrown call.
-        await expect(read(['executed.txt', 'executed-js.txt'])).resolves.toEqual({
+        expect(await readResult(['executed.txt', 'executed-js.txt'])).toEqual({
             files: [
                 {
                     path: join(workdir, 'executed.txt'),
@@ -172,7 +181,8 @@ describe('syntax', () => {
                     error: {
                         code: 'ENOENT',
                         message:
-                            'read could not find "executed.txt": no such file or directory (ENOENT).'
+                            'read could not find "executed.txt": no such file or directory (ENOENT). Nothing in ' +
+                            '"." resembles that name; list the folder (files/glob) before assuming the path is right.'
                     }
                 },
                 {
@@ -191,7 +201,8 @@ describe('syntax', () => {
                     error: {
                         code: 'ENOENT',
                         message:
-                            'read could not find "executed-js.txt": no such file or directory (ENOENT).'
+                            'read could not find "executed-js.txt": no such file or directory (ENOENT). Nothing ' +
+                            'in "." resembles that name; list the folder (files/glob) before assuming the path is right.'
                     }
                 }
             ],
@@ -201,6 +212,7 @@ describe('syntax', () => {
             // per-run workdir path and is matched rather than hardcoded.
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            modelBytes: expect.any(Number),
             skipped: 2
         });
     });
@@ -244,7 +256,7 @@ describe('file tools', () => {
 
         // The batched read returns one bounded window per path, in request order.
         // `# Hello` is one unterminated line, so the window ended at EOF.
-        await expect(read(['notes/hello.md'])).resolves.toEqual({
+        expect(await readResult(['notes/hello.md'])).toEqual({
             files: [
                 {
                     path: join(workdir, 'notes', 'hello.md'),
@@ -258,13 +270,15 @@ describe('file tools', () => {
                     nextColumn: null,
                     nextByte: null,
                     bytes: 7,
-                    sizeBytes: 7
+                    sizeBytes: 7,
+                    lineCount: 1
                 }
             ],
             truncated: false,
             bytes: 7,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            modelBytes: expect.any(Number),
             skipped: 0
         });
         // Results carry the directory they came from, so one flat list can hold
@@ -386,7 +400,7 @@ describe('file tools', () => {
             { path: 'multi-read/b.txt', content: 'b' }
         ]);
 
-        await expect(read(['multi-read/b.txt', 'multi-read/a.txt'])).resolves.toEqual({
+        expect(await readResult(['multi-read/b.txt', 'multi-read/a.txt'])).toEqual({
             files: [
                 {
                     path: join(workdir, 'multi-read', 'b.txt'),
@@ -400,7 +414,8 @@ describe('file tools', () => {
                     nextColumn: null,
                     nextByte: null,
                     bytes: 1,
-                    sizeBytes: 1
+                    sizeBytes: 1,
+                    lineCount: 1
                 },
                 {
                     path: join(workdir, 'multi-read', 'a.txt'),
@@ -414,13 +429,15 @@ describe('file tools', () => {
                     nextColumn: null,
                     nextByte: null,
                     bytes: 1,
-                    sizeBytes: 1
+                    sizeBytes: 1,
+                    lineCount: 1
                 }
             ],
             truncated: false,
             bytes: 2,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            modelBytes: expect.any(Number),
             skipped: 0
         });
     });
@@ -542,7 +559,7 @@ describe('file tools', () => {
         await write([{ path: 'over.txt', content: 'first' }]);
         await write([{ path: 'over.txt', content: 'second' }]);
 
-        await expect(read(['over.txt'])).resolves.toEqual({
+        expect(await readResult(['over.txt'])).toEqual({
             files: [
                 {
                     path: join(workdir, 'over.txt'),
@@ -556,13 +573,15 @@ describe('file tools', () => {
                     nextColumn: null,
                     nextByte: null,
                     bytes: 6,
-                    sizeBytes: 6
+                    sizeBytes: 6,
+                    lineCount: 1
                 }
             ],
             truncated: false,
             bytes: 6,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            modelBytes: expect.any(Number),
             skipped: 0
         });
     });
@@ -570,7 +589,7 @@ describe('file tools', () => {
     it('reports a missing file as an ordered not-found entry', async () => {
         // R1: a missing path is data now, not a thrown error. The entry keeps the
         // absolute resolved path, empty content, 0 bytes, and the ENOENT error.
-        await expect(read(['nope/missing.txt'])).resolves.toEqual({
+        expect(await readResult(['nope/missing.txt'])).toEqual({
             files: [
                 {
                     path: join(workdir, 'nope/missing.txt'),
@@ -588,7 +607,9 @@ describe('file tools', () => {
                     error: {
                         code: 'ENOENT',
                         message:
-                            'read could not find "nope/missing.txt": no such file or directory (ENOENT).'
+                            'read could not find "nope/missing.txt": no such file or directory (ENOENT). Its ' +
+                            'parent folder "nope" is missing too — the nearest folder along that path that DOES exist is ' +
+                            '".", 2 folder(s) up, so the directory part of the path is wrong, not only the file name.'
                     }
                 }
             ],
@@ -596,6 +617,7 @@ describe('file tools', () => {
             bytes: 0,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            modelBytes: expect.any(Number),
             skipped: 1
         });
     });
@@ -690,32 +712,24 @@ describe('presets inside a harness', () => {
             'assistant'
         ]);
         expect((entry.messages[3] as { content: string }).content).toBe('read it');
-        // The single-property rule unwrapped the model's {"paths":[...]} to the
-        // array, and the result serialized as the bounded batch object.
-        expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({
-            files: [
-                {
-                    path: join(workdir, 'harness.txt'),
-                    content: 'seeded content',
-                    startLine: 1,
-                    endLine: 1,
-                    truncated: false,
-                    limit: null,
-                    startByteAligned: null,
-                    nextLine: null,
-                    nextColumn: null,
-                    nextByte: null,
-                    bytes: 14,
-                    sizeBytes: 14
-                }
-            ],
-            truncated: false,
-            bytes: 14,
-            // wireBytes varies with the per-run workdir path, so it is matched.
-            wireBytes: expect.any(Number),
-            contentBudget: FILE_READ_CONTENT_BUDGET,
-            skipped: 0
-        });
+        // The single-property rule unwrapped the model's {"paths":[...]} to the array.
+        // What the model is then SHOWN is `read`'s projection, not the serialized result
+        // object (core/tool-text.ts): one header line naming the path, the line range, the
+        // size and what came back, then the file's text verbatim. The escaped JSON form
+        // would have cost the same facts plus `\"\` and `\\` overhead and 200 bytes of
+        // per-entry metadata — all of it charged to the caller's context window, which is
+        // the budget `read` exists to protect. The machine view is unchanged: the direct
+        // calls above assert `files[]`, and so does the server's manual-execute response.
+        const delivered = (entry.messages[2] as { content: string }).content;
+
+        expect(delivered).toBe(
+            `${join(workdir, 'harness.txt')}  lines 1-1 of 1  size 14 bytes  (reached end of file)  ` +
+                'returned 14 bytes\nseeded content\n'
+        );
+        // The prose is the SMALLER of the two renderings, which is what makes it safe to
+        // deliver through an envelope the harness measures (../../core/result-budget.ts).
+        expect(Buffer.byteLength(delivered, 'utf8')).toBeLessThan(FILE_READ_CONTENT_BUDGET);
+        expect(delivered).not.toContain('wireBytes');
     });
 
     it('discovers syntax and hands it the whole two-property object', async () => {

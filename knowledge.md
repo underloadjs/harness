@@ -169,8 +169,10 @@ src/
     tool-scan.ts        the AST half of discovery, with NO dependency on the manifest
     tool-source.ts      tool source compilation and loading (R1/R2, Node-only)
     tool-source-browser.ts the browser stub of `tool-source` (keeps the browser graph Node-free)
+    tool-text.ts        declarative tool PROJECTION — the `toolUi()`/`toolMedia()` seam, for
+                        the prose a MODEL reads instead of a serialized result object
     tool-ui.ts          declarative tool panels — the server-tool→client seam (R20.2)
-    *.test.ts           colocated suites (64 files in this folder in total, tests included);
+    *.test.ts           colocated suites (66 files in this folder in total, tests included);
                         `records.test.ts` pins the whole engine and
                         `records.store-events.test.ts` the store-change events, and there
                         is NO `task.test.ts` any more — task behaviour is
@@ -1495,7 +1497,7 @@ searchable remainder (`files`, `syntax`, `shell`, `gitDiff`, `download`) waits f
 | Export | Call | Result |
 |---|---|---|
 | `syntax` | `({ code, language: string })` — validated free name: `javascript`/`js`, `typescript`/`ts`, `tsx`, `jsx`, `json`, `python`/`py`/`python3` (trimmed, case-folded, a leading dot allowed) | `boolean`; an unsupported language, a non-string `code`, a missing interpreter, and a cancelled or timed-out Python run are all ERRORS, never a verdict |
-| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines? })[])` — non-empty, ≤100 | `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped, note? }`; defaults `startLine 1` and **no default line cap** (an explicit `maxLines` is 1..20000); the 256 KiB budget is measured on the **serialized** result and water-filled by demand, so `wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap — the `note`'s own size is reserved before the split, and it appears only for a file of `65536` bytes or more whose window was cut (up to 2 paths named, the rest counted). A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'EIO', message }` and consumes no budget; only a malformed request rejects the call. Binary detection is window-scoped, not whole-file |
+| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines?, maxBytes?, lossy?, numbered? })[])` — non-empty, ≤100 | a `toolText()` **envelope**, not a plain value: `{ content: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, error? }], truncated, bytes, wireBytes, contentBudget, modelBytes, skipped, note? }, __toolText: <projection> }` — `unwrapToolResult` hands the object to a programmatic caller (the server's manual-execute answer included) and the prose to the transcript. Per-file defaults `startLine 1`, `startColumn 0`, `startByte null`, **`maxLines 2000`, `maxBytes 65536`** — deliberately SMALL, because a read feeds a context window; ceilings 20000 lines / 262144 bytes, and an explicit value outside them is refused, never clamped. `limit` names WHICH governor cut a window (`'maxLines'` / `'maxBytes'` / `'budget'` / `null` for EOF) and `lineCount` (the `wc -l` figure) appears only when the newlines were counted to EOF. The 256 KiB budget is measured on the **serialized** result and water-filled by demand, so `modelBytes <= wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap — the `note`'s own size is reserved before the split, and it appears only for a file of `65536` bytes or more whose window was cut (up to 2 paths named, the rest counted). A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'ERANGE' \| 'EIO', message }` and consumes no budget: ENOENT names up to 3 near-miss siblings (`FILE_READ_SUGGESTION_MAX`) or the nearest existing ancestor, EISDIR previews up to 12 entries (`FILE_READ_PREVIEW_MAX`), an `ERANGE` seek past EOF names the file's size or line count, and `lossy: true` substitutes U+FFFD for undecodable bytes instead of reporting EBINARY (the entry then says `lossy: true`; a NUL is still binary). Only a malformed request rejects the call. Binary detection is window-scoped, not whole-file |
 | `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected by file identity, NUL content rejected (read would refuse it). Serialized per file against a concurrent `edit` on the same path |
 | `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes, match? }[]`; exact-first matching (typographic and trailing-whitespace fallbacks, line endings preserved), all preflighted before the first write, each file written once. `match` names a fallback tier. Read-match-write is one per-file critical section (`./tools/files/lock.ts`), so a concurrent call fails with "no match" instead of clobbering the other's change |
 | `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` - non-empty, ≤100 | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` → `{ path, entries, truncated, nextOffset, offset, limit, bytes }` (ONE page of `dir/entry`, directories end with `/`, non-recursive, 200 entries default / 1000 max, 64 KiB of entry text shared by every list operation in the call); `move`/`copy` → `{ path, to, kind, bytes }`, and an existing destination is refused unless `overwrite`; `delete` → `{ path, removed, recursive }` (a non-empty directory needs `recursive`, a missing path needs `force` and is then reported `removed: false, skipped: true`); `mkdir` → `{ path, created }`, creating parents and reporting an existing directory as `created: false`. A failed list entry carries its own `error: { code, message }`; a failed mutation rejects the call and names the operations already applied (there is no rollback). Operations run in array order against the state each one finds, and mutations hold the same per-file locks as `write`/`edit` (`./tools/files/lock.ts`) |
@@ -1533,49 +1535,110 @@ Implementation notes worth keeping:
   what makes `read(['a', 'b'])` and a model call carrying
   `{ "paths": ["a", "b"] }` the same code path. `read` keeps that property while
   allowing range objects as ITEMS (`{ path, startLine?, startColumn?, startByte?,
-  maxLines? }`); per-file windows are not a second top-level property.
-- **`read` is bounded by the BYTE BUDGET, with no default line cap.** A window starts at a
-  1-based `startLine`; `maxLines` is optional, its DEFAULT is "no cap"
-  (`FILE_READ_DEFAULT_MAX_LINES = Number.MAX_SAFE_INTEGER`), and an EXPLICIT value is still
-  capped at 20000 (`FILE_READ_MAX_LINES` — `src/tools/files/read.tool.ts:296-297`), so a
-  hand-written `maxLines: 100000000` cannot ask for an unbounded line window. On top of that
-  sits a fixed 256 KiB aggregate budget measured on
-  the SERIALIZED result (`FILE_READ_WIRE_BUDGET`), allocated by DEMAND: every readable
-  file gets an equal share, files needing less hand the difference back to the files
-  actually cut, and the passes are capped.
-  **Corrected in place (D6, 2026-11-11):** this bullet used to read "bounded by default. 5000
-  lines per file (`maxLines`, hard max 20000)" and justified the default as "sized so the
-  BUDGET binds before the line count on typical source — a 200-line default used 14.2% of the
-  envelope and a 1200-line default 22.7%". That sizing holds for ~55-byte source lines and
-  nowhere else: a default read of a 60,001-line file of short lines used 11.2% of the budget,
-  and even the 20,000-line hard maximum only 49.3% (measured), so a call spent a round trip to
-  return a fifth of what it was allowed. A 256 KiB window cannot exceed 256 KiB however many
-  lines it holds, so a line cap below the budget buys latency, not safety; the default is now
-  "the budget decides" and `maxLines` survives as an explicit per-request guard. The measured
-  reasoning and the honest cost of the change (a default read now commits up to the whole
-  budget) are in the comment at `src/tools/files/read.tool.ts:274-295`. It streams 64 KiB
-  chunks and stops at the cap, so a
-  huge file or giant line is never read wholesale. `content` is raw text
-  (line 1 is `startLine`); a truncated entry reports `nextLine`/`nextColumn`/`nextByte`,
-  where `nextColumn` is a 0-based byte offset inside the line (non-zero only for a line
-  cut mid-line). `startByte = nextByte` resumes by SEEKING with no line counting, which
-  is the O(window) way to walk a large file; a line-based window at line N rescans from
-  byte 0. A NUL or invalid UTF-8 sequence in the chunks DECODED WHILE STREAMING rejects
-  that ENTRY as binary; this is not whole-file validation, since bytes after the last
-  read chunk are never inspected, so one file can read as text for a narrow window and
-  as `EBINARY` for a wide one. A call accepts at most 100 paths so metadata cannot grow
-  without bound either.
+  maxLines?, maxBytes?, lossy?, numbered? }`); per-file windows are not a second
+  top-level property, and the item's `additionalProperties: false` REFUSES a typo'd
+  knob rather than dropping it — silently ignoring `maxLine` would hand the caller a
+  default window it did not ask for.
+- **`read` is bounded by TWO numbers on each axis: a DEFAULT that is a context budget, and a
+  CEILING that is the transport envelope.** A window starts at a 1-based `startLine`; per file
+  the defaults are `maxLines 2000` (`FILE_READ_DEFAULT_MAX_LINES`) and `maxBytes 65536`
+  (`FILE_READ_DEFAULT_MAX_BYTES`), and the ceilings an explicit argument may ask for are 20000
+  lines (`FILE_READ_MAX_LINES`) and 262 144 bytes (`FILE_READ_MAX_BYTES` =
+  `FILE_READ_WIRE_BUDGET` = `MODEL_TOOL_RESULT_BUDGET_BYTES`, held equal by an assertion in
+  `read.test.ts` rather than an import so the preset compiles with no captured dependency).
+  An explicit value outside `[1, ceiling]` is REFUSED, not clamped — a silent clamp of
+  `maxBytes: 10000000` down to the envelope would report `limit: "budget"` for a request the
+  caller believed was unlimited, and `limit` is the field that decides whether to ask again.
+  The exported defaults round-trip: a caller that reads `FILE_READ_DEFAULT_MAX_LINES` and
+  passes it back gets that behaviour, not a validation error.
+  **Corrected in place (D11, 2026-11-12):** the bullet this one replaces — and the D6
+  correction inside it, dated 2026-11-11, which argued "no default line cap: the 256 KiB
+  budget decides" — measured the default against the WIRE envelope, which is not the budget
+  that breaks. A default read of this package's own `src/harness.ts` (634 705 bytes,
+  12 323 lines) returned 261 129 content bytes ≈ 64k-78k tokens in ONE tool result, so an
+  agent that merely looked at a large file exhausted its context window immediately. A wire
+  cap is a transport guarantee, not a policy about what a caller should be SHOWN, so the
+  policy moved into the defaults and the ceiling stayed exactly where D6 put it. Measured on
+  the same 200 000-line fixture: a default ask takes lines 1-1325 (25.3% of the envelope,
+  cut by `maxBytes`), and `maxBytes: 262144, maxLines: 20000` still fills it (99.8%, cut by
+  the shared budget) — so "omit the arguments" never became a synonym for "want less", it
+  just stopped spending the whole window by default. Context-AWARE budgeting (sizing the
+  window from the model's remaining context) is deliberately absent: a tool that guesses how
+  much context is left invites the misjudgement the compaction tools exist to prevent.
+  Both knobs are PER FILE because "I want this one file, generously" is one argument; the
+  shared 256 KiB aggregate is still allocated by DEMAND (every readable file gets an equal
+  share, files needing less hand the difference back to the files actually cut, passes are
+  capped). `limit` therefore has three values, and each one has a different remedy:
+  `'maxLines'` → raise `maxLines`; `'maxBytes'` → raise `maxBytes`, the only knob that widens
+  ONE file; `'budget'` → the batch envelope is full, and raising either cap on that path
+  changes nothing (want fewer bytes across the batch); `null` → the window reached EOF,
+  nothing was withheld. It streams 64 KiB chunks and stops at the cap, so a huge file or
+  giant line is never read wholesale. `content` is raw text (line 1 is `startLine`); a
+  truncated entry reports `nextLine`/`nextColumn`/`nextByte`, where `nextColumn` is a 0-based
+  byte offset inside the line (non-zero only for a line cut mid-line). `startByte = nextByte`
+  resumes by SEEKING with no line counting, which is the O(window) way to walk a large file;
+  a line-based window at line N rescans from byte 0. A seek past EOF is an `ERANGE` entry that
+  names the file's size (a byte seek) or its line count (a `startLine` past the end), never an
+  empty window — an empty success teaches a model that the file is shorter than it is. A NUL
+  or invalid UTF-8 sequence in the chunks DECODED WHILE STREAMING rejects that ENTRY as binary;
+  this is not whole-file validation, since bytes after the last read chunk are never inspected,
+  so one file can read as text for a narrow window and as `EBINARY` for a wide one. A call
+  accepts at most 100 paths (`FILE_READ_MAX_TARGETS`) so metadata cannot grow without bound
+  either.
   A path that cannot be read is DATA, not a failed call: it keeps its ordered slot as
   an entry with empty `content`, `endLine = startLine - 1`, `bytes: 0`, and
-  `error: { code, message }` — `ENOENT`, `EISDIR`, `EACCES`/`EPERM`, `EBINARY`, or
+  `error: { code, message }` — `ENOENT`, `EISDIR`, `EACCES`/`EPERM`, `EBINARY`, `ERANGE`, or
   `EIO` — and it consumes no budget (the split is computed across files that actually
   opened, see `execute`'s two phases), so the readable files are still returned in
   full. Only a malformed REQUEST rejects the whole call.
   `wireBytes` is the exact serialized length of the response and always satisfies
   `wireBytes <= contentBudget`, which is what keeps the continuation fields alive
-  through the harness's own cap (`MODEL_TOOL_RESULT_BUDGET_BYTES`, held equal to
-  `FILE_READ_WIRE_BUDGET` by an assertion in `read.test.ts` rather than an import, so
-  the preset compiles with no captured dependency).
+  through the harness's own cap.
+- **`read` answers with a `toolText()` envelope: the model reads prose, the caller reads the
+  object** (`src/core/tool-text.ts`, the third branded seam after `toolUi()` and `toolMedia()`).
+  The return value is `{ __toolText: <projection>, content: <FileReadResult> }`, and
+  `unwrapToolResult` (`src/core/tool-media.ts`) peels text, media and panels in ANY nesting
+  order at the one delivery site (`deliverTask` in `src/harness.ts`), which writes
+  `text ?? serialize(content)` into the transcript. Serializing the machine result instead —
+  what every other tool does, and the cheapest honest rendering available — costs escaping
+  (+2.05% measured on this package's own source, +15.2% on quote-heavy code) plus ~200 bytes
+  of per-entry metadata, all of it charged to the CALLER'S context window, which is the one
+  budget `read` exists to protect. `content` stays byte-exact no matter how the prose is
+  rendered, so diffing `files[].content` against a file and the server's manual-execute
+  response are unaffected. The projection is one header line per entry (`path  lines A-B of N
+  size S bytes  (reached end of file)  returned X bytes`), then the window verbatim, then a
+  footer naming the cut reason and the exact continuation
+  (`[truncated by maxBytes; 64258 bytes returned; continue from startByte 64258]`).
+  `numbered: true` adds the `123: ` gutter to the PROJECTION ONLY — `content` stays raw — but
+  the gutter's bytes are charged inside the scanner, so numbering cannot silently push the
+  window past the allowance the same call bought unnumbered. The boundary rules are the same
+  as the other two brands: `unwrapToolResult(plain)` answers `{ content }` with NO `text` key,
+  so every tool that does not use the seam is byte-for-byte unchanged at the delivery
+  boundary; `toolText()` validates at the tool; and a forged or hand-built envelope is
+  REJECTED at the unwrap, never silently dropped ("the model never saw it" is the quiet
+  failure this prevents). The header and footer are RESERVED per file before the scan
+  (`PROJECTION_HEADER_MARGIN` 128 / `PROJECTION_CONTINUATION_MARGIN` 176), which is what keeps
+  `modelBytes <= wireBytes <= contentBudget` under every cut reason — an under-reserved
+  projection is the one way `modelBytes` could exceed the budget and have prose cut that the
+  machine view still has. The public surface is `toolText` / `toolTextOf` and the
+  `ToolTextExtraction` type on `@underload/harness`; `core/tool-source.ts` registers
+  `core/tool-text` in its live-core module map for the same reason it registers `tool-ui` and
+  `tool-media` — a compiled preset must reach the SAME brand the harness peels, or the
+  boundary serializes the wrapper instead of the prose, reintroducing every escaped byte the
+  seam exists to avoid.
+- **`read` explains a failure it can act on, and only on failure paths.** An `ENOENT` entry
+  names up to 3 siblings the requested spelling is close to (`FILE_READ_SUGGESTION_MAX`, from
+  a bounded `FILE_READ_SUGGESTION_SCAN = 200` readdir): prefix/substring ranks first — the
+  shape of a half-remembered path — then a banded Levenshtein under a `floor(len/3)` cap, the
+  shape of a mistyped COPY (`nested-targt.ts` for `nested-target.ts`), which no substring test
+  catches. Names longer than 120 code points are not scored at all, and an empty base (`dir/`)
+  suggests nothing rather than offering three arbitrary siblings. When the parent folder is
+  missing too, the message names the nearest folder along the path that DOES exist and how many
+  levels up it is, because then the DIRECTORY part is wrong, not just the file name; when the
+  parent exists but nothing resembles the name it says so and points at `files`/`glob` instead
+  of inventing a guess. An `EISDIR` entry previews up to 12 entries (`FILE_READ_PREVIEW_MAX`).
+  None of this rides on a successful read: guidance the caller did not need costs the same
+  context window the tool is protecting.
 - **`write` / `edit` preflight everything.** Every entry is shape-checked,
   every target must be unique **by real file identity** (`tools/files/identity.ts`:
   `realpath`, plus the nearest existing ancestor for a file that does not exist yet,
@@ -2885,7 +2948,10 @@ field is `src/types/index.ts:2607-2614`) and carries `ToolMediaDescriptor`s ONLY
 `{ id, kind, name, mime, size }`, `src/types/index.ts:91-98`, never the base64, because
 every event is JSON round-tripped and persisted while the bytes live exactly once, on the
 committed `tool` message. Like `ui`, it is absent for every medialess tool, so recorded
-events keep their historical shape.
+events keep their historical shape. A `toolText()` projection (`src/core/tool-text.ts`,
+currently only `read`) adds **no** event field either: it replaces the `content` TEXT the
+model reads — the transcript carries the tool's own prose instead of that result object's
+serialized JSON — while the machine value stays reachable through `unwrapToolResult`.
 
 The three concurrency fields are additive, and a client must fall back to its
 pre-concurrency rendering when they are absent (old persisted turns):
@@ -3542,8 +3608,10 @@ can fix.
 wrapper (`{ "ops": [{ op: 'list', path: 'src' }] }`) - and a wrong type is a `{ ok: false }` tool error with a
   JSON path instead of an implementation crash. `null` is normalized to `{}`.
 - Result and error TEXT share the model-facing per-result cap (`boundToolResult` in
-  `src/core/result-budget.ts`, 256 KiB, applied AFTER the `toolUi()` unwrap so panels stay on
-  their own limit). A result that fits is returned byte-for-byte unchanged; a result
+  `src/core/result-budget.ts`, 256 KiB, applied AFTER the `unwrapToolResult` peel of the
+  `toolUi()` / `toolMedia()` / `toolText()` brands, so panels stay on their own limit, media
+  rides on the message, and a tool that declared its own prose is measured on THAT text
+  rather than on the escaped JSON of its result object). A result that fits is returned byte-for-byte unchanged; a result
   that does not is returned as the parsed truncation envelope
   `{ truncated, originalBytes, budgetBytes, note, content, tail }` — `content` is the HEAD
   preview, `tail` the end of the original text, and `note` says how many bytes were cut,

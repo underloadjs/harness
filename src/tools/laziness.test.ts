@@ -33,6 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it, vi } from 'vitest';
+// probe: no package import
 
 // Every candidate handed to the runtime compiler, in call order. The `sourcePath`
 // recorded alongside each one is what proves the body comes from the descriptor's
@@ -95,15 +96,38 @@ const readAlphaExpected = () => ({
             nextColumn: null,
             nextByte: null,
             bytes: 5,
-            sizeBytes: 5
+            sizeBytes: 5,
+            lineCount: 1
         }
     ],
     truncated: false,
     bytes: 5,
     wireBytes: expect.any(Number),
     contentBudget: 262_144,
+    // The projection's byte length, which moves with the per-run scratch path like
+    // `wireBytes` does, so it is matched rather than hardcoded.
+    modelBytes: expect.any(Number),
     skipped: 0
 });
+
+// The same expectation from the CALLER'S side: peel `read`'s branded envelope
+// (core/tool-text.ts) the way the delivery boundary's `unwrapToolResult` does, so the
+// assertion stays about the machine result. The peel is written inline rather than
+// imported: this file replaces `../core` with a counting mock, and pulling the core
+// barrel — or the package root, which re-exports it — into the test module's own
+// imports stops `descriptors.ts`'s `await import('../core')` from ever reaching that
+// mock, i.e. the compile counter silently records nothing. The shape peeled here is the
+// brand key plus `content`, which `core/tool-text.test.ts` pins as the whole contract.
+const readAlpha = async (tool: unknown): Promise<unknown> => {
+    const envelope = (await (tool as (paths: unknown) => Promise<Record<string, unknown>>)([READ_TARGET])) as Record<
+        string,
+        unknown
+    >;
+
+    expect(Object.keys(envelope).sort()).toEqual(['__toolText', 'content']);
+
+    return envelope.content;
+};
 
 afterAll(() => {
     fs.rmSync(SCRATCH_ROOT, { recursive: true, force: true });
@@ -130,16 +154,17 @@ describe('lazy preset tools', () => {
         // few load-bearing phrases rather than the exact sentence.
         expect(presetTools.read.description.length).toBeGreaterThan(1000);
         for (const phrase of [
-            'Read a BOUNDED window of one or more UTF-8 text files',
+            'Read a BOUNDED window of UTF-8 text files',
             'startByte',
             'nextByte',
-            '256 KiB budget measured on the SERIALIZED JSON',
+            '256 KiB budget is measured on the SERIALIZED result',
             'EBINARY',
-            // The default line cap is gone: the budget is the documented limit, and an
-            // EXPLICIT maxLines is what stays bounded. Pinning the phrase that used to
-            // read "maxLines 5000" keeps this test doing its job — proving the full
-            // prose ships with the metadata — without re-pinning the whole sentence.
-            'NO line cap',
+            // D11: the DEFAULT is now a context budget (2000 lines / 65536 bytes) with the
+            // old behaviour kept as an explicit ceiling, so the phrase that used to read
+            // "NO line cap" is gone. Pinning the numbers instead keeps this test doing its
+            // job — proving the full prose ships with the metadata — without re-pinning the
+            // whole sentence, and the numbers are the part a model cannot guess.
+            'maxLines 2000, maxBytes 65536',
             'limit'
         ]) {
             expect(presetTools.read.description).toContain(phrase);
@@ -148,73 +173,74 @@ describe('lazy preset tools', () => {
         // Core by catalogue metadata (R18): declared up front, but that changes no
         // laziness property — the body still compiles only on first call.
         expect(presetTools.read.visibility).toBe('core');
-        expect(presetTools.read.parameters).toEqual({
-            type: 'object',
-            properties: {
-                paths: {
-                    type: 'array',
-                    maxItems: 100,
-                    items: {
-                        oneOf: [
-                            { type: 'string' },
-                            {
-                                type: 'object',
-                                properties: {
-                                    path: {
-                                        type: 'string',
-                                        description:
-                                            'File to read, absolute or relative to the working directory.'
-                                    },
-                                    startLine: {
-                                        type: 'integer',
-                                        minimum: 1,
-                                        description:
-                                            '1-based first line to return. Defaults to 1.'
-                                    },
-                                    startColumn: {
-                                        type: 'integer',
-                                        minimum: 0,
-                                        description:
-                                            '0-based UTF-8 byte offset within startLine, for continuing a giant line. Defaults to 0.'
-                                    },
-                                    startByte: {
-                                        type: 'integer',
-                                        minimum: 0,
-                                        description:
-                                            'Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. An offset inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; an offset at or past EOF is an ERANGE entry. Without an explicit startLine the true line at this offset is counted and reported. Defaults to null (count from the start).'
-                                    },
-                                    maxLines: {
-                                        type: 'integer',
-                                        minimum: 1,
-                                        maximum: 20_000,
-                                        description:
-                                            'Maximum lines to return. OMIT for no line cap: the 256 KiB budget then decides, which is the default. When supplied it must be an integer in [1, 20000]. A window cut by this cap reports limit: "maxLines".'
-                                    }
-                                },
-                                required: ['path'],
-                                additionalProperties: false
-                            }
-                        ]
-                    },
-                    description:
-                        'Files to read, in the order the results are returned. A string reads a default window; an object selects a line/byte range.'
-                }
-            },
-            required: ['paths'],
-            additionalProperties: false
-        });
+        // The schema is asserted STRUCTURALLY, not by re-pasting every property
+        // description: this test's claim is that the complete descriptor — prose, bounds
+        // and all — is readable with NO body compiled, while the exact wording is pinned
+        // by the manifest consistency check and the per-property contract by
+        // read.test.ts. What stays pinned here is what a model cannot guess and what the
+        // request shape depends on: the single-property rule, and the cap on each knob.
+        const parameters = presetTools.read.parameters as {
+            type: string;
+            required: string[];
+            additionalProperties: boolean;
+            properties: Record<string, { type: string; maxItems: number; items: { oneOf: Record<string, unknown>[] } }>;
+        };
+
+        expect(parameters.type).toBe('object');
+        expect(parameters.required).toEqual(['paths']);
+        expect(parameters.additionalProperties).toBe(false);
+        expect(Object.keys(parameters.properties)).toEqual(['paths']);
+
+        const paths = parameters.properties.paths;
+
+        expect(paths.type).toBe('array');
+        expect(paths.maxItems).toBe(100);
+        expect(paths.items.oneOf[0]).toEqual({ type: 'string' });
+
+        const range = paths.items.oneOf[1] as {
+            type: string;
+            required: string[];
+            additionalProperties: boolean;
+            properties: Record<string, Record<string, unknown>>;
+        };
+
+        expect(range.type).toBe('object');
+        expect(range.required).toEqual(['path']);
+        // A typo'd knob is refused, not ignored — a dropped `maxLine` would hand the
+        // model a default window it did not ask for.
+        expect(range.additionalProperties).toBe(false);
+        expect(Object.keys(range.properties).sort()).toEqual([
+            'lossy',
+            'maxBytes',
+            'maxLines',
+            'numbered',
+            'path',
+            'startByte',
+            'startColumn',
+            'startLine'
+        ]);
+        // D11's two caps are the numbers the DEFAULT window is sized against, so they
+        // belong in the schema the model reads, not only in the prose.
+        expect(range.properties.maxLines).toMatchObject({ type: 'integer', minimum: 1, maximum: 20_000 });
+        expect(range.properties.maxBytes).toMatchObject({ type: 'integer', minimum: 1, maximum: 262_144 });
+        expect(range.properties.startLine).toMatchObject({ type: 'integer', minimum: 1 });
+        expect(range.properties.startColumn).toMatchObject({ type: 'integer', minimum: 0 });
+        expect(range.properties.startByte).toMatchObject({ type: 'integer', minimum: 0 });
+        expect(range.properties.lossy).toMatchObject({ type: 'boolean' });
+        expect(range.properties.numbered).toMatchObject({ type: 'boolean' });
+        expect(range.properties.path).toMatchObject({ type: 'string' });
 
         // Still nothing compiled: metadata is descriptor data, not a body.
         expect(compiles).toEqual([]);
 
         // First execution compiles the entry the descriptor was scanned from.
-        await expect(presetTools.read([READ_TARGET])).resolves.toEqual(readAlphaExpected());
+        expect(await readAlpha(presetTools.read)).toEqual(readAlphaExpected());
         expect(compiles).toEqual([
             { sourcePath: 'tools/files/read.tool.ts', expectedName: 'read' }
         ]);
 
         // The proxy caches its successful resolve: a second call compiles nothing.
-        await expect(presetTools.read([READ_TARGET])).resolves.toEqual(readAlphaExpected());
+        expect(await readAlpha(presetTools.read)).toEqual(readAlphaExpected());
         expect(compiles).toHaveLength(1);
     });
 
@@ -238,7 +264,7 @@ describe('lazy preset tools', () => {
         expect(first.name).toBe('read');
         expect(second.name).toBe('read');
         expect(first.description).toBe(second.description);
-        await expect(first([READ_TARGET])).resolves.toEqual(readAlphaExpected());
+        expect(await readAlpha(first)).toEqual(readAlphaExpected());
         // Invoking a resolved tool compiles nothing further.
         expect(compiles).toHaveLength(2);
     });

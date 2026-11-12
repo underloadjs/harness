@@ -128,6 +128,12 @@ import * as toolUiApi from './tool-ui';
 // different module's brand and the delivery boundary would serialize the
 // wrapper itself instead of the summary.
 import * as toolMediaApi from './tool-media';
+// The model-projection seam (`read`'s prose) joins the live core namespace for the
+// same reason `tool-ui` and `tool-media` do: a compiled source entry must reach the
+// SAME brand the harness peels at `deliverTask`, or the projection would be a
+// different module's brand and the boundary would serialize the wrapper — every
+// escaped byte the seam exists to avoid — instead of the prose.
+import * as toolTextApi from './tool-text';
 import * as schedulerApi from './scheduler';
 import * as metadataApi from './metadata';
 import * as actionApi from './action';
@@ -370,9 +376,10 @@ const source = (): SourceRuntime => {
     );
 };
 
-// Resolve the package root by walking up from this module. Works from `src/`
-// during development and from `dist/` in the published package, then prefers the
-// editable `src/` tree (dev) and falls back to `tool-sources/` (deployed copies).
+// Resolve the package root by walking up from this module. The published package
+// ships `src/` (see package.json "files"), so this module lives in `src/` in every
+// install; a `dist/` layout is tolerated as a legacy fallback. The walk prefers the
+// editable `src/` tree and falls back to `tool-sources/` (deployed copies).
 const findPackageRoot = (runtime: SourceRuntime): string => {
     let directory = runtime.dirname(runtime.fileURLToPath(import.meta.url));
 
@@ -471,6 +478,7 @@ const liveCoreApi = (): Record<string, unknown> => {
         snapshotApi,
         toolUiApi,
         toolMediaApi,
+        toolTextApi,
         schedulerApi,
         metadataApi,
         actionApi,
@@ -504,6 +512,7 @@ const LIVE_MODULE_KEYS: Record<string, LiveModuleLookup> = {
     // directly must resolve the SAME brand + validator as `../core` does.
     'core/tool-media': () => toolMediaApi,
     'core/tool-ui': () => toolUiApi,
+    'core/tool-text': () => toolTextApi,
     util: () => utilApi,
     'util/index': () => utilApi,
     types: () => ({}),

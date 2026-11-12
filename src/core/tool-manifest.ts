@@ -1482,7 +1482,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "read",
     metadata: {
         name: "read",
-        description: "Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, startByte, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, error? }], truncated, bytes, wireBytes, contentBudget, skipped, note? }. Defaults: startLine 1, startColumn 0, startByte null, and NO line cap — the byte budget is the limit, so a default read returns as much as the envelope holds; an EXPLICIT maxLines is an integer in [1, 20000]. `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. `limit` says WHY a truncated window stopped: \"maxLines\" (raise maxLines to get more) or \"budget\" (more lines would not help; the 256 KiB envelope is full) — or null when the window reached EOF, in which case truncated is false. When an entry is truncated, pass startByte = nextByte to resume by SEEKING (no rescanned prefix) — that is how a large file should be walked; or use { startLine: nextLine, startColumn: nextColumn }, where nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. LARGE FILE: check `sizeBytes` against `bytes` and read `truncated` before assuming you have the whole file, and for a file you already know is large ask for a window ({ startLine } or { startByte }) instead of reading blindly from the top — when a file of 65536 bytes or more comes back cut, the top-level `note` names up to 2 of them — their size, what was returned, and the exact continuation — and counts the remainder as \"and N more large file(s) report truncated/nextByte\", so a big batch never spends the budget the note freed. A startByte that lands inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; a startByte at or past the end of the file is an ERANGE entry, not an empty window, so \"offset out of range\" and \"file is empty\" are different answers. With no startLine, the true line at a seek offset is counted and reported rather than defaulting to 1. The whole batch shares a 256 KiB budget measured on the SERIALIZED JSON (escaping included), allocated by demand: files that need less hand their surplus back to files that were cut, instead of splitting evenly by headcount. A call accepts at most 100 paths. A path that cannot be read is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code, message }` - codes are ENOENT, EISDIR (a directory: use files or glob), EACCES/EPERM (a real denial), EBINARY (NUL bytes or invalid UTF-8), ERANGE (startByte at or past EOF), or EIO - and it consumes no budget, so the other files in the same call are still read in full. Only a malformed request (bad path, bad range, empty or oversized array) rejects the whole call. A window at a deep line without startByte counts newlines from the start to find it, on raw bytes and at seek speed. Binary detection is WINDOW-SCOPED, not whole-file: bytes outside the requested window are never decoded, so one file can read as text for a narrow window and as EBINARY for a wide one. Paths are absolute or relative to the working directory.",
+        description: "Read a BOUNDED window of UTF-8 text files. A `paths` item is a path string or { path, startLine, startColumn, startByte, maxLines, maxBytes, lossy, numbered }. Result: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, error? }], truncated, bytes, wireBytes, contentBudget, modelBytes, skipped, note? }. Per-file defaults startLine 1, startColumn 0, startByte null, maxLines 2000, maxBytes 65536 - deliberately SMALL, because this feeds a context window, not a pipe (ceilings 20000 lines, 262144 bytes). `content` is raw text whose first line is `startLine`; `numbered: true` prefixes the model's copy with `123: `. Act on `truncated`/`limit` before assuming you have the file: \"maxLines\" raise maxLines, \"maxBytes\" raise maxBytes, \"budget\" means the batch's 256 KiB envelope is full (want fewer bytes across the batch), null means EOF. Continue with startByte = nextByte (a SEEK) or { startLine: nextLine, startColumn: nextColumn }; files 65536+ bytes cut are also named in `note`. A seek past EOF is an ERANGE entry naming the file size or line count, never an empty window. The 256 KiB budget is measured on the SERIALIZED result and allocated by demand; max 100 paths. An unreadable path stays IN ORDER with `error: { code, message }` - ENOENT (names likely paths), EISDIR (previews entries), EACCES/EPERM, EBINARY (`lossy: true` substitutes U+FFFD), ERANGE, EIO - and costs no budget. Only a malformed request rejects the call. Paths are relative to the working directory.",
         tags: [
             "files",
             "read",
@@ -1519,13 +1519,27 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                                     startByte: {
                                         type: "integer",
                                         minimum: 0,
-                                        description: "Absolute 0-based UTF-8 byte offset to seek to, skipping the line count. Feed back a previous nextByte. An offset inside a multi-byte character is advanced to the next code-point boundary and reported as startByteAligned; an offset at or past EOF is an ERANGE entry. Without an explicit startLine the true line at this offset is counted and reported. Defaults to null (count from the start)."
+                                        description: "0-based UTF-8 byte offset to SEEK to; feed back a previous nextByte. Inside a multi-byte character it moves to the next boundary (startByteAligned); at or past EOF it is an ERANGE entry. Without startLine the true line here is counted and reported. Defaults to null."
                                     },
                                     maxLines: {
                                         type: "integer",
                                         minimum: 1,
                                         maximum: 20000,
-                                        description: "Maximum lines to return. OMIT for no line cap: the 256 KiB budget then decides, which is the default. When supplied it must be an integer in [1, 20000]. A window cut by this cap reports limit: \"maxLines\"."
+                                        description: "Lines to return. Default 2000; an explicit value is an integer in [1, 20000]. A window cut by this cap reports limit: \"maxLines\"."
+                                    },
+                                    maxBytes: {
+                                        type: "integer",
+                                        minimum: 1,
+                                        maximum: 262144,
+                                        description: "Bytes this file may take, in the units `bytes`/`wireBytes` report. Default 65536; an explicit value is an integer in [1, 262144]. The only knob that widens ONE file. A window cut by it reports limit: \"maxBytes\"."
+                                    },
+                                    lossy: {
+                                        type: "boolean",
+                                        description: "Substitute U+FFFD for bytes that are not valid UTF-8 instead of reporting EBINARY, so a Latin-1 log stays readable; the entry then says `lossy: true`. Default false."
+                                    },
+                                    numbered: {
+                                        type: "boolean",
+                                        description: "Prefix each line of the model's copy with its line number (`123: `) so it can cite lines without arithmetic. `content` stays raw. Costs bytes. Default false."
                                     }
                                 },
                                 required: [
@@ -2327,67 +2341,67 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
 export const loadDiscoveredTool = (label: string): Promise<unknown> => {
     switch (label) {
         case "tools/runtime/toolRegistry.tool.ts":
-            return import("../tools/runtime/toolRegistry.tool.ts");
+            return import("../tools/runtime/toolRegistry.tool");
         case "tools/runtime/toolRequest.tool.ts":
-            return import("../tools/runtime/toolRequest.tool.ts");
+            return import("../tools/runtime/toolRequest.tool");
         case "tools/runtime/toolList.tool.ts":
-            return import("../tools/runtime/toolList.tool.ts");
+            return import("../tools/runtime/toolList.tool");
         case "tools/runtime/toolManage.tool.ts":
-            return import("../tools/runtime/toolManage.tool.ts");
+            return import("../tools/runtime/toolManage.tool");
         case "tools/runtime/toolCreate.tool.ts":
-            return import("../tools/runtime/toolCreate.tool.ts");
+            return import("../tools/runtime/toolCreate.tool");
         case "tools/runtime/records.tool.ts":
-            return import("../tools/runtime/records.tool.ts");
+            return import("../tools/runtime/records.tool");
         case "tools/runtime/tasks.tool.ts":
-            return import("../tools/runtime/tasks.tool.ts");
+            return import("../tools/runtime/tasks.tool");
         case "tools/runtime/profiles.tool.ts":
-            return import("../tools/runtime/profiles.tool.ts");
+            return import("../tools/runtime/profiles.tool");
         case "tools/runtime/chapters.tool.ts":
-            return import("../tools/runtime/chapters.tool.ts");
+            return import("../tools/runtime/chapters.tool");
         case "tools/runtime/locations.tool.ts":
-            return import("../tools/runtime/locations.tool.ts");
+            return import("../tools/runtime/locations.tool");
         case "tools/runtime/agentManage.tool.ts":
-            return import("../tools/runtime/agentManage.tool.ts");
+            return import("../tools/runtime/agentManage.tool");
         case "tools/runtime/agentResult.tool.ts":
-            return import("../tools/runtime/agentResult.tool.ts");
+            return import("../tools/runtime/agentResult.tool");
         case "tools/runtime/delegate.tool.ts":
-            return import("../tools/runtime/delegate.tool.ts");
+            return import("../tools/runtime/delegate.tool");
         case "tools/runtime/threadFork.tool.ts":
-            return import("../tools/runtime/threadFork.tool.ts");
+            return import("../tools/runtime/threadFork.tool");
         case "tools/runtime/actionRequest.tool.ts":
-            return import("../tools/runtime/actionRequest.tool.ts");
+            return import("../tools/runtime/actionRequest.tool");
         case "tools/runtime/toolCancel.tool.ts":
-            return import("../tools/runtime/toolCancel.tool.ts");
+            return import("../tools/runtime/toolCancel.tool");
         case "tools/syntax/syntax.tool.ts":
-            return import("../tools/syntax/syntax.tool.ts");
+            return import("../tools/syntax/syntax.tool");
         case "tools/files/read.tool.ts":
-            return import("../tools/files/read.tool.ts");
+            return import("../tools/files/read.tool");
         case "tools/files/write.tool.ts":
-            return import("../tools/files/write.tool.ts");
+            return import("../tools/files/write.tool");
         case "tools/files/edit.tool.ts":
-            return import("../tools/files/edit.tool.ts");
+            return import("../tools/files/edit.tool");
         case "tools/files/files.tool.ts":
-            return import("../tools/files/files.tool.ts");
+            return import("../tools/files/files.tool");
         case "tools/files/glob.tool.ts":
-            return import("../tools/files/glob.tool.ts");
+            return import("../tools/files/glob.tool");
         case "tools/files/grep.tool.ts":
-            return import("../tools/files/grep.tool.ts");
+            return import("../tools/files/grep.tool");
         case "tools/command/shell.tool.ts":
-            return import("../tools/command/shell.tool.ts");
+            return import("../tools/command/shell.tool");
         case "tools/command/gitDiff.tool.ts":
-            return import("../tools/command/gitDiff.tool.ts");
+            return import("../tools/command/gitDiff.tool");
         case "tools/webdownload/download.tool.ts":
-            return import("../tools/webdownload/download.tool.ts");
+            return import("../tools/webdownload/download.tool");
         case "tools/runtime/search.tool.ts":
-            return import("../tools/runtime/search.tool.ts");
+            return import("../tools/runtime/search.tool");
         case "tools/runtime/fetch.tool.ts":
-            return import("../tools/runtime/fetch.tool.ts");
+            return import("../tools/runtime/fetch.tool");
         case "tools/runtime/threadSend.tool.ts":
-            return import("../tools/runtime/threadSend.tool.ts");
+            return import("../tools/runtime/threadSend.tool");
         case "tools/runtime/threadRead.tool.ts":
-            return import("../tools/runtime/threadRead.tool.ts");
+            return import("../tools/runtime/threadRead.tool");
         case "tools/runtime/threadList.tool.ts":
-            return import("../tools/runtime/threadList.tool.ts");
+            return import("../tools/runtime/threadList.tool");
         default:
             return Promise.reject(
                 new Error(`No generated tool loader for "${label}". Regenerate with: npx vite-node scripts/generate-tool-manifest.mjs`)

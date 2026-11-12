@@ -14,8 +14,10 @@
 //   - actions: a pill opens its session, `×` deletes it, the `+` (in the header row AND in
 //     the dashboard) starts a fresh conversation. T9 removed the manual Refresh control;
 //     the directory re-read that used to sit behind it is still automatic (see the
-//     rejected-submit test below) and the busy/disabled rules the rail buttons carried are
-//     unchanged;
+//     rejected-submit test below). The busy/disabled rules the rail buttons carried are NOT
+//     inherited wholesale: opening a conversation and creating one are gated by `submitting`
+//     (plus boot/archived for the create) only — never by a run — so a working conversation
+//     can always be switched away from (see canonical-directory-live-main.test.ts);
 //   - empty state: a short hint, not the old "Locked to <harness>" sentence;
 //   - R3 (T9): `openHarnessDetails` puts that Sessions section in the dialog at
 //     EVERY width (jsdom answers `matchMedia` as phone by default, and the desktop stub

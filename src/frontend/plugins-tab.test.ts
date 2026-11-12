@@ -195,8 +195,8 @@ const compactionRow = (): Row => ({
     // paragraph-length paraphrase with this single sentence, and the pane shows it verbatim
     // as `.plugin-detail-description`.
     description: 'Compacts the thread context when the conversation reaches a configured token threshold.',
-    // Trimmed the same way the settings list below is (the shipped prompt is 715 characters
-    // and five lines, pinned byte-for-byte in src/plugin/context-compaction.test.ts). What
+    // Trimmed the same way the settings list below is (the shipped prompt is 1714 characters
+    // and 21 lines, pinned byte-for-byte in src/plugin/context-compaction.test.ts). What
     // this fixture HAS to keep is the shape the pane's contract is about: a multi-line value
     // with the plugin's own marker, so a renderer that flattens newlines or parses the text
     // as markup fails here instead of in the browser.
@@ -983,10 +983,11 @@ it('keeps the plugins and tools pages, their rows and their switches usable whil
     // pending state — the state that used to hide both catalogues.
     expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');
 
-    // The chat's own protections stay locked: a new conversation cannot start and the
-    // header cycler cannot move while the queue works (these are the gates R1 KEEPS).
-    expect(byClass('.new-session', 'button').disabled).toBe(true);
-    expect(byClass('.session-cycle', 'button').disabled).toBe(true);
+    // The chat's OWN protection stays locked: the composer offers STOP for this conversation's
+    // pending queue. The session surface is not locked any more — a run never blocks switching
+    // or creating, because leaving a conversation only unsubscribes its observer (R4).
+    expect(byClass('.new-session', 'button').disabled).toBe(false);
+    expect(byClass('.session-cycle', 'button').disabled).toBe(false);
 
     // The two catalogue controls answer only to `booted`, and boot has answered.
     expect(pluginsToggle().disabled).toBe(false);

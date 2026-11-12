@@ -85,11 +85,12 @@
 // pagehide clear everything. A hydrated or polled RUNNING turn derives activity
 // from its own events; settled history never lights a tile.
 //
-// Run/cancel is single-flight and instance-scoped: the composer's stop action uses
-// the instance that started the run (never "whatever is selected now"), and harness
-// switching and TEAM editing is disabled while a run is in flight. Model edits are
-// not a team edit: PATCH /sessions/:id applies to the next request without
-// cancelling the stream (R2).
+// Run/cancel is single-flight and instance-scoped: the composer's stop action is painted
+// from, and cancels, the SELECTED conversation (`stopRun` reads `current`), never "whatever
+// worked last". A run locks the TEAM edit, the harness create and the harness delete; it
+// does NOT lock harness or session switching, because leaving a working conversation is an
+// unsubscribe, not a cancel (R4). Model edits are not a team edit: PATCH /sessions/:id
+// applies to the next request without cancelling the stream (R2).
 //
 // API root: `./api.ts` resolves it at runtime (?apiRoot → injected config →
 // build-time VITE_HARNESS_API → the local/LAN chain on a GitHub Pages host → /api)
@@ -3198,8 +3199,8 @@ sessionCycle.addEventListener('click', () => {
 // The historical `.new-session` class is kept, and with the header strip gone this is the
 // only copy outside the dashboard, so every consumer that clicks `.new-session` while the
 // dialog is closed still reaches a real control. `paintSessionActions()` is the ONLY writer
-// of `disabled`, so the busy contract (submit / run / pending create / un-booted / archived
-// harness) is exactly the one the old strip button carried.
+// of `disabled`, so the busy contract (a submit in flight / an un-booted catalogue / an
+// archived harness) is one rule for every copy — and a run is deliberately NOT part of it.
 const sessionNew = el('button', 'new-session session-new', '+');
 sessionNew.type = 'button';
 sessionNew.disabled = true;
@@ -5422,8 +5423,9 @@ let agentDialogSignature: string | undefined;
 
 // Single-flight submit state (R4). `running` means the selected session has work
 // the server has not finished; it drives the composer's stop state and the harness
-// locks, but NOT submission, because submitting another task while one runs is
-// exactly how the queue is built. `submitting` covers only the short window between
+// create/delete locks, but NOT session switching and NOT submission, because leaving a
+// working conversation is an unsubscribe (R4) and submitting another task while one runs
+// is exactly how the queue is built. `submitting` covers only the short window between
 // pressing the submit action and the POST /tasks answer, so a double submit cannot
 // create two sessions or two copies of the same task.
 let running = false;
@@ -5432,6 +5434,34 @@ let booted = false;
 // The live queue observer for the selected session, if one is open. Aborting it
 // only unsubscribes (the server keeps running) — see api.ts observeSession.
 let watch: { instance: Instance; sessionId: string; controller: AbortController } | undefined;
+// R3: the ONE number that says what the centre column is supposed to show. It is raised by
+// USER NAVIGATION ONLY — three places, each one a thing the reader did:
+//   - `openSession` claims a value for itself (the header cycler, a strip pill, the
+//     harness-entry pick, the boot restore),
+//   - `newSession` (`+ New session` — an empty composer IS a choice),
+//   - `selectHarness` (the rail row, creating a harness, the reselect after a harness delete,
+//     boot's first selection, and the switch that ends a conversation open).
+// `openSession` re-checks the value it captured after EVERY await, so an answer that lands
+// late is dropped instead of painted. Everything else — an observer being re-pointed by a
+// submit's receipt, a cancel's reconciliation or a resync, a session delete, a tool runner
+// closing — is housekeeping and records NOTHING, so it can never cancel a gesture the reader
+// is still waiting for.
+//
+// Why the check cannot be opt-in: `newSession` leaves `instance.sessionId === undefined`, and
+// `applyView` adopts a document whenever the card has no pointer (the remembered-pointer boot
+// needs exactly that), so a released card is ACCEPTING by construction. Without this counter,
+// a `+` pressed while a conversation's read was in flight let that answer re-bind the card the
+// reader had just released: the transcript came back, `setBusy(instance.pending)` restored the
+// pending figure, and `rememberSession` wrote back the pointer `forgetRememberedSession` had
+// cleared. Two rapid opens failed the same way — last RESPONSE won, not last CLICK.
+let navigationIntent = 0;
+
+// Records a navigation gesture. The only reader is the `openSession` continuation that
+// captured an older value, so raising it costs nothing; a gesture site calls it rather than
+// reasoning about whether this particular path could race a read.
+const markNavigationIntent = (): void => {
+    navigationIntent += 1;
+};
 // Guards a double PATCH while an agent edit is in flight.
 let savingAgents = false;
 // How many POST /sessions requests are awaiting an answer. A model edit while a
@@ -5909,6 +5939,13 @@ const selectHarness = (
 ): void => {
     const descriptor = descriptorFor(name) ?? fallback;
     if (descriptor === undefined) return;
+    // R3: pointing the centre column at another harness IS a navigation intent, and this is
+    // the one place every such gesture passes through — the rail row, creating a harness, the
+    // reselect after a harness delete, boot's first selection, and the switch that ends a
+    // conversation open. The bump sits AFTER the descriptor guard so a harness the server no
+    // longer reports cannot supersede the open that is still landing.
+    markNavigationIntent();
+
     // Picking a harness (or a session, which lands here through openSession) is the
     // end of a phone rail visit: collapse it so the chat is visible again. Harmless
     // on desktop, where the state is never styled.
@@ -6020,8 +6057,10 @@ let armedHarness: string | undefined;
 // happen before the catalogue exists:
 //   - `submitting` is the POST /tasks window, which may be creating a session,
 //   - `savingAgents` is a harness/team PATCH,
-//   - `running`/`current.pending` means the centre column is showing work whose harness
-//     would vanish underneath it,
+//   - `running`/`current.pending` means THIS page still carries work whose harness would
+//     vanish underneath it — the centre column need not be showing that work (the reader can
+//     switch away and the queue keeps running), but the pending figure, the composer's stop
+//     state and the observer this page holds all still belong to the team being deleted,
 //   - a session creation in flight (`creatingSessions`) would make "which harness is
 //     selected" ambiguous exactly when the delete has to reselect one.
 const harnessDeletionBlocked = (): boolean =>
@@ -6168,7 +6207,12 @@ const buildHarnesses = (): void => {
         button.type = 'button';
         button.dataset.harness = descriptor.name;
         button.setAttribute('aria-pressed', selectedName === descriptor.name ? 'true' : 'false');
-        button.disabled = running;
+        // A run locks NO session or harness navigation (R4): the queue is server-owned, so
+        // leaving a working conversation is an unsubscribe. The two windows that genuinely
+        // race are the ones `paintControls` re-derives for this same map (`submitting`,
+        // `!booted`) — the create-time paint has to agree with that repaint, not self-heal
+        // afterwards.
+        button.disabled = submitting || !booted;
         // The description is available on hover/focus without becoming a wall of
         // prose in the centre column.
         button.title = descriptor.description;
@@ -9827,12 +9871,16 @@ const paintSessionPill = (
             select.removeAttribute('aria-current');
         }
 
-        // Switching conversations is refused while a run is in flight OR while a submit is in
-        // its enqueue window (the same lock the old row carried, and the reason New session
-        // is disabled too). `paintControls` re-applies the same expression on every later
-        // repaint; painting it here as well is what keeps a pill that was just created (or
-        // reused after a directory change) honest without a second pass over the strip.
-        select.disabled = submitting || running;
+        // Opening a conversation is a VIEW change, never a cancellation, so the only lock this
+        // control carries is `submitting` — the short POST /tasks enqueue window, during which
+        // the answer's session pointer could still race the switch. A RUN does not lock it: the
+        // queue is server-owned, leaving a conversation only unsubscribes its observer (R4, and
+        // the rule the harness rail buttons at `paintControls` already follow), so a conversation
+        // whose own queue is moving can always be switched away from AND into.
+        // `paintControls` re-applies the same expression on every later repaint; painting it here
+        // as well is what keeps a pill that was just created (or reused after a directory change)
+        // honest without a second pass over the strip.
+        select.disabled = submitting;
         select.title = `${session.harness} · ${session.status} · ${session.id}`;
     }
 
@@ -9870,8 +9918,9 @@ const pillNodesFor = (list: HTMLElement): Map<string, HTMLElement> => {
 //   - WHAT it shows: `shortId(id)` — eight characters, like the strip. The full uuid, the
 //     harness and the status are tooltip facts only, so the row stays one line wide.
 //   - WHAT a press does: the next entry of `sessionDirectory()`, the strip's own projection.
-// The guard is the strip's own "can I switch" rule (`submitting || running`, see
-// `paintControls`), because pressing this pill calls the very same `openSession`.
+// The guard is the strip's own "can I switch" rule (`submitting` only, see
+// `paintSessionPill`), because pressing this pill calls the very same `openSession`. A run
+// never locks it: leaving a conversation whose queue is moving only unsubscribes the observer.
 const paintSessionCycle = (): void => {
     const instance = current;
     const activeId = instance?.sessionId;
@@ -9899,9 +9948,10 @@ const paintSessionCycle = (): void => {
     const harness = record?.harness ?? (instance.frozen ?? instance.descriptor).title;
     const status = record?.status ?? 'unknown';
     const short = shortId(activeId);
-    // Same lock as a strip pill: switching mid-run would drop the reader out of a
-    // conversation whose queue is still moving.
-    const blocked = submitting || running;
+    // Same guard as a strip pill: only the submit's enqueue window locks a switch. A run in
+    // THIS conversation never does — leaving it unsubscribes the observer while the server keeps
+    // the queue moving, and coming back re-opens it (`openSession` → `startWatching`).
+    const blocked = submitting;
 
     sessionCycle.hidden = false;
     sessionCycle.disabled = blocked;
@@ -9915,10 +9965,12 @@ const paintSessionCycle = (): void => {
         `Current session ${short}. Switch to the next session.`
     );
     // The tooltip carries what the compact pill has no room for: the harness, the server
-    // status, the FULL uuid, and the action (or the reason the action is locked).
+    // status, the FULL uuid, and the action (or the reason the action is locked). A RUNNING
+    // conversation is not a reason: it says `click to switch`, because pressing this pill only
+    // moves the reader — the queue keeps running server-side.
     sessionCycle.title =
         `${harness} · ${status} · ${activeId} · ` +
-        (blocked ? 'wait for the run to finish before switching' : 'click to switch');
+        (blocked ? 'wait for the submit to finish before switching' : 'click to switch');
 };
 
 // The single painter for the directory. `renderSessions()` is still the only entry point
@@ -10014,20 +10066,25 @@ const renderSessions = (): void => {
 
 // One painter for the create-session control the page owns: the compact `+` in the header
 // row. R3 took the dashboard's copy away (a conversation is not created from inside the
-// details dialog), so there is one control again and this painter still has one rule for
-// its busy contract (submit / run / pending create / un-booted / archived harness).
+// details dialog), so there is one control again and this painter's busy contract is now
+// only the windows that can actually race the create: a submit in its enqueue window
+// (`submitting`) and an un-booted catalogue.
+//
+// A RUN is deliberately NOT part of the contract. `newSession()` tears down no queue: it
+// forgets the local pointer, unsubscribes the observer, and the previous conversation keeps
+// running server-side (R4) — which is exactly why the reader can start a fresh conversation
+// while one is already working. Sessions are independent; only the shared client state below
+// is reset, and it belongs to the conversation being left.
 //
 // R6: a NEW session needs a harness the registry still has. An archived conversation
 // (its harness deleted) is readable and can keep queuing tasks into its own record, but
 // `POST /sessions` for a missing harness would only produce a server error, so the action
 // is withheld rather than offered and failed.
 const paintSessionActions = (): void => {
-    const pending = running || current?.pending === true;
     const archivedSelection =
         selectedName !== undefined && descriptorFor(selectedName) === undefined;
-    const disabled = submitting || pending || !booted || archivedSelection;
 
-    sessionNew.disabled = disabled;
+    sessionNew.disabled = submitting || !booted || archivedSelection;
 };
 
 // Re-read the directory. A failure is reported in the status pill; the list on
@@ -11678,6 +11735,12 @@ const stopPolling = (): void => {
 };
 
 // Tear the observer down. This only unsubscribes; it never cancels a task.
+//
+// R3: this raises NO navigation intent. Every caller is either a gesture that ALSO records
+// its own intent (`selectHarness`, `newSession`, `openSession`) or the observer being
+// RE-POINTED at the conversation that just won it (`startWatching`, reached from a submit's
+// receipt, a cancel's reconciliation, or a resync) — and a re-point is housekeeping, which
+// must never cancel an explicit open the reader is still waiting for.
 const stopWatching = (): void => {
     if (watch !== undefined) watch.controller.abort();
     watch = undefined;
@@ -12110,12 +12173,16 @@ const releaseSessionState = (instance: Instance): void => {
 // server's COMPILED document; nothing is reconstructed from browser memory, and no
 // recorded event is fetched (T5 R1/R3).
 //
-// `stale` is the T24 opt-in guard for the AUTOMATIC opens (entering a harness): the read
-// is async, and the reader may have moved to another harness, picked their own
-// conversation, or asked for an empty composer while it was in flight. An explicit open
-// (a pill, the cycler) passes nothing, because the reader's click always wins.
-// `automatic: true` marks the same calls so the switch they perform keeps the app status
-// the reader was just told about (see `selectHarness`).
+// The read is async, so the continuation drops itself on either of two facts:
+//   - the NAVIGATION INTENT (R3), checked for EVERY call, explicit or automatic: the reader
+//     asked for something else while this read was in flight (another open, `+ New session`,
+//     or any observer teardown). See `navigationIntent`;
+//   - `stale`, the T24 opt-in guard the AUTOMATIC opens (entering a harness) add on top.
+//     `entryIsStale` also sees what no counter can: the reader entered ANOTHER harness, or
+//     this harness resolved a conversation of its own mid-flight.
+// An explicit open (a pill, the cycler) passes no `stale`, because the intent check alone is
+// what makes its click win. `automatic: true` marks the same calls so the switch they perform
+// keeps the app status the reader was just told about (see `selectHarness`).
 const openSession = async (
     id: string,
     options?: { stale?: () => boolean; automatic?: boolean }
@@ -12125,13 +12192,25 @@ const openSession = async (
     stopWatching();
     stopPolling();
 
+    // R3: THIS open is the newest intent. It is claimed after the teardown above (which is
+    // pure housekeeping and records nothing) and BEFORE the first await, so every open that is
+    // still in flight is now superseded — and nothing that merely re-dials the observer can
+    // take the claim away again.
+    const intent = navigationIntent + 1;
+    navigationIntent = intent;
+
+    // One predicate, re-checked after every await below. The opt-in `stale` stays as the
+    // additional automatic-entry condition (T24), never as the only guard.
+    const isStale = (): boolean => navigationIntent !== intent || (stale !== undefined && stale());
+
     let session: SessionView;
     try {
         session = await getView(id);
     } catch (error) {
-        // A superseded automatic open is not an event the reader should feel: the view it
-        // belonged to is already gone, so no pointer change, no header error, no refresh.
-        if (stale !== undefined && stale()) return;
+        // A superseded open is not an event the reader should feel: the view it belonged to
+        // is already gone, and the gesture that replaced it owns the header, the pointer and
+        // the directory re-read. So: no pointer change, no header error, no refresh.
+        if (isStale()) return;
         // A remembered id from a previous server process is not an error state
         // the user must fix: forget it and show what the server does have. A
         // stale id in a *row* (someone else's process) must not clear a valid
@@ -12142,9 +12221,10 @@ const openSession = async (
         return;
     }
 
-    // T24: an automatic open whose answer arrived after the reader moved on is dropped
-    // BEFORE it can select a harness, bind a conversation or repaint anything.
-    if (stale !== undefined && stale()) return;
+    // T24/R3: an open whose answer arrived after the reader moved on is dropped BEFORE it can
+    // select a harness, bind a conversation or repaint anything. This is the guard that keeps
+    // a released card from adopting the conversation it just let go.
+    if (isStale()) return;
 
     // R8: this read may have been in flight when the row was deleted (a DELETE is
     // allowed while a session is being opened). The record is gone server-side, so
@@ -12183,10 +12263,10 @@ const openSession = async (
             return;
         }
 
-        // T46: the definition read is a second hop, so the reader may have moved on or deleted
-        // the conversation while it was in flight. These are the same two guards the open itself
-        // applies above, re-checked before anything is selected or painted.
-        if (stale !== undefined && stale()) return;
+        // T46/R3: the definition read is a second hop, so the reader may have moved on or
+        // deleted the conversation while it was in flight. These are the same two guards the
+        // open itself applies above, re-checked before anything is selected or painted.
+        if (isStale()) return;
         if (deletedSessions.has(id)) return;
 
         // Cache it so `applyView` below (which re-derives the team from the document, and
@@ -12334,10 +12414,18 @@ const newSession = (): void => {
     // programmatic call from starting a session the server cannot resolve.
     if (descriptorFor(instance.descriptor.name) === undefined) return;
 
-    if (running) {
-        instance.view.notice('cancel the running task before starting a new session');
-        return;
-    }
+    // NO run guard (R4): a conversation is created by forgetting the local pointer, not by
+    // cancelling anything. Whatever the previous conversation has queued keeps running on the
+    // server, so starting a new session while it works is the normal way to open a second,
+    // independent conversation. The `running` flag itself is released below, with the rest of
+    // the state that belonged to the conversation being left.
+
+    // R3: an empty composer is a navigation intent, so it supersedes every conversation read
+    // still in flight. This is the guard the run lock used to provide by accident: the card is
+    // about to have NO pointer, and `applyView` binds any document that arrives for a
+    // pointer-free card, so without this the conversation just released would re-bind this
+    // card from its own late answer — transcript, pending figure and the remembered pointer.
+    markNavigationIntent();
 
     // New session is reachable from the phone rail: collapse it so the started
     // conversation is on screen (no-op on desktop).
@@ -12393,6 +12481,14 @@ const newSession = (): void => {
     // R2: the harness details dialog described the SAVED session (frozen team), so it
     // is dismissed when that conversation is replaced by a fresh one.
     closeHarnessDialog();
+    // The app-scoped `running` flag is derived from the SELECTED conversation alone, so clearing
+    // the pointer has to release it too: with the guard gone from the top of this function a run
+    // can be live at this moment, and the empty card must not keep painting the PREVIOUS
+    // conversation's STOP action (or hold the harness create button locked) while nothing on
+    // screen is working. Placed after the board/roster/pointer resets so the repaint it triggers
+    // sees the new conversation's state, not the one being released; this is the same release
+    // `forgetDeletedSession` performs for a deleted conversation.
+    setBusy(false);
     renderHarnessChrome();
     renderSessions();
     paintPanels();
@@ -12413,12 +12509,19 @@ const newSession = (): void => {
 //   - The composer's SUBMIT action stays ENABLED while a task runs: submitting
 //     another task is how the queue grows. Only `submitting` (the POST /tasks round
 //     trip) locks it — see `paintComposer`.
-//   - The composer switches to its STOP action whenever work is pending, including
-//     a session observed after a reload (Stop then cancels ALL explicitly via
-//     cancelSession(id, true)).
-//   - New session/harness switching stays locked while pending, because they would
-//     tear down the view of a queue that is still running. Reset is gone (R10), so
-//     there is no third composer control to paint.
+//   - The composer switches to its STOP action whenever work is pending ON THE SELECTED
+//     CONVERSATION — `running` is that conversation's own flag, re-set by its painters
+//     (`applyView`/`refreshPending` call `setBusy(instance.pending)`), and `current.pending`
+//     is the same figure read directly — including a session observed after a reload. The
+//     run of a conversation the reader left paints no STOP here; Stop cancels that ONE
+//     conversation's queue explicitly via cancelSession(id, true).
+//   - Session SWITCHING and session CREATION are NOT locked by a run (R4) — and neither is
+//     the harness rail, which now states the same rule at BOTH ends: `buildHarnesses` creates
+//     a row with `submitting || !booted`, and the pass below re-derives exactly that. The
+//     queue is server-owned, so leaving a conversation only unsubscribes its observer. Both
+//     keep the windows that can genuinely race — `submitting`, `!booted`, and an archived
+//     harness for the create — see `paintSessionActions`, `paintSessionCycle` and the strip
+//     pass below. Reset is gone (R10), so there is no third composer control to paint.
 //   - R1: the TWO CATALOGUES (Tools and Plugins) are NOT locked by a run. They are
 //     server-wide surfaces whose own writes have no idle window, and every transcript
 //     painter early-returns while a catalogue owns the centre column, so a stream keeps
@@ -12483,14 +12586,15 @@ const paintControls = (): void => {
     // R1/T3: pills replace the rail rows, and an archived conversation's pill is the same
     // control, so the busy-state pass walks every live strip instead of two lists.
     //
-    // Opening a conversation stays locked while a run is in flight OR while a submit is in
-    // its enqueue window: the pill is built with `disabled = running`, and this pass is
-    // what keeps that lock honest after a repaint that did not rebuild the strip.
+    // Opening a conversation is locked ONLY while a submit is in its enqueue window: the pill is
+    // built with `disabled = submitting` (`paintSessionPill`), and this pass is what keeps that
+    // state honest after a repaint that did not rebuild the strip. A RUN locks nothing — leaving
+    // a working conversation is an unsubscribe, not a cancel (R4).
     const deletionsBlocked = deletionBlocked();
 
     for (const bar of liveSessionBars()) {
         for (const select of bar.element.querySelectorAll<HTMLButtonElement>('.session-pill-select')) {
-            select.disabled = submitting || running;
+            select.disabled = submitting;
         }
 
         // R8: deletion is a write, so it is disabled for the same conflicting windows
@@ -13380,8 +13484,18 @@ const boot = async (): Promise<void> => {
 
         booted = true;
         // R1 (T3) / R4 (T9) / R3 (this pass): the header's New-session button is the only
-        // create control, and its enabled state is derived from `booted`, so this runs
-        // AFTER the flag flips (the rail used to force the buttons on directly).
+        // create control, and EVERY control's enabled state is derived from `booted`, so the
+        // shared painter runs AFTER the flag flips (the rail used to force the buttons on
+        // directly). `paintControls` is `paintSessionActions()` + `paintComposer()` + the rail,
+        // pill, cycler and catalogue passes, so this replaces the two ad-hoc calls that used
+        // to sit here.
+        //
+        // R3 (this pass): the harness rows are now CREATED from the same expression
+        // `paintControls` re-derives (`submitting || !booted`), so this repaint is what turns
+        // the rail on at the end of boot. It has to be the shared painter rather than the two
+        // ad-hoc calls: the boot path that opens NO conversation (`initial === undefined`
+        // below) never reaches `setBusy`, and every other rail repaint happens before
+        // `booted` flips — the rail would otherwise stay disabled until the first live frame.
         //
         // T3 (zero-harness boot): a RESOLVED bootstrap that reports ZERO harnesses is a
         // healthy server, not an offline one. The tool catalogue, the agent library and the
@@ -13393,10 +13507,7 @@ const boot = async (): Promise<void> => {
         // delete-everything server look dead AND left "+ New" refused by the `!booted` click
         // guard, so the reader could never create the first harness. Only a FAILED request
         // is offline — that is the catch below.
-        paintSessionActions();
-        // R9/R10: paint the single composer action now that submitting is allowed
-        // (it stays hidden while the field is empty and nothing is pending).
-        paintComposer();
+        paintControls();
 
         if (presetDescriptors.length === 0) {
             // The identical screen a reader gets after deleting the last harness, so a

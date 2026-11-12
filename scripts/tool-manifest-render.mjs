@@ -69,7 +69,7 @@ ${Object.entries(descriptor)
 // `../tools/runtime/toolRequest.tool` from `tools/runtime/toolRequest.tool.ts`. The
 // label is package-relative on purpose; the loader is generated in src/core/, so the
 // specifier only has to be right relative to THAT file.
-export const specifierOf = (label) => `../tools/${label.replace(/^tools\//, '')}`;
+export const specifierOf = (label) => `../tools/${label.replace(/^tools\//, '').replace(/\.ts$/, '')}`;
 
 // Render the whole generated module. `descriptors` must already be filtered to
 // package rows and sorted in registration order (the caller's scan does that).

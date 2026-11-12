@@ -7028,12 +7028,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // otherwise park a deliveryError and lose this result).
             try {
                 // Same unwrap/cap as the historical synchronous path (R10/R20.2),
-                // now for BOTH brands: `unwrapToolResult` peels `toolMedia()` and
-                // `toolUi()` in any nesting order and hands back the plain value.
-                // The bytes are NOT serialized here, so `boundToolResult` can
-                // never truncate a downloaded file into a filename.
+                // now for EVERY brand: `unwrapToolResult` peels `toolText()`,
+                // `toolMedia()` and `toolUi()` in any nesting order and hands back
+                // the plain value plus whatever the tool declared around it. The
+                // bytes are NOT serialized here, so `boundToolResult` can never
+                // truncate a downloaded file into a filename.
+                //
+                // A tool that declared a projection (`toolText(content, prose)`)
+                // supplies its OWN transcript text: the model reads the prose, while
+                // `content` remains the value the manual API response and a UI render.
+                // Tools that did not (every tool but `read`) still get `serialize(...)`,
+                // byte-for-byte as before.
                 const unwrapped = unwrapToolResult(task.result);
-                content = boundDelivery(run, call, serialize(unwrapped.content));
+                content = boundDelivery(
+                    run,
+                    call,
+                    unwrapped.text ?? serialize(unwrapped.content)
+                );
                 panels = unwrapped.panels;
                 media = unwrapped.media;
                 outcome = 'completed';
@@ -12129,10 +12140,15 @@ export {
     toolMedia,
     toolMediaDescriptors,
     toolMediaOf,
+    // Tool model-projection (`read`'s prose): the author declares what the MODEL reads,
+    // the delivery boundary peels it, and `content` stays the machine value for the API
+    // response and every programmatic caller. Same shape as the media and panel brands.
+    toolText,
+    toolTextOf,
     unwrapToolResult
 } from './core';
 export type { ToolSelectionOptions, ToolSelectionQuery, ToolSelectionResult } from './core';
-export type { ToolMediaExtraction, ToolResultExtraction } from './core';
+export type { ToolMediaExtraction, ToolResultExtraction, ToolTextExtraction } from './core';
 // (issue 0002) The published READ-ONLY tool-source compile, on the same surface as
 // the body compiler above. The two are different operations and the names say so:
 // `compileToolSource` compiles the BODY of an async function with `Function` (what

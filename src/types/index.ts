@@ -1585,6 +1585,25 @@ export type ToolMediaEnvelope<TContent = unknown> = {
 };
 
 // ---------------------------------------------------------------------------
+// Tool text: the same branded-envelope idea, for a MODEL PROJECTION
+// ---------------------------------------------------------------------------
+//
+// A tool whose structured result is expensive to hand to the model verbatim
+// returns `toolText(result, prose)`: the prose is what lands in the transcript,
+// while `result` stays the value the server response, a UI, and a programmatic
+// caller consume. `read` is the shipped user — its 256 KiB `content` string costs
+// the caller's context window 2% to 15% more once JSON-escaped, plus the
+// metadata of every entry, in the very budget the tool exists to protect.
+//
+// The unwrap is the same single boundary as the other two brands (see
+// `core/tool-text.ts`): the transcript takes `text`, everything else takes
+// `content`, and a tool that never calls `toolText()` is byte-for-byte unaffected.
+export type ToolTextEnvelope<TContent = unknown> = {
+    readonly __toolText: string;
+    readonly content: TContent;
+};
+
+// ---------------------------------------------------------------------------
 // records — the ONE session store engine (records-engine.md, Decisions A-P)
 // ---------------------------------------------------------------------------
 //

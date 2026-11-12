@@ -1,8 +1,13 @@
 // Ad-hoc verification of the read/write/edit changes against the stress-report scenarios.
 // Run: npx vite-node scripts/verify-read-fixes.mjs
 import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
-const C = 'D:/Projects/typescript/noobscript/.verify/c';
+// Repo-root Temp/ (AGENTS.md), resolved from this file rather than hardcoded, so the
+// scratch fixtures land in the same disposable place on every machine.
+const VERIFY_ROOT = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '../../../../', 'Temp', 'verify-read-fixes');
+const C = path.join(VERIFY_ROOT, 'c');
 rmSync(C, { recursive: true, force: true });
 mkdirSync(C, { recursive: true });
 
@@ -14,10 +19,23 @@ writeFileSync(`${C}/base.txt`, 'line one\nLINE TWO EDITED\nline three\n');
 writeFileSync(`${C}/nul.bin`, Buffer.concat([Buffer.from('hello'), Buffer.from([0]), Buffer.from('world')]));
 writeFileSync(`${C}/uni.txt`, 'emoji \u{1F389} family\ncjk \u4f60\u597d\n');
 
-const { read, FILE_READ_DEFAULT_MAX_LINES, FILE_READ_WIRE_BUDGET } = await import('../src/tools/files/read.tool.ts');
+const {
+    read,
+    FILE_READ_DEFAULT_MAX_LINES,
+    FILE_READ_DEFAULT_MAX_BYTES,
+    FILE_READ_MAX_LINES,
+    FILE_READ_MAX_BYTES,
+    FILE_READ_WIRE_BUDGET
+} = await import('../src/tools/files/read.tool.ts');
 const { edit } = await import('../src/tools/files/edit.tool.ts');
 const { write } = await import('../src/tools/files/write.tool.ts');
 const { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult } = await import('../src/core/result-budget.ts');
+// `read` returns a branded envelope (src/core/tool-text.ts): `content` is the machine
+// result, `__toolText` the prose a transcript gets. Every check here is about the
+// machine result, so the envelope is peeled exactly as the delivery boundary peels it.
+const { unwrapToolResult } = await import('../src/core/index.ts');
+
+const readContent = async (paths) => unwrapToolResult(await read(paths)).content;
 
 let failures = 0;
 const show = (label, ok, detail) => {
@@ -27,7 +45,10 @@ const show = (label, ok, detail) => {
 
 // ---- D1: a full-budget read must survive the harness envelope intact.
 {
-    const r = await read([{ path: `${C}/big.txt`, maxLines: 5000 }]);
+    // `maxBytes` at the ceiling, so this really is the full-budget case: under the
+    // per-file DEFAULT the same read stops at its own allowance, not at the shared
+    // envelope, and that default is what the Utilization block below pins.
+    const r = await readContent([{ path: `${C}/big.txt`, maxLines: 5000, maxBytes: FILE_READ_MAX_BYTES }]);
     const serialized = JSON.stringify(r);
     const bounded = boundToolResult(serialized);
 
@@ -48,27 +69,27 @@ const show = (label, ok, detail) => {
 // ---- D2: demand-based allocation.
 {
     const paths = [{ path: `${C}/a1.txt`, maxLines: 1 }, ...Array.from({ length: 99 }, () => `${C}/base.txt`)];
-    const r = await read(paths);
+    const r = await readContent(paths);
     show(
         'D2  large file not starved by 99 tiny neighbours',
         r.files[0].bytes === 40001 && r.files[0].truncated === false,
         `bytes=${r.files[0].bytes} truncated=${r.files[0].truncated} (was 655 before)`
     );
 
-    const mixed = await read([{ path: `${C}/a1.txt`, maxLines: 1 }, `${C}/base.txt`]);
+    const mixed = await readContent([{ path: `${C}/a1.txt`, maxLines: 1 }, `${C}/base.txt`]);
     show('D2  surplus from a small file is reallocated', mixed.files[0].bytes === 40001, `bytes=${mixed.files[0].bytes}`);
 }
 
 // ---- D3/D5: binary and directory are per-entry, not batch-fatal.
 {
-    const r = await read([`${C}/nul.bin`, `${C}/uni.txt`]);
+    const r = await readContent([`${C}/nul.bin`, `${C}/uni.txt`]);
     show(
         'D3  binary no longer kills the batch',
         r.files[0].error?.code === 'EBINARY' && r.files[1].content.includes('emoji'),
         `entry0=${r.files[0].error?.code} entry1bytes=${r.files[1].bytes} skipped=${r.skipped}`
     );
 
-    const d = await read([C, `${C}/uni.txt`]);
+    const d = await readContent([C, `${C}/uni.txt`]);
     show(
         'D3  directory no longer kills the batch',
         d.files[0].error?.code === 'EISDIR' && d.files[1].bytes > 0,
@@ -78,10 +99,10 @@ const show = (label, ok, detail) => {
 
 // ---- Efficiency: startByte seeking must equal the line-based window.
 {
-    const first = await read([{ path: `${C}/big.txt`, maxLines: FILE_READ_DEFAULT_MAX_LINES }]);
+    const first = await readContent([{ path: `${C}/big.txt`, maxLines: FILE_READ_DEFAULT_MAX_LINES }]);
 
     const t1 = Date.now();
-    const seeked = await read([
+    const seeked = await readContent([
         {
             path: `${C}/big.txt`,
             startByte: first.files[0].nextByte,
@@ -100,7 +121,7 @@ const show = (label, ok, detail) => {
     // claims are checked now: the mid-line equivalence, and line-boundary equality where
     // the offset is derived from the fixture rather than from a reported nextByte.
     const t2 = Date.now();
-    const lineBased = await read([
+    const lineBased = await readContent([
         {
             path: `${C}/big.txt`,
             startLine: first.files[0].nextLine,
@@ -118,8 +139,8 @@ const show = (label, ok, detail) => {
 
     const boundaryLine = 100_000;
     const boundaryByte = Buffer.byteLength(L.slice(0, boundaryLine - 1).map((s) => s + '\n').join(''), 'utf8');
-    const atBoundarySeek = await read([{ path: `${C}/big.txt`, startByte: boundaryByte, maxLines: 50 }]);
-    const atBoundaryLine = await read([{ path: `${C}/big.txt`, startLine: boundaryLine, maxLines: 50 }]);
+    const atBoundarySeek = await readContent([{ path: `${C}/big.txt`, startByte: boundaryByte, maxLines: 50 }]);
+    const atBoundaryLine = await readContent([{ path: `${C}/big.txt`, startLine: boundaryLine, maxLines: 50 }]);
     show(
         'seek  at a line boundary, startByte equals the counted window',
         atBoundarySeek.files[0].content === atBoundaryLine.files[0].content &&
@@ -129,15 +150,46 @@ const show = (label, ok, detail) => {
     );
 }
 
-// ---- Utilization: a DEFAULT read must fill the envelope it is delivered in.
+// ---- Utilization: the DEFAULT is a context budget, the CEILING is opt-in.
 {
-    const first = await read([`${C}/big.txt`]);
-    const util = first.wireBytes / FILE_READ_WIRE_BUDGET;
+    // The reported regression, stated as a check. A read that asks NOTHING used to fill
+    // the wire envelope, which spent 64k-78k tokens of the calling model's window on one
+    // tool result. The default is now 2000 lines / 64 KiB PER FILE, so the claim this
+    // block makes is the opposite of the one it replaces: a default read stays inside its
+    // own allowance and leaves the envelope mostly unused.
+    const first = await readContent([`${C}/big.txt`]);
+    const defaultShare = first.wireBytes / FILE_READ_WIRE_BUDGET;
 
     show(
-        `util  default read (maxLines=${FILE_READ_DEFAULT_MAX_LINES}) fills the budget`,
-        util > 0.8,
-        `${(util * 100).toFixed(1)}% of ${FILE_READ_WIRE_BUDGET}; lines 1-${first.files[0].endLine} (was 200 lines / 14.2% of 64 KiB, then 1200 lines / 22.7%)`
+        `util  default read (maxLines=${FILE_READ_DEFAULT_MAX_LINES}, maxBytes=${FILE_READ_DEFAULT_MAX_BYTES}) stays inside its allowance`,
+        first.files[0].bytes <= FILE_READ_DEFAULT_MAX_BYTES && first.files[0].limit !== null && defaultShare < 0.5,
+        `${(defaultShare * 100).toFixed(1)}% of ${FILE_READ_WIRE_BUDGET}; lines 1-${first.files[0].endLine}, cut by ${first.files[0].limit}`
+    );
+
+    // ... and the ceiling is still one argument away, so "omit the arguments" never
+    // became a synonym for "want less": asked generously, the same file fills the
+    // envelope it is delivered in and still survives the harness cap untouched.
+    const generous = await readContent([
+        { path: `${C}/big.txt`, maxLines: FILE_READ_MAX_LINES, maxBytes: FILE_READ_MAX_BYTES }
+    ]);
+    const util = generous.wireBytes / FILE_READ_WIRE_BUDGET;
+
+    show(
+        'util  an explicit full-envelope ask still fills the budget',
+        util > 0.8 && boundToolResult(JSON.stringify(generous)).truncated === false,
+        `${(util * 100).toFixed(1)}% of ${FILE_READ_WIRE_BUDGET}; lines 1-${generous.files[0].endLine}, cut by ${generous.files[0].limit}`
+    );
+
+    // The model's copy is the SMALLER rendering of the same facts, which is what makes it
+    // safe to deliver through a transcript the harness measures (src/core/result-budget).
+    const both = unwrapToolResult(await read([`${C}/big.txt`]));
+
+    show(
+        'text  the model gets prose, and it costs no more than the JSON it replaces',
+        typeof both.text === 'string' &&
+            both.content.modelBytes === Buffer.byteLength(both.text, 'utf8') &&
+            both.content.modelBytes <= both.content.wireBytes,
+        `modelBytes=${both.content.modelBytes} wireBytes=${both.content.wireBytes}`
     );
 }
 
@@ -188,7 +240,7 @@ const show = (label, ok, detail) => {
     let pages = 0;
 
     while (next.truncated && pages < 20) {
-        const page = await read([{ path: huge, startByte: next.nextByte ?? 0, startLine: next.nextLine ?? 1 }]);
+        const page = await readContent([{ path: huge, startByte: next.nextByte ?? 0, startLine: next.nextLine ?? 1 }]);
         next = page.files[0];
         collected += next.content;
         pages += 1;
@@ -198,5 +250,5 @@ const show = (label, ok, detail) => {
 }
 
 console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : failures + ' CHECK(S) FAILED'}`);
-rmSync('D:/Projects/typescript/noobscript/.verify', { recursive: true, force: true });
+rmSync(VERIFY_ROOT, { recursive: true, force: true });
 process.exit(failures === 0 ? 0 : 1);

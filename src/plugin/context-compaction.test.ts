@@ -672,8 +672,9 @@ describe('context-compaction metadata', () => {
         // `maxLength: 2000` (src/server/harness.swagger.yaml), and nothing enforces that at
         // runtime — src/server/api.ts `pluginRowOf` spreads the declared value out as-is — so
         // the budget is asserted here instead. The identity above covers both copies with this
-        // one check. The shipped prompt is 715 characters, so an operator-visible reword still
-        // has room; a text that crossed 2000 would otherwise ship a row the spec calls invalid.
+        // one check. The shipped prompt is 1714 characters and 21 lines (the OpenCode checkpoint
+        // template adopted 2026-11-12), so an operator-visible reword still has about 285
+        // characters of room; a text that crossed 2000 would otherwise ship a row the spec calls invalid.
         expect(COMPACTION_INSTRUCTION.length).toBeLessThanOrEqual(2000);
 
         // The DECISIONS the deleted per-setting prose used to carry are still pinned, just
@@ -2364,13 +2365,17 @@ describe('context-compaction action (executeCompaction)', () => {
 // ---------------------------------------------------------------------------
 // T9 — THE SUMMARIZE FLOW, end to end, through a real harness.
 //
-// Every number here is derived, never read back: the transcript is seeded with 1200
-// characters of one user turn (300 tokens) and the prompt `go` adds one more, so the live
-// projection at the first boundary is 301 against an effective limit of 250 — over, and
+// Every number here is derived, never read back: the transcript is seeded with 2100
+// characters of one user turn (525 tokens) and the prompt `go` adds one more, so the live
+// projection at the first boundary is 526 against an effective limit of 520 — over, and
 // `minTokens: 0` so the floor cannot refuse the pass. After a successful compaction the
-// retained head (the instruction ~186 tokens, the answer, the nudge) measures ~189, i.e.
-// under 250, which is what makes "the context is small again" an assertion rather than a
-// hope. The instruction and the nudge are the EXPORTED strings, because a case that pasted
+// retained head (the instruction ~429 tokens, the answer, the nudge) measures ~479, i.e.
+// under 520, which is what makes "the context is small again" an assertion rather than a
+// hope. The seed and the limit are SIZED BY THE SHIPPED INSTRUCTION: the head is
+// instruction + answer + nudge, so the OpenCode checkpoint template (1714 characters of
+// instruction, adopted 2026-11-12) moved both numbers — a limit under ~480 tokens would sit
+// below the retained head alone and every continuation turn would re-trigger, which is a real
+// property of the design, not an artefact of this fixture. The instruction and the nudge are the EXPORTED strings, because a case that pasted
 // its own copy would keep passing after the protocol changed.
 //
 // The continuation run is fire-and-forget from inside `thread.idle` (see the plugin's "WHY
@@ -2380,9 +2385,9 @@ describe('context-compaction action (executeCompaction)', () => {
 // ---------------------------------------------------------------------------
 
 describe('context-compaction summarize flow (T9)', () => {
-    const SEED = 'x'.repeat(1200);
+    const SEED = 'x'.repeat(2100);
     const PROMPT = 'go';
-    const LIMIT = 250;
+    const LIMIT = 520;
 
     // Scripted transport with a window INTO the request: `on` runs while the model turn is
     // in flight, which is the only moment a case can observe the roster status mid-pass, the
@@ -2509,8 +2514,8 @@ describe('context-compaction summarize flow (T9)', () => {
         ]);
 
         // Request 2 — THE PROOF THE CONTEXT IS SMALL AGAIN. The provider sees the instruction,
-        // the agent's own summary, and the nudge: 3 messages, ~189 tokens, and neither the
-        // 1200-character seed nor the prompt anywhere in it.
+        // the agent's own summary, and the nudge: 3 messages, ~479 tokens, and neither the
+        // 2100-character seed nor the prompt anywhere in it.
         expect(withoutIds(seen[1].messages)).toEqual([
             { role: 'user', content: COMPACTION_INSTRUCTION },
             { role: 'assistant', content: 'SUMMARY' },
@@ -2581,12 +2586,12 @@ describe('context-compaction summarize flow (T9)', () => {
         // the pass ran. `currentEstimatedTokens()` rather than `estimatedTokens` because the
         // latter is frozen at handler entry — a boundary that lands right after a compaction
         // would otherwise still see the pre-compaction size and fire the pass again.
-        expect(diagnostics[0].message).toContain('~301 estimated tokens against an effective limit of 250');
+        expect(diagnostics[0].message).toContain('~526 estimated tokens against an effective limit of 520');
         expect(diagnostics[0].data).toEqual({
             mode: 'summarize',
             threadId,
-            tokens: 301,
-            effective: 250,
+            tokens: 526,
+            effective: 520,
             entries: 3
         });
 
@@ -2852,10 +2857,10 @@ describe('context-compaction summarize flow (T9)', () => {
         expect((await writer.sendThreadInput(thread.id, PROMPT)).content).toBe('SUMMARY');
         expect(await settle(writer, thread.id, 7)).toBe(true);
 
-        // The trigger measured the PROJECTION, not the transcript: ~301 (the seed and the
-        // prompt), not ~601 with the already-withheld turn counted. A live estimate that read
+        // The trigger measured the PROJECTION, not the transcript: ~526 (the seed and the
+        // prompt), not ~829 with the already-withheld turn counted. A live estimate that read
         // canonical history would fire compaction on conversations that are already compacted.
-        expect(diagnostics[0].data).toMatchObject({ tokens: 301, effective: 250 });
+        expect(diagnostics[0].data).toMatchObject({ tokens: 526, effective: 520 });
 
         // And it stayed off: no request this pass produced — the compaction turn, the
         // continuation, or the follow-up — ever carried that text again.
@@ -2929,9 +2934,9 @@ describe('context-compaction summarize flow (T9)', () => {
         expect(diagnostics).toHaveLength(3);
         expect(seen.map(instructions)).toEqual([1, 1]);
 
-        // The next submission grows the conversation past the trigger again (~299 against
-        // 250). The cooldown does NOT hold it back, because the turn that ran on the compacted
-        // head measured ~189 — under the limit — and cleared it. So the second pass is a real
+        // The next submission grows the conversation past the trigger again (~554 against
+        // 520). The cooldown does NOT hold it back, because the turn that ran on the compacted
+        // head measured ~479 — under the limit — and cleared it. So the second pass is a real
         // crossing, and its finalize reclaims the FIRST pass's turns as well: after this, the
         // only retained memory is the second instruction and the second summary.
         expect((await writer.sendThreadInput(threadId, 'y'.repeat(300))).content).toBe('second');
@@ -3121,7 +3126,7 @@ describe('context-compaction summarize flow (T9)', () => {
         expect(String(seen[2].messages[seen[2].messages.length - 1].content)).toBe(COMPACTION_INSTRUCTION);
 
         // Out of the way for the continuation run: at this scale (the retained head alone is
-        // ~217 tokens against a limit of 100) the next boundary would compact again, which is
+        // ~478 tokens against a limit of 100) the next boundary would compact again, which is
         // correct behaviour but not what this case is measuring.
         stored.contextLimit = 100000;
         expect(await settle(writer, thread.id, 6)).toBe(true);
@@ -3520,8 +3525,10 @@ describe('context-compaction summarize flow (T9)', () => {
 
         // A conversation that trips BOTH passes on the first boundary: a `read` that failed
         // and was answered by a later `read` (a trim candidate), and enough text to cross the
-        // limit. The trimmer has never seen this transcript, so its plan is non-empty exactly
-        // on the round the compactor parks.
+        // 520 limit — 2200 characters of failure text puts the projection at ~573 tokens, the
+        // same margin over the trigger the seed gives the other cases in this block. The
+        // trimmer has never seen this transcript, so its plan is non-empty exactly on the
+        // round the compactor parks.
         writer.setThreadMessages(thread.id, [
             { role: 'user', content: 'open both' },
             {
@@ -3531,7 +3538,7 @@ describe('context-compaction summarize flow (T9)', () => {
             },
             {
                 role: 'tool',
-                content: `Tool "read" failed: ${'E'.repeat(1200)}`,
+                content: `Tool "read" failed: ${'E'.repeat(2200)}`,
                 toolCallId: 'c1',
                 name: 'read',
                 outcome: 'failed'

@@ -2990,10 +2990,11 @@ it('stops every task in the originating session while a run is in flight', async
     await subscribed(live, 'session', 's1');
     await flush();
 
-    // The queue is server-owned, so switching harness stays possible while it runs;
-    // the team row is locked (frozen session) and New session refuses pending work.
+    // The queue is server-owned, so switching harness AND starting a second conversation stay
+    // possible while it runs — leaving only unsubscribes the observer (R4). The team row is
+    // still locked, because that conversation is frozen while its run is live.
     expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(false);
-    expect(byClass('.new-session', 'button').disabled).toBe(true);
+    expect(byClass('.new-session', 'button').disabled).toBe(false);
     openAgents();
     // T3: mid-run the team/instruction editors are locked (the reason is the dialog's
     // own note), and the membership toggle is part of that lock.

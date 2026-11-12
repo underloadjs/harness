@@ -23,13 +23,13 @@
         "lib": ["decorators", "dom", "es5", "scripthost", "es2015.collection"],
         "types": ["node", "vitest/globals"],
         // Tests import the package by name, never by relative path. Mirror the
-        // package.json `exports.development` targets here (the entries Vite/Vitest
+        // package.json `exports.*.default` targets here (the entries Vite/Vitest
         // resolve) so the same specifier means the same FILE for editors, for
-        // `tsc --noEmit`, and for the suite. `paths` is required because the
-        // published `types` conditions deliberately stay on `dist/*.d.ts`: a
-        // NodeNext consumer must get the emitted declarations (src/*.ts uses
-        // extensionless relative specifiers that NodeNext rejects), so TS would
-        // otherwise typecheck the suite against a stale build.
+        // `tsc --noEmit`, and for the suite. `paths` is required because this package
+        // is published as its own repo, where `node_modules/@underload/harness` is
+        // not guaranteed to exist for the package's own sources to resolve through —
+        // and because the published `types` conditions now name `src/*.ts` directly,
+        // so resolution must land on the source, never on a build artifact.
         // The bare name is the Node root (`src/index.ts`), exactly what
         // `exports["."]` publishes for a Node host; the library-only graph is
         // `src/harness.ts`, reached through it.

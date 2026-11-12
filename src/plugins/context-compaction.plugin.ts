@@ -100,8 +100,10 @@
 // parks the thread, commits its own instruction into the CANONICAL transcript, and lets
 // the NEXT model turn of that same conversation answer it. The turn carries the full
 // context — the provider's prefix cache is still warm, because nothing before the
-// instruction moved — and the answer is the compacted knowledge: what is done and still
-// relevant, what the current task is and exactly where it left off, and what is pending.
+// instruction moved — and the answer is the compacted knowledge in the shape the instruction
+// dictates: the objective with its requirements and decisions, the work state split into
+// completed / active / blocked, an ordered next move, the files that matter, and the context a
+// fresh read cannot recover.
 //
 // Then everything the summary replaced stops being SENT: every entry BEFORE the
 // instruction, and the intermediate turns BETWEEN the instruction and that final answer,
@@ -369,11 +371,27 @@ export const metadata = {
     // `COMPACTION_INSTRUCTION` is declared AFTER it, so a reference here would read a
     // temporal dead zone. src/plugin/context-compaction.test.ts pins the two copies as
     // byte-identical, so a reword that moves only one of them fails a test.
-    systemPrompt: `[context compaction] Automated system prompt (not from the user): your context window has reached its limit. Compact your knowledge now. Reply with a single compact summary and nothing else:
-1. DONE — work completed so far that is still relevant to your current or pending tasks. Omit completed work that is irrelevant to both.
-2. CURRENT TASK — what you are working on right now and exactly where you left off, with the concrete details needed to resume (paths, ids, decisions, open questions, blockers).
-3. PENDING — all remaining tasks, in order.
-This summary will be your only retained memory of the earlier conversation: be specific but compact. Do not call tools and do not start any other work in this reply.`,
+    systemPrompt: `[context compaction] Automated system prompt (not from the user): your context window has reached its limit. Compact your knowledge now. Reply with one structured summary and nothing else, using these headings (omit any that does not apply):
+## Objective
+- [one or two sentences on what you are trying to accomplish]
+## Requirements
+- [constraints, preferences and scope the user stated, or "(none)"]
+## Decisions
+- [decisions made and why, or "(none)"]
+## Work State
+### Completed
+- [goals completed that still matter to the current or pending work; otherwise "(none)"]
+### Active
+- [what you are working on right now and exactly where you left off, with the details needed to resume; otherwise "(none)"]
+### Blocked
+- [what is blocking progress, and why; otherwise "(none)"]
+## Next Move
+1. [ordered next actions, or "(none)"]
+## Relevant Files
+- [at most 15 paths, most important first, each with a brief reason; or "(none)"]
+## Important Context
+- [facts you cannot recover from the code or the files listed; or "(none)"]
+Keep each section terse: single-line bullets, not prose. Preserve exact file paths, symbols, commands, error strings, URLs and identifiers. Carry forward only unanswered questions or work still requiring action, in the user's own words. Preserve consequential workflow state: uncommitted, committed, pushed, under review, merged. Summarize only what the user and you said and did — leave out instruction files such as AGENTS.md, repository conventions and environment details: the next turn gets current versions of those. This summary will be your only retained memory of the earlier conversation: be specific but compact. Do not call tools and do not start any other work in this reply.`,
     version: '1.0.0',
     tags: ['context', 'compaction', 'lifecycle'],
     builtin: true,
@@ -481,25 +499,50 @@ export const COMPACTION_MODES: readonly string[] = [MODE_SUMMARIZE, MODE_EXCLUDE
 // shape the transports are not promised (types/index.ts, `HarnessMessage`).
 const COMPACTION_MARKER = '[context compaction]';
 
-// The instruction the plugin commits into the transcript at the trigger. It asks for the
-// three things the compacted context has to survive on — done-and-relevant, current task
-// and where it stopped, pending work — and explicitly drops completed work that serves
-// neither, which is what keeps the summary small instead of a transcript in prose. The
-// tool ban is the agent's own guard rail: a compaction that stops to read a file spends
-// another turn and re-enters the phase machine for nothing (still handled, see
-// `turn.after`, but the summary is what this turn was for).
+// The instruction the plugin commits into the transcript at the trigger. Since 2026-11-12 it
+// asks for the OpenCode checkpoint shape (adopted from OpenCode v2.2.5's compaction prompt,
+// read out of the shipped binary — its docs never print the text): objective, requirements,
+// decisions, work state split into completed / active / blocked, an ordered next move, the
+// files the next turn would have to open, and the context a fresh read cannot recover. The
+// old three-item list (DONE / CURRENT TASK / PENDING) is what left the constraints, decisions
+// and blockers out — the open risk the T7 list still carries (docs/tasks/2026-11-09-
+// progressive-compaction.md). The trailing rules are the shape OpenCode pins that summary
+// with: terse single-line bullets, verbatim identifiers, only the questions still unanswered,
+// the git/workflow state that changes what an agent does next, and NOTHING about the
+// instruction files and environment the next turn receives fresh anyway. The tool ban is the
+// agent's own guard rail: a compaction that stops to read a file spends another turn and
+// re-enters the phase machine for nothing (still handled, see `turn.after`, but the summary is
+// what this turn was for).
 // Exported (not a private constant) because the finalize range and every test that names
 // the committed turn need the exact text, not a copy that can drift from it.
-export const COMPACTION_INSTRUCTION = `${COMPACTION_MARKER} Automated system prompt (not from the user): your context window has reached its limit. Compact your knowledge now. Reply with a single compact summary and nothing else:
-1. DONE — work completed so far that is still relevant to your current or pending tasks. Omit completed work that is irrelevant to both.
-2. CURRENT TASK — what you are working on right now and exactly where you left off, with the concrete details needed to resume (paths, ids, decisions, open questions, blockers).
-3. PENDING — all remaining tasks, in order.
-This summary will be your only retained memory of the earlier conversation: be specific but compact. Do not call tools and do not start any other work in this reply.`;
+export const COMPACTION_INSTRUCTION = `${COMPACTION_MARKER} Automated system prompt (not from the user): your context window has reached its limit. Compact your knowledge now. Reply with one structured summary and nothing else, using these headings (omit any that does not apply):
+## Objective
+- [one or two sentences on what you are trying to accomplish]
+## Requirements
+- [constraints, preferences and scope the user stated, or "(none)"]
+## Decisions
+- [decisions made and why, or "(none)"]
+## Work State
+### Completed
+- [goals completed that still matter to the current or pending work; otherwise "(none)"]
+### Active
+- [what you are working on right now and exactly where you left off, with the details needed to resume; otherwise "(none)"]
+### Blocked
+- [what is blocking progress, and why; otherwise "(none)"]
+## Next Move
+1. [ordered next actions, or "(none)"]
+## Relevant Files
+- [at most 15 paths, most important first, each with a brief reason; or "(none)"]
+## Important Context
+- [facts you cannot recover from the code or the files listed; or "(none)"]
+Keep each section terse: single-line bullets, not prose. Preserve exact file paths, symbols, commands, error strings, URLs and identifiers. Carry forward only unanswered questions or work still requiring action, in the user's own words. Preserve consequential workflow state: uncommitted, committed, pushed, under review, merged. Summarize only what the user and you said and did — leave out instruction files such as AGENTS.md, repository conventions and environment details: the next turn gets current versions of those. This summary will be your only retained memory of the earlier conversation: be specific but compact. Do not call tools and do not start any other work in this reply.`;
 
 // The turn that restarts the conversation once the range is disabled. It points at the
 // summary as the source of the next step, because after the finalize that is the ONLY
 // memory of the work still standing — an imperative with no anchor reads as a new task.
-export const CONTINUATION_NUDGE = `${COMPACTION_MARKER} Your context was just compacted; your summary above lists the current task, where you left off, and pending work. Continue your current task now.`;
+// The three things it names are the headings the instruction above writes down, so a reword
+// of one moves the other.
+export const CONTINUATION_NUDGE = `${COMPACTION_MARKER} Your context was just compacted; your summary above states the objective, the active work and where you left off, and the next move. Continue your current task now.`;
 
 // Not a setting (T4.6 declares exactly the four above, and a knob nobody asked for is a knob
 // nobody reads): the bound on how many units ONE pass may disable, so the first pass over an

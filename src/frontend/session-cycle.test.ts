@@ -24,8 +24,14 @@
 //     entry when the open conversation is not in the list, and doing NOTHING when the
 //     directory is empty. Every press is exactly one `openSession` — a view change, never a
 //     write (R4);
-//   - LOCK: `submitting || running`, the strip's own "can I switch" rule, because the pill
-//     calls the same `openSession` — and the tooltip says why rather than going quiet;
+//   - LOCK: `submitting` ONLY — the short POST /tasks enqueue window — because pressing this
+//     pill calls the same `openSession` the strip uses, and the tooltip says why rather than
+//     going quiet. A RUN is not a lock: leaving a conversation whose queue is moving only
+//     unsubscribes the observer (the server keeps working), which is why the tooltip on a
+//     running conversation still says `click to switch`. The live-run half of that rule —
+//     the cycler, the strip pills and the `+` all staying clickable, and the switch really
+//     switching — is pinned with a real observer in canonical-directory-live-main.test.ts;
+//     the fetch stub here has no socket, so it cannot reach a running conversation honestly;
 //   - NO DELETE here. The full dashboard (pills + `×` + `+`, and NO refresh control since
 //     T9/R4) stays behind the title button, where the ACTIVE pill is both painted
 //     (`data-active`) and announced (`aria-current`) and follows the pointer.
@@ -713,7 +719,7 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
         // T9: the strip that proves the other half of that sentence is the dashboard.
         expect(taskRequests).toBe(1);
         expect(pill.disabled).toBe(true);
-        expect(pill.title).toBe('instruct · idle · s1 · wait for the run to finish before switching');
+        expect(pill.title).toBe('instruct · idle · s1 · wait for the submit to finish before switching');
         const bar = dashboard();
         expect(bar.querySelector<HTMLElement>('.session-pill-select')?.disabled).toBe(true);
         // R2 (T9): the header `+` carries the same enqueue lock, so the reader cannot start a

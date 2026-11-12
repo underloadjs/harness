@@ -28,6 +28,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it, vi } from 'vitest';
+// `read` returns a branded envelope (core/tool-text.ts): the machine result the compiled
+// body produces is under `content`, exactly as the harness peels it before delivery.
+import { unwrapToolResult } from '@underload/harness';
 
 // Every generated-loader label this process resolves, in call order. A source-backed
 // catalogue must keep this empty: the generated loader is a BUILD ARTIFACT.
@@ -401,23 +404,31 @@ describe('live Node descriptor catalogue (T24)', () => {
                     nextColumn: null,
                     nextByte: null,
                     bytes: 5,
-                    sizeBytes: 5
+                    sizeBytes: 5,
+                    // The window reached EOF, so the whole-file line count (the `wc -l`
+                    // number, +1 for this unterminated line) is published.
+                    lineCount: 1
                 }
             ],
             truncated: false,
             bytes: 5,
             wireBytes: expect.any(Number),
             contentBudget: 262144,
+            // Both of these scale with the per-run scratch path, like `wireBytes`.
+            modelBytes: expect.any(Number),
             skipped: 0
         };
 
+        const readCompiled = async (tool: (paths: unknown) => unknown) =>
+            unwrapToolResult(await (tool as (paths: unknown) => unknown)([target])).content;
+
         // Proxy path (what `presetTools` exposes) and the direct seam both run the
         // entry body compiled from `tools/files/read.tool.ts`.
-        await expect(presetTools.read([target])).resolves.toEqual(expected);
+        expect(await readCompiled(presetTools.read)).toEqual(expected);
         const loaded = await loadPresetTool('read');
         expect(loaded.name).toBe('read');
         expect(loaded.description).toBe(entry.FILE_READ_METADATA.description);
-        await expect(loaded([target])).resolves.toEqual(expected);
+        expect(await readCompiled(loaded)).toEqual(expected);
 
         // The build artifact was never consulted, in either half.
         expect(generatedLoads).toEqual([]);

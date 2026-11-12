@@ -1035,9 +1035,11 @@ it('keeps the tools page, its rows and its switch usable while a run is pending'
     await boot();
     await flush();
 
-    // Pending, and the chat's own gates stay locked (the ones R1 deliberately KEEPS).
+    // Pending, and the chat's OWN gate stays locked: the composer offers STOP for this
+    // conversation's queue. The session surface is no longer locked by a run — switching and
+    // creating are view changes, and leaving a conversation only unsubscribes its observer (R4).
     expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');
-    expect(byClass('.new-session', 'button').disabled).toBe(true);
+    expect(byClass('.new-session', 'button').disabled).toBe(false);
 
     // The tools control answers to `booted` alone, so a run cannot grey it out.
     expect(byClass('.tools-toggle', 'button').disabled).toBe(false);

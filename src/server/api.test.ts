@@ -3257,7 +3257,12 @@ describe('manual tool execution', () => {
                             nextColumn: null,
                             nextByte: null,
                             bytes: 9,
-                            sizeBytes: 9
+                            sizeBytes: 9,
+                            // The window ran to EOF, so the file's total line count is
+                            // published (the `wc -l` figure, +1 for this unterminated
+                            // line) — the number the entry's own startLine/endLine count
+                            // against.
+                            lineCount: 1
                         }
                     ],
                     truncated: false,
@@ -3266,6 +3271,9 @@ describe('manual tool execution', () => {
                     // the absolute fixture path, so it is matched rather than hardcoded.
                     wireBytes: expect.any(Number),
                     contentBudget: 262144,
+                    // The size of the PROJECTION (`read`'s model-facing text) for the same
+                    // facts; it scales with the fixture path like `wireBytes` does.
+                    modelBytes: expect.any(Number),
                     skipped: 0
                 },
                 duration_ms: expect.any(Number)
@@ -3353,8 +3361,12 @@ describe('manual tool execution', () => {
             const path = join(fixture, 'big.txt');
             await writeTextFile(path, 'x'.repeat(300_000), 'utf8');
 
+            // `maxBytes` at the ceiling, so this really is the FULL-BUDGET case the title
+            // names: under the 64 KiB per-file DEFAULT the same file stops at its own
+            // allowance and never reaches the envelope (that default cut is pinned in
+            // ./tools/files/read.test.ts).
             const read = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('read'), {
-                parameters: [path]
+                parameters: [{ path, maxBytes: 262_144 }]
             });
 
             expect(read.status).toBe(200);
@@ -3366,10 +3378,14 @@ describe('manual tool execution', () => {
             // and its bytes are reserved before the split, so it joins the key set here
             // without moving the response over the cap (the assertion below).
             const result = read.body.result as Record<string, unknown>;
+            // `modelBytes` is part of the machine result (the size of the projection the
+            // transcript got), and it is NOT an envelope key: the response is the tool's
+            // own object, with no `content`/`budgetBytes` wrapper.
             expect(Object.keys(result).sort()).toEqual([
                 'bytes',
                 'contentBudget',
                 'files',
+                'modelBytes',
                 'note',
                 'skipped',
                 'truncated',
