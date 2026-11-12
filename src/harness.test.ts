@@ -991,7 +991,8 @@ describe('harness', () => {
         });
     });
 
-    it('stops a runaway tool loop instead of recursing forever', async () => {
+    it('stops a runaway tool loop at a configured maxIterations', async () => {
+        // The safeguard is opt-in, so this test names the bound it is pinning.
         // Always asks for another tool, never answers. Ids are unique per turn:
         // reusing a committed call id is rejected as aliasing (P2-B).
         let sequence = 0;
@@ -1009,16 +1010,45 @@ describe('harness', () => {
             visibility: 'core',
             execute: () => 'ok'
         });
-        const writer = harness({ agents: { writer: brain(loop) }, tools: { again } });
+        const writer = harness({ agents: { writer: brain(loop) }, tools: { again }, maxIterations: 16 });
 
         await expect(writer('go')).rejects.toThrow('requested tools more than 16 times');
         // The failed run leaves no partial history behind.
         expect(writer.agent.messages).toEqual([]);
     });
 
-    it('honours a configured maxIterations above the library default', async () => {
-        // 20 tool rounds would trip the default 16-round guard; a real session
-        // (the workspace preset) reaches this shape routinely.
+    it('runs unbounded by default — the iteration safeguard is opt-in', async () => {
+        // 20 tool rounds is what a real workspace session does routinely, and an
+        // unconfigured harness no longer treats it as a runaway loop.
+        const seen: HarnessStreamRequest[] = [];
+        const turns = [
+            ...Array.from({ length: 20 }, (_, index) => callTool(`c${index}`, 'again', '{}')),
+            answer('finished')
+        ];
+
+        const again = tool({
+            description: 'again',
+            tags: ['loop'],
+            visibility: 'core',
+            execute: () => 'ok'
+        });
+        const writer = harness({
+            agents: { writer: brain(scripted(turns, seen)) },
+            tools: { again }
+        });
+
+        const message = await writer('go');
+
+        expect(message.content).toBe('finished');
+        // 21 requests: 20 tool rounds plus the answering turn, and the run is not
+        // cut short at 16 the way the old library guard cut it.
+        expect(seen).toHaveLength(21);
+        // user + (assistant tool call + tool result) * 20 + assistant answer.
+        expect(writer.agent.messages).toHaveLength(42);
+        expect(withoutIds(writer.agent.messages.at(-1))).toEqual({ role: 'assistant', content: 'finished' });
+    });
+
+    it('honours a configured maxIterations above the old library default', async () => {
         const seen: HarnessStreamRequest[] = [];
         const turns = [
             ...Array.from({ length: 20 }, (_, index) => callTool(`c${index}`, 'again', '{}')),
@@ -1040,11 +1070,16 @@ describe('harness', () => {
         const message = await writer('go');
 
         expect(message.content).toBe('finished');
-        // 21 requests: 20 tool rounds plus the answering turn.
         expect(seen).toHaveLength(21);
-        // user + (assistant tool call + tool result) * 20 + assistant answer.
-        expect(writer.agent.messages).toHaveLength(42);
-        expect(withoutIds(writer.agent.messages.at(-1))).toEqual({ role: 'assistant', content: 'finished' });
+    });
+
+    it('accepts an explicit Infinity to leave the safeguard off', async () => {
+        expect(() =>
+            harness({
+                agents: { writer: brain(scripted([answer('hi')])) },
+                maxIterations: Number.POSITIVE_INFINITY
+            })
+        ).not.toThrow();
     });
 
     it('fails at the configured bound and names it in the error', async () => {
@@ -1108,15 +1143,15 @@ describe('harness', () => {
         ]);
     });
 
-    it('rejects a maxIterations that is not a positive safe integer', () => {
+    it('rejects a maxIterations that is not a positive safe integer or Infinity', () => {
         // The exact message is part of the contract: it names the field and the
-        // received value so a host can fix its configuration.
+        // received value so a host can fix its configuration. `Infinity` is NOT in
+        // this list: it is the documented "no limit" value.
         const invalid: Array<[unknown, string]> = [
             [0, 'received 0'],
             [-1, 'received -1'],
             [1.5, 'received 1.5'],
             [Number.NaN, 'received NaN'],
-            [Number.POSITIVE_INFINITY, 'received Infinity'],
             [Number.NEGATIVE_INFINITY, 'received -Infinity'],
             [Number.MAX_SAFE_INTEGER + 1, 'received 9007199254740992']
         ];
@@ -1127,7 +1162,7 @@ describe('harness', () => {
                     agents: { writer: brain(scripted([answer('hi')])) },
                     maxIterations: value as number
                 })
-            ).toThrow(`maxIterations must be a positive safe integer; ${received}.`);
+            ).toThrow(`maxIterations must be a positive safe integer or Infinity; ${received}.`);
         }
     });
 

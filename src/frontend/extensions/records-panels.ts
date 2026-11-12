@@ -65,6 +65,13 @@
 // and a screen reader (`aria-busy`) read the same single fact, and the phase is derived
 // from the client rather than tracked beside it (`recordsPanelPhaseOf`).
 //
+// THE CORNER BOX ADDS ONE DIMENSION THE PHASE DOES NOT CARRY. While a read is in flight
+// it says `reading` whatever `data-phase` says, because an unanswered fetch is not a
+// verdict on the rows already on screen — that was the reader's complaint about a badge
+// that went `live` → `stale` → `live` on every re-read. The body keeps its rows, its
+// phase and its sync sentence through a re-read; only the corner word follows the fetch
+// (`recordsCornerStateOf`, fed by `RecordsClient.fetching`).
+//
 // Cross-references:
 //   - ./shell-panels.ts — the registry these two register into
 //   - ./context.ts      — the capabilities a mounted panel gets, and its abort signal
@@ -275,6 +282,17 @@ const createRecordsEngine = (deps: {
         ...(deps.clientOptions === undefined ? {} : deps.clientOptions),
         onNotice: (notice) => {
             if (ctx.disposed) return;
+
+            // A FETCH notice is chrome only, so it is neither news nor a read: it moves
+            // the corner box and nothing else. It must not set `painted` either — the
+            // opening snapshot's own notice still has to read as the panel arriving, or a
+            // fetch that started a microsecond before it would make the panel narrate a
+            // past the reader never saw.
+            if (notice.reason === 'fetch') {
+                paint(client);
+
+                return;
+            }
 
             // THE FIRST READ IS NOT NEWS. The panel arriving is not the store changing:
             // announcing the window's last events on mount is a monologue about a past
@@ -581,25 +599,44 @@ const PHASE_LABEL: Record<RecordsPanelPhase, string> = {
     ready: 'live'
 };
 
+// THE CORNER BOX REPORTS WHAT THE SURFACE IS DOING BEFORE IT REPORTS WHAT THE DATA SAID.
+// While a read is in flight the box says `reading`, whatever the last answer claimed: an
+// unanswered fetch is not evidence that the rows on screen are behind, and a badge that
+// flips to `stale` for the length of every request is the flicker this box replaced the
+// skeleton to stop. The DATA phase still drives `data-phase` on the body (so the rows
+// never move) and the sync line's colour; only the corner word follows the fetch.
+export const recordsCornerStateOf = (phase: RecordsPanelPhase, fetching: boolean): RecordsSurfaceState =>
+    fetching ? 'loading' : phase;
+
 // The chrome every panel draws: the corner box that says what the surface is doing, and
 // the one honest line about the data under it. `data-phase` on the ROOT is what the
-// stylesheet switches on, so this only maintains the two attributes and the text. The
-// box is never re-inserted — it is built once at mount and only its word changes, which
-// is the whole reason it replaced the skeleton.
+// stylesheet switches on, so this only maintains the attributes and the text. The box is
+// never re-inserted — it is built once at mount and only its word changes, which is the
+// whole reason it replaced the skeleton.
 const paintChrome = (
     root: HTMLElement,
     status: HTMLElement,
     note: HTMLElement,
     phase: RecordsPanelPhase,
+    fetching: boolean,
     text: string
 ): void => {
+    // Two attributes, two questions. `data-phase` answers "what is the data on this
+    // surface"; `data-fetching` answers "is an answer outstanding right now". Only the
+    // corner box merges them, and only while the fetch is running.
     root.dataset.phase = phase;
-    root.setAttribute('aria-busy', String(phase === 'loading'));
+    root.dataset.fetching = String(fetching);
+    root.setAttribute('aria-busy', String(fetching || phase === 'loading'));
+
+    const corner = recordsCornerStateOf(phase, fetching);
 
     status.hidden = false;
-    status.dataset.state = phase;
-    status.textContent = PHASE_LABEL[phase];
+    status.dataset.state = corner;
+    status.textContent = PHASE_LABEL[corner];
 
+    // The sentence about the data keeps the DATA's state, so it does not flash amber for
+    // the length of a request: its words are the same either way, and a colour that comes
+    // and goes is the flicker the reader would be left with.
     note.dataset.state = phase === 'ready' || phase === 'loading' ? 'live' : phase;
     note.hidden = phase === 'ready';
     note.textContent = text;
@@ -1126,7 +1163,7 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
                 if (isFresh) freshMarker.mark(node);
             },
             fresh,
-            busy: current?.phase() === 'loading'
+            busy: current !== undefined && (current.phase() === 'loading' || current.fetching())
         });
 
         return applied;
@@ -1141,7 +1178,7 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         const done = tasks.filter((task) => task.completed).sort((left, right) => compareIds(left.id, right.id));
         const phase = recordsPanelPhaseOf(client, tasks.length);
 
-        paintChrome(body, statusBox, chrome, phase, recordsSyncLineOf(client, now()));
+        paintChrome(body, statusBox, chrome, phase, client.fetching(), recordsSyncLineOf(client, now()));
         status.textContent = `${tasks.length} task${tasks.length === 1 ? '' : 's'} · ${done.length} completed · ${pending.length} open`;
         const percent = tasks.length === 0 ? 0 : Math.round((done.length / tasks.length) * 100);
 
@@ -1278,6 +1315,7 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         bar.removeAttribute('aria-valuenow');
         bar.style.setProperty('--records-progress', '0%');
         delete body.dataset.phase;
+        delete body.dataset.fetching;
         body.removeAttribute('aria-busy');
     };
 
@@ -1701,7 +1739,7 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         const newestFirst = [...rows].reverse();
         const phase = recordsPanelPhaseOf(client, feedRows.length);
 
-        paintChrome(body, statusBox, chrome, phase, recordsSyncLineOf(client, now()));
+        paintChrome(body, statusBox, chrome, phase, client.fetching(), recordsSyncLineOf(client, now()));
         paintChips(client);
 
         // LOADING: the corner box says `reading`, the footer says the sentence, and the
@@ -1777,7 +1815,7 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
                 if (isFresh) freshMarker.mark(node);
             },
             fresh,
-            busy: client.phase() === 'loading'
+            busy: client.phase() === 'loading' || client.fetching()
         });
 
         if (applied.moved) flip.play(feed);
@@ -1849,6 +1887,7 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         footer.textContent = '';
         footer.dataset.state = 'live';
         delete body.dataset.phase;
+        delete body.dataset.fetching;
         body.removeAttribute('aria-busy');
     };
 

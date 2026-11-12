@@ -11,7 +11,7 @@
 //   (./toolbox.ts), and the first SEVEN register the SAME toolbox: package coding tools, the app
 //   tools, environment-backed search, and the harness core tools. Only the agents differ: names,
 //   instructions, guidelines, primary, and subagents. The eighth, `chat`, is the ONE declared
-//   exception on the toolbox axis (./toolbox.ts `sharedToolbox: false`, `maxIterations: 1`): it
+//   exception on the toolbox axis (./toolbox.ts `sharedToolbox: false`): it
 //   registers no catalogue tool at all, which is exactly why it exists — a client that wants a
 //   session that never touches the server host had no card to pick. These eight are `presets`, the
 //   default catalogue every registry and every `GET /harnesses` listing starts from — and they are
@@ -339,8 +339,10 @@ const debuggerPreset: HarnessPreset = {
 //     shipped card declared `SHARED_TOOL_NAMES`.
 //   - `subagents: []`: `delegate` is not even registered (src/harness.ts `activation: 'subagents'`),
 //     so there is no delegation and no child conversation.
-//   - `maxIterations: 1` (the toolbox factory's new per-harness override): one model call, one answer.
-//     If the model still asks for a tool, the loop ends at that boundary instead of running a round.
+//   - `maxIterations` is NOT set here: the tool-loop budget is an optional safeguard and no
+//     shipped card carries one, so this card answers when the model answers, however many
+//     rounds that takes. A tool round it does take can only ever hit a harness-owned core row
+//     — `sharedToolbox: false` registered nothing else.
 //
 // WHY `general` IS THE PRIMARY. "The preset name is also the entry agent's name" is a convention, not
 // a rule (the deleted `demo`/`flaky` fixtures ran `general` the same way), and `general` is the one
@@ -366,7 +368,7 @@ const chat: HarnessPreset = {
     name: 'chat',
     title: 'Chat',
     description:
-        'A single answer with no toolbox: the General profile on an empty catalogue (no file, search, delegation, or record tool is registered) and one model call. It cannot read or write the server host and never spends a tool round, so it is the card for a surface that only talks.',
+        'A single answer with no toolbox: the General profile on an empty catalogue (no file, search, delegation, or record tool is registered), so it cannot read or write the server host — the only tools it can ever call are the harness-owned core rows. It carries no iteration budget, so it keeps going until the model answers.',
     requiresEndpoint: true,
     // The trusted profile it runs — see the note above for why this is `general` and not a new id.
     primary: 'general',
@@ -382,7 +384,7 @@ const chat: HarnessPreset = {
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('general', [], {}, {}, {}, {}, { sharedToolbox: false, maxIterations: 1 })
+    create: createProfiledHarness('general', [], {}, {}, {}, {}, { sharedToolbox: false })
 };
 
 // ---------------------------------------------------------------------------

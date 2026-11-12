@@ -44,7 +44,8 @@ export const AGENT_RESULT_PAGE_MAX_CHARS = 8000;
 // What still bounds a run, so dropping the finite default did not open a hole:
 //   - every TOOL keeps its own wall-clock bound (shell, grep, webfetch, …) — the
 //     primary defence, and the reason an unbounded thread cannot hang forever on I/O;
-//   - `maxIterations` (a COUNT bound, `DEFAULT_MAX_ITERATIONS` in ../harness.ts) ends
+//   - `maxIterations` (an OPTIONAL COUNT bound, `DEFAULT_MAX_ITERATIONS` in ../harness.ts —
+//     no limit unless a host names one) ends
 //     a run that keeps requesting, abandoning pending work;
 //   - a `turn.before` plugin's `stop` decision (`HarnessTurnDecision`) ends the run
 //     through its own abort path — a policy assertion at a turn boundary, not a clock;

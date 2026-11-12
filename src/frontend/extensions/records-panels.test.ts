@@ -31,6 +31,7 @@ import {
     HARNESS_TASKS_PANEL_ID,
     mountRecordsPanel,
     mountTasksPanel,
+    recordsCornerStateOf,
     recordsPanelPhaseOf,
     recordsSyncLineOf,
     type RecordsPanelOptions
@@ -411,10 +412,13 @@ const expandRecords = async (host: Host): Promise<void> => {
 
 // Fakes for the two pure derivations: a client is a bag of getters, so the RULES are
 // what these tests pin, not the store they normally read from.
-const fakeClient = (over: { phase?: string; stale?: boolean; error?: string; link?: string; lastSync?: number } = {}): RecordsClient => ({
+const fakeClient = (
+    over: { phase?: string; stale?: boolean; error?: string; link?: string; lastSync?: number; fetching?: boolean } = {}
+): RecordsClient => ({
     phase: () => over.phase ?? 'ready',
     stale: () => over.stale ?? false,
     error: () => over.error,
+    fetching: () => over.fetching ?? false,
     linkState: () => over.link ?? 'live',
     lastSyncAt: () => over.lastSync ?? NOW,
     feed: () => [],
@@ -441,6 +445,23 @@ describe('records panel phase derivation', () => {
         // `count` is the CALLING panel's projection, so emptiness belongs to the panel.
         expect(recordsPanelPhaseOf(fakeClient(), 0)).toBe('empty');
         expect(recordsPanelPhaseOf(fakeClient(), 1)).toBe('ready');
+    });
+
+    it('puts an outstanding read ahead of the verdict in the corner box, and nowhere else', () => {
+        // THE CORNER BOX IS THE ONLY THING A FETCH MOVES. While an answer is outstanding
+        // it says `reading` whatever the last answer claimed — an unanswered request is
+        // not evidence that the rows on screen are behind. That is the whole fix for a
+        // badge that went `live` → `stale` → `live` on every re-read.
+        expect(recordsCornerStateOf('ready', true)).toBe('loading');
+        expect(recordsCornerStateOf('stale', true)).toBe('loading');
+        expect(recordsCornerStateOf('empty', true)).toBe('loading');
+        expect(recordsCornerStateOf('error', true)).toBe('loading');
+        // With nothing outstanding it says exactly what the data phase is, so the box and
+        // `data-phase` are one fact again the moment the read answers — and `loading` is
+        // still `loading` on a first read, which is the state that replaced the skeleton.
+        for (const phase of ['loading', 'empty', 'error', 'stale', 'ready'] as const) {
+            expect(recordsCornerStateOf(phase, false)).toBe(phase);
+        }
     });
 
     it('states the sync line as when the data last landed and what is wrong with it now', () => {
@@ -1416,6 +1437,77 @@ describe('harness.tasks — live updates', () => {
 
         // A move is not an arrival: the completed row never gets the "just landed" mark.
         expect(rowB.hasAttribute('data-fresh')).toBe(false);
+
+        host.dispose();
+    });
+
+    it('says `reading` in the corner for the length of a re-read and keeps the rows under it', async () => {
+        // THE BADGE THE READER COMPLAINED ABOUT. Every wake used to answer with a verdict
+        // on the rows already on screen — `live` → `stale` → `live`, once per burst — and
+        // each flip was a colour change in the top-right corner. The corner box now follows
+        // the FETCH, and the data keeps its own phase the whole time.
+        const backend = createBackend();
+        const host = tasksHost({ backend, bodyRefreshMs: 150 });
+
+        await host.settle();
+
+        const box = host.query<HTMLElement>('.panel-status') as HTMLElement;
+        const body = host.query<HTMLElement>('.panel-tasks-body') as HTMLElement;
+
+        expect(box.textContent).toBe('live');
+        expect(body.dataset.phase).toBe('ready');
+        expect(body.dataset.fetching).toBe('false');
+        expect(body.getAttribute('aria-busy')).toBe('false');
+
+        backend.push(TASK_ADDED, TASK_DONE);
+        backend.setSnapshot(AFTER_TASKS);
+        host.seam.wake(4);
+        await host.settle();
+
+        // A read is outstanding, so the corner word is `reading` — while `data-phase`, the
+        // attribute the rows and the note's colour read, stays `ready`: an unanswered
+        // request says nothing about the rows already painted.
+        expect(body.dataset.phase).toBe('ready');
+        expect(body.dataset.fetching).toBe('true');
+        expect(body.getAttribute('aria-busy')).toBe('true');
+        expect(box.dataset.state).toBe('loading');
+        expect(box.textContent).toBe('reading');
+        expect(host.queryAll('.panel-tasks-row')).toHaveLength(3);
+        // The sentence about the data neither appears nor changes colour for the length of
+        // a request: its words are the same either way, and a colour that comes and goes
+        // is the flicker the reader would be left with instead.
+        expect(host.query<HTMLElement>('.panel-tasks-sync')?.hidden).toBe(true);
+        expect(host.text('.panel-tasks-sync')).toBe('updated just now');
+        // The lists say busy too, so an assistive technology hears the same fact the box
+        // shows rather than a second, different claim about the same read.
+        expect(host.query('ol[data-group="pending"]')?.getAttribute('aria-busy')).toBe('true');
+
+        // The body re-read the delta queued is the SAME fetch still finishing: firing its
+        // debounce must not let the box flash `live` for 150ms on the way to the answer.
+        backend.holdSnapshots(true);
+        host.timers.fire(150);
+        await host.settle();
+
+        expect(backend.snapshotReads()).toBe(2);
+        expect(box.textContent).toBe('reading');
+        expect(box.dataset.state).toBe('loading');
+        expect(body.dataset.phase).toBe('ready');
+        expect(host.queryAll('.panel-tasks-row')).toHaveLength(3);
+
+        backend.holdSnapshots(false);
+        backend.release();
+        await host.settle();
+
+        // The answer landed: the same element, one word back, and the rows never moved or
+        // recoloured underneath it.
+        expect(host.query('.panel-status')).toBe(box);
+        expect(box.textContent).toBe('live');
+        expect(box.dataset.state).toBe('ready');
+        expect(body.dataset.phase).toBe('ready');
+        expect(body.dataset.fetching).toBe('false');
+        expect(body.getAttribute('aria-busy')).toBe('false');
+        expect(host.query('ol[data-group="pending"]')?.getAttribute('aria-busy')).toBe('false');
+        expect(taskRowOf(host, 'rec_d')?.querySelector('.panel-tasks-row-text')?.textContent).toBe('Land the change');
 
         host.dispose();
     });

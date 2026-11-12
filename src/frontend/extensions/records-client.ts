@@ -194,7 +194,13 @@ export type RecordsLinkState = 'unknown' | 'live' | 'down';
 // collections were rebuilt wholesale (a bootstrap, a reset or a `define`/`drop`), so a
 // panel must re-render its lists instead of patching the rows it holds.
 export type RecordsNotice = {
-    reason: 'boot' | 'delta' | 'reset' | 'collections' | 'bodies' | 'link' | 'error';
+    /**
+     * `fetch` is the CHROME's own news: a read was issued, or it finished (answered or
+     * failed). It carries no rows and names no collection — it exists so a panel can put
+     * `reading` in its corner box while an answer is outstanding and take it back out when
+     * it lands, which is the only thing that changes. See `RecordsClient.fetching`.
+     */
+    reason: 'fetch' | 'boot' | 'delta' | 'reset' | 'collections' | 'bodies' | 'link' | 'error';
     phase: RecordsPhase;
     stale: boolean;
     link: RecordsLinkState;
@@ -233,6 +239,16 @@ export type RecordsClient = {
     error: () => string | undefined;
     /** True while the last sync attempt failed or the realtime plane is down. */
     stale: () => boolean;
+    /**
+     * True while a read is in flight, or while an answer it queued is still owed: a
+     * debounced body re-read, or the coalesced follow-up a wake asked for. The corner box
+     * reads this and says `reading` while it is true: an unanswered fetch is not evidence
+     * that the rows on screen are behind, so a badge that went `live` → `stale` → `live` on
+     * every re-read would be the flicker this box exists to avoid (./records-panels.ts
+     * `recordsCornerStateOf`). Every transition publishes a `fetch` notice, because nothing
+     * else repaints a panel in between.
+     */
+    fetching: () => boolean;
     linkState: () => RecordsLinkState;
     /** Epoch ms of the last successful read; 0 when there has been none. */
     lastSyncAt: () => number;
@@ -463,6 +479,11 @@ export const createRecordsClient = (options: RecordsClientOptions): RecordsClien
     let refreshing = false;
     let refreshAgain = false;
     let bodyCancel: (() => void) | undefined;
+    // Whether the surface owes the reader a `reading` word. It is edge-detected rather
+    // than derived from the three flags below, because the two transitions are the only
+    // moments a panel has to repaint: nothing else moves between issuing a read and
+    // applying its answer.
+    let fetching = false;
 
     const notice = (reason: RecordsNotice['reason'], extra: Partial<RecordsNotice> = {}): void => {
         if (disposed || options.onNotice === undefined) return;
@@ -477,6 +498,28 @@ export const createRecordsClient = (options: RecordsClientOptions): RecordsClien
             replaced: extra.replaced ?? false,
             ...(extra.error === undefined ? {} : { error: extra.error })
         });
+    };
+
+    // A read is issued: the box goes to `reading` at once, so a slow answer is a stated
+    // wait rather than a badge sitting on the last verdict.
+    const beginFetch = (): void => {
+        if (fetching) return;
+
+        fetching = true;
+        notice('fetch');
+    };
+
+    // A read answered. Only when NOTHING is left outstanding: a delta that queued a body
+    // re-read is the same fetch still finishing, and letting the box flash `live` for the
+    // 150ms of that debounce is the flicker all over again — and so is a wake that arrived
+    // mid-read, whose coalesced follow-up is queued in `pullAgain`/`refreshAgain` before
+    // this runs. Both cases are one unanswered request wearing two calls.
+    const endFetch = (): void => {
+        if (refreshing || pulling || pullAgain || refreshAgain || bodyCancel !== undefined) return;
+        if (!fetching) return;
+
+        fetching = false;
+        notice('fetch');
     };
 
     const keyOf = (collection: string, id: string): string => `${collection}\u001f${id}`;
@@ -767,6 +810,7 @@ export const createRecordsClient = (options: RecordsClientOptions): RecordsClien
         }
 
         refreshing = true;
+        beginFetch();
         const owner = generation;
 
         try {
@@ -779,6 +823,7 @@ export const createRecordsClient = (options: RecordsClientOptions): RecordsClien
             fail(error, reason);
         } finally {
             refreshing = false;
+            endFetch();
 
             if (refreshAgain && !disposed) {
                 refreshAgain = false;
@@ -806,6 +851,7 @@ export const createRecordsClient = (options: RecordsClientOptions): RecordsClien
         }
 
         pulling = true;
+        beginFetch();
         const owner = generation;
         const since = feedSeq();
         const previousCollectionsRev = collectionsRev;
@@ -859,6 +905,7 @@ export const createRecordsClient = (options: RecordsClientOptions): RecordsClien
             fail(error, reason);
         } finally {
             pulling = false;
+            endFetch();
 
             if (pullAgain && !disposed) {
                 pullAgain = false;
@@ -1054,6 +1101,7 @@ export const createRecordsClient = (options: RecordsClientOptions): RecordsClien
         phase: () => phase,
         error: () => errorMessage,
         stale: () => stale,
+        fetching: () => fetching,
         linkState: () => link,
         lastSyncAt: () => lastSyncAt,
         watermarks: () => ({ storeRev, collectionsRev, revision }),

@@ -36,9 +36,9 @@
 //   - an unknown tool, an undiscovered tool, malformed arguments, or a throwing
 //     tool becomes a tool result the model can read and recover from — it does
 //     not end the run;
-//   - exceeding the configured model-request limit (`maxIterations`, default
-//     DEFAULT_MAX_ITERATIONS) — every turn counts, including pauses with pending
-//     work and wake-driven turns — or a transport failure ends the run: history is
+//   - exceeding the OPTIONAL model-request limit (`maxIterations`, unset by
+//     default = no limit; every turn counts, including pauses with pending work
+//     and wake-driven turns) — or a transport failure ends the run: history is
 //     truncated back to where the call started and the harness throws.
 //
 // Retries (R1): a failed model request is retried by the AGENT (core/agent.ts),
@@ -501,14 +501,15 @@ import type {
 } from './types';
 import type { PreparedTool, ToolSourceRecord } from './core';
 
-// Hard stop for a model that keeps requesting turns forever (tool rounds, pauses
-// with pending work, and wake-driven turns all count). This is a guard, not a
-// policy knob, so the library default stays deliberately small; a real agent
-// session can raise it with `harness({ maxIterations })` (the application presets
-// do, see harnesses/presets.ts). A runaway loop must not be able to run a CLI
-// process out of money or stack, so `maxIterations` is validated at construction
-// (positive safe integer) and can never be Infinity.
-const DEFAULT_MAX_ITERATIONS = 16;
+// Bound on model requests one run may make (tool rounds, pauses with pending work,
+// and wake-driven turns all count). This is an OPTIONAL
+// safeguard, not policy: no harness is capped unless a host (or one preset card)
+// names a number, so the library default is NO LIMIT — `Number.POSITIVE_INFINITY`
+// — and the guard below can never trip on an unconfigured harness. `harness({
+// maxIterations })` opts back in, and `Infinity` is accepted explicitly so a host
+// that lowered it can turn the bound off again. Runs are still bounded by every
+// tool's own wall-clock timeout, a plugin `stop`, and an explicit abort.
+const DEFAULT_MAX_ITERATIONS = Number.POSITIVE_INFINITY;
 
 // Background-work heartbeat (R4): 10 minutes. This is a LIVENESS interval, not a
 // timeout — nothing is killed automatically (the model decides, via toolCancel).
@@ -550,16 +551,18 @@ const resolveWakeInterval = (value: number | undefined): number => {
     return value;
 };
 
-// Validate and resolve the configured model-request bound. Rejecting anything that is
-// not a positive safe integer keeps the guard meaningful: 0 would make every tool
-// request fail, 1.5/NaN/Infinity have no well-defined round count, and values
-// beyond Number.MAX_SAFE_INTEGER cannot be counted exactly.
+// Validate and resolve the configured model-request bound. The safeguard is
+// optional: an UNSET value means no limit, and `Infinity` means the same thing
+// when a host states it. Every other value must be a positive safe integer —
+// 0 would make every tool request fail, 1.5/NaN have no well-defined round
+// count, and values beyond Number.MAX_SAFE_INTEGER cannot be counted exactly.
 const resolveMaxIterations = (value: number | undefined): number => {
     if (value === undefined) return DEFAULT_MAX_ITERATIONS;
+    if (value === Number.POSITIVE_INFINITY) return value;
 
     if (!Number.isSafeInteger(value) || value < 1) {
         throw new HarnessError(
-            `maxIterations must be a positive safe integer; received ${String(value)}.`
+            `maxIterations must be a positive safe integer or Infinity; received ${String(value)}.`
         );
     }
 
@@ -4147,7 +4150,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // that mechanism survives, but its DEFAULT is now "no limit". `timeoutMs` is
         // omitted → `DELEGATE_TIMEOUT_MS` → `Number.POSITIVE_INFINITY` → no timer is
         // armed, so the child ends only on its own answer (or on a tool's own clock,
-        // `maxIterations`, an explicit `toolCancel`, or the caller aborting).
+        // `maxIterations` (an OPTIONAL count, unarmed by default), an explicit
+        // `toolCancel`, or the caller aborting).
         //
         // The host path is deliberately NOT clamped (T2.3): the schema's 3600000
         // maximum bounds what a MODEL may ask for, and `runtime.delegate` is not
@@ -9794,8 +9798,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     // Run one agent until it has answered AND nothing it started is still
-    // running. `maxIterations` bounds model turns; exhaustion cancels the pending
-    // work before throwing so no orphan task survives a rolled-back run.
+    // running. `maxIterations` optionally bounds model turns (unset means no
+    // bound); exhaustion cancels the pending work before throwing so no orphan
+    // task survives a rolled-back run.
     const runAgentCore = async (
         run: RunState,
         input: string

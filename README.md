@@ -1600,7 +1600,7 @@ const writer = harness({
 | `agents` | Every brain, keyed by name. **The first key is the entry point** unless `primary` names another one. |
 | `primary` | Which agent the callable runs. Optional; must name a registered agent. Use it in multi-agent configs so routing is explicit. |
 | `subagents` | Allowlist the primary may delegate to. Optional; defaults to every agent except the primary. Empty (or a one-agent config) means no `delegate` tool at all. Must not contain the primary or an unknown name. |
-| `maxIterations` | Model requests one agent run may make before the harness throws. Every request counts: the first answer, each immediate tool continuation, a pause turn, and every completion or timed wake. **Default 16** — the library's runaway guard. Must be a positive safe integer (validated at construction); there is no unlimited value. The app presets set 1000. |
+| `maxIterations` | OPTIONAL runaway guard: model requests one agent run may make before the harness throws. Every request counts: the first answer, each immediate tool continuation, a pause turn, and every completion or timed wake. **Unset by default = no limit**, and `Infinity` states that explicitly; a finite value must be a positive safe integer (validated at construction). The app presets set no limit either. |
 | `forks` | `{ enabled?, maxDepth?, maxConcurrent?, maxHistoryBytes?, maxBranchRecords? }`. `enabled` defaults **true** and registers the core `threadFork` tool. Defaults: depth 2, 4 live branches, 8 MiB serialized branch history, 64 retained records; every numeric bound must be a positive safe integer. |
 | `interaction` | `{ actionRequest?: (context, signal) => Promise<HarnessActionChoice>, autoAnswer? }`. Presence registers the core `actionRequest` tool. `autoAnswer` defaults true and only governs a child/fork request's automatic owner fork; it never selects an option by itself. |
 | `tools` | Extra tools, keyed by the name the model calls. A configured tool replaces a preloaded preset of the same name. |
@@ -1815,8 +1815,9 @@ state after waking. This changes four things a caller must know:
     `status: "cancelled"` result with `partialContent` and `cancelledAtMessage`.
     CORRECTED IN PLACE: the default used to be a finite **300000 ms (5 minutes)**;
     the mechanism stays, the finite default does not. What still ends a long run is a
-    tool's own timeout, the `maxIterations` **request count** (16 by default — a
-    count bound, deliberately untouched by a policy about time), the run-depth and
+    tool's own timeout, the optional `maxIterations` **request count** (unset by
+    default = no limit — a count bound a host opts into, deliberately untouched by a
+    policy about time), the run-depth and
     record caps, `toolCancel`, and — ADDED 2026-11-09 when the plugin-pipeline
     user-facing lists landed — an explicit **`stop` decision** from a `turn.before`
     plugin ([`docs/plugins.md`](./docs/plugins.md)): a policy assertion made by code
@@ -1869,14 +1870,15 @@ Failures split in two:
 - **Recoverable** — unknown tool, undiscovered tool, malformed JSON arguments, or a
   throwing tool. Each becomes a tool result the model sees, so it can correct
   itself.
-- **Terminal** — a transport failure or more than `maxIterations` model requests
-  (default 16; the bundled live presets pass 1000). History is truncated back to
+- **Terminal** — a transport failure, or more than `maxIterations` model requests
+  when a host has opted into that OPTIONAL guard (unset by default = no limit; the
+  bundled live presets leave it unset). History is truncated back to
   where the call started and the harness throws, so a failed call is never
   replayed on the next attempt.
 
 `maxIterations` is per agent run — a delegated subagent gets its own budget — and
-is validated when `harness()` is called: a value that is not a positive safe
-integer throws `HarnessError` immediately instead of failing mid-run.
+is validated when `harness()` is called: a value that is neither a positive safe
+integer nor `Infinity` throws `HarnessError` immediately instead of failing mid-run.
 
 ### Owner questions and history forks
 
@@ -2823,7 +2825,7 @@ part of that declaration.
 | `reviewer` | Reviewer | Strict, independent judge of plans, code, documents and claims; every finding carries evidence, and it is non-mutating by default. |
 | `planner` | Manager | Holds the goal, writes the plan, delegates EVERY step, and accepts a result only after `reviewer` has independently checked it. Never executes a step, and refuses to run as a delegate. |
 | `debugger` | Debugger | Stress-tests the system: unlocks any searchable tool, runs any command, exercises each capability at its edges, and reports a reproduction. |
-| `chat` | Chat | The one card that opts out of the toolbox: the General profile on an EMPTY catalogue — no file, search, delegation, or record tool is registered — and one model call. It cannot read or write the server host and never spends a tool round, so it is the card for a surface that only talks. `tools: []` on the card is made true in the runtime by `sharedToolbox: false`, not merely promised. |
+| `chat` | Chat | The one card that opts out of the toolbox: the General profile on an EMPTY catalogue — no file, search, delegation, or record tool is registered. It cannot read or write the server host, because the only rows it can call are the harness-owned core tools, and it carries no iteration budget, so it runs until the model answers. `tools: []` on the card is made true in the runtime by `sharedToolbox: false`, not merely promised. |
 
 Every real preset's team is derived from ONE list: each card lists every *other* real
 role plus the `summarizer` as a direct subagent (`teamOf()` in
@@ -3847,11 +3849,17 @@ that looks clickable but is not would be a lie.
   is a nudge, never a payload; the two panels share ONE registration on that topic
   (`extensions/records-wake.ts`), and a burst costs one delta read, not one per
   frame. There is no polling anywhere.
-- **Five states, and the panel says which one it is in.** `loading` (a skeleton, but
-  only after the read has been slow for 250 ms), `empty`, `error` with a Retry,
-  `stale` (rows on screen that may be behind), and `ready`. The state is published as
-  `data-phase` on the panel root, so the stylesheet and assistive tech read the same
-  fact the reader sees.
+- **Five states, and the panel says which one it is in.** `loading`, `empty`, `error`
+  with a Retry, `stale` (rows on screen that may be behind), and `ready`. The state is
+  published as `data-phase` on the panel root, so the stylesheet and assistive tech read
+  the same fact the reader sees. A fixed box in the card's top-right corner names it in
+  one word — no skeleton is ever laid over the list, because a block of bars inserted and
+  pulled out on every re-read is what made the tile flicker — and while a read is
+  outstanding that box says `reading` whatever `data-phase` says: an unanswered fetch is
+  not a verdict on the rows already on screen, so the rows, the phase and the sync
+  sentence hold still and only the corner word moves (`recordsCornerStateOf`, fed by
+  `RecordsClient.fetching`, which stays up across the body-refresh debounce so the word
+  never blinks between a delta and the re-read it queued).
 - **A change speaks about itself.** A live row lands with its identity and order at
   once and its values one debounced re-read later, because a change row names the
   fields it touched and carries no values. A value that is not knowable renders `—`

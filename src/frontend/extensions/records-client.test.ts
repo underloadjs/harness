@@ -158,8 +158,15 @@ describe('records client — bootstrap', () => {
         expect(client.lastSyncAt()).toBe(0);
         expect(client.feed()).toEqual([]);
         expect(client.tasks()).toEqual([]);
+        expect(client.fetching()).toBe(false);
 
-        await client.boot();
+        // The read is issued synchronously, so the corner box goes to `reading` in the
+        // same turn the request is — a slow answer is a stated wait, not a badge sitting
+        // on the last verdict (./records-client.ts `fetching`).
+        const booting = client.boot();
+
+        expect(client.fetching()).toBe(true);
+        await booting;
 
         expect(client.phase()).toBe('ready');
         expect(client.error()).toBeUndefined();
@@ -200,19 +207,42 @@ describe('records client — bootstrap', () => {
         });
         expect(client.feedTruncated()).toBe(false);
 
-        // One wholesale replacement, and the bootstrapped rows handed to the painter.
-        expect(h.notices).toEqual([
-            {
-                reason: 'boot',
-                phase: 'ready',
-                stale: false,
-                link: 'unknown',
-                rows: expect.any(Array),
-                touched: ['tasks'],
-                replaced: true
-            }
-        ]);
-        expect(h.notices[0]?.rows).toHaveLength(1);
+        // One wholesale replacement, and the bootstrapped rows handed to the painter —
+        // wrapped in the two `fetch` notices that moved the corner box to `reading` and
+        // back. They are chrome only: no rows, no collection, no verdict of their own
+        // (their `phase`/`stale` are just the state at that instant), which is why the
+        // panel repaints and says nothing on one.
+        expect(h.notices.map((notice) => notice.reason)).toEqual(['fetch', 'boot', 'fetch']);
+        expect(h.notices[0]).toEqual({
+            reason: 'fetch',
+            phase: 'loading',
+            stale: false,
+            link: 'unknown',
+            rows: [],
+            touched: [],
+            replaced: false
+        });
+        expect(h.notices[1]).toEqual({
+            reason: 'boot',
+            phase: 'ready',
+            stale: false,
+            link: 'unknown',
+            rows: expect.any(Array),
+            touched: ['tasks'],
+            replaced: true
+        });
+        expect(h.notices[2]).toEqual({
+            reason: 'fetch',
+            phase: 'ready',
+            stale: false,
+            link: 'unknown',
+            rows: [],
+            touched: [],
+            replaced: false
+        });
+        expect(h.notices[1]?.rows).toHaveLength(1);
+        // The answer landed, so nothing is outstanding and the box has its word back.
+        expect(client.fetching()).toBe(false);
     });
 
     it('calls a snapshot with no collections and no events "empty", not "error"', async () => {
@@ -249,9 +279,30 @@ describe('records client — bootstrap', () => {
         expect(h.client.stale()).toBe(true);
         expect(h.client.error()).toBe(clipped);
         expect(h.client.feed()).toEqual([]);
-        expect(h.notices).toEqual([
-            { reason: 'boot', phase: 'error', stale: true, link: 'unknown', rows: [], touched: [], replaced: false, error: clipped }
-        ]);
+        // A failed read ENDS the fetch: the box takes `reading` back out and the panel's
+        // `error` state is what the reader is shown instead, so a dead store never leaves
+        // a card saying `reading` forever.
+        expect(h.notices.map((notice) => notice.reason)).toEqual(['fetch', 'boot', 'fetch']);
+        expect(h.notices[1]).toEqual({
+            reason: 'boot',
+            phase: 'error',
+            stale: true,
+            link: 'unknown',
+            rows: [],
+            touched: [],
+            replaced: false,
+            error: clipped
+        });
+        expect(h.notices[2]).toEqual({
+            reason: 'fetch',
+            phase: 'error',
+            stale: true,
+            link: 'unknown',
+            rows: [],
+            touched: [],
+            replaced: false
+        });
+        expect(h.client.fetching()).toBe(false);
 
         await h.client.refresh('boot');
 
@@ -520,7 +571,12 @@ describe('records client — delta application', () => {
         expect(h.client.stale()).toBe(true);
         expect(h.client.error()).toBe('delta exploded');
         expect(h.client.feed()).toHaveLength(1);
-        expect(h.notices[h.notices.length - 1]).toEqual({
+        // The failure is the last thing the reader is TOLD; the `fetch` after it only
+        // takes `reading` out of the corner box. The rows on screen are still the last
+        // honest answer, which is what `stale` says.
+        const data = h.notices.filter((notice) => notice.reason !== 'fetch');
+
+        expect(data[data.length - 1]).toEqual({
             reason: 'error',
             phase: 'ready',
             stale: true,
@@ -530,6 +586,8 @@ describe('records client — delta application', () => {
             replaced: false,
             error: 'delta exploded'
         });
+        expect(h.notices[h.notices.length - 1]?.reason).toBe('fetch');
+        expect(h.client.fetching()).toBe(false);
 
         h.client.linkUp();
         await h.client.pull('delta');
@@ -656,6 +714,121 @@ describe('records client — delta application', () => {
         expect(history.truncated).toBe(true);
 
         expect(h.client.historyOf('tasks', 'rec_missing')).toEqual({ items: [], truncated: false });
+    });
+});
+
+describe('records client — the `fetching` flag behind the corner box', () => {
+    it('is true only while an answer is outstanding, and stays true across the body-refresh debounce', async () => {
+        let release: (() => void) | undefined;
+        const h = harness({
+            delta: () =>
+                new Promise<RecordsDeltaResponse>((resolve) => {
+                    release = () =>
+                        resolve(rows({ seq: 2, collection: 'tasks', rev: 2, id: 'rec_x', op: 'add', fields: ['text'], item_rev: 0, at: AT_2 }));
+                })
+        });
+
+        expect(h.client.fetching()).toBe(false);
+
+        const booting = h.client.boot();
+
+        expect(h.client.fetching()).toBe(true);
+        await booting;
+        expect(h.client.fetching()).toBe(false);
+
+        const pulling = h.client.pull('delta');
+
+        expect(h.client.fetching()).toBe(true);
+        release?.();
+        await pulling;
+
+        // THE ANTI-FLICKER RULE. The delta named an `add` whose body it could not carry,
+        // so it queued ONE debounced re-read — and that queued read is the same fetch
+        // still finishing. Dropping the flag here would put `live` on screen for the whole
+        // 150ms of the debounce and `reading` again after it, which is the flicker the
+        // corner box replaced the skeleton to stop.
+        expect(h.timers).toHaveLength(1);
+        expect(h.client.fetching()).toBe(true);
+
+        h.timers.forEach((run) => run());
+        await h.settle();
+
+        expect(h.client.fetching()).toBe(false);
+        // The box moves at the EDGES of a read and nowhere in between: fetch → boot →
+        // fetch, then fetch → delta → bodies → fetch. Only the two state notices carry
+        // rows, and no notice is published twice for one transition.
+        expect(h.notices.map((notice) => notice.reason)).toEqual(['fetch', 'boot', 'fetch', 'fetch', 'delta', 'bodies', 'fetch']);
+        expect(
+            h.notices
+                .filter((notice) => notice.reason === 'fetch')
+                .every((notice) => notice.rows.length === 0 && notice.touched.length === 0 && !notice.replaced)
+        ).toBe(true);
+    });
+
+    it('holds the flag across a coalesced follow-up read, so a burst is ONE fetch', async () => {
+        let release: (() => void) | undefined;
+        const h = harness({
+            delta: () =>
+                new Promise<RecordsDeltaResponse>((resolve) => {
+                    release = () => resolve({ ...DELTA_BASE, changes: [] });
+                })
+        });
+
+        await h.client.boot();
+
+        const fetches = (): number => h.notices.filter((notice) => notice.reason === 'fetch').length;
+        const before = fetches();
+
+        // Three wakes while one read is in flight: the burst is answered by that read plus
+        // exactly one queued follow-up, and the queued pass is the SAME unanswered request.
+        // Lowering the flag between the two would blink `live` for the length of one
+        // microtask — invisible in a browser, but it is the same flicker, and it would make
+        // the notice stream lie about how many reads the reader is waiting on.
+        h.client.frame({ store_rev: 5, collections_rev: 4 });
+        await Promise.resolve();
+        const first = release;
+        h.client.frame({ store_rev: 5, collections_rev: 4 });
+        h.client.frame({ store_rev: 5, collections_rev: 4 });
+
+        expect(h.client.fetching()).toBe(true);
+
+        first?.();
+        await h.settle();
+
+        expect(h.calls.deltas).toHaveLength(2);
+        // The follow-up is in flight, and the flag never came down to let it start.
+        expect(h.client.fetching()).toBe(true);
+
+        release?.();
+        await h.settle();
+
+        expect(h.client.fetching()).toBe(false);
+        // Up once, down once, for two reads.
+        expect(fetches()).toBe(before + 2);
+    });
+
+    it('takes the flag back down when a read is superseded, so a late answer never strands `reading`', async () => {
+        let release: (() => void) | undefined;
+        const h = harness({
+            snapshot: () =>
+                new Promise<RecordsSnapshotResponse>((resolve) => {
+                    release = () => resolve(SNAPSHOT);
+                })
+        });
+
+        const first = h.client.refresh('boot');
+
+        expect(h.client.fetching()).toBe(true);
+
+        // The panel goes away while that snapshot is still outstanding. The read still
+        // answers, and its `finally` still closes the fetch — a disposed client publishes
+        // nothing, but it must not leave the flag up for whatever reads it next.
+        h.client.dispose();
+        release?.();
+        await first;
+
+        expect(h.client.disposed()).toBe(true);
+        expect(h.notices.map((notice) => notice.reason)).toEqual(['fetch']);
     });
 });
 

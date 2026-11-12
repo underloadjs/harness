@@ -44,7 +44,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent } from '../../harness';
-import type { HarnessProgress, HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '../../harness';
+import type { HarnessProgress, HarnessStreamEvent, HarnessStreamRequest } from '../../harness';
 import { createToolboxHarness } from './toolbox';
 import {
     createHarnessRegistry,
@@ -279,8 +279,9 @@ describe('preset catalogue', () => {
         ]);
     });
 
-    it('keeps the live tool-loop budget at 1000 and the library default untouched', () => {
-        expect(PRESET_MAX_ITERATIONS).toBe(1000);
+    it('gives the live harnesses no tool-loop budget', () => {
+        // The count guard is an optional safeguard: no shipped card caps a run.
+        expect(PRESET_MAX_ITERATIONS).toBe(Number.POSITIVE_INFINITY);
     });
 
     it('derives one team per primary: every other real role except the Manager, then the summarizer', () => {
@@ -664,54 +665,17 @@ describe('one toolbox, different agents', () => {
         expect(describeHarness(presetOf('chat'), configured).coreTools).toEqual(coreNamesAtRuntime);
     });
 
-    it('gives the tool-less posture one model call and leaves the roles on the shipped budget', async () => {
-        // `maxIterations` is resolved INSIDE the harness (`src/harness.ts:896`) and no Harness
-        // field exposes it, so the card's one-round-trip posture is pinned at the seam the card
-        // feeds: `createToolboxHarness` with the card's own configuration, driven by a scripted
-        // stream that always asks for a tool.
-        const seen: HarnessStreamRequest[] = [];
-        const alwaysAsksForATool: HarnessStream = async function* (request): AsyncGenerator<HarnessStreamEvent> {
-            seen.push(request);
-            yield {
-                type: 'done',
-                stopReason: 'tool_calls',
-                toolCalls: [{ id: 'c1', name: 'read', arguments: '{}' }]
-            };
-        };
-
-        const chatLike = createToolboxHarness(
-            {
-                agents: { general: agent({ model: 'test-model', stream: alwaysAsksForATool }) },
-                primary: 'general',
-                subagents: [],
-                sharedToolbox: false,
-                maxIterations: 1
-            },
-            SETTINGS,
-            progress
-        );
-
-        // ONE request, then the loop bound refuses instead of starting a second round-trip. The row
-        // the model asked for is not even registered here — `sharedToolbox: false` registered no
-        // `read` — which is the other half of the same posture.
-        await expect(chatLike('go')).rejects.toThrow(
-            'Agent "general" requested tools more than 1 times without answering.'
-        );
-        expect(seen).toHaveLength(1);
-
-        // THE wire-level statement of issue 0005-D: the only tool declarations this card ever
-        // sends are the kernel's bootstrap pair, so the model is told to unlock the rest.
-        expect(seen[0].tools?.map((declaration) => declaration.name)).toEqual(['toolRequest', 'tasks']);
-
-        // The roles are untouched: the same factory WITHOUT the option answers across two rounds,
-        // i.e. the budget is the shipped 1000 and not the chat card's 1.
-        const roleSeen: HarnessStreamRequest[] = [];
-        const twoRounds = [
+    it('runs the tool-less posture with no iteration budget and keeps the empty toolbox', async () => {
+        // `maxIterations` is resolved INSIDE the harness (`src/harness.ts`) and no Harness field
+        // exposes it, so the card's posture is pinned at the seam the card feeds:
+        // `createToolboxHarness` with the card's own configuration. The budget is OFF, so the
+        // surviving promise is the EMPTY TOOLBOX, not a one-round-trip cap.
+        const rounds = [
             [
                 {
                     type: 'done' as const,
                     stopReason: 'tool_calls' as const,
-                    toolCalls: [{ id: 'c1', name: 'timeNow', arguments: '{}' }]
+                    toolCalls: [{ id: 'c1', name: 'read', arguments: '{}' }]
                 }
             ],
             [
@@ -719,18 +683,54 @@ describe('one toolbox, different agents', () => {
                 { type: 'done' as const, stopReason: 'stop' as const, toolCalls: [] }
             ]
         ];
+
+        const seen: HarnessStreamRequest[] = [];
         let round = 0;
 
+        const chatLike = createToolboxHarness(
+            {
+                agents: {
+                    general: agent({
+                        model: 'test-model',
+                        stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
+                            seen.push(request);
+
+                            const frames = rounds[round] ?? rounds.at(-1)!;
+
+                            round += 1;
+                            for (const frame of frames) yield frame;
+                        }
+                    })
+                },
+                primary: 'general',
+                subagents: [],
+                sharedToolbox: false
+            },
+            SETTINGS,
+            progress
+        );
+
+        // TWO requests and an answer: the guard that used to refuse the second round-trip at
+        // `maxIterations: 1` no longer fires unless a card opts back in. The row the model asked
+        // for is still not registered here — `sharedToolbox: false` registered no `read` — so the
+        // call is a recoverable tool result, which is the half of the posture that survives.
+        expect((await chatLike('go')).content).toBe('done');
+        expect(seen).toHaveLength(2);
+
+        // THE wire-level statement of issue 0005-D: the only tool declarations this card ever
+        // sends are the kernel's bootstrap pair, so the model is told to unlock the rest.
+        expect(seen[0].tools?.map((declaration) => declaration.name)).toEqual(['toolRequest', 'tasks']);
+
+        // The other half of the seam is untouched: the same factory WITHOUT `sharedToolbox: false`
+        // registers the whole catalogue on top of the kernel rows.
         const roleHarness = createToolboxHarness(
             {
                 agents: {
                     general: agent({
                         model: 'test-model',
                         stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
-                            const frames = twoRounds[round] ?? twoRounds.at(-1)!;
-
-                            round += 1;
-                            for (const frame of frames) yield frame;
+                            yield { type: 'text', delta: 'done' };
+                            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
                         }
                     })
                 },
@@ -743,7 +743,6 @@ describe('one toolbox, different agents', () => {
 
         expect((await roleHarness('go')).content).toBe('done');
         expect(Object.keys(roleHarness.tools).length).toBeGreaterThan(Object.keys(chatLike.tools).length);
-        expect(PRESET_MAX_ITERATIONS).toBe(1000);
     });
 
     it('reuses the trusted general profile for chat instead of adding a role', () => {

@@ -1518,8 +1518,13 @@ body.is-resizing-rail {
     line-height: 1.4;
 }
 
+/* The save control is the row's only action, and it belongs on the RIGHT edge — the
+   flush-right treatment `.thread-transcript-read-actions` already gives its single
+   control. `justify-content` on the row (rather than `margin-left: auto` on the button)
+   keeps a wrapped second line reading from the right edge too, and touches nothing else. */
 .plugin-setting-actions {
     display: flex;
+    justify-content: flex-end;
     gap: 8px;
     margin-top: 2px;
 }

@@ -29,6 +29,11 @@
 //       `PATCH /plugins/context-compaction` `{ settings: { contextLimit: 150000 } }`
 //       (changed keys only), the answer is merged into the cache, the row's settings line
 //       moves with it, and reopening shows 150000 with no extra read;
+//     - the Save control is NEVER disabled (first frame, mid-write, after a save, after a
+//       refusal) and sits flush RIGHT in its own row; a press with nothing changed is a
+//       silent no-op, because the server refuses an empty settings patch with a 400
+//       (../server/plugins.ts) and sending every field anyway would pin each untouched
+//       default as an explicit stored override;
 //     - a refusal shows the server's message verbatim, keeps the typed value, and re-arms
 //       the write control;
 //     - a plugin with no declared settings renders read-only: no control, no Save;
@@ -1187,9 +1192,10 @@ it('opens the Context Compaction dialog with the declared hooks and a numeric li
     expect(label.htmlFor).toBe(input.id);
     expect(byClass('.plugin-setting-hint', 'p').textContent).toBe(compactionRow().settings[0]?.description);
 
-    // The write control exists but is honest: nothing is dirty on the first frame.
+    // The write control is always live: it exists, it is ENABLED on the first frame, and a
+    // press with nothing changed sends nothing (pinned by its own test below).
     expect(byClass('.plugin-setting-save', 'button').textContent).toBe('Save');
-    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(true);
+    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('');
 
     // Escape dismisses the layer, resets the row, re-describes the catalogue, and hands
@@ -1220,12 +1226,13 @@ it('saves only the changed key, repaints from the server row, and reopens with t
     input.value = '150000';
     input.dispatchEvent(new Event('input', { bubbles: true }));
 
-    // The dirty state is what arms the write control.
+    // The control is enabled before the press AND while the write is in flight: the handler's
+    // own `saving` guard is what keeps a double press from sending the patch twice, not a
+    // greyed-out button.
     expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
     byClass('.plugin-setting-save', 'button').click();
 
-    // In flight: the control is locked, so a double press cannot send two patches.
-    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(true);
+    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saving…');
 
     await flush();
@@ -1242,11 +1249,13 @@ it('saves only the changed key, repaints from the server row, and reopens with t
     ).toHaveLength(1);
 
     // The answer IS the new state: the form takes the server's figure, the row's settings
-    // line moves with it, and the dialog says so and clears the dirty state.
+    // line moves with it, and the dialog says so.
     expect(input.value).toBe('150000');
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
     expect(byClass('.plugin-setting-status', 'p').className).toBe('plugin-setting-status field-hint');
-    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(true);
+    // Still pressable: the form now holds the server's own figures, so the next press would
+    // send nothing at all — the control does not grey itself out to say so.
+    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
     expect(pluginRow('context-compaction').querySelector('.plugin-tab-values')?.textContent).toBe(
         'contextLimit: 150000'
     );
@@ -1262,7 +1271,53 @@ it('saves only the changed key, repaints from the server row, and reopens with t
 
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
     expect(byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input').value).toBe('150000');
-    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(true);
+    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
+    expect(pluginCountReads(dialed)).toBe(1);
+});
+
+it('keeps Save pressable and sends nothing when no setting changed', async () => {
+    // The control is never disabled, so "there is nothing to write" has to be a no-op in the
+    // handler rather than a greyed-out button. Two reasons the no-op is the right shape: the
+    // server REFUSES an empty settings patch (`400` — "A plugin settings patch must change at
+    // least one setting", ../server/plugins.ts:545-553), and sending EVERY field instead
+    // would pin each untouched default as an explicit stored override.
+    const { calls, dialed } = stub();
+
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-compaction').click();
+
+    const save = byClass('.plugin-setting-save', 'button');
+
+    expect(save.disabled).toBe(false);
+
+    save.click();
+    await flush();
+
+    // Nothing changed, so nothing left the browser: no write, no second catalogue read, and
+    // no invented success line — the status stays empty because nothing happened.
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+    expect(dialed.filter((line) => line.startsWith('PATCH'))).toEqual([]);
+    expect(pluginCountReads(dialed)).toBe(1);
+    expect(byClass('.plugin-setting-status', 'p').textContent).toBe('');
+    expect(save.disabled).toBe(false);
+
+    // The very same control writes the moment a figure differs from the server's.
+    const input = byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input');
+
+    input.value = '120000';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    save.click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/plugins/context-compaction', method: 'PATCH', body: { settings: { contextLimit: 120000 } } }
+    ]);
+    expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
+    expect(save.disabled).toBe(false);
     expect(pluginCountReads(dialed)).toBe(1);
 });
 
@@ -1292,7 +1347,8 @@ it('keeps the typed value editable and states the server refusal verbatim', asyn
     expect(status.textContent).toBe(message);
     expect(status.className).toBe('plugin-setting-status plugin-setting-status-error');
 
-    // Nothing was reset: the reader fixes the number they typed, and Save is armed again.
+    // Nothing was reset: the reader fixes the number they typed, and the control was never
+    // taken away in the first place.
     expect(input.value).toBe('500');
     expect(input.disabled).toBe(false);
     expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
@@ -1583,4 +1639,25 @@ it('styles the prompt block so its newlines survive and nothing clips horizontal
     // The new section keeps the dialog's divider grammar. An unstyled class here is how a
     // section quietly becomes an invisible band between the two it sits between.
     expect(css).toContain('.plugin-detail-hooks,\n.plugin-detail-prompt-section,\n.plugin-detail-settings {');
+});
+
+// The placement half of the settings form (2026-11-13): the Save control sits on the RIGHT
+// edge of the dialog, like the single control of every other action row in this app
+// (`.thread-transcript-read-actions`). jsdom lays nothing out, so the declaration itself is
+// what gets pinned.
+it('right-aligns the settings save control', () => {
+    const stylesheet = ['src/frontend/styles.css', 'src/styles.css']
+        .map((candidate) => resolve(process.cwd(), candidate))
+        .find((candidate) => existsSync(candidate));
+
+    if (stylesheet === undefined) throw new Error('styles.css not found');
+
+    const css = readFileSync(stylesheet, 'utf8');
+    const at = css.indexOf('\n.plugin-setting-actions {');
+
+    if (at < 0) throw new Error('.plugin-setting-actions is missing from styles.css');
+
+    const rule = css.slice(at, css.indexOf('}', at) + 1);
+
+    expect(rule).toContain('justify-content: flex-end');
 });

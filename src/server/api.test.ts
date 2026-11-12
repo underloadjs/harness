@@ -1313,7 +1313,7 @@ describe('harness catalogue reads', () => {
             name: 'chat',
             title: 'Chat',
             description:
-                'A single answer with no toolbox: the General profile on an empty catalogue (no file, search, delegation, or record tool is registered) and one model call. It cannot read or write the server host and never spends a tool round, so it is the card for a surface that only talks.',
+                'A single answer with no toolbox: the General profile on an empty catalogue (no file, search, delegation, or record tool is registered), so it cannot read or write the server host — the only tools it can ever call are the harness-owned core rows. It carries no iteration budget, so it keeps going until the model answers.',
             requires_endpoint: true,
             primary: 'general',
             subagents: [],

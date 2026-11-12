@@ -3385,18 +3385,21 @@ export type HarnessConfiguration = {
 
     // Maximum number of MODEL REQUESTS (turns) one agent run may make before the
     // harness treats it as a runaway loop: history is truncated back to the start
-    // of the call and the harness throws. Defaults to 16, the library guard. Must
-    // be a positive safe integer; validated at construction so a typo fails before
-    // a long run. There is no "unlimited" value. The same bound applies to every run
-    // in this harness (entry, ctx.run, and delegated subagents); each run gets its
-    // own budget.
+    // of the call and the harness throws. This is an OPTIONAL safeguard, and it is
+    // OFF by default — unset means no limit, and `Number.POSITIVE_INFINITY` states
+    // the same thing explicitly. A finite value must be a positive safe integer;
+    // both are validated at construction so a typo fails before a long run.
+    //
+    // The bound is harness-wide and per run: it applies to every run in this
+    // harness (entry, ctx.run, and delegated subagents), and each run gets its own
+    // count.
     //
     // With background tool calls this counts EVERY request, not just tool rounds:
     // a pause (`done` with pending work) and a wake-driven request each consume
-    // one. A run that never answers and keeps spawning work is still bounded; on
-    // exhaustion the pending work is aborted and the transcript rolled back rather
-    // than left orphaned. The bundled application presets set 1000 for real work -
-    // see harnesses/presets.ts.
+    // one. On exhaustion the pending work is aborted and the transcript rolled
+    // back rather than left orphaned. The bundled application presets set no limit
+    // either (see harnesses/presets.ts) — every tool keeps its own timeout, and a
+    // host that wants a hard stop opts in here.
     maxIterations?: number;
 
     // Who may create tools at runtime (R12). Defaults to 'all', the historical

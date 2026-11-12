@@ -56,11 +56,12 @@
 //     folder scan never reads — rather than by a name list.
 //   - the `chat` card opts OUT of this toolbox entirely (issue 0005-D):
 //     `configuration.sharedToolbox: false` skips `SHARED_TOOL_SOURCES` and both
-//     environment rows, and `configuration.maxIterations: 1` gives it one model call.
-//     It is the ONLY shipped preset that does, it is declared at the card in
-//     ./presets.ts rather than inferred from `tools: []`, and it exists because a
-//     client that wants a session which never touches the server host had no way to
-//     ask for one. Everything else on the factory's default path is unchanged.
+//     environment rows. It is the ONLY shipped preset that does, it is declared at
+//     the card in ./presets.ts rather than inferred from `tools: []`, and it exists
+//     because a client that wants a session which never touches the server host had
+//     no way to ask for one. The card no longer declares a `maxIterations` budget:
+//     no shipped card does. Everything else on the factory's default path is
+//     unchanged.
 //
 // LAZY, NOT EAGER
 // ---------------
@@ -100,11 +101,13 @@ import {
 import type { RunnerSettings } from './types';
 import type { HarnessPresetReport } from './types';
 
-// Tool-loop budget for live harnesses. The library default (16) is a runaway
-// guard, but a real session legitimately needs dozens of rounds: discovery,
-// several reads/edits, a command, then an answer. 1000 keeps a hard stop without
-// truncating real work. Exported so the CLI/server can report the same bound.
-export const PRESET_MAX_ITERATIONS = 1000;
+// Tool-loop budget for live harnesses: NO BUDGET. A real session legitimately
+// needs dozens or hundreds of rounds — discovery, several reads/edits, a command,
+// then an answer — and the count guard is an optional safeguard rather than
+// product policy, so live harnesses ship uncapped and every tool keeps its own
+// wall-clock timeout. A card or a host that wants a hard stop passes
+// `maxIterations`. Exported so the CLI/server report the same bound.
+export const PRESET_MAX_ITERATIONS = Number.POSITIVE_INFINITY;
 
 // Re-exported so the preset/registry modules and the descriptor tests keep ONE
 // import path for the shared app set (T25). Both are derived in ./tools.ts from the
@@ -521,8 +524,10 @@ export type ToolboxHarnessConfiguration = {
     // `presets: false` stays exactly as it is — the kernel's own baseline is skipped either way, so a
     // tool-less card registers nothing the descriptor does not advertise.
     sharedToolbox?: boolean;
-    // The tool-loop budget for THIS harness. Omitted means the app-wide `PRESET_MAX_ITERATIONS`, which
-    // is every live card. A single-answer card passes 1: one model call, no tool rounds.
+    // The tool-loop budget for THIS harness, and it is OPTIONAL: omitted means no
+    // budget at all (`PRESET_MAX_ITERATIONS`, i.e. Infinity — which is every shipped
+    // card). A card that wants a hard stop passes a finite count; a run that hits it
+    // is rolled back and rejected.
     maxIterations?: number;
     // Extra SOURCE entries, by package-relative path. Merged after the shared source
     // map and before host `extraTools`, so an extra is still compiled from its editable
@@ -598,8 +603,9 @@ export const createToolboxHarness = (
         // Host/example DEFINITIONS override sources by being registered last.
         tools: { ...configuration.extraTools },
         presets: false,
-        // Live sessions use the app-wide tool-loop budget, not the library's 16. A tool-less card
-        // overrides it (issue 0005-D: `maxIterations: 1` for one answer, no tool rounds).
+        // Tool-loop budget: no shipped card sets one, so live sessions get `PRESET_MAX_ITERATIONS`
+        // (Infinity — the guard is off). It survives as a per-card opt-in, and the library
+        // default is likewise uncapped (src/harness.ts `DEFAULT_MAX_ITERATIONS`).
         maxIterations: configuration.maxIterations ?? PRESET_MAX_ITERATIONS,
         // Environment-backed search; no key means the factory returns undefined
         // and the harness is unchanged. Keys are resolved at construction, after

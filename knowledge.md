@@ -2367,7 +2367,8 @@ await writer('tell me about new year');
   `callId` (named in the `status: "pending"` placeholder), and a `writer(input)` whose
   child never settles never resolves — that is the drain contract above working as
   specified, not a bug. What DOES bound a long run: every tool's own timeout (below),
-  the `maxIterations` REQUEST COUNT (`DEFAULT_MAX_ITERATIONS`, 16), `MAX_RUN_DEPTH`,
+  the OPTIONAL `maxIterations` REQUEST COUNT (`DEFAULT_MAX_ITERATIONS` is
+  `Infinity` — no limit unless a host names one), `MAX_RUN_DEPTH`,
   the thread/branch/record caps, and — ADDED 2026-11-09 when the plugin-pipeline
   user-facing lists landed — a `turn.before` plugin's `stop` decision
   (`HarnessTurnDecision`, `docs/plugins.md`): a policy assertion by shipped code at
@@ -2474,10 +2475,12 @@ await writer('tell me about new year');
 **Configuration fields this section did not already cover** (every line anchor is
 `src/types/index.ts`, the `HarnessConfiguration` type):
 
-- `maxIterations` (`:3104`) — the REQUEST-COUNT bound on one run (default
-  `DEFAULT_MAX_ITERATIONS`, 16 — `src/harness.ts:504`; the shipped presets set
-  `PRESET_MAX_ITERATIONS`, 1000 — `src/server/harnesses/toolbox.ts:102`). On
-  exhaustion the pending work is aborted and the transcript rolled back.
+- `maxIterations` (`:3104`) — the OPTIONAL REQUEST-COUNT bound on one run. Unset
+  means NO LIMIT: `DEFAULT_MAX_ITERATIONS` is `Infinity` (`src/harness.ts`), and the
+  shipped presets carry one either (`PRESET_MAX_ITERATIONS` is `Infinity` —
+  `src/server/harnesses/toolbox.ts`). A finite value must be a positive safe
+  integer; `Infinity` is accepted explicitly. On exhaustion the pending work is
+  aborted and the transcript rolled back.
 - `toolCreation` (`:3117`) — who may create tools at runtime (R12): `'all'` (default)
   or `'primary'`. A gated agent neither sees nor calls `toolCreate`; the host path
   `harness.toolCreate()` still works, because an operator action is not a model
@@ -2572,12 +2575,13 @@ Recoverable failures become tool results the model can read:
 Terminal failures truncate history to the pre-call length, emit `error`, and
 throw:
 - transport failure;
-- more than **maxIterations** model requests without an answer. Every request
+- more than **maxIterations** model requests without an answer — only when a host
+  has opted into that OPTIONAL guard. Every request
   counts, including an immediate tool continuation, a pause turn, and every
-  completion or timed wake. Defaults to **16** (the library guard);
-  `harness({ maxIterations })` raises or lowers it and is validated at construction
-  as a positive safe integer. The application presets pass 1000 for real sessions.
-  The bound is per agent run,
+  completion or timed wake. Defaults to **no limit**;
+  `harness({ maxIterations })` arms it and is validated at construction
+  as a positive safe integer or `Infinity`. The application presets leave it
+  unarmed. The bound is per agent run,
   so a delegated subagent gets its own budget.
 
 Multi-tool turns are **scheduled concurrently**, and every call gets a matching
@@ -4032,10 +4036,16 @@ where a read failed.
 - **One owner per answer.** A dead plane makes the client hold a pending resync, and the
   next baseline answers it. A panel re-reads on that baseline only when the client is not
   already owed the read, so a reconnect costs exactly one delta read, not two.
-- **States.** Five, derived and published as `data-phase` on the panel root: `loading`
-  (a skeleton only after the read has been slow for 250 ms), `empty`, `error` + Retry,
-  `stale`, `ready`. `recordsPanelPhaseOf` is the single derivation; the stylesheet switches
-  on the same attribute the tests assert.
+- **States.** Five, derived and published as `data-phase` on the panel root: `loading`,
+  `empty`, `error` + Retry, `stale`, `ready`. `recordsPanelPhaseOf` is the single derivation;
+  the stylesheet switches on the same attribute the tests assert. The corner box
+  (`recordsStatusOf`) adds ONE dimension the phase does not carry: while a read is in flight
+  it says `reading` whatever `data-phase` says, because an unanswered fetch is not evidence
+  that the rows on screen are behind — a badge that went `live` → `stale` → `live` on every
+  re-read was the flicker the reader complained about. `RecordsClient.fetching` is
+  edge-detected and stays up across the body-refresh debounce (a queued re-read is the same
+  fetch finishing), and each of its two transitions publishes a `fetch` notice, which a panel
+  answers by repainting chrome only: no announcement, no arrival, no `data-phase` move.
 - **The surface.** `extensions/records-dom.ts` holds the pieces both panels share: the
   pre-mounted visually-hidden `role=status` region and its coalescing announcer, the
   follow controller (frozen reading position + "N new" pill, auto-follow only at the live

@@ -9074,26 +9074,14 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
 
         save = el('button', 'button primary plugin-setting-save', 'Save');
         save.type = 'button';
-        // Nothing is dirty on the first frame, and an honest control says so.
-        save.disabled = true;
+        // NEVER disabled. The press is always live and a press with nothing changed sends
+        // nothing (see the empty-patch guard below); the `saving` flag in the handler is
+        // what keeps a double click from writing the same patch twice, so the control has
+        // no honest reason to grey itself out.
         actions.append(save);
         settingsSection.append(actions, status);
         body.append(settingsSection);
     }
-
-    // Dirty state drives the save control: enabled exactly while some field differs from
-    // what the server last reported.
-    const paintDirty = (): void => {
-        if (save === undefined) return;
-
-        const dirty = fields.some(({ setting, input }) => {
-            const value = literalOf(setting, input);
-
-            return value !== undefined && !Object.is(value, effectiveOf(shown, setting));
-        });
-
-        save.disabled = saving || !dirty;
-    };
 
     // Take the server's figures as the form's current values. A write can clamp/normalise
     // what was sent, so the box shows what is IN FORCE afterwards, not what was typed.
@@ -9104,8 +9092,6 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
             if (setting.type === 'boolean') input.checked = current === true;
             else input.value = String(current);
         }
-
-        paintDirty();
     };
 
     const note = (text: string, failed: boolean): void => {
@@ -9138,10 +9124,14 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
                     if (!Object.is(value, effectiveOf(shown, setting))) patch[setting.key] = value;
                 }
 
+                // Nothing changed, so nothing leaves the browser. The server REFUSES an
+                // empty settings patch (`400` — "A plugin settings patch must change at
+                // least one setting", ../server/plugins.ts:545-553), and sending every
+                // field anyway would pin each untouched default as an explicit stored
+                // override. A no-change press is therefore a silent no-op.
                 if (Object.keys(patch).length === 0) return;
 
                 saving = true;
-                paintDirty();
                 note('Saving…', false);
                 // An app-scoped config write, so the topbar pill reports the window
                 // exactly like the endpoint/model and harness writes do.
@@ -9170,17 +9160,14 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
                     setStatus('error', `plugin settings: ${message}`);
                 } finally {
                     saving = false;
-                    paintDirty();
                 }
             })();
         });
 
         for (const { input } of fields) {
-            // `input` (not `change`) so the save control lights up as the reader types.
-            input.addEventListener('input', () => {
-                note('', false);
-                paintDirty();
-            });
+            // `input` (not `change`) so a stale outcome line clears while the reader is
+            // still typing, not only when the field loses focus.
+            input.addEventListener('input', () => note('', false));
         }
     }
 
