@@ -4108,6 +4108,17 @@ export type HarnessPluginMetadata = {
     title: string;
     description?: string;
     version?: string;
+    // The system prompt this plugin sends to the model, shown READ-ONLY in the plugin
+    // details panel (2026-11-12 operator request). Display-only metadata: it never
+    // shapes behaviour, and a plugin that never prompts simply omits it, so every
+    // other plugin's row stays exactly as it was. In the plugin file it is a plain
+    // literal, NOT a reference to that plugin's own prompt constant: the constant is
+    // declared after `metadata`, so a reference would read a temporal dead zone, and a
+    // test pins the two copies byte-exact. The wire spelling is snake_case
+    // (`system_prompt`, src/server/harness.swagger.yaml `PluginSummary`); this internal
+    // name stays camelCase like every other field here (src/server/api.ts `pluginRowOf`
+    // is the one place that maps the two).
+    systemPrompt?: string;
     // Free-form categorisation for the UI (filters/search), never behaviour-bearing.
     tags?: readonly string[];
     // Which lifecycle stages this plugin subscribes to, for display. Informational:

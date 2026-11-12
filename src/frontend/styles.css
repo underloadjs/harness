@@ -1409,6 +1409,7 @@ body.is-resizing-rail {
 }
 
 .plugin-detail-hooks,
+.plugin-detail-prompt-section,
 .plugin-detail-settings {
     display: flex;
     flex-direction: column;
@@ -1436,6 +1437,24 @@ body.is-resizing-rail {
     margin: 0;
     color: var(--muted);
     font-size: 12px;
+}
+
+/* The read-only system prompt (2026-11-12). `.agent-instruction` is the precedent:
+   `pre-wrap` preserves the prompt's OWN newlines while still wrapping at the dialog's
+   width, and `max-height` + `overflow: auto` keep a ~715-character prompt from pushing
+   the settings form off screen. `overflow-wrap: break-word` is the no-clipping half:
+   `overflow: auto` alone would scroll a too-long word out of view instead of breaking
+   it, and a `<pre>` here would be overridden by ui/dialog.css's
+   `.dialog-body pre { white-space: pre }`. */
+.plugin-detail-prompt {
+    margin: 0;
+    max-height: 160px;
+    overflow: auto;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
 }
 
 /* R3: the settings form. One labelled control per declared setting, in the order the

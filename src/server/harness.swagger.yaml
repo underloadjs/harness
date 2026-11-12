@@ -4833,6 +4833,23 @@ components:
         description:
           type: string
           maxLength: 2000
+        # 2026-11-12: the operator reads the prompt a plugin sends, so the plugin declares it
+        # as display metadata. Everything normative lives in the property below (the `#` prose
+        # here is generator-facing only - it reaches neither the generated JSDoc nor the
+        # rendered spec, unlike the `description:` a sibling property carries).
+        system_prompt:
+          type: string
+          description: >-
+            The system prompt this plugin sends to the model, shown READ-ONLY in the plugin details pane
+            (2026-11-12). Display metadata only - it never shapes behaviour. Optional and absent-not-null:
+            a plugin that never prompts sends NO key, which is what keeps every other row's shape
+            byte-identical. The bounds below are DECLARED intent only - nothing enforces them, because
+            the row is projected straight from the plugin's own metadata - so a client reads an empty
+            string as "no prompt declared" and renders no section at all. snake_case like every other
+            multi-word key on this contract (`prompt_preview`, `plugin_diagnostics`); only the display
+            subtree keeps camelCase.
+          minLength: 1
+          maxLength: 2000
         version:
           type: string
           maxLength: 50

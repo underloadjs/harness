@@ -119,22 +119,19 @@ describe('plugin auto-discovery', () => {
                 type: 'number',
                 default: 200000,
                 min: 1000,
-                step: 1000,
-                description: 'The firing point: estimated tokens a conversation may reach before this plugin compacts it, measured with the ~4 characters/token estimate the UI context bar uses, anchored on the reported prompt size of the last request that reported usage — so after the first report it can differ from the bar by whatever the tool schemas and message framing actually cost. There is no separate headroom: the estimate at or above this number fires the pass on that turn. It is this value unless modelLimits overrides it for the model this conversation runs, or caps it at that model\'s declared context window. Set to 0 to turn compaction off for every model.'
+                step: 1000
             },
             {
                 key: 'modelLimits',
                 label: 'Per-model limits (JSON)',
                 type: 'string',
-                default: '{}',
-                description: 'A JSON object keyed by model id, each value `{ "limit": number, "window": number }` — both optional. `limit` replaces contextLimit for that model, for an operator who is willing to pay more (or less) for one model than for the rest. `window` states the model\'s HARD context window: it caps whatever limit is in force, so a 512000 ceiling on a 262144-token model still compacts around the 256k behaviour rather than waiting for a size the provider never accepts. Example: `{"gpt-4o": {"limit": 512000, "window": 131072}, "llama-8b": {"window": 8192}}`. The model id is read live from the agent, so switching models changes the ceiling on the next turn. Anything malformed — broken JSON, a value that is not an object, a non-positive or non-numeric limit — is ignored and the global limit applies, never an error.'
+                default: '{}'
             },
             {
                 key: 'enabled',
                 label: 'Compact conversations',
                 type: 'boolean',
-                default: true,
-                description: 'Runs compaction on or off, in either mode. Off changes nothing else: the limit is still read, the context bar still measures, and no other plugin is affected. It is the switch an operator expects when they want the behaviour gone without removing the built-in.'
+                default: true
             },
             {
                 key: 'minTokens',
@@ -142,8 +139,7 @@ describe('plugin auto-discovery', () => {
                 type: 'number',
                 default: 200,
                 min: 0,
-                step: 50,
-                description: 'A pass must withhold at least this many estimated tokens, or it does nothing at all — no flag write, no persistence notification, no save. A prune that saves 40 tokens is a provider prompt-cache invalidation for nothing, so this floor is what makes running on every turn cheap. Measured as a difference of the same estimate, so any provider anchor cancels out of it and only the withheld characters count. In "summarize" mode the same number is read the other way round, as a trivial floor on the LIVE estimate: a conversation smaller than this is never worth a compaction round trip, so the pass refuses rather than paying for a summary of a handful of turns. Set it to 0 to remove the floor, which a small per-model limit needs: a floor above that limit would never be crossed.'
+                step: 50
             },
             {
                 key: 'safetyTurns',
@@ -151,15 +147,13 @@ describe('plugin auto-discovery', () => {
                 type: 'number',
                 default: 6,
                 min: 0,
-                step: 1,
-                description: 'How many units at the END of the conversation no pass may touch. A unit is one assistant tool-call block plus its results, or one standalone message. The horizon counts UNITS from the end, never the per-run turn counter: a failure the model has not moved past yet is the highest-signal thing in the window, and pruning it is how an agent repeats the call it just watched fail. 0 removes the horizon. It belongs to "exclude" mode; "summarize" mode needs no horizon because the recent tail is exactly what the agent is summarizing.'
+                step: 1
             },
             {
                 key: 'mode',
                 label: 'Compaction mode',
                 type: 'string',
-                default: 'summarize',
-                description: 'Which compaction runs when the limit is reached. "summarize" — the default since the 2026-11-10 context-compaction ruling — parks the conversation at the turn boundary and lets its NEXT model turn write the summary: the agent condenses what is done, what it is working on and where it left off, everything before that instruction stops being sent, and the conversation resumes with a nudge. "exclude" is the earlier behaviour: a superseded tool unit keeps its place in canonical history and simply stops being sent, which is the reversible option the evidence favours and the cheaper one — no extra model turn. "annotate" — replace the result with a one-line handle back to the full text — is the planned SECOND WRITER over the same candidate list the policy already computes before writing anything, and any value other than these two (including that one) behaves as "exclude", the flow that cannot spend a model turn by accident. The value actually used is reported in the pass diagnostic.'
+                default: 'summarize'
             }
         ]);
         expect(writer.pluginMetadata.map((entry) => entry.builtin)).toEqual([true, true, true]);

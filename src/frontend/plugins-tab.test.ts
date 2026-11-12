@@ -31,7 +31,17 @@
 //       moves with it, and reopening shows 150000 with no extra read;
 //     - a refusal shows the server's message verbatim, keeps the typed value, and re-arms
 //       the write control;
-//     - a plugin with no declared settings renders read-only: no control, no Save.
+//     - a plugin with no declared settings renders read-only: no control, no Save;
+//   the read-only system prompt (2026-11-12)
+//     - a row that carries `system_prompt` gets a `System prompt` section BETWEEN Hooks and
+//       Settings, with the text verbatim (newlines included) in a styled `<p>` — never a
+//       `<pre>`, which ui/dialog.css forces onto one line;
+//     - a row without the field renders EXACTLY the sections it rendered before: the field
+//       is optional on the wire, and only the plugin that prompts declares it. Pinned twice,
+//       on the synthetic read-only row AND on the real shipped `async-ping` row;
+//     - a row whose `system_prompt` is an EMPTY string renders the same two sections: the
+//       contract declares `minLength: 1` and nothing enforces it, so the pane reads a blank
+//       as "no prompt declared" instead of opening a section over an empty `<p>`.
 //
 // R2 (this pass) FLIPPED the enablement half of that memo: there IS one tick box per
 // row, in the row's top-right corner, and this file pins it end to end —
@@ -51,6 +61,8 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts src/frontend/plugins-tab.test.ts
 
 import type { HarnessDescriptor, SessionSnapshot, SessionStreamItem, ToolDescriptor } from '../server/protocol';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 // `bumpFixtureEpoch` is the double's documented "the record moved OUTSIDE the request
 // stream" signal: it drops the adapter's memoized GET answers, which is what makes a
@@ -129,6 +141,11 @@ type Row = {
     name: string;
     title: string;
     description: string;
+    // The read-only system prompt (2026-11-12), OPTIONAL like the contract says
+    // (../shared/harness-api.ts `PluginSummary.system_prompt`): only a plugin that prompts
+    // declares one, and a row without it renders no prompt section at all — which is what
+    // keeps every other plugin's panel the same as it was.
+    system_prompt?: string;
     version: string;
     tags: string[];
     hooks: string[];
@@ -167,8 +184,19 @@ const asyncPingRow = (): Row => ({
 const compactionRow = (): Row => ({
     name: 'context-compaction',
     title: 'Context Compaction',
-    description:
-        'Watches each agent conversation against a context limit and, when the limit is reached, compacts the transcript at the turn boundary before the next model request is sent.',
+    // The shipped one-sentence summary (src/plugins/context-compaction.plugin.ts
+    // `metadata.description`, pinned byte-for-byte in
+    // src/plugin/context-compaction.test.ts). The 2026-11-12 cleanup replaced the old
+    // paragraph-length paraphrase with this single sentence, and the pane shows it verbatim
+    // as `.plugin-detail-description`.
+    description: 'Compacts the thread context when the conversation reaches a configured token threshold.',
+    // Trimmed the same way the settings list below is (the shipped prompt is 715 characters
+    // and five lines, pinned byte-for-byte in src/plugin/context-compaction.test.ts). What
+    // this fixture HAS to keep is the shape the pane's contract is about: a multi-line value
+    // with the plugin's own marker, so a renderer that flattens newlines or parses the text
+    // as markup fails here instead of in the browser.
+    system_prompt:
+        '[context compaction] Compact your knowledge now.\n1. DONE — work that is still relevant.\n2. PENDING — everything else, in order.',
     version: '1.0.0',
     tags: ['context', 'compaction', 'lifecycle'],
     hooks: ['turn.before'],
@@ -1104,7 +1132,37 @@ it('opens the Context Compaction dialog with the declared hooks and a numeric li
         'tags: context, compaction, lifecycle'
     ]);
     expect(texts('.plugin-hook-chip')).toEqual(['turn.before']);
-    expect(texts('.plugin-detail-section-title')).toEqual(['Hooks', 'Settings']);
+
+    // The read-only system prompt (2026-11-12): ONE new section, between the hooks and the
+    // settings, and only because THIS row carries `system_prompt`.
+    expect(texts('.plugin-detail-section-title')).toEqual(['Hooks', 'System prompt', 'Settings']);
+
+    // A `<p>`, never a `<pre>`: ui/dialog.css `.dialog-body pre { white-space: pre }`
+    // (specificity 0,1,1) would force the prompt onto one un-wrapped line and scroll it out
+    // of the dialog. The newlines are part of the VALUE and must survive verbatim — the
+    // pane writes it through `textContent`, so markup in a plugin's prompt stays inert.
+    const prompt = byClass('.plugin-detail-prompt', 'p');
+
+    expect(prompt.tagName).toBe('P');
+    expect(prompt.textContent).toBe(compactionRow().system_prompt);
+    expect(prompt.textContent).toContain('\n');
+
+    // Position is part of the request: the prompt belongs to the plugin's identity facts,
+    // so it reads AFTER the hooks and BEFORE the switches, and the body's child order is
+    // exactly that (nothing else moved).
+    const promptSection = byClass('.plugin-detail-prompt-section', 'div');
+
+    expect(promptSection.contains(prompt)).toBe(true);
+    expect([...(promptSection.parentElement?.children ?? [])].map((node) => node.className)).toEqual([
+        'plugin-detail-description',
+        'plugin-detail-facts',
+        'plugin-detail-hooks',
+        'plugin-detail-prompt-section',
+        'plugin-detail-settings'
+    ]);
+    // No control, no affordance: the section is prose an operator reads, not something the
+    // pane can edit, and the plugin row's own write surface is untouched.
+    expect(promptSection.querySelectorAll('button, input')).toHaveLength(0);
 
     // The head names the plugin whose layer is open — the contract the tool runner has.
     expect(byClass('.main-title', 'h1').textContent).toBe('Context Compaction');
@@ -1271,6 +1329,12 @@ it('renders a plugin with no declared settings read-only, with no write control'
     expect(texts('.dialog .plugin-detail-empty')).toEqual(['This plugin declares no settings · read-only.']);
     // The declared hooks still render: read-only covers SETTINGS, not the facts.
     expect(texts('.plugin-hook-chip')).toEqual(['turn.after']);
+    // 2026-11-12: a row WITHOUT `system_prompt` renders exactly the sections it rendered
+    // before the field existed — no empty section, no empty box. This is the byte-identical
+    // claim for every plugin that never prompts.
+    expect(texts('.dialog .plugin-detail-section-title')).toEqual(['Hooks', 'Settings']);
+    expect(document.querySelector('.dialog .plugin-detail-prompt')).toBeNull();
+    expect(document.querySelector('.dialog .plugin-detail-prompt-section')).toBeNull();
     expect(byClass('.main-title', 'h1').textContent).toBe('Quiet Observer');
     expect(byClass('.harness-note', 'p').textContent).toBe('v0.2.0 · 1 hook · read-only · built-in');
 
@@ -1280,6 +1344,31 @@ it('renders a plugin with no declared settings read-only, with no write control'
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.activeElement).toBe(row);
+});
+
+it('renders no System prompt section for a row whose declared prompt is empty', async () => {
+    // The 2026-11-12 edge the contract declares but never enforces: `system_prompt` carries
+    // `minLength: 1` (src/server/harness.swagger.yaml `PluginSummary`), yet src/server/api.ts
+    // `pluginRowOf` projects whatever the plugin declared, so an empty string CAN reach the
+    // pane. main.ts therefore gates the section on NON-EMPTY, and this pins that a blank prompt
+    // reads as "no prompt declared" — no `System prompt` heading over an empty <p>.
+    // Same shipped row, settings and all, with only the prompt blanked: everything else the
+    // field's presence bought has to survive unchanged.
+    stub({ rows: () => [{ ...compactionRow(), system_prompt: '' }] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-compaction').click();
+
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
+    // The two sections of a row that never prompts — nothing empty-shaped between them.
+    expect(texts('.dialog .plugin-detail-section-title')).toEqual(['Hooks', 'Settings']);
+    expect(document.querySelector('.dialog .plugin-detail-prompt')).toBeNull();
+    expect(document.querySelector('.dialog .plugin-detail-prompt-section')).toBeNull();
+    // The prose and the editor are untouched by the blank value.
+    expect(byClass('.plugin-detail-description', 'p').textContent).toBe(compactionRow().description);
+    expect(byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input').value).toBe('100000');
 });
 
 it('renders each declared setting as its own control and sends only the changed one', async () => {
@@ -1337,6 +1426,16 @@ it('replaces the open detail when another row is activated instead of stacking a
     // replacement rule, the same one the tool runner follows).
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Background Ping');
+
+    // 2026-11-12: the `async-ping` row above IS the shipped row (its figures come from
+    // src/plugins/async-ping.plugin.ts), and it declares no prompt — so this dialog, which
+    // REPLACED the compaction one, still renders exactly the two sections it rendered before
+    // `system_prompt` existed. "Panels without the field are unchanged", pinned on a real
+    // shipped plugin and not only on the synthetic read-only row further up.
+    expect(texts('.dialog .plugin-detail-section-title')).toEqual(['Hooks', 'Settings']);
+    expect(document.querySelector('.dialog .plugin-detail-prompt-section')).toBeNull();
+    expect(document.querySelector('.dialog .plugin-detail-prompt')).toBeNull();
+
     expect(compaction.getAttribute('aria-pressed')).toBe('false');
     expect(ping.getAttribute('aria-pressed')).toBe('true');
     expect(byClass('.main-title', 'h1').textContent).toBe('Background Ping');
@@ -1450,4 +1549,38 @@ it('re-reads the catalogue from the pane control instead of trusting the cache',
 
     pluginRow('context-compaction').click();
     expect(byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input').value).toBe('100000');
+});
+
+// The CSS half of the read-only prompt (2026-11-12), pinned against the stylesheet rather
+// than a browser — jsdom runs no cascade here, and what this really guards is a
+// specificity trap: ui/dialog.css `.dialog-body pre { white-space: pre }` (0,1,1) would
+// beat any element selector, so main.ts paints a `<p>` and styles.css owns the wrapping,
+// exactly the way `.agent-instruction` does and exactly the trap ui/tool-code-viewer.test.ts
+// records for the tool pane.
+it('styles the prompt block so its newlines survive and nothing clips horizontally', () => {
+    // Same resolution as the other CSS-source tests: package root (`yarn test:frontend`)
+    // or the frontend root (vitest.config.ts `root`).
+    const stylesheet = ['src/frontend/styles.css', 'src/styles.css']
+        .map((candidate) => resolve(process.cwd(), candidate))
+        .find((candidate) => existsSync(candidate));
+
+    if (stylesheet === undefined) throw new Error('styles.css not found');
+
+    const css = readFileSync(stylesheet, 'utf8');
+    const at = css.indexOf('\n.plugin-detail-prompt {');
+
+    if (at < 0) throw new Error('.plugin-detail-prompt is missing from styles.css');
+
+    const rule = css.slice(at, css.indexOf('}', at) + 1);
+
+    // The prompt's own newlines stay, and a line still wraps at the dialog's width.
+    expect(rule).toContain('white-space: pre-wrap');
+    // `overflow: auto` alone would SCROLL a too-long word out of view; breaking it is what
+    // means no part of the prompt is ever clipped.
+    expect(rule).toContain('overflow-wrap: break-word');
+    expect(rule).toContain('overflow: auto');
+    expect(rule).toContain('max-height: 160px');
+    // The new section keeps the dialog's divider grammar. An unstyled class here is how a
+    // section quietly becomes an invisible band between the two it sits between.
+    expect(css).toContain('.plugin-detail-hooks,\n.plugin-detail-prompt-section,\n.plugin-detail-settings {');
 });

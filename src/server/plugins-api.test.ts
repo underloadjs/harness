@@ -39,6 +39,11 @@ import { fileURLToPath } from 'node:url';
 import { agent, harness } from '../harness';
 import type { HarnessStream, HarnessStreamEvent } from '../harness';
 import { BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
+// The prompt constant, so the projected value below is a real string rather than
+// `COMPACTION.systemPrompt`: read from the descriptor, a MISSING field would become
+// `system_prompt: undefined`, which `toEqual` treats as absent and the assertion would
+// pass vacuously. This spelling fails loudly if the field or the projection goes away.
+import { COMPACTION_INSTRUCTION } from '../plugins/context-compaction.plugin';
 import { createPluginSettingsView } from '../plugin/settings';
 import type { HarnessPluginApi, HarnessPluginMetadata } from '../types';
 import { createHarnessRegistry, createToolboxHarness } from './harnesses';
@@ -389,6 +394,12 @@ describe('GET /v1/harness/plugins', () => {
             name: 'context-compaction',
             title: 'Context Compaction',
             description: COMPACTION.description,
+            // The prompt the details panel shows, projected to the contract's snake_case
+            // spelling (../server/harness.swagger.yaml `PluginSummary.system_prompt`).
+            // The other two rows declare no prompt and emit no such key: async-ping's
+            // key-set assertion above and context-trimmer's own deep-equal below are what
+            // pin that absence, so adding the field cannot widen the other rows.
+            system_prompt: COMPACTION_INSTRUCTION,
             version: '1.0.0',
             tags: ['context', 'compaction', 'lifecycle'],
             hooks: COMPACTION.hooks,
@@ -396,6 +407,14 @@ describe('GET /v1/harness/plugins', () => {
             // R2: same reserved switch; context-compaction DECLARES this key, so the row
             // field and `values.enabled` are one stored value read two ways.
             enabled: true,
+            // The 2026-11-12 settings-pane cleanup: NO compaction descriptor declares a
+            // `description` any more, so none is listed here AT ALL. This file used to read the
+            // value back off the descriptor (`description: COMPACTION.settings?.[0].description`),
+            // which became `undefined` the moment the prose was deleted — and `toEqual` treats an
+            // absent key and an `undefined`-valued one as the same thing, so that spelling passed
+            // whether or not a paragraph came back. Naming no key makes the deep-equal below a
+            // real pin: a reintroduced description reaches the row as a string and fails it. The
+            // stricter "not even an `undefined` value" form is asserted once, after the row.
             settings: [
                 {
                     key: 'contextLimit',
@@ -403,8 +422,7 @@ describe('GET /v1/harness/plugins', () => {
                     type: 'number',
                     default: 200000,
                     min: 1000,
-                    step: 1000,
-                    description: COMPACTION.settings?.[0].description
+                    step: 1000
                 },
                 // R4 added this BEFORE `enabled` (declared order is the row order the pane
                 // renders, so both position and value are pinned): the per-model JSON
@@ -414,15 +432,13 @@ describe('GET /v1/harness/plugins', () => {
                     key: 'modelLimits',
                     label: 'Per-model limits (JSON)',
                     type: 'string',
-                    default: '{}',
-                    description: COMPACTION.settings?.find((setting) => setting.key === 'modelLimits')?.description
+                    default: '{}'
                 },
                 {
                     key: 'enabled',
                     label: 'Compact conversations',
                     type: 'boolean',
-                    default: true,
-                    description: COMPACTION.settings?.find((setting) => setting.key === 'enabled')?.description
+                    default: true
                 },
                 {
                     key: 'minTokens',
@@ -430,8 +446,7 @@ describe('GET /v1/harness/plugins', () => {
                     type: 'number',
                     default: 200,
                     min: 0,
-                    step: 50,
-                    description: COMPACTION.settings?.find((setting) => setting.key === 'minTokens')?.description
+                    step: 50
                 },
                 {
                     key: 'safetyTurns',
@@ -439,15 +454,13 @@ describe('GET /v1/harness/plugins', () => {
                     type: 'number',
                     default: 6,
                     min: 0,
-                    step: 1,
-                    description: COMPACTION.settings?.find((setting) => setting.key === 'safetyTurns')?.description
+                    step: 1
                 },
                 {
                     key: 'mode',
                     label: 'Compaction mode',
                     type: 'string',
-                    default: 'summarize',
-                    description: COMPACTION.settings?.find((setting) => setting.key === 'mode')?.description
+                    default: 'summarize'
                 }
             ],
             values: {
@@ -459,6 +472,16 @@ describe('GET /v1/harness/plugins', () => {
                 mode: 'summarize'
             }
         });
+
+        // The STRICT half of the same "no help paragraph" rule. `toEqual` treats an absent key
+        // and an `undefined`-valued one as equal, so the deep-equal above would still pass a row
+        // whose descriptors carry `description: undefined`. Stated once, key by key, through the
+        // route that publishes them (src/server/api.ts `pluginSettingOf` omits the key rather
+        // than emitting null); src/plugin/context-compaction.test.ts pins the same absence on
+        // the descriptor objects themselves.
+        for (const setting of page.body.items[1].settings) {
+            expect(setting).not.toHaveProperty('description');
+        }
 
         // The third row: `context-trimmer` (R5, and the 2026-11-10 switch split). Same closed
         // key set, and `values` is the projection of ITS declared keys — which is the whole

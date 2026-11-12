@@ -451,16 +451,23 @@ describe('harness contract DTO shapes', () => {
     // `values`. The patch body uses the same key spelling as `values`, which is what makes the
     // pane's write a "send back what you edited" round trip rather than a second vocabulary.
     it('carries a plugin row with its declared settings and effective values', () => {
-        // Closed object: the row's key set is the contract's set and nothing else.
+        // Closed object: the row's key set is the contract's set and nothing else. The list
+        // below names ALL 11 keys the generated `PluginSummary` declares
+        // (../shared/harness-api.ts), in that same generated order — `system_prompt`
+        // (2026-11-12) and `enabled` (R2) included, because a list that omits one of them is a
+        // subset, not the contract. It is a hand-maintained mirror: a key the schema adds and
+        // this list forgets still compiles, so the list has to grow with the schema.
         type PluginRowKeys = keyof PluginSummary;
         const rowKeys: PluginRowKeys[] = [
             'name',
             'title',
             'description',
+            'system_prompt',
             'version',
             'tags',
             'hooks',
             'builtin',
+            'enabled',
             'settings',
             'values'
         ];
@@ -469,10 +476,12 @@ describe('harness contract DTO shapes', () => {
             'name',
             'title',
             'description',
+            'system_prompt',
             'version',
             'tags',
             'hooks',
             'builtin',
+            'enabled',
             'settings',
             'values'
         ]);

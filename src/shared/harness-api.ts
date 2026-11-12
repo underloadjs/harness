@@ -945,6 +945,16 @@ export interface PluginSummary {
     name: string;
     title: string;
     description?: string;
+    /**
+     * The system prompt this plugin sends to the model, shown READ-ONLY in the plugin details pane
+     * (2026-11-12). Display metadata only - it never shapes behaviour. Optional and absent-not-null: a plugin
+     * that never prompts sends NO key, which is what keeps every other row's shape byte-identical. The bounds
+     * below are DECLARED intent only - nothing enforces them, because the row is projected straight from the
+     * plugin's own metadata - so a client reads an empty string as "no prompt declared" and renders no section
+     * at all. snake_case like every other multi-word key on this contract (`prompt_preview`,
+     * `plugin_diagnostics`); only the display subtree keeps camelCase.
+     */
+    system_prompt?: string;
     version?: string;
     /** Free-form categorisation for filtering and search; never behaviour-bearing. */
     tags?: string[];

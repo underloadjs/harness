@@ -2353,6 +2353,13 @@ export const createHarnessApi = ({
             name: metadata.name,
             title: metadata.title,
             ...(metadata.description === undefined ? {} : { description: metadata.description }),
+            // Declared-only, like `description`: a plugin that never prompts emits NO key, so
+            // every other row keeps the exact key set it had before this field existed
+            // (src/server/plugins-api.test.ts pins the shipped catalogue's key sets). This one
+            // DOES rename on the way out — `metadata.systemPrompt` (internal camelCase,
+            // ../types/index.ts) -> `system_prompt` (wire snake_case, ../server/harness.swagger.yaml
+            // `PluginSummary`) — the same mapping every other REST key here makes.
+            ...(metadata.systemPrompt === undefined ? {} : { system_prompt: metadata.systemPrompt }),
             ...(metadata.version === undefined ? {} : { version: metadata.version }),
             ...(tags === undefined || tags.length === 0 ? {} : { tags }),
             ...(hooks === undefined || hooks.length === 0 ? {} : { hooks }),

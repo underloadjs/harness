@@ -643,39 +643,52 @@ describe('context-compaction metadata', () => {
             ['mode', 'string', 'summarize', undefined, undefined]
         ]);
 
-        // Every knob has to explain itself to the operator who is about to type a number
-        // into it; a silent default is how a policy gets blamed for the wrong reason.
+        // The 2026-11-12 settings-pane cleanup: the panel is label + input only, so NO
+        // descriptor carries a help paragraph. src/frontend/main.ts:8967 renders the hint
+        // paragraph only when `description` is present, so absence is the whole contract —
+        // asserting it here means reintroducing a paragraph is a reviewed edit, not drift.
         for (const setting of metadata.settings ?? []) {
-            expect(typeof setting.description).toBe('string');
-            expect((setting.description ?? '').length).toBeGreaterThan(40);
+            expect(setting.description).toBeUndefined();
         }
 
-        const descriptionOf = (key: string): string =>
-            String((metadata.settings ?? []).find((setting) => setting.key === key)?.description);
+        // The plugin-level description is the only prose the panel shows, so it is pinned
+        // EXACTLY (not by substring): one sentence, what the plugin does, nothing else.
+        expect(metadata.description).toBe(
+            'Compacts the thread context when the conversation reaches a configured token threshold.'
+        );
 
-        // The three texts that carry a DECISION rather than a label.
-        expect(descriptionOf('minTokens')).toContain('prompt-cache');
-        expect(descriptionOf('safetyTurns')).toContain('END of the conversation');
-        expect(descriptionOf('safetyTurns')).toContain('never the per-run turn counter');
-        expect(descriptionOf('mode')).toContain('"annotate"');
-        expect(descriptionOf('mode')).toContain('behaves as "exclude"');
+        // 2026-11-12: the panel also shows the PROMPT, read-only. `metadata.systemPrompt`
+        // DUPLICATES `COMPACTION_INSTRUCTION` because `metadata` is a plain object literal and
+        // the constant is declared after it (temporal dead zone) — not because the manifest
+        // scanner forbids a computed value. THIS is the pin that keeps the two copies from
+        // drifting silently: identity against the constant the plugin actually commits into
+        // the transcript, byte for byte, marker and em dashes and newlines included. (The
+        // constant's own wording is pinned by the marker/`Do not call tools` assertions at the
+        // bottom of this file, so this one assertion is the whole drift guard for the copy in
+        // `metadata`.)
+        expect(metadata.systemPrompt).toBe(COMPACTION_INSTRUCTION);
 
-        // T9: the floor's text now has to explain that the SAME number means a different
-        // thing in the new mode, or an operator with a small per-model limit sets a floor
-        // that quietly refuses every summarize pass.
-        expect(descriptionOf('minTokens')).toContain('summarize');
-        expect(descriptionOf('mode')).toContain('summarize');
+        // The contract's cap, pinned in-repo: `PluginSummary.system_prompt` declares
+        // `maxLength: 2000` (src/server/harness.swagger.yaml), and nothing enforces that at
+        // runtime — src/server/api.ts `pluginRowOf` spreads the declared value out as-is — so
+        // the budget is asserted here instead. The identity above covers both copies with this
+        // one check. The shipped prompt is 715 characters, so an operator-visible reword still
+        // has room; a text that crossed 2000 would otherwise ship a row the spec calls invalid.
+        expect(COMPACTION_INSTRUCTION.length).toBeLessThanOrEqual(2000);
 
-        // The texts that tell an operator WHERE the firing point actually is. The limit's
-        // own description has to state that it IS the firing point with no headroom beside
-        // it (the opposite disclaimer the removed gap scheme needed), and the map has to
-        // state that a bad value is IGNORED (an operator who fears breaking compaction never
-        // types the per-model fact they need).
-        expect(descriptionOf('contextLimit')).toContain('The firing point');
-        expect(descriptionOf('contextLimit')).toContain('no separate headroom');
-        expect(descriptionOf('modelLimits')).toContain('"window"');
-        expect(descriptionOf('modelLimits')).toContain('ignored');
-        expect(String(metadata.description)).toContain('The limit is the firing point');
+        // The DECISIONS the deleted per-setting prose used to carry are still pinned, just
+        // as behaviour rather than as wording, so dropping the text pins cost no coverage.
+        // They are named by TEST, not by line number, because lines move every time this file
+        // grows and a stale number misroutes the next reader:
+        //   - "the limit IS the firing point, no headroom"  -> the trigger table below,
+        //     `fires exactly at the global ceiling — the limit IS the firing point`
+        //   - "a malformed modelLimits value is IGNORED"    -> `ignores malformed modelLimits
+        //     JSON instead of throwing`
+        //   - "annotate behaves as exclude"                 -> `degrades an unimplemented mode
+        //     to exclude and reports both`, which pins the diagnostic SUBSTRING
+        //     `mode exclude, setting mode annotate` (`toContain`) and the data pair
+        //     `{ mode: 'exclude', requestedMode: 'annotate' }` (`toMatchObject`) — the clause
+        //     and the fields, not the whole rendered message.
 
         // `mode` enumerates ONLY what this build implements, so the UI cannot offer a value
         // that does nothing. T9 added the second writer, and the order is the UI's: the

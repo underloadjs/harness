@@ -9020,6 +9020,27 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
     hooksSection.append(hookList);
     body.append(hooksSection);
 
+    // The system prompt this plugin sends, read-only (2026-11-12: the operator designed the
+    // panel and asked to SEE the prompt, not guess it). Conditional on the row carrying a
+    // NON-EMPTY field — `PluginSummary.system_prompt` is optional, and only a plugin that
+    // prompts declares one — so EVERY other plugin's panel keeps the sections it had before,
+    // in the same order (plugins-tab.test.ts pins `['Hooks','Settings']` for a row without it,
+    // on both the synthetic row and the shipped `async-ping`). Empty counts as absent: the
+    // contract declares `minLength: 1` (../server/harness.swagger.yaml), so `''` is "no prompt
+    // declared", and a bare presence check would paint this heading over an empty <p>.
+    // A `<p>`, deliberately not a `<pre>`: ui/dialog.css `.dialog-body pre` (specificity
+    // 0,1,1) forces `white-space: pre` and would clip this 715-character prose to one
+    // un-wrapped line; `.plugin-detail-prompt` (styles.css) carries the wrapping and the
+    // scroll frame, mirroring `.agent-instruction`. Text, never markup — the same data-only
+    // rule the setting hint above follows.
+    if (plugin.system_prompt !== undefined && plugin.system_prompt !== '') {
+        const promptSection = el('div', 'plugin-detail-prompt-section');
+
+        promptSection.append(el('h3', 'plugin-detail-section-title', 'System prompt'));
+        promptSection.append(el('p', 'plugin-detail-prompt', plugin.system_prompt));
+        body.append(promptSection);
+    }
+
     // --- settings -----------------------------------------------------------------
     const settingsSection = el('div', 'plugin-detail-settings');
     settingsSection.append(el('h3', 'plugin-detail-section-title', 'Settings'));
