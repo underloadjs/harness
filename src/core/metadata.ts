@@ -72,13 +72,24 @@ export type { CoreToolMetadata, ToolMetadata } from './tool-metadata';
 // Shared agent-inspection bounds (leaf values, no imports). The runtime entries
 // inline the same numbers because they may not value-import this file; the
 // ownership test pins the equality.
+//
+// The three model-settable run bounds below join that list for the same reason: the
+// canonical number lives in ./agent-limits, the ENTRY restates it as a literal, and
+// this module is where a consumer (the server catalogue, and the ownership test that
+// pins the equality) reads the canonical value. `MODEL_TIMEOUT_MAX_MS` is the ceiling
+// BOTH `delegate` and `threadFork` inline as `3600000`; `FORK_TIMEOUT_MS` is the fork
+// half of "the default is no limit"; `DELEGATE_MAX_TURNS_MAX` is the `maxTurns`
+// ceiling the delegate entry inlines as `64`.
 export {
     AGENT_MANAGE_LIST_PER_AGENT,
     AGENT_MANAGE_PREVIEW_CHARS,
     AGENT_RESULT_PAGE_CHARS,
     AGENT_RESULT_PAGE_MAX_CHARS,
     AGENT_RESULT_RETENTION,
-    DELEGATE_TIMEOUT_MS
+    DELEGATE_MAX_TURNS_MAX,
+    DELEGATE_TIMEOUT_MS,
+    FORK_TIMEOUT_MS,
+    MODEL_TIMEOUT_MAX_MS
 } from './agent-limits';
 
 // Look one generated row up by wire name. Throws for an unknown name so a typo
@@ -181,6 +192,13 @@ export const THREAD_FORK_METADATA = coreMetadataOf(THREAD_FORK_NAME);
 export const THREAD_SEND_METADATA = coreMetadataOf(THREAD_SEND_NAME);
 export const THREAD_READ_METADATA = coreMetadataOf(THREAD_READ_NAME);
 export const THREAD_LIST_METADATA = coreMetadataOf(THREAD_LIST_NAME);
+// `threadDelete` (issue 0027) is deliberately NOT projected yet, and that is a load-
+// time fact rather than a style choice: `coreMetadataOf`/`descriptorOf` THROW for a
+// name the committed `./tool-manifest` does not carry. Adding its two rows here before
+// `yarn vite-node scripts/generate-tool-manifest.ts` re-ran would make this module —
+// and every importer of `core/index` — throw on import. The manifest-refresh step adds
+// `THREAD_DELETE_NAME` / `THREAD_DELETE_METADATA` in the same commit that regenerates
+// the table, next to the four rows above.
 
 // ---------------------------------------------------------------------------
 // Delegation: the ONE set-projection function in this module.
@@ -199,10 +217,16 @@ export const THREAD_LIST_METADATA = coreMetadataOf(THREAD_LIST_NAME);
 //
 // T28: the allowlist form is derived from the BASELINE SCHEMA, not re-typed. The
 // previous version restated `properties` by hand, so every new delegate argument
-// (`maxChars`, `requireClarification`, `timeoutMs`) had to be added twice and the
-// projection silently advertised a smaller surface than the entry it claimed to
-// mirror. Only `agent` is replaced (its enum IS the allowlist); every other property
-// is copied from the entry's own literal.
+// (`maxChars`, `requireClarification`, `timeoutMs`, `maxTurns`) had to be added twice
+// and the projection silently advertised a smaller surface than the entry it claimed
+// to mirror. Only `agent` is replaced (its enum IS the allowlist); every other
+// property is copied from the entry's own literal.
+//
+// The DESCRIPTION below is the one hand-duplicated string in this module: it is the
+// entry's `agentDelegateMetadata` allowlist wording (../tools/runtime/delegate.tool.ts),
+// which this module may not import. Keep the two character-for-character equal — the
+// entry has the matching note, and core/metadata.ownership.test.ts compares the two
+// projections, so the equality is enforced rather than intended.
 export const agentDelegateMetadata = (
     subagents: readonly string[] = []
 ): CoreToolMetadata => {
@@ -219,7 +243,7 @@ export const agentDelegateMetadata = (
 
     return {
         name: baseline.name,
-        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset, invocationId, threadId, status, durationMs, and - for a run that did not complete - error, partialContent, and cancelledAtMessage. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset, or delegate again with a larger maxChars. A cancelled or failed child still returns its partialContent and cancelledAtMessage instead of an empty record, so you can see what it had produced and how far it got. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder.`,
+        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset, invocationId, threadId, status, durationMs, and - for a run that did not complete - error, partialContent, and cancelledAtMessage. threadId and invocationId are HANDLES, not bookkeeping: threadId is the conversation the child ran in, so post a follow-up message into it with threadSend and read its transcript with threadRead, while agentResult pages that answer by invocationId; a finished child thread stays addressable until it is released with threadDelete, which is also how a session frees a thread slot. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset, or delegate again with a larger maxChars. A cancelled or failed child still returns its partialContent and cancelledAtMessage instead of an empty record, so you can see what it had produced and how far it got. maxTurns caps the child's model turns (1-64) when you want a deliberately short run; omit it and the harness-wide limit applies. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder.`,
         tags: [...baseline.tags],
         visibility: 'core',
         parameters: {

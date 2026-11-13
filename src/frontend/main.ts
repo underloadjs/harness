@@ -3483,15 +3483,15 @@ const openEndpointDialog = (trigger: HTMLElement): void => {
 };
 
 // Second press closes instead of stacking (a dialog on top of the pill is a popup the
-// reader cannot dismiss with the same gesture that opened it). The `showingTools` guard
-// matches `headTitleButton`: while the tools catalogue owns the centre, the top-right
-// pill is still the APP status pill, and pressing it must not fight that view.
-//
-// T7 (R2): the Plugins view owns the centre in exactly the same way, so it is gated
-// here too — pressing the pill while the plugin catalogue is on screen does nothing
-// rather than opening the endpoint dialog over it.
+// reader cannot dismiss with the same gesture that opened it). The pill is APP-scoped, not
+// centre-scoped: it opens/toggles this dialog from EVERY centre view — the chat, the Tools
+// catalogue and the Plugins catalogue — because the layer is an overlay on `document.body`
+// (./ui/dialog.ts) laid over whichever pane is showing; the pane underneath is untouched.
+// The previous `showingTools || showingPlugins` guard suppressed the press inside both
+// catalogues, which is the reported bug. `headTitleButton` carries no such guard either:
+// that trigger has always worked in BOTH heads, and `openHarnessDetails` simply switches
+// its layer to the Sessions-only variant while a catalogue owns the centre.
 statusButton.addEventListener('click', () => {
-    if (showingTools || showingPlugins) return;
     if (endpointDialog !== undefined) {
         closeEndpointDialog();
         return;

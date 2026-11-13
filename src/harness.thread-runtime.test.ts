@@ -1245,6 +1245,12 @@ describe('host-parent delegation (R4)', () => {
         const toolMessage = writer
             .threadMessages(first.id)
             .find((message) => message.role === 'tool') as { content: string };
+        // THE ROSTER IS A FAMILY (2026-11-13, B3). From inside `first` the caller sees its
+        // own thread, its ancestors/descendants, and the DEFAULT conversations of the
+        // agents in that family — NOT a sibling host thread it did not create. `second`
+        // is exactly such a sibling, so it is absent here while the threadless host view
+        // below still lists it: the roster is the address book for threadSend/threadRead/
+        // threadDelete, and those refuse everything a scoped caller cannot see.
         expect(JSON.parse(toolMessage.content)).toEqual({
             currentThreadId: first.id,
             threads: [
@@ -1262,17 +1268,22 @@ describe('host-parent delegation (R4)', () => {
                     status: 'running',
                     sequence: 2,
                     invocationId: '1'
-                },
-                {
-                    id: second.id,
-                    agent: 'writer',
-                    origin: 'host',
-                    status: 'idle',
-                    sequence: 3,
-                    label: 'later'
                 }
             ]
         });
+
+        // A CALLER WITH NO THREAD IS UNSCOPED: the host (here, the manual executeTool with
+        // no thread) still gets every live conversation, including the sibling.
+        const scopedOutRoster = (await writer.executeTool('threadList', {})) as {
+            currentThreadId?: string;
+            threads: { id: string }[];
+        };
+        expect(scopedOutRoster.currentThreadId).toBeUndefined();
+        expect(scopedOutRoster.threads.map((record) => record.id)).toEqual([
+            'agent:writer',
+            first.id,
+            second.id
+        ]);
 
         // Deletion removes the record, the roster entry, and the result lookup.
         writer.deleteThread(second.id);
@@ -1335,20 +1346,25 @@ describe('cross-thread chat and delegation links (R4)', () => {
         // createThread registers the conditional core tool, so the very next
         // request declares it.
         const alpha = writer.createThread('writer');
-        const beta = writer.createThread('writer');
+        // LINEAGE (2026-11-13): alpha may only write into its own lineage, so beta is
+        // created as alpha's child rather than as its sibling. A sibling send is a
+        // refusal, and that case has its own test below; this test is about the
+        // runtime-derived SENDER on a delivery that is allowed.
+        const beta = writer.createThread('writer', { ownerThreadId: alpha.id });
 
         const result = await writer.sendThreadInput(alpha.id, 'talk to beta');
         expect(result.content).toBe('alpha sent');
         // R9-R11: the demoted runtime rows are searchable, so the declared set is
-        // the bootstrap pair plus the three thread controls this harness just
-        // registered (roster first, then the transcript reader, then the sender —
-        // descending `order` inside the 'threads' activation group).
+        // the bootstrap pair plus the four thread controls this harness just
+        // registered (roster first, then the transcript reader, then the sender, then
+        // the deleter — descending `order` inside the 'threads' activation group).
         expect(seen[0]!.tools?.map((tool) => tool.name)).toEqual([
             'toolRequest',
             'tasks',
             'threadList',
             'threadRead',
-            'threadSend'
+            'threadSend',
+            'threadDelete'
         ]);
 
         // The tool result reports the delivery and the REAL sender: a dormant target
@@ -2265,7 +2281,9 @@ describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
 
         const writer = harness({ agents: { writer: brain(stream) }, presets: false });
         const alpha = writer.createThread('writer');
-        const beta = writer.createThread('writer');
+        // LINEAGE (2026-11-13): beta is alpha's CHILD, not its sibling, so alpha's model
+        // may steer it (a sibling send is refused — pinned in its own test below).
+        const beta = writer.createThread('writer', { ownerThreadId: alpha.id });
 
         const running = writer.sendThreadInput(beta.id, 'count to 120');
         await flush();

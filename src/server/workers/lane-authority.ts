@@ -125,6 +125,11 @@ export type LaneRuntimeCall =
     | { op: 'runtime'; method: 'agentResult'; parameters: Record<string, unknown>; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'threadSend'; threadId?: string; parameters: Record<string, unknown>; identity: LaneCallIdentity }
     | { op: 'runtime'; method: 'threadList'; identity: LaneCallIdentity }
+    // B5 (2026-11-13): the routed delete. `threadId` is the TARGET; the CALLER whose
+    // descendants scope the delete is `identity.threadId` (the same carrier `threadList`
+    // uses for its reader), so the model cannot name a caller and the authority answers
+    // with the cascade the canonical harness actually removed.
+    | { op: 'runtime'; method: 'threadDelete'; threadId: string; identity: LaneCallIdentity }
     // T10 finding S1: a cross-thread READ. The lane replica cannot answer it truthfully -
     // its roster and transcripts are a hello snapshot plus its own work - so the canonical
     // harness resolves the identity and returns the transcript. The pure paging/filtering
@@ -735,6 +740,11 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         return { value: runtime.threadSend(callerFor(request.identity) as never, request.threadId, request.parameters) };
                     case 'threadList':
                         return { value: runtime.threadList(request.identity.threadId) };
+                    // B5 (2026-11-13): the caller is the lane's own conversation
+                    // (`identity.threadId`), never a model argument, so the descendant scope
+                    // the authority enforces is the scope the lane really stands in.
+                    case 'threadDelete':
+                        return { value: runtime.threadDelete(request.identity.threadId, request.threadId) };
                     default:
                         throw new Error(`Unknown routed runtime method: ${JSON.stringify((request as { method?: string }).method)}.`);
                 }

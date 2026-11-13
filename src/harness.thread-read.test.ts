@@ -17,6 +17,13 @@
 //       cap is never what truncates a page â€” the tool's own budget reports the cut.
 //   R4  An unknown or deleted thread id and a malformed pattern come back as honest
 //       errors, and a manual host call has no thread to default to.
+//   R5  The DEFAULT page is the cheap one, and every part of that is visible through
+//       the real tool and the real schema: no system seed (`includeSystem`, opt-in),
+//       tool calls as { id, name, argumentsLength } REFERENCES rather than quoted
+//       payloads (`toolArgs: "full"` opts in), and a `matchedFields` report on every
+//       regex hit — including a hit in a field the page does not display, which is how
+//       a model can tell a real finding from its own tool-call arguments echoing the
+//       pattern back at it.
 //
 // Clock policy: no fake timers; every transport is scripted, so every assertion is
 // an exact value.
@@ -231,17 +238,20 @@ describe('threadRead through a model tool call (R2)', () => {
             },
             // [user seed, assistant seed, user turn, assistant tool-call turn]. The
             // assistant turn carrying this very call is already committed, so the
-            // tool sees itself in the transcript it reads — and its `arguments`
-            // contains the pattern, so that message matches the filter too.
+            // tool sees itself in the transcript it reads — and its raw `arguments`
+            // contains the pattern, so that message matches the filter too. `matchedFields`
+            // is what makes that SELF-MATCH readable: the row shows no arguments text
+            // at all (reference mode is the default), and the hit list says plainly that
+            // the match lives in `toolArguments`, not in anything the model can see.
             total: 4,
             matched: 2,
             offset: 0,
             limit: 20,
             hasMore: false,
             contentBudget: 32768,
-            // 10 characters of the seed message, plus the 22-character raw arguments
-            // string of the threadRead call itself.
-            bytes: 32,
+            // 10 characters of the seed message. The 22-character raw arguments string of
+            // the threadRead call itself is SEARCHED but not returned, so it costs nothing.
+            bytes: 10,
             truncated: false,
             messages: [
                 {
@@ -250,7 +260,8 @@ describe('threadRead through a model tool call (R2)', () => {
                     content: 'start here',
                     contentLength: 10,
                     contentOffset: 0,
-                    contentHasMore: false
+                    contentHasMore: false,
+                    matchedFields: ['content']
                 },
                 {
                     index: 3,
@@ -263,9 +274,10 @@ describe('threadRead through a model tool call (R2)', () => {
                         {
                             id: 'c1',
                             name: 'threadRead',
-                            arguments: '{"regex":"start here"}'
+                            argumentsLength: 22
                         }
-                    ]
+                    ],
+                    matchedFields: ['toolArguments']
                 }
             ]
         });
@@ -347,25 +359,20 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
                 sequence: target.sequence,
                 label: 'Notes'
             },
+            // `total` still counts all four committed messages, but the system seed is
+            // off by default, so the PAGE starts at index 1 and `matched` is 3. Index
+            // numbering is untouched: index 2 is the assistant turn either way.
             total: 4,
-            matched: 4,
+            matched: 3,
             offset: 0,
             limit: 20,
             hasMore: false,
             contentBudget: 32768,
-            // 15 + 30 + 22 + 20 content characters plus the 20-character tool-call
-            // arguments string. Reasoning is opt-in, so it costs nothing here.
-            bytes: 107,
+            // 30 + 22 + 20 content characters. The seed costs nothing (not returned)
+            // and the tool-call arguments cost nothing (reference mode quotes no text).
+            bytes: 72,
             truncated: false,
             messages: [
-                {
-                    index: 0,
-                    role: 'system',
-                    content: 'You keep notes.',
-                    contentLength: 15,
-                    contentOffset: 0,
-                    contentHasMore: false
-                },
                 {
                     index: 1,
                     role: 'user',
@@ -382,7 +389,8 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
                     contentLength: 22,
                     contentOffset: 0,
                     contentHasMore: false,
-                    toolCalls: [{ id: 't1', name: 'read', arguments: '{"path":"report.md"}' }]
+                    // A reference, not a quotation: the payload is named by length.
+                    toolCalls: [{ id: 't1', name: 'read', argumentsLength: 20 }]
                 },
                 {
                     index: 3,
@@ -397,10 +405,42 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
             ]
         });
 
-        // 15 + 30 + 22 + 20 content characters + 20 characters of tool-call
-        // arguments = 107. `bytes` counts UTF-8 BYTES of the text the page returns,
-        // which is the same unit the harness 64 KiB result cap measures.
-        expect(page.bytes).toBe(107);
+        // 30 + 22 + 20 content characters = 72. `bytes` counts UTF-8 BYTES of the text
+        // the page returns, which is the same unit the harness 64 KiB result cap measures.
+        expect(page.bytes).toBe(72);
+
+        // The opt-in is a schema-accepted parameter, and it restores exactly what the
+        // default withholds: index 0 on the page, `matched` 4, and the seed's own 15
+        // bytes charged to the page (72 + 15).
+        const seeded = pageOf(
+            await writer.executeTool('threadRead', { thread: target.id, includeSystem: true })
+        );
+
+        expect({
+            total: seeded.total,
+            matched: seeded.matched,
+            bytes: seeded.bytes,
+            indices: seeded.messages.map((message) => message.index)
+        }).toEqual({ total: 4, matched: 4, bytes: 87, indices: [0, 1, 2, 3] });
+        expect(seeded.messages[0]).toEqual({
+            index: 0,
+            role: 'system',
+            content: 'You keep notes.',
+            contentLength: 15,
+            contentOffset: 0,
+            contentHasMore: false
+        });
+
+        // `toolArgs: "full"` is the other half of the same contract: the payload comes
+        // back quoted, and the page pays 20 bytes for it.
+        const quoted = pageOf(
+            await writer.executeTool('threadRead', { thread: target.id, toolArgs: 'full' })
+        );
+
+        expect(quoted.messages[1].toolCalls).toEqual([
+            { id: 't1', name: 'read', arguments: '{"path":"report.md"}' }
+        ]);
+        expect(quoted.bytes).toBe(92);
     });
 
     it('reports attachment descriptors and never the base64 payload', async () => {
@@ -460,10 +500,68 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
                     contentOffset: 0,
                     contentHasMore: false,
                     name: 'read',
-                    toolCallId: 't1'
+                    toolCallId: 't1',
+                    // The report of WHY this row is on the page: the other hit (index 2)
+                    // came from reasoning this page never shows, and this one came from
+                    // the visible content.
+                    matchedFields: ['content']
                 }
             ]
         });
+
+        // `regexFields` narrows the SEARCH, and the harness schema accepts the array.
+        // 'list is the answer' exists ONLY in index 2's reasoning, which the page never
+        // displays (`includeReasoning` is false) — so the default search finds it and
+        // says where, while a content-only search finds nothing at all.
+        const hidden = pageOf(
+            await writer.executeTool('threadRead', { thread: target.id, regex: 'list is the answer' })
+        );
+
+        expect({
+            total: hidden.total,
+            matched: hidden.matched,
+            bytes: hidden.bytes,
+            messages: hidden.messages
+        }).toEqual({
+            total: 4,
+            matched: 1,
+            bytes: 22,
+            messages: [
+                {
+                    index: 2,
+                    role: 'assistant',
+                    content: 'Two TODO items remain.',
+                    contentLength: 22,
+                    contentOffset: 0,
+                    contentHasMore: false,
+                    toolCalls: [{ id: 't1', name: 'read', argumentsLength: 20 }],
+                    matchedFields: ['reasoning']
+                }
+            ]
+        });
+        // The page carries no reasoning of its own, and never claimed to: the hit report
+        // is what connects the row to the pattern.
+        expect('reasoning' in hidden.messages[0]).toBe(false);
+
+        const contentOnly = pageOf(
+            await writer.executeTool('threadRead', {
+                thread: target.id,
+                regex: 'list is the answer',
+                regexFields: ['content']
+            })
+        );
+
+        expect({
+            total: contentOnly.total,
+            matched: contentOnly.matched,
+            bytes: contentOnly.bytes,
+            messages: contentOnly.messages
+        }).toEqual({ total: 4, matched: 0, bytes: 0, messages: [] });
+
+        // An invented field name dies in schema validation, before the tool runs.
+        await expect(
+            writer.executeTool('threadRead', { thread: target.id, regex: 'TODO', regexFields: ['thoughts'] })
+        ).rejects.toThrow(/regexFields/);
 
         // A role filter is a whole-message cut, applied before the regex.
         const users = pageOf(
@@ -498,11 +596,27 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
                     contentLength: 22,
                     contentOffset: 0,
                     contentHasMore: false,
-                    toolCalls: [{ id: 't1', name: 'read', arguments: '{"path":"report.md"}' }],
+                    // Even a single-message read shows a reference by default; the
+                    // caller asks for the payload explicitly with `toolArgs: "full"`.
+                    toolCalls: [{ id: 't1', name: 'read', argumentsLength: 20 }],
                     reasoning: 'The TODO list is the answer.'
                 }
             ]
         });
+
+        // ... and the payload itself is one parameter away, untruncated at the default
+        // `contentLimit`, so a follow-up read costs one call and no paging.
+        const quoted = pageOf(
+            await writer.executeTool('threadRead', {
+                thread: target.id,
+                message: 2,
+                toolArgs: 'full'
+            })
+        );
+
+        expect(quoted.messages[0].toolCalls).toEqual([
+            { id: 't1', name: 'read', arguments: '{"path":"report.md"}' }
+        ]);
     });
 
     it('pages one long message without splitting a surrogate pair and stays under the result cap', async () => {
@@ -583,12 +697,21 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
                 sequence: 1
             },
             total: 2,
-            matched: 2,
-            indices: [
-                [0, 'system'],
-                [1, 'user']
-            ]
+            // The agent default conversation opens with its system instructions, and
+            // those are off by default now: `total` still reports both messages, the
+            // page starts at the user turn. `includeSystem: true` puts the seed back.
+            matched: 1,
+            indices: [[1, 'user']]
         });
+
+        expect(
+            pageOf(
+                await writer.executeTool('threadRead', { thread: 'agent:lead', includeSystem: true })
+            ).messages.map((message) => [message.index, message.role])
+        ).toEqual([
+            [0, 'system'],
+            [1, 'user']
+        ]);
     });
 
     it('rejects an unknown thread and a deleted thread alike', async () => {
@@ -622,7 +745,8 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
         );
 
         // The same call WITH an id works, which is what makes the error actionable.
-        expect(pageOf(await writer.executeTool('threadRead', { thread: target.id })).matched).toBe(4);
+        // `matched` is 3, not 4: the seed is filtered out of the candidate list.
+        expect(pageOf(await writer.executeTool('threadRead', { thread: target.id })).matched).toBe(3);
     });
 
     it('rejects arguments outside the schema before the tool runs', async () => {

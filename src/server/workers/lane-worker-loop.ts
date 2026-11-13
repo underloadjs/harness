@@ -399,6 +399,17 @@ export const installAuthorityRuntime = (replica: Harness): void => {
         identity: identityOf(caller, { threadId: threadId as string | undefined })
     }));
     route('threadList', (threadId) => ({ identity: identityOf(undefined, { threadId: threadId as string | undefined }) }));
+    // B5 (2026-11-13): `threadDelete(callerThreadId, threadId)`. The TARGET travels as the
+    // request's `threadId` (the thing to remove) and the CALLER travels inside `identity`,
+    // exactly like `threadList` carries its reader — the authority scopes the delete to that
+    // caller's own descendants, so a lane cannot release a sibling subtree through a replica
+    // copy. The receipt (`deleted`, `removedThreadIds`) comes back from the canonical
+    // harness, and `applySync` in the route helper rebases this lane's mirror of every
+    // conversation the cascade removed.
+    route('threadDelete', (callerThreadId, threadId) => ({
+        threadId: threadId as string,
+        identity: identityOf(undefined, { threadId: callerThreadId as string | undefined })
+    }));
     route('agentResult', (parameters) => ({ parameters, identity: identityOf(undefined) }));
     route('agentManage', () => ({ identity: identityOf(undefined) }));
     route('listTools', () => ({ identity: identityOf(undefined) }));

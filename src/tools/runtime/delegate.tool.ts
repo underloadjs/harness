@@ -49,6 +49,21 @@
 //     canonical constants, which is the fix for that duplication.
 // The schema `maximum` bounds a MODEL argument only; `runtime.delegate` (the host
 // path) is not schema-validated and may pass any finite bound.
+//
+// TURNS POLICY (2026-11-13, finding C1 + the `maxTurns` addition)
+// ---------------------------------------------------------------
+// `maxTurns` is a second OPTIONAL, caller-set bound next to `timeoutMs`: a count of
+// model turns (tool rounds) instead of a wall clock. Omitting it is the default and
+// means "the harness-wide limit" (`maxIterations`, itself unarmed unless a host
+// names one), so this argument can only LOWER what one child may do. Its ceiling
+// equals `DELEGATE_MAX_TURNS_MAX` in core/agent-limits.ts, restated here as the
+// literal `64` for the same zero-captured-dependency reason as the timeout ceiling
+// (which equals `MODEL_TIMEOUT_MAX_MS`), and the pin step asserts the equality.
+//
+// The other half of C1 is pure prose: the envelope has always carried `threadId`,
+// and it is the HANDLE for follow-up work (threadSend / threadRead on the child
+// conversation, threadDelete to release it). Nothing in the schema says so, so both
+// description forms below do — a model only ever reads the description.
 import type { CoreToolMetadata } from '../../core';
 import type { ToolContext } from '../../types';
 
@@ -67,7 +82,7 @@ export const AGENT_DELEGATE_NAME = 'delegate';
 export const metadata = {
     name: AGENT_DELEGATE_NAME,
     description:
-        'Delegate a self-contained task to a configured subagent and return its answer. Only the primary agent can delegate, subagents cannot delegate further, and a harness registers this tool only when it has subagents - a session whose harness has none answers 404.',
+        'Delegate a self-contained task to a configured subagent and return its answer. Only the primary agent can delegate, subagents cannot delegate further, and a harness registers this tool only when it has subagents - a session whose harness has none answers 404. The envelope names two HANDLES: `threadId` is the conversation the child ran in, so a follow-up goes through threadSend (another message into it) or threadRead (its transcript), and `invocationId` is what agentResult pages by; a finished child stays addressable until it is released with threadDelete. `maxChars` pages the answer, `timeoutMs` optionally bounds the child\'s wall clock (omit it for no limit), and `maxTurns` optionally caps its model turns at 1-64 (omit it for the harness-wide limit).',
     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
     visibility: 'core',
     parameters: {
@@ -96,6 +111,19 @@ export const metadata = {
                 maximum: 3600000,
                 description:
                     'Optional wall-clock bound for the child run, in integer milliseconds (1-3600000). OMIT IT FOR NO TIME LIMIT, which is the default: the child runs until it gives its own final answer, and nothing external ends it on a clock. Set a value only when you believe a limit is warranted; the 1-3600000 range bounds what you may ask for, never the absence of a bound. On expiry the child is stopped and the result reports status "cancelled" with its partialContent and cancelledAtMessage, exactly as for any other unfinished child. A child that is still running is abandoned with toolCancel using the callId from its pending placeholder. The tools the child calls carry their own time bounds, which is what keeps an unbounded child from hanging on I/O.'
+            },
+            // A COUNT bound next to the clock bound: 1-64 model turns (tool rounds).
+            // Omitted means the harness-wide `maxIterations` limit, which a host owns
+            // and a model cannot raise. Hitting the cap means the child never
+            // answered, so the result is the unfinished-run envelope (status
+            // "failed"/"cancelled" with partialContent), never a truncated answer
+            // presented as one.
+            maxTurns: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 64,
+                description:
+                    'Optional cap on how many model turns (tool rounds) the child run may take, 1-64. OMIT IT to use the harness-wide limit for this session, which is what normally applies; set it to keep a quick lookup cheap or to bound a long research run. A child that runs out of turns has not answered, so its result is reported like any other unfinished run - its status plus the partialContent it had produced - instead of a final answer it never gave.'
             },
             scope: {
                 type: 'object',
@@ -161,7 +189,12 @@ export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreTo
 
     return {
         name: AGENT_DELEGATE_NAME,
-        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset, invocationId, threadId, status, durationMs, and - for a run that did not complete - error, partialContent, and cancelledAtMessage. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset, or delegate again with a larger maxChars. A cancelled or failed child still returns its partialContent and cancelledAtMessage instead of an empty record, so you can see what it had produced and how far it got. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder.`,
+        // The allowlist wording is DUPLICATED verbatim in core/metadata.ts
+        // `agentDelegateMetadata` (the manifest-backed projection the server
+        // catalogue reads), because the two modules may not import each other. Keep
+        // the two in step when this changes — core/metadata.ownership.test.ts
+        // compares the two projections for equality.
+        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset, invocationId, threadId, status, durationMs, and - for a run that did not complete - error, partialContent, and cancelledAtMessage. threadId and invocationId are HANDLES, not bookkeeping: threadId is the conversation the child ran in, so post a follow-up message into it with threadSend and read its transcript with threadRead, while agentResult pages that answer by invocationId; a finished child thread stays addressable until it is released with threadDelete, which is also how a session frees a thread slot. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset, or delegate again with a larger maxChars. A cancelled or failed child still returns its partialContent and cancelledAtMessage instead of an empty record, so you can see what it had produced and how far it got. maxTurns caps the child's model turns (1-64) when you want a deliberately short run; omit it and the harness-wide limit applies. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder.`,
         tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
         visibility: 'core',
         parameters: {
@@ -195,6 +228,7 @@ export const execute = (context: ToolContext) => {
             maxChars?: number;
             requireClarification?: boolean;
             timeoutMs?: number;
+            maxTurns?: number;
             scope?: { tools?: readonly string[] };
         },
         context.run,

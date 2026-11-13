@@ -41,8 +41,11 @@
 //     RE-BASED on what is saved — a dismissed edit is gone and an applied one is not, and
 //     neither case rebuilds a field or loses a listener;
 //   - dismissal: Escape, the × button and a backdrop click all close it and hand focus
-//     back to the pill; a second press toggles instead of stacking; the pill is inert
-//     while the tools view owns the centre (the same guard style as the harness title);
+//     back to the pill; a second press toggles instead of stacking; and the pill keeps
+//     toggling while the Tools or Plugins catalogue owns the centre — the layer is a
+//     `document.body` overlay that covers whichever pane is on screen (./main.ts). `Apply`
+//     is therefore reachable over a catalogue, and it must leave the catalogue and its head
+//     exactly where they were (./main.ts `renderHarnessChrome` returns early there);
 //   - the status live region still updates IN PLACE (same node, inside the wrapper) while
 //     the dialog is open, and the settings still open from a non-idle state;
 //   - the rail: no endpoint markup at all, and the left panel host is the rail's last
@@ -1007,7 +1010,11 @@ it('closes on Escape, on the × button and on the backdrop, returning focus to t
     expect(document.activeElement).toBe(button);
 });
 
-it('stays out of the way while the tools view owns the centre', async () => {
+// R1: the pill is APP-scoped, not centre-scoped. While the tools catalogue owns the
+// centre column the press still opens the endpoint dialog — the layer is an overlay on
+// `document.body` (./ui/dialog.ts) that covers the pane — and a second press closes it
+// again without leaving the catalogue.
+it('opens over the tools catalogue and toggles closed on a second press', async () => {
     stub();
     await boot();
 
@@ -1015,13 +1022,104 @@ it('stays out of the way while the tools view owns the centre', async () => {
     expect(byClass('.tools-toggle', 'button').getAttribute('aria-pressed')).toBe('true');
 
     openSettings();
-    expect(document.querySelector('.dialog')).toBeNull();
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Endpoint & model');
+    // The catalogue is still the centre view underneath the dialog: the press added a
+    // body-level layer, it did not switch views.
+    expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
 
+    openSettings();
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
+    expect(byClass('.tools-toggle', 'button').getAttribute('aria-pressed')).toBe('true');
+
+    // Back in the chat the trigger behaves exactly as it always did.
     byClass('.tools-toggle', 'button').click();
     expect(byClass('.tools-toggle', 'button').getAttribute('aria-pressed')).toBe('false');
 
     openSettings();
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Endpoint & model');
+});
+
+// R2: the Plugins view owns the centre in exactly the same way, so it must not swallow the
+// press either. The catalogue is read on FIRST open (`./main.ts` `setPluginsView` →
+// `loadPlugins`), so this fixture answers `/api/plugins` with the empty page in the
+// `PluginSummaryPage` wire shape (../shared/harness-api.ts) — an unmapped route throws and
+// the pane would carry an error card instead of the catalogue.
+it('opens over the plugins catalogue and toggles closed on a second press', async () => {
+    const calls = stub((url) =>
+        url.startsWith('/api/plugins')
+            ? json({ items: [], limit: 25, next_cursor: null, observed_at: 1, revision: 1 })
+            : undefined
+    );
+    const pluginReads = (): number =>
+        calls.filter((call) => call.url.startsWith('/api/plugins')).length;
+
+    await boot();
+
+    // R2 from the other side of the same rule: the page is NOT paid for at boot.
+    expect(pluginReads()).toBe(0);
+
+    byClass('.plugins-toggle', 'button').click();
+    expect(byClass('.plugins-toggle', 'button').getAttribute('aria-pressed')).toBe('true');
+    await flush();
+
+    // Exactly one read, and it was ANSWERED (no `.plugins-error` card in the pane).
+    expect(pluginReads()).toBe(1);
+
+    openSettings();
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Endpoint & model');
+    expect(byClass('.stage', 'div').querySelector('.plugins-pane')).not.toBeNull();
+    expect(document.querySelector('.plugins-error')).toBeNull();
+
+    openSettings();
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
+    expect(byClass('.plugins-toggle', 'button').getAttribute('aria-pressed')).toBe('true');
+
+    byClass('.plugins-toggle', 'button').click();
+    expect(byClass('.plugins-toggle', 'button').getAttribute('aria-pressed')).toBe('false');
+
+    openSettings();
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Endpoint & model');
+});
+
+// R3: because the pill now opens over a catalogue, `Apply` is reachable WHILE the Tools
+// catalogue owns the centre — a path that did not exist while the guard suppressed the
+// press. Applying there is still a plain save (the harness server URL field is untouched,
+// so no reload): the layer closes, and the repaint it triggers must NOT reclaim the head.
+// `renderHarnessChrome` returns early while `showingTools`/`showingPlugins` is set
+// (./main.ts), so `paintToolsHead`'s title survives and the catalogue stays the centre
+// view — the reader is left exactly where they were, with the settings committed.
+it('applies from the pill over the tools catalogue without reclaiming the catalogue head', async () => {
+    stub();
+    await boot();
+
+    byClass('.tools-toggle', 'button').click();
+    expect(byClass('.tools-toggle', 'button').getAttribute('aria-pressed')).toBe('true');
+    expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
+    // The head the catalogue paints (./main.ts `paintToolsHead` writes the title text node
+    // inside the `h1.main-title` button, the same shared head the chat title uses).
+    expect(byClass('.main-title', 'h1').textContent).toBe('Tools Catalogue');
+
+    openSettings();
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Endpoint & model');
+
+    const navigation = stubNavigation();
+    applyButton().click();
+
+    // The layer is gone — both the panel and its backdrop, so nothing shadows the toggles.
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
+
+    // The catalogue still owns the centre column: the save never switched views.
+    expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
+    // And the chat head was NOT resurrected over it: the shared head still carries the
+    // catalogue title `paintToolsHead` painted, not the selected harness's display title.
+    expect(byClass('.main-title', 'h1').textContent).toBe('Tools Catalogue');
+    expect(byClass('.tools-toggle', 'button').getAttribute('aria-pressed')).toBe('true');
+
+    // No reload: the root did not move, so Apply is a save, not a reconnect.
+    expect(navigation.reloads()).toBe(0);
 });
 
 // --- the live region keeps working while the dialog is open -------------------

@@ -223,7 +223,14 @@ export const AUTHORITY_RUNTIME_METHODS = {
     agentManage: 'agentManage',
     agentResult: 'agentResult',
     threadSend: 'threadSend',
-    threadList: 'threadList'
+    threadList: 'threadList',
+    // B5 (2026-11-13): the model-facing release of one finished conversation. It moves
+    // canonical state (the record, its transcript, its invocation and branch lookups, and
+    // the host-thread slot the cap counts), so the AUTHORITY performs it; the caller's
+    // thread travels in the request's `identity` because the delete is scoped to that
+    // caller's own descendants. An unclassified key here would throw at hello in
+    // ./lane-worker-loop.ts rather than delete on a private copy.
+    threadDelete: 'threadDelete'
 } as const satisfies Record<string, string>;
 
 export type AuthorityRuntimeMethod = keyof typeof AUTHORITY_RUNTIME_METHODS;

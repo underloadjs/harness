@@ -1190,6 +1190,18 @@ export type HarnessMemory = {
 // kernel/harness state operations (discovery, guarded creation, per-session record
 // stores), not a restricted capability facade: every tool still receives the
 // unrestricted `context.harness` reference above.
+// What one `threadDelete` released (B5, 2026-11-13).
+//
+// `deleted` is the id the CALLER named — a refusal throws, so reaching a receipt at all
+// means the conversation went. `removedThreadIds` is every conversation that actually
+// went, the cascade included: deletion owns the descendants of the thread it deletes, and
+// a caller that just released a fan-out child needs to see the settled grandchildren leave
+// with it rather than infer the state change from a roster that got shorter.
+export type HarnessThreadDeleteResult = {
+    deleted: string;
+    removedThreadIds: string[];
+};
+
 export type HarnessToolRuntime = {
     // toolRequest: select/enable catalogue matches with this harness's enabled-set
     // bound and caller-specific core view.
@@ -1242,6 +1254,12 @@ export type HarnessToolRuntime = {
             maxChars?: number;
             requireClarification?: boolean;
             timeoutMs?: number;
+            // I5 (2026-11-13): OPTIONAL per-child turn bound (model rounds). Like
+            // `timeoutMs`, this host path is NOT schema-validated: the delegate TOOL's
+            // 1..64 range bounds a model argument, while a host may name any finite count.
+            // It can only LOWER the harness-wide `maxIterations`, and an omitted or
+            // non-finite value means "inherit that bound".
+            maxTurns?: number;
             scope?: { tools?: readonly string[] };
         },
         run: ToolContext['run'],
@@ -1258,6 +1276,23 @@ export type HarnessToolRuntime = {
         parameters: Record<string, unknown>
     ) => HarnessThreadMessageResult;
     threadList: (threadId: string | undefined) => HarnessThreadRoster;
+    // B5 (2026-11-13): the model-facing release of one finished conversation.
+    //
+    // `callerThreadId` is the CALLER's persistent thread, supplied by the runtime from the
+    // calling run and never by a model argument. It is what scopes the delete: absent means
+    // the host view (a manual `executeTool`, a plugin outside any conversation) and may
+    // release any terminal conversation; present means the caller only owns its own
+    // DESCENDANTS, and its current thread, an ancestor, a sibling, and another agent's
+    // default conversation are all refused with the reason.
+    //
+    // Refusals throw (running target, running descendant, this agent's default
+    // conversation, and an unknown or already-deleted id). The cascade is `deleteThread`'s,
+    // shared with the host path, so both doors release exactly the same set — and the
+    // receipt reports it (see HarnessThreadDeleteResult).
+    threadDelete: (
+        callerThreadId: string | undefined,
+        threadId: string
+    ) => HarnessThreadDeleteResult;
     // Opt-in network tools. The per-harness provider closures (and therefore their
     // credentials) live in the harness; the independently compiled source entries
     // only delegate to these live operations. A source replacement that does not
@@ -1332,11 +1367,20 @@ export type HarnessDelegationResult = {
     // Where to continue; present exactly when `truncated` is true.
     nextOffset?: number;
     // The invocation identity, shared with agentManage/agentResult.
-    invocationId: string;
+    //
+    // B2 (2026-11-13): OPTIONAL, and absent in exactly one situation — the child run
+    // finished but produced NO ledger entry to point at, because its record went with a
+    // thread the caller (or a cascade) deleted mid-run, or the bounded invocation ledger
+    // evicted it. The field used to be `''` in that case: an address that addressed
+    // nothing, next to a `status` of `'completed'` that no record supported. Absent is the
+    // honest answer, and a caller that wants the answer anyway still has `content`, the
+    // paging fields, and `durationMs` (this delegation's own measurement).
+    invocationId?: string;
     // The persistent conversation the child ran in. Absent for an ephemeral branch.
     threadId?: string;
-    // Terminal state of the child run.
-    status: HarnessInvocationStatus;
+    // Terminal state of the child run. Absent for the same reason `invocationId` is: it is
+    // read FROM the ledger record, and this result never invents one.
+    status?: HarnessInvocationStatus;
     // Measured span of the child run, in milliseconds.
     durationMs: number;
     // Failure/cancellation message. Present only when `status` is not 'completed'.
@@ -2197,7 +2241,7 @@ export type ToolContext<TParameters = any> = {
     run?: (
         agentName: string,
         input: string,
-        options?: { signal?: AbortSignal; tools?: readonly string[] }
+        options?: { signal?: AbortSignal; tools?: readonly string[]; maxTurns?: number }
     ) => Promise<HarnessAssistantMessage>;
     // The id of the tool call being executed (T28). Present for a model tool call
     // (the id the model wrote) and absent for a manual `executeTool` call, which has
@@ -2890,6 +2934,18 @@ export type HarnessThreadMessageResult = {
     sender: string;
     // The sender's persistent thread id, when the sender ran inside one.
     senderThreadId?: string;
+    // C1 (2026-11-13): an optional pointer at the conversation the caller PROBABLY meant.
+    //
+    // `agent:<name>` reads like "the conversation this agent is having", but in a session
+    // that delegates, the agent's live work is a child thread and the default conversation
+    // is a standing second brain. A message addressed to the default still goes to the
+    // default (the receipt's `threadId` is the truth, and `delivered` describes what
+    // happened there); the note names the running sibling so the caller can address IT
+    // instead of waiting for an answer that will come from a different conversation.
+    //
+    // It appears only for a default-conversation target that has a running thread of the
+    // same agent, and it never changes where the message went.
+    note?: string;
 };
 
 // Every event variant carries the SAME optional field (spelled out per variant so
@@ -3433,6 +3489,18 @@ export type HarnessConfiguration = {
     // host that wants a hard stop opts in here.
     maxIterations?: number;
 
+    // B1 (2026-11-13): the DEFAULT wall clock for a `threadFork` branch when the caller
+    // does not name one. `harness.thread.forkThread()`, `api.threads.fork()` and
+    // `runtime.threadFork` all resolve through it; the `threadFork` TOOL passes its own
+    // schema value, so this option is the host's backstop for every other fork door.
+    //
+    // Unset means NO LIMIT (FORK_TIMEOUT_MS in ./core/agent-limits.ts), the same policy the
+    // delegate default follows: a branch ends on its own answer, every tool it calls keeps
+    // its own wall clock, and `maxIterations`/`maxTurns` are the count bounds. A finite
+    // value arms a timer, so this is the option a host sets when it wants a stuck branch to
+    // release its concurrency slot by itself instead of waiting for `toolCancel`.
+    threadForkTimeoutMs?: number;
+
     // Who may create tools at runtime (R12). Defaults to 'all', the historical
     // behaviour:
     //   - 'all'     — every agent (primary and subagents) gets toolCreate;
@@ -3837,10 +3905,17 @@ export type Harness = {
     // A host thread follows its owning agent's CURRENT model: `agent.model('…')`
     // applies to every live thread of that agent on its next run. A request in
     // flight keeps the model it started with.
+    // B1/B4 (2026-11-13): both reads accept the CALLER's persistent thread id as an
+    // optional second argument (`threadRead.tool.ts` passes `context.threadId`). With a
+    // caller present, an address outside that caller's THREAD FAMILY is refused with its
+    // own sentence — "someone else's conversation" is never reported as "never created" —
+    // and a finished fork's `branch-N` resolves through the caller's branch ledger instead
+    // of throwing. Omitted, both are the unscoped host view, exactly as before: no gate,
+    // `undefined` for an id nobody has.
     threads: () => HarnessThreadRecord[];
-    thread: (id: string) => HarnessThreadRecord | undefined;
+    thread: (id: string, callerThreadId?: string) => HarnessThreadRecord | undefined;
     // The thread's committed transcript, as a detached copy.
-    threadMessages: (id: string) => HarnessMessage[];
+    threadMessages: (id: string, callerThreadId?: string) => HarnessMessage[];
     // C4: REPLACE one thread's committed transcript wholesale (the transcript
     // editor's write primitive). `messages` is validated with the same reader
     // `snapshot()`/`restore()` enforce, so a harness can never hold a transcript
@@ -3987,7 +4062,7 @@ export type Harness = {
     // terminal children, and every invocation/branch lookup scoped to it. Throws
     // while the thread (or an owned child) is running, and for an agent's default
     // conversation (use reset() for session memory).
-    deleteThread: (threadId: string) => void;
+    deleteThread: (threadId: string) => HarnessThreadDeleteResult;
     // T27: agent-roster mutation for a host that changes WHICH brains a live session
     // uses — the server's session-scoped agent binding routes
     // (`POST`/`DELETE /sessions/{id}/agents`, `PATCH .../agents/{id}` with `instruction`).

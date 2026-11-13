@@ -13,10 +13,27 @@ export const AGENT_RESULT_NAME = 'agentResult';
 // They are literals because a runtime entry must keep zero captured local
 // dependencies and must not value-import ../core (that closes a cycle through
 // core/metadata.ts); core/metadata.ownership.test.ts pins the equality.
+//
+// STATUS PROSE (2026-11-13). The description used to claim "a failed or cancelled
+// invocation reports its error and no content", which stopped being true when T28
+// added `partialContent`, and it described only "an agent that has not run yet" as
+// the empty case. Both halves are restated to match what `agentResultFor` actually
+// answers (src/harness.ts ~3798-3930), so every promise here is literally true:
+//   - NO COMPLETED result for that agent -> status "empty" with empty content. The
+//     omitted-`invocationId` selector picks the latest COMPLETED record, so an
+//     in-flight or failed-only agent must not answer with that record's identity.
+//   - an explicitly addressed RUNNING invocation -> status "running" with empty
+//     content: no partial text is ever passed off as a finished answer.
+//   - CANCELLED / FAILED -> the error plus paged `partialContent` and
+//     `cancelledAtMessage` (that is the surviving account of a rolled-back run).
+// The two pinned fragments below — "latest completed result" (the parameter
+// description, pinned by src/harness.agent-results.test.ts:169) and "at most 8000
+// characters (default 4000)" (pinned by core/metadata.ownership.test.ts:424) — are
+// kept verbatim, and every PARAMETER description stays byte-identical.
 export const AGENT_RESULT_METADATA: CoreToolMetadata = {
     name: AGENT_RESULT_NAME,
     description:
-        `Read the completed result of one agent invocation. Pass "agent"; optionally pass "invocationId" from agentManage (omit it for that agent's latest completed result). The result contains content, contentLength, offset, limit, hasMore, and nextOffset when more remains; page through by passing nextOffset back as offset. Each page is at most 8000 characters (default 4000), so a long answer is returned in full across pages instead of being silently truncated. A running invocation returns status "running" with no content, a failed or cancelled invocation reports its error and no content, an unknown invocation is an error, and an agent that has not run yet returns status "empty". Only completed answer text is exposed - never system instructions, transcripts, tool arguments, or tool bodies.`,
+        `Read the completed result of one agent invocation. Pass "agent"; optionally pass "invocationId" from agentManage (omit it for that agent's latest completed result - when that agent has no completed result the answer is status "empty" with empty content, not somebody else's run and not one that is still in flight). The result contains content, contentLength, offset, limit, hasMore, and nextOffset when more remains; page through by passing nextOffset back as offset. Each page is at most 8000 characters (default 4000), so a long answer is returned in full across pages instead of being silently truncated. What each status means: "empty" - no completed result is available for that agent, so nothing of yours has finished yet; "running" - an invocation you addressed by id is still running, and it reports empty content because a partial answer is never presented as a finished one; "cancelled" or "failed" - the run did not complete, and it reports its error together with the partialContent it had produced and the cancelledAtMessage showing how far it got, paged exactly like a completed answer; an unknown invocationId, or one that belongs to another agent, is an error. Only answer text is exposed - a finished answer in content, an unfinished one in partialContent - never system instructions, transcripts, tool arguments, or tool bodies.`,
     tags: ['agents', 'result', 'answer', 'output', 'subagent', 'inspect'],
     // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
     // and enables it for this session instead of seeing it declared on every request.

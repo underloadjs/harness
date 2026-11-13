@@ -466,6 +466,7 @@ import type {
     HarnessStreamTool,
     HarnessThread,
     HarnessThreadCreateOptions,
+    HarnessThreadDeleteResult,
     HarnessThreadMessageResult,
     HarnessThreadRecord,
     HarnessThreadRoster,
@@ -567,6 +568,70 @@ const resolveMaxIterations = (value: number | undefined): number => {
     }
 
     return value;
+};
+
+// B1 (2026-11-13) — the branch wall clock `threadFork` may carry.
+//
+// The 1..3600000 range a MODEL may name lives in the `threadFork` entry's schema
+// (src/tools/runtime/threadFork.tool.ts), which restates MODEL_TIMEOUT_MAX_MS
+// (src/core/agent-limits.ts:79) as a literal because a runtime entry keeps zero captured
+// local dependencies; core/metadata.ownership.test.ts pins the two together. A HOST
+// value (`harness({ threadForkTimeoutMs })`, a plugin `api.threads.fork`) is not
+// schema-validated, so any finite bound it names is honoured as given — the identical
+// rule `HarnessToolRuntime.delegate` documents for `timeoutMs`.
+//
+// `FORK_TIMEOUT_DEFAULT_MS` is what an omitted bound resolves to, and it mirrors
+// FORK_TIMEOUT_MS (src/core/agent-limits.ts:86): NO LIMIT. Before this finding the
+// `threadForkTimeoutMs` option was declared and read by nobody, so the effective bound
+// was "whatever the entry's schema default happened to be", and a hung branch could
+// only be released through `toolCancel`.
+const FORK_TIMEOUT_DEFAULT_MS = Number.POSITIVE_INFINITY;
+
+// Resolve one opt-in branch wall clock, byte-for-byte the rule `delegateFor` applies to
+// `timeoutMs`: a missing, non-number, non-finite, or sub-1 value means "no bound" rather
+// than a 0 ms timer, and a finite value is floored to a whole millisecond.
+const resolveForkTimeoutMs = (value: unknown, fallback: number): number =>
+    typeof value === 'number' && Number.isFinite(value)
+        ? Math.max(1, Math.floor(value))
+        : fallback;
+
+// THE ONE WALL-CLOCK TIMER IN THIS FILE, and the only place a thread may be ended by a
+// clock (policy 2026-11-09 T5.5; `src/harness.delegation.test.ts` asserts this shape).
+//
+// Two callers opt into it, both EXPLICITLY and both with a value they chose:
+//   - `delegate`'s `timeoutMs` (its fallback `DELEGATE_TIMEOUT_MS` is unbounded), and
+//   - `threadFork`'s `timeoutMs` (B1; its fallback is FORK_TIMEOUT_DEFAULT_MS).
+// Everything else stays bounded the way the policy doc requires: each tool keeps its own
+// wall clock, `maxIterations`/`maxTurns` is a COUNT bound, a plugin `stop` is a policy
+// assertion, and a stuck child is abandoned by the liveness wake plus `toolCancel`.
+//
+// Arming sits behind a finiteness check, so an unbounded caller creates no timer at all
+// (`vi.getTimerCount()` stays 0 for it), and the returned disarms exactly once. The abort
+// carries a HarnessError naming `label`, so the reason a run or branch stopped is readable
+// from the tool result, the branch record and `agentResult` without guessing.
+const armWallClock = (
+    controller: AbortController,
+    label: string,
+    timeoutMs: number
+): (() => void) => {
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
+    if (Number.isFinite(timeoutMs)) {
+        timeoutTimer = setTimeout(() => {
+            controller.abort(
+                new HarnessError(`${label} exceeded its ${timeoutMs}ms timeout and was stopped.`)
+            );
+        }, timeoutMs);
+
+        // Node keeps the process alive for a pending timer; a bound must not.
+        (timeoutTimer as { unref?: () => void }).unref?.();
+    }
+
+    // No timer means nothing to clear; the guard keeps the unbounded path free of any
+    // timer work at all.
+    return () => {
+        if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+    };
 };
 
 // Fork/branch configuration, resolved once at construction. The defaults are the
@@ -926,6 +991,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // run in this harness (entry, ctx.run, and delegated subagents); each run gets
     // its own budget because the check lives in runAgentCore's loop.
     const maxIterations = resolveMaxIterations(configuration.maxIterations);
+
+    // B1 (2026-11-13): the DEFAULT branch wall clock for this harness. An unset or
+    // non-finite value means no bound, so an unconfigured harness arms no timer for a fork
+    // at all — the shape `src/harness.delegation.test.ts` pins. A finite value is the
+    // host's choice for every fork door that does not name its own `timeoutMs`
+    // (`harness.thread.forkThread()`, a plugin `api.threads.fork()`); the `threadFork` tool
+    // always names one, so a model call is unaffected by this option.
+    const threadForkTimeoutMs = resolveForkTimeoutMs(
+        configuration.threadForkTimeoutMs,
+        FORK_TIMEOUT_DEFAULT_MS
+    );
 
     // Background heartbeat interval (T3/R4), validated at construction like every
     // other numeric bound so a typo fails before a run starts. It is no longer a
@@ -3451,6 +3527,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             delegateFor(caller, parameters, run, runDepth, callerSignal, selfCallId, selfScope),
         threadSend: (caller, threadId, parameters) => threadSendFor(caller, threadId, parameters),
         threadList: (threadId) => threadRoster(threadId),
+        // B5 (2026-11-13): the model-facing release. A threadless caller is the host view
+        // and deletes anything terminal; a caller WITH a thread only reaches its own
+        // descendants (`threadDeleteFor`).
+        threadDelete: (callerThreadId, threadId) => threadDeleteFor(callerThreadId, threadId),
         search: (context) => {
             const operation = webOperations.search;
 
@@ -3830,13 +3910,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // Latest FINISHED result wins (completion order, not start order,
                 // so a fork that finished earlier never masks the root's answer);
                 // a still-running invocation does not hide the last finished
-                // answer. Fall back to the newest started record so a failure or
-                // an active-only agent is still explainable.
+                // answer.
+                //
+                // B2 (2026-11-13): the fallback used to be the newest STARTED record, so an
+                // agent whose newest run is still in flight got that running record back with
+                // `content: ''` — a `running` status next to an empty body, indistinguishable
+                // from "this agent has said nothing yet", and the reason a caller stopped
+                // polling a child that had already finished an earlier turn. The default is
+                // now the newest TERMINAL record (completed, failed or cancelled): the last
+                // answer that actually exists. An agent whose only run is still running has
+                // no RESULT yet, and 'empty' says that honestly — `agentManage` is the
+                // surface that reports live invocations, and it still does.
                 const completed = recent
                     .filter((entry) => entry.status === 'completed')
                     .sort((left, right) => right.completedOrder - left.completedOrder);
 
-                record = completed[0] ?? recent[0];
+                record = completed[0] ?? recent.find((entry) => entry.status !== 'running');
             }
 
             const limit =
@@ -3844,7 +3933,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     ? Math.min(parameters.limit, AGENT_RESULT_PAGE_MAX_CHARS)
                     : AGENT_RESULT_PAGE_CHARS;
 
-            // No invocation at all: an honest empty state, not an error.
+            // No RESULT to report: either this agent has never run, or every invocation it
+            // has is still in flight (B2 — the default no longer hands back a `running`
+            // record with an empty body and calls that a result). An honest empty state, not
+            // an error, and an explicit `invocationId` still reaches the running record.
             if (record === undefined) {
                 return {
                     agent: name,
@@ -3990,6 +4082,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             maxChars?: number;
             requireClarification?: boolean;
             timeoutMs?: number;
+            // I5 (2026-11-13): OPTIONAL per-delegation turn bound for THIS child. The
+            // number of model turns (tool rounds) the child may take before it has to
+            // answer. It can only LOWER the harness-wide `maxIterations` bound, never
+            // raise it; omitted means "inherit whatever the host configured". The
+            // `delegate` entry advertises 1..DELEGATE_MAX_TURNS_MAX (64) for a MODEL;
+            // this host path is not schema-validated, so any finite count is honoured.
+            maxTurns?: number;
             scope?: { tools?: readonly string[] };
         },
         run: ToolContext['run'],
@@ -4127,29 +4226,32 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const timeoutController = new AbortController();
 
         // THE ONE TURN-BOUNDING TIMER IN THIS FILE, and it is guarded by a finiteness
-        // check. `src/harness.delegation.test.ts` asserts both facts against this
-        // source text so a future "safety timeout" cannot silently reintroduce a
-        // thread limit (policy doc, T5.5).
-        let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+        // check inside `armWallClock` (module scope, above). Both opt-in wall clocks —
+        // this delegation's and `threadFork`'s — arm through that single site, so
+        // `src/harness.delegation.test.ts` can keep asserting against the source text
+        // that no third path ends a conversation on a clock (policy doc, T5.5).
+        const disarmWallClock = armWallClock(
+            timeoutController,
+            `Delegation to "${target}"`,
+            timeoutMs
+        );
 
-        if (Number.isFinite(timeoutMs)) {
-            timeoutTimer = setTimeout(() => {
-                timeoutController.abort(
-                    new HarnessError(
-                        `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
-                    )
-                );
-            }, timeoutMs);
-
-            // Node keeps the process alive for a pending timer; a delegation must not.
-            (timeoutTimer as { unref?: () => void }).unref?.();
-        }
+        // I5: the child's own turn bound. Same resolution rule as `timeoutMs` above (a
+        // missing, non-number, non-finite or sub-1 value means "no per-child bound"), and
+        // `runAgentCore` takes the MINIMUM of this and the harness-wide `maxIterations`.
+        const maxTurns =
+            typeof parameters?.maxTurns === 'number' && Number.isFinite(parameters.maxTurns)
+                ? Math.max(1, Math.floor(parameters.maxTurns))
+                : Number.POSITIVE_INFINITY;
 
         const childSignal = linkSignals(callerSignal, timeoutController.signal);
 
         try {
             message = await run(target, parameters.input, {
                 signal: childSignal,
+                // I5: carried to `runAgentCore` through the run options and the RunState,
+                // so the bound belongs to the child run, not to the tool call.
+                maxTurns,
                 // T28: an explicit tool allowlist for the child. A planning or review
                 // delegation can therefore be read-only by construction instead of by
                 // instruction, so it cannot leave artifacts in the user's checkout.
@@ -4203,9 +4305,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     : { cancelledAtMessage: record.cancelledAtMessage })
             };
         } finally {
-            // No timer means nothing to clear; the guard keeps the unbounded path free
-            // of any timer work at all (and `vi.getTimerCount()` stays 0 for it).
-            if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+            // No timer means nothing was armed; the disarm closure is a no-op for the
+            // unbounded path (and `vi.getTimerCount()` stays 0 for it).
+            disarmWallClock();
         }
 
         // Only the answer crosses back: the subagent keeps its own transcript and
@@ -4224,9 +4326,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             limit,
             truncated: page.hasMore,
             ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
-            invocationId: record?.invocationId ?? '',
+            // B2 (2026-11-13): the identity is OBSERVED, never invented. `newInvocationOf`
+            // comes back empty in two real cases — the child's record was purged with its
+            // thread (a `threadDelete`/cascade during the run, which is what a caller that
+            // reaps finished children does) or the bounded ledger evicted it — and the
+            // result used to paper over both with `invocationId: ''` and
+            // `status: 'completed'`. A caller then had an address it could not address and
+            // a status no record supported. Absent means "this run produced no ledger entry
+            // to point at"; the content and paging fields stay exact either way.
+            ...(record === undefined ? {} : { invocationId: record.invocationId }),
             ...(record?.threadId === undefined ? {} : { threadId: record.threadId }),
-            status: record?.status ?? 'completed',
+            ...(record === undefined ? {} : { status: record.status }),
+            // The elapsed time is this delegation's own measurement, so it stays honest
+            // without a ledger record: the child's number when there is one, otherwise the
+            // wall clock this call actually spent.
             durationMs: record?.durationMs ?? Math.max(0, Date.now() - startedAt)
         };
     };
@@ -4583,6 +4696,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         active: boolean;
         aborted: boolean;
         iteration: number;
+        // I5 (2026-11-13): the per-run turn bound a caller supplied (`delegate`'s
+        // `maxTurns`). `Number.POSITIVE_INFINITY` means "no per-run bound", so
+        // `Math.min(maxIterations, maxTurns)` is byte-for-byte the old guard when unset.
+        maxTurns: number;
         // T5.2 — the tool-result bytes committed SINCE the last model request, under
         // the aggregate per-turn cap. Reset at the top of `requestTurn`, so one
         // window covers exactly the deliveries of one turn (the loop drains the
@@ -4811,12 +4928,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // tool, so both read exactly the same roster (deleted threads are already
     // absent from the map). `currentThreadId` comes from the RUN, never from a
     // tool argument.
-    const threadRoster = (currentThreadId?: string): HarnessThreadRoster => ({
-        ...(currentThreadId === undefined ? {} : { currentThreadId }),
-        threads: [...threadStates.values()]
-            .sort((left, right) => left.record.sequence - right.record.sequence)
-            .map((state) => threadRecordCopy(state.record))
-    });
+    //
+    // B3 (2026-11-13): when that caller thread exists, the roster is the caller's THREAD
+    // FAMILY, not the whole session (see `threadFamilyOf`). This is not a privacy nicety:
+    // the roster is the address book for `threadSend`/`threadRead`/`threadDelete`, and
+    // those refuse everything outside the family, so a session-wide list advertised doors
+    // the caller could not walk through — and in a fan-out run it buried the caller's own
+    // children under siblings it could not act on. A caller with no thread stays
+    // session-wide: that is the host view, and the host may address any conversation.
+    const threadRoster = (currentThreadId?: string): HarnessThreadRoster => {
+        const family = familyOfCaller(currentThreadId);
+
+        return {
+            ...(currentThreadId === undefined ? {} : { currentThreadId }),
+            threads: [...threadStates.values()]
+                .filter((state) => family === undefined || family.has(state.record.id))
+                .sort((left, right) => left.record.sequence - right.record.sequence)
+                .map((state) => threadRecordCopy(state.record))
+        };
+    };
 
     // Cross-thread chat + roster are CONDITIONAL core tools (core/metadata.ts):
     // a session with one conversation per agent pays no context for them, and the
@@ -4967,20 +5097,86 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // after the receipt helper — because a message that merely ARRIVES at a
         // parked conversation is not the work the holder parked for.
 
+        // B4 (2026-11-13) — THE CALLER'S LINEAGE IS THE ADDRESS SPACE.
+        //
+        // A visible id used to be a writable id: `threadList` printed the session, and
+        // this function accepted any id it printed, so a fan-out parent's child could post
+        // into a sibling subtree it never spoke to (the roster scope, `threadFamilyOf`,
+        // exists for the same reason). A threadless caller — a host, a plugin, a manual
+        // `executeTool` — stays unscoped: the host may speak into any conversation, and the
+        // server's thread surfaces depend on that.
+        //
+        // The refusal is deliberately a DIFFERENT sentence from `threadStateOf`'s: "this id
+        // does not exist" and "this id exists but is not yours to write into" are separate
+        // facts for a model deciding whether to re-read the roster or pick another target.
+        if (
+            sender.threadId !== undefined &&
+            sender.threadId !== targetThreadId &&
+            familyOfCaller(sender.threadId)?.has(targetThreadId) === false
+        ) {
+            throw new HarnessError(
+                `Thread "${targetThreadId}" is not one thread "${sender.threadId}" can address: threadSend reaches ` +
+                    'your own thread, an ancestor, one of your descendants, or this agent\'s default conversation ' +
+                    '(see threadList). The id exists — it is simply outside your lineage.'
+            );
+        }
+
         const content = `from agent "${sender.agent}"${
             sender.threadId === undefined ? '' : ` (thread ${sender.threadId})`
         }:\n${message}`;
 
         // Every field of a receipt is the target plus the SENDER's own identity; only
         // `delivered` varies by state, and it has exactly two values (T3.6).
+        //
+        // B4/C1: `note` is the one optional field, and it exists for exactly one
+        // confusion — `agent:<name>` looks like "the conversation this agent is having",
+        // while the conversation actually in flight is a delegated child thread. The
+        // message still goes where it was addressed (the receipt's `threadId` is the
+        // truth), and the note names the live thread so the caller can address IT instead.
         const receipt = (
-            delivered: HarnessThreadMessageResult['delivered']
+            delivered: HarnessThreadMessageResult['delivered'],
+            note?: string
         ): HarnessThreadMessageResult => ({
             threadId: targetThreadId,
             delivered,
             sender: sender.agent,
-            ...(sender.threadId === undefined ? {} : { senderThreadId: sender.threadId })
+            ...(sender.threadId === undefined ? {} : { senderThreadId: sender.threadId }),
+            ...(note === undefined ? {} : { note })
         });
+
+        // C1: the live conversation of THIS agent, if one is running somewhere else. Only
+        // computed for a default-conversation target, because that is the only address
+        // whose meaning is ambiguous; the newest one wins, preferring a thread the sender
+        // itself owns (a sibling's running turn is the weaker hint, but still worth naming
+        // rather than letting the caller believe `agent:<name>` is where the agent lives).
+        const liveSiblingNoteFor = (): string | undefined => {
+            if (target.record.origin !== 'agent') return undefined;
+
+            const candidates = [...threadStates.values()].filter(
+                (entry) =>
+                    entry.record.id !== target.record.id &&
+                    entry.record.agent === target.record.agent &&
+                    entry.record.status === 'running'
+            );
+            if (candidates.length === 0) return undefined;
+
+            const ownedBySender =
+                sender.threadId === undefined
+                    ? undefined
+                    : candidates.find(
+                          (entry) => entry.record.ownerThreadId === sender.threadId
+                      );
+            const live =
+                ownedBySender ??
+                candidates.reduce((left, right) =>
+                    right.record.sequence > left.record.sequence ? right : left
+                );
+
+            return (
+                `"${targetThreadId}" is ${target.record.agent}'s default conversation, and this message went there. ` +
+                `The live ${target.record.agent} conversation is thread "${live.record.id}"; address that id to reach the turn in flight.`
+            );
+        };
 
         // T8 — THE PARK IS NOT A STOP AND NOT A REVIVAL. A delegate or tool speaking
         // into a conversation a plugin parked gets the same next-boundary queue a
@@ -5003,16 +5199,50 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // next run, which drains it at its first boundary.
             if (target.run !== undefined) markRunDirty(target.run);
 
-            return receipt('queued');
+            return receipt('queued', liveSiblingNoteFor());
         }
 
         if (target.record.status === 'running' && target.run !== undefined) {
             // Running: land at the next model boundary, never inside the request
             // that is already in flight (R5 ordering guarantee).
+            //
+            // B4: this is also the ONLY thing a caller may do to a conversation it is
+            // already standing in — mid-run steering. Addressing your own thread, or this
+            // agent's default conversation, while it runs is a message into the turn that
+            // is asking, so it queues exactly like any other steer.
             target.queue.push(content);
             notifyStateChange('thread');
             markRunDirty(target.run);
-            return receipt('queued');
+            return receipt('queued', liveSiblingNoteFor());
+        }
+
+        // B4 (2026-11-13) — A CALLER MAY NOT START ITS OWN CONVERSATION.
+        //
+        // Everything above returned, so at this point the target is DORMANT: starting it
+        // means a fresh run. Doing that to a conversation the caller is already inside is
+        // not a chat, it is a nested run with worse manners — the message would sit in a
+        // queue behind a turn that is currently answering it, and the model reads the
+        // answer in the NEXT turn, which is how "I messaged myself" becomes a lost
+        // round-trip. Two addresses are the caller's own:
+        //
+        //   - its own thread (it is standing in that turn right now);
+        //   - this agent's default conversation (`agent:<name>`) — the standing
+        //     conversation of the very agent that is asking, which the prose used to
+        //     advertise as a target and then answer by starting a second turn of itself.
+        //
+        // A DIFFERENT agent's default conversation is still fair game (the historical
+        // cross-agent chat), and a dormant thread of yours that you are not standing in is
+        // too — that is how a parent wakes a child it parked.
+        const ownThread = sender.threadId !== undefined && sender.threadId === targetThreadId;
+        const ownDefault =
+            target.record.origin === 'agent' && target.record.agent === sender.agent;
+
+        if (ownThread || ownDefault) {
+            throw new HarnessError(
+                ownThread
+                    ? `Thread "${targetThreadId}" is the conversation this message comes from; it is already running this turn, so threadSend would only queue behind it. Answer in this turn, or send to a thread you do not stand in.`
+                    : `"${targetThreadId}" is agent "${sender.agent}"'s own conversation and is idle: a message into it would start a second turn of the agent that is asking. Use this turn, or address a thread you created (see threadList).`
+            );
         }
 
         // Dormant: `idle` and nothing else. `stopped` threw at the top, `paused`
@@ -5053,7 +5283,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             target
         ).catch(() => undefined);
 
-        return receipt('started');
+        return receipt('started', liveSiblingNoteFor());
     };
 
     // Create one host thread and return its LIVE state. Shared by the public
@@ -5175,6 +5405,172 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return chain;
     };
 
+    // ------------------------------------------------------------------
+    // B3/B4 (2026-11-13) — THREAD VISIBILITY: what one caller may see and address
+    // ------------------------------------------------------------------
+    //
+    // WHY A CONVERSATION NEEDS A VIEWER AT ALL
+    // ----------------------------------------
+    // Every thread id used to be a global id: `threadList` handed a caller every host
+    // thread in the session, and `threadSend`/`threadRead`/`threadDelete` accepted any id
+    // it printed. In a fan-out session (issue 0027: one parent, nineteen delegated
+    // children) that meant a settled child could post into a sibling subtree it never
+    // spoke to, read a conversation nobody pointed it at, and the roster itself drowned
+    // the caller in siblings it could not act on. The id is an ADDRESS, and an address is
+    // only meaningful inside the family that produced it.
+    //
+    // THE FAMILY (the same set `threadList` advertises, `threadSend`/`threadRead` accept,
+    // and `threadDelete` narrows to descendants):
+    //   1. the caller's own thread;
+    //   2. its ancestors — the conversations whose `ownerThreadId` chain owns it;
+    //   3. its descendants — every conversation whose chain reaches the caller, however
+    //      deep (a delegated child's own child stays reachable, because the caller owns
+    //      the whole subtree it minted);
+    //   4. the DEFAULT conversations (`agent:<name>`) of the agents in that family, plus
+    //      a default whose first-wins `ownerThreadId` is in the family — the default is an
+    //      agent's standing conversation, and the family is defined by AGENTS as well as
+    //      by threads (that is how a child talks to the conversation its agent shares).
+    //
+    // A SIBLING is deliberately NOT in the set: it shares an ancestor but was not created
+    // by this caller, and 0027's complaint was precisely that a caller was shown — and
+    // could write into — dozens of those.
+    //
+    // A CALLER WITH NO THREAD (the host, a plugin outside any conversation, a manual
+    // `executeTool`) is UNSCOPED and sees everything: the host is the one party that may
+    // address any conversation, and the server's roster/thread surfaces depend on that
+    // staying true.
+    const threadFamilyOf = (state: ThreadState): Set<string> => {
+        const family = new Set<string>([state.record.id]);
+
+        // (2) Ancestors.
+        for (const owner of ownersOf(state)) family.add(owner.record.id);
+
+        // (3) Descendants, walked DOWNWARD from the caller. `ownerThreadId` points at the
+        // persistent owner, so one pass per level over the table is the whole subtree; the
+        // guard against a hand-edited snapshot cycle is the `family` set itself.
+        let frontier: string[] = [state.record.id];
+
+        while (frontier.length > 0) {
+            const next: string[] = [];
+            const level = new Set(frontier);
+
+            for (const candidate of threadStates.values()) {
+                const owner = candidate.record.ownerThreadId;
+                if (owner === undefined || !level.has(owner)) continue;
+                if (family.has(candidate.record.id)) continue;
+
+                family.add(candidate.record.id);
+                next.push(candidate.record.id);
+            }
+
+            frontier = next;
+        }
+
+        // (4) The defaults of the agents this family spans. A host thread is always backed
+        // by an agent, so the agent set is what makes `agent:<name>` addressable from a
+        // delegated child instead of only from the parent that named it.
+        const agents = new Set<string>();
+        for (const entry of threadStates.values()) {
+            if (family.has(entry.record.id)) agents.add(entry.record.agent);
+        }
+
+        for (const candidate of threadStates.values()) {
+            if (candidate.record.origin !== 'agent') continue;
+            if (agents.has(candidate.record.agent)) {
+                family.add(candidate.record.id);
+                continue;
+            }
+
+            // A default that was first adopted by a thread of this family (the
+            // first-wins `ownerThreadId` link the run-start site writes) belongs to it.
+            const owner = candidate.record.ownerThreadId;
+            if (owner !== undefined && family.has(owner)) family.add(candidate.record.id);
+        }
+
+        return family;
+    };
+
+    // The family of a CALLER IDENTIFIER, or `undefined` when the caller has no thread at
+    // all (unscoped). A caller id that no longer resolves (deleted mid-run, or a stale
+    // replica) is treated as unscoped rather than as "sees nothing": the alternative would
+    // report a conversation the caller is standing in as invisible to itself, which is the
+    // worse failure of the two and cannot happen for a live run.
+    const familyOfCaller = (callerThreadId: string | undefined): Set<string> | undefined => {
+        if (callerThreadId === undefined) return undefined;
+
+        const caller = threadStates.get(callerThreadId);
+        return caller === undefined ? undefined : threadFamilyOf(caller);
+    };
+
+    // B1 (2026-11-13) — A BRANCH ID IS A CONVERSATION ADDRESS, NOT A ROSTER ENTRY.
+    //
+    // `threadFork` hands back `{ branchId, threadId, content }` where `threadId` IS the
+    // branch id, the `branch_start` frame carries that id, and `agentResult` answers by
+    // it — so a caller reasonably expects `thread(branch-N)` / `threadRead` on a finished
+    // fork to work. It did not: a branch run is an INVOCATION with an ephemeral transcript
+    // (a sibling pin asserts `threads()` excludes it), so the id was absent from
+    // `threadStates` and the read threw "it was never created, or it was deleted" — the
+    // one answer that is false, because the transcript is right there in the branch ledger.
+    //
+    // So the read seams resolve a branch through `branchRecordOf` and present the branch's
+    // committed transcript (`HarnessBranchRecord.messages`, replaced with the committed
+    // transcript at the terminal transition). While a branch is still running that field is
+    // the transcript captured at its launch — the honest "what has it said so far", not a
+    // live tail, which only the branch's own actor holds.
+    //
+    // The synthesized record is deliberately minimal, and every field is derived:
+    //   - `origin: 'host'` — a branch is not an agent's default conversation, and 'host' is
+    //     the only value that means "a conversation on top of an agent";
+    //   - `status` — 'running' while the branch task is live, otherwise 'idle'. A terminal
+    //     branch is done working, and `deleteThread`'s running-refusal reads exactly this
+    //     field, so a finished branch is releasable like a finished thread;
+    //   - `sequence` — the branch's position in the retained ledger plus one. The ledger is
+    //     kept in creation order, so this is stable for a given session state and is never
+    //     a fabricated timestamp;
+    //   - `invocationId` — the branch id itself, because `invocationIdOf` keys a branch
+    //     run's ledger entry by it, which is what makes `agentResult` and this record name
+    //     the same run.
+    const threadRecordOfBranch = (branch: HarnessBranchRecord): HarnessThreadRecord => ({
+        id: branch.branchId,
+        agent: branch.agent,
+        origin: 'host',
+        status: branch.status === 'running' ? 'running' : 'idle',
+        sequence: branchRecords.indexOf(branch) + 1,
+        ...(branch.threadId === undefined ? {} : { ownerThreadId: branch.threadId }),
+        invocationId: branch.branchId
+    });
+
+    // The B4 read gate for ONE address. A caller with no thread is the host view and sees
+    // everything. A live conversation is visible when it is in the caller's family; a
+    // BRANCH address is visible when the persistent conversation that OWNS it is, because
+    // a branch is part of its owner's subtree (`HarnessBranchSummary.threadId` is exactly
+    // that owner, and it is what `purgeThread` cascades on).
+    //
+    // An id that resolves for NOBODY returns `true` on purpose: "unknown/deleted" and "not
+    // yours" are different sentences, and the caller with the better claim to the first one
+    // is the read that is about to throw `threadStateOf`'s canonical not-found error.
+    const isAddressVisible = (threadId: string, callerThreadId: string | undefined): boolean => {
+        if (callerThreadId === undefined) return true;
+
+        const family = familyOfCaller(callerThreadId);
+        if (family === undefined || family.has(threadId)) return true;
+
+        const branch = branchRecordOf(threadId);
+        if (branch === undefined) return true;
+
+        return branch.threadId === undefined || family.has(branch.threadId);
+    };
+
+    // Separate sentence from the not-found error, for the same reason `threadSend`'s
+    // refusal is: an id that exists outside your lineage is a roster problem, and an id
+    // nobody has is a typo or a released conversation.
+    const threadNotVisibleError = (threadId: string, callerThreadId: string): HarnessError =>
+        new HarnessError(
+            `Thread "${threadId}" is not visible to thread "${callerThreadId}": a read reaches your own thread, an ` +
+                'ancestor, one of your descendants, or this agent\'s default conversation (see threadList). The id ' +
+                'exists — it is simply outside your lineage.'
+        );
+
     // Mark one thread stopped and abort its run, if any. Returns whether a live run
     // was actually aborted (a thread with no active work is still marked stopped).
     const stopThreadState = (state: ThreadState, reason: HarnessError): boolean => {
@@ -5294,7 +5690,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // was already copied into another transcript (a delegated answer, a delivered
     // chat message) is NOT recalled: deletion is a purge of THIS conversation, not
     // a promise of forgetting what other histories learned from it.
-    const deleteThread = (threadId: string): void => {
+    const deleteThread = (threadId: string): HarnessThreadDeleteResult => {
         const state = threadStateOf(threadId);
 
         if (state.record.origin === 'agent') {
@@ -5338,10 +5734,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // Capture the identities BEFORE the purge: a hook that receives the payload must
         // not be able to observe (or be confused by) half-removed lookups, and
-        // `purgeThread` drops the record from every index the id appears in. Only built
-        // when something listens — the purge itself must stay a single path.
+        // `purgeThread` drops the record from every index the id appears in. The id list is
+        // built unconditionally now (B5): `threadDelete` reports it to the CALLER, whose
+        // whole question is "what did I just release" — a cascade that silently took three
+        // settled children is worth one allocation. The hook payload stays lazy.
+        const purged = [state, ...descendants];
+        const removedThreadIds = purged.map((entry) => entry.record.id);
         const removed = hookBus.has('thread.deleted')
-            ? [state, ...descendants].map((entry) => ({
+            ? purged.map((entry) => ({
                   threadId: entry.record.id,
                   agent: entry.record.agent
               }))
@@ -5356,6 +5756,66 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (removed !== undefined) {
             for (const payload of removed) hookBus.fire('thread.deleted', payload);
         }
+
+        // B5 (2026-11-13): the receipt is the state the caller caused. `deleted` is the id
+        // it named (a refusal throws, so a return is always a removal); `removedThreadIds`
+        // is every conversation that actually went, the cascade included.
+        return { deleted: threadId, removedThreadIds };
+    };
+
+    // B5 (2026-11-13) — the model-facing release, scoped to the caller's OWN descendants.
+    //
+    // `deleteThread` above stays the HOST operation (unscoped: a host may close any
+    // terminal conversation, including an ancestor's and its own). This is the door a
+    // thread uses on itself and its children, and the scoping is what makes it safe to
+    // advertise to a model: issue 0027's fan-out parent must be able to reap the nineteen
+    // one-shot children its delegations minted, and it must not be able to reach sideways
+    // into a sibling subtree or up into the conversation that owns it.
+    //
+    //   - no caller thread (a manual `executeTool`, a plugin outside any conversation) →
+    //     the host view, exactly `deleteThread`;
+    //   - a caller thread → the target must be a STRICT descendant of it. The caller's own
+    //     thread, an ancestor, a sibling, and another agent's conversation are all refused
+    //     with the reason, and the ordering below matters: the unknown-id and lineage
+    //     refusals come first so "not yours" is never reported as "not running" for a
+    //     thread the caller could not delete anyway.
+    //
+    // The cascade, the running refusal, and the `agent:<name>` refusal are unchanged —
+    // they live in `deleteThread`, so both doors refuse identically.
+    const threadDeleteFor = (
+        callerThreadId: string | undefined,
+        threadId: string
+    ): HarnessThreadDeleteResult => {
+        if (callerThreadId === undefined) return deleteThread(threadId);
+
+        const target = threadStateOf(threadId);
+        const caller = threadStateOf(callerThreadId);
+
+        // Walk the persistent owner chain up from the target. `ownerThreadId` is the
+        // first-wins link set when a conversation is minted (see the run-start site), so a
+        // thread this caller created — directly or several levels down — terminates here.
+        let owned = false;
+        let current: string | undefined = target.record.ownerThreadId;
+        const seen = new Set<string>([target.record.id]);
+
+        while (current !== undefined && !seen.has(current)) {
+            seen.add(current);
+            if (current === caller.record.id) {
+                owned = true;
+                break;
+            }
+            current = threadStates.get(current)?.record.ownerThreadId;
+        }
+
+        if (!owned) {
+            throw new HarnessError(
+                `Thread "${threadId}" is not one of the conversations "${caller.record.id}" created; ` +
+                    'threadDelete releases your own descendants (see threadList) — never your current thread, ' +
+                    'an ancestor, a sibling, or another agent\'s conversation.'
+            );
+        }
+
+        return deleteThread(threadId);
     };
 
     // ------------------------------------------------------------------
@@ -5542,8 +6002,38 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         );
     };
 
-    const threadMessages = (threadId: string): HarnessMessage[] =>
-        cloneMessages(threadStateOf(threadId).agent.messages);
+    // The committed transcript of one conversation, as a detached copy.
+    //
+    // `callerThreadId` (B1/B4, 2026-11-13) is the CALLER's persistent thread, supplied by
+    // the runtime — `threadRead.tool.ts` passes `context.threadId`, and a lane replica's
+    // routed read passes nothing because the request shape carries only the target. Two
+    // things hang off it:
+    //
+    //   - VISIBILITY: with a caller present, an address outside that caller's thread family
+    //     is refused with its own sentence, so "someone else's conversation" is never
+    //     reported as "never created" (and a model cannot brute-force a sibling's
+    //     transcript);
+    //   - BRANCH RESOLUTION: a finished fork's `branch-N` is not in the thread table at
+    //     all, and the caller's own branch ledger is the only place that still holds it
+    //     (see `threadRecordOfBranch`). Omitting the caller leaves both rules off, which is
+    //     what every host-side caller (the server, a plugin, the tests written before this)
+    //     expects: the same transcript, unscoped.
+    const threadMessages = (threadId: string, callerThreadId?: string): HarnessMessage[] => {
+        if (callerThreadId !== undefined && !isAddressVisible(threadId, callerThreadId)) {
+            throw threadNotVisibleError(threadId, callerThreadId);
+        }
+
+        const state = threadStates.get(threadId);
+        if (state !== undefined) return cloneMessages(state.agent.messages);
+
+        // B1: the branch fallback, before the not-found error.
+        const branch = branchRecordOf(threadId);
+        if (branch !== undefined) return cloneMessages(branch.messages);
+
+        // An id nobody has: the SAME error every other thread operation throws, so a
+        // deleted conversation and a mistyped one are indistinguishable here on purpose.
+        return cloneMessages(threadStateOf(threadId).agent.messages);
+    };
 
     // C4: wholesale transcript replacement (the server's transcript editor).
     //
@@ -6970,10 +7460,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // the provider projection would keep a placeholder forever. It is
             // error-SHAPED (no usable value exists) but classified `cancelled`, so
             // a UI renders it as a control outcome instead of a tool failure.
+            //
+            // B1 (2026-11-13): for a FORK the sentence must name the branch id. A fork is
+            // the one background call whose work survives its own cancellation — the branch
+            // committed a transcript and `agentResult`/`threadRead` answer by `branch-N` —
+            // so "no result is available" used to send the caller past the only address it
+            // could still read. Every other cancelled call keeps the historical sentence
+            // byte for byte (the background suite pins it).
+            const branchId = branchCallIds.get(`${run.scope}\u0000${call.id}`);
+
             content = boundDelivery(
                 run,
                 call,
-                `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
+                branchId === undefined
+                    ? `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
+                    : `Tool call "${call.name}" (${call.id}) was cancelled before it completed; its branch "${branchId}" still holds what it produced — read it with threadRead "${branchId}" or agentResult by that id.`
             );
             outcome = 'cancelled';
         } else if (task.failed) {
@@ -7512,7 +8013,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // runtime supplies it (never a tool argument), so threadSend can
                     // attribute the sender honestly.
                     ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
-                    run: (agentName: string, input: string, options?: { signal?: AbortSignal; tools?: readonly string[] }) => {
+                    run: (
+                        agentName: string,
+                        input: string,
+                        options?: { signal?: AbortSignal; tools?: readonly string[]; maxTurns?: number }
+                    ) => {
                         // T14: refuse BEFORE anything is resolved, so no child thread state, no
                         // transcript append and no provider request can exist behind the refusal.
                         // The throw is inside THIS function, which is also why a body that
@@ -7563,7 +8068,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                                 undefined,
                                 undefined,
                                 // T28: the caller's tool allowlist, enforced on the child.
-                                options?.tools
+                                options?.tools,
+                                // I5: the caller's per-child turn bound (`delegate`'s
+                                // `maxTurns`), enforced on the child run.
+                                options?.maxTurns
                             )
                         );
                     }
@@ -7702,6 +8210,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // is what prevents a terminal-without-start audit pair.
     const branchStarted = new Set<string>();
 
+    // B1 (2026-11-13) — which branch belongs to which requesting tool call.
+    //
+    // `deliverTask` reports a cancelled call back to the model, and for a fork the useful
+    // address is NOT the call id — it is the branch id, the id `threadFork` returned, the
+    // key of `harness.branch()`, and the transcript a cancelled branch still holds. Nothing
+    // else in the run carries the pair after the task settles (`activeBranches` and
+    // `branchScopes` are both released in the task's `finally`, which runs BEFORE the
+    // mailbox delivery this report is built in), so the requester keeps its own map.
+    //
+    // Keyed `scope\u0000callId` because a call id is unique only within one run. Released
+    // with the branch itself in `releaseBranchesForScope`, so it cannot outlive the run that
+    // filled it.
+    const branchCallIds = new Map<string, string>();
+
     // Release every branch owned by this run. AWAITED by runAgent's finally: a
     // task the scheduler abandons before `run` is invoked has no catch to report
     // its lifecycle, so this cleanup is the only place that can emit the single
@@ -7723,6 +8245,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             const kind = record.kind;
             const callId = record.callId ?? '';
+
+            // B1: the call→branch address goes with the branch.
+            if (callId !== '') branchCallIds.delete(`${run.scope}\u0000${callId}`);
 
             const transitioned = finishBranch(branchId, 'cancelled', {
                 error: {
@@ -7972,6 +8497,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // without this announcement; `deliverTask` clears it again on the drain.
         await announcePending(run, call);
 
+        // B1 (2026-11-13) — the branch's OPTIONAL wall clock.
+        //
+        // `timeoutMs` is opt-in: the entry passes its schema default (120000) for a model
+        // call, and a direct `harness.thread.forkThread()` / `api.threads.fork()` resolves
+        // to `threadForkTimeoutMs` from the harness configuration, else unbounded
+        // (FORK_TIMEOUT_DEFAULT_MS). Before this the fork had no bound at a fork site at
+        // all: the configured option was read by nobody, and a branch that never answered
+        // held its concurrency slot until `toolCancel`.
+        //
+        // The bound aborts the branch task's own controller (exactly how `delegateFor`
+        // bounds a child), so the requester's run keeps its signal and still receives the
+        // structured outcome in its transcript.
+        const forkTimeoutMs = resolveForkTimeoutMs(
+            (parameters as { timeoutMs?: unknown })?.timeoutMs,
+            threadForkTimeoutMs
+        );
+
+        // The requester-visible address of this branch. `deliverTask` reports a cancelled
+        // tool call by name and id, which for a fork is not enough: the id a caller follows
+        // is the BRANCH id, and a cancelled branch keeps the transcript it committed. The
+        // pair is keyed by scope + call id because a call id is unique only within one run.
+        branchCallIds.set(`${run.scope}\u0000${call.id}`, metadata.branchId);
+
         scheduler.schedule({
             scope: run.scope,
             agent: run.actorKey,
@@ -7979,11 +8527,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             name: call.name,
             parent: run.signal,
             run: async (signal) => {
+                // The branch's own clock, linked into the task signal the scheduler hands
+                // us (which already carries the requester's abort). `branchFailureStatus`
+                // stays untouched: the timeout verdict is read from this controller
+                // directly, so a caller-cancelled branch and a clock-stopped branch keep
+                // their separate reasons.
+                const timeoutController = new AbortController();
+                const disarmWallClock = armWallClock(
+                    timeoutController,
+                    `Thread branch "${metadata.branchId}"`,
+                    forkTimeoutMs
+                );
+                const branchSignal = linkSignals(signal, timeoutController.signal);
+
                 try {
                     const message = await runAgent(
                         branch,
                         input,
-                        signal,
+                        branchSignal,
                         run,
                         call.id,
                         undefined,
@@ -8013,7 +8574,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     };
                     return fork;
                 } catch (error) {
-                    const status = branchFailureStatus(signal);
+                    // B1: the branch's OWN clock counts as an abort, so a branch the
+                    // timeout stopped is recorded `cancelled` (the honest control outcome)
+                    // rather than `failed`, exactly like a `toolCancel` of the same call.
+                    // `branchFailureStatus` reads the LINKED signal — the scheduler's
+                    // signal alone would not see this controller, and the branch would look
+                    // like it threw on its own. The reason the caller reads is the abort
+                    // reason itself, which names the branch id and the bound that fired.
+                    const status = branchFailureStatus(branchSignal);
                     const info = toErrorInfo(error);
 
                     if (
@@ -8026,6 +8594,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     }
                     throw error;
                 } finally {
+                    // A branch that settled normally must not leave its timer pending
+                    // (an unref'd timer still holds the callback until it fires).
+                    disarmWallClock();
                     activeBranches.delete(metadata.branchId);
                     branchScopes.delete(metadata.branchId);
                     branchStarted.delete(metadata.branchId);
@@ -9776,16 +10347,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // rejects: one bad delivery must not poison the agent's chain).
                 if (run.deliveryError !== undefined) throw run.deliveryError;
 
-                if (run.iteration >= (run.autoAnswer ? 1 : maxIterations)) {
+                // I5 (2026-11-13): the effective turn bound is the TIGHTER of the
+                // harness-wide `maxIterations` (an OPTIONAL safeguard, unarmed unless a
+                // host names one) and this run's own `maxTurns` (the per-child bound a
+                // `delegate` caller asked for). `run.maxTurns` is Infinity when unset, so
+                // this is byte-for-byte the previous expression for every existing path.
+                const turnLimit = run.autoAnswer ? 1 : Math.min(maxIterations, run.maxTurns);
+
+                if (run.iteration >= turnLimit) {
                     // Explicit drain: release everything this run started before
                     // the rollback below, so a failure cannot leave a task that
                     // later inserts into a dead transcript.
                     scheduler.abandonScope(run.scope);
-                    const limit = run.autoAnswer ? 1 : maxIterations;
+                    const limit = turnLimit;
                     throw new HarnessError(
                         run.autoAnswer
                             ? 'The owner fork did not answer in one tool-free response; actionRequest accepts no tools.'
-                            : `Agent "${brain.name}" requested tools more than ${limit} times without answering.`
+                            : // The number in the message is the bound that actually stopped
+                              // the run, and a caller-set `maxTurns` says so explicitly — a
+                              // model that hit its own budget needs to know that widening it
+                              // is its choice, not the harness's.
+                              `Agent "${brain.name}" requested tools more than ${limit} times without answering${
+                                  limit === maxIterations ? '' : `, the ${limit} turns this run was given`
+                              }.`
                     );
                 }
 
@@ -10128,6 +10712,62 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         })();
     };
 
+    // B2 (2026-11-13) — ONE synchronous terminal commit for a finished run.
+    //
+    // WHY THIS EXISTS
+    // --------------
+    // A run's terminal state is TWO facts: the agent-result ledger entry
+    // (`finishInvocation`) and the conversation's release back to `idle`. They used to
+    // happen in two places with an `await` between them — the ledger inside the inner
+    // try/catch, the release in the outer `finally` AFTER `await
+    // releaseBranchesForScope(run)`. Anything a `run.finished`/`run.failed` handler did
+    // in that window saw a conversation that had already answered but was still
+    // `running` and still held its run slot, so `threadDelete` refused with "stop it
+    // first" and a handler could observe the conversation gone while its ledger entry
+    // had not yet been terminal.
+    //
+    // THE INVARIANT: after this returns, the ledger entry is terminal AND the thread is
+    // released, with no await in between, so a delete that arrives once a run is finished
+    // either removes the whole conversation (record, transcript, invocation lookups,
+    // branch records) or refuses on a genuinely live run — never half. `deleteThread`'s
+    // purge also removes the ledger entry (`purgeThread` matches `record.threadId` and
+    // `record.invocationId`), which is what keeps "conversation gone, ledger entry
+    // survives" impossible.
+    //
+    // EVENT ORDER IS PRESERVED ON PURPOSE: only the STATE MOVES EARLIER. The
+    // `thread.idle` emit stays in `runAgent`'s `finally`, still after
+    // `run.finished`/`run.failed` and still after the thread's terminal hooks, because
+    // that relative order is observable (the deferred-dispose note in the same `finally`).
+    // The `finally` keeps its release block as the backstop for a run that ends before
+    // this commit can run (refused after acquiring the actor, an abort that bypasses the
+    // inner try); every statement in it is idempotent, so running both is a no-op.
+    //
+    // A `stopped` record keeps that status: the host's intent survives the abort (the
+    // same rule the `finally` enforces), and no thread state-change notification fires
+    // here for the reason documented at the run-start site (a run already emits
+    // `agent_message` per append).
+    const commitRunTerminal = (
+        run: RunState,
+        outcome: { message?: HarnessAssistantMessage; error?: unknown }
+    ): void => {
+        finishInvocation(run, outcome);
+
+        const threadState = run.threadState;
+        if (threadState === undefined) return;
+        // A different run owns the conversation now (impossible while a run holds the
+        // slot, but the guard is what makes this commit safe to call twice).
+        if (threadState.run !== undefined && threadState.run !== run) return;
+
+        if (threadState.run === run) threadState.run = undefined;
+        if (threadState.controller !== undefined && run.signal === threadState.controller.signal) {
+            threadState.controller = undefined;
+        }
+
+        if (threadState.record.status === 'running') {
+            threadState.record.status = 'idle';
+        }
+    };
+
     // The one entry point every path uses: the harness call, ctx.run, and
     // delegate. Guards live here so none can be bypassed through a tool's
     // general context.
@@ -10163,7 +10803,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // T28: the tool allowlist this run is scoped to (a delegation's `scope.tools`).
         // Omitted means unrestricted. A scoped run neither sees nor can call a tool
         // outside the list (see `declared` and the launch gate).
-        toolScope?: readonly string[]
+        toolScope?: readonly string[],
+        // I5 (2026-11-13): a per-RUN turn bound (model rounds) supplied by the caller that
+        // started this run — today only `delegate`'s `maxTurns`. It can only LOWER the
+        // harness-wide `maxIterations`; omitted/Infinity means "no per-run bound". Carried
+        // onto RunState so the exhaustion guard in `runAgentCore` reads it from the run
+        // (the same place every other per-run bound lives) rather than from a closure.
+        maxTurns?: number
     ): Promise<HarnessAssistantMessage> => {
         // Validation is the first side-effect-free step: a malformed attachment
         // rejects the run with nothing appended, nothing emitted, and no queued
@@ -10391,6 +11037,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // T2.3: a run starts un-stopped; only a `stop` decision sets it.
                 pluginStopped: false,
                 iteration: 0,
+                // I5: the caller-supplied turn bound, normalised the same way
+                // `delegateFor` normalises `timeoutMs` — a missing, non-number,
+                // non-finite or sub-1 value means "no per-run bound" rather than a run
+                // that ends before its first request.
+                maxTurns:
+                    typeof maxTurns === 'number' && Number.isFinite(maxTurns)
+                        ? Math.max(1, Math.floor(maxTurns))
+                        : Number.POSITIVE_INFINITY,
                 dirty: false,
                 // T5.2 — this run's per-turn tool-result tally, on the shared
                 // aggregate cap. Created per run so two concurrent threads never
@@ -11460,7 +12114,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // the historical full-catalogue shape (unrestricted = the R2 baseline).
             // T14: the live nested-run policy of THIS instance.
             nestedRuns: nestedRunPolicy,
-            run: (agentName: string, input: string, options?: { signal?: AbortSignal; tools?: readonly string[] }) => {
+            run: (
+                agentName: string,
+                input: string,
+                options?: { signal?: AbortSignal; tools?: readonly string[]; maxTurns?: number }
+            ) => {
                 // T14: refuse this door before anything resolves (no parent run reaches
                 // `runAgent`'s lineage guard from here).
                 if (nestedRunsRefused()) {
@@ -11490,7 +12148,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         undefined,
                         undefined,
                         // T28: the caller's tool allowlist, enforced on the child.
-                        options?.tools
+                        options?.tools,
+                        // I5: the caller's per-child turn bound (`delegate`'s `maxTurns`),
+                        // enforced on the child run. A manual `executeTool('delegate', …)`
+                        // reaches the child through THIS context, so omitting it here would
+                        // make the same argument work from a model call and be ignored from
+                        // a host call.
+                        options?.maxTurns
                     )
                 );
             }
@@ -11912,9 +12576,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             [...threadStates.values()]
                 .sort((left, right) => left.record.sequence - right.record.sequence)
                 .map((state) => threadRecordCopy(state.record)),
-        thread: (id: string) => {
+        // B1/B4: both reads accept the CALLER's thread id as an optional second argument
+        // (`threadRead.tool.ts` passes `context.threadId`). It switches on the visibility
+        // gate and, for `thread`, the branch-address fallback; omitted, both behave exactly
+        // as they always did — the host view, unscoped, and `undefined` for an id nobody has.
+        thread: (id: string, callerThreadId?: string) => {
+            if (callerThreadId !== undefined && !isAddressVisible(id, callerThreadId)) {
+                throw threadNotVisibleError(id, callerThreadId);
+            }
+
             const state = threadStates.get(id);
-            return state === undefined ? undefined : threadRecordCopy(state.record);
+            if (state !== undefined) return threadRecordCopy(state.record);
+
+            // B1: `branch-N` resolves through the branch ledger, so the id `threadFork`
+            // returned is the id `thread()` and `threadRead` answer with.
+            const branch = branchRecordOf(id);
+            return branch === undefined ? undefined : threadRecordCopy(threadRecordOfBranch(branch));
         },
         threadMessages,
         // C4: the transcript editor's write primitive (validate + replace in place).
