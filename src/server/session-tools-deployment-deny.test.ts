@@ -14,8 +14,10 @@
 //   1. FRESH SESSION UNDER A DENY — the denied row reports `enabled: false` / `protected: false`
 //      / `origin: 'catalogue'` (the seed filtered the deny list out before the pass,
 //      ../harness.ts `seedSwitchableTools`), while every other switchable row keeps its seeded
-//      slot; the GLOBAL row for the same name states the deployment's answer (`enabled: false`),
-//      which is the read a client uses for that figure;
+//      slot. T6 states the enabled figure as the call axis, so the count is 31 of 32 rows and not
+//      21 of 32: the ten names that hold no cap slot are `true` through their declaration list, and
+//      the one false row is the denied name; the GLOBAL row for the same name states the
+//      deployment's answer (`enabled: false`), which is the read a client uses for that figure;
 //   2. NO SESSION ROW FIELD STATES THE DENIAL — the two figures a session row does carry for a
 //      denied name are unrelated facts: `availability` is a CREDENTIAL gate the catalogue states
 //      (absent entirely for `shell`), and `source_available` is the editable-source gate (true).
@@ -88,6 +90,49 @@ const SEEDED_NAMES = [
     'diceRoll',
     'noteSearch',
     'textSummarize'
+];
+
+// The ten names that hold NO `maxEnabledTools` slot. Since T6 the session row's `enabled` is the
+// CALL AXIS, not this capped list: these ten answer `true` through their declaration list, so the
+// enabled figure below is 31 of 32 rows with `shell` denied, not 21 of 32. `shell` is one of the
+// capped names, which is exactly why the deny is visible on it and invisible on a core row.
+const SLOTLESS_NAMES = ['toolRequest', 'tasks', 'delegate', 'toolCancel', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
+
+// All 32 rows in the server's own order (`SEEDED_NAMES` interleaved with `SLOTLESS_NAMES`), so the
+// enabled figure cannot be satisfied by a reordered or partially populated list.
+const ROW_ORDER = [
+    'toolRegistry',
+    'toolRequest',
+    'toolList',
+    'toolManage',
+    'toolCreate',
+    'records',
+    'tasks',
+    'profiles',
+    'chapters',
+    'locations',
+    'agentManage',
+    'agentResult',
+    'delegate',
+    'threadFork',
+    'actionRequest',
+    'toolCancel',
+    'syntax',
+    'read',
+    'write',
+    'edit',
+    'files',
+    'glob',
+    'grep',
+    'shell',
+    'gitDiff',
+    'download',
+    'timeNow',
+    'textCount',
+    'diceRoll',
+    'noteSearch',
+    'textSummarize',
+    'fetch'
 ];
 
 // The two sentences the kernel owns for a denied name: the launch gate's tool RESULT, and the
@@ -283,8 +328,17 @@ describe('a brand-new session under a deployment-wide deny', () => {
         expect('availability' in shell).toBe(false);
         expect(shell.source_available).toBe(true);
 
-        // Every OTHER switchable row keeps the seeded slot, so the deny removed exactly one name.
-        expect(namesWhere(rows, (row) => row.enabled)).toEqual(SEEDED_NAMES.filter((name) => name !== 'shell'));
+        // Every OTHER switchable row keeps its seeded slot, so the deny removed exactly one name —
+        // and the ten rows with no slot are on anyway, through their declaration list. T6 states the
+        // figure as the call axis (31 of 32), where the pre-T6 cap figure read 21 of 32.
+        expect(namesWhere(rows, (row) => row.enabled)).toEqual(ROW_ORDER.filter((name) => name !== 'shell'));
+        expect(namesWhere(rows, (row) => !row.enabled)).toEqual(['shell']);
+        expect(namesWhere(rows, (row) => SLOTLESS_NAMES.includes(row.name as string) && row.enabled)).toEqual(SLOTLESS_NAMES);
+        // Stated the other way round, against the capped list this file seeds: every name that holds
+        // a slot is on except the denied one, so the deny is a one-name removal and nothing else.
+        expect(namesWhere(rows, (row) => row.enabled && SEEDED_NAMES.includes(row.name as string))).toEqual(
+            SEEDED_NAMES.filter((name) => name !== 'shell')
+        );
 
         // The deployment's answer is stated where the deployment is the subject: the global row.
         const globalRow = (await call(api, 'GET', `${MOUNT}/tools/shell`)).body.tool as Record<string, any>;

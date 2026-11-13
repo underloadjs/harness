@@ -239,13 +239,16 @@ const sessionRows = (tools: readonly WireTool[]): SessionToolRowSeed[] => tools.
 // main.ts's `TOOL_ENABLED_TITLE` and `TOOL_DISABLED_TITLE`, and between them they state the three
 // facts the switch actually has — the scope (this conversation's agents and threads), the timing
 // (their NEXT turn, running or idle), and the limit (another tool calling it internally, or a direct
-// REST call, still runs it). Nothing here says a name "cannot be switched": only a server that
+// REST call, still runs it). The off state adds WHY a name can be off, and it names ALL THREE
+// causes a row can answer `enabled: false` for — this conversation's switch, a full capped toolbox,
+// or the deployment deny list (./server/tool-settings.ts), which is off for every conversation and
+// is NOT lifted by clicking here. Nothing here says a name "cannot be switched": only a server that
 // reports no figure at all earns that (`no-enablement`, pinned on its own test below).
 const ENABLED_TITLE =
     'Enabled for this conversation · click to switch it off · the switch covers this conversation’s agents and threads, applies from their next turn whether a thread is running or idle, and does not stop another tool calling it or a direct REST call running it';
 
 const DISABLED_TITLE =
-    'Disabled for this conversation · click to switch it on · the switch covers this conversation’s agents and threads, applies from their next turn whether a thread is running or idle, and does not stop another tool calling it or a direct REST call running it · a name can be off because this conversation switched it off or because its toolbox has no free slot';
+    'Disabled for this conversation · click to switch it on · the switch covers this conversation’s agents and threads, applies from their next turn whether a thread is running or idle, and does not stop another tool calling it or a direct REST call running it · a name can be off because this conversation switched it off, because its toolbox has no free slot, or because this deployment’s tool settings switch it off for every conversation';
 
 const snapshot = (overrides: Partial<SessionSnapshot> = {}): SessionSnapshot =>
     ({
@@ -1360,13 +1363,15 @@ it('switches a tool off and back on with one tile click, and repaints the row fr
 });
 
 it('marks a refused switch on that row\u2019s corner mark and keeps the server sentence on the pill', async () => {
-    // The conversation's own route refuses the write (409 while it is working, 403 for a protected
-    // name — ../shared/harness-api.ts:1885). The sentence is the server's, and R4 leaves it in
-    // exactly two places: this row's corner mark (its `title` and accessible name) and the pill.
-    // Nothing was written, and no re-read follows a failure.
-    const message = 'read cannot be switched off while this conversation is working.';
+    // The conversation's own route REFUSES this write. Under T5's contract that refusal can no
+    // longer come from the two states this fixture used to pin — a working conversation and a
+    // harness-owned name both answer 200 now — so it stands for the one case that is left: the
+    // server refuses for a reason the pane cannot predict (here a plain 500). The sentence is the
+    // server's, and R4 leaves it in exactly two places: this row's corner mark (its `title` and
+    // accessible name) and the pill. Nothing was written, and no re-read follows a failure.
+    const message = 'Tool "read" could not be switched in session "s1".';
     const calls = stubFetch((url, method) => {
-        if (url === '/api/sessions/s1/tools/read' && method === 'PATCH') return json({ error: { message } }, 409);
+        if (url === '/api/sessions/s1/tools/read' && method === 'PATCH') return json({ error: { message } }, 500);
 
         return undefined;
     });
@@ -1456,12 +1461,13 @@ it('takes the refusal mark off a tool row whose next switch is accepted', async 
     // The lifecycle the reader actually walks: press, be refused, press again, land. R4's promise is
     // that a warning never sticks to a row that later succeeded — and the tools pane has no sentence
     // to overwrite, so the mark is the ONLY thing that could get this wrong.
-    const message = 'read cannot be switched off while this conversation is working.';
+    const message = 'Tool "read" could not be switched in session "s1".';
     let refused = 0;
     const calls = stubFetch((url, method) => {
-        // ONE refusal, then the double's own store applies the write.
+        // ONE refusal (the shape the pane cannot predict — see the test above), then the double's
+        // own store applies the write.
         if (url === '/api/sessions/s1/tools/read' && method === 'PATCH' && refused++ === 0)
-            return json({ error: { message } }, 409);
+            return json({ error: { message } }, 500);
 
         return undefined;
     });
@@ -1501,7 +1507,7 @@ it('rebuilds the tools list clean after a refused switch', async () => {
     // repaints it from the cached page (`loadSessionTools` → `buildToolsTab`), and a rebuilt row is
     // a new node — the refusal figure belongs to the node it was painted on, so the map that drives
     // it is emptied with the nodes it describes rather than resurrected onto them.
-    const message = 'read cannot be switched off while this conversation is working.';
+    const message = 'Tool "read" could not be switched in session "s1".';
     const calls = stubFetch((url, method) => {
         if (url === '/api/sessions/s1/tools/read' && method === 'PATCH') return json({ error: { message } }, 409);
 
@@ -1798,24 +1804,31 @@ it('renders a brand-new session with every tile on, and switches one of them wit
     expect(byClass('.status-detail', 'span').textContent).toBe('');
 });
 
-// F2-3 — the figure the reader asked for, rendered from the payload the SERVER actually answers.
+// F2-3 / R5 — the figure the reader asked for, rendered from the payload the SERVER answers.
 //
 // The row list below is MEASURED, not invented: `Temp/final2/f23-probe.ts` boots the real
 // in-process server, creates a session the way `POST /sessions` does, and reads
 // `GET /v1/harness/sessions/{id}/tools?limit=100` (a keyless host, so the three search credential
-// tools stay unregistered). That run answers 32 rows — 22 `enabled: true` / `protected: false` /
-// `origin: 'discovered'`, 10 `enabled: false` / `protected: true` / `origin: 'catalogue'` — and the
-// capture is kept in `Temp/final2/f23-rows.json`. The seeds here restate the KERNEL facts those
-// figures come from (`visibility: 'core'` for the eight declared controls, `pendingOnly` for
-// `toolCancel`, searchable-and-undeclared for the rest) and the shared double derives the wire
-// row, so the payload this test paints is the payload the route answers, field for field.
+// tools stay unregistered). Its 32 registrations are restated here as KERNEL facts —
+// `visibility: 'core'` for the eight declared controls, `pendingOnly` for `toolCancel`,
+// searchable-and-undeclared for the rest — and the shared double derives the wire row from them.
 //
-// What is pinned is the pane's own two figures, NOT a translation of them: every tile PRESSED
-// (`main.ts` `toolRowInContext` — a protected name is in context because the harness holds it, and
-// the reader's complaint was a page that looked empty) and EXACTLY the ten protected tiles LOCKED
-// (`toolSwitchLockOf` — the tile whose PATCH would 403 carries the `aria-disabled` +
-// `data-locked='protected'` pair before the click, which is the other half of the complaint:
-// pressing `delegate` used to produce a refusal).
+// The DERIVATION is the pin, and R5 moved every one of the ten harness-owned rows with it: a
+// registered name is `enabled: true` on a fresh conversation whether or not the harness owns it,
+// so `protected: true` now rides an ENABLED row (it says "cannot be unregistered", and the pane
+// reads nothing off it). Two names are held OFF deliberately, one per flavor the wire can answer:
+//   - `edit` — WITHHELD: a `visibility: 'core'` name this conversation switched off, which is the
+//     flavor that did not exist before R5 (a core row could not be switched off at all);
+//   - `textSummarize` — BEYOND CAP: a searchable name with no slot in the capped toolbox, the
+//     flavor a fresh conversation ships with and nobody switched.
+// Both paint the same `enabled: false` figure, and both are togglable: the pane has no field to
+// tell them apart and invents no second state for them (the tooltip names both possibilities).
+//
+// What is pinned is the pane's own figures, NOT a translation of them: every tile PRESSABLE
+// (`main.ts` `toolRowEnabled` is the row's `enabled` and nothing else), the two withheld rows
+// painted OFF, and NO tile locked — `toolSwitchLockOf` has no reason that applies to a fresh
+// conversation, so the ten harness-owned tiles carry neither `aria-disabled` nor `data-locked`.
+// That is the other half of the original complaint: pressing `delegate` used to produce a refusal.
 const hostRow = (name: string, over: Partial<SessionToolRowSeed> = {}): SessionToolRowSeed => ({
     name,
     group: 'Preset tools',
@@ -1843,13 +1856,17 @@ const MEASURED_SEEDS: readonly SessionToolRowSeed[] = [
     hostRow('delegate', { visibility: 'core', declared: true }),
     hostRow('threadFork'),
     hostRow('actionRequest'),
-    // Protected WITHOUT being declared — a pending-only runtime control (`main.ts` reads the same
-    // figure through the row's `protected`, never by guessing from `visibility`).
+    // Unregisterable WITHOUT being declared — a pending-only runtime control (`main.ts` reads the
+    // same figure through the row's `protected`, never by guessing from `visibility`). It is a
+    // switch like any other.
     hostRow('toolCancel', { pendingOnly: true }),
     hostRow('syntax'),
     hostRow('read', { visibility: 'core', declared: true }),
+    // The row R5 exists for: a `visibility: 'core'` name the reader can switch, and whose tile says
+    // so (the tile of this very row is what the test after this one presses).
     hostRow('write', { visibility: 'core', declared: true }),
-    hostRow('edit', { visibility: 'core', declared: true }),
+    // FALSE FLAVOR 1 — withheld: harness-owned AND switched off by this conversation.
+    hostRow('edit', { visibility: 'core', declared: true, withheld: true }),
     hostRow('files'),
     hostRow('glob', { visibility: 'core', declared: true }),
     hostRow('grep', { visibility: 'core', declared: true }),
@@ -1860,44 +1877,54 @@ const MEASURED_SEEDS: readonly SessionToolRowSeed[] = [
     hostRow('textCount'),
     hostRow('diceRoll'),
     hostRow('noteSearch'),
-    hostRow('textSummarize'),
-    // A core-visibility row that the frozen definition does NOT declare: protected, not declared.
+    // FALSE FLAVOR 2 — beyond cap: an ordinary searchable name with no free slot.
+    hostRow('textSummarize', { beyondCap: true }),
+    // A core-visibility row that the frozen definition does NOT declare: unregisterable, not
+    // declared, and ENABLED like every other registered name.
     hostRow('fetch', { visibility: 'core' })
 ];
 
-// The ten rows the harness owns itself — the exact set the probe reported as `protected: true`.
-const PROTECTED_HOST_NAMES = ['delegate', 'edit', 'fetch', 'glob', 'grep', 'read', 'tasks', 'toolCancel', 'toolRequest', 'write'];
+// The ten rows the harness owns itself — the set the probe reported as `protected: true`, which is
+// the UNREGISTER axis now. They are pinned as the names whose tile must NOT carry a lock marker.
+const HARNESS_OWNED_HOST_NAMES = ['delegate', 'edit', 'fetch', 'glob', 'grep', 'read', 'tasks', 'toolCancel', 'toolRequest', 'write'];
 
-it('paints the measured 32-row new-session payload with every tile pressed and exactly the ten protected tiles locked', async () => {
+// The two rows the payload holds off, one per flavor. `edit` is off through the gate, `textSummarize`
+// through the cap, and the pane paints the identical figure for both.
+const OFF_HOST_NAMES = ['edit', 'textSummarize'];
+
+it('paints the measured 32-row payload with every tile pressable, the two off rows painted off, and no tile locked', async () => {
     const { config } = seededFetch(MEASURED_SEEDS);
 
     // The payload first: the 32 rows the pane is about to paint, in server order, exactly as the
-    // measured route stated them. Any drift in the doubles' derivation shows up here as a name
-    // moving between the enabled and the protected figure — which is the bug the report was about.
+    // route states them. Any drift in the doubles' derivation shows up here as a name moving
+    // between the enabled and the off figure — and every harness-owned name moved in this pass,
+    // because `protected` stopped meaning "reported off" the moment the gate covered it.
     expect(config.toolRows().map((row) => `${row.name}:${String(row.enabled)}:${String(row.protected)}:${row.origin}`)).toEqual([
         'toolRegistry:true:false:discovered',
-        'toolRequest:false:true:catalogue',
+        'toolRequest:true:true:catalogue',
         'toolList:true:false:discovered',
         'toolManage:true:false:discovered',
         'toolCreate:true:false:discovered',
         'records:true:false:discovered',
-        'tasks:false:true:catalogue',
+        'tasks:true:true:catalogue',
         'profiles:true:false:discovered',
         'chapters:true:false:discovered',
         'locations:true:false:discovered',
         'agentManage:true:false:discovered',
         'agentResult:true:false:discovered',
-        'delegate:false:true:catalogue',
+        'delegate:true:true:catalogue',
         'threadFork:true:false:discovered',
         'actionRequest:true:false:discovered',
-        'toolCancel:false:true:catalogue',
+        // A pending-only control is unregisterable, enabled, and (enabled + undeclared) `discovered`
+        // — the three figures the old derivation could not state at the same time.
+        'toolCancel:true:true:discovered',
         'syntax:true:false:discovered',
-        'read:false:true:catalogue',
-        'write:false:true:catalogue',
+        'read:true:true:catalogue',
+        'write:true:true:catalogue',
         'edit:false:true:catalogue',
         'files:true:false:discovered',
-        'glob:false:true:catalogue',
-        'grep:false:true:catalogue',
+        'glob:true:true:catalogue',
+        'grep:true:true:catalogue',
         'shell:true:false:discovered',
         'gitDiff:true:false:discovered',
         'download:true:false:discovered',
@@ -1905,8 +1932,8 @@ it('paints the measured 32-row new-session payload with every tile pressed and e
         'textCount:true:false:discovered',
         'diceRoll:true:false:discovered',
         'noteSearch:true:false:discovered',
-        'textSummarize:true:false:discovered',
-        'fetch:false:true:catalogue'
+        'textSummarize:false:false:catalogue',
+        'fetch:true:true:discovered'
     ]);
 
     await boot();
@@ -1915,52 +1942,65 @@ it('paints the measured 32-row new-session payload with every tile pressed and e
 
     // Every row reaches the pane: the page read is `?limit=25`, so this also proves the cursor
     // walk (`main.ts` `readSessionToolRows`) followed the page instead of stopping at 25 rows.
-    // The figure read is the TILE's: `aria-pressed` for the state, `data-locked` for the reason
-    // a press cannot write, and `title` for the sentence the reader hears.
+    // The figures read are the TILE's: `aria-pressed` for the state, `data-enabled` for the edge
+    // (they must move together), `aria-disabled`/`data-locked` for the refusal, and `title` for the
+    // sentence the reader hears.
     const painted = [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) => {
         const tile = node.querySelector<HTMLButtonElement>('.tool-tab-button')!;
 
         return {
             name: tile.dataset.tool ?? '',
             pressed: tile.getAttribute('aria-pressed'),
+            edge: tile.dataset.enabled,
+            disabled: tile.getAttribute('aria-disabled'),
             locked: tile.dataset.locked,
+            isDisabledAttr: tile.disabled,
             title: tile.title
         };
     });
 
     expect(painted).toHaveLength(32);
-    // The complaint in one figure: on a brand-new conversation NO tile reads as off.
-    expect(painted.filter((row) => row.pressed !== 'true').map((row) => row.name)).toEqual([]);
-    // ...and the complaint that `delegate` errors when pressed: exactly the ten names the route
-    // 403s are the ten tiles that cannot write — each one stating WHY, and none of them using the
-    // `disabled` attribute, because every row keeps its info control.
-    expect(painted.filter((row) => row.locked !== undefined)).toEqual(
-        PROTECTED_HOST_NAMES.map((name) => ({
-            name,
-            pressed: 'true',
-            locked: 'protected',
-            title: 'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
-        }))
-    );
+    // The reader's complaint in one figure: the ONLY tiles that read as off are the two the payload
+    // holds off — one withheld, one beyond the cap. No harness-owned name is painted off any more.
+    expect(painted.filter((row) => row.pressed !== 'true').map((row) => row.name)).toEqual(OFF_HOST_NAMES);
+    // `data-enabled` (the green edge) and `aria-pressed` never disagree, on any of the 32 rows.
+    expect(painted.filter((row) => row.edge !== row.pressed).map((row) => row.name)).toEqual([]);
+    // ...and the complaint that `delegate` errors when pressed: NO tile is locked. The vocabulary
+    // `data-locked` can hold is `writing` / `offline` / `no-enablement`, and none of the three
+    // describes a fresh conversation with a live server — so the marker and `aria-disabled` are
+    // absent on all 32 rows, the harness-owned ten included, and no tile takes `disabled`.
+    expect(painted.filter((row) => row.locked !== undefined).map((row) => row.name)).toEqual([]);
+    expect(painted.filter((row) => row.disabled !== null).map((row) => row.name)).toEqual([]);
+    expect(painted.filter((row) => row.isDisabledAttr).map((row) => row.name)).toEqual([]);
     expect(painted.filter((row) => row.locked === undefined).map((row) => row.name)).toEqual(
-        MEASURED_SEEDS.map((seed) => seed.name)
-            .filter((name) => !PROTECTED_HOST_NAMES.includes(name))
+        MEASURED_SEEDS.map((seed) => seed.name).sort((left, right) => left.localeCompare(right))
+    );
+    // The ten harness-owned rows specifically: pressed (except the withheld `edit`), unlocked, and
+    // named by the LIVE sentence — never "cannot be switched here".
+    expect(painted.filter((row) => HARNESS_OWNED_HOST_NAMES.includes(row.name))).toEqual(
+        [...HARNESS_OWNED_HOST_NAMES]
             .sort((left, right) => left.localeCompare(right))
+            .map((name) => ({
+                name,
+                pressed: name === 'edit' ? 'false' : 'true',
+                edge: name === 'edit' ? 'false' : 'true',
+                disabled: null,
+                locked: undefined,
+                isDisabledAttr: false,
+                title: name === 'edit' ? DISABLED_TITLE : ENABLED_TITLE
+            }))
     );
     // Every row of the payload has its own corner mark, locked rows included — the dialog is
-    // reachable from all 32 rows even though ten of them cannot be switched.
+    // reachable from all 32 rows whatever their enablement says.
     expect(document.querySelectorAll('.tool-tab-info')).toHaveLength(32);
     expect(document.querySelectorAll('.tool-tab-enable')).toHaveLength(0);
 
-    // The two tooltip sentences, stated per row rather than counted: a locked tile says WHY the
-    // harness holds it, a live tile says it can be switched off. A protected row that read as
-    // "off, click to switch it on" is the lie this pass exists to remove.
+    // The two tooltip sentences, stated per row rather than counted: an enabled tile says the switch
+    // covers this conversation's agents and threads, an off tile says the same and names the two
+    // reasons a name can be off. A tile that claimed the harness holds the name is the lie this pass
+    // exists to remove, so the sentence is asserted verbatim for all 32 rows.
     for (const row of painted) {
-        expect(row.title).toBe(
-            PROTECTED_HOST_NAMES.includes(row.name)
-                ? 'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
-                : ENABLED_TITLE
-        );
+        expect(row.title).toBe(OFF_HOST_NAMES.includes(row.name) ? DISABLED_TITLE : ENABLED_TITLE);
     }
 
     // The row SET is A–Z (R5), and the head note counts what it renders — both halves of "32 rows"
@@ -1968,6 +2008,90 @@ it('paints the measured 32-row new-session payload with every tile pressed and e
     // pane (`main.ts` `paintToolsHead` writes the count line).
     expect(painted.map((row) => row.name)).toEqual([...MEASURED_SEEDS.map((seed) => seed.name)].sort((left, right) => left.localeCompare(right)));
     expect(byClass('.harness-note', 'p').textContent).toBe('32 tools · the toolbox of this conversation');
+});
+
+// R5 — the reader's words: "I noticed some tools like 'write' says 'Always in context for this
+// conversation'. This is incorrect. All tools can be toggled off."
+//
+// `write` is the exact regression: a `visibility: 'core'` name, `protected: true` on the wire (the
+// unregister axis), and the tile that used to render `aria-disabled` + `data-locked="protected"`
+// and swallow the press. This test presses it and pins the whole chain — no lock marker, one PATCH
+// on the conversation's route, the shared double's 200 (NOT a 403), the re-read that moves the
+// green edge, and the corner mark that stays a plain info glyph because nothing was refused.
+it('switches a formerly-protected core row (`write`) from its tile, and the green edge follows the write', async () => {
+    const { calls, config } = seededFetch(MEASURED_SEEDS);
+
+    // The wire figure the tile is painted from: `write` is protected AND enabled, the pair the old
+    // derivation could not produce.
+    expect(config.toolRows().find((row) => row.name === 'write')).toMatchObject({ enabled: true, protected: true });
+
+    await boot();
+    openTools();
+    await flush();
+
+    const tile = toolTile('write');
+    const mark = toolInfo('write');
+
+    // NOT locked, NOT `aria-disabled`, NOT `disabled` — and its tooltip is the live one.
+    expect(tile.dataset.enabled).toBe('true');
+    expect(tile.getAttribute('aria-pressed')).toBe('true');
+    expect(tile.getAttribute('aria-disabled')).toBeNull();
+    expect(tile.dataset.locked).toBeUndefined();
+    expect(tile.disabled).toBe(false);
+    expect(tile.title).toBe(ENABLED_TITLE);
+
+    tile.click();
+
+    // In flight: the ONLY lock that exists is this tile's own write, and it is the one the reader
+    // cannot cause twice.
+    expect(tile.getAttribute('aria-busy')).toBe('true');
+    expect(tile.dataset.locked).toBe('writing');
+    expect(tile.title).toBe('Switching this tool for this conversation…');
+
+    await flush();
+    await flush();
+
+    // One write, on the conversation's route, with the contract's body — and the double ANSWERED it
+    // (a 403 would have left `toolWrites` empty of the effect and put the server's sentence on the
+    // mark). The deployment route is never dialled.
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/sessions/s1/tools/write', method: 'PATCH', body: { enabled: false } }
+    ]);
+    expect(calls.filter((call) => call.url === '/api/tools/write' && call.method === 'PATCH')).toEqual([]);
+    expect(config.toolWrites).toEqual([{ name: 'write', body: { enabled: false } }]);
+
+    // THE FIGURE, on the control that performed it: the edge and the toggle followed the server's
+    // answer, and the tooltip switched to the off sentence.
+    expect(byClass('.tool-tab-button[data-tool="write"]', 'button')).toBe(tile);
+    expect(tile.dataset.enabled).toBe('false');
+    expect(tile.getAttribute('aria-pressed')).toBe('false');
+    expect(tile.getAttribute('aria-busy')).toBe('false');
+    expect(tile.dataset.locked).toBeUndefined();
+    expect(tile.getAttribute('aria-disabled')).toBeNull();
+    expect(tile.title).toBe(DISABLED_TITLE);
+
+    // Nothing was refused, so the row wears no warning glyph and the pill is idle again.
+    expect(markState(mark)).toBe('idle:info');
+    expect(mark.querySelector('path')?.getAttribute('d')).toBe(INFO_ICON_PATH);
+    expect(markNaming(mark)).toEqual(['Details for write', 'Details for write']);
+    expect(byClass('.status-text', 'span').textContent).toBe('idle');
+    expect(byClass('.status-detail', 'span').textContent).toBe('');
+
+    // A second press switches it back ON — the withheld figure is a gate the reader owns, not a
+    // one-way door, and a harness-owned name returns to the tool list like any other.
+    tile.click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(2);
+    expect(config.toolWrites).toEqual([
+        { name: 'write', body: { enabled: false } },
+        { name: 'write', body: { enabled: true } }
+    ]);
+    expect(tile.dataset.enabled).toBe('true');
+    expect(tile.getAttribute('aria-pressed')).toBe('true');
+    expect(tile.title).toBe(ENABLED_TITLE);
+    expect(markState(mark)).toBe('idle:info');
 });
 
 // R1 (swap)'s click separation: the tile and the corner mark are two controls in one row, and
@@ -2028,7 +2152,7 @@ it('writes enablement from the tile without opening the runner, and the corner m
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').dataset.enabled).toBe('false');
 });
 
-it('keeps the tools page and its rows usable while a run is pending, and locks every switch that route would refuse', async () => {
+it('keeps the tools page and its rows usable while a run is pending, and switches every row mid-run', async () => {
     // The conversation the shell opens on boot still holds work, so the whole shell is in
     // its pending state — the state that used to hide the tools page entirely.
     const running = snapshot({
@@ -2076,15 +2200,16 @@ it('keeps the tools page and its rows usable while a run is pending, and locks e
     // attribute, because its corner mark has to keep opening the dialog.
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').disabled).toBe(false);
 
-    // T4: the SWITCH is a different story. `PATCH /sessions/{id}/tools/{id}` answers 409 unless the
-    // session is idle (../shared/harness-api.ts:1873, `assertIdleForToolMutation` in
-    // src/server/api.ts), so main.ts states that rule on the control BEFORE the click
-    // (`toolSwitchLockOf` → 'running') instead of taking the refusal on the chin afterwards.
+    // R5: the SWITCH is the same story as the page. `PATCH /sessions/{id}/tools/{id}` `{ enabled }`
+    // is a write-anytime route — the old idle-window 409 and the old protected-name 403 are gone,
+    // because the switch is agent-facing and lands on the agents' NEXT turn — so main.ts locks
+    // nothing while this thread runs: no `aria-disabled`, no `data-locked`, and the live tooltip.
     const runningTile = toolTile('read');
 
-    expect(runningTile.getAttribute('aria-disabled')).toBe('true');
-    expect(runningTile.dataset.locked).toBe('running');
-    expect(runningTile.title).toBe('This conversation is working · the switch unlocks when its run ends');
+    expect(runningTile.getAttribute('aria-disabled')).toBeNull();
+    expect(runningTile.dataset.locked).toBeUndefined();
+    expect(runningTile.getAttribute('aria-pressed')).toBe('true');
+    expect(runningTile.title).toBe(ENABLED_TITLE);
 
     // A row is clickable mid-run: its runner opens over the list, schema read and all — from the
     // corner mark, which a pending run never locks.
@@ -2094,19 +2219,29 @@ it('keeps the tools page and its rows usable while a run is pending, and locks e
     await flush();
     expect(byClass('.stage', 'div').querySelector('.tools-pane')?.isConnected).toBe(true);
 
-    // A locked tile swallows the press in its handler, so the run costs the conversation no write
-    // and no 409: the toolbox traffic of this fixture is the single read that opened the pane.
+    // And the press WRITES. This is the half R5 changed: the tile used to swallow it to spare the
+    // conversation a 409, and now the switch goes out while the thread is still running, the route
+    // accepts it, and the re-read moves the green edge.
     runningTile.click();
     await flush();
     await flush();
 
-    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
-    // The whole toolbox traffic of this fixture is the ONE read that opened the pane: the locked
-    // control costs the conversation no write and no 409 round-trip.
-    expect(toolboxTraffic(calls)).toEqual([{ url: TOOLBOX_PAGE_URL, method: undefined, body: undefined }]);
-    // And the figure is exactly what it was before the press: nothing moved, optimistically or
-    // otherwise.
-    expect(toolTile('read').getAttribute('aria-pressed')).toBe('true');
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/sessions/s1/tools/read', method: 'PATCH', body: { enabled: false } }
+    ]);
+    // The whole toolbox traffic of this fixture: the read that opened the pane, the write the run
+    // no longer blocks, and the re-read that repaints the row from the accepted figure.
+    expect(toolboxTraffic(calls)).toEqual([
+        { url: TOOLBOX_PAGE_URL, method: undefined, body: undefined },
+        { url: '/api/sessions/s1/tools/read', method: 'PATCH', body: { enabled: false } },
+        { url: TOOLBOX_PAGE_URL, method: undefined, body: undefined }
+    ]);
+    // The figure the agents see from their next turn, painted on the tile the reader pressed — with
+    // the conversation still running, which is the whole point of the route being write-anytime.
+    expect(toolTile('read').getAttribute('aria-pressed')).toBe('false');
+    expect(toolTile('read').dataset.enabled).toBe('false');
+    expect(toolTile('read').title).toBe(DISABLED_TITLE);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');
 });
 
 // ---------------------------------------------------------------------------

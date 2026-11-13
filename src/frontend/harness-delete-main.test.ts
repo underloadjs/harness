@@ -136,9 +136,11 @@ const stubServer = (options: {
         // so the runner pays the deployment's identified detail read (`GET /tools/{name}`,
         // ./api.ts `getTool`) — execution stayed deployment-scoped. Both come from the same
         // `tools` list these fixtures already state, and `sessionToolRow` gives the row the
-        // SERVER's semantics for `protected`/`declared`/`origin`/`enabled`
-        // (./session-config-test-support.ts, src/server/api-reads.ts:1003-1032) — including
-        // `enabled: false` on the core name below, which is the figure the server really sends.
+        // contract's semantics for `protected`/`declared`/`origin`/`enabled`
+        // (./session-config-test-support.ts): `protected` is the UNREGISTER axis, and R5 means the
+        // pane reads only `enabled` — which these fixtures leave at the double's default (ON for a
+        // registered name), because a conversation's toolbox here is a subject for the delete flow,
+        // not a figure this file pins.
         const toolboxMatch = /^\/api\/sessions\/[^/]+\/tools/.exec(url);
 
         if (toolboxMatch !== null && method === undefined) {

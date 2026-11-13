@@ -666,8 +666,19 @@ const reserve = (identities: Partial<Record<IdSpace, number>>): HarnessIdentityR
 // a frame - including what it dropped and why - without reaching into harness internals, and so
 // the warm-lane tests can state the difference between "installed" and "silently ignored".
 export type LaneToolStateReconcile = {
-    // The names this replica now holds, in each of the two canonical lists, pruned to what this
-    // replica can honour. Equal to the frame's lists minus `dropped`.
+    // WHAT THE FRAME ASKED FOR, pruned to what this replica could honour - NOT a read of the two
+    // sets this replica ends up holding. The two genuinely differ, in both directions, and `dropped`
+    // does not cover either difference:
+    //   - `enabled` can name a slot this replica never took: step 3's `requestTools` insert is
+    //     capped, so when the cap binds the kernel evicts one of the names this list carries, and
+    //     the pruner says nothing because it only judges what the FRAME could mean, not what the
+    //     CAP could hold (./lane-tool-reconcile.test.ts, the capped fixture);
+    //   - `withheld` can leave out a name this replica IS flagged for: step 4 flags every capped
+    //     name it withdraws (the residue below), and a name canonical merely evicted never appears
+    //     in the frame's `withheld` at all - so the return has said `['probeCore']` while the
+    //     replica held `['probeCore', 'probeOther']`.
+    // The replica's real state is the harness's own `discoveredTools` / `withheldTools`, which is
+    // what every case here asserts alongside this report.
     enabled: string[];
     withheld: string[];
     // Names the frame carried that THIS replica could not install, each with its reason. A
@@ -685,9 +696,10 @@ export type LaneToolStateReconcile = {
  * The frame is one-way (no id, no receipt, no ordering guarantee beyond the port), the switch is
  * per-SESSION while lanes are per-conversation and appear and disappear, and a lane may have
  * been rebuilt from a fresh snapshot between two frames. Setting both lists from the payload
- * makes every frame independently sufficient: a duplicate lands the same state, a late one lands
- * the newer state, and a lost one is covered by the next click. A delta would need all three to
- * be true at once.
+ * makes every frame independently sufficient: a duplicate lands the same SWITCH state (the cap
+ * arithmetic step 3 performs can still move which name holds a slot - see THE RESIDUE below), a
+ * late one lands the newer state, and a lost one is covered by the next click. A delta would need
+ * all three to be true at once.
  *
  * WHY IT USES THE KERNEL SEAMS INSTEAD OF A NEW ONE
  * -------------------------------------------------
@@ -714,12 +726,22 @@ export type LaneToolStateReconcile = {
  *
  * THE RESIDUE, stated rather than hidden (step 4): the only seam that frees a cap slot is
  * `disable`, which also sets the switch flag, so a name canonical merely EVICTED (cap pressure,
- * not a user action) ends up flagged on the replica as well as off its list. That is the
- * redundant-but-safe direction: a flagged-and-uncapped name is undeclared and refused at the
- * gate, which is exactly canonical's behaviour for it, and the flag is self-clearing - the next
- * frame's step 2 removes it, and a canonical grant for that name is replayed with the flag
- * cleared in `applySync` above. The flag can never make the lane MORE permissive than canonical,
- * which is the only invariant a reconcile has to keep.
+ * not a user action) ends up flagged on the replica as well as off its list - and the returned
+ * `withheld` does not name it, because that field is the frame's pruned ask, not this replica's
+ * set. That is the redundant-but-safe direction: a flagged-and-uncapped name is undeclared and
+ * refused at the gate, which is exactly canonical's behaviour for it. THE FLAG IS NOT
+ * SELF-CLEARING: a repeated identical frame re-creates it - step 2 clears it, step 4 puts it
+ * straight back - so a steady frame holds the residue as a FIXED POINT rather than dissolving it.
+ * Only a frame whose `enabled` list carries the name again, or a grant for it replayed in
+ * `applySync` above, takes the name out of the flag set for good.
+ *
+ * AND WHEN THE CAP BINDS, the residue costs a slot. Step 2's re-enable re-takes a cap slot
+ * newest-first before step 4 gives it back, so on a full toolbox one of the names the frame lists
+ * can end up MISSING from this replica's catalogue, and which one survives can move between two
+ * identical frames. The invariant that does hold is the one that matters: a reconcile never makes
+ * this lane MORE permissive than canonical - every name it declares is a name canonical declares -
+ * while it may legitimately declare fewer. Both halves, plus the fixed point, are pinned against a
+ * capped harness in ./lane-tool-reconcile.test.ts.
  *
  * `target` defaults to the live lane's replica and its captured LOCAL runtime; a test passes a
  * plain harness and its own runtime so the reconcile can be pinned without spawning a thread
@@ -750,8 +772,12 @@ export const applyToolStateSync = (
 
         for (const name of names) {
             // A non-string or blank member is wire junk, not a name. It is SKIPPED rather than
-            // reported: the kernel throws on a blank name (`toolManage requires a non-empty tool
-            // name`), and there is no name to name in the result.
+            // reported: the routed door this applier calls refuses a blank name outright
+            // (`toolManage ${operation} requires \`name\`.`, src/harness.ts `manageTool` case
+            // 'enable' / 'disable'), and there is no name to name in the result. A WHITESPACE-only
+            // name is NOT skipped: that same test is `values.name.length === 0`, so a name-shaped
+            // string gets through and is refused as unregistered — which is why `'   '` is dropped
+            // and REPORTED two blocks below.
             if (typeof name !== 'string' || name.length === 0 || seen.has(name)) continue;
 
             seen.add(name);
@@ -813,6 +839,12 @@ export const applyToolStateSync = (
 
     // Step 4: free the capped slots this replica holds and canonical does not, and that are not
     // already accounted for by step 1 (a name the frame withholds left the list in step 1).
+    //
+    // `disable` is the ONLY seam that frees a slot, and it sets the switch flag on the way out, so
+    // every name withdrawn here leaves FLAGGED (see THE RESIDUE in the block comment above): the
+    // replica withholds a name canonical may merely have evicted. The direction is safe — a
+    // flagged name is undeclared and gate-refused, exactly as canonical treats it — and the flag is
+    // a fixed point across identical frames, not something the next frame clears.
     const stillEnabled = new Set(replica.discoveredTools);
     const stale = [...stillEnabled].filter((name) => !wantEnabled.has(name) && !wantWithheld.has(name));
 
@@ -1640,6 +1672,12 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
     // `.pendingToolSync`): the coordinator has ALREADY posted the newer state, so applying it on
     // top of the blueprint's is what makes "toggle a tool while the lane is starting" land rather
     // than vanish. Cleared here so a later hello on a rebuilt replica cannot re-apply a stale one.
+    //
+    // Mutation-probed as DEFENSIVE rather than load-bearing with today's host: the worker drains the
+    // whole hello install before the frame posted at `lanes.set` is ever processed
+    // (./lane-host.ts:872-874), so the boot-window case in ../lane-tool-reconcile.test.ts stays
+    // green with this stash removed. It stays because that ordering is a host implementation detail,
+    // not a protocol guarantee - an `await` ahead of this install would make it live again.
     const earlySync = state.pendingToolSync;
 
     state.pendingToolSync = undefined;
@@ -1948,7 +1986,10 @@ const handle = async (frame: LaneCommand): Promise<void> => {
             if (state.replica === undefined) {
                 // Mid-handshake. Stashed and applied at the end of hello (see LaneWorkerState
                 // `.pendingToolSync`); a fault here would fail the handshake over a settings
-                // frame, which is the wrong size of answer.
+                // frame, which is the wrong size of answer. Mutation-probed: with today's host the
+                // worker drains the hello install before this frame is ever processed, so the path
+                // is defensive rather than load-bearing (lane-tool-reconcile.test.ts, boot-window
+                // case). It stays because a future `await` ahead of the install would make it live.
                 state.pendingToolSync = frame.tools;
                 return;
             }

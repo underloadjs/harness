@@ -3953,9 +3953,9 @@ export type Harness = {
     // belongs to the harness built IN THIS PROCESS. A session created before a restart is built
     // again on the restore path, so a host that wants `reset` to answer the same toolbox after a
     // restart has to ask for the seed on THAT build too. The shipped store does
-    // (`src/server/sessions.ts:2204` for a create, `:3843` for a restore) and it is safe there:
-    // `restore()` replaces the enabled set from the persisted snapshot afterwards
-    // (`src/harness.ts:11676`), so the seed refills nothing until a reset asks for it. Built
+    // (`src/server/sessions.ts` `create` for a create, `restoreSession` for a restore) and it is
+    // safe there: `restore()` replaces the enabled set from the persisted snapshot afterwards
+    // (`src/harness.ts` `restore`), so the seed refills nothing until a reset asks for it. Built
     // unseeded, this seam is a no-op on a restored session and its reset silently answers an
     // empty toolbox while the same session, reset in its own process, answers a full one.
     //

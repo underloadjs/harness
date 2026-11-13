@@ -917,9 +917,12 @@ it('lays out each catalogue row as a switch tile plus its own corner info contro
     expect(rules).not.toContain('.tool-tab-enable');
 
     // A locked switch is inert but never `disabled`, so the cursor is the only thing that can
-    // say it: `data-locked` names the reason (protected / running / writing / offline for tools,
-    // writing / offline for plugins) and `writing` keeps the progress cursor the busy tick box
-    // used to carry.
+    // say it. R5 cut the reason set to the states that really refuse a write: `writing` (this
+    // tile's own PATCH is in flight) plus the two the lock helper cannot see — `offline` for the
+    // tools tile when no server answers, and `no-enablement` for a row whose server reported no
+    // figure at all. The `protected` and `running` markers are gone, because a harness-owned name
+    // and a working conversation both answer a switch now; the Plugins pane always had the
+    // shorter set (`writing` / `offline`). Both panes keep the progress cursor for `writing`.
     expect(blockOf('.tool-tab-button[data-locked] {')).toContain('cursor: default');
     expect(blockOf(".tool-tab-button[data-locked='writing'] {")).toContain('cursor: progress');
 

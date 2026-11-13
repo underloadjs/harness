@@ -1867,32 +1867,35 @@ export type SessionToolSummary = ToolSummary
      * switched off, which is the ONLY record for a core or pending-only name because such a name has no cap
      * slot), and the capped set (`harness.discoveredTools` - which names currently hold one of the
      * `maxEnabledTools` slots). A name that holds a slot is on exactly while the capped set holds it; a name
-     * with NO slot - a core declaration, or the pending-only `toolCancel` - is in context through the
-     * declaration list, so it answers `true` unless this conversation switched it off. THE TWO FALSES ARE
-     * DIFFERENT FACTS and a client must not merge them: a WITHHELD name is one the operator turned off, and
-     * `toolRequest` cannot even list it any more (not as `forbidden` - simply absent), while an OFF-SLOT name
-     * is one the cap evicted or this conversation has not discovered yet, which is not the user's decision,
-     * keeps showing up in this list, and is one `toolRequest` round away from being callable again. A session
-     * this server created NEW answers `true` for every row the deployment has not denied: the toolbox is seeded
-     * from the kernel's own switchable names when the harness is built, and the operator's deny list is
-     * filtered out of that pass first (`./tool-settings.ts` - the same provider the GLOBAL Tools row's
-     * `enabled` states); a session the server RESETS answers the same way, because a reset starts a new
-     * conversation, re-runs that one pass, and clears every switch this conversation had made. THE SCOPE OF
-     * THAT PROMISE, stated plainly: this figure is one conversation's own state, and the deployment-wide switch
-     * OUTRANKS it. A name the operator has denied is hidden from a model's declarations, refused at the launch
-     * gate, and answered `forbidden` by `toolRequest` whatever this row says, so a ticked row on a denied name
-     * is a true statement about this conversation and no promise of capability. Both authority directions hold,
-     * deliberately: a session CAN hold a denied name enabled - a session-scoped `PATCH` of it answers 200 and
-     * persists across a restart - and a denial that lands mid-life rewrites none of this session's rows. A
-     * client that needs the deployment's answer asks the global read (`GET /v1/harness/tools`), which states it
-     * per name; no session row field carries it. What this figure does NOT gate, in either direction: the
-     * operator's own doors. `PATCH` writes this switch, and switching a tool off restricts the agents and
-     * threads of THIS conversation only - it is accepted while a thread is RUNNING (no idle gate, and no 403
-     * for a harness-owned name: every registered row answers 200), it lands on that thread's very next model
-     * request, and it never un-registers anything. A nested call made by another tool (`context.callTool`) and
-     * a manual REST execution (`POST /v1/harness/sessions/{session_id}/tools/{tool_id}/executions`) still run
-     * the switched-off name, and a name this row reports `false` for stays listed here, because the operator
-     * needs to see the tool they just hid from the model.
+     * with NO slot - a core declaration, or the pending-only `toolCancel` - is in context through its
+     * declaration list instead, so it reports `true` until this conversation switches it off: the switch IS
+     * recorded for such a name (in `withheldTools`), it simply has no cap slot to evict. A slotless row is
+     * therefore never `false` because of the cap, and removing it entirely is `DELETE`'s job (which the kernel
+     * refuses for a core name). THE TWO FALSES ARE DIFFERENT FACTS and a client must not merge them: a WITHHELD
+     * name is one the operator turned off, and `toolRequest` cannot even list it any more (not as `forbidden` -
+     * simply absent), while an OFF-SLOT name is one the cap evicted or this conversation has not discovered
+     * yet, which is not the user's decision, keeps showing up in this list, and is one `toolRequest` round away
+     * from being callable again. A session this server created NEW answers `true` for every row the deployment
+     * has not denied: the toolbox is seeded from the kernel's own switchable names when the harness is built,
+     * and the operator's deny list is filtered out of that pass first (`./tool-settings.ts` - the same provider
+     * the GLOBAL Tools row's `enabled` states); a session the server RESETS answers the same way, because a
+     * reset starts a new conversation, re-runs that one pass, and clears every switch this conversation had
+     * made. THE SCOPE OF THAT PROMISE, stated plainly: this figure is one conversation's own state, and the
+     * deployment-wide switch OUTRANKS it. A name the operator has denied is hidden from a model's declarations,
+     * refused at the launch gate, and answered `forbidden` by `toolRequest` whatever this row says, so a ticked
+     * row on a denied name is a true statement about this conversation and no promise of capability. Both
+     * authority directions hold, deliberately: a session CAN hold a denied name enabled - a session-scoped
+     * `PATCH` of it answers 200 and persists across a restart - and a denial that lands mid-life rewrites none
+     * of this session's rows. A client that needs the deployment's answer asks the global read (`GET
+     * /v1/harness/tools`), which states it per name; no session row field carries it. What this figure does NOT
+     * gate, in either direction: the operator's own doors. `PATCH` writes this switch, and switching a tool off
+     * restricts the agents and threads of THIS conversation only - it is accepted while a thread is RUNNING (no
+     * idle gate, and no 403 for a harness-owned name: every registered row answers 200), it lands on that
+     * thread's very next model request, and it never un-registers anything. A nested call made by another tool
+     * (`context.callTool`) and a manual REST execution (`POST
+     * /v1/harness/sessions/{session_id}/tools/{tool_id}/executions`) still run the switched-off name, and a
+     * name this row reports `false` for stays listed here, because the operator needs to see the tool they just
+     * hid from the model.
      */
     enabled: boolean;
     /**

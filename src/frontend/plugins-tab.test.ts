@@ -105,7 +105,11 @@
 //   - the tile is NEVER the `disabled` attribute — it keeps focus and keeps answering the press,
 //     and an inert switch says WHY with `data-locked` (`writing` = its own PATCH in flight,
 //     `offline` = no server; there is no `protected` and no idle-window twin here) plus
-//     `aria-disabled`. A locked press costs the conversation no request;
+//     `aria-disabled`. A locked press costs the conversation no request. R5 moved the Tools
+//     Catalogue onto this SAME one-reason set — its `writing` is its own PATCH, and its two extra
+//     markers are the states the lock helper cannot see (`offline` = no server, `no-enablement` =
+//     a row whose server reported no figure) — so a mid-run press writes in both panes and no tool
+//     row is locked for being harness-owned (./tools-tab.test.ts pins it);
 //   - the row's top-right CORNER IS AN INFO BUTTON (`button.plugin-tab-info`, `Details for
 //     <title>`, the shared `ui/info-icon.ts` glyph) and it is the ONLY dialog opener. It is never
 //     locked, never absent, and it is the layer's `returnFocus` target. "Which layer is open" is
@@ -719,6 +723,11 @@ const stub = (fixture: Fixture = {}): { calls: Call[]; dialed: string[]; settleR
     // `settled` is A5's knob: the bounded fallback refresh answers with the terminal
     // record once the test flips it, which is the run completing WHILE the pane is open.
     const state = { reads: 0, patches: 0, settled: false };
+    // R5: the ONE enablement figure this fixture's toolbox reports. The tool PATCH route used to be
+    // undeclared here (a write was unthinkable mid-run); now the double keeps the figure the same way
+    // the plugin store keeps its settings, so the pane's repaint-after-write is pinned against a
+    // server that actually moved.
+    const toolEnablement = { enabled: true };
     const plugins = pluginRoutes(fixture, calls, state);
 
     const raw = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response | undefined> => {
@@ -752,10 +761,12 @@ const stub = (fixture: Fixture = {}): { calls: Call[]; dialed: string[]; settleR
 
         // T4: the ⚒ pane describes the CONVERSATION on screen, so it dials
         // `GET /sessions/{id}/tools`. The only tool these fixtures describe is `read` (the boot
-        // document's `tools` page above), and the row shape is the SERVER's rule for `protected`,
-        // `declared`, `origin` and `enabled` — `sessionToolRow` states
-        // src/server/api-reads.ts:1003-1032, so the pane paints a discovered, switchable name
-        // rather than a fixture invention.
+        // document's `tools` page above), and the row shape is the CONTRACT's —
+        // `sessionToolRow` builds what ../shared/harness-api.ts `SessionToolSummary` states for
+        // `protected` (the unregister axis), `declared`, `origin` and `enabled`, so the pane paints
+        // a registered, switchable name rather than a fixture invention. `enabled` rides the
+        // switchable `toolEnablement` figure below, which is what makes the repaint-after-write
+        // assertion in the mid-run case real.
         if (url.match(/^\/api\/sessions\/[^/]+\/tools(\?limit=25)?$/) !== null && method === undefined) {
             return json(
                 sessionToolPage([
@@ -765,10 +776,21 @@ const stub = (fixture: Fixture = {}): { calls: Call[]; dialed: string[]; settleR
                         description: 'Read one or more files.',
                         tags: ['files', 'read'],
                         visibility: 'searchable',
-                        enabled: true
+                        enabled: toolEnablement.enabled
                     })
                 ])
             );
+        }
+
+        // R5: the toolbox PATCH. The route is WRITE-ANYTIME — no idle window and no protected-name
+        // refusal (../shared/harness-api.ts `UpdateSessionToolRequest`) — so the double answers 200
+        // mid-run AND moves the figure the read above reports. The body is the contract's
+        // `{ enabled }`; the reply is the registration ack (`SessionToolRegistrationResponse`),
+        // which the pane ignores because it re-reads the collection to repaint the row.
+        if (/^\/api\/sessions\/[^/]+\/tools\/[^/]+$/.test(url) && method === 'PATCH') {
+            toolEnablement.enabled = (body as { enabled?: boolean }).enabled === true;
+
+            return json({ registration: { name: 'read', source: 'static', injected: false } }, 200);
         }
 
         // A toolbox row carries NO argument schema (../shared/harness-api.ts `SessionToolSummary`),
@@ -1699,28 +1721,41 @@ it('keeps the plugins and tools pages, their rows and their switches usable whil
     expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').disabled).toBe(false);
 
-    // R1 (the swap): the tools switch IS the row's tile. It never takes the `disabled`
-    // attribute — the row keeps its focus and its corner mark keeps opening the dialog — so the
-    // locked state is the `aria-disabled` + `data-locked='running'` pair.
+    // R1 (the swap) + R5: the tools switch IS the row's tile, and it behaves exactly like the
+    // plugin tiles above — a mid-run press is a write, not a swallowed click. The tile never takes
+    // the `disabled` attribute (the row keeps its focus and its corner mark keeps opening the
+    // dialog), and `enabled` writes have no idle gate on the route (../shared/harness-api.ts
+    // `UpdateSessionToolRequest`), so there is no lock marker and no `aria-disabled` here either.
     const toolSwitch = byClass('.tool-tab-button[data-tool="read"]', 'button');
 
-    // T4: that row is THIS conversation's toolbox, and the server answers 409 for any session tool
-    // write outside an idle window (src/server/api-session-tool-writes.ts), so EVERY tool switch is
-    // locked while the conversation works — the opposite of the plugin tick boxes above it, whose
-    // route has no idle gate and which stay live. The figure is still painted from the row, and the
-    // row still opens its runner (execution stayed deployment-scoped).
-    expect(toolSwitch.getAttribute('aria-disabled')).toBe('true');
-    expect(toolSwitch.dataset.locked).toBe('running');
-    expect(toolSwitch.title).toBe('This conversation is working · the switch unlocks when its run ends');
+    // T4: that row is THIS conversation's toolbox. The 409 this fixture used to answer for any
+    // session tool write outside an idle window is gone, so the two catalogues now behave the same
+    // way while the conversation works: live switch, figure painted from the row, runner still
+    // reachable from the corner mark.
+    expect(toolSwitch.getAttribute('aria-disabled')).toBeNull();
+    expect(toolSwitch.dataset.locked).toBeUndefined();
+    expect(toolSwitch.title).toBe(
+        'Enabled for this conversation · click to switch it off · the switch covers this conversation’s agents and threads, applies from their next turn whether a thread is running or idle, and does not stop another tool calling it or a direct REST call running it'
+    );
     expect(toolSwitch.getAttribute('aria-pressed')).toBe('true');
 
     // A tool row opens its runner mid-run as well — from the corner mark, which a run never
-    // locks, while the locked tile costs no PATCH.
+    // locks, and which costs the conversation no PATCH.
     byClass('.tool-tab-info[data-tool="read"]', 'button').click();
     expect(byClass('.dialog-title', 'h2').textContent).toBe('read');
     expect(dialed.filter((line) => line.startsWith('PATCH /v1/harness/sessions/s1/tools/'))).toEqual([]);
     byClass('.dialog-close', 'button').click();
     await flush();
+
+    // And the tool tile WRITES mid-run, exactly like the plugin tile above: one PATCH on the
+    // conversation's toolbox, and the row repaints from the answer.
+    toolSwitch.click();
+    await flush();
+    await flush();
+
+    expect(dialed.filter((line) => line === 'PATCH /v1/harness/sessions/s1/tools/read')).toHaveLength(1);
+    expect(toolSwitch.dataset.enabled).toBe('false');
+    expect(toolSwitch.getAttribute('aria-pressed')).toBe('false');
 });
 
 it('lets a pending run settle underneath the open plugins pane without disturbing it', async () => {

@@ -205,6 +205,45 @@ const ENABLED_NAMES = [
     'textSummarize'
 ];
 
+// The same toolbox as the ROW LIST, in the server's own order: the 22 capped names above plus the
+// ten that hold no `maxEnabledTools` slot. T6 states the row's `enabled` as the CALL AXIS, so every
+// one of these is `true` on a seeded session that has switched nothing off — the ten slotless names
+// are in context through their declaration list, not through a slot the seed filled.
+const ROW_ORDER = [
+    'toolRegistry',
+    'toolRequest',
+    'toolList',
+    'toolManage',
+    'toolCreate',
+    'records',
+    'tasks',
+    'profiles',
+    'chapters',
+    'locations',
+    'agentManage',
+    'agentResult',
+    'delegate',
+    'threadFork',
+    'actionRequest',
+    'toolCancel',
+    'syntax',
+    'read',
+    'write',
+    'edit',
+    'files',
+    'glob',
+    'grep',
+    'shell',
+    'gitDiff',
+    'download',
+    'timeNow',
+    'textCount',
+    'diceRoll',
+    'noteSearch',
+    'textSummarize',
+    'fetch'
+];
+
 const runtimeOf = (root: string, presets: readonly HarnessPreset[]): HarnessRuntime =>
     createHarnessRuntime({
         root,
@@ -225,7 +264,7 @@ type StoredDocument = {
         id: string;
         queue: string[];
         core: {
-            discovery?: { enabled?: string[]; offsets?: unknown[] };
+            discovery?: { enabled?: string[]; withheld?: string[]; offsets?: unknown[] };
             createdTools?: { name: string }[];
         } & Record<string, unknown>;
     }[];
@@ -252,6 +291,19 @@ const tamperDiscovery = (root: string, id: string, staleName: string): void => {
     if (enabled.includes(staleName)) throw new Error(`the snapshot already names "${staleName}".`);
 
     session.core.discovery = { ...(session.core.discovery ?? {}), enabled: [...enabled, staleName] };
+    writeDocument(root, document);
+};
+
+// Append a WITHHELD list to one session's committed snapshot — the shape a record written by a
+// T6 server has: the switches this conversation made, in the kernel's own order. Names that resolve
+// nowhere are what `pruneStaleEnabledTools` must drop WITHOUT a report.
+const tamperWithheld = (root: string, id: string, withheld: readonly string[]): void => {
+    const document = readDocument(root);
+    const session = document.sessions.find((entry) => entry.id === id);
+
+    if (session === undefined) throw new Error(`state.json holds no session "${id}".`);
+
+    session.core.discovery = { ...(session.core.discovery ?? {}), withheld: [...withheld] };
     writeDocument(root, document);
 };
 
@@ -335,11 +387,14 @@ describe('a stale enabled tool name is tolerated on restore (R1 seed)', () => {
         // only the unresolvable one is gone.
         expect(enabledOf(second, sessionId)).toEqual(ENABLED_NAMES);
 
-        // The rows the pane renders state the same fact: everything switchable is still ON,
-        // and a name this build does not register is not a row at all.
+        // The rows the pane renders state the same fact from the other side: every row this build
+        // registers is still ON — all 32, not just the 22 capped ones, because T6's `enabled` is the
+        // call axis and the ten slotless names are callable through their declaration list — and a
+        // name this build does not register is not a row at all.
         const rows = await rowsOf(second, sessionId);
 
-        expect(namesWhere(rows, (row) => row.enabled)).toEqual(ENABLED_NAMES);
+        expect(rows.map((row) => row.name)).toEqual(ROW_ORDER);
+        expect(namesWhere(rows, (row) => row.enabled)).toEqual(ROW_ORDER);
         expect(rows.some((row) => row.name === 'commandRun')).toBe(false);
 
         // One tolerated line, no drop diagnostic.
@@ -531,5 +586,183 @@ export const execute = () => ({ pruneProbe: true });
         expect(created?.protected).toBe(false);
 
         second.store.dispose();
+    });
+});
+
+// T6 added a SECOND list to every record whose conversation touched a switch:
+// `core.discovery.withheld`, the tools this conversation turned off. The same operational events
+// that strand an enabled name strand a withheld one — a web-search key disappears, a plugin is
+// unregistered, an app tool is edited out of the card — and the store has to be as tolerant there,
+// because the alternative is a name the kernel will not accept (`restore()` validates the switch
+// list against the rebuilt registry, ../harness.ts:11843-11845).
+//
+// What is pinned, exactly:
+//   1. the withheld prune is SILENT. An enabled ghost claims a capability this build lost, which is
+//      a fact an operator wants; a withheld ghost claims nothing — "do not show the agents a tool we
+//      do not have" is a no-op — so `restoreErrors` keeps its "what went wrong" meaning and stays
+//      empty (src/server/sessions.ts `pruneStaleEnabledTools`, the `droppedWithheld` branch);
+//   2. the bar is REGISTRATION, not `isToolSwitchable`. A core declaration (`write`) has no cap
+//      slot, and its switch is the ONLY record of the disable — pruning it by the cap predicate
+//      would throw a core switch away on every restart, which is the durability
+//      ./session-reset-toolbox.test.ts and ./api-session-tool-writes.test.ts depend on;
+//   3. a switch on a tool the session CREATED survives too, for the same reason the enabled list
+//      keeps it: `createdTools` re-registers the name during `restore()`, so it is not a ghost at
+//      the moment the decision is made;
+//   4. the stale name is FORGOTTEN: the pruned list is what the next save writes, so a third load
+//      has nothing left to drop;
+//   5. an EMPTY withheld list stays absent from the record — the kernel omits the key when nothing is
+//      switched off (../harness.ts:11731), and the prune must not materialise `[]` into every
+//      pre-T6 document it touches.
+describe('a stale WITHHELD switch is dropped on restore (T6)', () => {
+    it('drops a switch whose tool this build no longer registers, silently, and keeps the rest', async () => {
+        const root = tempRoot('withheld-prune');
+        const presets = [toolboxPreset()];
+        const first = runtimeOf(root, presets);
+        const sessionId = await createSession(first, 'toolbox');
+
+        first.store.dispose();
+
+        // The shape of a record whose card changed underneath it: two switches, one of which names a
+        // tool this build does not register.
+        tamperWithheld(root, sessionId, ['commandRun', 'shell']);
+
+        expect(readDocument(root).sessions[0].core.discovery?.withheld).toEqual(['commandRun', 'shell']);
+
+        const second = runtimeOf(root, presets);
+
+        // Kept, and silent: `restoreErrors` is the enabled prune's channel, and nothing went wrong
+        // here. The empty list is the assertion — a withheld ghost that reported would make the
+        // channel mean "something in this record was stale", which is a different promise.
+        expect(second.store.list().map((session) => session.id)).toEqual([sessionId]);
+        expect(second.store.restoreErrors).toEqual([]);
+
+        // The live switch survives the prune and reaches the rows. `shell` holds a cap slot, so the
+        // row is `enabled: false` through BOTH halves of the call axis, and `origin` follows the slot.
+        expect(second.store.liveSession(sessionId).harness.withheldTools).toEqual(['shell']);
+
+        const rows = await rowsOf(second, sessionId);
+
+        expect(rows.map((row) => row.name)).toEqual(ROW_ORDER);
+        expect(rows.find((row) => row.name === 'shell')).toMatchObject({ enabled: false, protected: false });
+        expect(namesWhere(rows, (row) => row.enabled)).toEqual(ROW_ORDER.filter((name) => name !== 'shell'));
+
+        // FORGOTTEN, not re-pruned forever: the committed document now states the pruned switch list,
+        // so a third load has nothing to drop and reports nothing.
+        second.store.dispose();
+
+        expect(readDocument(root).sessions[0].core.discovery?.withheld).toEqual(['shell']);
+
+        const third = runtimeOf(root, presets);
+
+        expect(third.store.restoreErrors).toEqual([]);
+        expect(third.store.liveSession(sessionId).harness.withheldTools).toEqual(['shell']);
+
+        third.store.dispose();
+    });
+
+    it('keeps a switch on a CORE name, because the bar is registration and not the cap', async () => {
+        const root = tempRoot('withheld-core');
+        const presets = [toolboxPreset()];
+        const first = runtimeOf(root, presets);
+        const sessionId = await createSession(first, 'toolbox');
+
+        expect((await callApi(first, 'PATCH', `${MOUNT}/sessions/${sessionId}/tools/write`, { enabled: false })).status).toBe(200);
+
+        // The durability asymmetry T6 exists for: `write` never holds a cap slot, so the enabled list
+        // cannot state its switch and `withheld` is the only record. A prune keyed on
+        // `isToolSwitchable` would drop it here and hand the tool back ON after every restart.
+        expect(readDocument(root).sessions[0].core.discovery?.withheld).toEqual(['write']);
+        expect(readDocument(root).sessions[0].core.discovery?.enabled ?? []).toEqual(ENABLED_NAMES);
+
+        first.store.dispose();
+
+        const second = runtimeOf(root, presets);
+
+        expect(second.store.restoreErrors).toEqual([]);
+        expect(second.store.liveSession(sessionId).harness.withheldTools).toEqual(['write']);
+
+        const rows = await rowsOf(second, sessionId);
+
+        expect(rows.find((row) => row.name === 'write')).toMatchObject({ enabled: false, protected: true, declared: true });
+        expect(namesWhere(rows, (row) => row.enabled)).toEqual(ROW_ORDER.filter((name) => name !== 'write'));
+
+        second.store.dispose();
+
+        expect(readDocument(root).sessions[0].core.discovery?.withheld).toEqual(['write']);
+    });
+
+    it('keeps a switch on a tool the session CREATED, because the snapshot re-registers it', async () => {
+        const root = tempRoot('withheld-created');
+        const presets = [barePreset()];
+        const first = runtimeOf(root, presets);
+        const sessionId = await createSession(first, 'bare');
+
+        const registered = await callApi(first, 'POST', `${MOUNT}/sessions/${sessionId}/tools`, {
+            name: 'switchProbe',
+            description: 'Created tool the conversation switches off.',
+            tags: ['test', 'prune'],
+            module_text: `
+export const metadata = {
+    name: 'switchProbe',
+    description: 'Created tool the conversation switches off.',
+    tags: ['test', 'prune']
+};
+export const execute = () => ({ switchProbe: true });
+`
+        });
+
+        expect(registered.status).toBe(201);
+        expect((await callApi(first, 'PATCH', `${MOUNT}/sessions/${sessionId}/tools/switchProbe`, { enabled: false })).status).toBe(200);
+
+        // The name appears in `createdTools` AND in `withheld`, and is absent from the enabled list —
+        // the pair `restore()` has to re-register before the switch means anything.
+        const stored = readDocument(root).sessions[0].core;
+
+        expect((stored.createdTools ?? []).map((created) => created.name)).toEqual(['switchProbe']);
+        expect(stored.discovery?.withheld).toEqual(['switchProbe']);
+        expect(stored.discovery?.enabled ?? []).toEqual([]);
+
+        first.store.dispose();
+
+        const second = runtimeOf(root, presets);
+
+        expect(second.store.restoreErrors).toEqual([]);
+        expect(second.store.liveSession(sessionId).harness.withheldTools).toEqual(['switchProbe']);
+
+        const rows = await rowsOf(second, sessionId);
+
+        expect(rows.find((row) => row.name === 'switchProbe')).toMatchObject({
+            enabled: false,
+            origin: 'created',
+            protected: false
+        });
+
+        second.store.dispose();
+    });
+
+    it('leaves a record with no switches byte-identical — the absent key is not materialised', async () => {
+        const root = tempRoot('withheld-absent');
+        const presets = [toolboxPreset()];
+        const first = runtimeOf(root, presets);
+        const sessionId = await createSession(first, 'toolbox');
+
+        first.store.dispose();
+
+        // A pre-T6 record shape: the switch key was never written at all.
+        expect(Object.keys(readDocument(root).sessions[0].core.discovery ?? {})).not.toContain('withheld');
+
+        const before = JSON.stringify(readDocument(root).sessions[0].core.discovery);
+
+        const second = runtimeOf(root, presets);
+
+        expect(second.store.restoreErrors).toEqual([]);
+        expect(second.store.liveSession(sessionId).harness.withheldTools).toEqual([]);
+
+        second.store.dispose();
+
+        // The prune ran (it always runs) and changed nothing: an absent list means "nothing is
+        // switched off", and `[]` would be a different byte in every restored record.
+        expect(JSON.stringify(readDocument(root).sessions[0].core.discovery)).toEqual(before);
+        expect(Object.keys(readDocument(root).sessions[0].core.discovery ?? {})).not.toContain('withheld');
     });
 });

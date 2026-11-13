@@ -107,6 +107,33 @@ export type LaneCallIdentity = {
     runDepth?: number;
 };
 
+// The `toolManage` operations that move THIS session's tool-switch state, i.e. the ones that
+// have to be pushed to every live lane (R5b, T10). Stated at module scope because it is a fact
+// about the KERNEL's switch, not about this module: `enable|disable` write both discovery sets
+// through `applyToolSwitch` (src/harness.ts:1957) and `remove` takes the name out of the registry
+// AND out of both sets (src/harness.ts:3071).
+//
+// Everything else in that switch stays silent here on purpose. `list` / `details` / `source` /
+// `path` are reads. `create` / `update` / `reload` install a REGISTRY revision — the axis
+// `onRegistryChange` and ./lane-host.ts `broadcastRegistry` already own — and this lane also
+// learns the installed name from the `sync.enabled` of its OWN reply (./lane-worker-loop.ts
+// `applySync`). Pushing a created name here instead would post it to a sibling replica that has
+// not installed the revision yet, where the applier drops it as `not-registered`
+// (./lane-worker-loop.ts `applyToolStateSync`): harmless, and nothing a later reconcile cannot
+// heal, which is why the created-tool path is left on the registry axis. THE REMAINING GAP THERE
+// is reported rather than papered over: a sibling lane registers a created tool from
+// `broadcast.registry`, and nothing today hands it the cap slot that canonical granted — a
+// broadcast of the ENABLED set on the registry axis (T7's, not this trigger's) is the fix.
+const TOOL_SWITCH_OPERATIONS = new Set(['enable', 'disable', 'remove']);
+
+// The operation of a routed `manageTool` parameter block, defensively. `parameters` is `unknown`
+// on the wire (./protocol.ts), and an unparseable block cannot have moved canonical state — the
+// routed door refuses it before any write (`toolManage ${operation} requires \`name\`.`,
+// src/harness.ts `manageTool` case 'enable' / 'disable'), which is why the caller never reaches the
+// notification anyway.
+const toolSwitchOperationOf = (parameters: unknown): boolean =>
+    TOOL_SWITCH_OPERATIONS.has(String((parameters as { operation?: unknown } | undefined)?.operation ?? ''));
+
 // One routed `harness.runtime` call, as it crosses the boundary.
 export type LaneRuntimeCall =
     | { op: 'runtime'; method: 'executeRecords'; name: RecordToolName; parameters: unknown; identity: LaneCallIdentity }
@@ -224,6 +251,26 @@ export type LaneAuthorityOptions = {
         removed: boolean;
         memoryKeys?: string[];
     }) => void;
+    // R5b (T10, THE MODEL DOOR): the session's TOOL SWITCH moved on the canonical harness, so
+    // every live lane of this session has to be reconciled — the same push the operator's route
+    // makes through ../sessions.ts `pushToolState`, from the OTHER door.
+    //
+    // WHY A HOOK HERE INSTEAD OF A CALL IN THE ROUTE: a lane's `toolManage enable|disable` and a
+    // lane's `toolRequest` grant land on the canonical harness THROUGH this module (`answer` ->
+    // `runtime.manageTool` / `runtime.requestTools`), and no REST route is involved at all. Only
+    // the writer can see the write, so only the writer can broadcast it. Without this seam a lane
+    // that switched a tool off reached ITSELF (the `sync.enabled` in its own reply) and left every
+    // sibling lane of the same conversation declaring and launching the hidden name — while the
+    // user's requirement is that a switch is PER-SESSION and lands on threads that are already
+    // running.
+    //
+    // The payload is this authority's own canonical read (`toolStateNow()`), so the reconcile a
+    // lane receives is byte-identical to the state this module just wrote; the caller hands it
+    // straight to ./lane-host.ts `broadcastTools`. Fired ONLY when a state-moving operation
+    // actually reached the canonical harness — never on a read (`toolManage list|details|source`),
+    // never when the canonical call threw, and not for a created tool's registration (that moves
+    // the REGISTRY, which `onRegistryChange` owns).
+    onToolStateChange?: (tools: LaneToolStateSync) => void;
     // Called when the identity ledger moved, so a NEW lane's blueprint inherits it.
     onIdentityChange?: (watermarks: Partial<Record<IdSpace, number>>) => void;
 };
@@ -564,6 +611,57 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
     // is that build's real state rather than a crash in the push.
     const withheldNow = (): string[] => [...((harness as unknown as { withheldTools?: readonly string[] }).withheldTools ?? [])];
 
+    // R5b: the WHOLE tool-switch state, in the shape `sync.tools` carries (./protocol.ts
+    // `LaneToolStateSync`). Hoisted out of the returned object because BOTH doors that move the
+    // switch call it: the model/plugin door below (`notifyToolStateChange`, inside `answer`) and
+    // the operator door (../sessions.ts `pushToolState`, through this member). One read, one
+    // spelling, so a pushed frame can never state something this module does not believe.
+    //
+    // BOTH lists come from the same harness at the same instant, so a reconcile can never carry a
+    // name in one list that the other list contradicts a moment later (the invariant
+    // `applyToolSwitch` keeps, src/harness.ts:1957). Copied, never the live arrays: the frame is
+    // structured-cloned on the way out, and a caller that sorts or filters must not move the
+    // harness.
+    const toolStateNow = (): LaneToolStateSync => ({ enabled: enabledNow(), withheld: withheldNow() });
+
+    // R5b: list equality, order included. The canonical `enabled` order is newest-selection-first
+    // (src/harness.ts:13149) and a replica replays it verbatim, so a REORDER is a real move that a
+    // set comparison would swallow (a sibling lane would keep declaring the name in the old
+    // position, which is exactly the drift this frame exists to prevent).
+    const sameToolList = (left: readonly string[], right: readonly string[]): boolean =>
+        left.length === right.length && left.every((name, index) => name === right[index]);
+
+    // R5b: the model-door push. `previous` is the state read immediately BEFORE the canonical
+    // write, and the hook fires ONLY if that write moved either list.
+    //
+    // WHY THE GATE IS WORTH A READ: `toolRequest` runs inside a live model turn, so one turn can
+    // raise it several times (a model re-asking for a tool it already holds is the common case),
+    // and an idempotent `enable|disable` answers `changed: false` (src/harness.ts:3003). Each of
+    // those would post a session-wide `sync.tools` frame whose effect is provably nothing — to
+    // EVERY lane of the conversation, on a hot path. A frame is still one-way and convergent
+    // (./lane-worker-loop.ts `applyToolStateSync`), so this gate is noise control, never
+    // correctness.
+    //
+    // FAILURE-TOLERANT BY CONTRACT: the listener hands the payload to ./lane-host.ts
+    // `broadcastTools`, and a lane whose thread died between the read and the post must not fault
+    // the routed REQUEST that the canonical write already settled. There is no logger in this
+    // module (and ./lane-host.ts `broadcastRegistry` is silent for the same reason), so a lost
+    // push is swallowed here and reported at the store's door (../sessions.ts `pushToolState`).
+    const notifyToolStateChange = (previous: LaneToolStateSync): void => {
+        if (options.onToolStateChange === undefined) return;
+
+        const current = toolStateNow();
+
+        if (sameToolList(previous.enabled, current.enabled) && sameToolList(previous.withheld, current.withheld)) return;
+
+        try {
+            options.onToolStateChange(current);
+        } catch {
+            // The canonical write stands and the lane's answer is on its way; a lane that is gone
+            // simply learns the state from its next blueprint.
+        }
+    };
+
     // The canonical transcript of one conversation, in canonical order. `threadMessages`
     // resolves BOTH ids a lane uses - a host thread AND an agent's default conversation
     // (`agent:<name>` is a real thread record with the registry agent attached) - so there is
@@ -634,7 +732,18 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         return { value, sync: { identities: ledger.watermarks() } };
                     }
                     case 'manageTool': {
+                        // R5b (T10): the state BEFORE the canonical write, so the push below can
+                        // tell a moved switch from an idempotent one (src/harness.ts:3003 answers
+                        // `changed: false` without touching either set).
+                        const before = toolStateNow();
                         const value = await runtime.manageTool(callerFor(request.identity), request.parameters);
+
+                        // THE MODEL DOOR. A lane's `toolManage enable|disable` is the same kernel
+                        // write the operator's PATCH makes, so it gets the same session-wide
+                        // reconcile — every OTHER live lane of this conversation stops declaring
+                        // (and stops launching) the name this one just switched off, on its very
+                        // next model request. A read operation never reaches this line's push.
+                        if (toolSwitchOperationOf(request.parameters)) notifyToolStateChange(before);
 
                         return { value, sync: { enabled: enabledNow() } };
                     }
@@ -752,12 +861,26 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         // does not contain it). `selfCallId` stays unset on purpose: the
                         // canonical pending board has no lane tool calls, and a lane
                         // call id must not mask a real canonical pending task.
+
+                        // R5b (T10): the OTHER model-facing door, and the one a live turn actually
+                        // uses — `toolRequest` is how an agent gains a searchable tool mid-run
+                        // (src/tools/runtime/toolRequest.tool.ts:84 calls this very seam). The
+                        // grant moves the canonical capped set, which is half of `sync.tools`, so a
+                        // sibling lane that never asked must stop declaring a state this
+                        // conversation has already outgrown. `before` is read HERE rather than
+                        // comparing against the reply because a DENIAL (T11's out-of-scope shape)
+                        // also returns through this line and moves nothing: the gate in
+                        // `notifyToolStateChange` is what keeps a refused request — which a model
+                        // may repeat every turn — from posting a session-wide frame.
+                        const before = toolStateNow();
                         const value = await runtime.requestTools(
                             callerFor(request.identity),
                             request.parameters,
                             undefined,
                             request.scope
                         );
+
+                        notifyToolStateChange(before);
 
                         return { value, sync: { enabled: enabledNow() } };
                     }
@@ -1202,12 +1325,9 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
         blueprintIdentities: () => ledger.published(),
         blueprintSnapshot: () => harness.snapshot(),
         memoryWindow: (laneEpoch, keys) => captureMemoryWindow(memory, keys ?? [...declared], laneEpoch),
-        // R5b: the one canonical read the server feeds to `host.broadcastTools`. BOTH lists come
-        // from the same harness at the same instant, so a reconcile can never carry a name in one
-        // list that the other list contradicts a moment later (the invariant `applyToolSwitch`
-        // keeps, src/harness.ts:1957). Copied, never the live arrays: the frame is structured-
-        // cloned on the way out, and a caller that sorts or filters must not move the harness.
-        toolStateNow: (): LaneToolStateSync => ({ enabled: enabledNow(), withheld: withheldNow() }),
+        // R5b: the one canonical read the server feeds to `host.broadcastTools` (the local above;
+        // hoisted because `notifyToolStateChange` uses the same reading on the model door).
+        toolStateNow,
         answer,
         commit,
         canonicalLengthOf,

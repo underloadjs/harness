@@ -194,12 +194,11 @@ const stub = (sessions: Record<string, unknown>[]): void => {
             // The pane lists THIS session's registrations, not `GET /tools`. The row is the
             // server's own projection (`sessionToolRowsOf`, ../server/api-reads.ts:1003-1032): the
             // name HARNESS_CARD's frozen definition declares (`core_tools: ['tasks']`), so
-            // `declared` is true and `origin` is the catalogue's, while `protected` follows the
-            // kernel's switchability answer (`visibility: 'core'` is never a cap slot,
-            // ../harness.ts:1799-1806) and `enabled` is FALSE with it — a core name never enters the
-            // live enabled set, so `enabled: true` + `protected: true` is a pair the server cannot
-            // send. It carries NO `parameters` — that is the whole point of the identified read
-            // below.
+            // `declared` is true and `origin` is the catalogue's. `protected` is the kernel's
+            // UNREGISTER answer, NOT a switch figure (R5/T5): this row states `enabled: false`
+            // because THIS conversation holds that name off — the withheld flavor of false, the
+            // one the reader can put back — and the pane paints it as an off, live tile. It carries
+            // NO `parameters` — that is the whole point of the identified read below.
             if (path === `${ROOT}/sessions/chat-1/tools` && method === 'GET') {
                 return json(
                     sessionToolPage([

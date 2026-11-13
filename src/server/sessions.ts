@@ -2316,7 +2316,7 @@ export class SessionStore {
     //     switchable tool ticked instead of making the model spend a discovery round trip first.
     //   - `restoreSession`: the seed is a CAPABILITY FLAG, not a refill. `harness.restore()` ends
     //     by replacing the enabled set wholesale with the persisted `discovery.enabled`
-    //     (`setActiveTools`, src/harness.ts:11676 — it clears first), so the conversation still
+    //     (src/harness.ts `restore` -> `setActiveTools` — it clears first), so the conversation still
     //     comes back with exactly the set it COMMITTED, including an empty one. A restart has
     //     never refilled a session that had switched tools off, and still does not; what the seed
     //     on this path adds is the ability to re-run later.
@@ -2574,12 +2574,69 @@ export class SessionStore {
             ask: (request) => this.askFromLane(session, request),
             // A registry change made anywhere (lane, operator, model) is applied here first,
             // then pushed to every live replica so no lane keeps running a replaced revision.
-            onRegistryChange: (change) => this.host?.broadcastRegistry(session.id, change)
+            onRegistryChange: (change) => this.host?.broadcastRegistry(session.id, change),
+            // R5b (T10): THE MODEL/PLUGIN DOOR. A lane's own `toolManage enable|disable|remove`,
+            // or a `toolRequest` grant, moves the SAME per-session switch state the operator's
+            // PATCH moves, and nothing else tells this session's other lanes about it: the routed
+            // reply's `sync.enabled` reaches only the lane that asked (./workers/lane-worker-loop.ts
+            // `applySync`), while the requirement is that a toggle is session-wide and lands on
+            // threads that are already running. The payload is the authority's canonical read
+            // (./workers/lane-authority.ts `toolStateNow`), posted exactly like the registry
+            // broadcast above, and `notifyToolStateChange` there swallows a dead-lane throw so a
+            // settings push can never fault the request that made it.
+            onToolStateChange: (tools) => this.host?.broadcastTools(session.id, tools)
         });
 
         this.authorities.set(session.id, authority);
 
         return authority;
+    }
+
+    // R5b (T10): THE OPERATOR DOOR, as a store method — the one call ./api.ts makes after a tool
+    // write lands on the canonical harness. FOUR call sites use it, one per door that moves
+    // canonical tool state: the gate-only PATCH (../api.ts:4150), the gate half of a combined PATCH
+    // (:4446), a registration, create or update (:4308), and an un-registration (:4535). All four
+    // are safe here for the same reason: the harness write has already happened, and this method
+    // only reports it.
+    //
+    // WHY IT LIVES HERE: the two handles it needs are both private to this class, on purpose.
+    // `host` is the lane machinery this store owns (created lazily, `lanes()` above), and
+    // `authorityOf` is the only canonical reader of the state a lane must land on
+    // (./workers/lane-authority.ts `toolStateNow`). A dispatcher that reached both with casts would
+    // fork "what should the lanes be told" into a third place — T7 left `broadcastTools` with no
+    // production caller precisely because the caller had not been written yet, and this is it.
+    //
+    // THE TWO DOORS, one push. The operator's route calls THIS method; the model's own switch (a
+    // routed `toolManage enable|disable`, or a `toolRequest` grant) reaches the same broadcast
+    // through the `onToolStateChange` wiring in `authorityOf` above. Both read canonical state at
+    // the moment of the write, so a warm lane reconciles to what the coordinator believes — which
+    // is the requirement: "toggling tools is purely for agents/threads of that session, and it can
+    // be in real time (when the agent's thread is still running)".
+    //
+    // FIRE-AND-FORGET AND FAILURE-TOLERANT:
+    //   - no `host` (an inline store, or a worker store that has not run a turn yet) is not a
+    //     failure — there is no replica to tell, and a lane created later learns the same two lists
+    //     from its blueprint (./workers/lane-host.ts `LaneBlueprintSource.withheldTools`, plus the
+    //     snapshot's `discovery.withheld`);
+    //   - an unknown id means the session was removed between the write and this call;
+    //   - a lane that died in between cannot fail the HTTP request that already committed the
+    //     switch: `broadcastTools` skips a closed lane, and a post that throws for ONE lane is a
+    //     LOST PUSH for that lane, not a lost write — the host names it on its own stderr line
+    //     (./workers/lane-host.ts `broadcastTools`) and keeps posting to the siblings. Anything
+    //     that throws HERE — before or after the loop reaches a lane — is reported on the store's
+    //     own stderr convention (`noteRestoreError` / `notePersistenceError` above) and swallowed,
+    //     because the switch is already committed. The next switch, or the next lane, converges.
+    pushToolState(sessionId: string): void {
+        const host = this.host;
+        const session = this.sessions.get(sessionId);
+
+        if (host === undefined || session === undefined) return;
+
+        try {
+            host.broadcastTools(sessionId, this.authorityOf(session).toolStateNow());
+        } catch (error) {
+            console.error(`[harness] a tool-switch push for session "${sessionId}" did not reach its lanes: ${messageOf(error)}`);
+        }
     }
 
     // Broker a lane's owner question against this session's pending-action machinery.
@@ -2654,7 +2711,12 @@ export class SessionStore {
             // (../harness.ts:13165). Lane-creation snapshot like every other field here: a lane
             // that is already running keeps the set it was built with, and the CURRENT set
             // reaches the next lane its conversation creates.
-            withheldTools: session.harness.withheldTools,
+            // Spread, not the getter's value: the handle hands back a `readonly string[]`
+            // (../types/index.ts:3907) and `LaneBlueprint.withheldTools` is a plain `string[]`
+            // (./workers/protocol.ts:177), because the blueprint is serialised into the `hello`
+            // frame. The spread is also an explicit ownership boundary — the lane cannot mutate a
+            // array that is really this live handle's own state.
+            withheldTools: [...session.harness.withheldTools],
             pluginSettings: session.plugins.snapshot()
         };
     }
@@ -3888,7 +3950,7 @@ export class SessionStore {
             // WHAT THIS DOES NOT DO (the guarantee that made this path unseeded in the first
             // place): it does not switch anything on for the restored conversation. A few lines
             // below `harness.restore(pruned)` ends by calling `setActiveTools(next.discovery.enabled)`
-            // (src/harness.ts:11676), which CLEARS the set and rebuilds it from the snapshot, so
+            // (src/harness.ts `restore`), which CLEARS the set and rebuilds it from the snapshot, so
             // whatever this construction seed enabled is discarded before the session is ever
             // published, and the post-restore `harness.snapshot()` re-captured at the bottom of
             // this method is the committed set — not the seed. A restart therefore still keeps
@@ -10251,10 +10313,11 @@ export class SessionStore {
         //
         // WHAT IT DELIBERATELY DOES NOT DO: it does not touch the RESTORE itself. A restart still
         // re-applies the set that conversation committed, because `harness.restore()` replaces the
-        // enabled set wholesale after construction (src/harness.ts:11676) — the seed on that path
-        // only re-arms this seam, it never refills a conversation that had switched tools off. That
-        // is the guarantee the prune note below protects, and it is still true. Only an explicit
-        // reset starts over — and it starts over MEANING the same thing in every process now.
+        // enabled set wholesale after construction (src/harness.ts `restore` -> `setActiveTools`) —
+        // the seed on that path only re-arms this seam, it never refills a conversation that had
+        // switched tools off. That is the guarantee the prune note below protects, and it is still
+        // true. Only an explicit reset starts over — and it starts over MEANING the same thing in
+        // every process now.
         //
         // Guarded, not assumed: a host handle assembled without the seam keeps the previous
         // behaviour instead of failing the reset.

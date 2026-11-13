@@ -6272,8 +6272,11 @@ components:
                 and the capped set (`harness.discoveredTools` - which names currently hold one of
                 the `maxEnabledTools` slots). A name that holds a slot is on exactly while the
                 capped set holds it; a name with NO slot - a core declaration, or the pending-only
-                `toolCancel` - is in context through the declaration list, so it answers `true`
-                unless this conversation switched it off. THE TWO FALSES ARE DIFFERENT FACTS and a
+                `toolCancel` - is in context through its declaration list instead, so it reports
+                `true` until this conversation switches it off: the switch IS recorded for such a
+                name (in `withheldTools`), it simply has no cap slot to evict. A slotless row is
+                therefore never `false` because of the cap, and removing it entirely is `DELETE`'s
+                job (which the kernel refuses for a core name). THE TWO FALSES ARE DIFFERENT FACTS and a
                 client must not merge them: a WITHHELD name is one the operator turned off, and
                 `toolRequest` cannot even list it any more (not as `forbidden` - simply absent),
                 while an OFF-SLOT name is one the cap evicted or this conversation has not

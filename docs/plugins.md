@@ -214,7 +214,9 @@ Eighteen events (`HarnessLifecycleEvent`), payload per event in
 a plugin can observe the whole tree; `threadId` is absent for a branch run.
 A `tool.before` hook **cannot veto a call** — a refusal needs a tool result,
 and that is the model's contract rather than a hook's. The only "no" a hook
-can say to a tool is "don't run it next turn" (`api.disableTool`), or a
+can say to a tool is "this conversation's agents do not get it from the next
+request on" (`api.disableTool`, which lands on a running thread's very next
+model request, not merely the next turn), or a
 `stop`/`pause` decision at the next turn boundary.
 
 ---
@@ -789,9 +791,23 @@ with different rules.
   swallowed. This is where a compactor names the units it withheld, each
   one's estimated tokens, and the id of the unit that superseded it — the
   difference between "compacted" and "silently did nothing".
-- `enableTool` / `disableTool` / `enabledTools` — the progressive-discovery
-  gate; both refuse a CORE declaration (it is always in context, so
-  switching it would be a lie), and `enableTool` may evict an over-cap name.
+- `enableTool` / `disableTool` / `enabledTools` — the SAME session switch
+  `toolManage enable|disable` performs, through one kernel (`src/harness.ts`
+  `applyToolSwitch`), so a plugin gets no weaker rule than the model or the
+  operator. Both refuse ONLY a blank name and an unregistered one
+  (`requireSwitchableTool`): a `visibility: 'core'` declaration and the
+  pending-only runtime controls are switchable now, which retires the old
+  refusal ("a CORE declaration is always in context, so switching it would be
+  a lie") — true only while a switch meant "move a cap slot". For a core or
+  pending-only name the decision is recorded in the conversation's
+  `withheldTools` set and touches no slot at all; for a searchable name it
+  additionally moves the capped set, so `enableTool` may still evict an
+  over-cap name. `enabledTools()` lists the CAPPED names newest-first, so it
+  cannot show a switch on a slotless name — for that, read the handle's
+  `withheldTools` (`src/types/index.ts` `Harness.withheldTools`). What a
+  plugin cannot gate, on purpose: the manual and nested doors —
+  `harness.executeTool` and `context.callTool` reach a switched-off name whatever
+  this seam decided.
 - `async.pending(agent?)` / `async.wake(agent?)` — the background board and
   the wake. The scheduler owns NO timer: the wake is a plugin policy
   (`async-ping`), and `wake()` is the only way one is produced.

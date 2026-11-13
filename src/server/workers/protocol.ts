@@ -278,6 +278,17 @@ export type LaneRegistryChange = {
 // arrives twice, out of order relative to another, or after a lane rebuilt from a fresh
 // snapshot, lands the same state. That is why there is no `seq`, no CAS digest, and no reply.
 //
+// ONE ASYMMETRY TO EXPECT — on the REPLICA, never on the canonical harness that wrote these
+// lists: the replica's own `withheldTools` can be a SUPERSET of `withheld`. Freeing a cap slot is
+// only reachable through `disable`, which sets the switch flag in the same breath, so every capped
+// name the applier withdraws that this frame does NOT withhold — a name canonical merely EVICTED
+// under cap pressure — is left flagged on the replica. Repeated identical frames re-create that
+// residue (a fixed point, not something the next frame dissolves), and it is the redundant-but-safe
+// direction: a flagged name is undeclared and refused at the launch gate, so a replica is never
+// MORE permissive than this payload, though the cap arithmetic can make it declare less. The whole
+// rule, including what the applier's return value does and does not report, is stated in
+// ./lane-worker-loop.ts `applyToolStateSync`.
+//
 // TOLERANT BY CONTRACT: the replica is rebuilt from a RECORD and may genuinely lack a name the
 // coordinator has (a `tool()` object a preset passed cannot cross a thread — the exact case
 // ./lane-tool-settings.test.ts pins for `testFlaky`), and `refuseNestedRuns` deletes

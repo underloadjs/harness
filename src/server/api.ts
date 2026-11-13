@@ -4109,7 +4109,9 @@ export const createHarnessApi = ({
         // so this write lands on a RUNNING thread's next request (../types/index.ts
         // `Harness.withheldTools`), which is the user's real-time requirement. A lane replica is
         // told about it through the blueprint (`./sessions.ts` `blueprintFor` ->
-        // `LaneBlueprint.withheldTools`); the wire frame itself is T7's.
+        // `LaneBlueprint.withheldTools`) for a lane not yet born, and through the `sync.tools`
+        // frame for a lane that is already warm — the push runs below (T10), and its payload is the
+        // authority's own canonical read, not this route's guess.
         try {
             record.harness.runtime.manageTool(undefined, {
                 operation: enabled ? 'enable' : 'disable',
@@ -4133,6 +4135,19 @@ export const createHarnessApi = ({
             // predicts it.
             throw new HttpError(409, boundErrorMessage(error));
         }
+
+        // THE TRIGGER (T10/R5b): the switch is canonical now, so EVERY live lane of THIS session is
+        // reconciled to it before this route answers. Pushed HERE, immediately after the write and
+        // BEFORE the durable commit, because the harness already holds the new state: a persistence
+        // failure that turns this request into a 500 must not be the reason a warm lane goes on
+        // declaring a tool its user switched off. `pushToolState` is synchronous, fire-and-forget
+        // and swallows a dead-lane failure (../sessions.ts), so no push can fail this request.
+        //
+        // Unconditional, unlike the authority's own gate: the kernel answers an idempotent switch
+        // with `changed: false` and nothing moves, yet a repeat click is exactly how an operator
+        // heals a lane that missed an earlier frame — the reconcile is wholesale and convergent
+        // (./workers/lane-worker-loop.ts `applyToolStateSync`).
+        store.pushToolState(record.id);
 
         // The durable session document is written from the harness snapshot, whose discovery
         // state just changed (`discovery.enabled` for a name that holds a cap slot,
@@ -4273,6 +4288,25 @@ export const createHarnessApi = ({
                           sourcePath: record.harness.toolSource(created.name)?.sourcePath
                       }) as unknown as Awaited<ReturnType<typeof record.harness.registerTool>>);
 
+            // T10: a REGISTRATION is a switch write as well, and this is the third door that opens
+            // it. Both modes end inside `acceptTool`, which calls `enableTools([name])` and therefore
+            // `setActiveTools` (src/harness.ts:2408) — the session's DECLARED set. Measured on the
+            // live store (probe: Temp/t10/probe-create2.ts): creating `probeCreated` moves `enabled`
+            // from 23 names to 24 with the new name at the HEAD of the order, and re-registering
+            // `glob` moves `glob` to the head with no length change — an order-only move, exactly the
+            // kind a set comparison swallows and a replica still declares wrong. So every warm lane of
+            // this session is stale the moment this route answers. The registry frame below installs
+            // the DEFINITION on each replica (./workers/lane-worker-loop.ts:868 `applyRegistryChange`
+            // → `registerTool`) but never says which names the next model request must declare, and at
+            // a full cap a create also EVICTS the oldest name — a fact only a wholesale `enabled` list
+            // can carry. Unconditional, for the same reason as the two switch routes above: a lane that
+            // missed one frame heals on the next registration.
+            //
+            // BEFORE `persistRegistry`, like those routes: durability and worker frames are
+            // independent, and the write is already published in the live harness. A candidate the
+            // kernel refused throws above and never reaches this line, so a refusal posts nothing.
+            store.pushToolState(record.id);
+
             // The document must not claim a registry the live harness already changed, so the
             // store's own durable commit boundary runs here (a no-op for an in-memory store).
             await store.persistRegistry();
@@ -4404,6 +4438,13 @@ export const createHarnessApi = ({
                     name
                 });
 
+                // R5b (T10): the gate on a COMBINED patch is still a tool switch, so it gets the
+                // same session-wide reconcile the `enabled`-only route fires. THIS is the path that
+                // runs behind `assertIdleForToolMutation` above, so by definition no run is in
+                // flight — and a lane that is warm but IDLE is still a lane that would otherwise go
+                // on declaring the name this request just switched off.
+                store.pushToolState(record.id);
+
                 await store.persistRegistry();
                 events.bumpRevision('session_tools', record.id);
             } catch (error) {
@@ -4432,21 +4473,38 @@ export const createHarnessApi = ({
         // figure is the kernel's own `remove` rule (`harness.tools[name].visibility === 'core'`,
         // ../harness.ts:3045), i.e. a harness-owned core declaration such as `write`, `tasks`,
         // `delegate` or the always-mounted `fetch` — so removing it would break the session's own
-        // control surface -> 403. A name this session merely INHERITS from the catalogue with no
-        // session-local registration and no enabled slot has nothing to remove -> 400.
+        // control surface -> 403. The 400 below answers a DIFFERENT question, and its test is a
+        // CAPTURED SOURCE REVISION, not "was this name registered by the session": it fires only
+        // when the name has no live created-tool record AND no `harness.toolSource(name)` (the same
+        // read that sets the row's `source_available`, ./api-reads.ts `sessionToolRowsOf`) AND its
+        // row is not a `discovered` registration — i.e. when there is no session-local revision to
+        // take away.
         //
         // T6 MOVED THE OTHER DIRECTION OF THIS IDENTITY: `protected` used to be
         // `!harness.isToolSwitchable(name)`, which also swept in the pending-only `toolCancel`.
         // `toolCancel` registers at `visibility: 'searchable'`, the kernel's `remove` never
-        // refused it, and the row now says so (`protected: false`); clicking DELETE on it still
-        // answers the 400 above, because this session never registered it either. Switching the
-        // SAME name off is a 200 (see `setSessionToolEnabled`): unregister and switch are two
-        // different privileges, and only the first one is what this flag predicts.
+        // refused it, and the row now says so (`protected: false`) — and clicking DELETE on it
+        // answers 200, NOT the 400 above. A baseline runtime control is installed through the same
+        // acceptance kernel as any other name (`registerBaselineDescriptors` → `registerDescriptor`
+        // → `registerBaselineSource` → `registerAtStartup`, ../harness.ts), and that path writes a
+        // `toolSourceRecords` entry whatever `{ record: false }` says — that flag only keeps a name
+        // out of `createdToolRecords`, it does not gate the captured revision. So the row reports
+        // `source_available: true`, the guard finds a revision, and the removal runs: that is the
+        // 200 ../api-session-tool-writes.test.ts pins, and it is what the DELETE description in
+        // ./harness.swagger.yaml already states (`toolCancel` is deletable).
+        //
+        // WHERE THE 400 IS THE REAL ANSWER: a build with no source compiler — the aliased browser
+        // graph, where `supportsToolCompilation === false` — installs the same baseline from a
+        // PREBUILT definition, and `prepareDefinition` publishes a `format: 'function-body'` record
+        // with no source bytes, which `acceptTool` therefore does NOT store (../harness.ts). Nothing
+        // in such a build has a session-local revision, so an inherited name answers 400 there.
         //
         // What an ORDINARY toolbox row (`syntax`, `files`, a created tool) means is unchanged: it
         // is not core, therefore not protected, therefore removable — the runtime `remove`
         // operation is the one that decides, and it never disagrees with the row the client
-        // clicked.
+        // clicked. And switching ANY of these names off is a 200 in every build (see
+        // `setSessionToolEnabled`): unregister and switch are two different privileges, and only
+        // the first is what `protected` predicts.
         if (row.protected) {
             throw new HttpError(
                 403,
@@ -4476,6 +4534,22 @@ export const createHarnessApi = ({
 
             throw new HttpError(409, boundErrorMessage(error));
         }
+
+        // T10: the THIRD operator door, and this one pushes too. `sync.tools`' `enabled` axis is the
+        // session's DECLARED set (../workers/lane-authority.ts:602 reads `harness.discoveredTools`),
+        // and an un-registration takes the name out of it. Measured on the live store (probe:
+        // Temp/t10/probe-create2.ts): removing a created tool moves `enabled` from 25 names to 24 and
+        // the name is gone from the list, while `withheld` does not move at all. So a warm lane that
+        // heard nothing here would go on declaring — and offering its model — a tool this session no
+        // longer has. This is also the symmetry the MODEL door already keeps: the same kernel
+        // operation through ../workers/lane-authority.ts `toolSwitchOperationOf` does post.
+        //
+        // What the frame still cannot say is the DEFINITION, and that half of the gap stands: an
+        // un-publish is a registry fact, and the registry axis (./lane-host.ts `broadcastRegistry`)
+        // has no caller for a session-local removal — the store fires it only for a lane-created tool
+        // (../sessions.ts). A replica therefore keeps an implementation it no longer declares until
+        // its next hello, which is the safe direction (declared-but-missing is the one that faults).
+        store.pushToolState(record.id);
 
         // Same durable boundary a registration uses: the document is written from the harness
         // snapshot, and the removal just changed it.

@@ -4049,11 +4049,17 @@ headTitleButton.addEventListener('click', () => {
 // RELOCATION (this change): the two catalogue toggles join that line as a right-aligned
 // group AFTER the id span, because each pane they open is presented for the SESSION
 // currently in view (the header is repainted per session — one pair for the session shown,
-// not one per session). What is NOT session-scoped is what those panes WRITE: their
-// enablement switches are deployment-wide (every conversation, from the next turn), and the
-// genuinely per-session tool state — `/sessions/{id}/tools` — lives on a surface these panes
-// never call. `harnessTitleTools` mirrors the `.topbar-right` wrapper convention (a flex
-// group the stylesheet positions as one unit); `margin-left: auto` pushes it flush right.
+// not one per session). WHAT THOSE PANES WRITE is now the same scope: both dial
+// session-scoped routes for that one conversation — the tool pane's tile is
+// `PATCH /sessions/{id}/tools/{tool_id}` with `{ enabled }` (`setToolEnabled`), the plugin
+// pane's is `PATCH /sessions/{id}/plugins/{plugin_id}` with the reserved `enabled` key
+// (`setPluginEnabled`) — so read and write agree on one conversation and the pair is
+// meaningful exactly while a session is bound (hence `paintControls` hiding it when none
+// is). What is NOT on either pane is the DEPLOYMENT surface: the process-wide tool deny
+// list (`PATCH /v1/harness/tools/{tool_id}`) and the template plugin settings
+// (`/v1/harness/plugins[/:plugin_id]`), which no pane calls any more. `harnessTitleTools`
+// mirrors the `.topbar-right` wrapper convention (a flex group the stylesheet positions as
+// one unit); `margin-left: auto` pushes it flush right.
 //
 // The two buttons are MOVED, not rebuilt: `toolsToggle`/`pluginsToggle` are the same nodes
 // created in the topbar assembly above, so `paintToolsToggle`, `paintPluginsToggle` and the
@@ -8873,9 +8879,9 @@ type ToolEnablement = { name: string; enabled?: boolean };
 // old `row.protected === true ||` escape hatch existed because the server used to report a
 // harness-owned name as `enabled: false` while it stayed callable — that field was membership in
 // the capped discovered set, not "switched off". Every registered tool now HAS a gate, so `false`
-// means off (whether the conversation withheld it or its toolbox has no free slot) and the tile
-// says off. `declared` states nothing here either: a name the frozen definition declares is
-// switched off exactly like any other.
+// means off (whether the conversation withheld it, its toolbox has no free slot, or this
+// deployment's deny list holds the name) and the tile says off. `declared` states nothing here
+// either: a name the frozen definition declares is switched off exactly like any other.
 const toolRowEnabled = (row: ToolEnablement): boolean => row.enabled === true;
 
 // Why one row's switch cannot write right now. R5 removed BOTH conversation-level reasons this
@@ -8906,10 +8912,13 @@ const TOOL_SWITCH_SCOPE =
 const TOOL_ENABLED_TITLE = `Enabled for this conversation · click to switch it off · ${TOOL_SWITCH_SCOPE}`;
 
 // The off state adds the one question the figure leaves open: WHY is it off? The wire has no field
-// for the difference (both flavors answer `enabled: false`), so the tooltip names both possibilities
-// and says the switch behaves identically for either.
+// for the difference (all three flavors answer `enabled: false`), so the tooltip names every
+// possibility and says the switch behaves identically for each. There are THREE, and the third is
+// the one this pane cannot act on: a name the DEPLOYMENT deny list (`../server/tool-settings.ts`)
+// holds is off for every conversation, so switching it on here answers 200 and lights the green
+// edge, and the model still cannot call it — the deployment rule outranks the session switch.
 const TOOL_DISABLED_TITLE =
-    `Disabled for this conversation · click to switch it on · ${TOOL_SWITCH_SCOPE} · a name can be off because this conversation switched it off or because its toolbox has no free slot`;
+    `Disabled for this conversation · click to switch it on · ${TOOL_SWITCH_SCOPE} · a name can be off because this conversation switched it off, because its toolbox has no free slot, or because this deployment’s tool settings switch it off for every conversation`;
 
 // The tooltip for one state of one switch. `writing` is the only lock with a sentence of its own:
 // the tile is mid-write, so the figure the reader is looking at is the one the server already

@@ -1076,11 +1076,49 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
     // receive it. A lane created after this call learns the same state from its blueprint
     // (`withheldTools` + the snapshot's `discovery.withheld`), which is why no replay buffer is
     // needed here.
+    //
+    // THE CALLERS (T10): this stopped being a caller-less seam. ../sessions.ts `pushToolState`
+    // posts it for the OPERATOR door (`PATCH /sessions/:id/tools/:tool_id {enabled}`), and the
+    // `onToolStateChange` wiring in ../sessions.ts `authorityOf` posts it for the MODEL door, which
+    // ./lane-authority.ts `notifyToolStateChange` fires after a routed `toolManage enable|disable`
+    // or a `toolRequest` grant.
+    //
+    // TOLERANCE IS PER LANE, not per broadcast, and that is the whole point of the guard: a frame
+    // that cannot be cloned for ONE lane (or a thread that exited between the `closed` check and
+    // the post) must not strand the SIBLING lanes of the same session, because the switch is a
+    // per-session fact. A push that never left is a lost push, not a failed request — the reconcile
+    // is wholesale, so the next frame or the next lane converges, and the route that fired the push
+    // must still answer 200 for a write the canonical harness already committed.
+    //
+    // WHAT IT DOES NOT DO IS GO SILENT. `broadcastRegistry` above logs nothing because nothing it
+    // does can fail quietly: it posts with no guard, so a fault there travels to its caller
+    // (../sessions.ts `onRegistryChange`), which reports it. Here the guard IS the failure sink, so
+    // the miss is named. This module still has no logger of its own, and the package convention for
+    // a swallowed harness-side fault is the store's stderr line (`../sessions.ts` `pushToolState`
+    // and `noteRestoreError` / `notePersistenceError`), so that is the form: a `[harness]`
+    // `console.error` naming the lane and the reason. WHY IT MATTERS: the lane that misses this
+    // frame keeps declaring a tool its user has already switched off until the next toggle or a
+    // lane rebuild, and without this line the operator has no signal that a warm lane is stale.
+    // WHAT IT COSTS: nothing ordinary. A session with NO live lane posts nothing at all (the loop
+    // never reaches a `post`), so a pre-lane toggle stays silent; only a frame that cannot be
+    // cloned, or a worker whose thread exited between the `closed` check and the post, prints a
+    // line. It is `console.error` rather than a quieter tier because this package has no debug sink
+    // to route one to, and a swallowed per-lane fault is exactly what the store's `[harness]` notes
+    // are for.
     const broadcastTools = (sessionKey: string, tools: LaneToolStateSync): void => {
         for (const lane of [...lanes.values()]) {
             if (lane.closed || !lane.key.startsWith(`${sessionKey}::`)) continue;
 
-            post(lane, { kind: 'sync.tools', laneEpoch: lane.epoch, tools });
+            try {
+                post(lane, { kind: 'sync.tools', laneEpoch: lane.epoch, tools });
+            } catch (error) {
+                // THIS lane misses the frame; the others still get it, and the post that failed is
+                // recorded on stderr rather than dropped. `lane.key` is `session::target`, so one
+                // field names both halves of who is now stale.
+                const message = error instanceof Error ? error.message : String(error);
+
+                console.error(`[harness] a tool-switch frame did not reach lane "${lane.key}": ${message}`);
+            }
         }
     };
 

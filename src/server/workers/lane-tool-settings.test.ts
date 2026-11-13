@@ -170,7 +170,12 @@ describe('R3 lane propagation: the blueprint carries the deny list at lane creat
             'memoryKeys',
             'pluginSettings',
             'record',
-            'settings'
+            'settings',
+            // R5b: the SESSION's own switch set, beside the deployment's deny list. Same carrier,
+            // different scope - and the one field of the three that the coordinator ALSO re-pushes
+            // to a live lane (./protocol.ts `sync.tools`, ./lane-host.ts `broadcastTools`), so the
+            // "lane-creation snapshot" wording below does not fully describe it.
+            'withheldTools'
         ]);
 
         // One source of truth: the SAME set the durable document carries (the store's
