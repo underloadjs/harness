@@ -2182,8 +2182,11 @@ describe('canonical sessions', () => {
         // A row states the live session facts; the argument schema, the source TEXT, and any tool
         // result never ride it. `source_revision` rides only for a row with an installed revision,
         // and item[0] here (toolRegistry) is a source-registered tool - the bytes themselves are one
-        // named route away.
+        // named route away. `availability` rides because a session row IS the same catalogue
+        // projection the global `/harness/tools` row is (R3): toolRegistry's entry states a
+        // session-bound hint, and one tool must not have two shapes across the two routes.
         expect(Object.keys(tools.items[0]).sort()).toEqual([
+            'availability',
             'declared',
             'description',
             'enabled',

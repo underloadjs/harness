@@ -1,16 +1,27 @@
 ﻿// T5 regression tests: per-session isolation while restoring the durable database.
 //
-// The failure these tests reproduce is the one an operator hits after a tool
-// rename: a session persisted by an OLDER build names tools this build no longer
-// registers (`commandRun` -> `shell`, `fileEdit` -> `edit`, `fileRead` -> `read`,
-// `webSearch` -> `search`, `webFetch` -> `fetch`, `agentDelegate` -> `delegate`).
-// `harness.restore()` rejects such a snapshot with
-// `Snapshot discovery names "commandRun", which is not registered in this harness.`
-// (src/harness.ts:6826-6832). Before the fix that throw escaped the SessionStore
-// constructor (src/server/sessions.ts restore loop), so `createHarnessRuntime`
-// (src/server/runtime.ts) and `startHarnessServer` (src/server/start.ts) aborted:
-// the whole server became unavailable and NO session — healthy or not — could be
-// listed, and no new session could be created.
+// The failure these tests reproduce is the one an operator hits after a RENAME: a
+// session persisted by an OLDER build names something this build no longer holds.
+// `harness.restore()` rejects such a snapshot — for an agent rename with
+// `Snapshot agent "two-renamed" is not registered in this harness.`
+// (src/harness.ts:11586-11592) — and BEFORE the R6 fix that throw escaped the
+// SessionStore constructor (src/server/sessions.ts restore loop), so
+// `createHarnessRuntime` (src/server/runtime.ts) and `startHarnessServer`
+// (src/server/start.ts) aborted: the whole server became unavailable and NO
+// session — healthy or not — could be listed, and no new session could be created.
+//
+// WHY THE TOOL CASE MOVED OUT OF THIS FILE (R1): the same sentence existed for a
+// stale ENABLED TOOL name (`commandRun` -> `shell`, `webSearch` -> `search`, ...)
+// and used to drop the session the same way. The new-session toolbox seed now
+// persists every switchable name (src/server/sessions.ts `create` passes
+// `enableAllTools`), so a vanished registration would otherwise delete an ordinary
+// conversation the first time a search key is removed or a plugin is unregistered.
+// The STORE therefore prunes an enabled name the rebuilt harness cannot register
+// (`pruneStaleEnabledTools`, src/server/sessions.ts) and keeps the session; the
+// kernel stays strict for every other caller, which is what these tests pin by
+// renaming an AGENT instead — nothing in the store repairs an agent map, so that
+// record is still unrecoverable and still dropped. The tolerated tool prune is
+// pinned in ./restore-enabled-tool-prune.test.ts.
 //
 // The contract under test:
 //   R6   restore is best-effort PER SESSION: one broken record is dropped, while
@@ -19,7 +30,7 @@
 //   R7   no legacy alias and no snapshot migration: the broken session is NOT
 //        exposed as usable (404 / absent, never a half-restored row) and the
 //        reason stays observable (reporter + `restoreErrors` + stderr default).
-//   R8   these tests drive a REAL old-tool snapshot through a real state.json
+//   R8   these tests drive a REAL stale snapshot through a real state.json
 //        next to valid sessions, and check list/create/get behaviour.
 //   scope the isolation is per SESSION, not per DOCUMENT: malformed JSON, an
 //        unknown database version and an invalid record SHAPE are still fatal,
@@ -155,7 +166,10 @@ type StoredDocument = {
         id: string;
         queue: string[];
         agentModels?: Record<string, string>;
-        core: { discovery?: { enabled?: string[]; offsets?: unknown[] } } & Record<string, unknown>;
+        core: {
+            discovery?: { enabled?: string[]; offsets?: unknown[] };
+            agents?: Record<string, unknown>;
+        } & Record<string, unknown>;
     }[];
 };
 
@@ -172,27 +186,51 @@ const sessionOf = (document: StoredDocument, id: string): StoredDocument['sessio
     return session;
 };
 
-// Make ONE session's committed core snapshot name a tool this build renamed —
-// the exact shape of a real pre-rename state.json entry.
-const tamperDiscovery = (root: string, id: string, legacyName: string): void => {
+// Rename ONE session's agent key — the exact shape of a real state.json written before
+// an agent profile was renamed. The value (transcript and every other field) is moved
+// untouched, so the document stays shape-valid and the refusal comes from exactly one
+// place: `harness.restore()` matching the snapshot's agent keys against the live
+// registry (src/harness.ts:11586-11592). Nothing on the store's restore path repairs an
+// agent map, which is what keeps this file's drop semantics intact after R1 moved the
+// stale-TOOL-name case into `pruneStaleEnabledTools` (./sessions.ts).
+//
+// `agentResults` is dropped alongside the rename because it is OPTIONAL
+// (../types/index.ts:3363-3367 states a pre-feature snapshot simply omits it) and it
+// cross-references the agent by name: leaving it in would make the snapshot READER
+// refuse first (`snapshot.agentResults[0].agent names "two", ...`), and the diagnostic
+// these tests pin would then be about the results index rather than the rename.
+const tamperAgent = (root: string, id: string, agentName: string): string => {
     const document = readDocument(root);
     const session = sessionOf(document, id);
-    const enabled = session.core.discovery?.enabled ?? [];
+    const agents = session.core.agents;
 
-    if (enabled.includes(legacyName)) throw new Error(`the snapshot already names "${legacyName}".`);
+    if (agents === undefined) throw new Error(`the snapshot of "${id}" holds no agent map.`);
 
-    session.core.discovery = { ...(session.core.discovery ?? {}), enabled: [...enabled, legacyName] };
+    const persisted = Object.keys(agents);
+
+    if (!persisted.includes(agentName)) {
+        throw new Error(`the snapshot of "${id}" has no agent "${agentName}" to rename (it has ${persisted.join(', ')}).`);
+    }
+
+    const renamed = `${agentName}-renamed`;
+    const value = agents[agentName];
+
+    delete agents[agentName];
+    agents[renamed] = value;
+    delete session.core.agentResults;
     writeDocument(root, document);
+
+    return renamed;
 };
 
 // Expected diagnostics, composed the way production composes them:
 // HarnessPersistenceError prefixes the file (persistence.ts:166-176) and
 // restoreSession wraps the reason as `Session "<id>" could not be restored: ...`.
-const discoveryReason = (legacyName: string): string =>
-    `Snapshot discovery names "${legacyName}", which is not registered in this harness.`;
+const missingAgentReason = (renamedName: string): string =>
+    `Snapshot agent "${renamedName}" is not registered in this harness.`;
 
-const expectedDiagnostic = (root: string, id: string, legacyName: string): string =>
-    `${stateFile(root)}: Session "${id}" could not be restored: ${discoveryReason(legacyName)}`;
+const expectedDiagnostic = (root: string, id: string, renamedName: string): string =>
+    `${stateFile(root)}: Session "${id}" could not be restored: ${missingAgentReason(renamedName)}`;
 
 // HTTP-shaped call through the runtime dispatcher (same convention as
 // ./persistence.test.ts).
@@ -255,12 +293,12 @@ const persistTwoSessions = async (label: string): Promise<{ root: string; health
 };
 
 describe('per-session restore isolation (T5/R6)', () => {
-    it('drops only the session naming a renamed tool and still restores, lists and runs the healthy one', async () => {
+    it('drops only the session naming a renamed agent and still restores, lists and runs the healthy one', async () => {
         const { root, healthy, broken } = await persistTwoSessions('isolate');
 
-        tamperDiscovery(root, broken.id, 'commandRun');
+        const renamed = tamperAgent(root, broken.id, 'two');
 
-        // The runtime itself comes up: a stale tool name is a per-session problem,
+        // The runtime itself comes up: a stale agent name is a per-session problem,
         // not a startup problem (this is the call that used to throw).
         const second = runtimeOf(root);
 
@@ -278,7 +316,7 @@ describe('per-session restore isolation (T5/R6)', () => {
         expect(missing.message).toBe(`Unknown session "${broken.id}".`);
 
         // R7: the reason is retained verbatim (file + session id + root cause).
-        expect(second.store.restoreErrors).toEqual([expectedDiagnostic(root, broken.id, 'commandRun')]);
+        expect(second.store.restoreErrors).toEqual([expectedDiagnostic(root, broken.id, renamed)]);
 
         // The healthy session is not merely listed: it still runs a turn.
         await second.store.run(healthy.id, 'continue after restart', async () => {});
@@ -314,8 +352,8 @@ describe('per-session restore isolation (T5/R6)', () => {
     it('still starts an empty, usable server when every saved session is invalid', async () => {
         const { root, healthy, broken } = await persistTwoSessions('all-invalid');
 
-        tamperDiscovery(root, healthy.id, 'commandRun');
-        tamperDiscovery(root, broken.id, 'fileEdit');
+        const renamedHealthy = tamperAgent(root, healthy.id, 'one');
+        const renamedBroken = tamperAgent(root, broken.id, 'two');
 
         const second = runtimeOf(root);
 
@@ -323,8 +361,8 @@ describe('per-session restore isolation (T5/R6)', () => {
         expect(second.store.list()).toEqual([]);
         expect(second.store.size).toBe(0);
         expect(second.store.restoreErrors).toEqual([
-            expectedDiagnostic(root, healthy.id, 'commandRun'),
-            expectedDiagnostic(root, broken.id, 'fileEdit')
+            expectedDiagnostic(root, healthy.id, renamedHealthy),
+            expectedDiagnostic(root, broken.id, renamedBroken)
         ]);
 
         // A brand-new session is creatable AND runnable on a store that loaded
@@ -379,10 +417,10 @@ describe('per-session restore isolation (T5/R6)', () => {
     it('rewrites state.json without the dropped session so the next restart loads cleanly', async () => {
         const { root, healthy, broken } = await persistTwoSessions('persist-drop');
 
-        tamperDiscovery(root, broken.id, 'commandRun');
+        const renamed = tamperAgent(root, broken.id, 'two');
 
         const second = runtimeOf(root);
-        expect(second.store.restoreErrors).toEqual([expectedDiagnostic(root, broken.id, 'commandRun')]);
+        expect(second.store.restoreErrors).toEqual([expectedDiagnostic(root, broken.id, renamed)]);
 
         // Any structural mutation commits the in-memory database, and the dropped
         // record is simply no longer part of it.
@@ -390,7 +428,7 @@ describe('per-session restore isolation (T5/R6)', () => {
         second.store.dispose();
 
         const raw = fs.readFileSync(stateFile(root), 'utf8');
-        expect(raw).not.toContain('commandRun');
+        expect(raw).not.toContain(renamed);
         expect(raw).not.toContain(broken.id);
         expect(raw).not.toContain('drop this');
         expect(readDocument(root).sessions.map((session) => session.id)).toEqual([healthy.id, added.id]);
@@ -405,7 +443,7 @@ describe('per-session restore isolation (T5/R6)', () => {
     it('reports each dropped session to the injected onRestoreError reporter instead of stderr', async () => {
         const { root, healthy, broken } = await persistTwoSessions('reporter');
 
-        tamperDiscovery(root, broken.id, 'commandRun');
+        const renamed = tamperAgent(root, broken.id, 'two');
 
         const database: HarnessDatabase | undefined = new HarnessPersistence(root).load();
         if (database === undefined) throw new Error('the tampered document did not load');
@@ -428,7 +466,7 @@ describe('per-session restore isolation (T5/R6)', () => {
             );
 
             // Exactly one report, carrying the full diagnostic (file + id + reason).
-            expect(reported).toEqual([expectedDiagnostic(root, broken.id, 'commandRun')]);
+            expect(reported).toEqual([expectedDiagnostic(root, broken.id, renamed)]);
             expect(store.restoreErrors).toEqual(reported);
             expect(store.list().map((session) => session.id)).toEqual([healthy.id]);
 
@@ -447,7 +485,7 @@ describe('per-session restore isolation (T5/R6)', () => {
     it('logs the drop to stderr when the host injects no reporter (R7 observability)', async () => {
         const { root, healthy, broken } = await persistTwoSessions('stderr');
 
-        tamperDiscovery(root, broken.id, 'commandRun');
+        const renamed = tamperAgent(root, broken.id, 'two');
 
         const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
 
@@ -458,7 +496,7 @@ describe('per-session restore isolation (T5/R6)', () => {
             expect(
                 stderr.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith('[harness]'))
             ).toEqual([
-                `[harness] skipped an unrestorable saved session: ${expectedDiagnostic(root, broken.id, 'commandRun')}`
+                `[harness] skipped an unrestorable saved session: ${expectedDiagnostic(root, broken.id, renamed)}`
             ]);
 
             runtime.store.dispose();

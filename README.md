@@ -69,7 +69,12 @@ subagents exist) are also declared up front and are the only session-bound core
 tools. Every other harness-owned row — `toolRegistry`, `toolList`, `toolManage`,
 `toolCreate`, `records`, `profiles`, `chapters`, `locations`, `agentManage`, and
 `agentResult` — stays registered so `toolRequest` can enable it, but is searchable,
-not declared (R9-R11). Two conditional harness-owned
+not declared (R9-R11). That is the DEFAULT posture, not what the server's conversations
+start with: a session the server creates seeds the enabled set with every
+switchable name this deployment has not denied and the cap admits, so those
+names are declared from its first request (`enableAllTools`, see [Tool
+discovery](#tool-discovery)).
+Two conditional harness-owned
 tools are registered the same way: `actionRequest` when `interaction` is configured, and `threadFork`
 when forks are enabled (the default) — see
 [Owner questions and history forks](#owner-questions-and-history-forks).
@@ -620,13 +625,46 @@ A catalogue can reach thousands of tools. Declaring all of them would spend the
 model's context on schemas it will never call, so a request declares only:
 
 - every `visibility: 'core'` tool, and
-- every searchable tool that `toolRequest` has already enabled.
+- every searchable tool the enabled set carries — what `toolRequest` or `toolManage`
+  has already enabled, plus what the host seeded at construction (`enableAllTools`,
+  below).
 
 `toolRequest` is a core tool the harness always registers. It accepts exact
 `names`, a name `regex`, and/or capability `tags`, selects the **union** of those
 criteria, enables the matches for the next request, and returns the matched
 metadata. Selection is uncapped; the host bounds the persistent enabled set with
 `maxEnabledTools` (default 32), and core tools never spend that bound.
+
+The enabled set can also be seeded instead of queried: `enableAllTools: true` runs ONE
+`enableTools` pass over the registered names at the end of construction
+(`src/harness.ts:12046-12048`), so every name that harness can switch — live, not
+`visibility: 'core'`, not pending-only, not switched off by the deployment's tool deny list
+(`src/harness.ts:1542`, filtered inside the seed pass at `:12064`) — is enabled before the first request.
+`maxEnabledTools` is not raised for the seed: past the cap the remaining names are
+simply left off, exactly as an over-cap `toolRequest` match is omitted, and it is never
+an error. It is off for a library harness unless you pass it;
+the shipped server passes it on BOTH of its build paths — for every session it CREATES
+(`src/server/sessions.ts:2204`), which is what makes a brand-new conversation usable
+immediately, and for every session it RESTORES (`src/server/sessions.ts:3843`). The restore
+seed changes nothing about the conversation that comes back: `harness.restore()` ends by
+replacing the enabled set wholesale with the persisted `discovery.enabled`
+(`src/harness.ts:11676`), so a restart still cannot switch a tool back on for a conversation
+that had switched it off — a restored session keeps exactly the set it committed. It is there
+because the RESET re-seam below is gated on that same build configuration, which belongs to the
+process that built the harness: built unseeded, a session reset after a restart had no seed to
+re-run. A session RESET is the other event that starts a new conversation, so the server re-runs
+the same pass there (`src/server/sessions.ts:10204`, through `harness.enableAllSwitchableTools()`),
+in every process — `create → reset` and `create → restart → reset` are the same toolbox. A restart
+on its own is not, and stays exactly as described above. A record written before this seed existed
+is no exception: nothing about the posture is stored per session (the committed set already is,
+inside the snapshot), so a legacy session refills on its first RESET like any other, and a plain
+restart of one never refills it. The ONE case that still resets to an empty toolbox is a session
+whose preset factory withholds the seed from the configuration — an injected or scripted preset
+that builds its own harness (`src/server/session-reset-toolbox.test.ts`,
+`src/server/sessions.test.ts`); every shipped preset forwards it, and a library `harness()` caller
+or the CLI never receives the report at all. `harness.isToolSwitchable(name)` is the matching
+read: it answers which names the kernel will let anyone switch at all, which is the
+`protected` figure the session-tool routes refuse a write on.
 
 Every harness also preloads the bundled preset catalogue by default (`presets:
 true`), so its tools are available with no imports at all. The five core file tools
@@ -638,7 +676,9 @@ declared from the first request, together with the harness-owned `toolRequest` a
 `chapters`, `locations`, `agentManage`, and `agentResult` — plus the
 conditional `actionRequest` (`interaction` configured) and `threadFork`
 (`forks.enabled`, the default) stays registered but searchable: the model enables
-them with `toolRequest`, and a manual server call still runs them directly.
+them with `toolRequest` — or finds them already enabled in a session the server created,
+because that session starts with the seeded toolbox described above — and a manual server
+call still runs them directly.
 `files`, `download`, `shell`, `gitDiff`, `syntax`, and the app tools
 stay searchable too. `toolList` is the name+description inventory of the live registry
 (enabled or not); `toolManage` is the source/path/edit surface described below.
@@ -687,8 +727,9 @@ claiming nothing matched. These entries are never enabled, never count against
 | Already available | Core tools the caller already has (`delegate` with subagents, `tasks`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. A **conditionally declared** control is reported the same way while it is genuinely actionable: `toolCancel` appears in this list exactly when the caller has calls in flight, because it is declared only then — querying `cancel` must never answer "no such capability" about a tool the caller is holding. |
 | No match | when neither a searchable nor an already-available core tool matches, the result carries `unmatchedTags` and the full searchable `availableTags`, so the model retries with real vocabulary. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
-| Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. `harness.discoveredTools` exposes the enabled names. |
-| Scope on the server | The enabled set is per harness and ONE session owns one harness, so discovery is per conversation — and a CPU-isolated lane replica resolves that same session's enabled names (`src/server/workers/lane-authority.ts:381`, `:534`). Two switches sit ABOVE that set and are deliberately not per conversation: the deployment **tool deny list** (`PATCH /v1/harness/tools/:id`, one store per process, honoured on the next turn of every session AND thread, `src/server/tool-settings.ts:1-2`) and the plugin **template** (`PATCH /v1/harness/plugins/:id`, inherited by sessions created after the write). Plugin settings proper are per conversation — `PATCH /v1/harness/sessions/:id/plugins/:pluginId` (`src/server/plugins.ts`, "THE TWO SCOPES"). A session CAN withhold or re-enable a name in its own toolbox (`PATCH /v1/harness/sessions/:id/tools/:tool_id`), but that is not a copy of the deny list: every harness re-filters the request list through the provider (`src/harness.ts:4567-4581`) and refuses to launch a denied name (`:7845-7853`), so a session cannot lift a deployment denial — while the MANUAL path (`harness.executeTool`, both tool-execution routes) is not gated by it at all, which is what lets an operator run a name the model was refused. |
+| Seeded enabled set | `enableAllTools: true` (`HarnessConfiguration`, **off** for a library caller) enables every switchable registered name at the end of construction through one `enableTools` pass (`src/harness.ts:12046-12048`, the pass itself at `:12063`) — so `maxEnabledTools` still caps it, the overflow is left off rather than thrown, and a name the deployment denies is filtered out first. The shipped server sets it on BOTH build paths: for a session it CREATES (`src/server/sessions.ts:2204`) and for a session it RESTORES (`:3843`), and re-runs the pass whenever a session is RESET (`:10204`, via `harness.enableAllSwitchableTools()`) — a reset starts a new conversation, in any process. Setting it on the restore path does not refill anything: `harness.restore()` replaces the enabled set with the persisted `discovery.enabled` (`src/harness.ts:11676`) after construction, so a restored session keeps the set it committed and only a RESET starts full again; the flag on that path is what lets the reset seam fire at all after a restart, because the seam is gated on the per-process build configuration. A pre-existing record (written before the seed) needs nothing special: it refills on its first reset and never on a plain restart. The one qualification of "exactly": an enabled name THIS build no longer registers is pruned off the committed set on restore instead of losing the conversation (`src/server/sessions.ts:3672-3697`). A deployment denial outranks either figure: a denied name is filtered out of the seed, hidden from the model, and refused at the launch gate whatever a row's `enabled` says. `harness.isToolSwitchable(name)` states which names the kernel allows switching at all — the figure the session-tool routes refuse a write on. |
+| Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. `harness.discoveredTools` exposes the enabled names — seeded ones included. |
+| Scope on the server | The enabled set is per harness and ONE session owns one harness, so discovery is per conversation — and a CPU-isolated lane replica resolves that same session's enabled names (`src/server/workers/lane-authority.ts:386`, `:539`). Two switches sit ABOVE that set and are deliberately not per conversation: the deployment **tool deny list** (`PATCH /v1/harness/tools/:id`, one store per process, honoured on the next turn of every session AND thread, `src/server/tool-settings.ts:1-2`) and the plugin **template** (`PATCH /v1/harness/plugins/:id`, inherited by sessions created after the write). Plugin settings proper are per conversation — `PATCH /v1/harness/sessions/:id/plugins/:pluginId` (`src/server/plugins.ts`, "THE TWO SCOPES"). A session CAN withhold or re-enable a name in its own toolbox (`PATCH /v1/harness/sessions/:id/tools/:tool_id`), but that is not a copy of the deny list: every harness re-filters the request list through the provider (`src/harness.ts:4567-4581`) and refuses to launch a denied name (`:7845-7853`), so a session cannot lift a deployment denial — while the MANUAL path (`harness.executeTool`, both tool-execution routes) is not gated by it at all, which is what lets an operator run a name the model was refused. |
 | Reserved names | `toolRequest`, `toolList`, `toolManage`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, and `agentResult` belong to the harness, and `delegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
 | Manual call | an operator may run any registered tool through `harness.executeTool()` /
   `POST /v1/harness/tools/:id/executions` (or the session-scoped form of it); discovery gates the model, not the user. Core file tools need no session; the harness-owned set does. `actionRequest` and `threadFork` are the exception: they need the run that owns the conversation and are refused by the manual path. |
@@ -1292,15 +1333,23 @@ unsupported `language` and a non-string `code`: both throw, so `false` always me
 JavaScript check never loads the TypeScript compiler, the compiler never loads the
 interpreter, and JSON needs neither.
 
-Every preset is tagged. The five core file tools and `download` are always
-declared, so a model
-reads/writes/edits/lists names with `glob` and finds text with `grep` directly, and
-pulls a real file with `download` without a discovery round.
+Every preset is tagged. The five core file tools are always declared, so a model
+reads/writes/edits/lists names with `glob` and finds text with `grep` directly. `download`
+is `visibility: 'searchable'` (`src/tools/webdownload/download.tool.ts:566`), so a library
+model opens it with `toolRequest` — and a session the server creates starts with it already
+enabled by the seed (subject to the cap and the deny list), which is where "pulls a real
+file with `download` without a discovery round" is true there (`enableAllTools`, see
+[Tool discovery](#tool-discovery)).
 `files` is found with `files`/`list`/`move`/`rename`/`copy`/`delete`/`mkdir`; a shell
 with `shell`, git with `git`, syntax checks with `javascript`/`typescript`/`json`/`python`,
 and `fetch` with `web`/`fetch`/`url`/`read`/`research` when the harness opted into
 `webfetch`. Those
-searchable tools stay out of the context window until enabled.
+searchable tools stay out of the context window until something enables them:
+`toolRequest` in a library harness, or the new-session seed the server applies to a
+conversation it creates (`enableAllTools`, see
+[Tool discovery](#tool-discovery)) — which is what makes a fresh server session's
+`download` or `shell` call need no discovery round, as long as `maxEnabledTools` admits
+the name.
 
 **These presets hold no sandbox.** `read`, `write`, `edit`,
 `shell`, and `gitDiff` act with the permissions of the host process. Run the
@@ -1636,6 +1685,7 @@ const writer = harness({
 | `toolSources` | Map of wire name → editable source path. Registered after the baseline/presets and before `tools`; each revision is inspectable through `toolSource()`/`toolSources()`. |
 | `toolFolders` | Ordered external folders scanned recursively for `*.tool.ts` modules. Absolute or cwd-relative; later folders win name collisions; invalid folders/modules fail construction. Folder code is trusted code with process permissions. |
 | `maxEnabledTools` | Maximum number of SEARCHABLE tools enabled at once (default **32**). Core tools never count. This is the persistent enabled-set bound, not a per-query match cap; `toolRequest` reports the full union in `matched` and what the bound withheld in `omitted`. |
+| `enableAllTools` | Seed the enabled set at construction: one `enableTools` pass over every registered name THIS harness can switch (live, not `visibility: 'core'`, not pending-only, not switched off by the host's global tool provider (`toolSettings`)), so a brand-new instance starts with the switchable toolbox enabled instead of waiting for a `toolRequest` match (`src/harness.ts:12046-12048`). **Off unless exactly `true`**; the cap above still binds, and an over-cap catalogue keeps the first names in registration order and leaves the rest off — never a throw. Not snapshot state, so a restore keeps the set it committed (`restore()` replaces the enabled set from the persisted `discovery.enabled`, `src/harness.ts:11676`; one honest exception: an enabled name THIS build no longer registers is pruned on restore rather than losing the conversation, `src/server/sessions.ts:3672-3697`), and the kernel's `reset()` empties it. The shipped server passes it on both of its build paths — every session it creates (`src/server/sessions.ts:2204`) and every session it restores (`:3843`) — and a session RESET re-runs the same pass (`:10204`, through `harness.enableAllSwitchableTools()`), because a reset starts a new conversation and must not look like the empty toolbox this flag exists to remove. The restore path asks for the flag so that re-run survives a restart (the seam reads this per-process configuration); it does not make a restart refill, because the restore above overwrites the seed. |
 | `maxCreatedTools` | Lifetime budget for `toolCreate` / `toolRegistry` **in this harness instance** (default **32**, `unlimited` disables it). It is not a process-wide guard: a replacement that removes a name frees no slot, and N harnesses each hold their own budget. A host that builds one harness per conversation therefore pays the construction cost per conversation and gets N independent budgets — see [External tool folders](#external-tool-folders-and-toolts) for the shared-source shape. |
 | `presets` | Preload the discovered `preset`-group entries. **True by default**; `false` filters that group out, so the runtime (harness-owned) rows plus `tools` remain. `download` is one of those preset entries, so `presets: false` removes it too. |
 | `websearch` | `true` or `{ env?, exa?, tavily?, linkup? }`. Registers the core `search` tool when at least one provider key resolves; the default provider is the first key in the **exa → tavily → linkup** order and `provider` overrides per call. Absent, `false`, or no key means no tool. A configured `tools.search` wins. |
@@ -1655,8 +1705,10 @@ repeat the name inside the definition.
 | `writer.agent` | The entry agent. `writer.agent.messages` is the live transcript. |
 | `writer.agents` | Every agent, including the entry one. |
 | `writer.subagents` | The agents the primary may delegate to, keyed by name. Empty when delegation is not configured. |
-| `writer.tools` | Every registered tool, keyed by wire name: the preset/app catalogue plus the harness-owned set (`toolRequest`, `toolList`, `toolManage`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `delegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured). Registration is not declaration: `tool.visibility` and `toolRequest` say which half a name is in. |
-| `writer.discoveredTools` | Names `toolRequest` has enabled, in discovery order. Read-only copy; `reset()` empties it. |
+| `writer.tools` | Every registered tool, keyed by wire name: the preset/app catalogue plus the harness-owned set (`toolRequest`, `toolList`, `toolManage`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `delegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured). Registration is not declaration: `tool.visibility` and the enabled set — `toolRequest`, `toolManage`, or an `enableAllTools` seed — say which half a name is in. |
+| `writer.discoveredTools` | Names in the enabled set, in discovery order: what `toolRequest` has enabled plus what an `enableAllTools` seed put there. Read-only copy; `reset()` empties it (the shipped server re-runs the seed after ITS reset — `src/server/sessions.ts:10204`). |
+| `writer.isToolSwitchable(name)` | Whether THIS harness's kernel will let a caller switch that name on or off (`src/harness.ts:12635-12642`) — the same predicate the enable/disable operations refuse with, so `false` covers an unregistered name, a `visibility: 'core'` declaration, and a pending-only control such as `toolCancel` (which is registered as `'searchable'` yet stays pending-only). Read at call time: a tool registered after construction is switchable the moment it exists. This is what `harness.discoveredTools` cannot say — it reports what IS on, not what MAY be switched — and it is the fact behind the server's `protected` figure on a session-tool row (`src/server/api-reads.ts:988-998`), so a pane can grey a row out before the click instead of after it. |
+| `writer.enableAllSwitchableTools()` | OPTIONAL host seam (`src/types/index.ts:3886-3907`, implemented at `src/harness.ts:12643-12674`): re-runs the `enableAllTools` pass on a LIVE harness — every registered name this harness can switch, minus the deployment's deny list, capped in registration order. `reset()` empties the set and the construction seed is not snapshot state, so this is the only way a host whose "new conversation" is a RESET gives one the toolbox a fresh CREATE gets; looping `toolManage enable` per name is not equivalent, because an explicit enable inserts newest-first and keeps a different set once the cap binds. Reports one `state_change` when the set moves, nothing when it does not. |
 | `writer.toolCreate(config)` | Host-side runtime creation. Same validation/registry/budget as the model's `toolCreate`; throws `HarnessError`. |
 | `writer.executeTool(name, parameters)` | Run one registered tool directly, with this harness's context (`agent`, `agents`, `run`). The server's manual-execution path: discovery gates the model, not the operator, so an un-discovered searchable tool still runs. Reserved policy is kept (`toolCreate` registration, primary-only `delegate`); an unregistered name throws, and `actionRequest`/`threadFork` are refused because they need the owning run. |
 | `writer.commands` | The registered slash commands, keyed by name **without** the leading slash (`commands.help` answers `/help`). Every read is a frozen defensive copy of the live registry, so a command registered later shows up in the next read — and mutating the copy changes nothing. |
@@ -1664,7 +1716,7 @@ repeat the name inside the definition.
 | `writer.registerCommand(command)` | Register or **replace** one command at runtime, with `registerTool`'s replace semantics. Validates the name and the definition and throws `HarnessError` without touching the registry when either is invalid. |
 | `writer.branches()` | Detached copies of retained branch audit records (`HarnessBranchRecord[]`), newest terminal records within `maxBranchRecords`; active records are never evicted. Ephemeral: not part of the snapshot. |
 | `writer.branch(id)` | One detached branch record by id, or `undefined`. |
-| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `tasks`, `profiles`, `chapters`, `locations`, and the `agentManage`/`agentResult` registry. Created tools stay registered but are no longer enabled. Branch records and pending questions are ephemeral runtime state and are **not** cleared here. |
+| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `tasks`, `profiles`, `chapters`, `locations`, and the `agentManage`/`agentResult` registry. Created tools stay registered but are no longer enabled. Branch records and pending questions are ephemeral runtime state and are **not** cleared here. The KERNEL leaves the enabled set empty; the shipped server's session reset immediately re-runs the `enableAllTools` pass on top of it (`src/server/sessions.ts:10204`), so a reset conversation starts with the toolbox a new one gets instead of the empty pane this used to produce. |
 | `writer.nestedRuns()` / `writer.nestedRuns('refuse')` | Read, or arm once, this instance's **nested-run policy** (`'allow'` by default; armed on EVERY lane worker replica at hello, whatever preset that lane rebuilt). Under `'refuse'` every door that could start a CHILD conversation throws the named `nested-run-unsupported` limitation before the child, its transcript or its provider request exists: a tool's `context.run(...)`, a `harness(...)` call made from inside a tool body, `harness.sendThreadInput(...)`, a sibling brain run through `context.agents`, `delegate`, and a `threadFork` branch. On a refusing instance those doors are refused at the SURFACES a tool is handed, not at a stack depth: `context.harness` is a guarded view of the live handle (`src/harness.ts` `toolHandleView`) whose callable, `sendThreadInput` and sibling-brain members throw whenever they are reached — a reference the body stores and fires after its own call settled is refused just the same, while every plain read and every routed `harness.runtime` operation passes through. An inline harness still receives the strict-identical live handle. A tool reads the same policy from its own context (`context.nestedRuns`) and takes its local path when it says `'refuse'`. Arming a value the build does not recognise throws, and only a lane worker arms it — an inline harness never changes, see [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker). |
 
 ### Runtime tool creation
@@ -1798,7 +1850,8 @@ What that means for the shipped roles:
 append user input
 repeat:
     turn()                 -> assistant message (+ tool calls)
-    declare                -> core tools + everything toolRequest enabled
+    declare                -> core tools + everything the enabled set carries
+                             (what toolRequest enabled, or the enableAllTools seed)
     no tool calls?         -> report done, return the message
     schedule each call     -> CONCURRENT async work, not a serial loop
     results stream back    -> each `tool_result` carries its own duration
@@ -3030,13 +3083,13 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/sessions/:id` | One session's metadata plus its live model map and counters — still no turns, threads, transcripts or display trees |
 | `PATCH /v1/harness/sessions/:id` | Retarget models in a live session: body `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key/value, applies all-or-nothing, and is allowed while the session is running (the next request uses the new model; the current one keeps its own). See [Server and UI](#server-and-ui) |
 | `DELETE /v1/harness/sessions/:id` | Dispose a session — `{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }` |
-| `GET /v1/harness/sessions/:id/definition` | The harness definition this session froze, plus `frozen_at`, `source_revision` / `current_revision` / `current`, and `discovered_tools` |
+| `GET /v1/harness/sessions/:id/definition` | The harness definition this session froze, plus `frozen_at`, `source_revision` / `current_revision` / `current`, and `discovered_tools` — the enabled set, omitted while it is empty and therefore already populated on a session the server created (`enableAllTools`) |
 | `GET /v1/harness/sessions/:id/usage` | The session's token accounting (server-summed from the recorded `usage` events) |
 | `GET /v1/harness/sessions/:id/commands` | The slash commands this session can run (discovery only — execution is a task submit) |
 | `GET /v1/harness/sessions/:id/records` | The session record store, whole or as a `?since=` delta; read-only, so polling it moves no revision |
 | `GET /v1/harness/sessions/:id/queue` | The tasks waiting in this session's queue |
 | `POST /v1/harness/sessions/:id/tasks` | Submit a task (`{ input, attachments?, references?, thread_id? }`) or steer a running conversation → `202` **`TaskReceipt`** (see above). Each thread runs its own lane FIFO (cap 100 pending across all lanes, `429`) and continues after a task fails. Omitting `thread_id` opens a new thread; a running `thread_id` steers, or queues a continuation when attachments/an unfinished reference prevent it |
-| `POST /v1/harness/sessions/:id/reset` | Discard a session's conversation state — `{ reset: true, session_id, discarded_turns, discarded_threads, dropped_queued_tasks, revision }`; `409` while a run or queued work is pending |
+| `POST /v1/harness/sessions/:id/reset` | Discard a session's conversation state — `{ reset: true, session_id, discarded_turns, discarded_threads, dropped_queued_tasks, revision }`; `409` while a run or queued work is pending. The cleared toolbox is immediately re-seeded (`src/server/sessions.ts:10204`), so the next `GET .../tools` shows the same rows a brand-new session shows — unlike a restart, which keeps the set the conversation committed |
 | `POST /v1/harness/sessions/:id/cancel` | Optional `{ all?: true }` → the cancel receipt. Default cancels the active run only; `all: true` (the UI Stop button) also drains every queued turn, which stays in `/turns` as a `cancelled` row |
 | `GET /v1/harness/sessions/:id/actions` | The owner questions still waiting for an answer |
 | `POST /v1/harness/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', option_id } \| { kind: 'custom', text } }` → `{ ok: true, request_id, resolved_at }`. Settles one pending `actionRequest`; allowed while the session is busy. `400` invalid/unknown option, `404` unknown session/request, `409` answered or expired |
@@ -3047,11 +3100,11 @@ were deleted rather than kept behind a flag. See
 | `DELETE /v1/harness/sessions/:id/agents/:agentId` | Remove one binding (the primary is not detachable; live or queued work is a `409`) |
 | `GET /v1/harness/sessions/:id/agents/:agentId/instruction` | One session agent's effective instruction, naming the layer it came from |
 | `PATCH /v1/harness/sessions/:id/agents/:agentId/instruction` | Replace or clear it (`{ instruction: "…" \| null }`) and return that same document |
-| `GET /v1/harness/sessions/:id/tools` | This session's toolbox |
+| `GET /v1/harness/sessions/:id/tools` | This session's toolbox: one row per live registry name, with `declared` (in the frozen definition's **`coreTools`**, not the preset's tool list), `enabled` (the capped set — a session the server CREATED starts with every switchable name there, `enableAllTools`, and so does one it RESETS; a name the deployment denies is the one name the seed leaves off, and the denial outranks this figure — `GET /v1/harness/tools` is the row that states it), `origin` (`created` / `discovered` / `catalogue`) and `protected` (the kernel's own `!harness.isToolSwitchable(name)`, so a row that looks clickable is never refused) |
 | `POST /v1/harness/sessions/:id/tools` | Register a session-local tool |
 | `GET /v1/harness/sessions/:id/tools/:toolId` | One session tool with its argument schema |
-| `PATCH /v1/harness/sessions/:id/tools/:toolId` | Edit or re-enable one session tool (withholding it from the model does not unregister it) |
-| `DELETE /v1/harness/sessions/:id/tools/:toolId` | Remove one registration — the implementation, its captured revision, its created-tool record and its enabled slot go in one step, so a restart does not resurrect the name |
+| `PATCH /v1/harness/sessions/:id/tools/:toolId` | Edit or re-enable one session tool (withholding it from the model does not unregister it). `200` for any row the kernel can switch — a searchable preset such as `syntax`, `files` or `shell` included; `403` for a `protected` row (`src/server/api.ts:4099-4104`), i.e. a core declaration (`toolRequest`, `tasks`, the file tools, the thread group, a configured `search`/`fetch`, `delegate`) or the pending-only `toolCancel`; `409` while the session is busy (`:4060-4070`) — the kernel's own "core declaration" refusal is unreachable from this route, because the row states it before the click, and the runtime's remaining `409` needs the state to have moved between the row and the write (`:4123`) |
+| `DELETE /v1/harness/sessions/:id/tools/:toolId` | Remove one registration — the implementation, its captured revision, its created-tool record and its enabled slot go in one step, so a restart does not resurrect the name. `403` a `protected` row (`src/server/api.ts:4419-4424`); `400` only a name this session merely INHERITS, with no session-local registration and no enabled slot (`:4432-4437`) — an enabled catalogue row, the new-session seed included, is `origin: 'discovered'` and removes with `200`; `409` while the session is busy |
 | `GET /v1/harness/sessions/:id/tools/:toolId/source` | One tool's installed source revision |
 | `POST /v1/harness/sessions/:id/tools/:toolId/executions` | Execute a tool through THIS session's registry (a replaced preset, a created tool and a session-owned core tool all run what the session holds); a busy session is a `409`. See [the call body](#the-tool-call-body) |
 | `GET /v1/harness/sessions/:id/plugins` | THIS conversation's plugin rows — the same catalogue, the same paging, and THIS session's `enabled`/`values`. `X-Harness-Revision` is that session's own counter: 0 until its first `PATCH`, and it never moves the template counter |
@@ -4156,15 +4209,39 @@ Recovery policy on restart:
   becomes the `[transcript unreadable: …]` placeholder, and the raw value is retained
   in the additive `invalidThreads` roster so the operator can still repair it (see
   [Editable thread transcripts](#editable-thread-transcripts));
-- a session this build **cannot rebuild** (a snapshot naming a tool that has since
-  been renamed, a model map naming a retired agent, an internally inconsistent
-  record) is **dropped on load instead of failing startup**: every other session,
-  the registry, the API and new-session creation keep working, and the dropped id
-  answers `404 Unknown session` rather than presenting a half-restored row. Each
-  drop is reported through `onRestoreError` (stderr by default) and kept in
-  `SessionStore.restoreErrors`, so the reason stays readable after the session is
-  gone; the next whole-document commit therefore no longer carries that record.
-  Document-level problems stay **fatal** — an unreadable file, malformed JSON, an
+- a stale **enabled-tool name** in the snapshot does **not** cost the session: the
+  store filters the saved `core.discovery.enabled` through
+  `harness.isToolSwitchable(name)` immediately before `harness.restore()`, switching
+  off only the names this rebuilt harness cannot register and keeping every other
+  switch exactly as committed (`pruneStaleEnabledTools`,
+  `src/server/sessions.ts:3672-3697`, applied at `:3994`). A tool the session CREATED
+  keeps its slot, because the snapshot
+  re-registers it and `restore()` counts that name as available
+  (`src/harness.ts:11605-11609`). So a `search` key being removed, a plugin being
+  unregistered or an app tool being edited out of a harness card costs one switch, not
+  the conversation — while the kernel itself stays strict for a snapshot handed to it
+  directly (`src/harness.ts:11611-11617`). CORRECTED IN PLACE 2026-11-13: the bullet
+  below used to name "a snapshot naming a tool that has since been renamed" as a drop
+  cause; because a session the server creates starts with the whole switchable toolbox
+  enabled, that was the ordinary case and it silently deleted conversations. The
+  tolerance is pinned by `src/server/restore-enabled-tool-prune.test.ts`, and
+  `src/server/restore-isolation.test.ts` now pins the drop by renaming an AGENT;
+- a session this build **cannot rebuild** for any other reason (a snapshot naming an
+  agent that has since been renamed, a model map naming a retired agent, an internally
+  inconsistent record) is **dropped on load instead of failing startup**: every other
+  session, the registry, the API and new-session creation keep working, and the dropped
+  id answers `404 Unknown session` rather than presenting a half-restored row. Both
+  outcomes are reported through the SAME channel — `onRestoreError` (stderr by default)
+  and `SessionStore.restoreErrors`, where the lines interleave — so a host separates
+  them by their text, not by their position: a drop always states the reason, so it
+  stays readable after the session is gone, while a prune states that the session
+  restored and names what it switched off
+  (`src/server/sessions.ts:1818-1826`). A dropped record is gone from the next
+  whole-document commit, and a pruned name is forgotten there too: the store re-captures
+  the session's snapshot right after the restore (`src/server/sessions.ts:4013`), so
+  the stale name is out of the saved set at the first save and is not re-reported on
+  every restart. Document-level problems stay **fatal** — an unreadable file,
+  malformed JSON, an
   unknown database version and an invalid record SHAPE still abort startup, because
   an unparseable document says nothing trustworthy about the sessions inside it —
   and a failed load never rewrites the operator's file.

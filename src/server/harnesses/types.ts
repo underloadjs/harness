@@ -70,6 +70,19 @@ export type HarnessPresetReport = {
     // `buildHarness` passes one provider for the whole runtime; the worker lane cannot
     // (../tool-settings.ts, "WORKER MODE").
     toolSettings?: HarnessToolSettingsProvider;
+    // R1: "this build should START with the whole switchable toolbox enabled", forwarded by
+    // the shared toolbox factory into `HarnessConfiguration.enableAllTools`. It rides this one
+    // optional third argument for the identical reason `toolSettings` above does: every
+    // existing factory signature and caller keeps compiling, and a factory that ignores it
+    // simply produces a harness on the library default (an empty enabled set, discovery-driven).
+    //
+    // IT IS A BUILD DECISION, NOT A DEPLOYMENT FACT, which is why the value is per-build and
+    // not a constant in the factory: `../sessions.ts` `create` sets it for a session that has
+    // never run, and `../sessions.ts` `restoreSession` leaves it unset for a session whose
+    // enabled set comes back from its own committed snapshot. A preset that does not build
+    // through `createToolboxHarness` is free to ignore it, exactly like the other report
+    // fields — nothing about that factory's behaviour changes.
+    enableAllTools?: boolean;
     // Plugin diagnostics (pipeline T1.5's last mile). Same optional-third-argument discipline
     // as `stateChange`, `interaction` and `pluginSettings` above, so every existing factory
     // signature and caller keeps compiling and a factory that ignores it simply produces a

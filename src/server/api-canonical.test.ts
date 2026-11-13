@@ -781,8 +781,12 @@ describe('canonical REST contract', () => {
         // A row states the live session facts; the argument schema, the source TEXT, and any
         // tool result never ride it. `source_revision` rides only for a row with an installed
         // revision (item[0] here is a source-registered tool), and the bytes themselves are
-        // one named route away.
+        // one named route away. `availability` rides because a session row is the SAME catalogue
+        // projection the global `/harness/tools` row is (R3): item[0] is `toolRegistry`, whose
+        // entry states a session-bound hint, and a pane that reads the two routes must not see
+        // two different shapes for one tool.
         expect(Object.keys(tools.body.items[0]).sort()).toEqual([
+            'availability',
             'declared',
             'description',
             'enabled',

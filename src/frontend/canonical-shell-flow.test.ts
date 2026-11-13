@@ -192,10 +192,14 @@ const stub = (sessions: Record<string, unknown>[]): void => {
 
             // --- the ⚒ pane: the toolbox of the conversation on screen (T4) -----------------
             // The pane lists THIS session's registrations, not `GET /tools`. The row is the
-            // server's own projection (`sessionToolRowsOf`, ../server/api-reads.ts:959-994): the
+            // server's own projection (`sessionToolRowsOf`, ../server/api-reads.ts:1003-1032): the
             // name HARNESS_CARD's frozen definition declares (`core_tools: ['tasks']`), so
-            // `declared`/`protected` are true and `origin` is the catalogue's. It carries NO
-            // `parameters` — that is the whole point of the identified read below.
+            // `declared` is true and `origin` is the catalogue's, while `protected` follows the
+            // kernel's switchability answer (`visibility: 'core'` is never a cap slot,
+            // ../harness.ts:1799-1806) and `enabled` is FALSE with it — a core name never enters the
+            // live enabled set, so `enabled: true` + `protected: true` is a pair the server cannot
+            // send. It carries NO `parameters` — that is the whole point of the identified read
+            // below.
             if (path === `${ROOT}/sessions/chat-1/tools` && method === 'GET') {
                 return json(
                     sessionToolPage([
@@ -209,7 +213,7 @@ const stub = (sessions: Record<string, unknown>[]): void => {
                                 session_bound: true,
                                 declared: true,
                                 origin: 'catalogue',
-                                enabled: true
+                                enabled: false
                             },
                             'chat-1'
                         )

@@ -777,6 +777,10 @@ export type ThreadLaneInfo = ThreadLane;
 // tool that has since been renamed, a hand-edited record, a stale model map).
 // Such a session is DROPPED, never fatal, and the message is reported here —
 // the default is stderr and every message is also kept in `restoreErrors`.
+// The one NON-drop report is a session that was KEPT after `pruneStaleEnabledTools`
+// switched off an enabled name this build no longer registers: that line states the
+// session restored, so a host that counts reports must not read one as a lost
+// conversation (`list()` still returns it).
 export type SessionStoreOptions = {
     persistence?: HarnessPersistence;
     database?: HarnessDatabase;
@@ -1811,9 +1815,15 @@ export class SessionStore {
         return this.ioClosing;
     }
 
-    // Sessions this load dropped, document order, each as the exact diagnostic
-    // that was reported (see noteRestoreError). Empty for an in-memory store and
-    // for a document whose every session rebuilt successfully.
+    // Sessions this load DROPPED, document order, each as the exact diagnostic that was
+    // reported (see noteRestoreError). Empty for an in-memory store and for a document whose
+    // every session rebuilt successfully.
+    //
+    // Interleaved in the same order are the TOLERATED lines: one per session that was KEPT
+    // but whose enabled set named a tool this build no longer registers, switched off by
+    // `pruneStaleEnabledTools`. Those lines name a session that IS still listed and usable,
+    // so a caller distinguishes them by text, not by position — a drop always reads
+    // `Session "<id>" could not be restored: …`.
     get restoreErrors(): readonly string[] {
         return this.restoreFailures;
     }
@@ -2186,7 +2196,12 @@ export class SessionStore {
         const plugins = copyPluginSettingsStore(this.plugins);
 
         try {
-            harness = this.buildHarness(preset, settings, () => session, plugins);
+            // R1: a session that has NEVER run starts with the whole switchable toolbox
+            // enabled. The flag is a build option, so the harness and the Session object are
+            // still the only pair that ever disagrees about nothing: `definition` below is
+            // described from the same preset, and the snapshot at the bottom of this method
+            // captures the seeded enabled set exactly as the live harness states it.
+            harness = this.buildHarness(preset, settings, () => session, plugins, { enableAllTools: true });
         } catch (error) {
             // T27: a build failure that ALREADY carries an HTTP status is propagated, not
             // re-numbered. The case that matters is a retired agent profile: `agent-state`
@@ -2291,11 +2306,42 @@ export class SessionStore {
     // the template store down, `restoreSession` rebuilds the session's persisted copy. Both
     // build paths therefore pass a per-session store, and no build path passes the process
     // store's provider any more.
+    //
+    // `options.enableAllTools` (R1) is set by BOTH store build paths, and both of them mean the
+    // same thing: "this harness is one the server treats as a switchable toolbox". It is NOT a
+    // statement about the enabled set the conversation starts with — that is decided later, and
+    // differently, per path:
+    //
+    //   - `create`: the seed IS the starting set. A session that has never run gets every
+    //     switchable tool ticked instead of making the model spend a discovery round trip first.
+    //   - `restoreSession`: the seed is a CAPABILITY FLAG, not a refill. `harness.restore()` ends
+    //     by replacing the enabled set wholesale with the persisted `discovery.enabled`
+    //     (`setActiveTools`, src/harness.ts:11676 — it clears first), so the conversation still
+    //     comes back with exactly the set it COMMITTED, including an empty one. A restart has
+    //     never refilled a session that had switched tools off, and still does not; what the seed
+    //     on this path adds is the ability to re-run later.
+    //
+    // WHY THE RESTORE PATH HAS TO ASK AT ALL: the seed lives in `HarnessConfiguration`, and the
+    // reset re-seam (`Harness.enableAllSwitchableTools`, src/harness.ts) is gated on exactly that
+    // configuration value. A configuration is per-process, so if only `create` asked, a session
+    // reset in the process that created it would get the full toolbox while the SAME session reset
+    // after a restart would get none — `create → reset` 22 on, `create → restart → reset` 0 on.
+    // The posture therefore travels on the build, on both paths, and nothing else has to: the
+    // enabled set itself is already durable as the committed snapshot.
+    //
+    // The flag is still a per-build OPTION rather than an unconditional `true` in here because it
+    // is only one half of the deal: whether it reaches `HarnessConfiguration` is up to the preset
+    // factory. A factory that ignores the report (a scripted fixture, a hand-assembled handle)
+    // produces a non-seeded harness whose reset stays as empty as its first conversation was
+    // (src/server/harnesses/toolbox.ts forwards it; src/server/cli/index.ts never passes a report).
+    // Nothing here names a tool: the kernel's own switchability rule, the host deny list, and
+    // `maxEnabledTools` decide the seeded set (src/types/index.ts `HarnessConfiguration.enableAllTools`).
     private buildHarness(
         preset: HarnessPreset,
         settings: RunnerSettings,
         current: () => Session | undefined,
-        plugins: HarnessPluginSettingsStore
+        plugins: HarnessPluginSettingsStore,
+        options: { enableAllTools?: boolean } = {}
     ): Harness {
         // Progress routing (R1-R6). The runtime has ONE progress hook per harness,
         // so two concurrent root thread runs would otherwise be indistinguishable
@@ -2377,7 +2423,11 @@ export class SessionStore {
             // `create` for a fresh session and the restore path for one rebuilt from
             // `state.json`. Forwarded through `HarnessPresetReport.toolSettings` by the
             // shared toolbox (../harnesses/toolbox.ts), exactly like `pluginSettings`.
-            toolSettings: this.tools.provider
+            toolSettings: this.tools.provider,
+            // R1: the per-build toolbox seed, forwarded verbatim so a preset factory never has
+            // to guess whether ITS session is new. Absent (every restore, and every caller that
+            // does not ask) means the library default: an empty enabled set.
+            ...(options.enableAllTools === true ? { enableAllTools: true } : {})
         });
 
         // T4 (data plane): the record store's live signal.
@@ -3584,6 +3634,94 @@ export class SessionStore {
         session.invalidThreads = restored;
     }
 
+    // TOLERATED prune of stale ENABLED names, run on the snapshot immediately before
+    // `harness.restore` (R1 consequence; the lane replica does the identical thing for its
+    // rebuilt copy at ./workers/lane-worker-loop.ts:1391).
+    //
+    // WHY THIS EXISTS NOW: `create` seeds a brand-new session's enabled set with EVERY
+    // switchable name (../types/index.ts `HarnessConfiguration.enableAllTools`), so a
+    // persisted `discovery.enabled` list is ~22 names instead of the handful a couple of
+    // `toolRequest` rounds used to leave behind. The kernel refuses an enabled name the
+    // rebuilt harness does not register:
+    //   `Snapshot discovery names "X", which is not registered in this harness.`
+    //   (../harness.ts:11611-11617)
+    // and the store turns that throw into a PER-SESSION DROP (the load loop at :1731-1737 ->
+    // `noteRestoreError`), so one vanished registration — a web-search key removed, so
+    // `search` is gone; a plugin unregistered; an app tool edited out of a harness — silently
+    // deletes a whole conversation. The hazard pre-dates the seed; the seed makes it the
+    // common case, and nothing else on this path prunes.
+    //
+    // WHY HERE AND NOT IN THE KERNEL: `restore()` stays strict. A snapshot handed to the
+    // kernel directly (a host, a lane frame, a test) must still fail loudly for an
+    // unregistered name — ./restore-isolation.test.ts pins that semantics — while the STORE
+    // is the layer that knows a stale name is not worth losing a conversation over.
+    //
+    // WHAT IS DROPPED is exactly what this rebuilt harness could never call:
+    //   - `harness.isToolSwitchable(name)` is false — the kernel's own "a live, switchable
+    //     definition resolves under this name" answer (../types/index.ts:3885), the same
+    //     predicate `toolManage enable|disable` refuses with; AND
+    //   - the snapshot does not re-register it ITSELF. A tool the session CREATED lives only
+    //     in `createdTools`, so it is not in the registry yet at this point, and `restore()`
+    //     counts such a name as available (../harness.ts:11609) — dropping it would switch a
+    //     session's own runtime tool off after a restart.
+    // Everything else keeps its switch state verbatim, so a restore that prunes nothing is
+    // byte-identical to the previous behaviour.
+    //
+    // The snapshot is COPIED rather than mutated: `record.core` is the parsed document and a
+    // frame that needed no pruning is restored exactly as it arrived (the lane rule again).
+    private pruneStaleEnabledTools(
+        core: HarnessSnapshot,
+        harness: Harness,
+        sessionId: string
+    ): HarnessSnapshot {
+        // Defensive `??`s: `discovery`/`createdTools` are required by the snapshot TYPE, but
+        // a hand-edited `state.json` reaches here after only the document-level shape check
+        // (./persistence.ts `readHarnessSnapshot`), and an absent list means "nothing was
+        // enabled", which is a valid state rather than a corruption to report.
+        const enabled = core.discovery?.enabled ?? [];
+
+        if (enabled.length === 0) return core;
+
+        const recreated = new Set((core.createdTools ?? []).map((created) => created.name));
+        const dropped = new Set(
+            enabled.filter((name) => !recreated.has(name) && !harness.isToolSwitchable(name))
+        );
+
+        if (dropped.size === 0) return core;
+
+        const kept = enabled.filter((name) => !dropped.has(name));
+
+        this.noteToleratedRestore(sessionId, kept.length, [...dropped]);
+
+        return { ...core, discovery: { ...core.discovery, enabled: kept } };
+    }
+
+    // Observability for the prune above, on the channel that already reports what a saved
+    // document named: the aggregate `restoreErrors` list plus the injected restore reporter
+    // (stderr when the host injected none) — the same reporter-or-stderr convention as
+    // `noteRestoreError` and the plugin-diagnostic path (`notePluginDiagnostic`). It is
+    // deliberately NOT a drop: the session survived, so the line STATES that, and a host
+    // reading `restoreErrors` still sees its session in `list()`.
+    private noteToleratedRestore(sessionId: string, kept: number, dropped: readonly string[]): void {
+        const message =
+            `Session "${sessionId}" restored with ${kept} enabled tool(s); ` +
+            `${dropped.length} name(s) this build does not register were switched off: ${dropped.join(', ')}.`;
+
+        this.restoreFailures.push(message);
+
+        if (this.onRestoreError !== undefined) {
+            try {
+                this.onRestoreError(new Error(message));
+            } catch {
+                // Observability only; the restore already succeeded.
+            }
+
+            return;
+        }
+
+        console.error(`[harness] kept a session whose enabled set named a tool this build lost: ${message}`);
+    }
+
     // Rebuild one session from a validated record. Order matters: the frozen
     // preset decides the harness shape, the harness must be built from it, and only
     // then can the core snapshot be applied (restore validates against the exact
@@ -3683,7 +3821,26 @@ export class SessionStore {
             // in the per-session restore failure (noteRestoreError), not in a dropped database.
             this.assertWorkerCapable(preset);
 
-            const harness = this.buildHarness(preset, settings, () => session, plugins);
+            // R1 — the SAME seed posture `create` uses, and for one reason that is easy to miss:
+            // the reset re-seam is gated on `HarnessConfiguration.enableAllTools` (src/harness.ts
+            // `enableAllSwitchableTools`), and that configuration belongs to THIS process's build.
+            // Built unseeded, a restored session's `POST /reset` silently returned an empty
+            // toolbox — `create → reset` 22 on, `create → restart → reset` 0 — while the same
+            // session reset in its own process returned the full set.
+            //
+            // WHAT THIS DOES NOT DO (the guarantee that made this path unseeded in the first
+            // place): it does not switch anything on for the restored conversation. A few lines
+            // below `harness.restore(pruned)` ends by calling `setActiveTools(next.discovery.enabled)`
+            // (src/harness.ts:11676), which CLEARS the set and rebuilds it from the snapshot, so
+            // whatever this construction seed enabled is discarded before the session is ever
+            // published, and the post-restore `harness.snapshot()` re-captured at the bottom of
+            // this method is the committed set — not the seed. A restart therefore still keeps
+            // "a restored session keeps exactly the set it committed", including a committed empty
+            // set; only an explicit reset starts a new conversation and refills.
+            //
+            // Pinned by src/server/restore-enabled-tool-prune.test.ts and
+            // src/server/session-reset-toolbox.test.ts ("a restart alone never refills…").
+            const harness = this.buildHarness(preset, settings, () => session, plugins, { enableAllTools: true });
 
             session = {
                 id: record.id,
@@ -3826,8 +3983,15 @@ export class SessionStore {
             // would silently rewrite the session's primary conversation.
             const invalidThreads = this.tolerateThreadTranscripts(core);
 
-            session.core = core;
-            harness.restore(core);
+            // R1: drop only the enabled names THIS rebuilt harness cannot register, so a
+            // vanished tool costs a switch, not the conversation (see `pruneStaleEnabledTools`
+            // above for the rule and why it lives at the store layer). `session.core` is
+            // assigned the pruned snapshot so the value on the Session object is the one that
+            // was actually applied; the authoritative re-capture below replaces it again.
+            const pruned = this.pruneStaleEnabledTools(core, harness, record.id);
+
+            session.core = pruned;
+            harness.restore(pruned);
 
             // Merge what the document recorded as unreadable (C4). A thread that is
             // still a placeholder is the one case where the persisted raw value is
@@ -10007,6 +10171,37 @@ export class SessionStore {
             agent.reset();
         }
         session.harness.reset();
+
+        // R1's SEED, RE-APPLIED — a reset starts a NEW conversation, so it gets the toolbox a
+        // NEW conversation gets.
+        //
+        // WHY: `harness.reset()` empties the enabled set (src/harness.ts; README's `reset()` row
+        // and src/types/index.ts `discoveredTools` both say so), and the construction seed is
+        // NOT snapshot state, so a reset conversation used to sit at 0 on / 22 off-but-clickable
+        // rows — byte-for-byte the brand-new harness the report objected to, one reset later.
+        // `create` seeds above (`:2204`); this is the same promise, on the same ONE condition
+        // (a conversation that has never run), reached through the kernel's own re-seam so the
+        // cap, the deployment deny list and the registration order decide it exactly as they did
+        // at construction (src/types/index.ts `Harness.enableAllSwitchableTools`). The seam is
+        // GATED on that same build option inside the kernel, so a session whose harness build never
+        // asked for a seeded toolbox — a preset whose factory drops the store's report, or a host
+        // handle assembled without `enableAllTools` — resets to the same empty set it was created
+        // with. `reset` and `create` stay two names for ONE posture either way. BOTH store build
+        // paths now ask (`create` at `:2204`, `restoreSession` at `:3843`), which is what makes the
+        // gate hold across a restart instead of only in the process that created the session: the
+        // gate reads a per-process configuration, so an unseeded restore used to disarm this call
+        // and a reset after a restart landed on 0 enabled.
+        //
+        // WHAT IT DELIBERATELY DOES NOT DO: it does not touch the RESTORE itself. A restart still
+        // re-applies the set that conversation committed, because `harness.restore()` replaces the
+        // enabled set wholesale after construction (src/harness.ts:11676) — the seed on that path
+        // only re-arms this seam, it never refills a conversation that had switched tools off. That
+        // is the guarantee the prune note below protects, and it is still true. Only an explicit
+        // reset starts over — and it starts over MEANING the same thing in every process now.
+        //
+        // Guarded, not assumed: a host handle assembled without the seam keeps the previous
+        // behaviour instead of failing the reset.
+        session.harness.enableAllSwitchableTools?.();
 
         // T5: a reset restarts record ids, the tool budget view, and the archive, so the
         // session's identity ledger and memory plan are rebuilt from the fresh harness on the

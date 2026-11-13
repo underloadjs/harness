@@ -12020,6 +12020,50 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // (budget, enabled set, persistence bookkeeping, and state-change reporting).
     startupPhase = false;
 
+    // THE OPTIONAL FULL-TOOLBOX SEED (`configuration.enableAllTools`, src/types/index.ts).
+    //
+    // WHY HERE AND NOT EARLIER: the seed asks "which names are switchable right now", so it
+    // has to run after the LAST startup registration — baseline descriptors, host
+    // `toolSources`, folder scans, `tools` overrides, the two web tools, and every plugin
+    // hook (a plugin registers tools while `runPlugins` runs, above). Seeding anywhere before
+    // that would silently miss whatever registered last.
+    //
+    // WHY `enableTools` AND NOT A DIRECT `activeTools.add`: one path owns the enabled set, so
+    // the seed inherits the kernel's rules for free instead of restating them —
+    // `occupiesSearchableSlot` drops core and pending-only names, deduplicates, and
+    // `maxEnabledTools` bounds the result (the overflow is simply left off, the same
+    // `omitted` outcome a `toolRequest` match beyond the cap gets, never a throw).
+    //
+    // THE DENY LIST IS FILTERED HERE, BEFORE the pass: `enableTools` does not consult the
+    // host's global provider (an explicit operator/model action may still name a disabled
+    // tool), so a seed that skipped this would spend cap slots on names the deployment has
+    // switched off for every session, and the rows would report them as enabled.
+    //
+    // NO `stateChange` and no notification: this is construction, not a mutation. The server
+    // takes its first snapshot after `harness()` returns (`sessions.ts` records `core`), so
+    // the seeded set is durable from the session's own commit, and a library consumer that
+    // never passes the flag keeps an empty enabled set byte-for-byte.
+    if (configuration.enableAllTools === true) {
+        seedSwitchableTools();
+    }
+
+    // THE SEED PASS, in ONE hoisted declaration so the construction site above and the re-seed
+    // host seam (`Harness.enableAllSwitchableTools`, assembled on the handle below) run the
+    // SAME selection and cannot drift apart. Hoisted deliberately: the call site stays exactly
+    // where the startup comment ends, so the documented anchor `src/harness.ts:12046-12048`
+    // keeps naming the seed rather than shifting every time this note grows.
+    //
+    // WHAT ONE PASS OWNS: every registered name minus this deployment's deny list (see the
+    // comment above), handed to `enableTools`, which applies `occupiesSearchableSlot`,
+    // de-duplicates, and caps at `maxEnabledTools` IN REGISTRATION ORDER. That last detail is
+    // why a host must not re-implement the seed by looping `toolManage enable` name by name:
+    // an explicit enable inserts newest-first, so once the cap binds a loop keeps the LAST N
+    // names while this pass keeps the FIRST N — a re-seed would then land a different set than
+    // the construction seed it is supposed to reproduce.
+    function seedSwitchableTools(): { enabled: string[]; omitted: string[]; evicted: string[]; retained: string[] } {
+        return enableTools(Object.keys(tools).filter((name) => !isToolGloballyDisabled(name)));
+    }
+
     // The host/server-facing execution path (R8): run one REGISTERED tool by name
     // with the session it belongs to, exactly like the model would, but without
     // spending a discovery round trip. The server's `POST /tools/:name` calls this
@@ -12588,6 +12632,46 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         registerTool,
         toolSource,
         toolSources,
+        // THE KERNEL'S OWN SWITCHABILITY ANSWER (src/types/index.ts `Harness.isToolSwitchable`).
+        // A bare forward onto `occupiesSearchableSlot` — the ONE predicate `toolManage
+        // enable|disable`, `enableToolFor`/`disableToolFor`, the snapshot, and restore already
+        // share — so a host can state which names a conversation may switch at all without
+        // re-implementing the rule (and getting `toolCancel` and the searchable preset rows
+        // wrong in opposite directions). Read at call time: a tool registered after
+        // construction is switchable the moment it exists, and a removed one is not.
+        isToolSwitchable: (name: string) => occupiesSearchableSlot(name),
+        // THE FULL-TOOLBOX RE-SEED (`src/types/index.ts` `Harness.enableAllSwitchableTools`).
+        // `reset()` empties the enabled set and the construction seed is NOT snapshot state, so
+        // a host that wants a RESET conversation to start like a NEW one calls this. It is the
+        // construction pass verbatim — same deny list, same cap, same registration order — which
+        // is the whole reason the seam exists rather than a host-side loop over `manageTool
+        // enable`: a loop restates the rule and lands a different set once the cap binds (see
+        // `seedSwitchableTools` above).
+        //
+        // GATED ON THE SAME CONDITION AS CONSTRUCTION: this re-runs THE SEED this harness was built
+        // with, so a handle built WITHOUT `enableAllTools` (a library consumer, or a preset whose
+        // `create` does not forward the store's report) has no seed to re-run and stays exactly as
+        // empty as its first conversation was. That gate is what keeps `reset` and `create` two
+        // names for ONE posture; a host that wants to fill a non-seeded harness switches names
+        // itself (`toolManage enable` / `toolRequest`).
+        //
+        // ONE `state_change`, and only when the set actually moved. Construction stayed silent
+        // because it is not a mutation; this is one, and an enabled-set change is snapshot state,
+        // so a persistence observer has to see it exactly like a `toolManage enable` does. A
+        // no-op re-seed (an already-full toolbox, or a harness that never asked for the seed)
+        // reports nothing.
+        enableAllSwitchableTools: (): void => {
+            if (configuration.enableAllTools !== true) return;
+
+            const before = new Set(currentEnabledNames());
+
+            seedSwitchableTools();
+
+            const after = currentEnabledNames();
+            const moved = after.length !== before.size || after.some((name) => !before.has(name));
+
+            if (moved) notifyStateChange('tool_create');
+        },
         callTool: (name: string, parameters: unknown, options?: HarnessToolCallOptions) =>
             callToolInternal(name, parameters, options),
         // Stable, replacement-surviving tool memory.

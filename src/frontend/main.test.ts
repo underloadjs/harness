@@ -224,8 +224,9 @@ const stubFetch = (
 // either pane therefore needs BOTH halves of the new subject: a session in the boot roster, and
 // the toolbox page that pane reads (`GET /sessions/{id}/tools`, ./api.ts `listSessionTools`).
 // `withConversation` states the first, `conversationToolbox` the second, and the row semantics are
-// the SERVER's — `sessionToolRow` encodes src/server/api-reads.ts:959-994 for `protected`,
-// `declared` and `origin`, so a core name arrives locked for the right reason.
+// the SERVER's — `sessionToolRow` restates src/server/api-reads.ts:1003-1032 for `protected`
+// (the kernel's switchability answer), `declared` and `origin`, so a core name arrives locked for
+// the right reason and a switchable one arrives enabled, exactly as a brand-new session reports it.
 const withConversation = (boot: Record<string, unknown> = {}): Record<string, unknown> =>
     bootstrap({ ...boot, sessions: [snapshot()] });
 
@@ -239,10 +240,10 @@ const conversationToolbox = (tools: readonly ToolDescriptor[] = []): Response =>
                     description: tool.description,
                     tags: tool.tags,
                     visibility: tool.visibility,
-                    // A toolbox row is a name this conversation CAN call, so the figure is ON. The
-                    // deployment catalogue's own `enabled` is a different subject and never reaches
-                    // the pane.
-                    enabled: true
+                    // NO `enabled`: the server's figure for a fresh conversation is ON for every
+                    // switchable name and OFF for every protected one (`enableAllTools`,
+                    // src/harness.ts:12046-12048), and `sessionToolRow` derives exactly that from
+                    // the visibility above.
                 })
             )
         )

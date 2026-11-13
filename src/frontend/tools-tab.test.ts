@@ -61,8 +61,9 @@
 //     only, never `PATCH /tools/{tool_id}` — and repaints from the session re-read that follows
 //     the accepted write (`main.ts` `setToolEnabled`/`applySessionToolRows`), which is why every
 //     switch assertion below pins a PATCH and the re-read that follows it;
-//   - a row the conversation cannot switch (`protected`: harness-owned core control, or declared
-//     by its frozen definition — ../shared/harness-api.ts:1885) renders a LOCKED box, and a run
+//   - a row the conversation cannot switch (`protected`: the harness declares that control
+//     itself — `visibility: 'core'`, or a pending-only runtime control — never merely "declared by
+//     the frozen definition"; ../shared/harness-api.ts:1885) renders a LOCKED box, and a run
 //     in flight locks every box, because that PATCH answers 403 and 409 respectively;
 //   - with NO conversation bound both header toggles are `hidden` (`main.ts` `syncConfigScope`,
 //     `styles.css` `.tools-toggle[hidden]`), so these fixtures boot with one session in the
@@ -153,10 +154,11 @@ const toolRequestTool = coreTool('toolRequest', {
 });
 
 // T4: the pane's rows are this CONVERSATION's toolbox, in the spelling `GET /sessions/{id}/tools`
-// serves (`SessionToolSummary`, ../shared/harness-api.ts:1852-1900). The two facts a catalogue row
-// never carried follow the SERVER's rule (`sessionToolRowsOf`, src/server/api-reads.ts:959-994):
-// a harness-owned core name is `protected`, and so is any name the frozen definition declares.
-// The ordinary tools here got in through `toolRequest`, so they are `declared: false` +
+// serves (`SessionToolSummary`, ../shared/harness-api.ts:1852-1900). The three facts a catalogue
+// row never carried follow the SERVER's rule (`sessionToolRowsOf`, src/server/api-reads.ts:1003-1032):
+// `protected` is the kernel's switchability answer, so a `visibility: 'core'` name is protected and
+// every other name here is switchable — `declared` plays no part in it (these fixtures declare
+// nothing). The ordinary tools got in through `toolRequest`, so they are `declared: false` +
 // `origin: 'discovered'` — the only shape whose PATCH the server accepts, which is what makes the
 // switch tests below legal. A core row states `enabled: false` (a core tool never enters the
 // enabled set) and is still in context, which is exactly what `toolRowInContext` in main.ts reads.
@@ -1019,20 +1021,21 @@ it('paints one corner tick box on EVERY row, the harness-owned core row included
     expect(readRow.dataset.enabled).toBe('true');
 
     // T4: the harness-owned core row still gets a box — every row that states an enablement does —
-    // but the box is LOCKED. `protected` is the server's figure (src/server/api-reads.ts:959-994:
-    // a core control tool, or a name the frozen definition declares) and its PATCH answers 403, so
-    // main.ts states that refusal on the control before the click instead of after it.
+    // but the box is LOCKED. `protected` is the server's figure (src/server/api-reads.ts:1003-1032:
+    // the negation of `harness.isToolSwitchable`, so a `visibility: 'core'` control name) and its
+    // PATCH answers 403, so main.ts states that refusal on the control before the click instead of
+    // after it.
     const coreRow = byClass('.tool-tab-button[data-tool="toolRequest"]', 'button');
     const coreSwitch = toolBox('toolRequest');
 
     // A core row reads `enabled: false` on the session route and is STILL in context, which is
-    // what `toolRowInContext` (main.ts:8745) decides from `protected` — so the tick is on.
+    // what `toolRowInContext` (main.ts:8752) decides from `protected` — so the tick is on.
     expect(coreRow.dataset.enabled).toBe('true');
     expect(coreSwitch.checked).toBe(true);
     expect(coreSwitch.disabled).toBe(true);
     expect(coreSwitch.getAttribute('aria-label')).toBe('Disable toolRequest');
     expect(coreSwitch.title).toBe(
-        'Harness-owned or declared by this conversation’s team · it cannot be switched here'
+        'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
     );
 
     // Nothing is left of the old pill or the pin, in the document or in the markup.
@@ -1219,6 +1222,375 @@ it('pulls a refused switch back to the server figure and keeps the server senten
     expect(byClass('.status-detail', 'span').textContent).toBe(`tool enablement: ${message}`);
 });
 
+// ---------------------------------------------------------------------------
+// The two row shapes the reader met on a BRAND-NEW conversation (the upgrade regression: a
+// checkbox that answered with the top-right `error` pill).
+//
+// Both fixtures state ONLY the kernel facts a row is derived from — `visibility`, `pendingOnly`,
+// `declared` — and let `sessionToolRow` compute `protected` / `enabled` / `origin` the way
+// `sessionToolRowsOf` (src/server/api-reads.ts:1003-1032) does. That is deliberate: a fixture that
+// hand-states `protected: true` pins its own opinion and cannot catch the rule drifting, while
+// these two pin the derivation itself (the first `expect` of each test is the exact row the double
+// projects, before the pane ever sees it).
+// ---------------------------------------------------------------------------
+
+// The shared double wired into a fixture's OWN handler, so its routes win over `stubFetch`'s
+// default toolbox (`stubFetch` tries the test handler first — see its `declared` branch). The
+// handler form also hands the test the double itself: `toolRows()` is the payload the pane is
+// about to paint, and `toolWrites` is what the server actually received.
+const seededFetch = (seeds: readonly SessionToolRowSeed[]) => {
+    const config = sessionConfigDouble({ tools: seeds });
+    const calls = stubFetch((url, method, body) => config.respond(url, method, body));
+
+    return { calls, config };
+};
+
+it('renders a harness-owned row checked and locked, and its press cannot ask the server for a switch', async () => {
+    // `delegate` as the live kernel reports it (measured on a real session): harness-owned, NOT
+    // declared by the frozen definition, `session_bound: true`, and therefore `protected: true`
+    // with `enabled: false`.
+    const delegateSeed: SessionToolRowSeed = {
+        name: 'delegate',
+        group: 'Core tools',
+        description: 'Delegate a unit of work to a subagent.',
+        tags: ['core', 'harness'],
+        visibility: 'core',
+        session_bound: true,
+        declared: false
+    };
+    // The other direction of the same rule: `toolCancel` is protected WITHOUT being declared,
+    // because its registration is pending-only — its manifest visibility is demoted to
+    // `searchable`, which is precisely the case a server-side guess from `visibility` used to get
+    // wrong (and the case that made the pane offer a switch the route answers 403 to).
+    const cancelSeed: SessionToolRowSeed = {
+        name: 'toolCancel',
+        group: 'Core tools',
+        description: 'Cancel the work this conversation has queued.',
+        tags: ['core', 'harness'],
+        visibility: 'searchable',
+        session_bound: true,
+        declared: false,
+        pendingOnly: true
+    };
+    const { calls, config } = seededFetch([delegateSeed, cancelSeed]);
+
+    // The exact rows the double serves — the derivation, not an opinion. `protected` is the
+    // negation of switchability in BOTH names (`delegate` by `visibility: 'core'`, `toolCancel` by
+    // its pending-only registration), `enabled` is false because a protected name never enters the
+    // capped set, and `origin` is `catalogue` for both — `discovered` is an ENABLED name this
+    // session did not declare, and neither of these holds a slot.
+    expect(config.toolRows()).toEqual([
+        {
+            name: 'delegate',
+            group: 'Core tools',
+            description: 'Delegate a unit of work to a subagent.',
+            tags: ['core', 'harness'],
+            visibility: 'core',
+            session_bound: true,
+            enabled: false,
+            session_id: 's1',
+            declared: false,
+            origin: 'catalogue',
+            protected: true,
+            source_available: false
+        },
+        {
+            name: 'toolCancel',
+            group: 'Core tools',
+            description: 'Cancel the work this conversation has queued.',
+            tags: ['core', 'harness'],
+            visibility: 'searchable',
+            session_bound: true,
+            enabled: false,
+            session_id: 's1',
+            declared: false,
+            origin: 'catalogue',
+            protected: true,
+            source_available: false
+        }
+    ]);
+
+    await boot();
+    openTools();
+    await flush();
+
+    // `name:checked:disabled` for every row: both are ticked ON (`main.ts` `toolRowInContext` reads
+    // `protected`, so a harness-owned name shows as in context whatever `enabled` says) and both
+    // are LOCKED. Nothing here is clickable-but-off.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) => {
+            const box = node.querySelector<HTMLInputElement>('.tool-tab-enable');
+
+            return `${node.querySelector('.tool-tab-button')?.dataset.tool}:${String(box?.checked)}:${String(box?.disabled)}`;
+        })
+    ).toEqual(['delegate:true:true', 'toolCancel:true:true']);
+
+    // The lock says WHY, in the reader's terms — and the reason is the harness, not the team that
+    // wrote this conversation's definition.
+    const delegate = toolBox('delegate');
+
+    expect(delegate.className).toBe('tool-tab-enable is-on');
+    expect(delegate.dataset.enabled).toBe('true');
+    expect(delegate.getAttribute('aria-label')).toBe('Disable delegate');
+    expect(delegate.title).toBe(
+        'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
+    );
+
+    // Two presses, in the two ways a press can arrive.
+    //
+    // The NATIVE one first: a disabled control swallows the click (real hit-testing, and jsdom's
+    // `HTMLElement.click()` implements the same rule), so the row cannot move at all.
+    delegate.click();
+    toolBox('toolCancel').click();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+    expect(toolBox('delegate').checked).toBe(true);
+    expect(toolBox('toolCancel').checked).toBe(true);
+
+    // A DISPATCHED click gets past the disabled control — the path a scripted reader, or a frame
+    // that painted the box before its lock did, takes — so this is main.ts's own guard under test
+    // (`if (row.protected === true) return`, main.ts:8722): no write leaves the pane. The native
+    // checkbox still flips its own `checked` on a synthesized click and the guard returns before
+    // any repaint, so the DOM figure is re-based by the next paint pass rather than by this click;
+    // what may never change is the traffic and the pill, and those are what the reader's complaint
+    // is about.
+    delegate.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    toolBox('toolCancel').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+    expect(config.toolWrites).toEqual([]);
+    // The pill is the ONLY place a refusal could appear, and there is no refusal: the state is
+    // still the idle one boot left, with no diagnostic under it. The pane itself keeps its
+    // deliberate shape — no inline error line, no retry control, head = title only — which is the
+    // layout the reader asked for (main.ts `setToolEnabled`'s catch reports on the pill alone).
+    expect(byClass('.status-text', 'span').textContent).toBe('idle');
+    expect(byClass('.status-detail', 'span').textContent).toBe('');
+    expect(document.querySelector('.tools-tab-note')).toBeNull();
+    expect(document.querySelector('.tools-tab-hint')).toBeNull();
+    expect(document.querySelector('.tools-tab-retry')).toBeNull();
+    expect([...byClass('.tools-tab-head', 'div').children].map((node) => node.className)).toEqual(['tools-tab-title']);
+});
+
+it('renders a brand-new session with every switchable box on, and switches one of them with one accepted write', async () => {
+    // The seed a brand-new conversation ships with: `enableAllTools` (src/harness.ts:12046-12048,
+    // set by `src/server/sessions.ts:2204` for a CREATE and for a RESTORE (`:3843`), and re-run by
+    // `:10204` for a RESET) puts
+    // every globally-enabled
+    // SWITCHABLE registration in the capped set, so each row below must arrive
+    // `enabled: true` / `protected: false` without a fixture saying so.
+    const seededFetchRows: readonly SessionToolRowSeed[] = [
+        { name: 'glob', group: 'Files', description: 'List files by pattern.', tags: ['files'], visibility: 'searchable', declared: false },
+        { name: 'read', group: 'Files', description: 'Read one or more files.', tags: ['files', 'read'], visibility: 'searchable', declared: false },
+        // Declared by the frozen definition AND switchable (`syntax` is in the definition's
+        // `coreTools` and the kernel lets the session switch it): `declared` does NOT lock the row,
+        // and because it is enabled-but-declared its `origin` is `catalogue`, not `discovered`.
+        { name: 'syntax', group: 'Core tools', description: 'Check a file for syntax errors.', tags: ['core'], visibility: 'searchable', declared: true }
+    ];
+    const { calls, config } = seededFetch(seededFetchRows);
+
+    // `name:enabled:protected:declared:origin` — the whole toolbox the pane is about to paint.
+    expect(config.toolRows().map((row) => [row.name, row.enabled, row.protected, row.declared, row.origin])).toEqual([
+        ['glob', true, false, false, 'discovered'],
+        ['read', true, false, false, 'discovered'],
+        ['syntax', true, false, true, 'catalogue']
+    ]);
+
+    await boot();
+    openTools();
+    await flush();
+
+    // R1: every box is ON and every box is togglable — no row on a fresh conversation can produce
+    // the refusal the reader hit.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) => {
+            const box = node.querySelector<HTMLInputElement>('.tool-tab-enable');
+
+            return `${node.querySelector('.tool-tab-button')?.dataset.tool}:${String(box?.checked)}:${String(box?.disabled)}`;
+        })
+    ).toEqual(['glob:true:false', 'read:true:false', 'syntax:true:false']);
+    expect(toolBox('read').title).toBe('Enabled for this conversation · click to switch this tool off');
+
+    toolBox('read').click();
+    await flush();
+    await flush();
+
+    // The write, on the conversation's route, and the re-read that repaints it — in that order.
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/sessions/s1/tools/read', method: 'PATCH', body: { enabled: false } }
+    ]);
+    expect(toolboxTraffic(calls)).toHaveLength(3);
+    expect(config.toolWrites).toEqual([{ name: 'read', body: { enabled: false } }]);
+
+    // The row moves to the figure the next read states, and the read re-derives `origin` with it
+    // (a name that is no longer enabled is not `discovered`). The other boxes are untouched.
+    expect(config.toolRows().map((row) => [row.name, row.enabled, row.protected, row.origin])).toEqual([
+        ['glob', true, false, 'discovered'],
+        ['read', false, false, 'catalogue'],
+        ['syntax', true, false, 'catalogue']
+    ]);
+    expect(toolBox('read').checked).toBe(false);
+    expect(toolBox('read').className).toBe('tool-tab-enable is-off');
+    expect(toolBox('read').dataset.enabled).toBe('false');
+    expect(toolBox('read').getAttribute('aria-label')).toBe('Enable read');
+    expect(toolBox('glob').checked).toBe(true);
+    expect(toolBox('syntax').checked).toBe(true);
+    expect(byClass('.tool-tab-button[data-tool="read"]', 'button').dataset.enabled).toBe('false');
+    // An accepted switch says so on the pill the way every other accepted write does: `idle`, with
+    // no diagnostic line — the error pill stays reserved for a refusal.
+    expect(byClass('.status-text', 'span').textContent).toBe('idle');
+    expect(byClass('.status-detail', 'span').textContent).toBe('');
+});
+
+// F2-3 — the figure the reader asked for, rendered from the payload the SERVER actually answers.
+//
+// The row list below is MEASURED, not invented: `Temp/final2/f23-probe.ts` boots the real
+// in-process server, creates a session the way `POST /sessions` does, and reads
+// `GET /v1/harness/sessions/{id}/tools?limit=100` (a keyless host, so the three search credential
+// tools stay unregistered). That run answers 32 rows — 22 `enabled: true` / `protected: false` /
+// `origin: 'discovered'`, 10 `enabled: false` / `protected: true` / `origin: 'catalogue'` — and the
+// capture is kept in `Temp/final2/f23-rows.json`. The seeds here restate the KERNEL facts those
+// figures come from (`visibility: 'core'` for the eight declared controls, `pendingOnly` for
+// `toolCancel`, searchable-and-undeclared for the rest) and the shared double derives the wire
+// row, so the payload this test paints is the payload the route answers, field for field.
+//
+// What is pinned is the pane's own two figures, NOT a translation of them: every box TICKED
+// (`main.ts` `toolRowInContext` — a protected name is in context because the harness holds it, and
+// the reader's complaint was a page that looked empty) and EXACTLY the ten protected boxes LOCKED
+// (`toolSwitchLockOf` — the box that 403s is disabled before the click, which is the other half of
+// the complaint: pressing `delegate` used to produce a refusal).
+const hostRow = (name: string, over: Partial<SessionToolRowSeed> = {}): SessionToolRowSeed => ({
+    name,
+    group: 'Preset tools',
+    description: `${name} preset tool`,
+    tags: ['preset'],
+    visibility: 'searchable',
+    declared: false,
+    ...over
+});
+
+// The 32 registrations of the measured keyless host, IN SERVER ORDER (registry order).
+const MEASURED_SEEDS: readonly SessionToolRowSeed[] = [
+    hostRow('toolRegistry'),
+    hostRow('toolRequest', { visibility: 'core', declared: true }),
+    hostRow('toolList'),
+    hostRow('toolManage'),
+    hostRow('toolCreate'),
+    hostRow('records'),
+    hostRow('tasks', { visibility: 'core', declared: true }),
+    hostRow('profiles'),
+    hostRow('chapters'),
+    hostRow('locations'),
+    hostRow('agentManage'),
+    hostRow('agentResult'),
+    hostRow('delegate', { visibility: 'core', declared: true }),
+    hostRow('threadFork'),
+    hostRow('actionRequest'),
+    // Protected WITHOUT being declared — a pending-only runtime control (`main.ts` reads the same
+    // figure through the row's `protected`, never by guessing from `visibility`).
+    hostRow('toolCancel', { pendingOnly: true }),
+    hostRow('syntax'),
+    hostRow('read', { visibility: 'core', declared: true }),
+    hostRow('write', { visibility: 'core', declared: true }),
+    hostRow('edit', { visibility: 'core', declared: true }),
+    hostRow('files'),
+    hostRow('glob', { visibility: 'core', declared: true }),
+    hostRow('grep', { visibility: 'core', declared: true }),
+    hostRow('shell'),
+    hostRow('gitDiff'),
+    hostRow('download'),
+    hostRow('timeNow'),
+    hostRow('textCount'),
+    hostRow('diceRoll'),
+    hostRow('noteSearch'),
+    hostRow('textSummarize'),
+    // A core-visibility row that the frozen definition does NOT declare: protected, not declared.
+    hostRow('fetch', { visibility: 'core' })
+];
+
+// The ten rows the harness owns itself — the exact set the probe reported as `protected: true`.
+const PROTECTED_HOST_NAMES = ['delegate', 'edit', 'fetch', 'glob', 'grep', 'read', 'tasks', 'toolCancel', 'toolRequest', 'write'];
+
+it('paints the measured 32-row new-session payload with every box ticked and exactly the ten protected boxes locked', async () => {
+    const { config } = seededFetch(MEASURED_SEEDS);
+
+    // The payload first: the 32 rows the pane is about to paint, in server order, exactly as the
+    // measured route stated them. Any drift in the doubles' derivation shows up here as a name
+    // moving between the enabled and the protected figure — which is the bug the report was about.
+    expect(config.toolRows().map((row) => `${row.name}:${String(row.enabled)}:${String(row.protected)}:${row.origin}`)).toEqual([
+        'toolRegistry:true:false:discovered',
+        'toolRequest:false:true:catalogue',
+        'toolList:true:false:discovered',
+        'toolManage:true:false:discovered',
+        'toolCreate:true:false:discovered',
+        'records:true:false:discovered',
+        'tasks:false:true:catalogue',
+        'profiles:true:false:discovered',
+        'chapters:true:false:discovered',
+        'locations:true:false:discovered',
+        'agentManage:true:false:discovered',
+        'agentResult:true:false:discovered',
+        'delegate:false:true:catalogue',
+        'threadFork:true:false:discovered',
+        'actionRequest:true:false:discovered',
+        'toolCancel:false:true:catalogue',
+        'syntax:true:false:discovered',
+        'read:false:true:catalogue',
+        'write:false:true:catalogue',
+        'edit:false:true:catalogue',
+        'files:true:false:discovered',
+        'glob:false:true:catalogue',
+        'grep:false:true:catalogue',
+        'shell:true:false:discovered',
+        'gitDiff:true:false:discovered',
+        'download:true:false:discovered',
+        'timeNow:true:false:discovered',
+        'textCount:true:false:discovered',
+        'diceRoll:true:false:discovered',
+        'noteSearch:true:false:discovered',
+        'textSummarize:true:false:discovered',
+        'fetch:false:true:catalogue'
+    ]);
+
+    await boot();
+    openTools();
+    await flush();
+
+    // Every row reaches the pane: the page read is `?limit=25`, so this also proves the cursor
+    // walk (`main.ts` `readSessionToolRows`) followed the page instead of stopping at 25 rows.
+    const painted = [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) => {
+        const box = node.querySelector<HTMLInputElement>('.tool-tab-enable')!;
+
+        return { name: box.dataset.tool ?? '', checked: box.checked, disabled: box.disabled, title: box.title };
+    });
+
+    expect(painted).toHaveLength(32);
+    // The complaint in one figure: on a brand-new conversation NO row is off.
+    expect(painted.filter((row) => !row.checked).map((row) => row.name)).toEqual([]);
+    // ...and the complaint that `delegate` errors when pressed: exactly the ten names the route
+    // 403s are the ten boxes that cannot be pressed.
+    expect(painted.filter((row) => row.disabled).map((row) => row.name).sort()).toEqual(PROTECTED_HOST_NAMES);
+
+    // The two tooltip sentences, stated per row rather than counted: a locked box says WHY the
+    // harness holds it, a live box says it can be switched off. A protected row that read as
+    // "disabled, click to switch it on" is the lie this pass exists to remove.
+    for (const row of painted) {
+        expect(row.title).toBe(
+            PROTECTED_HOST_NAMES.includes(row.name)
+                ? 'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
+                : 'Enabled for this conversation · click to switch this tool off'
+        );
+    }
+
+    // The row SET is A–Z (R5), and the head note counts what it renders — both halves of "32 rows"
+    // the reader can see, pinned so a page-walk regression cannot quietly drop seven rows off the
+    // pane (`main.ts` `paintToolsHead` writes the count line).
+    expect(painted.map((row) => row.name)).toEqual([...MEASURED_SEEDS.map((seed) => seed.name)].sort((left, right) => left.localeCompare(right)));
+    expect(byClass('.harness-note', 'p').textContent).toBe('32 tools · the toolbox of this conversation');
+});
+
 // R1's click separation: the box and the tile are two controls in one row, and each owns
 // exactly one of the two actions.
 it('writes enablement from the corner box without opening the runner, and the tile click still opens it', async () => {
@@ -1386,8 +1758,8 @@ it('lists the whole catalogue as ONE alphabetical list with no group headings, a
     ];
 
     // T4: the rows the pane lists are the CONVERSATION's, so the toolbox served for this fixture
-    // is the same nine-name catalogue, restated as session rows (`sessionRows` keeps the server's
-    // core/declared rule for `protected`).
+    // is the same nine-name catalogue, restated as session rows (`sessionRow` states the server's
+    // switchability figure for `protected`: the `visibility: 'core'` names, and only those).
     stubFetch((url) => (url === '/api' ? json(bootstrap({ tools: served })) : undefined), undefined, served);
     await boot();
 

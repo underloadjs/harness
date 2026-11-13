@@ -3593,6 +3593,32 @@ export type HarnessConfiguration = {
     // the enabled set, NOT a cap on selectTools matches: toolRequest reports/omits
     // nothing artificially beyond this configured bound.
     maxEnabledTools?: number;
+    // START WITH THE WHOLE SWITCHABLE TOOLBOX ON (server-toolbox default, R1).
+    //
+    // OFF unless `true`: a library consumer's harness starts with an EMPTY enabled set
+    // exactly as before, and `toolRequest` stays the only way a searchable name gets
+    // switched on. One server deployment asks for the opposite posture — a brand-new
+    // conversation should not have to spend a discovery round trip to reach `shell` — and
+    // that is what this flag is: an opt-in SEED, not a policy change.
+    //
+    // WHAT IT DOES, precisely, at the end of startup (after every registration the
+    // configuration and the plugins made, BEFORE the handle exists): it runs ONE
+    // `enableTools` pass over the registered names, and that pass is the SAME code path an
+    // ordinary `toolRequest` match goes through — so the kernel's own switchability rule
+    // (`occupiesSearchableSlot`: live, not `visibility: 'core'`, not pending-only) decides
+    // which names qualify, a name the host's GLOBAL tool provider has disabled is skipped
+    // (seeding a disabled name would spend a cap slot on a tool the operator switched off),
+    // and `maxEnabledTools` still bounds the result: an over-cap catalogue keeps the first
+    // `maxEnabledTools` names in registration order and leaves the rest off, reported by
+    // the rows rather than thrown.
+    //
+    // WHAT IT DOES NOT DO: it never enables a core declaration (those are always in context
+    // and spend no slot), it emits no `stateChange` (construction is not a mutation the host
+    // has to persist separately — the server snapshots the harness after creation anyway),
+    // it is NOT snapshot state (a restore re-applies the persisted `discovery.enabled`, so an
+    // existing session keeps exactly the enabled set it committed), and `reset()` still
+    // empties the enabled set: a cleared conversation is a different event from a new one.
+    enableAllTools?: boolean;
     // Preload the bundled preset catalogue (src/tools/) into the registry. True by
     // default: discovery exists so a large catalogue costs nothing until it is
     // asked for. Set false to start from `tools` alone. A configured tool wins on
@@ -3838,6 +3864,57 @@ export type Harness = {
     // which is what lets a later turn call a tool discovered earlier. Copied on
     // read; `reset()` empties it.
     readonly discoveredTools: string[];
+    // Whether THIS harness's kernel would let a caller switch one name on or off, stated by
+    // the same predicate the enable/disable operations themselves refuse with (the
+    // `occupiesSearchableSlot` rule behind `toolManage enable|disable`): a name is
+    // switchable only while it resolves to a live definition that is NOT `visibility:
+    // 'core'` and NOT pending-only.
+    //
+    // WHY THIS IS A HOST SEAM: `discoveredTools` says which names are ON; it cannot say
+    // which names MAY be switched. A host that re-derives that rule from catalogue metadata
+    // gets it wrong in both directions — `toolCancel` is demoted to `visibility:
+    // 'searchable'` at registration yet stays pending-only (so it is refused), while a
+    // searchable preset row such as `shell` looks core-adjacent but is genuinely switchable.
+    // Reading the kernel's own answer is the only version that cannot drift, and it is what
+    // lets a UI state the refusal BEFORE the click instead of discovering it afterwards.
+    //
+    // `false` covers three distinct cases the kernel refuses identically: an unregistered
+    // name, a core declaration (always in context, never a cap slot), and a pending-only
+    // runtime control (declared only while actionable). Callers that need the reason ask the
+    // operation itself; this seam answers only the yes/no.
+    isToolSwitchable: (name: string) => boolean;
+    // Re-runs the `enableAllTools` seed pass on a LIVE harness: one `enableTools` pass over
+    // every registered name this harness can switch, minus the names the host's global tool
+    // provider denies, capped at `maxEnabledTools` in registration order (the construction seed,
+    // `src/harness.ts` `seedSwitchableTools`, verbatim — same selection, same cap, same order).
+    //
+    // ONLY FOR A SEEDED HARNESS: the pass belongs to `enableAllTools`, so a handle built WITHOUT
+    // it has no seed to re-run and this is a no-op. That gate is what lets a host call it
+    // unconditionally: the enabled set a RESET conversation starts with then equals the set a NEW
+    // conversation of the same session starts with — a full toolbox, or the same empty one.
+    //
+    // WHY THIS IS A HOST SEAM: the construction seed is not snapshot state and `reset()` empties
+    // the enabled set, so a host whose "new conversation" operation is a RESET (the shipped
+    // server's session reset) has no way to hand a fresh conversation the toolbox a fresh
+    // CREATE gets. Doing it from outside means looping the per-name switch, which inserts
+    // newest-first and therefore keeps a DIFFERENT set than the seed once the cap binds; only
+    // the kernel can re-run its own pass.
+    //
+    // CONSEQUENCE FOR A HOST THAT PERSISTS SESSIONS: the gate reads `HarnessConfiguration`, which
+    // belongs to the harness built IN THIS PROCESS. A session created before a restart is built
+    // again on the restore path, so a host that wants `reset` to answer the same toolbox after a
+    // restart has to ask for the seed on THAT build too. The shipped store does
+    // (`src/server/sessions.ts:2204` for a create, `:3843` for a restore) and it is safe there:
+    // `restore()` replaces the enabled set from the persisted snapshot afterwards
+    // (`src/harness.ts:11676`), so the seed refills nothing until a reset asks for it. Built
+    // unseeded, this seam is a no-op on a restored session and its reset silently answers an
+    // empty toolbox while the same session, reset in its own process, answers a full one.
+    //
+    // OPTIONAL on purpose: it is an additive seam, and a handle a host assembled by hand (a
+    // fixture, a library wrapper) may not carry it. Callers guard with `?.` and fall back to the
+    // pre-existing behaviour (an empty set after a reset). It reports one `state_change` when the
+    // set moves, like any other enabled-set mutation, and nothing when it does not.
+    enableAllSwitchableTools?: () => void;
     // N3: every branch record this harness knows, newest last. Includes running
     // branches and the bounded newest terminal records (see
     // MAX_BRANCH_RECORDS / core/branch.ts). The returned array is a detached

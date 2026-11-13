@@ -93,7 +93,10 @@ replaces the entry's generic literal at registration — credentials and the
 configured provider list never enter editable source. The `download` entry needs
 neither credential nor configuration: it is a `preset`-group row with
 `activation: always` and `visibility: searchable`, so every harness registers it and
-opens it through `toolRequest` (order 235, between `gitDiff` 230 and `search` 240).
+opens it through `toolRequest` (order 235, between `gitDiff` 230 and `search` 240) —
+or finds it already open in a harness built with `enableAllTools`, which is what the
+server does for a session it creates (`src/server/sessions.ts:2204`) and for one it resets
+(`:10204`).
 The two web rows are the opposite: `search.tool.ts` and `fetch.tool.ts` are
 `visibility: core` (R9-R11), so a harness that REGISTERED them declares them on every
 request - the gate is activation, never a discovery round. The server mirrors that

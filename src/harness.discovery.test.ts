@@ -570,3 +570,181 @@ describe('toolRequest selection', () => {
         });
     });
 });
+
+// ---------------------------------------------------------------------------
+// R1 — the opt-in FULL-TOOLBOX SEED, and the switchability view that decides it.
+//
+// `configuration.enableAllTools` (src/types/index.ts) is what a host sets so a brand-new
+// conversation starts with every SWITCHABLE tool enabled instead of making the model spend a
+// discovery round trip to reach its own toolbox. Two rules matter and both live in the kernel,
+// which is why they are pinned here rather than in a server projection:
+//   - WHICH names the seed admits is `occupiesSearchableSlot`, the same predicate
+//     `toolManage enable|disable` refuses with — NOT a catalogue-visibility guess. A
+//     visibility-only reimplementation gets both directions wrong: `toolCancel` is demoted to
+//     `visibility: 'searchable'` at registration yet stays pending-only (never seedable, never
+//     switchable), while `file-00`/`threadFork` look runtime-ish and genuinely ARE switchable;
+//   - the seed is a pass through `enableTools`, so `maxEnabledTools` still bounds it and the
+//     host's global tool switch still wins: an over-cap or disabled name is left OFF, reported
+//     by the rows, never an error.
+//
+// The library default is unchanged and asserted first: a consumer that does not pass the flag
+// gets an empty enabled set, exactly as before.
+// ---------------------------------------------------------------------------
+
+// The twelve names this fixture registers that MAY occupy an enabled slot, in
+// registration order: the eleven demoted runtime rows (no `interaction` is configured, so
+// `actionRequest` is not registered) plus the two 'widgets' fixtures. `toolRequest`/`tasks`
+// (core) and `toolCancel` (pending-only) are deliberately absent.
+const SEEDABLE_RUNTIME_NAMES = [
+    'toolRegistry',
+    'toolList',
+    'toolManage',
+    'toolCreate',
+    'records',
+    'profiles',
+    'chapters',
+    'locations',
+    'agentManage',
+    'agentResult',
+    'threadFork'
+];
+
+const seedOf = (names: string[]): string[] => [...SEEDABLE_RUNTIME_NAMES, ...names];
+
+describe('configuration.enableAllTools — starting with the whole switchable toolbox', () => {
+    it('leaves the enabled set empty when the host does not ask for the seed', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(2),
+            presets: false
+        });
+
+        // The library default, byte for byte: discovery is still the only way a searchable
+        // name gets switched on.
+        expect(writer.discoveredTools).toEqual([]);
+    });
+
+    it('enables every switchable name in registration order, and no core or pending-only one', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')], seen)) },
+            tools: fixtures(2),
+            presets: false,
+            enableAllTools: true
+        });
+
+        expect(writer.discoveredTools).toEqual(seedOf(['file-00', 'file-01']));
+
+        // THE SEED IS REAL, NOT A FIGURE: the first model request is declared from this state,
+        // so the conversation starts able to call its own tools. A core name is declared
+        // without ever entering the enabled set, and the pending-only `toolCancel` appears in
+        // neither place until it is actionable.
+        await writer('go');
+
+        const declared = (seen[0].tools ?? []).map((declaration) => declaration.name);
+
+        expect(declared).toEqual([
+            'toolRequest',
+            'tasks',
+            'toolRegistry',
+            'toolList',
+            'toolManage',
+            'toolCreate',
+            'records',
+            'profiles',
+            'chapters',
+            'locations',
+            'agentManage',
+            'agentResult',
+            'threadFork',
+            'file-00',
+            'file-01'
+        ]);
+        expect(declared).not.toContain('toolCancel');
+    });
+
+    it('skips every name the host has switched off globally, so a disabled name costs no slot', () => {
+        const denied = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(2),
+            presets: false,
+            enableAllTools: true,
+            // Two names, two different shapes: an ordinary fixture and a runtime row. Neither
+            // may be seeded — `enableTools` does not consult the provider, so a seed that
+            // ignored it would fill cap slots with tools the operator disabled for everyone.
+            toolSettings: { isToolDisabled: (name: string) => name === 'file-01' || name === 'records' }
+        });
+
+        expect(denied.discoveredTools).toEqual(
+            seedOf(['file-00']).filter((name) => name !== 'records')
+        );
+    });
+
+    it('keeps the maxEnabledTools bound and leaves the overflow off instead of throwing', () => {
+        const capped = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(2),
+            presets: false,
+            enableAllTools: true,
+            maxEnabledTools: 3
+        });
+
+        // Registration order decides who gets a slot, and the rest simply stays off — the same
+        // `omitted` outcome a `toolRequest` match beyond the cap gets. "Everything enabled" is
+        // therefore representable up to the bound, and a catalogue larger than the bound
+        // reports the truth through the rows rather than failing construction.
+        expect(capped.discoveredTools).toEqual(['toolRegistry', 'toolList', 'toolManage']);
+    });
+});
+
+describe("harness.isToolSwitchable — the kernel's own answer to \"may this be switched?\"", () => {
+    it('refuses core and pending-only names, admits searchable ones, and an unknown name is not switchable', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(2),
+            presets: false
+        });
+
+        // A fixture the harness registered and that is not core: switchable.
+        expect(writer.isToolSwitchable('file-00')).toBe(true);
+
+        // The declared core pair: always in context, never a cap slot, so switching is a no-op
+        // the caller would believe took effect — the kernel refuses it.
+        expect(writer.isToolSwitchable('toolRequest')).toBe(false);
+        expect(writer.isToolSwitchable('tasks')).toBe(false);
+
+        // THE CASE A SERVER-SIDE GUESS GETS WRONG: `toolCancel` reports `visibility:
+        // 'searchable'` (its registration demotes it so `toolList`/details stay honest), so a
+        // rule rebuilt from visibility alone would call it switchable and offer a checkbox the
+        // runtime then refuses. The pending-only marker is the difference, and this predicate
+        // is the only place that marker is read.
+        expect(writer.tools.toolCancel.visibility).toBe('searchable');
+        expect(writer.isToolSwitchable('toolCancel')).toBe(false);
+
+        // Not registered at all (a name this harness never holds, e.g. `delegate` without a
+        // subagent team, or `search` without a provider key) is likewise not switchable.
+        expect(writer.isToolSwitchable('delegate')).toBe(false);
+        expect(writer.isToolSwitchable('nope')).toBe(false);
+    });
+
+    it('answers live: a tool registered after construction becomes switchable at once', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(1),
+            presets: false
+        });
+
+        expect(writer.isToolSwitchable('late')).toBe(false);
+
+        await writer.createTool({
+            name: 'late',
+            description: 'Registered after construction.',
+            tags: ['late'],
+            source: 'return 1;'
+        });
+
+        expect(writer.isToolSwitchable('late')).toBe(true);
+        // A created tool is enabled by the same kernel, and stays switchable afterwards.
+        expect(writer.discoveredTools).toContain('late');
+    });
+});

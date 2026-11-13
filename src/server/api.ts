@@ -291,6 +291,7 @@ import {
     threadRowOf,
     toolCallFailure,
     toolDetailOf,
+    toolEntryOf,
     toolExecutionScopeOf,
     toolSummaryOf,
     transcriptMetadataOf,
@@ -1206,6 +1207,12 @@ export const createHarnessApi = ({
     const context: ReadContext = {
         hub: events,
         catalogue,
+        // R3/TRUTHFUL ROWS: the harness-owned entries travel with the read context so a
+        // SESSION tool row resolves a runtime name (`delegate`, `records`, `threadSend`, ...)
+        // exactly the way a GLOBAL row does — `toolEntryOf` below. Without it the session pane
+        // fell back to the "no catalogue entry" defaults and described `delegate` as a created,
+        // searchable, non-session-bound tool while this same dispatcher listed it as core.
+        coreEntries,
         defaults: effectiveDefaults(),
         runtime,
         titles,
@@ -2473,7 +2480,10 @@ export const createHarnessApi = ({
 
     const getToolOne: Handler = (ctx) => {
         const name = ctx.params.tool_id;
-        const entry = coreEntries.find((candidate) => candidate.name === name) ?? catalogue.find(name);
+        // ONE resolver for both surfaces (./api-reads.ts `toolEntryOf`): the harness-owned
+        // entries first, then the callable catalogue, so a global row and a session row about
+        // the same name state the same group/visibility/session-bound facts.
+        const entry = toolEntryOf(name, context);
 
         if (entry === undefined) throw missing('tool', name);
 
@@ -2500,7 +2510,10 @@ export const createHarnessApi = ({
     // the running conversations did not have.
     const patchTool: Handler = async (ctx) => {
         const name = ctx.params.tool_id;
-        const entry = coreEntries.find((candidate) => candidate.name === name) ?? catalogue.find(name);
+        // ONE resolver for both surfaces (./api-reads.ts `toolEntryOf`): the harness-owned
+        // entries first, then the callable catalogue, so a global row and a session row about
+        // the same name state the same group/visibility/session-bound facts.
+        const entry = toolEntryOf(name, context);
 
         // Identity FIRST, so a typo on a name that does not exist is a 404 and never a
         // 403 about protection or a 400 about a body the client has not sent yet.
@@ -2537,7 +2550,10 @@ export const createHarnessApi = ({
     // standalone implementation at all (hence 403, not 400 - it is a policy refusal).
     const postToolExecution: Handler = async (ctx) => {
         const name = ctx.params.tool_id;
-        const entry = coreEntries.find((candidate) => candidate.name === name) ?? catalogue.find(name);
+        // ONE resolver for both surfaces (./api-reads.ts `toolEntryOf`): the harness-owned
+        // entries first, then the callable catalogue, so a global row and a session row about
+        // the same name state the same group/visibility/session-bound facts.
+        const entry = toolEntryOf(name, context);
 
         if (entry === undefined) throw missing('tool', name);
 
@@ -4068,12 +4084,18 @@ export const createHarnessApi = ({
 
         if (row === undefined) throw missing('tool', name, record.id);
 
-        // A `protected` entry is the control plane THIS session runs on: the switch is not a
-        // user-level edit, and the runtime would refuse it anyway (a core declaration is
-        // always in context). Note the scope: this is the SESSION-scoped route, whose
-        // `protected` row field is a per-conversation fact (./api-reads.ts
-        // `isCoreToolName` or the frozen definition). The GLOBAL route above has no such
-        // exception — every listed tool is switchable there (R5).
+        // A `protected` entry is one this session's kernel refuses to switch at all: a core
+        // declaration (always in context, never a cap slot) or a pending-only runtime control
+        // such as `toolCancel`. The figure is the KERNEL's answer, not this dispatcher's guess:
+        // ./api-reads.ts `sessionToolRowsOf` sets `protected = !harness.isToolSwitchable(name)`,
+        // which is the same predicate the `toolManage enable|disable` switch below refuses with
+        // (../harness.ts `occupiesSearchableSlot`). That identity is the whole point — the row
+        // a client rendered and the status this route answers are one fact stated twice, so no
+        // row that LOOKS clickable can come back refused, and a refusal is stated before the
+        // click (403 here, per the published contract) instead of after it.
+        //
+        // The scope note still holds: this is the SESSION-scoped route. The GLOBAL route above
+        // has no such exception — every listed tool is switchable there (R5).
         if (row.protected) {
             throw new HttpError(
                 403,
@@ -4091,8 +4113,13 @@ export const createHarnessApi = ({
         } catch (error) {
             if (isInstanceOf(error, SessionError)) throw error;
 
-            // The runtime owns the only rule this route cannot restate (a core declaration
-            // cannot occupy an enabled slot), so its message becomes the 409/400 boundary.
+            // The runtime owns the rules this route cannot restate up front (an idle check
+            // race, a name that stopped being registered between the row and the write), so its
+            // message becomes the 409/400 boundary. The core-declaration sentence is NOT
+            // reachable from a pane that reads its rows: a name the kernel will not switch is
+            // `protected` and stopped at the 403 above, which is exactly the contract
+            // ./harness.swagger.yaml publishes for this route (403, never 409, for a row the
+            // session cannot switch).
             throw new HttpError(409, boundErrorMessage(error));
         }
 
@@ -4381,10 +4408,14 @@ export const createHarnessApi = ({
         if (row === undefined) throw missing('tool', name, record.id);
 
         // Two different refusals, kept distinct because they mean different things to a
-        // client: a `protected` entry (a harness-owned control tool, or a name the frozen
-        // definition declares) is not a user-level edit at all -> 403. A name this session
-        // merely INHERITS from the catalogue with no session-local registration has nothing
-        // to remove -> 400.
+        // client: a `protected` entry — the same kernel-stated figure the `enabled` PATCH above
+        // refuses with, i.e. a core declaration or a pending-only runtime control — is not a
+        // user-level edit at all -> 403. A name this session merely INHERITS from the catalogue
+        // with no session-local registration and no enabled slot has nothing to remove -> 400.
+        // Note what that identity means for an ORDINARY toolbox row (`syntax`, `files`, a
+        // created tool): it is switchable, therefore not protected, therefore removable — the
+        // runtime `remove` operation is the one that decides, and it never disagrees with the
+        // row the client clicked.
         if (row.protected) {
             throw new HttpError(
                 403,

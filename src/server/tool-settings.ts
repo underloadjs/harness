@@ -48,9 +48,18 @@
 // that honours every stored name (core included), and no write-edge refusal.
 //
 // The session-scoped surface keeps its OWN, unrelated notion of an entry a conversation
-// cannot detach (a harness-owned control tool, or a name its frozen definition declares —
-// ./api-reads.ts `isCoreToolName` plus `declared`). That gate is a property of one live
-// harness's enabled set, not of this deployment-wide switch, and it is unchanged.
+// cannot detach: the row's `protected` flag, which is the NEGATION of the kernel's own
+// switchability predicate — `!harness.isToolSwitchable(name)` (../harness.ts
+// `occupiesSearchableSlot`), stated by ./api-reads.ts `sessionToolRowsOf` and refused with
+// 403 by the session-tool PATCH/DELETE (./api.ts). It is deliberately NOT
+// "`isCoreToolName` plus `declared`", the combination this note used to describe: that guess
+// locks searchable rows the kernel happily switches (`syntax`, `files`, `shell`) and misses
+// `delegate` and the pending-only `toolCancel`, which it refuses without being in
+// `CORE_TOOL_NAMES`. `isCoreToolName` now feeds only the EXECUTION gate (`scope:
+// session_required`, ./api-reads.ts `toolExecutionScopeOf`), a different question with a
+// different answer. That gate is a property of one live harness's registry, not of this
+// deployment-wide switch: nothing here changes it, and disabling `toolRequest` globally does
+// not make a name the kernel will not switch suddenly switchable in a session.
 //
 // WORKER MODE (the provider cannot cross; the SET can)
 // ---------------------------------------------------

@@ -136,8 +136,9 @@ const stubServer = (options: {
         // so the runner pays the deployment's identified detail read (`GET /tools/{name}`,
         // ./api.ts `getTool`) — execution stayed deployment-scoped. Both come from the same
         // `tools` list these fixtures already state, and `sessionToolRow` gives the row the
-        // SERVER's semantics for `protected`/`declared`/`origin`
-        // (./session-config-test-support.ts, src/server/api-reads.ts:959-994).
+        // SERVER's semantics for `protected`/`declared`/`origin`/`enabled`
+        // (./session-config-test-support.ts, src/server/api-reads.ts:1003-1032) — including
+        // `enabled: false` on the core name below, which is the figure the server really sends.
         const toolboxMatch = /^\/api\/sessions\/[^/]+\/tools/.exec(url);
 
         if (toolboxMatch !== null && method === undefined) {
@@ -150,7 +151,7 @@ const stubServer = (options: {
                             description: tool.description,
                             tags: tool.tags,
                             visibility: tool.visibility,
-                            enabled: true
+                            enabled: tool.visibility !== 'core'
                         })
                     )
                 )

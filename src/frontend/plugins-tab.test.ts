@@ -709,8 +709,9 @@ const stub = (fixture: Fixture = {}): { calls: Call[]; dialed: string[]; settleR
         // T4: the ⚒ pane describes the CONVERSATION on screen, so it dials
         // `GET /sessions/{id}/tools`. The only tool these fixtures describe is `read` (the boot
         // document's `tools` page above), and the row shape is the SERVER's rule for `protected`,
-        // `declared` and `origin` — `sessionToolRow` states src/server/api-reads.ts:959-994, so the
-        // pane paints a discovered, switchable name rather than a fixture invention.
+        // `declared`, `origin` and `enabled` — `sessionToolRow` states
+        // src/server/api-reads.ts:1003-1032, so the pane paints a discovered, switchable name
+        // rather than a fixture invention.
         if (url.match(/^\/api\/sessions\/[^/]+\/tools(\?limit=25)?$/) !== null && method === undefined) {
             return json(
                 sessionToolPage([

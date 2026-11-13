@@ -1366,7 +1366,35 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
     // Math.max, so an inflated reservation survives it, and a snapshot whose newest id is
     // lower cannot hand this lane an id somebody else already holds (T3 finding F2).
     replica.reserveIdentity(reservationOf(blueprint.identities));
-    replica.restore(blueprint.snapshot as never);
+
+    // R1 consequence, handled HERE rather than by weakening the kernel: the coordinator seeds a
+    // brand-new session's enabled set with every name ITS harness can switch, and this replica is
+    // rebuilt from a RECORD (`presetFromRecord`, ../harnesses/registry.ts:873-884 — "a factory
+    // closure from the coordinator's process cannot cross", ./capability.ts), so a tool a preset
+    // passed as a `tool()` object (`extraTools`, e.g. the `testFlaky` fixture) is registered on
+    // the coordinator and absent here. `restore()` refuses an enabled name that is not registered
+    // (src/harness.ts:11611) because on the COORDINATOR such a name would be silently un-callable
+    // after a restart; on a lane replica it is the ordinary shape of a record rebuild, and the
+    // shipped rebuild already says so (registry.ts:727-730: the rebuilt harness runs "minus a tool
+    // this build no longer has"). `isToolSwitchable` is the kernel's own "a live, switchable
+    // definition resolves under this name" answer (src/types/index.ts:3885), so a name it rejects
+    // is a name this lane could never call: it is dropped from the replica's copy of the enabled
+    // set. Everything the replica DOES register keeps its switch state, which is what the R3
+    // lane-propagation pins (../workers/lane-tool-settings.test.ts) still test, and the coordinator's
+    // strict check — with its per-session restore isolation, ./restore-isolation.test.ts — is untouched.
+    type DiscoveryCarrier = { discovery?: { enabled?: readonly string[] } & Record<string, unknown> } & Record<string, unknown>;
+    const carried = blueprint.snapshot as DiscoveryCarrier;
+    const discovery = carried.discovery;
+    const enabledNames = discovery?.enabled ?? [];
+    // Only a name this replica cannot switch is dropped, and the snapshot object is copied rather
+    // than mutated, so a frame that needed no pruning is restored exactly as it arrived.
+    const kept = enabledNames.filter((name) => replica.isToolSwitchable(name));
+
+    replica.restore(
+        kept.length === enabledNames.length
+            ? (blueprint.snapshot as never)
+            : ({ ...carried, discovery: { ...discovery, enabled: kept } } as never)
+    );
 
     state.replica = replica;
     state.declaredKeys = [...blueprint.memoryKeys];

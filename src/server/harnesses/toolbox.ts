@@ -660,7 +660,15 @@ export const createToolboxHarness = (
         // `laneToolSettingsProvider`, ../workers/protocol.ts `LaneBlueprint.disabledTools`).
         // Only the reference is live; a lane is live for the set it was created with
         // (../tool-settings.ts "WORKER MODE").
-        ...(observer?.toolSettings === undefined ? {} : { toolSettings: observer.toolSettings })
+        ...(observer?.toolSettings === undefined ? {} : { toolSettings: observer.toolSettings }),
+        // R1: the host's per-build "start with the whole switchable toolbox enabled" seed,
+        // forwarded verbatim into `HarnessConfiguration.enableAllTools` (src/types/index.ts).
+        // Absent means the library default — an empty enabled set — which is what a library
+        // consumer, a scripted demo, and a RESTORED session all get: a restore re-applies the
+        // snapshot's own `discovery.enabled`, so the persisted set is the authority there.
+        // The kernel, not this layer, decides WHICH names the seed admits (its switchability
+        // rule, the host deny list, and `maxEnabledTools`), so no name list travels here.
+        ...(observer?.enableAllTools === true ? { enableAllTools: true } : {})
     };
 
     return harness(liveConfiguration);

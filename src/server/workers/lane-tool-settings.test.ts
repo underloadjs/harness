@@ -749,6 +749,61 @@ describe('R3 lane propagation: a worker lane omits a disabled tool from its requ
         expect(withSwitch).toEqual(withoutSwitch.filter((name) => name !== DISABLED));
         expect(withSwitch).toContain('toolRequest');
     }, 180_000);
+
+    // R1 x THE RECORD REBUILD. A brand-new session's enabled set is seeded with every name the
+    // COORDINATOR can switch, and `testFlaky` is one of them: the fixture preset passes it as a
+    // `tool()` OBJECT (../harnesses/fixture-presets.test-support.ts:381), which cannot cross a
+    // thread — the replica is rebuilt from a record by `presetFromRecord`
+    // (../harnesses/registry.ts:873-884, "a factory closure from the coordinator's process cannot
+    // cross", ./capability.ts:65). The kernel refuses to restore an enabled name it does not
+    // register (src/harness.ts:11611), so before the replica-side prune in ./lane-worker-loop.ts
+    // the FIRST lane-served run of a new session died with
+    // `Snapshot discovery names "testFlaky", which is not registered in this harness.` and every
+    // `turn.status` pin above reported 'error'.
+    it('runs a seeded session on a lane although the record rebuild lacks one enabled name', async () => {
+        const tools = await laneRequestFor([]);
+
+        // The name this build cannot register is absent from the replica's declaration list...
+        expect(tools).not.toContain('testFlaky');
+        // ...and every name the replica DOES register keeps its seeded slot, in the replica's own
+        // order: the declared core set, the conditional thread tools, then the seeded switchable
+        // names. The prune removes exactly one name (`testFlaky`), never a neighbour or a slot.
+        expect(tools).toEqual([
+            'toolRequest',
+            'tasks',
+            'read',
+            'write',
+            'edit',
+            'glob',
+            'grep',
+            'fetch',
+            'threadList',
+            'threadRead',
+            'threadSend',
+            'threadDelete',
+            'toolRegistry',
+            'toolList',
+            'toolManage',
+            'toolCreate',
+            'records',
+            'profiles',
+            'chapters',
+            'locations',
+            'agentManage',
+            'agentResult',
+            'actionRequest',
+            'syntax',
+            'files',
+            'shell',
+            'gitDiff',
+            'download',
+            'timeNow',
+            'textCount',
+            'diceRoll',
+            'noteSearch',
+            'textSummarize'
+        ]);
+    }, 180_000);
 });
 
 describe('R3 lane propagation: a lane replica delivers or skips a plugin pass on the snapshot value', () => {

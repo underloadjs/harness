@@ -1854,39 +1854,58 @@ export type SessionToolSummary = ToolSummary
     session_id: string;
     /**
      * True when this session's FROZEN definition declares the name, which is the set that is in context on
-     * every request. It is a property of what the session was built with, not of what the current turn happens
-     * to be running, so the value does not flicker between turns.
+     * every request - the definition's own `core_tools` list, NOT the larger `tools` list of names the card
+     * merely registers (most of those still have to be discovered before the model can call them). It is a
+     * property of what the session was built with, not of what the current turn happens to be running, so the
+     * value does not flicker between turns.
      */
     declared: boolean;
     /**
-     * Membership in THIS SESSION's live enabled/discovered set - the capped set the running harness currently
-     * keeps switched on (`harness.discoveredTools`, read in `./api-reads.ts` `sessionToolRowsOf`). It is NOT
-     * "is this name in the model's context": a freshly created session answers `false` for EVERY row here, its
-     * harness-owned control tools included, because those arrive in context through the FROZEN definition and
-     * the runtime manifest and never occupy an enabled slot. `declared` and `protected` are the two fields that
-     * state whether a name is in context regardless of this one. `PATCH` toggles membership in the set. `false`
-     * withdraws the name without losing its registration or its captured source revision, and `true` switches
-     * that same live slot back on: it does NOT restore an inherited binding, because a removal or an override
-     * here never keeps a superseded copy to hand back. Toggling requires an idle session (409) and is refused
-     * with 403 on a protected entry.
+     * Membership in THIS SESSION's live enabled set - the capped set the running harness currently keeps
+     * switched on (`harness.discoveredTools`, read in `./api-reads.ts` `sessionToolRowsOf`). It is NOT "is this
+     * name in the model's context": a core declaration is in context on every request without ever occupying an
+     * enabled slot, so it answers `false` here and `declared` plus `protected` are the fields that state its
+     * real position. A session this server created NEW answers `true` for every row that is switchable at all
+     * AND that this deployment has not switched off: the enabled set is seeded from the kernel's own switchable
+     * names when the harness is built, and the operator's deny list is filtered out of that pass first
+     * (`./tool-settings.ts` - the same provider the GLOBAL Tools row's `enabled` states). A session the server
+     * RESETS answers the same way, because a reset starts a new conversation and re-runs that one pass
+     * (`./sessions.ts` `reset`). Only a `protected` name is left `false` - because a name that was never in the
+     * set cannot be switched off. THE SCOPE OF THAT PROMISE, stated plainly: this figure is one conversation's
+     * own membership, and the deployment-wide switch OUTRANKS it. A name the operator has denied is hidden from
+     * a model's declarations, refused at the launch gate, and answered `forbidden` by `toolRequest` whatever
+     * this row says, so a ticked row on a denied name is a true statement about this conversation and no
+     * promise of capability. Both authority directions hold, deliberately: a session CAN hold a denied name
+     * enabled - a session-scoped `PATCH` of it answers 200 and persists across a restart - and a denial that
+     * lands mid-life rewrites none of this session's rows. A client that needs the deployment's answer asks the
+     * global read (`GET /v1/harness/tools`), which states it per name; no session row field carries it. `PATCH`
+     * toggles membership in the set. `false` withdraws the name without losing its registration or its captured
+     * source revision, and `true` switches that same live slot back on: it does NOT restore an inherited
+     * binding, because a removal or an override here never keeps a superseded copy to hand back. Toggling
+     * requires an idle session (409) and is refused with 403 on a protected entry.
      */
     enabled: boolean;
     /**
      * How it got into this session's toolbox: `created` is a name this session registered (it owns the source
-     * revision and a created-tool slot), `discovered` is a catalogue tool this conversation enabled through
-     * `toolRequest`, `catalogue` is everything else - declared by the frozen definition or inherited from the
-     * shared registry with no local registration.
+     * revision and a created-tool slot), `discovered` is an ENABLED name this session did not declare - a
+     * catalogue tool this conversation switched on through `toolRequest`, or one the server seeded on for a
+     * brand-new session; both hold the same slot in the same capped set, so both are reported the same way,
+     * `catalogue` is everything else - declared by the frozen definition or inherited from the shared registry
+     * with no local registration and no enabled slot.
      */
     origin: "catalogue" | "discovered" | "created";
     /**
-     * True for the control plane this session runs on: the harness-owned core set the runtime manifest ships
-     * (`toolRegistry`, `toolRequest`, `toolCreate`, `toolManage`, `task`, `delegate`, ...) OR any name this
-     * session's FROZEN definition declares. The declared half is why an ordinary preset tool is protected too -
-     * the definition, not the operator, chose it. Consequences, stated exactly: a protected entry refuses an
-     * `enabled`-only PATCH and refuses DELETE with 403, and it accepts a source PATCH (replacing an
-     * implementation is a different privilege from switching the control plane off). A CREATE that collides
-     * with a protected name is NOT refused: the POST answers 201 with `replaced: true` even here, so a client
-     * must not expect 403 from a collision.
+     * True for an entry this session's kernel refuses to switch at all: a core declaration (always in context,
+     * never an enabled slot - `toolRequest`, `tasks`, `delegate`, the core file set, the thread controls when
+     * they exist) or a pending-only runtime control such as `toolCancel`, which is declared only while it is
+     * actionable. It is the NEGATION of the harness's own switchability predicate, computed by the same code
+     * path the enable/disable operation refuses with - not a server-side guess from catalogue `visibility`,
+     * which is why a row that is searchable in the manifest (`syntax`, `files`, `shell`) is honestly switchable
+     * here and a row whose manifest visibility was demoted is not. Consequences, stated exactly: a protected
+     * entry refuses an `enabled`-only PATCH and refuses DELETE with 403, and it accepts a source PATCH
+     * (replacing an implementation is a different privilege from switching the control plane off). A CREATE
+     * that collides with a protected name is NOT refused: the POST answers 201 with `replaced: true` even here,
+     * so a client must not expect 403 from a collision.
      */
     protected: boolean;
     /**
@@ -1924,13 +1943,18 @@ export type SessionToolDetail = SessionToolSummary
  */
 export interface ToolExecutionScope {
     /**
-     * On a session row: `session_required` for a harness-owned core name (the control plane, whose effect
-     * depends on a live conversation) and `session_only` for EVERY other live entry this session holds -
-     * created, discovered, replaced, or inherited with no local registration. It is a statement about the name,
-     * not about where the entry came from, so a replaced catalogue tool still reads `session_only`. `global` is
-     * not answered by this route at all: it appears only on the catalogue detail read (`GET /tools/{tool_id}`),
-     * where an entry with a standalone implementation is callable without a session. Treat the three values as
-     * two different projections of one gate rather than a ladder.
+     * On a session row: `session_required` for a shipped control-plane name with NO standalone implementation
+     * (`toolRequest` and `tasks` - the list `./api-reads.ts` reads as `CORE_TOOL_NAMES`), whose effect depends
+     * on a live conversation, and `session_only` for EVERY other live entry this session holds - created,
+     * discovered, replaced, or inherited with no local registration. It is a statement about the name, not
+     * about where the entry came from, so a replaced catalogue tool still reads `session_only`. This is the
+     * EXECUTION axis and it is NOT the same predicate as the row's `protected` flag, which is the SWITCH axis
+     * decided by the kernel's own switchability rule: `read`, `write`, `edit`, `glob`, `grep`, `delegate` and
+     * `toolCancel` are `protected: true` and STILL `session_only`, because a conversation may not switch them
+     * off yet a manual session-scoped call still runs them. `global` is not answered by this route at all: it
+     * appears only on the catalogue detail read (`GET /tools/{tool_id}`), where an entry with a standalone
+     * implementation is callable without a session. Treat the three values as two different projections of one
+     * gate rather than a ladder.
      */
     scope: "global" | "session_required" | "session_only";
     /**

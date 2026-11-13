@@ -19,14 +19,32 @@
 //
 // Why the doubles below are not a second opinion
 // ----------------------------------------------
-// The row semantics are the SERVER's: `sessionToolRowsOf` (src/server/api-reads.ts:959-994) says
-// `protected = isCoreToolName(name) || the frozen definition declares it`, `enabled` is membership
-// in the live enabled set, and `origin` is `created | discovered | catalogue`. The same rules are
-// encoded here — a protected row refuses an `enabled` write with 403 (src/server/api-session-tool-
-// writes.ts), an accepted write mutates the stored row so the NEXT read shows the new figure, and
-// a plugin write answers with the whole row (src/shared/harness-api.ts `PluginDetailResponse`).
-// Where a fixture needs a refusal the double does not model (409 while the conversation runs, a
-// 400 on a bad setting), it passes `toolPatchStatus`/`pluginPatchStatus` instead.
+// The row semantics are the SERVER's, figure for figure (`sessionToolRowsOf`,
+// src/server/api-reads.ts:1003-1032):
+//   - `declared`  — membership in the FROZEN definition's `coreTools` (what is in context on every
+//                   request), nothing else;
+//   - `protected` — the NEGATION of the kernel's own switchability predicate:
+//                   `!harness.isToolSwitchable(name)` (src/types/index.ts:3867-3885), i.e.
+//                   `!occupiesSearchableSlot` (src/harness.ts:1799-1806) — no live definition, OR
+//                   `visibility: 'core'`, OR a pending-only registration such as `toolCancel`.
+//                   It is NOT `isCoreToolName(name) || declared`: a name the definition declares
+//                   but the kernel lets this conversation switch (`syntax`, `files`, `shell`) is
+//                   unprotected, and `toolCancel` is protected WITHOUT being declared. The write
+//                   route 403s on exactly this figure (src/server/api.ts:4083-4104), which is why
+//                   no row the pane paints clickable can come back refused;
+//   - `enabled`   — membership in the live capped set (`harness.discoveredTools`). Because only a
+//                   switchable name can ever enter that set, `enabled: true` and `protected: true`
+//                   is a pair the server never sends, and a NEW session answers `true` for every
+//                   switchable row that this deployment has not switched off (`enableAllTools`
+//                   filters the operator's deny list out of the same pass, src/harness.ts:12046-12048
+//                   and src/server/harnesses/toolbox.ts);
+//   - `origin`    — `created | discovered | catalogue`, with `discovered` = enabled and not declared.
+// The same rules are encoded here: a protected row refuses an `enabled` write with 403
+// (src/server/api-session-tool-writes.ts), an accepted write mutates the stored row so the NEXT
+// read shows the new figure, and a plugin write answers with the whole row
+// (src/shared/harness-api.ts `PluginDetailResponse`). Where a fixture needs a refusal the double
+// does not model (409 while the conversation runs, a 400 on a bad setting), it passes
+// `toolPatchStatus`/`pluginPatchStatus` instead.
 import type {
     PageMeta,
     PluginSummary,
@@ -36,11 +54,25 @@ import type {
     UpdateSessionToolRequest
 } from '../shared/harness-api';
 import { HARNESS_API_ROOT } from '../shared/harness-api';
-import { HARNESS_CORE_TOOL_NAMES } from './contract';
 
 // A row the caller describes in the few fields the panes actually read; everything else is the
 // shape a catalogue projection carries anyway, so the defaults keep the payload legal.
-export type SessionToolRowSeed = Partial<Omit<SessionToolSummary, 'name'>> & { name: string };
+//
+// `pendingOnly` and `created` are NOT wire fields — they are the two KERNEL facts the wire row is
+// only ever a consequence of, and a fixture has to state them to drive the server's derivations:
+//   - `pendingOnly` — the registration is declared only while it is actionable (the
+//     `pendingOnlyDefinitions` set, src/harness.ts:1307, filled from `descriptor.pendingOnly` at
+//     src/harness.ts:3221 and :12398). `toolCancel` is the live example: its manifest visibility is
+//     demoted to `searchable`, yet `occupiesSearchableSlot` still refuses it, so its row is
+//     `protected`.
+//   - `created` — `record.core.createdTools` carries the name (src/server/api-reads.ts:300-301),
+//     i.e. this session registered it and owns its source revision + budget slot. `origin` reads
+//     it first, ahead of `discovered`/`catalogue`.
+export type SessionToolRowSeed = Partial<Omit<SessionToolSummary, 'name'>> & {
+    name: string;
+    pendingOnly?: boolean;
+    created?: boolean;
+};
 
 // The page fields every collection read carries. Fixed figures on purpose: a test that pinned an
 // `observed_at` would be pinning a clock.
@@ -51,10 +83,27 @@ const pageMeta = (rows: readonly unknown[]): PageMeta => ({
     revision: 1
 });
 
-// One session tool row. `declared`/`protected` move together by the server's rule unless the
-// fixture overrides one of them, and a core name is protected whatever the definition says.
+// One session tool row, derived by the SERVER's rules from the kernel facts a fixture states.
+// `switchable` is `occupiesSearchableSlot` (src/harness.ts:1799-1806) restated over the seed: a
+// name is switchable while it has a definition that is NOT `visibility: 'core'` and NOT
+// pending-only. Everything else follows from that one figure, exactly as it does on the server:
+//   - `protected` is its negation, and `declared` does NOT enter it (the old rule
+//     `isCoreToolName(name) || declared` is what this double used to get wrong in BOTH
+//     directions — a declared-but-switchable name came out locked, `toolCancel` came out free);
+//   - `enabled` defaults to ON for a switchable name and OFF for a protected one, which is the
+//     state of a session the server created NEW: `enableAllTools` seeds the capped set with every
+//     globally-enabled switchable registration (src/harness.ts:12046-12048), and a protected name
+//     never occupies a slot at all (so it can never be switched off, only reported off);
+//   - `origin` is `created` when this session registered the name, else `discovered` when it is
+//     enabled without being declared, else `catalogue`.
+// A fixture that wants a NON-seeded figure (a name switched off, an older server that reports a
+// core row differently) overrides `enabled`/`protected` directly — the override is honoured, the
+// derivation only fills what the seed leaves unstated.
 export const sessionToolRow = (seed: SessionToolRowSeed, sessionId = 's1'): SessionToolSummary => {
     const declared = seed.declared ?? false;
+    const switchable = (seed.visibility ?? 'searchable') !== 'core' && seed.pendingOnly !== true;
+    const isProtected = seed.protected ?? !switchable;
+    const enabled = seed.enabled ?? !isProtected;
 
     return {
         name: seed.name,
@@ -64,13 +113,14 @@ export const sessionToolRow = (seed: SessionToolRowSeed, sessionId = 's1'): Sess
         visibility: seed.visibility ?? 'searchable',
         session_bound: seed.session_bound ?? false,
         ...(seed.availability === undefined ? {} : { availability: seed.availability }),
-        // The catalogue half of the row keeps the GLOBAL switch true: the pane never reads it, and
-        // a row that reported it false would imply the deployment had disabled the name.
-        enabled: seed.enabled ?? true,
+        // The session's live enabled figure. `SessionToolSummary.enabled` is membership in THIS
+        // conversation's capped set (../shared/harness-api.ts:1863-1876), not the deployment's
+        // global switch; the pane reads it and paints the tick from it.
+        enabled,
         session_id: seed.session_id ?? sessionId,
         declared,
-        origin: seed.origin ?? (declared ? 'catalogue' : 'discovered'),
-        protected: seed.protected ?? (HARNESS_CORE_TOOL_NAMES.includes(seed.name as never) || declared),
+        origin: seed.origin ?? (seed.created === true ? 'created' : !declared && enabled ? 'discovered' : 'catalogue'),
+        protected: isProtected,
         source_available: seed.source_available ?? false,
         ...(seed.source_revision === undefined ? {} : { source_revision: seed.source_revision })
     };
@@ -161,8 +211,9 @@ const routePath = (url: string): { path: string; query: string } => {
 // everything else, so a fixture keeps ownership of its boot, view and runner routes.
 export const sessionConfigDouble = (options: SessionConfigDoubleOptions = {}): SessionConfigDouble => {
     const sessionId = options.sessionId ?? 's1';
-    const toolsOf = (): SessionToolSummary[] =>
-        (typeof options.tools === 'function' ? options.tools() : options.tools ?? []).map((seed) => sessionToolRow(seed, sessionId));
+    const seedsOf = (): SessionToolRowSeed[] => [
+        ...(typeof options.tools === 'function' ? options.tools() : options.tools ?? [])
+    ];
     const pluginsOf = (): PluginSummary[] => [
         ...(typeof options.plugins === 'function' ? options.plugins() : options.plugins ?? [])
     ];
@@ -172,8 +223,14 @@ export const sessionConfigDouble = (options: SessionConfigDoubleOptions = {}): S
     // starts empty and every read re-runs its getter.
     const overrides = new Map<string, { enabled: boolean }>();
 
+    // The row is projected from the seed + the accepted writes, on EVERY read — which is what the
+    // server does too (`sessionToolRowsOf` re-reads the live enabled set per request). The write
+    // therefore moves `enabled` AND everything derived from it: a name the conversation just
+    // switched off stops reporting `origin: 'discovered'`, because `discovered` is an ENABLED name
+    // this session did not declare. Patching the built row instead would leave a stale `origin`
+    // beside a fresh `enabled`, i.e. a pair the server cannot send.
     const toolRows = (): SessionToolSummary[] =>
-        toolsOf().map((row) => (overrides.has(row.name) ? { ...row, enabled: Boolean(overrides.get(row.name)?.enabled) } : row));
+        seedsOf().map((seed) => sessionToolRow({ ...seed, enabled: overrides.get(seed.name)?.enabled ?? seed.enabled }, sessionId));
 
     const pluginStore = pluginsOf();
 
@@ -202,10 +259,14 @@ export const sessionConfigDouble = (options: SessionConfigDoubleOptions = {}): S
         const refuses = options.toolPatchGuard ?? ((tool: string) => Boolean(toolRows().find((r) => r.name === tool)?.protected));
 
         if (row === undefined) return failure(`unknown tool '${name}'`, 404);
-        // 403 is the server's answer for the control plane: harness-owned core tools and names the
-        // frozen definition declares (src/server/api-reads.ts:959-994 `protected`).
+        // 403 is the server's answer for a `protected` name: the row's figure and this refusal are
+        // the SAME fact (`protected = !harness.isToolSwitchable(name)`, src/server/api-reads.ts:1027
+        // and src/server/api.ts:4083-4104), and the sentence below is that route's, verbatim.
         if (settings.enabled !== undefined && refuses(name) && row.protected) {
-            return failure(`the tool '${name}' is part of this session's control plane`, 403);
+            return failure(
+                `Tool "${name}" is harness-owned in session "${sessionId}"; a protected entry cannot be enabled or disabled.`,
+                403
+            );
         }
 
         if (settings.enabled !== undefined) overrides.set(name, { enabled: Boolean(settings.enabled) });
@@ -316,6 +377,13 @@ export type CatalogueToolSeed = {
     // The SAME figure in the contract's snake_case spelling, which is how a fixture that copies the
     // wire descriptor states it (./catalogue.test.ts).
     session_bound?: boolean;
+    // The kernel fact behind a pending-only registration (`toolCancel`): switchability refuses it
+    // even though its manifest visibility reads `searchable`. Forwarded to `sessionToolRow`, which
+    // is where the server's `protected` rule is restated.
+    pendingOnly?: boolean;
+    // This session registered the name (`record.core.createdTools`), which is the first branch of
+    // the server's `origin` rule.
+    created?: boolean;
 };
 
 // The routes that make a conversation the subject of the two configuration panes: the roster that
@@ -348,10 +416,14 @@ export const sessionToolReads = (
                         // figure and its warning line come from the row, and a row that reports
                         // nothing renders neither.
                         ...(tool.availability === undefined ? {} : { availability: tool.availability }),
-                        // Every tool this server ships is callable in the fixture's conversation, so
-                        // the figure is ON. A core name is still protected — by the server's rule
-                        // inside `sessionToolRow`, not by anything the fixture has to remember.
-                        enabled: true
+                        // The two kernel facts the seed may state, forwarded untouched so a fixture
+                        // can describe a `toolCancel` (pending-only) or a created row at all.
+                        ...(tool.pendingOnly === undefined ? {} : { pendingOnly: tool.pendingOnly }),
+                        ...(tool.created === undefined ? {} : { created: tool.created })
+                        // NO `enabled`: the seeded new-session figure (`!protected`) is what the
+                        // server reports for a fresh conversation, and `sessionToolRow` derives it
+                        // from the visibility above — a core name reads `enabled: false` and stays
+                        // in context through `protected`, which is what main.ts paints from.
                     })
                 )
             )

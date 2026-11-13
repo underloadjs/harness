@@ -5840,9 +5840,13 @@ let currentTool: ToolRowEntry | undefined;
 // (../shared/harness-api.ts `SessionToolSummary`:1852-1900):
 //   - `declared`  — this conversation's FROZEN definition registers the name, so it is in
 //                   context on every request whatever the live gate says;
-//   - `protected` — harness-owned core control, or declared by that definition: the name
-//                   this conversation can neither drop nor switch off (its PATCH answers
-//                   403), so its tick box renders LOCKED, not togglable;
+//   - `protected` — the kernel's own switchability answer, negated: `!harness.isToolSwitchable`
+//                   is `visibility: 'core'` or a pending-only control such as `toolCancel`
+//                   (../harness.ts:1799-1806, ../types/index.ts:3867-3885). It is the name this
+//                   conversation can neither drop nor switch off (its PATCH answers 403), so its
+//                   tick box renders LOCKED, not togglable. `declared` is a SEPARATE fact and does
+//                   not lock anything: a tool the definition declares and the kernel lets the
+//                   session switch is togglable, which is why the pane never derives this figure;
 //   - `origin`    — `catalogue` / `discovered` / `created`, i.e. how it got in here.
 // All three are OPTIONAL: a deployment-catalogue row (the only other thing that ever reaches
 // this type) states none of them, and a row that states no enablement renders no switch.
@@ -8738,19 +8742,22 @@ const toolEntryOf = (name: string): ToolRowEntry | undefined =>
 type ToolEnablement = { name: string; enabled?: boolean; declared?: boolean; protected?: boolean };
 
 // What the tick STATES for one row: whether the name is callable in this conversation right
-// now. A `protected` row is always in — it is either the harness-owned control plane this
-// session runs on or a name its FROZEN definition declares — and the server deliberately
-// reports `enabled: false` for a core tool, because that field is membership in the live
-// DISCOVERED set (`harness.discoveredTools`, ../server/api-reads.ts:959-987), not "in context".
-// Painting a core row from `enabled` alone would show the control plane as switched off.
+// now. A `protected` row is always in — the harness owns that control itself (a `visibility:
+// 'core'` entry, or a pending-only runtime control), and the server deliberately reports
+// `enabled: false` for it, because that field is membership in the live DISCOVERED set
+// (`harness.discoveredTools`, ../server/api-reads.ts:1003-1032) and a protected name never
+// occupies a slot in it, not "in context". Painting a protected row from `enabled` alone would
+// show the control plane as switched off. `declared` states neither figure: a declared name is in
+// context because the definition says so, and it is still togglable unless the kernel refuses it.
 const toolRowInContext = (row: ToolEnablement): boolean => row.protected === true || row.enabled === true;
 
 // Why one row's switch is locked, in the order the reader needs to hear it. `protected` is a
-// property of the NAME (403 on the server: this conversation can neither drop its control
-// plane nor switch off a tool its own team declared), `writing` is this control's own
-// in-flight PATCH, and `running` is the conversation having work queued — the session route
-// answers 409 unless the session is idle (`assertIdleForToolMutation`, ../server/api.ts), so
-// the lock here is the server's rule stated before the click instead of after it.
+// property of the NAME (403 on the server: this conversation can neither drop its control plane
+// nor switch off a control the harness declares for itself — never a guess from `declared` or from
+// the catalogue's `visibility`), `writing` is this control's own in-flight PATCH, and `running` is
+// the conversation having work queued — the session route answers 409 unless the session is idle
+// (`assertIdleForToolMutation`, ../server/api.ts), so the lock here is the server's rule stated
+// before the click instead of after it.
 type ToolSwitchLock = 'protected' | 'writing' | 'running';
 
 const toolSwitchLockOf = (row: ToolEnablement): ToolSwitchLock | undefined => {
@@ -8763,9 +8770,13 @@ const toolSwitchLockOf = (row: ToolEnablement): ToolSwitchLock | undefined => {
 
 // The tooltip for one state of one switch. Every sentence names THIS conversation, because
 // that is the scope the write has; the old "every conversation on this harness server" copy
-// promised a deployment-wide change the route no longer makes.
+// promised a deployment-wide change the route no longer makes. The `protected` sentence states
+// the REAL reason a row is locked: the harness declares that control itself (core, or a
+// pending-only runtime control), NOT "this conversation's team declared it" — a name the frozen
+// definition merely declares is switchable, and the old copy told the reader it was not.
 const toolSwitchTitleOf = (inContext: boolean, lock: ToolSwitchLock | undefined): string => {
-    if (lock === 'protected') return 'Harness-owned or declared by this conversation’s team · it cannot be switched here';
+    if (lock === 'protected')
+        return 'Always in context for this conversation · the harness itself declares it, so it cannot be switched here';
     if (lock === 'running') return 'This conversation is working · the switch unlocks when its run ends';
     if (lock === 'writing') return 'Switching this tool for this conversation…';
 
@@ -8829,7 +8840,7 @@ const paintToolEnableBusy = (name: string, busy: boolean): void => {
 //
 // The row SET is not reconciled here on purpose: `enabled` gates a name in and out of the
 // conversation's callable set without touching its registration, so the live registry — which
-// is what the page lists (../server/api-reads.ts:989-994) — cannot gain or lose a row from a
+// is what the page lists (../server/api-reads.ts:1034-1039) — cannot gain or lose a row from a
 // gate write. A read that DOES change the set lands through `buildTools` on the next open.
 const applySessionToolRows = (rows: readonly ToolRowEntry[]): void => {
     toolEntries = rows;

@@ -125,6 +125,21 @@ export const TURN_PROMPT_PREVIEW_CHARS = 320;
 export type ReadContext = {
     hub: HarnessEventHub;
     catalogue: ToolCatalogue;
+    /**
+     * The harness-owned rows the GLOBAL Tools surface lists BEFORE the catalogue
+     * (`./api.ts` `createCoreToolEntries()`, ./harnesses/core.ts). Session rows need them for
+     * the same reason the global routes consult them (`coreEntries.find(name) ?? catalogue
+     * .find(name)`): a name like `delegate` or `records` is a RUNTIME entry that
+     * `createToolCatalogue()` does not carry, so a session row resolved against the catalogue
+     * alone falls back to the "no entry" defaults (`group: 'Created tools'`,
+     * `visibility: 'searchable'`, `session_bound: false`) and contradicts the global row for
+     * the same name — the pane then shows one tool as two different tools.
+     *
+     * OPTIONAL for the same reason `agentState` is: a hand-built read context over the
+     * projections may legitimately state only the catalogue, and an absent list means
+     * "no harness-owned entries", which is exactly what every pre-R3 projection asserted.
+     */
+    coreEntries?: readonly CatalogueEntry[];
     /** Effective GLOBAL provider defaults (config layer), never a per-session merge. */
     defaults: { baseURL: string; model: string; apiKey: string };
     /** Deployment runtime facts (./config.ts), reported read-only on /config and a session. */
@@ -933,31 +948,60 @@ export const recordsDeltaOf = (record: SessionRecord, since: number, revision: n
 
 /**
  * Whether a name is one of the harness-owned control tools the runtime ships (`toolRequest`,
- * `tasks`, ...). SESSION semantics only: it is half of a session row's `protected` field (the
- * entry a conversation can neither un-register nor switch off) and it decides the execution
- * gate below. The GLOBAL deployment switch does not consult it — every listed tool is
- * switchable there (./tool-settings.ts).
+ * `tasks`, ...). SESSION semantics only, and today ONLY for the execution gate below: these
+ * entries have no standalone implementation, so the session route is the one that can run
+ * them. It is deliberately NOT the source of a session row's `protected` figure any more —
+ * that is the kernel's own switchability answer, see `sessionToolRowsOf` — because the two
+ * sets genuinely differ: `delegate` is refused by the kernel without being in this list, and
+ * `syntax`/`files`/`shell` are in neither list and ARE switchable. The GLOBAL deployment
+ * switch does not consult it either — every listed tool is switchable there
+ * (./tool-settings.ts).
  */
 const isCoreToolName = (name: string): boolean => CORE_TOOL_NAMES.includes(name);
+
+/**
+ * The catalogue entry one tool name resolves to, using the SAME lookup the global Tools
+ * routes use (./api.ts resolves a name as `coreEntries.find(name) ?? catalogue.find(name)`).
+ *
+ * WHY THE HARNESS-OWNED HALF MATTERS: `createToolCatalogue()` carries the directly callable
+ * tools, so a runtime name (`delegate`, `records`, `threadSend`, ...) is invisible to
+ * `catalogue.find` and every row metadata field falls back to its "no entry" default —
+ * `group: 'Created tools'`, `visibility: 'searchable'`, `session_bound: false`. That made the
+ * session pane call `delegate` a created, searchable, non-session-bound tool while the global
+ * Tools list called the same name a core, session-bound one. One resolver for both surfaces
+ * is what keeps those two rows about one tool, and ./api.ts calls THIS function for its global
+ * name lookups so the rule cannot be restated differently on either side.
+ */
+export const toolEntryOf = (name: string, context: ReadContext): CatalogueEntry | undefined =>
+    context.coreEntries?.find((entry) => entry.name === name) ?? context.catalogue.find(name);
 
 /**
  * Every live registry entry as a session row.
  *
  * The state a catalogue row CANNOT state comes from the running harness:
- *   - `declared`  - the frozen definition registers the name (always in context);
+ *   - `declared`  - the frozen definition's `coreTools` carries the name, i.e. it is in
+ *                   context on every request (NOT `definition.tools`, which is the larger set
+ *                   this card REGISTERS and most of which still has to be discovered);
  *   - `enabled`   - the live enabled set (`harness.discoveredTools`);
  *   - `origin`    - `created` when a source revision is installed, `discovered` when the
  *                   enabled set contains a non-declared name, `catalogue` otherwise;
- *   - `protected` - a harness-owned control tool (see `isCoreToolName`) or a name this
- *                   session's frozen definition declares, which that conversation can
- *                   neither drop nor switch off, so its write routes refuse it with 403.
+ *   - `protected` - the ONE figure this projection does not decide for itself: it is the
+ *                   NEGATION of the kernel's own switchability predicate
+ *                   (`harness.isToolSwitchable`, ../harness.ts `occupiesSearchableSlot`), the
+ *                   same code path the enable/disable operations refuse with. A catalogue row
+ *                   cannot state it and a server-side guess from `visibility` cannot either
+ *                   (`toolCancel` is demoted to `visibility: 'searchable'` at registration yet
+ *                   stays pending-only, so it is NOT switchable). Stating the kernel's answer
+ *                   BEFORE the click is what lets the pane grey the row out instead of
+ *                   answering a click with a refusal: the write routes' 403 and this field are
+ *                   now the same fact, so no clickable row can be refused.
  *                   This is a per-conversation fact; the global Tools rows carry no such
  *                   field, because the deployment-wide switch applies to every name;
  *   - `source_*`  - the installed source revision, which is what makes the source route
  *                   worth calling.
  */
 export const sessionToolRowsOf = (record: SessionRecord, context: ReadContext): SessionToolSummary[] => {
-    const declared = new Set<string>(record.definition.tools);
+    const declared = new Set<string>(record.definition.coreTools ?? []);
     const enabled = new Set<string>(record.harness.discoveredTools ?? []);
     const sources = new Map(record.harness.toolSources().map((source) => [source.name, source]));
     // One rule decides `origin` and the budget, so a row and the page's budget can never
@@ -966,7 +1010,7 @@ export const sessionToolRowsOf = (record: SessionRecord, context: ReadContext): 
     const live = liveToolNames(record);
 
     return live.map((name) => {
-        const entry = context.catalogue.find(name);
+        const entry = toolEntryOf(name, context);
         const source = sources.get(name);
         const isDeclared = declared.has(name);
         const isEnabled = enabled.has(name);
@@ -976,10 +1020,11 @@ export const sessionToolRowsOf = (record: SessionRecord, context: ReadContext): 
             session_id: record.id,
             declared: isDeclared,
             enabled: isEnabled,
-            // `created` is what this session registered; `discovered` is a catalogue tool the
-            // run enabled through `toolRequest`; `catalogue` is everything else.
+            // `created` is what this session registered; `discovered` is an enabled name this
+            // session did not declare (a `toolRequest` match, or the host's new-session toolbox
+            // seed — same slot in the same capped set); `catalogue` is everything else.
             origin: created.has(name) ? 'created' : !isDeclared && isEnabled ? 'discovered' : 'catalogue',
-            protected: isCoreToolName(name) || isDeclared,
+            protected: !record.harness.isToolSwitchable(name),
             source_available: source !== undefined,
             ...(source === undefined ? {} : { source_revision: source.revision })
         };
@@ -1010,18 +1055,22 @@ export const sessionToolDetailOf = (
     const rows = sessionToolRowsOf(record, context);
     const row = rows.find((candidate) => candidate.name === name);
 
-    // A name the live registry does not hold cannot be addressed by this route (the caller
-    // answers 404 first), so the row below is a type-complete fallback, not a claim: every
-    // session-scoped fact it states is "no", and the execution gate is still the truth for
-    // the name.
+    // A name the live registry does not hold cannot be addressed by this route: every caller
+    // answers 404 from the row list first (`./api.ts` `getSessionTool`, `patchSessionTool`,
+    // `deleteSessionTool`), so the row below is a type-complete fallback, not a claim a client
+    // ever sees. What it states must still be TRUE for the name, which is why `protected` is
+    // the kernel's own answer rather than a literal: an unregistered name is by definition not
+    // switchable (`../harness.ts` `occupiesSearchableSlot` reads the live registry), so a
+    // fallback that said `protected: false` would contradict the row rule it stands in for
+    // (`sessionToolRowsOf` above sets `protected = !isToolSwitchable(name)`).
     if (row === undefined) {
         return {
-            ...toolSummaryOf(context.catalogue.find(name), name),
+            ...toolSummaryOf(toolEntryOf(name, context), name),
             session_id: record.id,
             declared: false,
             enabled: false,
             origin: 'catalogue',
-            protected: false,
+            protected: !record.harness.isToolSwitchable(name),
             source_available: false,
             execution: toolExecutionScopeOf(name)
         };
@@ -1057,8 +1106,16 @@ const toolDetailsOf = (
 
 /** How one entry may be called over HTTP, stated rather than inferred by the client. */
 export const toolExecutionScopeOf = (name: string): ToolExecutionScope => ({
-    // A harness-owned control tool has no standalone implementation, so the session route
-    // is the only one that can run it.
+    // THIS IS THE EXECUTION AXIS, and it is a DIFFERENT predicate from the row's `protected`
+    // flag on the switch axis. `session_required` names the control-plane entries the runtime
+    // ships that have NO standalone implementation (`CORE_TOOL_NAMES` = `toolRequest` and
+    // `tasks`, ./harnesses/toolbox.ts:194-196), because only a live conversation can run them.
+    // `protected` answers whether THIS conversation may switch the name at all, which is the
+    // kernel's switchability rule and covers a far wider set — `read`, `write`, `edit`, `glob`,
+    // `grep`, `delegate` and `toolCancel` are all protected (../harness.ts
+    // `occupiesSearchableSlot`) while remaining callable through the session route, so they
+    // stay `session_only` here. The two figures disagree ON PURPOSE; neither one may be derived
+    // from the other (see the `isCoreToolName` note above and `sessionToolRowsOf`).
     scope: isCoreToolName(name) ? 'session_required' : 'session_only',
     // Manual execution is the documented session surface for every live entry.
     manual: true
