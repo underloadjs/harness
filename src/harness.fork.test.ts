@@ -30,6 +30,7 @@ import { agent, harness, tool } from '@underload/harness';
 import { BRANCH_PENDING_PLACEHOLDER } from './core/branch';
 import type {
     Agent,
+    Harness,
     HarnessEvent,
     HarnessMessage,
     HarnessPluginApi,
@@ -1355,5 +1356,602 @@ describe('threadFork runtime', () => {
         expect(record?.status).toBe('completed');
         expect(record?.result?.content).toBe('branch done');
         expect(record?.error).toBeUndefined();
+    });
+});
+
+// ---------------------------------------------------------------------------
+//
+// BRANCH ADDRESSABILITY AND THE BRANCH'S OWN CLOCK (finding B1, 2026-11-13).
+//
+// `threadFork` answers with `{ branchId, threadId, content }`, both ids the SAME
+// generated `branch-N`, and the branch is recorded as the invocation of that id. So the
+// id is a HANDLE. This block pins the three things that used to be missing: the read
+// seams answer that id (`thread()`, `threadMessages()`, and `threadRead` from inside the
+// requester's lineage), a caller can BOUND the branch (`timeoutMs` on the call, or
+// `threadForkTimeoutMs` on the harness for every door that names no bound), and the
+// message that reaches the requester when a branch ends early carries the branch id that
+// still addresses the work.
+//
+// The counterpart of the clock is its ABSENCE by default, already pinned by the policy
+// test above (`vi.getTimerCount()` stays 0 and time passing changes nothing); the last
+// test below re-pins it for the configured-option path, where a regression would actually
+// live.
+describe('threadFork branch addressability and its opt-in clock (B1)', () => {
+    // This block owns the clock: `vi.getTimerCount()` is the assertion that a branch bound
+    // exists (or does not), and `advanceBy` is what fires it.
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    // One requester conversation plus one sibling that never took part in the fork: the pair
+    // the visibility rule needs and the pair the roster check needs. `async-ping` is replaced
+    // (the documented override path) so the heartbeat's interval timer stays out of the timer
+    // count and the only timer a bounded branch arms is its own clock.
+    const fixture = (stream: HarnessStream, extra: Record<string, unknown> = {}) => {
+        const writer = harness({
+            agents: { writer: brain(stream) },
+            presets: false,
+            plugins: [{ name: 'async-ping', setup: () => undefined }],
+            ...extra
+        });
+        const home = writer.createThread('writer', { label: 'Home' });
+        const sibling = writer.createThread('writer', { label: 'Sibling' });
+
+        return { writer, home, sibling };
+    };
+
+    // A THREAD RUN needs the timer pump to move: `sendThreadInput` settles through timers,
+    // and under fake timers settling takes passes rather than microtasks. So a test starts the
+    // turn, pumps until its own bookkeeping says the run is done, then awaits the promise —
+    // the shape `src/harness.thread-runtime.test.ts` uses for the same reason.
+    const runThread = (writer: Harness, threadId: string, input: string) => {
+        const state: { settled: boolean; content?: string; failure?: string } = {
+            settled: false
+        };
+        const turn = writer.sendThreadInput(threadId, input).then(
+            (message) => {
+                state.settled = true;
+                state.content = message.content;
+                return message;
+            },
+            (error: Error) => {
+                state.settled = true;
+                state.failure = error.message;
+                throw error;
+            }
+        );
+
+        const pump = async (predicate: () => boolean, passes = 64): Promise<void> => {
+            for (let pass = 0; pass < passes && !predicate(); pass += 1) await flush();
+        };
+
+        return { state, turn, pump };
+    };
+
+    // A branch that starts work and parks inside a tool call of its own, so whatever ends it
+    // is the clock, a cancellation, or the release — never its own answer.
+    const parkedBranch: HarnessStreamEvent[] = [
+        { type: 'text', delta: 'started the work' },
+        {
+            type: 'done',
+            stopReason: 'tool_calls',
+            toolCalls: [{ id: 'h1', name: 'hold', arguments: '{}' }]
+        }
+    ];
+
+    const holdTool = (promise: Promise<string>) => ({
+        hold: tool({
+            description: 'Park until released.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: () => promise
+        })
+    });
+
+    // The route every fixture below shares, told apart by TRANSCRIPT rather than by turn
+    // index (one transport serves the origin and its branch). Order matters: the settled
+    // results first, then the "my own call is still parked, do not re-issue it" guard, then
+    // the first turns. `pending` is filtered out of the origin's view because an async fork
+    // leaves a pending placeholder behind while the branch works.
+    const route = (rules: {
+        branchSettled?: string;
+        branchAnswer: string;
+        rootAnswer: string;
+        forkArguments: string;
+        cancel?: boolean;
+    }): HarnessStream =>
+        routed((request) => {
+            const results = toolContents(request);
+            const realResults = results.filter((content) => !content.includes('"status":"pending"'));
+
+            // The branch, after its parked tool settled (its release text, or its own answer).
+            if (rules.branchSettled !== undefined && results.some((c) => c.includes(rules.branchSettled!))) {
+                return answer(rules.branchAnswer);
+            }
+
+            // The origin, once a REAL result crossed back (a fork receipt, a cancellation, a
+            // refusal) and the model has something to say about it.
+            if (realResults.some((content) => content.includes(rules.rootAnswer))) {
+                return answer(`${rules.rootAnswer}:done`);
+            }
+
+            // The branch's turn while its own call is still parked: re-issuing it would reuse
+            // a committed tool-call id, which is a hard harness error.
+            if (
+                request.messages.some(
+                    (message) =>
+                        message.role === 'assistant' &&
+                        (message.toolCalls ?? []).some((entry) => entry.name === 'hold')
+                )
+            ) {
+                return answer('waiting');
+            }
+
+            // The branch's first turn: park on a tool of its own.
+            if (latestUser(request) === 'inspect') return parkedBranch;
+
+            // The origin's first turn: ask for the fork.
+            if (!request.messages.some((message) => message.role === 'assistant')) {
+                return call('f1', 'threadFork', rules.forkArguments);
+            }
+
+            // The origin, with the fork still in flight: cancel it, or simply pause and let
+            // the completion drive the next turn.
+            if (rules.cancel === true && realResults.length === 0) {
+                if (
+                    request.messages.some(
+                        (message) =>
+                            message.role === 'assistant' &&
+                            (message.toolCalls ?? []).some((entry) => entry.name === 'toolCancel')
+                    )
+                ) {
+                    return answer('waiting');
+                }
+
+                return call('k1', 'toolCancel', '{"callId":"f1"}');
+            }
+
+            return answer('waiting');
+        });
+
+    // The tool deliveries one thread's transcript recorded, in order.
+    const toolResultsOf = (writer: Harness, threadId: string): string[] =>
+        writer
+            .threadMessages(threadId)
+            .filter((entry): entry is Extract<HarnessMessage, { role: 'tool' }> => entry.role === 'tool')
+            .map((entry) => entry.content);
+
+    // The fork-call deliveries the requester's own transcript recorded, in order.
+    const forkDeliveries = (writer: Harness, threadId: string): string[] =>
+        writer
+            .threadMessages(threadId)
+            .filter(
+                (entry): entry is Extract<HarnessMessage, { role: 'tool' }> =>
+                    entry.role === 'tool' && entry.name === 'threadFork'
+            )
+            .map((entry) => entry.content);
+
+    it('answers thread(), threadMessages() and a lineage threadRead() by the branch id', async () => {
+        // The branch id only exists after the first run, and the SECOND conversation asks for
+        // it by name, so the route reads it from a mutable cell — the convention
+        // `src/plugin/context-compaction.test.ts` uses for an id it cannot know at build time.
+        let branchAddress = '';
+
+        const stream = routed((request) => {
+            const user = latestUser(request);
+
+            // The sibling's own turn: one `threadRead` of the branch it was never part of.
+            if (user === 'read the branch') {
+                if (toolContents(request).some((content) => content.includes('is not visible to thread'))) {
+                    return answer('sibling heard the refusal');
+                }
+
+                return call('r1', 'threadRead', JSON.stringify({ thread: branchAddress }));
+            }
+
+            if (user === 'inspect') return answer('branch summary');
+
+            if (toolContents(request).some((content) => content.includes('branch summary'))) {
+                return answer('root done');
+            }
+
+            if (!request.messages.some((message) => message.role === 'assistant')) {
+                return call('f1', 'threadFork', '{"input":"inspect"}');
+            }
+
+            return answer('waiting');
+        });
+
+        const { writer, home, sibling } = fixture(stream);
+        const run = runThread(writer, home.id, 'go');
+        await run.pump(() => run.state.settled);
+
+        expect(run.state.failure).toBeUndefined();
+        expect(run.state.content).toBe('root done');
+
+        const record = writer.branches()[0];
+        const branchId = record.branchId;
+        // The branch counter is module-global across a file's harnesses, so the id is pinned
+        // by shape here and by value everywhere it is used below.
+        expect(branchId).toMatch(/^branch-\d+$/);
+
+        // THE RECORD, every field derived from the branch ledger by `threadRecordOfBranch`:
+        // `origin: 'host'` because a branch is a conversation ON TOP of an agent rather than
+        // an agent's default; `status: 'idle'` because a terminal branch is done working;
+        // `sequence` is its position in the retained ledger (kept in creation order);
+        // `invocationId` IS the branch id, which is what makes `thread()` and `agentResult`
+        // name the same run; `ownerThreadId` is the REQUESTER's persistent thread — the owner
+        // whose delete cascades this branch away.
+        expect(writer.thread(branchId)).toEqual({
+            id: branchId,
+            agent: 'writer',
+            origin: 'host',
+            status: 'idle',
+            sequence: 1,
+            ownerThreadId: home.id,
+            invocationId: branchId
+        });
+
+        // THE TRANSCRIPT: the copied baseline (the fork's own unanswered call carries the
+        // created-branch placeholder) plus the branch's own two turns, in order.
+        expect(withoutIds(writer.threadMessages(branchId))).toEqual([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    { id: `call_${branchId}_1`, name: 'threadFork', arguments: '{"input":"inspect"}' }
+                ]
+            },
+            {
+                role: 'tool',
+                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                toolCallId: `call_${branchId}_1`,
+                name: 'threadFork'
+            },
+            { role: 'user', content: 'inspect' },
+            { role: 'assistant', content: 'branch summary' }
+        ]);
+
+        // AN ADDRESS, NOT A ROSTER ENTRY. A branch is an invocation with an ephemeral
+        // transcript; it holds no thread slot, so the roster is still exactly the default
+        // conversation plus the two host conversations.
+        expect(writer.threads().map((entry) => entry.id)).toEqual([
+            'agent:writer',
+            home.id,
+            sibling.id
+        ]);
+
+        // THE HOST READ. A caller with no thread of its own is the host view and is UNSCOPED,
+        // so the manual read accepts the branch id and pages what the branch committed.
+        const page = JSON.parse(
+            JSON.stringify(await writer.executeTool('threadRead', { thread: branchId }))
+        ) as {
+            thread: { id: string };
+            total: number;
+            matched: number;
+            messages: Array<{ index: number; content: string }>;
+        };
+        expect({
+            thread: page.thread.id,
+            total: page.total,
+            matched: page.matched,
+            messages: page.messages.map((entry) => ({ index: entry.index, content: entry.content }))
+        }).toEqual({
+            thread: branchId,
+            total: 5,
+            matched: 5,
+            messages: [
+                { index: 0, content: 'go' },
+                { index: 1, content: '' },
+                { index: 2, content: BRANCH_PENDING_PLACEHOLDER.threadFork },
+                { index: 3, content: 'inspect' },
+                { index: 4, content: 'branch summary' }
+            ]
+        });
+
+        // THE OWNER READS IT. `home` owns the branch, so the branch is inside its family and
+        // both read seams answer the id for it.
+        expect(writer.threadMessages(branchId, home.id).map((entry) => entry.content)).toEqual([
+            'go',
+            '',
+            BRANCH_PENDING_PLACEHOLDER.threadFork,
+            'inspect',
+            'branch summary'
+        ]);
+        expect(writer.thread(branchId, home.id)?.invocationId).toBe(branchId);
+
+        // A SIBLING does not inherit the lineage of the conversation that forked. The seam
+        // `threadRead` reads through refuses it with the sentence for an id that EXISTS but is
+        // not its to read — never the not-found sentence.
+        const notVisible =
+            `Thread "${branchId}" is not visible to thread "${sibling.id}": a read reaches your own thread, ` +
+            'an ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists ' +
+            '(see threadList). The id exists — it is simply outside your lineage.';
+
+        expect(() => writer.threadMessages(branchId, sibling.id)).toThrow(notVisible);
+        expect(() => writer.thread(branchId, sibling.id)).toThrow(notVisible);
+
+        // AND THE MODEL FEELS IT TOO. The sibling's own run calls `threadRead` with the id;
+        // what lands in ITS transcript is the refusal, so a conversation cannot borrow a
+        // neighbour's branch address by guessing it.
+        branchAddress = branchId;
+        const second = runThread(writer, sibling.id, 'read the branch');
+        await second.pump(() => second.state.settled);
+
+        expect(second.state.failure).toBeUndefined();
+        expect(second.state.content).toBe('sibling heard the refusal');
+        // What the model is handed is the tool-call failure envelope around that sentence —
+        // the same wrapper every other refused call gets, and it still names the id and the
+        // reason.
+        expect(toolResultsOf(writer, sibling.id)).toEqual([
+            `Tool "threadRead" failed: ${notVisible}`
+        ]);
+
+        // AN UNKNOWN BRANCH ID IS THE CANONICAL UNKNOWN THREAD: one sentence for "gone" and
+        // "never existed", on both read seams.
+        expect(writer.thread('branch-999999')).toBeUndefined();
+        expect(() => writer.threadMessages('branch-999999')).toThrow(
+            'Thread "branch-999999" is not available in this harness; it was never created, or it was deleted.'
+        );
+
+        // A branch is not a thread SLOT, so the host's release keeps refusing it: its records
+        // leave with its owner conversation (the M2 cascade), never on their own.
+        expect(() => writer.deleteThread(branchId)).toThrow(
+            `Thread "${branchId}" is not available in this harness; it was never created, or it was deleted.`
+        );
+    });
+
+    it('ends a branch on the bound its caller names, and reports the branch id that still addresses the work', async () => {
+        let release!: () => void;
+        const hold = new Promise<string>((resolve) => {
+            release = () => resolve('released');
+        });
+
+        const stream = route({
+            branchSettled: 'released',
+            branchAnswer: 'branch done',
+            rootAnswer: 'exceeded its 30ms timeout',
+            forkArguments: '{"input":"inspect","timeoutMs":30}'
+        });
+
+        const { writer, home } = fixture(stream, { tools: holdTool(hold) });
+        const run = runThread(writer, home.id, 'go');
+
+        // The fork is live and parked inside its own tool call before any clock moves.
+        await run.pump(() => writer.branches().length === 1);
+
+        const branchId = writer.branches()[0].branchId;
+
+        // THE CLOCK IS ARMED, and it is the only timer this harness holds: the branch is
+        // running, and nothing else ends it on a clock.
+        expect(vi.getTimerCount()).toBe(1);
+        expect(writer.branch(branchId)?.status).toBe('running');
+        expect(writer.thread(branchId)?.status).toBe('running');
+
+        await advanceBy(31);
+        await run.pump(() => run.state.settled);
+
+        // A branch the clock stopped is a CANCELLATION, not a failure — the same control
+        // outcome a `toolCancel` of the same call records — with the reason naming the branch
+        // and the bound that fired. `branches()` hands out detached records, so the branch is
+        // re-read through its id rather than read through the earlier snapshot.
+        expect(writer.branch(branchId)).toMatchObject({
+            status: 'cancelled',
+            error: { message: `Thread branch "${branchId}" exceeded its 30ms timeout and was stopped.` }
+        });
+        expect(writer.branch(branchId)?.result).toBeUndefined();
+        expect(run.state.content).toBe('exceeded its 30ms timeout:done');
+
+        // WHAT REACHES THE REQUESTER names the branch id, because that id is the handle for
+        // what survives: the sentence it reads is the branch's own abort reason, and B3
+        // (2026-11-13) adds the clause that proves the work is not gone — the surviving
+        // address, an inline preview of what the branch had produced, and the two doors
+        // that read the rest. The preview is capped (FORK_PARTIAL_PREVIEW_CHARS in
+        // src/harness.ts); the full text is what `agentResult` reports below.
+        expect(forkDeliveries(writer, home.id)).toEqual([
+            `Tool "threadFork" failed: Thread branch "${branchId}" exceeded its 30ms timeout and was stopped. — its branch "${branchId}" still holds what it produced: "started the work" — read it with threadRead "${branchId}" or agentResult by that id.`
+        ]);
+
+        // THE PARTIAL WORK STAYS READABLE BY THAT ID. The branch never gave a final summary;
+        // what it had produced pages exactly like a finished answer would.
+        const result = (await writer.executeTool('agentResult', {
+            agent: 'writer',
+            invocationId: branchId
+        })) as Record<string, unknown>;
+        expect({
+            agent: result.agent,
+            invocationId: result.invocationId,
+            kind: result.kind,
+            status: result.status,
+            content: result.content,
+            contentLength: result.contentLength,
+            hasMore: result.hasMore,
+            error: result.error,
+            // B3 (2026-11-13): the WHOLE partial, as its own key. A timed-out branch is
+            // forensically readable by its id: `content` is the page, `partialContent` is
+            // the run's last substantive text, and a caller that only wants the gist gets
+            // it in this one call. The key was missing before, which made the entry's own
+            // prose ("the result carries the partial content it had produced") a promise
+            // nothing honoured.
+            partialContent: result.partialContent,
+            cancelledAtMessage: result.cancelledAtMessage
+        }).toEqual({
+            agent: 'writer',
+            invocationId: branchId,
+            kind: 'fork',
+            status: 'cancelled',
+            content: 'started the work',
+            contentLength: 16,
+            hasMore: false,
+            error: `Thread branch "${branchId}" exceeded its 30ms timeout and was stopped.`,
+            partialContent: 'started the work',
+            cancelledAtMessage: 2
+        });
+
+        // A terminal branch reports as a finished conversation, and its clock is DISARMED: no
+        // timer is left pending once the branch has settled.
+        expect(writer.thread(branchId)?.status).toBe('idle');
+        expect(vi.getTimerCount()).toBe(0);
+
+        release();
+    });
+
+    it('names the branch address when the requester cancels the fork call', async () => {
+        const hold = new Promise<string>(() => undefined);
+
+        const stream = route({
+            branchAnswer: 'branch done',
+            rootAnswer: 'still holds what it produced',
+            forkArguments: '{"input":"inspect"}',
+            cancel: true
+        });
+
+        const { writer, home } = fixture(stream, { tools: holdTool(hold) });
+        const run = runThread(writer, home.id, 'go');
+        await run.pump(() => run.state.settled);
+
+        const branchId = writer.branches()[0].branchId;
+        expect(run.state.failure).toBeUndefined();
+        expect(run.state.content).toBe('still holds what it produced:done');
+        expect(writer.branch(branchId)?.status).toBe('cancelled');
+
+        // THE CANCELLATION SENTENCE. Every other cancelled call says "no result is available";
+        // a FORK's work survives its own cancellation, so the sentence carries the branch id
+        // and BOTH doors that read it. Pinned verbatim, because the whole point is that the id
+        // is inside the text a model reads.
+        expect(forkDeliveries(writer, home.id)).toEqual([
+            `Tool call "threadFork" (f1) was cancelled before it completed; its branch "${branchId}" still holds what it produced — read it with threadRead "${branchId}" or agentResult by that id.`
+        ]);
+
+        // And the address it names is real. A cancelled run rolls back its OWN turns, so what
+        // survives at that address is the baseline the branch was created from, up to and
+        // including the fork call it was made to answer.
+        expect(withoutIds(writer.threadMessages(branchId))).toEqual([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    { id: `call_${branchId}_1`, name: 'threadFork', arguments: '{"input":"inspect"}' }
+                ]
+            },
+            {
+                role: 'tool',
+                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                toolCallId: `call_${branchId}_1`,
+                name: 'threadFork'
+            }
+        ]);
+
+        // The work it HAD produced is not lost either: it is the invocation's partial answer,
+        // paged by the same id the sentence names. B3 (2026-11-13): `partialContent` is the
+        // same text in ONE field, so a caller that cancels a fork reads what it got without
+        // paging — and the key exists for a cancelled branch exactly as it does for a
+        // cancelled delegation.
+        const partial = (await writer.executeTool('agentResult', {
+            agent: 'writer',
+            invocationId: branchId
+        })) as Record<string, unknown>;
+        expect({
+            agent: partial.agent,
+            invocationId: partial.invocationId,
+            kind: partial.kind,
+            status: partial.status,
+            content: partial.content,
+            contentLength: partial.contentLength,
+            hasMore: partial.hasMore,
+            error: partial.error,
+            partialContent: partial.partialContent,
+            cancelledAtMessage: partial.cancelledAtMessage
+        }).toEqual({
+            agent: 'writer',
+            invocationId: branchId,
+            kind: 'fork',
+            status: 'cancelled',
+            content: 'started the work',
+            contentLength: 16,
+            hasMore: false,
+            error: expect.stringContaining('aborted'),
+            partialContent: 'started the work',
+            cancelledAtMessage: 2
+        });
+    });
+
+    it('takes the bound from the harness for a fork that names none, and arms no clock when nobody names one', async () => {
+        let release!: () => void;
+        const hold = new Promise<string>((resolve) => {
+            release = () => resolve('released');
+        });
+
+        // THE HOST'S BACKSTOP. The model named no `timeoutMs`, so the configured value IS the
+        // bound — the option that used to be declared and read by nobody.
+        const stream = route({
+            branchSettled: 'released',
+            branchAnswer: 'branch done',
+            rootAnswer: 'exceeded its 40ms timeout',
+            forkArguments: '{"input":"inspect"}'
+        });
+
+        const { writer, home } = fixture(stream, { tools: holdTool(hold), threadForkTimeoutMs: 40 });
+        const run = runThread(writer, home.id, 'go');
+        await run.pump(() => writer.branches().length === 1);
+
+        expect(writer.branches()[0].status).toBe('running');
+        expect(vi.getTimerCount()).toBe(1);
+
+        await advanceBy(41);
+        await run.pump(() => run.state.settled);
+
+        expect(run.state.content).toBe('exceeded its 40ms timeout:done');
+        const boundedId = writer.branches()[0].branchId;
+        expect(writer.branch(boundedId)).toMatchObject({
+            status: 'cancelled',
+            error: { message: `Thread branch "${boundedId}" exceeded its 40ms timeout and was stopped.` }
+        });
+        expect(vi.getTimerCount()).toBe(0);
+
+        // UNSET MEANS NO LIMIT. The same fork on an unconfigured harness arms NO timer, and
+        // twenty-five minutes of clock time change nothing: the branch still ends on its own
+        // answer — released here by the tool it was parked in.
+        release();
+
+        let releaseTwo!: () => void;
+        const holdTwo = new Promise<string>((resolve) => {
+            releaseTwo = () => resolve('released');
+        });
+
+        const plain = fixture(
+            route({
+                branchSettled: 'released',
+                branchAnswer: 'branch done',
+                rootAnswer: 'branch done',
+                forkArguments: '{"input":"inspect"}'
+            }),
+            { tools: holdTool(holdTwo) }
+        );
+
+        const plainRun = runThread(plain.writer, plain.home.id, 'go');
+        await plainRun.pump(() => plain.writer.branches().length === 1);
+
+        expect(plain.writer.branches()[0].status).toBe('running');
+        expect(vi.getTimerCount()).toBe(0);
+
+        await advanceBy(1_500_000);
+        expect(plain.writer.branches()[0].status).toBe('running');
+
+        releaseTwo();
+        await plainRun.pump(() => plainRun.state.settled);
+
+        expect(plainRun.state.content).toBe('branch done:done');
+        const plainId = plain.writer.branches()[0].branchId;
+        expect(plain.writer.branch(plainId)).toMatchObject({
+            status: 'completed',
+            result: { content: 'branch done' }
+        });
     });
 });

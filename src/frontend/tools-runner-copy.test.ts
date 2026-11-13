@@ -12,6 +12,7 @@
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 
 const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -87,11 +88,23 @@ const boot = async (): Promise<Call[]> => {
                     presets: [descriptor()],
                     tools: [fileReadTool],
                     defaults: { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false },
-                    sessions: [],
+                    // T4: the ⚒ pane describes a CONVERSATION (and main.ts hides both header
+                    // toggles while none is bound), so the fixture boots with one.
+                    sessions: [snapshot()],
                     agents: []
                 });
             }
             if (url === '/api/models') return json({ models: ['m1'] });
+
+            // T4: the pane's toolbox read and the runner's identified schema read (a toolbox row
+            // carries no parameters), both out of the same `[fileReadTool]` list the boot document
+            // reports — see ./session-config-test-support.ts `sessionToolReads`.
+            const toolReads = sessionToolReads([fileReadTool], url, init?.method);
+
+            if (toolReads !== undefined) return toolReads;
+
+            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [snapshot()] });
+            if (url === '/api/sessions/s1' && init?.method === undefined) return json({ session: snapshot() });
             if (url === '/api/tools/read' && init?.method === 'POST') {
                 return json({ ok: true, result: READ_RESULT, durationMs: 9 });
             }

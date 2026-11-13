@@ -14,6 +14,8 @@
 //     exposed: only the completed assistant answer value is recorded.
 
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { agent, harness, tool } from '@underload/harness';
 import type {
     Agent,
@@ -1231,3 +1233,411 @@ describe('snapshot durability (R3)', () => {
     });
 });
 
+// ---------------------------------------------------------------------------
+// B2 (2026-11-13) — ONE synchronous terminal commit for a finished run
+// ---------------------------------------------------------------------------
+//
+// A run's terminal state is TWO facts: the agent-result ledger entry (`finishInvocation`)
+// and the conversation's release back to `idle`. They used to happen in two places with an
+// `await` between them, so anything a `run.finished`/`run.failed` handler did in that
+// window saw a conversation that had already ANSWERED but was still `running` and still
+// held its run slot. Two consequences, both pinned here:
+//   - a handler that reaps a finished conversation (`deleteThread`, the way a session
+//     frees a thread slot) drew `Thread "…" is running; stop it before deleting it.` even
+//     though the run was over;
+//   - the read side handed back the NEWEST STARTED record when no finished one was newer,
+//     i.e. a `status: 'running'` next to `content: ''` — indistinguishable from "this
+//     agent has never said anything", which is why a caller stopped polling a child that
+//     had already answered on an earlier turn.
+//
+// The host thread is the fixture throughout: `deleteThread` refuses an agent's default
+// `agent:<name>` conversation by design, so `origin: 'host'` is the only conversation a
+// reaper can actually close, and it is also the only one whose removal is observable here.
+describe('terminal commit is atomic for a finished run (B2)', () => {
+    // A gate the test opens by hand: the run that calls `hold` stays in flight until the
+    // assertions below have been made, which is the only way to observe a STARTED record.
+    const deferred = <T,>(): { promise: Promise<T>; resolve: (value: T) => void } => {
+        let resolve!: (value: T) => void;
+        const promise = new Promise<T>((accept) => {
+            resolve = accept;
+        });
+        return { promise, resolve };
+    };
+
+    // Real timers and an explicit pump: this block is about STATE, not time, so the runs
+    // are driven by draining the queue until the roster says what the test needs, and the
+    // pump itself asserts the condition so a stuck run fails here rather than later.
+    const pump = async (predicate: () => boolean, passes = 60): Promise<void> => {
+        for (let index = 0; index < passes && !predicate(); index++) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        expect(predicate()).toBe(true);
+    };
+
+    it('a run.finished handler finds the thread idle, and its delete removes the whole conversation', async () => {
+        const reaped: { threadId: string; status: string | undefined }[] = [];
+        let refusal: string | undefined;
+        let reapedId: string | undefined;
+
+        const reaper = {
+            name: 'reaper',
+            setup: (api) => {
+                api.on('run.finished', ({ threadId }) => {
+                    if (threadId === undefined || threadId !== reapedId) return;
+
+                    // Observed from INSIDE the hook, which is the window the finding is
+                    // about: the record's status at the moment `run.finished` fires.
+                    reaped.push({
+                        threadId,
+                        status: api.threads.list().find((record) => record.id === threadId)?.status
+                    });
+
+                    try {
+                        api.threads.delete(threadId);
+                    } catch (error) {
+                        refusal = (error as Error).message;
+                    }
+                });
+            }
+        };
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done here')])) },
+            plugins: [reaper],
+            presets: false
+        });
+
+        const thread = writer.createThread('writer');
+        reapedId = thread.id;
+
+        expect((await writer.sendThreadInput(thread.id, 'go')).content).toBe('done here');
+
+        // THE FIX: at `run.finished` the ledger entry is terminal AND the conversation is
+        // released, with no await in between, so the record reads `idle` and the delete is
+        // accepted. Before this, `status` was 'running' and `refusal` was the sentence the
+        // handler had no way to satisfy — the run it was told about was already over.
+        expect(reaped).toEqual([{ threadId: thread.id, status: 'idle' }]);
+        expect(refusal).toBeUndefined();
+
+        // And the removal is WHOLE. Record, roster, transcript and the invocation lookup
+        // all go together (purgeThread matches `record.threadId` and the roster's own
+        // `invocationId`), so "the conversation is gone but its result survives" is now
+        // unrepresentable — which is the state a reaping caller could previously be left
+        // polling.
+        expect(writer.thread(thread.id)).toBeUndefined();
+        expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer']);
+
+        expect(await writer.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            agent: 'writer',
+            status: 'empty',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // The other half of the atomic claim: the harness is still usable afterwards, so a
+        // reaped conversation cannot strand the session.
+        expect(writer.agent.messages).toEqual([]);
+    });
+
+    it('a delete that arrives while the run still holds the conversation refuses on the live run', async () => {
+        let refusal: string | undefined;
+        let reapedId: string | undefined;
+
+        // `run.started` is the genuinely-live case: the run owns the slot, the record says
+        // `running`, and deleting then must still refuse. B2 moved state earlier; it did
+        // NOT loosen the live-run guard, and this is the half that proves that.
+        const eager = {
+            name: 'eager',
+            setup: (api) => {
+                api.on('run.started', ({ threadId }) => {
+                    if (threadId === undefined || threadId !== reapedId) return;
+
+                    try {
+                        api.threads.delete(threadId);
+                    } catch (error) {
+                        refusal = (error as Error).message;
+                    }
+                });
+            }
+        };
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('still here')])) },
+            plugins: [eager],
+            presets: false
+        });
+
+        const thread = writer.createThread('writer');
+        reapedId = thread.id;
+
+        expect((await writer.sendThreadInput(thread.id, 'go')).content).toBe('still here');
+
+        expect(refusal).toBe(`Thread "${thread.id}" is running; stop it before deleting it.`);
+        expect(writer.thread(thread.id)).toMatchObject({ id: thread.id, status: 'idle' });
+
+        // The refusal left nothing half-removed, so the conversation is still repleasable
+        // by the same op once its run is genuinely over.
+        expect(writer.deleteThread(thread.id)).toEqual({
+            deleted: thread.id,
+            removedThreadIds: [thread.id]
+        });
+    });
+
+    it('the default result is the newest FINISHED answer, never a run that is still in flight', async () => {
+        const gate = deferred<string>();
+
+        // One agent, two conversations: `first` finishes (record 1), `second` is parked
+        // inside a tool (record 2). Before B2 the DEFAULT lookup sorted by START order, so
+        // `agentResult` with no invocationId returned record 2 with an empty body and a
+        // `running` status — the caller read that as "no answer yet" and stopped polling,
+        // even though record 1 held the real answer.
+        const writerAgent = brain(
+            routed((request) => {
+                const brief = latestUser(request);
+
+                if (brief.includes('second')) {
+                    return request.messages.some((message) => message.name === 'hold')
+                        ? answer('second answer')
+                        : callTool('h1', 'hold', '{}');
+                }
+
+                return answer('first answer');
+            })
+        );
+
+        // A second agent whose ONLY invocation is in flight: it has no result at all, and
+        // the honest answer is the empty state, not a `running` record with an empty body.
+        const quietAgent = brain(
+            routed((request) =>
+                request.messages.some((message) => message.name === 'hold')
+                    ? answer('quiet answer')
+                    : callTool('h2', 'hold', '{}')
+            )
+        );
+
+        const hold = tool({
+            description: 'Hold until the test releases it.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: () => gate.promise
+        });
+
+        const writer = harness({
+            agents: { writer: writerAgent, quiet: quietAgent },
+            tools: { hold },
+            presets: false
+        });
+
+        const first = writer.createThread('writer');
+        await writer.sendThreadInput(first.id, 'first');
+        expect(await writer.executeTool('agentResult', { agent: 'writer' })).toMatchObject({
+            invocationId: '1',
+            status: 'completed',
+            content: 'first answer'
+        });
+
+        const second = writer.createThread('writer');
+        const quiet = writer.createThread('quiet');
+
+        const secondRun = writer.sendThreadInput(second.id, 'second');
+        const quietRun = writer.sendThreadInput(quiet.id, 'hush');
+
+        await pump(() => {
+            return (
+                writer.thread(second.id)?.status === 'running' &&
+                writer.thread(quiet.id)?.status === 'running'
+            );
+        });
+
+        // The finished answer still wins the default, with the parked run in flight.
+        expect(await writer.executeTool('agentResult', { agent: 'writer' })).toMatchObject({
+            invocationId: '1',
+            status: 'completed',
+            content: 'first answer'
+        });
+
+        // An agent with only an in-flight run reports the EMPTY state — `status: 'running'`
+        // next to `content: ''` was the lie this replaces.
+        expect(await writer.executeTool('agentResult', { agent: 'quiet' })).toEqual({
+            agent: 'quiet',
+            status: 'empty',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // The live invocations are still reported where they belong, and an explicit id
+        // still reaches the running record: `agentManage` is the liveness surface, and
+        // `agentResult` by id is the address.
+        expect(await writer.executeTool('agentManage', {})).toMatchObject({
+            totalResults: 3,
+            activeResults: 2
+        });
+
+        expect(await writer.executeTool('agentResult', { agent: 'quiet', invocationId: '3' })).toMatchObject({
+            invocationId: '3',
+            kind: 'root',
+            status: 'running',
+            content: ''
+        });
+
+        gate.resolve('released');
+        const secondAnswer = await secondRun;
+        const quietAnswer = await quietRun;
+
+        expect([secondAnswer.content, quietAnswer.content]).toEqual(['second answer', 'quiet answer']);
+
+        // Completion order decides the default, and every record is terminal again.
+        expect(await writer.executeTool('agentResult', { agent: 'writer' })).toMatchObject({
+            invocationId: '2',
+            status: 'completed',
+            content: 'second answer'
+        });
+
+        expect(await writer.executeTool('agentResult', { agent: 'quiet' })).toMatchObject({
+            invocationId: '3',
+            status: 'completed',
+            content: 'quiet answer'
+        });
+
+        expect(await writer.executeTool('agentManage', {})).toMatchObject({
+            totalResults: 3,
+            activeResults: 0
+        });
+    });
+
+    // THE UNTESTED HALF OF THE B2 SELECTOR (`src/harness.ts:3935-3939`):
+    // `record = completed[0] ?? recent.find((entry) => entry.status !== 'running')`.
+    // The completed branch and the nothing-finished-at-all branch were both pinned; the
+    // `??` fallback — an agent whose only FINISHED runs failed or were cancelled — was
+    // not, and that is exactly the case the entry's prose used to get wrong (it promised
+    // `status: 'empty'` "when that agent has no completed result", which contradicts a
+    // fallback that returns that failed record). Pinned here as an exact answer: the
+    // NEWEST terminal record, with its own error and forensic fields, never `empty`.
+    it('the default selector returns the newest terminal record when nothing completed (B2 fallback)', async () => {
+        const gate = deferred<string>();
+
+        // Turn 1 is a transport error (record 1 -> `failed`). Turn 2 parks inside a tool
+        // so the host can stop it (record 2 -> `cancelled`). `retry: false` keeps the
+        // first run ONE record rather than a retry sequence with several.
+        const writerAgent = brain(
+            routed((request) => {
+                const brief = latestUser(request);
+
+                if (brief.includes('stop')) {
+                    return request.messages.some((message) => message.name === 'hold')
+                        ? answer('never answered')
+                        : callTool('h1', 'hold', '{}');
+                }
+
+                return [{ type: 'error', message: 'first transport exploded' }];
+            }),
+            { retry: false }
+        );
+
+        const hold = tool({
+            description: 'Hold until the test releases it.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: () => gate.promise
+        });
+
+        const writer = harness({ agents: { writer: writerAgent }, tools: { hold }, presets: false });
+
+        const broken = writer.createThread('writer');
+
+        await expect(writer.sendThreadInput(broken.id, 'boom')).rejects.toThrow('first transport exploded');
+
+        // Nothing has COMPLETED, so a caller of the pre-B2-fallback build read `empty`
+        // here and gave up. The terminal fallback answers the failed run instead.
+        expect(await writer.executeTool('agentResult', { agent: 'writer' })).toMatchObject({
+            invocationId: '1',
+            status: 'failed',
+            error: 'first transport exploded'
+        });
+
+        const stopped = writer.createThread('writer');
+        const stoppedRun = writer.sendThreadInput(stopped.id, 'stop me');
+
+        await pump(() => writer.thread(stopped.id)?.status === 'running');
+        expect(writer.stopThread(stopped.id, 'the host stopped it')).toBe(true);
+        await expect(stoppedRun).rejects.toThrow();
+
+        // The NEWEST terminal record wins the default — the cancelled run, not the older
+        // failure — because "the last thing that actually finished" is what a caller
+        // polling without an id is asking for.
+        expect(await writer.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            agent: 'writer',
+            invocationId: '2',
+            kind: 'root',
+            status: 'cancelled',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'the host stopped it',
+            cancelledAtMessage: 1,
+            durationMs: expect.any(Number)
+        });
+
+        // And `empty` keeps its exact, narrow meaning: no finished run at all. The same
+        // agent answers `empty` before its first run, which is the only place that status
+        // appears for an agent that HAS run.
+        const untouched = harness({
+            agents: { writer: brain(scripted([answer('unused')])), fresh: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+
+        expect(await untouched.executeTool('agentResult', { agent: 'fresh' })).toEqual({
+            agent: 'fresh',
+            status: 'empty',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        gate.resolve('released');
+    });
+
+    it('invents no invocation identity when the delegate result has no ledger record to point at', () => {
+        // This one is pinned against the SOURCE, and the reason is honest: the omitted
+        // identity has no reachable trigger inside one process today. A delegated child
+        // runs in the child agent's DEFAULT conversation (`agent:<name>`), which
+        // `deleteThread` refuses outright, and the requesting run holds its own thread
+        // until its pending async work settles — so neither the child's conversation nor
+        // an ancestor can be reaped while the delegation is open, and the only other way
+        // to lose the record is the 64-record ledger bound. The branch is therefore
+        // guarded at the read, and this test is what makes removing the guard a decision
+        // rather than an accident.
+        const source = readFileSync(fileURLToPath(new URL('./harness.ts', import.meta.url)), 'utf8');
+
+        // Every identity field is a CONDITIONAL spread: an absent record means an absent
+        // field, never a placeholder that reads like an address or a status.
+        expect(source).toContain('...(record === undefined ? {} : { invocationId: record.invocationId }),');
+        expect(source).toContain('...(record?.threadId === undefined ? {} : { threadId: record.threadId }),');
+        expect(source).toContain('...(record === undefined ? {} : { status: record.status }),');
+
+        // The fabrication the finding replaced is gone from the CODE: an empty string that
+        // READS like an address, so a caller pages `agentResult` with `''` and gets an
+        // unrelated result instead of noticing that there is none. Comment lines are
+        // excluded because the comment at the commit site QUOTES the old code.
+        const codeLines = source
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => !line.startsWith('//') && !line.startsWith('*'));
+
+        expect(codeLines.filter((line) => line.includes("invocationId: ''"))).toEqual([]);
+
+        // `durationMs` keeps its honest fallback: the child's own measurement when the
+        // record exists, otherwise the span this call actually spent.
+        expect(source).toContain('durationMs: record?.durationMs ?? Math.max(0, Date.now() - startedAt)');
+    });
+});

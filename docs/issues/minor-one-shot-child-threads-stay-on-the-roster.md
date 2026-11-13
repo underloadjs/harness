@@ -1,6 +1,6 @@
 # 0027 — Every delegation leaves a live thread on the roster, and the model has no way to close one
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-13 (see **Update (2026-11-13, fix) — closed** at the bottom)
 > **Severity:** Minor
 > **Area:** `src/harness.ts` (host threads), `src/tools/runtime/threadList`
 > **Date opened:** 2026-11-11
@@ -120,3 +120,68 @@ recovery path.
   ordinary use, and it belongs in **Gap** when the owner takes the issue up.
 - **Test gap confirmed:** nothing in `src/harness.delegation.test.ts` asserts thread creation,
   thread count, or the cap for delegated children.
+
+## Update (2026-11-13, fix) — closed
+
+- **Shipped — the release half landed, and with it the scoping that makes the roster
+  usable.** The proposal's "expose the existing purge to the model as an explicit,
+  owner-scoped close on the child handle" is now the core tool **`threadDelete`**
+  (`src/tools/runtime/threadDelete.tool.ts`): one required `thread` id, registered
+  with the thread group (`activation: 'threads'`, `order: 255` so the roster stays
+  declared first), not searchable and not a direct-call catalogue row, exactly like
+  its three siblings. Nothing is automatic and nothing is recoverable, as **Alternatives
+  considered** required: a settled child stays fully readable until its owner deletes it.
+- **The close is owner-scoped, not host-wide.** The tool calls
+  `harness.runtime.threadDelete(callerThreadId, threadId)` → `threadDeleteFor`
+  (`src/harness.ts`): the target must be a STRICT DESCENDANT of the caller (walk the
+  persistent `ownerThreadId` chain up from the target), so the caller's own thread, an
+  ancestor, a sibling, and another agent's conversation are each refused by name. The
+  host operation `deleteThread` keeps its unscoped host semantics, and a threadless
+  caller (manual `executeTool`, plugin outside any conversation) gets it verbatim.
+  Running threads refuse ("stop it first"), the default `agent:<name>` conversations
+  refuse, and the delete CASCADES over finished descendants — a running descendant
+  refuses the whole delete, so no partial removal is possible. The receipt is
+  `{ deleted, removedThreadIds }` — `HarnessThreadDeleteResult`, a new type in this
+  pass, reported by the host `deleteThread` door as well as the tool.
+- **Acceptance criteria, honestly.**
+  1. *Distinguish settled from live* — shipped differently than proposed: no
+     `terminal` status or `settled` flag was added. Instead `threadList` is scoped to
+     the caller's THREAD FAMILY (own thread, ancestors, descendants, the family's
+     `agent:<name>` defaults — `threadFamilyOf`/`familyOfCaller` in `src/harness.ts`),
+     which removes the nineteen-unreadable-siblings problem at its root, and the
+     existing `status` field already separates a live conversation (`running`) from a
+     settled one (`idle`). Settled entries are not hidden: inside the family they are
+     listed until released.
+  2. *Release with the host purge's reach* — `threadDelete` reaches the same
+     `purgeThread` the host door uses, so the invocation and branch lookups go with
+     the record, and the removed ids become unknown to threadList/Read/Send/Delete
+     ("a deleted id is an error" is now literally true on the model surface).
+  3. *`threadRead` on a settled child works until released* — pinned (a released one
+     is unknown afterwards, a settled one reads normally).
+  4. *Sibling isolation unchanged* — the minting site is untouched; the fix adds the
+     release, not a shared transcript.
+- **The cap cliff from the independent review is now climbable from inside a session.**
+  `createThreadState` still throws at `MAX_THREAD_RECORDS` ("…delete a terminal one
+  before creating another (maximum 256)", `src/harness.ts`), but a caller that fans out
+  can now free slots itself: read the answer, `threadDelete` the child. The 256-thread
+  bound is a policy the model can act on rather than a dead end.
+- **Worker mode keeps it canonical.** `threadDelete` is classified in
+  `AUTHORITY_RUNTIME_METHODS` (`src/server/workers/capability.ts`), routed with the
+  TARGET as the request's `threadId` and the CALLER inside `identity`
+  (`src/server/workers/lane-worker-loop.ts`), and executed by the canonical harness
+  (`src/server/workers/lane-authority.ts`), so a lane never deletes against a private
+  replica and the caller's descendant scope is enforced authority-side.
+- **Pins added.** `src/tools/runtime/threadDelete.test.ts` — the entry's metadata /
+  registration / import-discipline literals and the execute contract (caller thread +
+  trimmed id forwarded, receipt returned untouched, threadless-host passthrough, empty
+  ids refused without touching the runtime). `src/harness.thread-runtime.test.ts` — the
+  B3/B4/B5 block: the scoped roster is the caller's family while the host roster stays
+  session-wide, the two host read seams refuse a sibling by name, `threadSend` reaches
+  ancestor/descendant/another agent's default, `deleteThread` reports every conversation
+  it released (cascade included), `threadDelete` is a descendant door (a parent reaps its
+  child and nothing else), and a running descendant still refuses while a released one
+  is unknown afterwards.
+- Status is **Fixed**. The log's rule for a closed issue is to delete the file and
+  drop the index row; the file is kept, with the row marked, so the fix can be
+  reviewed against its issue in the same pass — the owner's integrated run decides,
+  and deletion is then a one-command step.

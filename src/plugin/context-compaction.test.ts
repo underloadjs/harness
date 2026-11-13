@@ -3494,7 +3494,14 @@ describe('context-compaction summarize flow (T9)', () => {
 
         const writer = handle;
         const thread = writer.createThread('writer', { label: 'Parked compaction' });
-        const scoutThread = writer.createThread('scout', { label: 'Delegate' });
+        // LINEAGE (2026-11-13): the scout posts INTO `thread`, so `thread` must be in the
+        // scout's lineage for that send to be admitted at all — it is created as the
+        // owner of the scout's thread, which is exactly the relationship the test relies
+        // on (a delegate reporting back into the conversation that owns its brief).
+        const scoutThread = writer.createThread('scout', {
+            label: 'Delegate',
+            ownerThreadId: thread.id
+        });
 
         threadId = thread.id;
         scoutThreadId = scoutThread.id;

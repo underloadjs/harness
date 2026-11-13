@@ -18,6 +18,20 @@
 //   R6  stopThread aborts one conversation (and owner-linked children) and marks
 //       it stopped; stopAllThreads aborts every active run; deleteThread purges a
 //       terminal host conversation plus its invocation lookups.
+//   B3/B4/B5 (2026-11-13, thread-tools wave) The THREAD FAMILY is the visibility
+//       unit: a caller that names a thread (`callerThreadId` on `harness.thread` /
+//       `harness.threadMessages`, the tool context of `threadRead`/`threadSend`/
+//       `threadDelete`) sees itself, its ancestors, its descendants, and the
+//       DEFAULT conversations of exactly those agents — siblings are refused with
+//       `threadNotVisibleError`, and `deleteThread` narrows that to strict
+//       descendants only. A threadless caller (the host, `api.threads.*`, a
+//       context-less `executeTool`) stays UNSCOPED: the full roster, no send
+//       guards, no read gate. `threadSend` into another agent's DEFAULT
+//       conversation still lands, but answers with a `note` naming the live thread
+//       to address instead, and `deleteThread` returns a
+//       `HarnessThreadDeleteResult` receipt (`deleted` + `removedThreadIds`) so a
+//       cascade is observable — see the group of the same name at the end of this
+//       file.
 //
 // Clock policy: the CLOCK is pinned (see EPOCH_MS below), the SCHEDULER is not.
 // Every task-store timestamp (`updatedAt`, the change-feed `at`, a claim's
@@ -2492,5 +2506,612 @@ describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
             sequence: 3
         });
         expect(writer.threadMessages(beta.id)).toEqual([]);
+    });
+});
+// ---------------------------------------------------------------------------
+// B3 / B4 / B5 (2026-11-13) — the thread family is the address space
+// ---------------------------------------------------------------------------
+//
+// Before this, EVERY thread id was a global id: `threadList` printed the session, and
+// `threadSend`/`threadRead`/`threadDelete` accepted any id it printed. In a fan-out
+// session (issue 0027: one parent, nineteen delegated children) a settled child could
+// therefore post into a sibling subtree it had never spoken to, read a conversation nobody
+// pointed it at, and drown in roster rows it could not act on. The three findings are one
+// rule seen from three doors:
+//
+//   B3 the roster (`threadList`) and the two reads (`harness.thread`,
+//      `harness.threadMessages`, the `threadRead` tool) see the caller's THREAD FAMILY —
+//      itself, its ancestors, its descendants however deep, and the DEFAULT conversations
+//      of the agents that family spans. A sibling is NOT in the family: it shares an
+//      ancestor, and this caller did not create it.
+//   B4 `threadSend` accepts exactly the ids B3 makes visible, and a caller may not START a
+//      conversation it is already standing in (its own thread, or this agent's idle
+//      default) — starting those is a nested run with worse manners, not a chat.
+//   B5 `threadDelete` is the NARROWEST door: strict descendants only, and its receipt
+//      names every conversation that actually left, cascade included.
+//
+// A CALLER WITH NO THREAD (the host, a plugin outside any conversation, a manual
+// `executeTool`) stays UNSCOPED everywhere, and that is pinned once per group: the host is
+// the one party allowed to address any conversation, and the server's thread surfaces
+// depend on it staying true.
+//
+// The model-facing refusals go through REAL TURNS, because `executeTool(name, parameters)`
+// takes no caller thread — it is the unscoped host door by construction and cannot
+// exhibit a guard. One thread therefore runs one scripted SEQUENCE of door calls, one per
+// turn; `routed` keys on a thread's first prompt, so a thread with several turns cannot
+// also be several scenarios.
+describe('thread family visibility, send policy, and release (B3/B4/B5)', () => {
+    // One thread calling thread doors once per turn, then answering. The arguments are
+    // THUNKS because the ids they name do not exist until the fixture has created the
+    // threads, and a route table is declared before that.
+    const modelDoors = (
+        calls: Array<{ name: string; args: () => Record<string, unknown> }>,
+        reply: string
+    ): HarnessStream => {
+        let turn = 0;
+
+        return async function* stream() {
+            const call = calls[turn];
+            turn += 1;
+
+            const frames =
+                call === undefined
+                    ? answer(reply)
+                    : callTool(`m${turn}`, call.name, JSON.stringify(call.args()));
+
+            for (const frame of frames) yield frame;
+        };
+    };
+
+    // The SAME doors, one per HOST TURN. Every call is followed by an answer step, which
+    // ENDS that run: a harness keeps taking model turns while the model calls tools, so
+    // without the answer step a list of calls all lands inside ONE run — and these cases
+    // are about a LATER turn of the conversation, after the situation changed.
+    const modelTurns = (
+        calls: Array<{ name: string; args: () => Record<string, unknown> }>,
+        reply: string
+    ): HarnessStream => {
+        let step = 0;
+
+        return async function* stream() {
+            const index = step;
+            step += 1;
+
+            const call = calls[Math.floor(index / 2)];
+            const frames =
+                call === undefined || index % 2 === 1
+                    ? answer(reply)
+                    : callTool(
+                          `m${Math.floor(index / 2) + 1}`,
+                          call.name,
+                          JSON.stringify(call.args())
+                      );
+
+            for (const frame of frames) yield frame;
+        };
+    };
+
+    // The single-call form, which is most of these cases.
+    const modelDoor = (
+        name: string,
+        args: () => Record<string, unknown>,
+        reply: string
+    ): HarnessStream => modelDoors([{ name, args }], reply);
+
+    // Every recorded tool result of one conversation, in call order. A refusal reaches the
+    // model as `Tool "<name>" failed: <message>` (src/harness.ts), which is exactly what
+    // these assertions read back out of the sender's transcript.
+    const doorResults = (host: Harness, threadId: string): string[] =>
+        toolResultsOf(host.threadMessages(threadId));
+
+    const firstResult = (host: Harness, threadId: string): string => doorResults(host, threadId)[0] ?? '';
+
+    // A conversation tree the HOST opened, spanning two agents:
+    //   parent (writer)  <- child (writer)  <- borrowed (scout)
+    //   sibling (writer) — no owner, so OUTSIDE child's family
+    // plus the two default conversations `agent:writer` and `agent:scout`.
+    const lineage = (
+        routes: Record<string, HarnessStream>,
+        scoutRoutes: Record<string, HarnessStream> = {}
+    ) => {
+        const writer = harness({
+            agents: {
+                writer: brain(routed(routes, scripted([answer('writer answers')]))),
+                scout: brain(routed(scoutRoutes, scripted([answer('scout answers')])))
+            },
+            presets: false
+        });
+
+        const parent = writer.createThread('writer');
+        const child = writer.createThread('writer', { ownerThreadId: parent.id });
+        const sibling = writer.createThread('writer');
+        const borrowed = writer.createThread('scout', { ownerThreadId: child.id });
+
+        return { writer, parent, child, sibling, borrowed };
+    };
+
+    // The family of `child`, in roster order (sequence, which is creation order). The two
+    // defaults come first because the harness mints one per agent up front.
+    const childFamily = (ids: { parent: string; child: string; borrowed: string }): string[] => [
+        'agent:writer',
+        'agent:scout',
+        ids.parent,
+        ids.child,
+        ids.borrowed
+    ];
+
+    it('a scoped roster is the family of the caller, and the host roster stays session-wide (B3)', async () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({
+            'who can I see?': modelDoor('threadList', () => ({}), 'roster read')
+        });
+
+        await writer.sendThreadInput(child.id, 'who can I see?');
+
+        const roster = JSON.parse(firstResult(writer, child.id)) as {
+            currentThreadId?: string;
+            threads: Record<string, unknown>[];
+        };
+
+        // The caller is named, and the rows are ITS family: the ancestor, the conversation
+        // two levels down (a scout thread, because the family spans agents), and the
+        // default conversations of the agents in that family. `sibling` is absent — the
+        // roster is the address book for the doors below, and this caller cannot walk
+        // through that row.
+        expect(roster.currentThreadId).toBe(child.id);
+        expect(roster.threads).toEqual([
+            { id: 'agent:writer', agent: 'writer', origin: 'agent', status: 'idle', sequence: 1 },
+            { id: 'agent:scout', agent: 'scout', origin: 'agent', status: 'idle', sequence: 2 },
+            { id: parent.id, agent: 'writer', origin: 'host', status: 'idle', sequence: 3 },
+            {
+                id: child.id,
+                agent: 'writer',
+                origin: 'host',
+                status: 'running',
+                sequence: 4,
+                ownerThreadId: parent.id,
+                invocationId: '1'
+            },
+            {
+                id: borrowed.id,
+                agent: 'scout',
+                origin: 'host',
+                status: 'idle',
+                sequence: 6,
+                ownerThreadId: child.id
+            }
+        ]);
+
+        expect(roster.threads.map((record) => record.id)).not.toContain(sibling.id);
+
+        // UNSCOPED stays UNSCOPED: the same tool with no caller thread (a manual
+        // executeTool is an operator action) is the session-wide host view — sibling
+        // included, `currentThreadId` absent, the pre-B3 shape unchanged.
+        const hostRoster = (await writer.executeTool('threadList', {})) as {
+            currentThreadId?: string;
+            threads: { id: string }[];
+        };
+
+        expect(hostRoster.currentThreadId).toBeUndefined();
+        expect(hostRoster.threads.map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            parent.id,
+            child.id,
+            sibling.id,
+            borrowed.id
+        ]);
+    });
+
+    it('the two host read seams reach the family and refuse a sibling by name (B3)', () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({});
+        const notVisible = (target: string): string =>
+            `Thread "${target}" is not visible to thread "${child.id}": a read reaches your own thread, an ` +
+            'ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists (see ' +
+            'threadList). The id exists — it is simply outside your lineage.';
+
+        // Every family member reads with `child` as the caller — the ancestor, its own
+        // thread, a descendant two levels down, and BOTH defaults (including the scout's,
+        // because a scout conversation hangs inside this family).
+        for (const id of childFamily({ parent: parent.id, child: child.id, borrowed: borrowed.id })) {
+            expect(writer.thread(id, child.id)?.id).toBe(id);
+            expect(writer.threadMessages(id, child.id)).toEqual([]);
+        }
+
+        // A SIBLING exists, so the answer is the lineage sentence rather than the
+        // not-found sentence: "re-read your roster" and "typo or released conversation" are
+        // different facts for a caller choosing its next call. The check sits in front of
+        // the branch-ledger fallback so a live thread is never mistaken for an unknown id.
+        expect(() => writer.thread(sibling.id, child.id)).toThrow(notVisible(sibling.id));
+        expect(() => writer.threadMessages(sibling.id, child.id)).toThrow(notVisible(sibling.id));
+
+        // An id that resolves for NOBODY keeps `threadStateOf`'s canonical sentence, and the
+        // two seams differ in their honest way of saying it: `thread` answers `undefined`
+        // (its contract is a record or nothing), `threadMessages` throws. Neither one turns a
+        // typo into a lineage lesson, with a caller present or not.
+        const unknown = 'Thread "thread-99" is not available in this harness; it was never created, or it was deleted.';
+
+        expect(writer.thread('thread-99', child.id)).toBeUndefined();
+        expect(writer.thread('thread-99')).toBeUndefined();
+        expect(() => writer.threadMessages('thread-99', child.id)).toThrow(unknown);
+        expect(() => writer.threadMessages('thread-99')).toThrow(unknown);
+
+        // Without a caller both seams are the host view, so the sibling reads fine: this is
+        // what keeps the server and every host surface behaving exactly as before B3.
+        expect(writer.thread(sibling.id)?.id).toBe(sibling.id);
+        expect(writer.threadMessages(sibling.id)).toEqual([]);
+    });
+
+    it('threadSend reaches an ancestor, a descendant, and the default of another agent (B4)', async () => {
+        const { writer, parent, child, borrowed } = lineage({
+            // ONE call per thread: a thread routes on its first prompt, so several
+            // scenarios need several conversations.
+            'tell my parent': modelDoor(
+                'threadSend',
+                () => ({ thread: parent.id, message: 'the child is reporting' }),
+                'parent told'
+            ),
+            'tell my grandchild and the scout': modelDoors(
+                [
+                    { name: 'threadSend', args: () => ({ thread: borrowed.id, message: 'the parent is asking' }) },
+                    { name: 'threadSend', args: () => ({ thread: 'agent:scout', message: 'a writer thread is asking' }) }
+                ],
+                'both told'
+            )
+        });
+
+        // The PARENT speaks first, and its own conversation is the caller for two
+        // addresses: a DESCENDANT two levels down — another agent's host thread, but one
+        // this family minted — and that other agent's DEFAULT conversation, which stays
+        // addressable because the family spans the agents in it, not only the threads.
+        // (`modelDoors` is one door per turn of one conversation, so both calls happen in
+        // the same run of the parent.)
+        await writer.sendThreadInput(parent.id, 'tell my grandchild and the scout');
+        expect(doorResults(writer, parent.id).map((content) => JSON.parse(content))).toEqual([
+            {
+                threadId: borrowed.id,
+                delivered: 'started',
+                sender: 'writer',
+                senderThreadId: parent.id
+            },
+            {
+                threadId: 'agent:scout',
+                delivered: 'started',
+                sender: 'writer',
+                senderThreadId: parent.id,
+                // The `note` is present HERE, and its presence is the point: the first send
+                // of this same run started `borrowed`, a scout conversation that is still
+                // in flight while the second send lands. `agent:scout` therefore reads as
+                // an ambiguous address, and the receipt names the live thread instead of
+                // letting the caller assume the default is where the agent is working.
+                note:
+                    '"agent:scout" is scout\'s default conversation, and this message went there. ' +
+                    `The live scout conversation is thread "${borrowed.id}"; address that id to reach the turn in flight.`
+            }
+        ]);
+
+        await settleThread(writer, borrowed.id);
+        expect(textOf(writer.threadMessages(borrowed.id))).toEqual([
+            `from agent "writer" (thread ${parent.id}):\nthe parent is asking`,
+            'scout answers'
+        ]);
+
+        // The cross-agent chat is the historical behaviour B4 keeps: no `note` here,
+        // because no scout turn was in flight, so the address is not ambiguous.
+        await settleThread(writer, 'agent:scout');
+        expect(textOf(writer.threadMessages('agent:scout'))).toEqual([
+            `from agent "writer" (thread ${parent.id}):\na writer thread is asking`,
+            'scout answers'
+        ]);
+
+        // An ANCESTOR, dormant: the message becomes its new prompt (`started`), and the
+        // receipt names the sender's thread so the target can address IT back. The last
+        // two entries of the parent's transcript are the attributed message and the turn
+        // it started.
+        await writer.sendThreadInput(child.id, 'tell my parent');
+        expect(JSON.parse(firstResult(writer, child.id))).toEqual({
+            threadId: parent.id,
+            delivered: 'started',
+            sender: 'writer',
+            senderThreadId: child.id
+        });
+
+        await settleThread(writer, parent.id);
+        expect(textOf(writer.threadMessages(parent.id)).slice(-2)).toEqual([
+            `from agent "writer" (thread ${child.id}):\nthe child is reporting`,
+            'both told'
+        ]);
+    });
+
+    it('threadSend refuses a sibling, and never starts the conversation it is standing in (B4)', async () => {
+        const { writer, parent, child, sibling } = lineage({
+            'tell my sibling': modelDoor(
+                'threadSend',
+                () => ({ thread: sibling.id, message: 'unsolicited' }),
+                'sibling refused'
+            ),
+            'my own doors': modelDoors(
+                [
+                    // its own thread, dormant
+                    { name: 'threadSend', args: () => ({ thread: parent.id, message: 'thinking aloud' }) },
+                    // this agent's own default, idle
+                    { name: 'threadSend', args: () => ({ thread: 'agent:writer', message: 'standing order' }) },
+                    // a dormant thread it minted: allowed, and the point of the pair
+                    { name: 'threadSend', args: () => ({ thread: child.id, message: 'do the work' }) }
+                ],
+                'own doors answered'
+            )
+        });
+
+        // A SIBLING is neither visible nor writable, and the sentence points at the roster
+        // because the caller's next move is a roster read.
+        await writer.sendThreadInput(child.id, 'tell my sibling');
+        expect(firstResult(writer, child.id)).toBe(
+            `Tool "threadSend" failed: Thread "${sibling.id}" is not one thread "${child.id}" can address: ` +
+                "threadSend reaches your own thread, an ancestor, one of your descendants, or a default " +
+                'conversation (agent:<name>) your roster lists (see threadList). The id exists — it is simply outside your lineage.'
+        );
+        expect(writer.threadMessages(sibling.id)).toEqual([]);
+
+        // ITS OWN THREAD (dormant): the answer is THIS turn, not a second turn. A message
+        // into yourself queues behind the turn that is asking it, which is how "I messaged
+        // myself" becomes a lost round-trip.
+        // THIS AGENT'S OWN DEFAULT (idle): the same trap one step away — `agent:writer`
+        // looks like "the conversation this agent is having", and a message into it starts
+        // a second turn of the agent that is asking.
+        await writer.sendThreadInput(parent.id, 'my own doors');
+        // ITS OWN THREAD: a caller standing in a turn can only STEER that turn, and that is
+        // exactly what the send becomes — the next-boundary queue of the run that is
+        // asking. (The dormant variant of this address has its own refusal sentence, "is the
+        // conversation this message comes from", which no live run can reach: while a
+        // thread's model is calling the tool, its own thread is by definition running. That
+        // sentence is for a caller whose thread has been released around it.)
+        expect(JSON.parse(doorResults(writer, parent.id)[0])).toEqual({
+            threadId: parent.id,
+            delivered: 'queued',
+            sender: 'writer',
+            senderThreadId: parent.id
+        });
+        expect(doorResults(writer, parent.id)[1]).toBe(
+            `Tool "threadSend" failed: "agent:writer" is agent "writer"'s own conversation and is idle: a ` +
+                'message into it would start a second turn of the agent that is asking. Use this turn, or ' +
+                'address a thread you created (see threadList).'
+        );
+
+        // The rule does NOT reach down: a parent still wakes a dormant thread it minted —
+        // that is how a fan-out parent drives its one-shot children.
+        expect(JSON.parse(doorResults(writer, parent.id)[2])).toEqual({
+            threadId: child.id,
+            delivered: 'started',
+            sender: 'writer',
+            senderThreadId: parent.id
+        });
+
+        await settleThread(writer, child.id);
+        // The woken conversation is the SECOND run of `child` (its first run was the
+        // sibling send), so the attributed message and the turn it started are the last
+        // two entries — the message IS the new prompt, appended by that run itself.
+        expect(textOf(writer.threadMessages(child.id)).slice(-2)).toEqual([
+            `from agent "writer" (thread ${parent.id}):\ndo the work`,
+            'sibling refused'
+        ]);
+
+        // The RUNNING branch (steer rather than start) is unchanged by B4 and is pinned
+        // with a genuinely mid-request target in `threadSend is state-aware
+        // (delegate-stress T3.1-T3.6)` above.
+    });
+
+    it('a send addressed at a default conversation names the thread already in flight (B4/C1)', async () => {
+        const slow = gatedAnswer('slow writer turn');
+
+        const { writer, parent, borrowed } = lineage(
+            { 'slow work': slow.stream },
+            {
+                'tell the writers': modelDoor(
+                    'threadSend',
+                    () => ({ thread: 'agent:writer', message: 'a scout thread is asking' }),
+                    'default told'
+                )
+            }
+        );
+
+        // A writer turn genuinely in flight, created by the same parent so it sits inside
+        // the sender's family rather than beside it.
+        const worker = writer.createThread('writer', { ownerThreadId: parent.id });
+        const running = writer.sendThreadInput(worker.id, 'slow work');
+        await flush();
+        expect(writer.thread(worker.id)?.status).toBe('running');
+
+        // The sender is a SCOUT thread, so `agent:writer` is not its own conversation and
+        // the send is legal. The address is still ambiguous: the message lands in the
+        // writer DEFAULT conversation while the turn a reader cares about is `worker`. The
+        // receipt stays honest about where the message went (`threadId` is the truth), and
+        // `note` names the live thread so the caller can address the turn instead — the
+        // confusion this field exists for, reported instead of inferred.
+        await writer.sendThreadInput(borrowed.id, 'tell the writers');
+        expect(JSON.parse(firstResult(writer, borrowed.id))).toEqual({
+            threadId: 'agent:writer',
+            delivered: 'started',
+            sender: 'scout',
+            senderThreadId: borrowed.id,
+            note:
+                '"agent:writer" is writer\'s default conversation, and this message went there. ' +
+                `The live writer conversation is thread "${worker.id}"; address that id to reach the turn in flight.`
+        });
+
+        await settleThread(writer, 'agent:writer');
+        expect(textOf(writer.threadMessages('agent:writer'))).toEqual([
+            `from agent "scout" (thread ${borrowed.id}):\na scout thread is asking`,
+            'writer answers'
+        ]);
+
+        slow.ready.open();
+        await running;
+        expect(writer.thread(worker.id)?.status).toBe('idle');
+    });
+
+    it('the threadless host door keeps sending across the whole session (B4)', async () => {
+        const { writer, child, sibling } = lineage({});
+
+        // A manual `executeTool` has no caller thread, so it is the HOST speaking: the
+        // sibling send a scoped model turn cannot make still works, and the receipt carries
+        // no `senderThreadId` because the host stands in no conversation.
+        const receipt = (await writer.executeTool('threadSend', {
+            thread: sibling.id,
+            message: 'host note'
+        })) as Record<string, unknown>;
+
+        expect(receipt).toEqual({ threadId: sibling.id, delivered: 'started', sender: 'writer' });
+
+        await settleThread(writer, sibling.id);
+        expect(textOf(writer.threadMessages(sibling.id))).toEqual([
+            'from agent "writer":\nhost note',
+            'writer answers'
+        ]);
+
+        // A family member is equally reachable from the host.
+        await writer.executeTool('threadSend', { thread: child.id, message: 'host note 2' });
+        await settleThread(writer, child.id);
+        expect(textOf(writer.threadMessages(child.id))).toEqual([
+            'from agent "writer":\nhost note 2',
+            'writer answers'
+        ]);
+    });
+
+    it('deleteThread reports every conversation it released, cascade included (B5)', () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({});
+
+        // The receipt is the state the caller CAUSED: the id it named, plus everything that
+        // actually went — the M2 cascade of settled descendants, in creation order. `parent`
+        // owns `child`, which owns `borrowed`, so one call releases three conversations and
+        // a reaping parent can PROVE what it freed.
+        expect(writer.deleteThread(parent.id)).toEqual({
+            deleted: parent.id,
+            removedThreadIds: [parent.id, child.id, borrowed.id]
+        });
+
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            sibling.id
+        ]);
+
+        // A leaf release reports exactly one id, and the host door is UNSCOPED: it may close
+        // a terminal conversation anywhere in the session, including a sibling — the very
+        // target a model turn would be refused.
+        expect(writer.deleteThread(sibling.id)).toEqual({
+            deleted: sibling.id,
+            removedThreadIds: [sibling.id]
+        });
+        expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer', 'agent:scout']);
+
+        // The default conversations are not a delete door at all; that refusal predates B5
+        // and the receipt did not change it.
+        expect(() => writer.deleteThread('agent:writer')).toThrow(
+            `Thread "agent:writer" is the agent's own conversation and cannot be deleted; use reset() to clear the session.`
+        );
+    });
+
+    it('threadDelete is a descendant door: a parent reaps its child, and nothing else (B5)', async () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({
+            'reap what is not mine': modelDoors(
+                [
+                    { name: 'threadDelete', args: () => ({ thread: parent.id }) },
+                    { name: 'threadDelete', args: () => ({ thread: sibling.id }) }
+                ],
+                'both refused'
+            ),
+            'reap what is mine': modelDoors(
+                [
+                    { name: 'threadDelete', args: () => ({ thread: borrowed.id }) },
+                    { name: 'threadDelete', args: () => ({ thread: child.id }) }
+                ],
+                'both reaped'
+            )
+        });
+
+        // UP and SIDEWAYS are refused, and the sentence names every address this door will
+        // not take. The lineage check runs BEFORE the running check, so a thread the caller
+        // could not delete anyway is never reported as "still running".
+        const lineageRefusal = (target: string): string =>
+            `Tool "threadDelete" failed: Thread "${target}" is not one of the conversations "${child.id}" created; ` +
+            'threadDelete releases your own descendants (see threadList) — never your current thread, an ' +
+            "ancestor, a sibling, or another agent's conversation.";
+
+        await writer.sendThreadInput(child.id, 'reap what is not mine');
+        expect(doorResults(writer, child.id)).toEqual([lineageRefusal(parent.id), lineageRefusal(sibling.id)]);
+        expect(writer.thread(sibling.id)).toBeDefined();
+
+        // DOWN is the caller's, however deep: a grandchild minted two levels away releases
+        // on its own, and the receipt shrinks to what is actually released — which is what
+        // makes a reaping loop auditable instead of a guess.
+        await writer.sendThreadInput(parent.id, 'reap what is mine');
+        expect(doorResults(writer, parent.id).map((content) => JSON.parse(content))).toEqual([
+            { deleted: borrowed.id, removedThreadIds: [borrowed.id] },
+            { deleted: child.id, removedThreadIds: [child.id] }
+        ]);
+
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            parent.id,
+            sibling.id
+        ]);
+    });
+
+    it('a running descendant still refuses the delete, and a released one is unknown afterwards (B5)', async () => {
+        const held = gatedAnswer('child at work');
+
+        const { writer, parent, child, borrowed } = lineage({
+            'start work': held.stream,
+            // One door per HOST TURN (see `modelTurns`): the state under test changes
+            // between turns, so all three calls must land in three separate runs of the
+            // parent conversation.
+            'reap the worker': modelTurns(
+                [
+                    { name: 'threadDelete', args: () => ({ thread: child.id }) },
+                    { name: 'threadDelete', args: () => ({ thread: child.id }) },
+                    { name: 'threadDelete', args: () => ({ thread: child.id }) }
+                ],
+                'done reaping'
+            )
+        });
+
+        // The child is genuinely mid-run: its answer is behind the gate.
+        const running = writer.sendThreadInput(child.id, 'start work');
+        await flush();
+        expect(writer.thread(child.id)?.status).toBe('running');
+
+        // TURN 1, while the run is live. B2 made a FINISHED conversation deletable from
+        // inside its own `run.finished` hook; it did not loosen this. A live run still owns
+        // its thread, so the refusal is the running sentence and the receipt never claims a
+        // release that did not happen.
+        await writer.sendThreadInput(parent.id, 'reap the worker');
+        expect(doorResults(writer, parent.id)).toEqual([
+            `Tool "threadDelete" failed: Thread "${child.id}" is running; stop it before deleting it.`
+        ]);
+        expect(writer.thread(child.id)).toBeDefined();
+
+        held.ready.open();
+        await running;
+        expect(writer.thread(child.id)?.status).toBe('idle');
+
+        // TURN 2, the same conversation on a later turn of the same route: the release is
+        // accepted, and the receipt names the cascade this caller caused — `borrowed` is the
+        // child's own conversation, and a released parent never leaves a live child behind.
+        await writer.sendThreadInput(parent.id, 'reap the worker again');
+        expect(doorResults(writer, parent.id)[1]).toBeDefined();
+        expect(JSON.parse(doorResults(writer, parent.id)[1] ?? '{}')).toEqual({
+            deleted: child.id,
+            removedThreadIds: [child.id, borrowed.id]
+        });
+
+        // TURN 3: a SECOND delete of the same id is the canonical unknown-thread refusal.
+        // A released conversation is indistinguishable from one that never existed, which is
+        // what makes a reaping retry safe rather than destructive.
+        await writer.sendThreadInput(parent.id, 'reap the worker again');
+        expect(doorResults(writer, parent.id)[2]).toBe(
+            `Tool "threadDelete" failed: Thread "${child.id}" is not available in this harness; it was never created, or it was deleted.`
+        );
+        expect(doorResults(writer, parent.id)).toHaveLength(3);
     });
 });

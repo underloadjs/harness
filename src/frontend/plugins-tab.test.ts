@@ -116,6 +116,7 @@ import type { HarnessDescriptor, SessionSnapshot, SessionStreamItem, ToolDescrip
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { sessionToolPage, sessionToolRow } from './session-config-test-support';
 // `bumpFixtureEpoch` is the double's documented "the record moved OUTSIDE the request
 // stream" signal: it drops the adapter's memoized GET answers, which is what makes a
 // Retry/reload actually reach the fixture instead of re-reading the cached answer.
@@ -163,8 +164,13 @@ const bootstrap = (fixture: Fixture = {}): Record<string, unknown> => ({
     presets: fixture.presets ?? [descriptor()],
     tools: [fileReadTool],
     defaults,
+    // T4: the panes describe the CONVERSATION on screen, and with no conversation bound main.ts
+    // HIDES both toggles (main.ts `sessionIsBound`), so this fixture always boots with s1 open.
+    // `running` only decides whether that conversation is mid-run (the state R1 pins) or already
+    // settled; every other test just needs a subject for the pane to describe.
+    //
     // R1: the RUNNING conversation the catalogue gates used to hide behind.
-    sessions: fixture.running ? [runningSession()] : [],
+    sessions: [fixture.running ? runningSession() : settledSession(), ...(fixture.extraSessions ?? [])],
     agents: []
 });
 
@@ -549,6 +555,19 @@ const settledSession = () =>
         ]
     }) as unknown as Record<string, unknown>;
 
+// The conversation the OTHER harness opens on (T4's harness-switch case). It is the settled
+// figure with a different id and owner: the shell picks the newest conversation OF THE HARNESS
+// on screen, so `harness: 'research'` is what makes the moved card open THIS record, and
+// `harnessDefinition` is the definition that conversation runs under (frozen at create).
+const researchSession = (): Record<string, unknown> =>
+    ({
+        ...settledSession(),
+        id: 's2',
+        harness: 'research',
+        updatedAt: T + 1_000,
+        harnessDefinition: descriptor({ name: 'research', title: 'Research', agents: ['research'], primary: 'research' })
+    }) as unknown as Record<string, unknown>;
+
 type Call = { url: string; method: string | undefined; body: unknown };
 
 type Fixture = {
@@ -566,12 +585,19 @@ type Fixture = {
     // is made with the shell's pending lock held — the state the catalogues used to hide
     // themselves in.
     running?: boolean;
+    // T4: conversations on OTHER harnesses. Moving the card to a second harness is only a real
+    // conversation switch when that harness HAS a conversation of its own (with none, main.ts
+    // hides both configuration toggles), which is what the harness-switch test is about.
+    extraSessions?: readonly Record<string, unknown>[];
 };
 
-// The plugin half of the server: `GET /plugins` answers the whole page (descriptor plus
-// effective values) and `PATCH /plugins/{id}` applies the settings map and returns the
-// row — exactly the two routes T5 publishes (`../shared/harness-api.ts`
-// `PluginSummaryPage` / `PluginDetailResponse`).
+// The plugin half of the server, for the CONVERSATION on screen: `GET /sessions/:id/plugins`
+// answers the whole page (descriptor plus this session's effective values) and `PATCH
+// /sessions/:id/plugins/{id}` applies the settings map and returns the row — exactly the two
+// routes the pane dials (../shared/harness-api.ts `PluginSummaryPage` / `PluginDetailResponse`,
+// and ./api.ts `listSessionPlugins` / `updateSessionPluginSettings`). T4 moved the panes off the
+// deployment spellings (`/plugins`, `/plugins/{id}`), which is why the urls below carry the
+// session id: the SAME rows, read about one conversation.
 const pluginRoutes = (
     fixture: Fixture,
     calls: Call[],
@@ -586,8 +612,17 @@ const pluginRoutes = (
     }));
 
     return (url, method, body) => {
+        // A paged read arrives WITH its query string (`?limit=25`, ./api.ts `pageParams`), and
+        // these fixtures match pathnames, so the query comes off first.
+        const path = url.split('?')[0];
+
         // A GET arrives with the method OMITTED (this double's convention).
-        if (url === '/api/plugins' && method === undefined) {
+        //
+        // The conversation is a VARIABLE here, not `s1`: the harness-switch test moves the card to
+        // a second conversation and the pane re-reads for THAT id. One store answers both, because
+        // what these tests pin is the descriptor/settings contract, not a per-conversation
+        // difference in plugin state.
+        if (path.match(/^\/api\/sessions\/[^/]+\/plugins$/) !== null && method === undefined) {
             state.reads += 1;
             calls.push({ url, method, body });
 
@@ -598,7 +633,7 @@ const pluginRoutes = (
             return json({ items: store, limit: 25, next_cursor: null, observed_at: state.reads, revision: state.reads });
         }
 
-        const patch = url.match(/^\/api\/plugins\/([^/]+)$/);
+        const patch = path.match(/^\/api\/sessions\/[^/]+\/plugins\/([^/]+)$/);
 
         if (patch !== null && method === 'PATCH') {
             calls.push({ url, method, body });
@@ -650,21 +685,55 @@ const stub = (fixture: Fixture = {}): { calls: Call[]; dialed: string[]; settleR
         if (url === '/api') return json(bootstrap(fixture));
         if (url === '/api/models') return json({ models: ['m1'] });
 
-        // R1: the conversation the shell opens on boot when the fixture asks for a run.
-        // Every canonical read (`/views/:id`, the row page, the definition, the metadata
-        // refresh) is COMPOSED by the shared double from this one raw record, which is why
-        // the running case declares exactly one route.
-        if (fixture.running === true) {
-            // The double's memo is per EPOCH, so a record that moves needs the documented
-            // bump (`settleRun` below does both) — otherwise a refresh re-reads the cached
-            // running document and A5 would never exercise the settling path.
-            if (url === '/api/sessions/s1' && method === undefined) {
-                return json({ session: state.settled ? settledSession() : runningSession() });
-            }
+        // T4/R1: the conversations the directory reports. `sessionRecord` is the one the card opens
+        // on boot — `settled` is A5's knob, so its record moves only for the running case, while
+        // every other test boots on the settled figure (the same conversation, work done) — and
+        // `extraSessions` is a SECOND harness's conversation for the test that moves the card.
+        // Every canonical read of a record (the view open, the row page, the definition, the
+        // metadata refresh) is COMPOSED by the shared double from the one raw figure, which is why
+        // each conversation costs this fixture exactly one route.
+        const sessionRecord = (): Record<string, unknown> =>
+            fixture.running === true ? (state.settled ? settledSession() : runningSession()) : settledSession();
+        const roster = (): Record<string, unknown>[] => [sessionRecord(), ...(fixture.extraSessions ?? [])];
 
-            if (url === '/api/sessions' && method === undefined) {
-                return json({ sessions: [state.settled ? settledSession() : runningSession()] });
-            }
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: roster() });
+
+        const readOne = /^\/api\/sessions\/([^/?]+)$/.exec(url);
+
+        if (readOne !== null && method === undefined) {
+            const record = roster().find((candidate) => candidate.id === readOne[1]);
+
+            if (record !== undefined) return json({ session: record });
+        }
+
+        // T4: the ⚒ pane describes the CONVERSATION on screen, so it dials
+        // `GET /sessions/{id}/tools`. The only tool these fixtures describe is `read` (the boot
+        // document's `tools` page above), and the row shape is the SERVER's rule for `protected`,
+        // `declared` and `origin` — `sessionToolRow` states src/server/api-reads.ts:959-994, so the
+        // pane paints a discovered, switchable name rather than a fixture invention.
+        if (url.match(/^\/api\/sessions\/[^/]+\/tools(\?limit=25)?$/) !== null && method === undefined) {
+            return json(
+                sessionToolPage([
+                    sessionToolRow({
+                        name: 'read',
+                        group: 'Files',
+                        description: 'Read one or more files.',
+                        tags: ['files', 'read'],
+                        visibility: 'searchable',
+                        enabled: true
+                    })
+                ])
+            );
+        }
+
+        // A toolbox row carries NO argument schema (../shared/harness-api.ts `SessionToolSummary`),
+        // so the manual runner pays the deployment's identified detail read (`GET /tools/read`,
+        // ./api.ts `getTool`). T4 left EXECUTION global: the row still runs against the playground
+        // conversation, not the one the pane describes.
+        if (url === '/api/tools/read' && method === undefined) {
+            return json({
+                tool: { ...fileReadTool, session_bound: false, execution: { scope: 'global', manual: true } }
+            });
         }
 
         const answered = plugins(url, method, body);
@@ -815,8 +884,11 @@ const settingsFormTree = (): unknown[] =>
         );
     });
 
+// Every plugins-page read the browser dialled, WHICHEVER conversation it was dialled for. T4
+// scoped the pane to the conversation on screen, so its url carries that id — and a card move is
+// a new subject, which makes "did the cache ride along?" a question about two different urls.
 const pluginCountReads = (dialed: readonly string[]): number =>
-    dialed.filter((line) => line.startsWith('GET /v1/harness/plugins')).length;
+    dialed.filter((line) => /^GET \/v1\/harness\/sessions\/[^/]+\/plugins/.test(line)).length;
 
 beforeEach(() => {
     vi.resetModules();
@@ -924,16 +996,20 @@ it('opens the pane from the toggle, reads the catalogue on first open, and lists
     await flush();
 
     expect(pluginsToggle().getAttribute('aria-pressed')).toBe('true');
-    expect(dialed.filter((line) => line.startsWith('GET /v1/harness/plugins'))).toEqual([
-        'GET /v1/harness/plugins?limit=25'
+    // The read is THIS conversation's — `{root}/sessions/s1/plugins` — and the DEPLOYMENT
+    // catalogue route (`{root}/plugins`) is never dialled at all: T4 moved the pane's subject, it
+    // did not add a second surface next to the old one.
+    expect(dialed.filter((line) => line.startsWith('GET /v1/harness/sessions/s1/plugins'))).toEqual([
+        'GET /v1/harness/sessions/s1/plugins?limit=25'
     ]);
+    expect(dialed.filter((line) => /^GET \/v1\/harness\/plugins/.test(line))).toEqual([]);
 
     // The head describes the catalogue, not the selected harness.
     expect(byClass('.main-title', 'h1').textContent).toBe('Plugins');
     expect(byClass('.harness-id', 'span').textContent).toBe('built-ins');
     expect(byClass('.harness-id', 'span').hidden).toBe(false);
     expect(byClass('.harness-note', 'p').textContent).toBe(
-        '3 plugins · auto-scanned · settings save on the harness server'
+        '3 plugins · auto-scanned · settings save for this conversation'
     );
     expect(byClass('.plugins-tab-title', 'h2').textContent).toBe('Plugins');
     // The pane's DESCRIPTIVE copy is gone (2026-11-13): the "Auto-scanned · tick to enable…"
@@ -1022,7 +1098,7 @@ it('opens the pane from the toggle, reads the catalogue on first open, and lists
     expect(compactionSwitch.getAttribute('aria-checked')).toBeNull();
     expect(compactionSwitch.getAttribute('aria-label')).toBe('Disable Context Compaction');
     expect(compactionSwitch.title).toBe(
-        'Enabled for every conversation on this server · click to switch context-compaction off'
+        'Enabled for this conversation · click to switch context-compaction off'
     );
     expect(compactionSwitch.disabled).toBe(false);
     expect(compactionSwitch.closest('.plugin-tab-row')?.contains(compactionSwitch)).toBe(true);
@@ -1135,9 +1211,9 @@ it('switches a plugin off and back on with one click, and repaints the row from 
     // framework accepts `enabled` for every plugin (../shared/harness-api.ts
     // `PluginSettingsUpdate`), and an omitted key is no change.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
+        { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
     ]);
-    expect(dialed.filter((line) => line === 'PATCH /v1/harness/plugins/context-compaction')).toHaveLength(1);
+    expect(dialed.filter((line) => line === 'PATCH /v1/harness/sessions/s1/plugins/context-compaction')).toHaveLength(1);
 
     // The answer IS the new state: the SAME nodes are repainted in place (the row stays
     // the trigger the dialog would hand focus back to), and the box now reads off — box,
@@ -1156,7 +1232,7 @@ it('switches a plugin off and back on with one click, and repaints the row from 
     // The switch line states the accepted figure, the COUNT line keeps counting, and the
     // other rows were not touched.
     expect(byClass('.plugins-tab-status', 'p').textContent).toBe(
-        'Context Compaction is now disabled for every conversation.'
+        'Context Compaction is now disabled for this conversation.'
     );
     expect(byClass('.plugins-tab-status', 'p').hidden).toBe(false);
     expect(byClass('.plugins-tab-status', 'p').className).toBe('plugins-tab-status field-hint');
@@ -1164,7 +1240,7 @@ it('switches a plugin off and back on with one click, and repaints the row from 
     // deleted), and an enablement write does not repaint the switch line away: the two
     // channels stay independent, exactly as they were when the pane carried its own line.
     expect(byClass('.harness-note', 'p').textContent).toBe(
-        '3 plugins · auto-scanned · settings save on the harness server'
+        '3 plugins · auto-scanned · settings save for this conversation'
     );
     expect(pluginRow('async-ping').dataset.enabled).toBe('true');
     expect(byClass('.status-text', 'span').textContent).toBe('idle');
@@ -1185,7 +1261,7 @@ it('switches a plugin off and back on with one click, and repaints the row from 
 
     expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(2);
     expect(calls.filter((call) => call.method === 'PATCH')[1]).toEqual({
-        url: '/api/plugins/context-compaction',
+        url: '/api/sessions/s1/plugins/context-compaction',
         method: 'PATCH',
         body: { settings: { enabled: true } }
     });
@@ -1216,7 +1292,7 @@ it('states a refused switch with the server sentence and leaves the row exactly 
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
+        { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
     ]);
 
     // Nothing moved: the row and its box still state the figure the server has, and the
@@ -1232,7 +1308,7 @@ it('states a refused switch with the server sentence and leaves the row exactly 
     // The cache was not touched, so the head subtitle still describes the same three rows
     // (it is the only place that sentence renders since the pane's own copy was deleted).
     expect(byClass('.harness-note', 'p').textContent).toBe(
-        '3 plugins · auto-scanned · settings save on the harness server'
+        '3 plugins · auto-scanned · settings save for this conversation'
     );
     expect(byClass('.status-text', 'span').textContent).toBe('error');
 
@@ -1263,7 +1339,7 @@ it('writes enablement from the corner box without opening the dialog, and the ti
 
     // The write went, and NO dialog layer was opened over the list.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
+        { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
     ]);
     expect(document.querySelector('.dialog')).toBeNull();
     expect(pluginBox('context-compaction').checked).toBe(false);
@@ -1330,7 +1406,7 @@ it('keeps the plugins and tools pages, their rows and their switches usable whil
     await flush();
 
     expect(
-        dialed.filter((line) => line === 'PATCH /v1/harness/plugins/context-compaction')
+        dialed.filter((line) => line === 'PATCH /v1/harness/sessions/s1/plugins/context-compaction')
     ).toHaveLength(1);
     expect(pluginBox('context-compaction').checked).toBe(false);
 
@@ -1346,7 +1422,13 @@ it('keeps the plugins and tools pages, their rows and their switches usable whil
 
     const toolSwitch = byClass('.tool-tab-enable[data-tool="read"]', 'input');
 
-    expect(toolSwitch.disabled).toBe(false);
+    // T4: that row is THIS conversation's toolbox, and the server answers 409 for any session tool
+    // write outside an idle window (src/server/api-session-tool-writes.ts), so EVERY tool switch is
+    // locked while the conversation works — the opposite of the plugin tick boxes above it, whose
+    // route has no idle gate and which stay live. The figure is still painted from the row, and the
+    // row itself still opens its runner (execution stayed deployment-scoped).
+    expect(toolSwitch.disabled).toBe(true);
+    expect(toolSwitch.title).toBe('This conversation is working · the switch unlocks when its run ends');
     expect(toolSwitch.checked).toBe(true);
 
     // A tool row opens its runner mid-run as well.
@@ -1557,10 +1639,10 @@ it('saves only the changed key, repaints from the server row, and reopens with t
     // as "no change" (../shared/harness-api.ts `PluginSettingsUpdate`), so untouched
     // settings are never rewritten by an unrelated save.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/context-compaction', method: 'PATCH', body: { settings: { contextLimit: 150000 } } }
+        { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { contextLimit: 150000 } } }
     ]);
     expect(
-        dialed.filter((line) => line === 'PATCH /v1/harness/plugins/context-compaction')
+        dialed.filter((line) => line === 'PATCH /v1/harness/sessions/s1/plugins/context-compaction')
     ).toHaveLength(1);
 
     // The answer IS the new state: the form takes the server's figure, the row's settings
@@ -1629,7 +1711,7 @@ it('keeps Save pressable and sends nothing when no setting changed', async () =>
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/context-compaction', method: 'PATCH', body: { settings: { contextLimit: 120000 } } }
+        { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { contextLimit: 120000 } } }
     ]);
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
     expect(save.disabled).toBe(false);
@@ -1771,7 +1853,7 @@ it('renders each declared setting as its own control and sends only the changed 
 
     // The checkbox became `true` and the untouched text setting is NOT in the patch.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/extras', method: 'PATCH', body: { settings: { verbose: true } } }
+        { url: '/api/sessions/s1/plugins/extras', method: 'PATCH', body: { settings: { verbose: true } } }
     ]);
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
     expect(byClass('.plugin-setting-input[data-setting="verbose"]', 'input').checked).toBe(true);
@@ -1825,9 +1907,13 @@ it('replaces the open detail when another row is activated instead of stacking a
 });
 
 it('leaves the plugins pane when the reader selects another harness', async () => {
-    // Two harnesses, so the switch is a real selection and not a repaint of the same one.
+    // Two harnesses, so the switch is a real selection and not a repaint of the same one. And the
+    // second harness has a conversation of its own (s2): T4 hides BOTH configuration toggles for a
+    // harness with no conversation, so without s2 the second half of this test would have no pane
+    // to re-enter.
     const { dialed } = stub({
-        presets: [descriptor(), descriptor({ name: 'research', title: 'Research', agents: ['research'], primary: 'research' })]
+        presets: [descriptor(), descriptor({ name: 'research', title: 'Research', agents: ['research'], primary: 'research' })],
+        extraSessions: [researchSession()]
     });
 
     await boot();
@@ -1852,13 +1938,21 @@ it('leaves the plugins pane when the reader selects another harness', async () =
     expect(byClass('.composer', 'form').hidden).toBe(false);
     expect(byClass('.agent-slot', 'div').hidden).toBe(false);
 
-    // The cache survives the switch: re-entering the pane paints the rows without a second
-    // read, because the catalogue is server-wide rather than per harness.
+    // The moved card points at ANOTHER conversation (s2, the one `research` owns), and the pane's
+    // rows belong to a conversation — they are no longer a server-wide cache. So re-entering pays
+    // a SECOND read, dialled under s2, and paints the rows that read returned.
     openPlugins();
+
+    // The frame BEFORE the answer is the proof the cache went with the conversation: the pane
+    // re-opens on its loading line with NO rows at all, never with s1's three still on screen.
+    expect(byClass('.plugins-loading', 'p').textContent).toBe('Reading the plugin catalogue…');
+    expect(pluginNames()).toEqual([]);
+
     await flush();
 
     expect(pluginNames()).toHaveLength(3);
-    expect(pluginCountReads(dialed)).toBe(1);
+    expect(pluginCountReads(dialed)).toBe(2);
+    expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s2/plugins?limit=25')).toHaveLength(1);
 });
 
 // --- the read failure, the retry, and the refresh ----------------------------
@@ -1896,10 +1990,10 @@ it('states a failed catalogue read with the server sentence and reloads on Retry
     // (`pluginsCountNote` → `paintPluginsHead`) is what makes that recovery automatic now
     // that the pane carries no copy of its own.
     expect(byClass('.harness-note', 'p').textContent).toBe(
-        '3 plugins · auto-scanned · settings save on the harness server'
+        '3 plugins · auto-scanned · settings save for this conversation'
     );
     expect(document.querySelector('.plugins-error')).toBeNull();
-    expect(calls.filter((call) => call.url === '/api/plugins')).toHaveLength(2);
+    expect(calls.filter((call) => call.url === '/api/sessions/s1/plugins?limit=25')).toHaveLength(2);
     expect(pluginCountReads(dialed)).toBe(2);
 });
 
@@ -1919,7 +2013,7 @@ it('re-reads the catalogue from the pane control instead of trusting the cache',
     // The explicit refresh is the only way a second read leaves the browser, and the rows
     // are repainted from the fresh page (still wired afterwards).
     expect(pluginCountReads(dialed)).toBe(2);
-    expect(calls.filter((call) => call.url === '/api/plugins')).toHaveLength(2);
+    expect(calls.filter((call) => call.url === '/api/sessions/s1/plugins?limit=25')).toHaveLength(2);
     expect(pluginNames()).toHaveLength(3);
 
     pluginRow('context-compaction').click();
@@ -2074,7 +2168,7 @@ it('keeps a hidden setting registered and savable, and re-takes the reveal from 
     // Hiding a dependent row does not drop it from the write: `thoughtTurns` is in the patch
     // on its own, and nothing else rode along with it.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/context-trimmer', method: 'PATCH', body: { settings: { thoughtTurns: 7 } } }
+        { url: '/api/sessions/s1/plugins/context-trimmer', method: 'PATCH', body: { settings: { thoughtTurns: 7 } } }
     ]);
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
     expect(byClass('.plugin-setting-input[data-setting="thoughtTurns"]', 'input').value).toBe('7');
@@ -2275,7 +2369,7 @@ it('shows a child gated by a non-boolean setting exactly like one gated by nothi
 
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/wrong-gate', method: 'PATCH', body: { settings: { limit: 7, underGhost: 3 } } }
+        { url: '/api/sessions/s1/plugins/wrong-gate', method: 'PATCH', body: { settings: { limit: 7, underGhost: 3 } } }
     ]);
 });
 
@@ -2322,7 +2416,7 @@ it('reveals and focuses the hidden row whose value Save refuses, and still sends
 
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/plugins/context-trimmer', method: 'PATCH', body: { settings: { trimThoughts: true, thoughtTurns: 9 } } }
+        { url: '/api/sessions/s1/plugins/context-trimmer', method: 'PATCH', body: { settings: { trimThoughts: true, thoughtTurns: 9 } } }
     ]);
 });
 

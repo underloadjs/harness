@@ -71,6 +71,7 @@ import { HARNESS_API_ROOT } from '../shared/harness-api';
 import { API_ROOT } from './api';
 import { STATIC_API_CANDIDATES } from './deployment';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 
 const SETTINGS_KEY = 'underload-harness-app:settings';
 // The harness server URL has its OWN storage key (./api.ts `API_ROOT_STORAGE_KEY`): it
@@ -275,6 +276,21 @@ const boot = async (): Promise<void> => {
     await import('./main');
     await flush();
     await flush();
+};
+
+// T4: the ⚒ tools and ⚙ plugins panes describe the CONVERSATION on screen, and with none bound
+// main.ts stops rendering BOTH header toggles AND leaves them `disabled` (`sessionIsBound`) — a
+// disabled control swallows a click, so a dialog test that wants a catalogue in the centre column
+// now has to state the conversation that catalogue configures. These are the routes that do it:
+// the boot roster naming s1, the view open that pointer triggers, and the toolbox + identified
+// schema reads the pane and its runner dial (./session-config-test-support.ts).
+const conversationRoutes = (url: string, method: string): Response | undefined => {
+    if (method !== 'GET') return undefined;
+    if (url === '/api') return json(bootstrap({ sessions: [snapshot()] }));
+    if (url.split('?')[0] === '/api/sessions') return json({ sessions: [snapshot()] });
+    if (/^\/api\/sessions\/[^/?]+$/.test(url)) return json({ session: snapshot() });
+
+    return sessionToolReads(tools, url, method);
 };
 
 const modelCalls = (calls: Call[]): Call[] => calls.filter((call) => call.url === '/api/models');
@@ -1015,7 +1031,9 @@ it('closes on Escape, on the × button and on the backdrop, returning focus to t
 // `document.body` (./ui/dialog.ts) that covers the pane — and a second press closes it
 // again without leaving the catalogue.
 it('opens over the tools catalogue and toggles closed on a second press', async () => {
-    stub();
+    // T4: the catalogue this test puts in the centre column configures a conversation, so the
+    // fixture states one (main.ts hides and disables both toggles with none bound).
+    stub(conversationRoutes);
     await boot();
 
     byClass('.tools-toggle', 'button').click();
@@ -1041,18 +1059,20 @@ it('opens over the tools catalogue and toggles closed on a second press', async 
 });
 
 // R2: the Plugins view owns the centre in exactly the same way, so it must not swallow the
-// press either. The catalogue is read on FIRST open (`./main.ts` `setPluginsView` →
-// `loadPlugins`), so this fixture answers `/api/plugins` with the empty page in the
-// `PluginSummaryPage` wire shape (../shared/harness-api.ts) — an unmapped route throws and
-// the pane would carry an error card instead of the catalogue.
+// press either. T4 moved what it reads: the pane asks for the CONVERSATION's plugins
+// (`GET /sessions/s1/plugins`, ./api.ts `listSessionPlugins`), so this fixture answers THAT route
+// with the empty page in the `PluginSummaryPage` wire shape (../shared/harness-api.ts) — an
+// unmapped route throws and the pane would carry an error card instead of the catalogue.
 it('opens over the plugins catalogue and toggles closed on a second press', async () => {
-    const calls = stub((url) =>
-        url.startsWith('/api/plugins')
-            ? json({ items: [], limit: 25, next_cursor: null, observed_at: 1, revision: 1 })
-            : undefined
-    );
+    const calls = stub((url, method) => {
+        if (method === 'GET' && /^\/api\/sessions\/[^/]+\/plugins/.test(url)) {
+            return json({ items: [], limit: 25, next_cursor: null, observed_at: 1, revision: 1 });
+        }
+
+        return conversationRoutes(url, method);
+    });
     const pluginReads = (): number =>
-        calls.filter((call) => call.url.startsWith('/api/plugins')).length;
+        calls.filter((call) => /\/sessions\/[^/]+\/plugins/.test(call.url)).length;
 
     await boot();
 
@@ -1091,7 +1111,8 @@ it('opens over the plugins catalogue and toggles closed on a second press', asyn
 // (./main.ts), so `paintToolsHead`'s title survives and the catalogue stays the centre
 // view — the reader is left exactly where they were, with the settings committed.
 it('applies from the pill over the tools catalogue without reclaiming the catalogue head', async () => {
-    stub();
+    // T4: same as above — the catalogue needs a conversation to configure.
+    stub(conversationRoutes);
     await boot();
 
     byClass('.tools-toggle', 'button').click();

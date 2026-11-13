@@ -31,12 +31,15 @@
 // read can prove, because both are about an answer that arrives after the reader moved on:
 //
 //   5. THE CENTRE COLUMN HAS ONE OWNER: THE NEWEST GESTURE. `openSession`'s record read is
-//      async, and the card `+ New session` releases has NO pointer — the one state
-//      `applyView` ADOPTS a document in. Without the navigation-intent guard (./main.ts
-//      `navigationIntent`) a conversation left mid-read re-binds the card from its own late
-//      answer: transcript back, pending figure restored, and the pointer `+` cleared written
-//      back. The cases park the browser's own record read (the view adapter answers every
-//      other route) so the stale answer can be delivered last.
+//      async, and the window `+ New session` opens clears the card's pointer and holds it
+//      clear until the create answers — the state `applyView` ADOPTS a document in (the
+//      remembered-pointer boot needs exactly that). Without the navigation-intent guard
+//      (./main.ts `navigationIntent`) a conversation left mid-read re-binds the card from its
+//      own late answer: transcript back, pending figure restored, and the pointer overwritten
+//      — under T3 that pointer is the id the CREATE was about to install, so the guard now
+//      protects an adoption as well as an emptiness. The cases park the browser's own record
+//      read (the view adapter answers every other route) so the stale answer can be delivered
+//      last.
 //   6. A THREAD ID IS ONLY UNIQUE INSIDE ITS CONVERSATION. The runtime mints thread ids per
 //      session, so the conversation being LEFT and the one being ENTERED can carry the same
 //      id. The last case gives both `thread-1` and asserts that nothing of the first survives
@@ -311,6 +314,9 @@ describe('the canonical directory', () => {
         let current = snapshot('s-live', { status: 'running', updatedAt: 500, createdAt: 1, turns: [] });
         localStorage.setItem(SESSION_KEY, 's-live');
         const stream = await installLiveStream({ sessionId: 's-live', snapshot: () => current });
+        // T3 (R1): the `+` near the bottom of this case CREATES a conversation, so the fixture
+        // answers the create (and the new row) instead of letting the press fail.
+        const made = snapshot('made-1', { updatedAt: 900, createdAt: 900, turns: [] });
 
         vi.stubGlobal(
             'fetch',
@@ -323,6 +329,9 @@ describe('the canonical directory', () => {
                     }
                     if (url === '/api/models') return json({ models: ['m1'] });
                     if (url === '/api/sessions/s-live') return json({ session: current });
+                    if (url === '/api/sessions' && init?.method === 'POST')
+                        return json({ session: made }, 201);
+                    if (url === '/api/sessions/made-1') return json({ session: made });
 
                     throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
                 }, { root: '/api' })
@@ -490,25 +499,54 @@ describe('the canonical directory', () => {
     });
 
     // R2 of "sessions are independent": the header `+` is the other half of the lock that
-    // was removed. It must be clickable while a run is live, and `newSession()` must
-    // actually proceed — the old code answered this gesture with a pane notice telling the
-    // reader to cancel their own task first.
-    it('starts a fresh conversation while another is still running, without cancelling it or a notice', async () => {
+    // was removed. It must be clickable while a run is live, and it must actually PROCEED —
+    // the old code answered this gesture with a pane notice telling the reader to cancel their
+    // own task first. T3 (R1) changed what "proceed" means: the press now CREATES a server
+    // record and adopts it, so the new conversation is on screen with its own id, the run that
+    // was left is still uncancelled on the wire, and a late frame for it cannot resurrect it.
+    it('creates a fresh conversation while another is still running, without cancelling it or a notice', async () => {
         let live = snapshot('s-live', { status: 'running', updatedAt: 500, createdAt: 1, turns: [] });
 
         localStorage.setItem(SESSION_KEY, 's-live');
 
         const stream = await installLiveStream({ sessionId: 's-live', snapshot: () => live });
 
+        // The created record joins the readable set, exactly as a real server's new row does.
+        const records = [live];
+        const creates: { url: string; harness: unknown; settings: unknown }[] = [];
+
         const answer = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') {
-                return json({ rootPath: '/api', presets: [descriptor()], tools: [], defaults, sessions: [live], agents });
+                return json({ rootPath: '/api', presets: [descriptor()], tools: [], defaults, sessions: records, agents });
             }
             if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [live] });
+            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: records });
             if (url === '/api/sessions/s-live') return json({ session: live });
+
+            // T3: the create. A POST on the DIRECTORY path, answered with a fresh id and no
+            // turns — and the method is the only thing distinguishing it from the list read.
+            if (url === '/api/sessions' && init?.method === 'POST') {
+                const body = init.body === undefined ? {} : JSON.parse(String(init.body));
+
+                creates.push({
+                    url: '/api/sessions',
+                    harness: (body as { harness?: unknown }).harness,
+                    settings: (body as { settings?: unknown }).settings
+                });
+                const created = snapshot('made-1', { updatedAt: 900, createdAt: 900, turns: [] });
+                records.push(created);
+
+                return json({ session: created }, 201);
+            }
+            if (url === '/api/sessions/made-1') {
+                const created = records.find((row) => row.id === 'made-1');
+
+                return created === undefined
+                    ? json({ error: { message: 'unknown session' } }, 404)
+                    : json({ session: created });
+            }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
         }, { root: '/api' });
@@ -536,11 +574,25 @@ describe('the canonical directory', () => {
 
         newSessionButton().click();
         await flush();
+        await flush();
 
-        // It PROCEEDED: the pointer is gone, so the cycler has no conversation to name, and the
-        // pending figure was released with the conversation that owned it.
-        expect(byClass('.session-cycle', 'button').hidden).toBe(true);
-        expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+        // T3 (R1): it PROCEEDED by CREATING. Exactly one conversation write, addressed to the
+        // collection route, carrying the harness and the current endpoint settings — which is
+        // why the create is eager at all: the record exists (and is configurable) before the
+        // first task.
+        expect(creates).toEqual([
+            {
+                url: '/api/sessions',
+                harness: 'instruct',
+                settings: { base_url: 'http://provider/v1', api_key: '', model: 'm1' }
+            }
+        ]);
+        // The card adopted the SERVER-assigned id: the cycler names it, and it is the pointer.
+        expect(byClass('.session-cycle', 'button').hidden).toBe(false);
+        expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('made-1');
+        expect(localStorage.getItem(SESSION_KEY)).toBe('made-1');
+        // The pending figure was released with the conversation that owned it: a fresh 0-turn
+        // record has no work, so the composer is back to SEND.
         expect(byClass('.composer-action', 'button').dataset.action).toBe('none');
         expect(byClass('.composer-stop', 'button').hidden).toBe(true);
         // The `+` stays live for a second fresh conversation, and the archived-harness rule
@@ -559,16 +611,25 @@ describe('the canonical directory', () => {
         expect(dashboard().querySelector<HTMLElement>('.session-pill[data-session-id="s-live"]')?.dataset.status).toBe(
             'running'
         );
+        // T3: the directory shows BOTH conversations now, and the ACTIVE one is the record the
+        // create made — the run that is still going is merely listed.
+        expect(dashboard().querySelectorAll('.session-pill')).toHaveLength(2);
+        expect(
+            dashboard().querySelector('.session-pill[data-session-id="made-1"] .session-pill-select')
+                ?.dataset.active
+        ).toBe('true');
         closeDashboard();
 
         // And the run is still live on the socket: a frame pushed after the new session lands
-        // without resurrecting the conversation that was left (no pointer, no STOP reappearing).
+        // must not resurrect the conversation that was left (no STOP reappearing) and must not
+        // move the card off the conversation its reader created.
         live = snapshot('s-live', { status: 'idle', updatedAt: 900, createdAt: 1, turns: [] });
         expect(stream.push([{ type: 'snapshot', session: live }])).toBe(true);
         await flush();
         await flush();
 
-        expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+        expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('made-1');
+        expect(localStorage.getItem(SESSION_KEY)).toBe('made-1');
         expect(byClass('.composer-action', 'button').dataset.action).toBe('none');
     });
 });
@@ -642,6 +703,11 @@ describe('the conversation switch', () => {
     // log of the BROWSER urls so a case can name the reads the shell itself dialled. `park`
     // names the conversation whose record read must not answer yet, and `extra` answers the
     // writes a case needs beyond the plain read surface (a task receipt, a cancel).
+    //
+    // T3 (R1): the `+` is one of those writes now, so the double answers `POST /sessions`
+    // itself with a fresh 0-turn record under the harness the BODY names (`made-1`, `made-2`,
+    // …) and joins it to the readable set. `creates` is the log the `+` cases assert — the
+    // create is a POST on the directory's OWN path, so only the method tells them apart.
     const serve = (
         rows: SessionSnapshot[],
         park: string | undefined,
@@ -650,8 +716,12 @@ describe('the conversation switch', () => {
         response: Promise<Response>;
         release: (body: Response) => void;
         calls: { url: string; method: string | undefined }[];
+        creates: { url: string; harness: unknown }[];
     } => {
         const parked = parkedRead();
+        const records = [...rows];
+        const creates: { url: string; harness: unknown }[] = [];
+        let made = 0;
 
         const answer = viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
@@ -660,12 +730,23 @@ describe('the conversation switch', () => {
             if (handled !== undefined) return handled;
 
             if (url === '/api') {
-                return json({ rootPath: '/api', presets: [descriptor()], tools: [], defaults, sessions: rows, agents });
+                return json({ rootPath: '/api', presets: [descriptor()], tools: [], defaults, sessions: records, agents });
             }
             if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: rows });
+            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: records });
 
-            for (const row of rows) {
+            if (url === '/api/sessions' && init?.method === 'POST') {
+                const body = init.body === undefined ? {} : JSON.parse(String(init.body));
+                const harness = String((body as { harness?: unknown }).harness ?? '');
+                made += 1;
+                creates.push({ url: '/api/sessions', harness });
+                const created = snapshot(`made-${made}`, { harness, updatedAt: 900, createdAt: 900, turns: [] });
+                records.push(created);
+
+                return json({ session: created }, 201);
+            }
+
+            for (const row of records) {
                 if (url === `/api/sessions/${row.id}`) return json({ session: row });
             }
 
@@ -697,14 +778,17 @@ describe('the conversation switch', () => {
             })
         );
 
-        return { ...parked, calls };
+        return { ...parked, calls, creates };
     };
 
     // R3: an open that is still in flight when the reader presses `+` must be DROPPED, not
-    // painted. This is the race the removed run lock used to hide by accident: `newSession`
-    // leaves the card with no pointer, and a document that arrives for a pointer-free card is
-    // ADOPTED — transcript back, pending figure restored, and the pointer that `+` cleared
-    // written back by `rememberSession`.
+    // painted. This is the race the removed run lock used to hide by accident, re-derived for
+    // the eager create (T3): `newSession` clears the card's pointer and holds it clear for the
+    // whole window the create request is open, and a document that arrives for a pointer-free
+    // card is ADOPTED — transcript back, pending figure restored, and the pointer written back
+    // over the one the create is about to install. The guard has to win twice over: against
+    // the released conversation, and against the record the `+` adopted AFTER that open was
+    // already superseded.
     it('drops the conversation a released card answers with after the reader pressed `+`', async () => {
         const live = snapshot('s-live', { status: 'running', updatedAt: 500, createdAt: 1, turns: [] });
         const parkedRow = snapshot('s-parked', { updatedAt: 400, createdAt: 2, turns: [] });
@@ -712,7 +796,7 @@ describe('the conversation switch', () => {
         localStorage.setItem(SESSION_KEY, 's-live');
 
         const stream = await installLiveStream({ sessionId: 's-live', snapshot: () => live });
-        const { response, release, calls } = serve([live, parkedRow], 's-parked');
+        const { response, release, calls, creates } = serve([live, parkedRow], 's-parked');
 
         await import('./main');
         await flush();
@@ -739,29 +823,39 @@ describe('the conversation switch', () => {
         expect(cycle.dataset.sessionId).toBe('s-live');
         expect(newSessionButton().disabled).toBe(false);
 
-        // 2. The reader asks for an empty conversation instead, and gets one.
+        // 2. T3 (R1): the reader presses `+`, and the press CREATES a conversation — one POST,
+        //    and the card adopts the id the server assigned. The superseded `s-parked` open is
+        //    still unserved at this moment, which is the whole point of the case.
+        creates.length = 0;
         newSessionButton().click();
         await flush();
+        await flush();
 
-        expect(cycle.hidden).toBe(true);
-        expect(cycle.dataset.sessionId).toBeUndefined();
-        expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+        expect(creates).toEqual([{ url: '/api/sessions', harness: 'instruct' }]);
+        expect(cycle.dataset.sessionId).toBe('made-1');
+        expect(localStorage.getItem(SESSION_KEY)).toBe('made-1');
+        // An empty conversation has no pending work, so the STOP of the conversation the reader
+        // left is gone with it (R4: leaving is an unsubscribe, never a cancellation).
         expect(action.dataset.action).toBe('none');
+        // The create is a POST on the directory's own path, so the READ count must not move:
+        // only the method distinguishes them, and `conversationReads` names it.
+        expect(conversationReads(calls)).toEqual(['s-live', 's-parked']);
 
-        // 3. NOW the parked answer lands — the oldest gesture on the page. It is discarded: the
-        //    card stays empty, and the pointer `+` cleared is never written back.
+        // 3. NOW the parked answer lands — the oldest gesture on the page. It is discarded:
+        //    the card keeps the conversation the `+` created, and the pointer the create
+        //    installed is never written back with the conversation the reader let go.
         release(json({ session: parkedRow }));
         await flush();
         await flush();
 
-        expect(cycle.hidden).toBe(true);
-        expect(cycle.dataset.sessionId).toBeUndefined();
-        expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+        expect(cycle.dataset.sessionId).toBe('made-1');
+        expect(localStorage.getItem(SESSION_KEY)).toBe('made-1');
         expect(action.dataset.action).toBe('none');
-        // The open never bound anything: no registration for `s-parked` was ever dialled, and
-        // the only session-scope facts on the socket are still the two `s-live` ones — which
-        // `+` had already released with an unsubscribe, not a cancel.
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2']);
+        // The open never bound anything: no registration for `s-parked` was ever dialled. The
+        // only session-scope facts on the socket are the two `s-live` ones `+` had already
+        // released (an unsubscribe, not a cancel) plus the record channel of the conversation
+        // the create adopted — which `+` had already released with an unsubscribe, not a cancel.
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2', 'made-1:s3']);
         expect(unsubscriptions(stream)).toEqual(['s1', 's2']);
         expect(cancellations(calls)).toEqual([]);
 
@@ -773,8 +867,10 @@ describe('the conversation switch', () => {
 
         expect(cycle.dataset.sessionId).toBe('s-parked');
         expect(localStorage.getItem(SESSION_KEY)).toBe('s-parked');
-        // An idle conversation gets the record channel only, never an observer.
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2', 's-parked:s3']);
+        // An idle conversation gets the record channel only, never an observer. The log is the
+        // registrations this page has ever dialled, so the create's `made-1` channel is still
+        // named in it (released, not erased) — and `s-parked` is the newest one.
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2', 'made-1:s3', 's-parked:s4']);
     });
 
     // R3: two rapid conversation clicks resolve by the LAST CLICK, not by the last ANSWER. The

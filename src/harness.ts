@@ -587,6 +587,15 @@ const resolveMaxIterations = (value: number | undefined): number => {
 // only be released through `toolCancel`.
 const FORK_TIMEOUT_DEFAULT_MS = Number.POSITIVE_INFINITY;
 
+// How many characters of a dead branch's partial answer ride INSIDE the failure
+// delivery to the requester (B3, 2026-11-13). It is a courtesy preview, not the
+// payload: the full text always stays readable through `agentResult`/`threadRead` by
+// the branch id the same sentence names, so this cap only bounds how much of it a
+// model reads without spending a second call. It is deliberately near
+// `AGENT_MANAGE_PREVIEW_CHARS` (200, core/agent-limits.ts) — the same "a glance at one
+// answer" budget — and `boundDelivery` still caps the whole delivery independently.
+const FORK_PARTIAL_PREVIEW_CHARS = 240;
+
 // Resolve one opt-in branch wall clock, byte-for-byte the rule `delegateFor` applies to
 // `timeoutMs`: a missing, non-number, non-finite, or sub-1 value means "no bound" rather
 // than a 0 ms timer, and a finite value is floored to a whole millisecond.
@@ -995,9 +1004,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // B1 (2026-11-13): the DEFAULT branch wall clock for this harness. An unset or
     // non-finite value means no bound, so an unconfigured harness arms no timer for a fork
     // at all — the shape `src/harness.delegation.test.ts` pins. A finite value is the
-    // host's choice for every fork door that does not name its own `timeoutMs`
-    // (`harness.thread.forkThread()`, a plugin `api.threads.fork()`); the `threadFork` tool
-    // always names one, so a model call is unaffected by this option.
+    // host's choice for every fork door that does not name its own `timeoutMs`, which
+    // includes a MODEL call: the `threadFork` entry declares no schema default (its prose
+    // says "omit it for no time limit"), so an omitted argument falls through to this
+    // option, exactly as `harness.thread.forkThread()` and a plugin `api.threads.fork()`
+    // do. An explicit `timeoutMs` in the call always wins over the configured default.
     const threadForkTimeoutMs = resolveForkTimeoutMs(
         configuration.threadForkTimeoutMs,
         FORK_TIMEOUT_DEFAULT_MS
@@ -3994,6 +4005,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         ? {}
                         : { nextOffset: partialPage.nextOffset }),
                     error: record.error ?? 'The invocation did not complete.',
+                    // B3 (2026-11-13): the WHOLE partial, next to the page. `content` is one
+                    // page (4000 chars by default), so a caller that just wants to know what
+                    // the run had produced before it died used to have to page to the end to
+                    // read it. `delegate`'s unfinished-run envelope has always carried this
+                    // field (see the `partialContent` line in `delegateFor`); an agentResult
+                    // description names it too, so the key now exists instead of being prose
+                    // only. Present ONLY when the run actually said something, which keeps
+                    // every "failed on its first request" envelope byte-for-byte what it was.
+                    ...(record.partialContent === undefined
+                        ? {}
+                        : { partialContent: record.partialContent }),
                     // How far the run got before it was stopped. Present only when the
                     // run actually appended something, so a run cancelled before its
                     // first turn keeps a minimal shape.
@@ -5116,8 +5138,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         ) {
             throw new HarnessError(
                 `Thread "${targetThreadId}" is not one thread "${sender.threadId}" can address: threadSend reaches ` +
-                    'your own thread, an ancestor, one of your descendants, or this agent\'s default conversation ' +
-                    '(see threadList). The id exists — it is simply outside your lineage.'
+                    'your own thread, an ancestor, one of your descendants, or a default conversation (agent:<name>) ' +
+                    'your roster lists (see threadList). The id exists — it is simply outside your lineage.'
             );
         }
 
@@ -5522,8 +5544,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //   - `origin: 'host'` — a branch is not an agent's default conversation, and 'host' is
     //     the only value that means "a conversation on top of an agent";
     //   - `status` — 'running' while the branch task is live, otherwise 'idle'. A terminal
-    //     branch is done working, and `deleteThread`'s running-refusal reads exactly this
-    //     field, so a finished branch is releasable like a finished thread;
+    //     branch is done working, and a READ reports exactly that. It is NOT a delete door:
+    //     a branch is detached audit state owned by its requester conversation (there is no
+    //     thread state to release), so `deleteThread("branch-N")` keeps the canonical
+    //     unknown-id refusal and the record goes when its OWNER is deleted (the M2 cascade);
     //   - `sequence` — the branch's position in the retained ledger plus one. The ledger is
     //     kept in creation order, so this is stable for a given session state and is never
     //     a fabricated timestamp;
@@ -5555,6 +5579,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const family = familyOfCaller(callerThreadId);
         if (family === undefined || family.has(threadId)) return true;
 
+        // A LIVE conversation outside the family is the refusal this gate exists for. The
+        // order matters: `threadStates` is checked BEFORE the branch ledger, because a live
+        // thread is never a branch record, and skipping it made every non-family id look
+        // "unknown" and therefore visible — which left a scoped caller reading a sibling's
+        // transcript through the seam the roster told it not to ask for.
+        if (threadStates.has(threadId)) return false;
+
         const branch = branchRecordOf(threadId);
         if (branch === undefined) return true;
 
@@ -5564,11 +5595,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Separate sentence from the not-found error, for the same reason `threadSend`'s
     // refusal is: an id that exists outside your lineage is a roster problem, and an id
     // nobody has is a typo or a released conversation.
+    //
+    // W6 (2026-11-13, independent review): the last address is "a default conversation
+    // (agent:<name>) YOUR ROSTER lists", not "this agent's default conversation". The family rule
+    // (`threadFamilyOf` step 4) admits the defaults of EVERY agent the family spans, plus a default
+    // whose first-wins owner link falls in the family — that is how the cross-agent chat survives —
+    // so naming only "this agent's" default describes a narrower set than the gate enforces and
+    // sends a model to re-read a roster that actually listed the thread. The same wording is used
+    // by the `threadSend` refusal above, so the two doors state one rule.
     const threadNotVisibleError = (threadId: string, callerThreadId: string): HarnessError =>
         new HarnessError(
             `Thread "${threadId}" is not visible to thread "${callerThreadId}": a read reaches your own thread, an ` +
-                'ancestor, one of your descendants, or this agent\'s default conversation (see threadList). The id ' +
-                'exists — it is simply outside your lineage.'
+                'ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists (see ' +
+                'threadList). The id exists — it is simply outside your lineage.'
         );
 
     // Mark one thread stopped and abort its run, if any. Returns whether a live run
@@ -6005,8 +6044,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // The committed transcript of one conversation, as a detached copy.
     //
     // `callerThreadId` (B1/B4, 2026-11-13) is the CALLER's persistent thread, supplied by
-    // the runtime — `threadRead.tool.ts` passes `context.threadId`, and a lane replica's
-    // routed read passes nothing because the request shape carries only the target. Two
+    // the runtime — `threadRead.tool.ts` passes `context.threadId`, and a lane replica's routed
+    // read carries the same id in its request `identity` (./server/workers/lane-worker-loop.ts
+    // `threadReadRoutePayload`, answered by ./server/workers/lane-authority.ts
+    // `case 'thread:read'`), so a scoped lane read and the identical inline call agree. Two
     // things hang off it:
     //
     //   - VISIBILITY: with a caller present, an address outside that caller's thread family
@@ -7482,10 +7523,37 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // a primitive/object/proxy, and this failure reporter must never throw
             // while describing that value. `task.failed` (not `task.error`) decides
             // failure so `throw undefined` is still an error result.
+            //
+            // B3 (2026-11-13) — A FAILED FORK STILL CARRIES ITS PARTIAL WORK. A fork is
+            // the one background call whose transcript survives the failure of the CALL
+            // (the branch commits its turns as it goes, and `branch-N` keeps addressing
+            // them), and the `threadFork` entry promises exactly that: "on expiry the
+            // result that reaches you carries the partial content it had produced".
+            // The bare failure sentence broke that promise, because the branch's own
+            // clock ends the branch TASK, so a timeout lands here rather than in the
+            // cancellation branch above. The clause therefore states the surviving
+            // address, an inline preview so a short answer costs no extra call, and the
+            // two doors that read the rest. Every other failed call — and a fork whose
+            // branch never said anything, the `produced no substantive answer` case —
+            // keeps the historical sentence byte for byte.
+            const failedBranchId = branchCallIds.get(`${run.scope}\u0000${call.id}`);
+            const failedPartial =
+                failedBranchId === undefined
+                    ? undefined
+                    : invocationRecords.get(failedBranchId)?.partialContent;
+            const preview =
+                failedPartial === undefined || failedPartial.trim().length === 0
+                    ? undefined
+                    : failedPartial.length > FORK_PARTIAL_PREVIEW_CHARS
+                      ? `${failedPartial.slice(0, FORK_PARTIAL_PREVIEW_CHARS)}…`
+                      : failedPartial;
+
             content = boundDelivery(
                 run,
                 call,
-                `Tool "${call.name}" failed: ${toErrorInfo(task.error).message}`
+                preview === undefined
+                    ? `Tool "${call.name}" failed: ${toErrorInfo(task.error).message}`
+                    : `Tool "${call.name}" failed: ${toErrorInfo(task.error).message} — its branch "${failedBranchId}" still holds what it produced: "${preview}" — read it with threadRead "${failedBranchId}" or agentResult by that id.`
             );
             outcome = 'failed';
         } else {
@@ -8499,12 +8567,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // B1 (2026-11-13) — the branch's OPTIONAL wall clock.
         //
-        // `timeoutMs` is opt-in: the entry passes its schema default (120000) for a model
-        // call, and a direct `harness.thread.forkThread()` / `api.threads.fork()` resolves
-        // to `threadForkTimeoutMs` from the harness configuration, else unbounded
-        // (FORK_TIMEOUT_DEFAULT_MS). Before this the fork had no bound at a fork site at
-        // all: the configured option was read by nobody, and a branch that never answered
-        // held its concurrency slot until `toolCancel`.
+        // `timeoutMs` is opt-in at every door: a model that names one wins, a model that
+        // omits it (the entry declares no schema default, and its prose says an omitted
+        // value means no limit) resolves to `threadForkTimeoutMs` from the harness
+        // configuration, and an unconfigured harness resolves to unbounded
+        // (FORK_TIMEOUT_DEFAULT_MS). Before this finding the fork had no bound at a fork
+        // site at all: the configured option was read by nobody, and a branch that never
+        // answered held its concurrency slot until `toolCancel`.
         //
         // The bound aborts the branch task's own controller (exactly how `delegateFor`
         // bounds a child), so the requester's run keeps its signal and still receives the
@@ -11178,7 +11247,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             try {
                 const message = await runAgentCore(run, input);
-                finishInvocation(run, { message });
+
+                // B2: terminal ledger entry AND released conversation, synchronously,
+                // BEFORE the hooks fire. `run.finished` is the boundary a caller that
+                // reaps finished conversations works from, so the state it reads has to
+                // already agree with the answer it was handed.
+                commitRunTerminal(run, { message });
 
                 // Only a run that produced an answer gets `run.finished`; the failure
                 // path below reports `run.failed` instead, so a handler never sees both
@@ -11192,7 +11266,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 return message;
             } catch (error) {
-                finishInvocation(run, { error });
+                // B2: same commit on the failure path, so a `run.failed` handler can
+                // delete the conversation too (a ledger entry that survives its
+                // conversation is the state this makes unrepresentable).
+                commitRunTerminal(run, { error });
 
                 // `toErrorInfo` is total (util/errors.ts), so a tool that threw a
                 // primitive/object/Proxy still yields a serializable payload here.
@@ -11225,6 +11302,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // (the host's intent must survive the abort); an ordinary finish
                 // returns the conversation to idle. The controller and run are
                 // cleared so a later stop cannot abort a run that already ended.
+                //
+                // B2: this is now the BACKSTOP, not the primary release — a run that
+                // ends normally is already committed and released by `commitRunTerminal`
+                // before its hooks. Every statement here is idempotent (each is guarded
+                // by an identity check), so a run that ends before that commit can run
+                // (refused after acquiring the actor, an abort outside the inner try) is
+                // still released, and a run that did use the commit changes nothing.
                 if (resolvedThread !== undefined) {
                     if (resolvedThread.run === run) resolvedThread.run = undefined;
                     if (resolvedThread.controller === threadController) {
@@ -12852,7 +12936,12 @@ export {
     THREAD_READ_METADATA,
     THREAD_READ_NAME,
     THREAD_SEND_METADATA,
-    THREAD_SEND_NAME
+    THREAD_SEND_NAME,
+    // Issue 0027: the release door, for the same reason as the trio above — it is
+    // conditional (registered with the first independent thread), and a server
+    // catalogue quotes the same name/schema the runtime uses.
+    THREAD_DELETE_METADATA,
+    THREAD_DELETE_NAME
 } from './core';
 export { MAX_THREAD_LABEL_CHARS, MAX_THREAD_RECORDS, defaultThreadIdOf } from './core';
 // Tool-panel bounds and the normalizer are public too: a client or a host-side

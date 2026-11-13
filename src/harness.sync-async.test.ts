@@ -227,6 +227,10 @@ describe('tool turn policy (R2)', () => {
             'read:sync',
             'search:sync',
             'shell:async',
+            // Issue 0027: the release door STATES 'sync' rather than inheriting the
+            // default, because its caller needs the receipt (`removedThreadIds`) in the
+            // tool message of the same turn.
+            'threadDelete:sync',
             'threadFork:async'
         ]);
 

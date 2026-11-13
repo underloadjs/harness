@@ -18,6 +18,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
@@ -40,6 +41,21 @@ const flush = async (): Promise<void> => {
 // triggers) — the last three composed from this same fixture, so nothing here invents a
 // payload the fixture does not state. Without that adapter the client booted offline
 // (no page, no card, no definition) and every chrome assertion below read an empty head.
+// T4: the conversation boot resolves for the only harness. The ⚒/⚙ toggles describe THIS
+// conversation (main.ts `configScope`), so a fixture that opens either pane has to name one;
+// `harness: 'instruct'` matches `presets[0]`, which is what makes boot open it instead of
+// landing on an empty harness view.
+const SESSION = {
+    id: 's1',
+    harness: 'instruct',
+    status: 'idle',
+    model: 'm1',
+    createdAt: 1,
+    updatedAt: 2,
+    messages: [],
+    turns: []
+};
+
 const bootstrap = {
     rootPath: '/api',
     presets: [
@@ -74,7 +90,13 @@ const bootstrap = {
         }
     ],
     defaults,
-    sessions: [],
+    // T4: BOTH header catalogues configure the CONVERSATION on screen, and main.ts stops
+    // RENDERING them while none is bound (`paintControls` sets `hidden` on
+    // `.harness-title-tools`, `styles.css` `.harness-title-tools[hidden]`). A fixture with an
+    // empty roster therefore has no ⚒ button to press at all — see the two new toggle tests
+    // at the bottom of this file, which pin exactly that — so the chrome tests below boot with
+    // one conversation of the only harness. `harness: 'instruct'` is what makes boot open it.
+    sessions: [SESSION],
     agents: [
         {
             name: 'instruct',
@@ -96,18 +118,41 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-const boot = async (): Promise<void> => {
+// The boot body with the ROSTER and the HARNESS LIST decided by the caller: `boot()` keeps the
+// one conversation the chrome tests need, `bootWith([])` describes a server whose harness has
+// none, and the second argument adds harnesses (the unbound-state test below needs one the
+// reader can switch to).
+const bootWith = async (
+    sessions: readonly unknown[],
+    presets: readonly unknown[] = bootstrap.presets
+): Promise<void> => {
     // Canonical adapter OUTSIDE, the fixture's raw routes INSIDE: the shell dials
     // `/v1/harness/*`, the adapter rewrites each of those to the raw twin this fixture
     // declares (`/api`, `/api/models`) and composes the pages/definition from that same
     // boot body (see the note above `bootstrap`).
+    //
+    // T4: binding a conversation adds three routes the shell never dialled before — the roster
+    // that names it, the view open behind the rail pill boot selects, and the toolbox page the
+    // ⚒ pane reads on its FIRST open (./session-config-test-support.ts `sessionToolReads`, which
+    // answers that page AND the identified `GET /tools/{name}` the runner needs from the ONE
+    // `tools` list above, so the catalogue, the pane and the runner cannot disagree). The double
+    // stays strict: anything else is an `unexpected request`.
+    const body = { ...bootstrap, presets: [...presets], sessions: [...sessions] };
+
     vi.stubGlobal(
         'fetch',
         vi.fn(
             viewAwareFetch(async (input: RequestInfo | URL) => {
                 const url = String(input);
-                if (url === '/api') return json(bootstrap);
+
+                if (url === '/api') return json(body);
                 if (url === '/api/models') return json({ models: ['m1'] });
+                if (url === '/api/sessions' || url === '/api/sessions?limit=25') return json({ sessions: [...sessions] });
+                if (sessions.length > 0 && url === '/api/sessions/s1') return json({ session: SESSION });
+
+                const toolReads = sessionToolReads(body.tools, url);
+
+                if (toolReads !== undefined) return toolReads;
 
                 throw new Error(`unexpected request: ${url}`);
             }, { root: '/api' })
@@ -117,6 +162,10 @@ const boot = async (): Promise<void> => {
     await import('./main');
     await flush();
     await flush();
+};
+
+const boot = async (): Promise<void> => {
+    await bootWith([SESSION]);
 };
 
 const byClass = <K extends keyof HTMLElementTagNameMap>(
@@ -178,6 +227,14 @@ it('opens and closes the global tools view from the session-line icon only', asy
     expect(toggle.title).toBe('Show or hide the tool catalogue');
     // Boot reached a selected harness, so the global control is usable now.
     expect(toggle.disabled).toBe(false);
+    // T4: and it is RENDERED, because this boot has a conversation bound. Being unusable and
+    // being absent are different states, and only the second one is the unbound case: with no
+    // conversation `paintControls` puts `hidden` on the group AND on each toggle, so the DOM has
+    // nothing to press instead of a greyed-out promise of an empty pane (the two `hidden` tests
+    // at the end of this file pin the other half, including the CSS that makes `hidden` stick).
+    expect(group.hidden).toBe(false);
+    expect(toggle.hidden).toBe(false);
+    expect(byClass('.plugins-toggle', 'button').hidden).toBe(false);
     expect(stage.querySelector('.tools-pane')).toBeNull();
     expect(head.querySelector('.main-title')?.textContent).toBe('Instruct');
     // The chat head shows ONLY the display title: the harness registry id
@@ -207,9 +264,11 @@ it('opens and closes the global tools view from the session-line icon only', asy
     // badge and hides it, exactly the way `renderHarnessChrome` hides it in chat — the
     // badge is spare room for the title, not a second label.
     expect(badge.hidden).toBe(true);
-    expect(head.querySelector('.harness-note')?.textContent).toBe(
-        '1 tool · calls run on the harness server'
-    );
+    // T4: the note states THIS CONVERSATION's toolbox — the count of rows the session read
+    // returned — and no longer asserts anything about where a call runs. The manual runner
+    // keeps its own playground note (`createToolRunner`), which is where "calls run on the
+    // harness server" is still true (`tools-runner-copy.test.ts` pins it there).
+    expect(head.querySelector('.harness-note')?.textContent).toBe('1 tool · the toolbox of this conversation');
     // The runner lives in the shared modal now, so nothing of it is mounted while
     // the list is alone on screen.
     expect(document.querySelector('.dialog')).toBeNull();
@@ -272,9 +331,9 @@ it('opens and closes the global tools view from the session-line icon only', asy
     // Dialog close repaints the catalogue head (`paintToolsHead`), which keeps the shared
     // badge blanked + hidden — closing a runner does not bring the stray word back.
     expect(badge.hidden).toBe(true);
-    expect(head.querySelector('.harness-note')?.textContent).toBe(
-        '1 tool · calls run on the harness server'
-    );
+    // T4: closing a runner repaints the SAME conversation's tally — the rows are still the ones
+    // this conversation's read returned, and nothing re-dials the toolbox on a dialog close.
+    expect(head.querySelector('.harness-note')?.textContent).toBe('1 tool · the toolbox of this conversation');
     expect(document.activeElement).toBe(toolButton);
     expect(stage.querySelector('.tools-pane')).not.toBeNull();
     expect(agentSlot.hidden).toBe(true);
@@ -321,6 +380,66 @@ it('keeps the tools toggle disabled until the catalogue has loaded', async () =>
     );
 });
 
+// --- T4: the two catalogues configure ONE conversation ---------------------
+
+// A second harness with NO conversation of its own. Selecting it is the pointer release
+// `syncConfigScope` watches (a harness with nothing to show stays unbound — no conversation is
+// created on entry), so the page can move rendered → absent → rendered without a create or a
+// delete request, and without a fetch route this file does not already serve.
+const RESEARCH = { ...bootstrap.presets[0], name: 'research', title: 'Research' };
+
+const harnessRow = (title: string): HTMLButtonElement => {
+    const found = [...document.querySelectorAll<HTMLButtonElement>('.harness-item')].find(
+        (node) => node.textContent?.includes(title) === true
+    );
+
+    if (found === undefined) throw new Error(`no rail row titled ${title}`);
+
+    return found;
+};
+
+it('renders both header catalogues only while a conversation is bound', async () => {
+    // The ⚒ and ⚙ panes read and write the conversation on screen (`main.ts` `configScope`), so
+    // with no conversation there is nothing for either button to open. The Decision is to stop
+    // RENDERING them: `paintControls` puts `hidden` on the `.harness-title-tools` group and on
+    // each button, and the layout claim lives in the CSS test below.
+    await bootWith([SESSION], [bootstrap.presets[0], RESEARCH]);
+
+    const group = byClass('.harness-title-tools', 'div');
+    const tools = byClass('.tools-toggle', 'button');
+    const plugins = byClass('.plugins-toggle', 'button');
+
+    // Boot resolves the one conversation `instruct` has, so all three are in the document.
+    expect(group.hidden).toBe(false);
+    expect(tools.hidden).toBe(false);
+    expect(plugins.hidden).toBe(false);
+
+    // The harness with nothing to show: the pointer is released, and both catalogues leave with
+    // it. They are ABSENT, not disabled-and-explained — `disabled` keeps its single meaning
+    // ("the server never answered", the state `showOffline` leaves behind), so the controls stay
+    // enabled while hidden and no tooltip has to claim a reason the reader cannot act on. The
+    // unbound guard is at the pane's own edge instead: `loadSessionTools`/`loadPlugins` never
+    // dial a request for a missing id.
+    harnessRow('Research').click();
+    await flush();
+
+    expect(group.hidden).toBe(true);
+    expect(tools.hidden).toBe(true);
+    expect(plugins.hidden).toBe(true);
+    expect(tools.disabled).toBe(false);
+    expect(plugins.disabled).toBe(false);
+
+    // Back to the harness that has a conversation: the same pointer path re-binds it and both
+    // icons return. The rows are re-read on the next open rather than carried — the caches were
+    // dropped when the pointer was released (`invalidateConfigPanes`).
+    harnessRow('Instruct').click();
+    await flush();
+
+    expect(group.hidden).toBe(false);
+    expect(tools.hidden).toBe(false);
+    expect(plugins.hidden).toBe(false);
+});
+
 // --- R1: phone disclosures, DOM/state --------------------------------------
 
 it('opens harness details from the clickable title and keeps the dashboard reachable from the tools head', async () => {
@@ -343,9 +462,14 @@ it('opens harness details from the clickable title and keeps the dashboard reach
     expect(button.textContent).toBe('Instruct');
     expect(title.textContent).toBe('Instruct');
 
-    // The desktop note stays in the DOM with its text (the phone block hides it; the
-    // dialog carries the details instead).
-    expect(note.textContent).toBe('Edits apply to new sessions');
+    // The desktop note's text is what the details dialog below carries. T4: this boot has a
+    // CONVERSATION open, and a saved conversation's head carries no note at all —
+    // `renderHarnessChrome` blanks it and sets `hidden` (main.ts:6891-6908), because
+    // "Edits apply to new sessions" is a sentence about the harness definition, not about the
+    // conversation on screen. The element stays in the DOM (the phone block and the archived
+    // branches both need it back), it is simply empty and hidden here.
+    expect(note.textContent).toBe('');
+    expect(note.hidden).toBe(true);
     expect(head.dataset.expanded).toBeUndefined();
 
     // Press: the shared modal opens with the selected harness's own details.
@@ -360,14 +484,21 @@ it('opens harness details from the clickable title and keeps the dashboard reach
     );
     // Existing metadata only (the same line the rail rows show): kind · agent count.
     expect(dialog.querySelector('.harness-details-meta')?.textContent).toBe('template · 1 agent');
-    // The header note is hidden on a phone, so the dialog carries it too.
-    expect(dialog.querySelector('.harness-details-note')?.textContent).toBe(
-        'Edits apply to new sessions'
-    );
-    // The aggregate totals are OMITTED here: this boot has no conversations at all, and
-    // a row of zeros would read as a measurement (session-pills.test.ts pins the row
-    // itself, including its exact figures).
-    expect(dialog.querySelector('.harness-details-stats')).toBeNull();
+    // The header note is hidden on a phone, so the dialog repeats it — and T3/R1 left a saved
+    // conversation with NO note, so there is nothing to repeat here: the element is absent, not
+    // empty (`main.ts:3963`). The sentence itself still belongs to the harness definition, and
+    // the unbound case (`bootWith([])`, and the archived branch) is where it prints.
+    expect(dialog.querySelector('.harness-details-note')).toBeNull();
+    // The aggregate totals render HERE because this boot has a conversation: the row is gated on
+    // `summary.sessions > 0` (main.ts:3948-3955), which an empty roster failed and one
+    // conversation passes. Its single figure is the thread tally across every conversation of
+    // this harness, and the conversation this fixture ships has no turns, so the exact answer is
+    // zero (`session-pills.test.ts` pins the row's other shapes, including its stale-frame no-op).
+    const stats = byClass('.harness-details-stats', 'p');
+
+    expect(
+        [...stats.querySelectorAll<HTMLElement>('.harness-details-stat')].map((node) => [node.title, node.textContent])
+    ).toEqual([['Threads across all sessions of this harness', '0 threads']]);
     expect(document.activeElement).toBe(dialog);
 
     // Closing restores focus to the title button.
@@ -472,7 +603,12 @@ it('moves focus to the tools toggle when the details dialog is closed by that sw
 });
 
 it('keeps the agent configuration reachable from the composer button at every width', async () => {
-    await boot();
+    // This test is about the composer's agent button and the dialog it opens, not about the
+    // session-scoped panes, so it boots the way this file always did: a harness with NO
+    // conversation. The dialog therefore edits the harness TEMPLATE — which is the state whose
+    // remove/promote/`[+]` rules are pinned below; a saved conversation edits its own frozen
+    // roster instead (./main.ts `ensureSession`'s note, pinned in the agent-dialog suite).
+    await bootWith([]);
 
     // Nothing from the old deck sits permanently in the chat chrome any more.
     expect(document.querySelector('.agent-row')).toBeNull();
@@ -961,4 +1097,24 @@ it('reveals the compact harness head and agent strip only at <=860px', () => {
     // has nothing left to override).
     expect(blockOf('.harness-title-row {')).toContain('align-items: center');
     expect(phone).not.toContain('.harness-title-row');
+});
+
+it('takes the hidden catalogues out of the layout, not just out of the DOM', () => {
+    // T4: `hidden` on its own hides NOTHING here. `.harness-title-tools` declares
+    // `display: flex` and both buttons declare `display: inline-flex`, and an AUTHOR rule always
+    // outranks the UA stylesheet's `[hidden] { display: none }` at equal specificity
+    // (styles.css:1893-1915). Delete these three declarations and the unbound state still shows
+    // two pressable icons — jsdom would keep reporting `hidden === true` while the reader sees
+    // the old chrome, so the claim has to be pinned against the sheet.
+    expect(blockOf('.harness-title-tools[hidden] {')).toContain('display: none');
+    // The two icons are covered by ONE rule, so the selector list itself is the pin: a rule that
+    // named only one of them would leave the other icon on screen.
+    expect(rules).toContain('.tools-toggle[hidden],\n.plugins-toggle[hidden] {');
+    expect(blockOf('.tools-toggle[hidden],')).toContain('display: none');
+    expect(blockOf('.plugins-toggle[hidden] {')).toContain('display: none');
+    // The base rules the override exists to beat, pinned so the pair cannot be "fixed" by
+    // deleting the base `display` instead.
+    expect(blockOf('.harness-title-tools {')).toContain('display: flex');
+    expect(blockOf('.tools-toggle {')).toContain('display: inline-flex');
+    expect(blockOf('.plugins-toggle {')).toContain('display: inline-flex');
 });

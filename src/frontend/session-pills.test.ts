@@ -12,11 +12,21 @@
 //     in the tooltip, never in rendered text;
 //   - state: the open conversation's pill carries `data-active="true"`;
 //   - actions: a pill opens its session, `×` deletes it, the `+` (in the header row AND in
-//     the dashboard) starts a fresh conversation. T9 removed the manual Refresh control;
+//     the dashboard) starts a fresh conversation. T3 made that create EAGER: one press is
+//     exactly one `POST /v1/harness/sessions`, the card adopts the server-assigned id, a
+//     second press creates a SECOND conversation (no dedup, and a press that lands while the
+//     first create is still awaiting its answer creates one too), and a rejected create leaves
+//     an unbound draft plus an error pill — the four `+` cases in the middle of this file pin
+//     R1/R2/R3 of that rule. A FIFTH case (F1) pins the PRE-FLIGHT refusal instead: with
+//     `requiresEndpoint` and a blank base URL the press issues NO request at all and leaves the
+//     bound conversation, its active pill and its `localStorage` pointer exactly as they were,
+//     stating `run()`'s endpoint sentence rather than the `new session: <reason>` detail a rejected
+//     write paints. T9 removed the manual Refresh control;
 //     the directory re-read that used to sit behind it is still automatic (see the
 //     rejected-submit test below). The busy/disabled rules the rail buttons carried are NOT
 //     inherited wholesale: opening a conversation and creating one are gated by `submitting`
-//     (plus boot/archived for the create) only — never by a run — so a working conversation
+//     (plus boot/archived for the create) only — never by a run, and never by a create that
+//     is already in flight — so a working conversation
 //     can always be switched away from (see canonical-directory-live-main.test.ts);
 //   - empty state: a short hint, not the old "Locked to <harness>" sentence;
 //   - R3 (T9): `openHarnessDetails` puts that Sessions section in the dialog at
@@ -35,6 +45,10 @@ import { withViewRoutes } from './view-test-support';
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
 
 const SESSION_KEY = 'underload-harness-app:session';
+// The stored endpoint settings (main.ts `loadSettings`): seeding this key is the only way a
+// fixture reaches a BLANK `settings.baseURL`, because `applyDefaults` never overwrites a stored
+// settings document (main.ts F4). Used by the no-endpoint `+` refusal below.
+const SETTINGS_KEY = 'underload-harness-app:settings';
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 const T = 1_700_000_000_000;
 
@@ -471,14 +485,19 @@ it('deletes a session from its pill with one click', async () => {
     );
 });
 
-it('starts a fresh conversation from the header `+`, without opening the dashboard', async () => {
+it('creates the conversation on the server from the header `+`, without opening the dashboard', async () => {
     const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+    // T3 (R1): `+` is now a SERVER create, so the answer carries a brand-new id the UI has
+    // never seen, with no turns and no threads — the state the user called out as valid.
+    const created = snapshot({ id: 's-fresh', harnessDefinition: descriptor(), turns: [] });
     localStorage.setItem(SESSION_KEY, 's1');
 
-    const calls = stubFetch((url) => {
+    const calls = stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap({ sessions: [first] }));
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1') return json({ session: first });
+        if (url === '/api/sessions' && method === 'POST') return json({ session: created }, 201);
+        if (url === '/api/sessions/s-fresh') return json({ session: created });
         return undefined;
     });
 
@@ -495,18 +514,339 @@ it('starts a fresh conversation from the header `+`, without opening the dashboa
 
     headerNew().click();
     await flush();
+    await flush();
 
-    // Same contract the rail's New session had: no conversation write is sent, the pointer
-    // is forgotten, the transcript is empty and no pill is active. (`/v1/harness/models` is
-    // the background provider discovery POST boot always fires, not a conversation write.)
+    // T3 (R1): the click sends EXACTLY ONE conversation write — the create — and nothing
+    // else. (`/v1/harness/models` is the background provider-discovery POST boot always
+    // fires; it is not a conversation write, and the match is the ROUTE so a directory
+    // READ of the same path is not counted.)
     expect(
-        calls.filter((call) => (call.method === 'POST' || call.method === 'DELETE') && call.url !== '/v1/harness/models')
-    ).toEqual([]);
-    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+        calls.filter(
+            (call) =>
+                (call.method === 'POST' || call.method === 'DELETE') &&
+                call.url !== '/v1/harness/models'
+        )
+    ).toEqual([
+        {
+            url: '/v1/harness/sessions',
+            method: 'POST',
+            body: {
+                harness: 'instruct',
+                settings: { base_url: 'http://provider/v1', api_key: '', model: 'm1' }
+            }
+        }
+    ]);
+
+    // The card ADOPTS the server-assigned id: the pointer moves to the new conversation (it
+    // is the one on screen), the cycler names it, and its pill is the active one.
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-fresh');
+    expect(byClass('.session-cycle', 'button').hidden).toBe(false);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s-fresh');
+
+    // An empty conversation: no tiles, and the empty transcript card still on screen.
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(document.querySelector('.empty-text')?.textContent).toBe(
+        'Send a task below to start this harness.'
+    );
+
+    // The directory gained the new conversation, and the OLD one is no longer active.
+    expect(pillIds(dashboard())).toEqual(['s1', 's-fresh']);
+    expect(
+        dashboard().querySelector('.session-pill[data-session-id="s-fresh"] .session-pill-select')
+            ?.dataset.active
+    ).toBe('true');
+    expect(
+        dashboard().querySelector('.session-pill[data-session-id="s1"] .session-pill-select')
+            ?.dataset.active
+    ).toBeUndefined();
+});
+
+// T3 (R2): the user's rule is that EVERY press makes a conversation — "it is up to user to
+// spam them". No dedup, no reuse of the id that is already bound, no client-side cap: the
+// teardown clears the pointer first, so the second press is indistinguishable from the first.
+it('creates ANOTHER conversation on a second `+`, with a second distinct id', async () => {
+    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+    let issued = 0;
+    // Each POST answers with a FRESH uuid, exactly as `POST /v1/harness/sessions` does
+    // (`id: randomUUID()` on the server), so a reused id would be visible in the log.
+    const bodies = new Map<string, SessionSnapshot>();
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [first] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === 'POST') {
+            issued += 1;
+            const id = `s-made-${issued}`;
+            const record = snapshot({ id, harnessDefinition: descriptor(), turns: [] });
+            bodies.set(id, record);
+
+            return json({ session: record }, 201);
+        }
+        const read = /^\/api\/sessions\/(s1|s-made-\d+)$/.exec(url);
+        if (read !== null) {
+            const record = read[1] === 's1' ? first : bodies.get(read[1]);
+            if (record === undefined) return json({ error: { message: 'unknown session' } }, 404);
+
+            return json({ session: record });
+        }
+        return undefined;
+    });
+
+    localStorage.setItem(SESSION_KEY, 's1');
+    await import('./main');
+    await flush();
+    await flush();
+
+    headerNew().click();
+    await flush();
+    await flush();
+    headerNew().click();
+    await flush();
+    await flush();
+
+    // TWO creates, TWO distinct ids, and the card points at the SECOND one.
+    const creates = calls.filter(
+        (call) => call.method === 'POST' && call.url === '/v1/harness/sessions'
+    );
+
+    expect(creates.map((call) => (call.body as { harness: string }).harness)).toEqual([
+        'instruct',
+        'instruct'
+    ]);
+    expect(issued).toBe(2);
+    expect(pillIds(dashboard())).toEqual(['s1', 's-made-1', 's-made-2']);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s-made-2');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-made-2');
+});
+
+// T3 (R2): a SECOND press while the first create is still awaiting its answer is a separate
+// action, not a deduplicated one. The double-click is the honest shape of it: the shell has no
+// idea a second press is coming, so the case fires both clicks in one tick and the fixture
+// holds BOTH answers open until the reader has pressed twice. `creatingSessions` guards a
+// single create's own double-send; it must not swallow a press.
+it('issues a create for each `+` even while the first one is still awaiting its answer', async () => {
+    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+
+    // The two answers are held on a gate the case opens itself, so "in flight" is a fact of
+    // the fixture and not a guess about microtask ordering.
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+        release = resolve;
+    });
+    let issued = 0;
+    const bodies = new Map<string, SessionSnapshot>();
+
+    const calls = stubFetch(async (url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [first] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1') return json({ session: first });
+        if (url === '/api/sessions' && method === 'POST') {
+            issued += 1;
+            const id = `s-held-${issued}`;
+            const record = snapshot({ id, harnessDefinition: descriptor(), turns: [] });
+            bodies.set(id, record);
+            await gate;
+
+            return json({ session: record }, 201);
+        }
+        const read = /^\/api\/sessions\/(s1|s-held-\d+)$/.exec(url);
+        if (read !== null) {
+            const record = read[1] === 's1' ? first : bodies.get(read[1]);
+            if (record === undefined) return json({ error: { message: 'unknown session' } }, 404);
+
+            return json({ session: record });
+        }
+        return undefined;
+    });
+
+    localStorage.setItem(SESSION_KEY, 's1');
+    await import('./main');
+    await flush();
+    await flush();
+
+    // Both presses land in the same tick, so the second one finds the first request open.
+    headerNew().click();
+    headerNew().click();
+    await flush();
+
+    expect(issued).toBe(2);
+    release();
+    await flush();
+    await flush();
+
+    // TWO records, and the card points at the conversation whose answer arrived LAST.
+    expect(
+        calls.filter((call) => call.method === 'POST' && call.url === '/v1/harness/sessions')
+    ).toHaveLength(2);
+    expect(pillIds(dashboard())).toEqual(['s1', 's-held-1', 's-held-2']);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s-held-2');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-held-2');
+});
+
+// T3 (R3): a create that FAILS must leave a coherent state, not a phantom conversation. The
+// teardown has already released the previous card, and `ensureSession` writes nothing before
+// its request settles, so the card is simply still an empty draft — with the failure said out
+// loud on the app-scoped pill.
+it('leaves an unbound draft and an error pill when the create is rejected', async () => {
+    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [first] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1') return json({ session: first });
+        if (url === '/api/sessions' && method === 'POST')
+            return json({ error: { message: 'provider is offline' } }, 500);
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // A draft is typed BEFORE the press, because the rule is that a failed create must not
+    // cost the reader their text.
+    byClass('.composer-input', 'textarea').value = 'keep me';
+    headerNew().click();
+    await flush();
+    await flush();
+
+    // The create was attempted once, and nothing else was written.
+    expect(
+        calls.filter(
+            (call) =>
+                (call.method === 'POST' || call.method === 'DELETE') &&
+                call.url !== '/v1/harness/models'
+        )
+    ).toEqual([
+        {
+            url: '/v1/harness/sessions',
+            method: 'POST',
+            body: {
+                harness: 'instruct',
+                settings: { base_url: 'http://provider/v1', api_key: '', model: 'm1' }
+            }
+        }
+    ]);
+
+    // NO phantom session: nothing bound, no pill marked active, no directory row for a
+    // conversation the server never made, and the pointer stays where the failed create left
+    // it (the previous conversation is released — the draft is the state to retry from).
     expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBeUndefined();
     expect(pillIds(dashboard())).toEqual(['s1']);
-    expect(dashboard().querySelector('.session-pill-select')?.dataset.active).toBeUndefined();
+    expect(
+        dashboard().querySelector('.session-pill[data-session-id="s1"] .session-pill-select')
+            ?.dataset.active
+    ).toBeUndefined();
+
+    // The empty transcript is ready for the retry, and the draft survived.
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(document.querySelector('.empty-text')?.textContent).toBe(
+        'Send a task below to start this harness.'
+    );
+    expect(byClass('.composer-input', 'textarea').value).toBe('keep me');
+
+    // The failure is stated on the app-scoped pill (R1: a failed app write, not a run
+    // outcome), with the server's own reason in the tooltip.
+    const status = byClass('.status', 'span');
+    expect(status.dataset.state).toBe('error');
+    expect(status.getAttribute('title')).toBe('new session: provider is offline');
+
+    // And the `+` is still usable: a failed create must not strand the reader.
+    expect(headerNew().disabled).toBe(false);
+});
+
+// F1 (this pass): the create is EAGER, so `+` now dials `POST /v1/harness/sessions` from the press
+// itself — and a harness whose descriptor sets `requiresEndpoint` is refused SERVER-side when no
+// provider base URL is configured (`sessions.ts` `create` answers
+// `Harness "general" needs a provider base URL.`). The old order therefore did real damage before
+// the refusal arrived: the teardown had already run, so `forgetRememberedSession()` had dropped the
+// `localStorage` pointer and the conversation the reader was in was gone from the screen AND from
+// the next reload. `newSession()` now refuses with `run()`'s own guard at the very top, BEFORE any
+// teardown. Pinned here, all at once: zero conversation writes, the open conversation and its
+// pointer untouched, `run()`'s exact sentence on the board, and the status pill stating the missing
+// SETTING rather than the `new session: <reason>` detail a rejected create paints.
+it('refuses `+` with no endpoint configured, with no request and the open conversation intact', async () => {
+    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+
+    // A BLANK base URL is a stored-settings fact: `applyDefaults` skips a stored document
+    // (main.ts F4), so seeding `SETTINGS_KEY` with an empty `baseURL` is the only way to boot with
+    // no endpoint, and it is exactly what the Endpoint & model dialog leaves behind when the field
+    // is cleared. `requiresEndpoint: true` is this file's own descriptor default, so the harness
+    // side of the guard needs no override.
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ baseURL: '', apiKey: '', model: 'm1' }));
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [first] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1') return json({ session: first });
+        // The create IS answered, so a regression that issues the request is caught by the exact
+        // call list below (and by the pointer/tile assertions), not by an unexpected-request throw.
+        if (url === '/api/sessions' && method === 'POST')
+            return json({ session: snapshot({ id: 's-created', harnessDefinition: descriptor(), turns: [] }) }, 201);
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // The card is bound to the saved conversation BEFORE the press — the state the guard must
+    // preserve — so the assertions after it cannot pass by accident.
+    expect(byClass('.session-cycle', 'button').hidden).toBe(false);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s1');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
+
+    headerNew().click();
+    await flush();
+    await flush();
+
+    // NO request at all: the press issued nothing, so the server never saw a create it had to
+    // refuse. (`/v1/harness/models` is the background provider-discovery POST boot always fires;
+    // it is a read of the provider list, not a conversation write — see the test above.)
+    expect(
+        calls.filter(
+            (call) =>
+                (call.method === 'POST' || call.method === 'DELETE' || call.method === 'PATCH') &&
+                call.url !== '/v1/harness/models'
+        )
+    ).toEqual([]);
+    expect(calls.filter((call) => call.url === '/v1/harness/sessions' && call.method === 'POST')).toHaveLength(0);
+
+    // NO teardown: the conversation the reader was in is still the one on screen, with its
+    // transcript, its ACTIVE pill, and its pointer still in `localStorage` (the secondary defect
+    // this fix removes: the reload would otherwise reopen nothing).
+    expect(byClass('.session-cycle', 'button').hidden).toBe(false);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s1');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
+    expect(document.querySelector('.tile')?.textContent).toContain('hello');
+    expect(
+        dashboard().querySelector('.session-pill[data-session-id="s1"] .session-pill-select')
+            ?.dataset.active
+    ).toBe('true');
+    // No directory row for a conversation the server never made.
+    expect(pillIds(dashboard())).toEqual(['s1']);
+
+    // The refusal is stated where `run()` states it: the board's notice line, with the same words.
+    const notices = [...document.querySelectorAll<HTMLElement>('.log .notice')];
+    expect(notices.map((node) => [node.dataset.tone, node.textContent])).toEqual([
+        ['info', 'set a base URL in Endpoint & model, then run again']
+    ]);
+
+    // And the pill carries the ENDPOINT diagnostic, not the rejected-create one: `error` +
+    // `new session: <server sentence>` is the shape of a write the server refused, and this press
+    // never wrote anything.
+    const status = byClass('.status', 'span');
+    expect(status.dataset.state).toBe('error');
+    expect(status.getAttribute('title')).toBe('no endpoint configured');
+    expect(status.getAttribute('title')).not.toContain('new session');
+    expect(byClass('.status-detail', 'span').textContent).toBe('no endpoint configured');
+
+    // The action stays available: configuring the endpoint and pressing `+` again is the recovery,
+    // and a refusal that consumed nothing must not have cost the reader the draft either.
+    expect(headerNew().disabled).toBe(false);
 });
 
 // T9 removed the manual Refresh BUTTON; this pins what replaced it as the contract: the

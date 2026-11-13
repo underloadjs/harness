@@ -23,6 +23,12 @@
 // `pending delegation placeholder (delegate-stress T1.3/T1.4)`,
 // `liveness wake covers a delegated child (policy 2026-11-09 T8)` and
 // `harness source shape (policy 2026-11-09 T5.5)` at the end of this file.
+//
+// Finding I5 adds the COUNT bound a caller sets on ONE delegation: `maxTurns` caps the
+// child's model turns and can only lower the harness-wide `maxIterations`. See
+// `per-delegation turn cap (I5)`, and note the T5.5 block now also pins that BOTH
+// opt-in clocks (this file's `timeoutMs` and `threadFork`'s) arm through the single
+// `armWallClock` helper in `src/harness.ts`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -1662,6 +1668,289 @@ describe('liveness wake covers a delegated child (policy 2026-11-09 T8)', () => 
 });
 
 // ---------------------------------------------------------------------------
+// Per-delegation turn cap (I5 — the COUNT bound a caller sets on one `delegate`)
+// ---------------------------------------------------------------------------
+//
+// `maxTurns` sits next to `timeoutMs` on a single delegation: `timeoutMs` bounds the
+// child's wall clock, this bounds its model turns (tool rounds). The contract pinned
+// here:
+//   - it caps the CHILD's model requests and nothing else, and it is counted, not timed;
+//   - an omitted `maxTurns` leaves the harness-wide `maxIterations` limit in charge, and
+//     a set value can only LOWER that limit (core/agent-limits.ts:88-90 is the prose,
+//     src/harness.ts `runAgentCore` is the enforcement);
+//   - running out of turns means the child NEVER ANSWERED, so the envelope keeps the
+//     unfinished-run shape (status + partialContent + cancelledAtMessage) rather than
+//     presenting a truncated turn as a final answer;
+//   - the error text says WHICH bound fired: only the per-run cap adds the
+//     "this run was given" suffix, so a caller can tell its own cap from the session's.
+//
+// Every case goes through an unvalidated HOST tool calling
+// `harness.runtime.delegate` directly — the same door the
+// `delegation time limits (policy 2026-11-09)` block uses for `timeoutMs`, and the door
+// that proves the runtime is not merely relying on schema validation. The model-facing
+// door cannot carry `maxTurns` yet: the generated `src/core/tool-manifest.ts` row for
+// `delegate` still has ZERO occurrences of the property, so a model argument fails the
+// schema's additionalProperties check until `yarn tools:manifest` regenerates that row
+// (another task's edit). The model-visible schema is therefore pinned from the tool
+// module below, which is the object the manifest row is generated from.
+describe('per-delegation turn cap (I5)', () => {
+    // A child that never answers: every model turn emits text plus one tool round, so
+    // the ONLY thing that can end it is a count bound. Call ids are fresh per turn
+    // because re-using one is a hard harness error, not a second round. Pass `answerAt`
+    // to have the same child answer on that turn instead — that is how "the cap did not
+    // interfere" is told apart from "the cap fired one turn too early".
+    const childTurns = (seen: HarnessStreamRequest[], answerAt?: number): HarnessStream => {
+        return async function* stream(request) {
+            seen.push(request);
+            const turn = seen.length;
+
+            if (answerAt !== undefined && turn >= answerAt) {
+                for (const frame of answer('an answer')) yield frame;
+                return;
+            }
+
+            yield { type: 'text', delta: `pass ${turn}` };
+            yield {
+                type: 'done',
+                stopReason: 'tool_calls',
+                toolCalls: [{ id: `p${turn}`, name: 'peek', arguments: '{}' }]
+            };
+        };
+    };
+
+    // The host door, mirroring `hangingChild` above: the tool builds the delegate input
+    // itself, so a value outside the model schema's 1-64 still reaches the runtime here.
+    // Only the two bounds under test are optional; the brief is fixed.
+    const cappedChild = (options: {
+        seenChild: HarnessStreamRequest[];
+        maxTurns?: number;
+        maxIterations?: number;
+        answerAt?: number;
+    }) => {
+        const researcher = brain(childTurns(options.seenChild, options.answerAt));
+        const writerAgent = brain(scripted([callTool('c1', 'hostDelegate', '{}'), answer('final')]));
+
+        const hostDelegate = tool({
+            description: 'Delegate through the unvalidated host path.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: (context) =>
+                context.harness!.runtime.delegate(
+                    context.agent,
+                    {
+                        agent: 'researcher',
+                        input: 'find facts',
+                        ...(options.maxTurns === undefined ? {} : { maxTurns: options.maxTurns })
+                    },
+                    context.run!,
+                    context.runDepth,
+                    context.signal,
+                    context.callId,
+                    context.runScope
+                )
+        });
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            tools: {
+                peek: tool({ description: 'Peek.', tags: ['test'], visibility: 'core', execute: () => 'a fact' }),
+                hostDelegate
+            },
+            presets: false,
+            ...(options.maxIterations === undefined ? {} : { maxIterations: options.maxIterations })
+        });
+
+        return { writer, writerAgent };
+    };
+
+    // The envelope the PARENT was handed, minus `durationMs` — a measured span no
+    // assertion here owns (the T28 contract test above pins the identity fields with
+    // expect.any). The rest is asserted WHOLE with toEqual, so an extra, missing or
+    // renamed field in the unfinished-run shape fails here instead of sliding past a
+    // toMatchObject.
+    const envelopeOf = (message: unknown): Record<string, unknown> => {
+        const { durationMs, ...rest } = delegationOf(message);
+        expect(durationMs).toEqual(expect.any(Number));
+        return rest;
+    };
+
+    it('caps the child at exactly maxTurns model turns and names that cap', async () => {
+        const seenChild: HarnessStreamRequest[] = [];
+        const { writer, writerAgent } = cappedChild({ maxTurns: 2, seenChild });
+
+        await writer('go');
+
+        // EXACTLY two model requests; the third would have been another tool round.
+        // This is the whole point of the cap: bounded work, counted.
+        expect(seenChild).toHaveLength(2);
+
+        // A run that runs out of turns ROLLS BACK its own turns, exactly like the
+        // harness-wide `maxIterations` guard does, so the child's readable transcript is
+        // empty afterwards and the envelope's `partialContent` below is the only
+        // surviving evidence of the two turns it did spend. The thread record itself
+        // stays addressable (idle, at sequence 2, owned by the requesting thread — that
+        // contract belongs to `src/harness.thread-runtime.test.ts`).
+        expect(writer.threadMessages('agent:researcher')).toEqual([]);
+        expect(writer.thread('agent:researcher')?.sequence).toBe(2);
+
+        // Out of turns means NOT ANSWERED: the unfinished-run envelope, with the
+        // per-run suffix "this run was given" marking this cap (not the session
+        // limit) as the bound that fired. `content` and `partialContent` are the last
+        // turn's text, which is what the child had actually produced.
+        expect(envelopeOf(writerAgent.messages[2])).toEqual({
+            agent: 'researcher',
+            content: 'pass 2',
+            contentLength: 6,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'agent:researcher',
+            status: 'failed',
+            error:
+                'Agent "researcher" requested tools more than 2 times without answering, the 2 turns this run was given.',
+            partialContent: 'pass 2',
+            cancelledAtMessage: 5
+        });
+
+        // The capped child is DATA for the parent, not a failed parent: the parent's own
+        // run continues to its answer, and the released child thread is idle again.
+        expect(content(writerAgent.messages[3])).toBe('final');
+        expect(writer.thread('agent:researcher')?.status).toBe('idle');
+    });
+
+    it('falls back to the harness-wide maxIterations when maxTurns is omitted, without naming a run', async () => {
+        const seenChild: HarnessStreamRequest[] = [];
+        const { writer, writerAgent } = cappedChild({ maxIterations: 3, seenChild });
+
+        await writer('go');
+
+        expect(seenChild).toHaveLength(3);
+
+        // The session bound fired, so the sentence has NO per-run suffix — the reader
+        // can tell "my cap" from "the session's cap" from the text alone.
+        expect(envelopeOf(writerAgent.messages[2])).toEqual({
+            agent: 'researcher',
+            content: 'pass 3',
+            contentLength: 6,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'agent:researcher',
+            status: 'failed',
+            error: 'Agent "researcher" requested tools more than 3 times without answering.',
+            partialContent: 'pass 3',
+            cancelledAtMessage: 7
+        });
+    });
+
+    it('only lowers the session bound: maxTurns above maxIterations does not raise it', async () => {
+        const seenChild: HarnessStreamRequest[] = [];
+        const { writer, writerAgent } = cappedChild({ maxTurns: 9, maxIterations: 2, seenChild });
+
+        await writer('go');
+
+        // A host asking for nine turns against a session limit of two gets two, and the
+        // unsuffixed sentence again. `maxTurns` is not a way to buy more work.
+        expect(seenChild).toHaveLength(2);
+        expect(envelopeOf(writerAgent.messages[2])).toEqual({
+            agent: 'researcher',
+            content: 'pass 2',
+            contentLength: 6,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'agent:researcher',
+            status: 'failed',
+            error: 'Agent "researcher" requested tools more than 2 times without answering.',
+            partialContent: 'pass 2',
+            cancelledAtMessage: 5
+        });
+    });
+
+    it('leaves a child that answers inside its cap completely alone', async () => {
+        const seenChild: HarnessStreamRequest[] = [];
+        const { writer, writerAgent } = cappedChild({ maxTurns: 3, answerAt: 2, seenChild });
+
+        await writer('go');
+
+        expect(seenChild).toHaveLength(2);
+
+        // The completed envelope, and the strict toEqual is what proves the ABSENCE of
+        // error/partialContent/cancelledAtMessage: a cap that never fired leaves no
+        // trace of being a cap at all.
+        expect(envelopeOf(writerAgent.messages[2])).toEqual({
+            agent: 'researcher',
+            content: 'an answer',
+            contentLength: 9,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'agent:researcher',
+            status: 'completed'
+        });
+    });
+
+    it('cuts a child that would have answered one turn later, and says so in the same shape', async () => {
+        const seenChild: HarnessStreamRequest[] = [];
+        const { writer, writerAgent } = cappedChild({ maxTurns: 1, answerAt: 2, seenChild });
+
+        await writer('go');
+
+        // The cap is a hard count, not a "let it finish" hint: the answer the child
+        // would have produced on turn 2 is never asked for.
+        expect(seenChild).toHaveLength(1);
+        expect(envelopeOf(writerAgent.messages[2])).toEqual({
+            agent: 'researcher',
+            content: 'pass 1',
+            contentLength: 6,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'agent:researcher',
+            status: 'failed',
+            error:
+                'Agent "researcher" requested tools more than 1 times without answering, the 1 turns this run was given.',
+            partialContent: 'pass 1',
+            cancelledAtMessage: 3
+        });
+    });
+
+    it('declares the model-facing bounds the schema says: 1-64, optional, unknown keys refused', async () => {
+        // Read from the tool module rather than the model door: the generated manifest
+        // row is regenerated by another task, and this is the object it is generated
+        // from, so the pin holds before and after that regeneration.
+        const delegateModule = await import('./tools/runtime/delegate.tool');
+
+        const maxTurnsSchema = {
+            type: 'integer',
+            minimum: 1,
+            maximum: 64,
+            description:
+                'Optional cap on how many model turns (tool rounds) the child run may take, 1-64. OMIT IT to use the harness-wide limit for this session, which is what normally applies; set it to keep a quick lookup cheap or to bound a long research run. A child that runs out of turns has not answered, so its result is reported like any other unfinished run - its status plus the partialContent it had produced - instead of a final answer it never gave.'
+        };
+
+        // The catalogue form (no subagents) and the live session declaration are the
+        // SAME schema object content: the live one is derived from the literal, so a new
+        // delegate argument is written once and both forms advertise it.
+        expect(delegateModule.metadata.parameters.properties.maxTurns).toEqual(maxTurnsSchema);
+        expect(delegateModule.agentDelegateMetadata(['researcher']).parameters?.properties?.maxTurns).toEqual(
+            maxTurnsSchema
+        );
+
+        // Optional: `maxTurns` is NOT in `required`, and `additionalProperties: false` is
+        // what turns an out-of-range model argument into a refusal instead of a clamp.
+        expect(delegateModule.metadata.parameters.required).toEqual(['agent', 'input']);
+        expect(delegateModule.metadata.parameters.additionalProperties).toBe(false);
+    });
+});
+
+
+// ---------------------------------------------------------------------------
 // Policy doc T5.5 — the guard that keeps the policy from rotting
 // ---------------------------------------------------------------------------
 //
@@ -1702,5 +1991,53 @@ describe('harness source shape (policy 2026-11-09 T5.5)', () => {
         // "no limit by default" fact lives (core/agent-limits.ts, value infinity).
         const fallback = codeLines(lines, ': DELEGATE_TIMEOUT_MS');
         expect(fallback).toHaveLength(1);
+    });
+
+    it('arms BOTH opt-in clocks through that one helper, and reads the fork bound it declares', () => {
+        const lines = harnessSource();
+
+        // The helper's own arm site is still the ONLY timer in the file, still behind the
+        // finiteness check, and its disarm is still guarded by the existence check — the
+        // two assertions above, restated against the helper's locals so moving the arm
+        // into `armWallClock` cannot silently drop them.
+        const armed = codeLines(lines, 'timeoutTimer = setTimeout(');
+        expect(armed).toHaveLength(1);
+        expect(lines[armed[0].index - 1]).toContain('if (Number.isFinite(timeoutMs)) {');
+
+        const cleared = codeLines(lines, 'if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);');
+        expect(cleared).toHaveLength(1);
+
+        // B1: a fork's clock is the SAME mechanism, not a second one. Both doors call the
+        // helper and both call the closure it returns, so neither can leak a live timer
+        // past its run, and a third clock would have to edit this test on purpose.
+        const armedDoors = codeLines(lines, '= armWallClock(');
+        expect(armedDoors).toHaveLength(2);
+        expect(armedDoors.map(({ line }) => line)).toEqual([
+            expect.stringContaining('const disarmWallClock = armWallClock('),
+            expect.stringContaining('const disarmWallClock = armWallClock(')
+        ]);
+        expect(lines.join('\n')).toContain('`Delegation to "${target}"`,');
+        expect(lines.join('\n')).toContain('`Thread branch "${metadata.branchId}"`,');
+
+        const disarmed = codeLines(lines, 'disarmWallClock();');
+        expect(disarmed).toHaveLength(2);
+
+        // B1, second half: the fork's omitted bound resolves to ONE readable constant
+        // (infinity, i.e. no clock) and the harness option that overrides it is actually
+        // read. The finding this pins is that `threadForkTimeoutMs` used to be declared
+        // and read by nobody, so a host that set it got silence.
+        const forkFallback = codeLines(lines, 'const FORK_TIMEOUT_DEFAULT_MS = Number.POSITIVE_INFINITY;');
+        expect(forkFallback).toHaveLength(1);
+
+        const forkBound = codeLines(lines, 'resolveForkTimeoutMs(');
+        expect(forkBound).toHaveLength(2);
+        expect(forkBound.map(({ line }) => line.trim())).toEqual([
+            'const threadForkTimeoutMs = resolveForkTimeoutMs(',
+            'const forkTimeoutMs = resolveForkTimeoutMs('
+        ]);
+
+        // Exactly one read of the configuration field, and it is the line above.
+        const configured = codeLines(lines, 'configuration.threadForkTimeoutMs,');
+        expect(configured).toHaveLength(1);
     });
 });

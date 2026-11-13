@@ -162,6 +162,10 @@ export const THREAD_FORK_NAME = descriptorOf('threadFork').name;
 export const THREAD_SEND_NAME = descriptorOf('threadSend').name;
 export const THREAD_READ_NAME = descriptorOf('threadRead').name;
 export const THREAD_LIST_NAME = descriptorOf('threadList').name;
+// B3 (2026-11-13): the row is now projected. `descriptorOf` throws for a name the
+// committed `./tool-manifest` does not carry, so this line could only land once
+// `yarn tools:manifest` had regenerated the table with `threadDelete` (order 255).
+export const THREAD_DELETE_NAME = descriptorOf('threadDelete').name;
 
 // ---------------------------------------------------------------------------
 // Declarative halves, by historical symbol name.
@@ -192,13 +196,12 @@ export const THREAD_FORK_METADATA = coreMetadataOf(THREAD_FORK_NAME);
 export const THREAD_SEND_METADATA = coreMetadataOf(THREAD_SEND_NAME);
 export const THREAD_READ_METADATA = coreMetadataOf(THREAD_READ_NAME);
 export const THREAD_LIST_METADATA = coreMetadataOf(THREAD_LIST_NAME);
-// `threadDelete` (issue 0027) is deliberately NOT projected yet, and that is a load-
-// time fact rather than a style choice: `coreMetadataOf`/`descriptorOf` THROW for a
-// name the committed `./tool-manifest` does not carry. Adding its two rows here before
-// `yarn vite-node scripts/generate-tool-manifest.ts` re-ran would make this module —
-// and every importer of `core/index` — throw on import. The manifest-refresh step adds
-// `THREAD_DELETE_NAME` / `THREAD_DELETE_METADATA` in the same commit that regenerates
-// the table, next to the four rows above.
+// B3 (2026-11-13): `threadDelete` (issue 0027) is projected NOW, and the ordering was
+// the constraint, not taste: `coreMetadataOf`/`descriptorOf` THROW for a name the
+// committed `./tool-manifest` does not carry, so this row could only land in the same
+// step that regenerated the table (`yarn tools:manifest`, 32 descriptors). Before that
+// the row made this module — and every importer of `core/index` — throw on import.
+export const THREAD_DELETE_METADATA = coreMetadataOf(THREAD_DELETE_NAME);
 
 // ---------------------------------------------------------------------------
 // Delegation: the ONE set-projection function in this module.
@@ -243,7 +246,7 @@ export const agentDelegateMetadata = (
 
     return {
         name: baseline.name,
-        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset, invocationId, threadId, status, durationMs, and - for a run that did not complete - error, partialContent, and cancelledAtMessage. threadId and invocationId are HANDLES, not bookkeeping: threadId is the conversation the child ran in, so post a follow-up message into it with threadSend and read its transcript with threadRead, while agentResult pages that answer by invocationId; a finished child thread stays addressable until it is released with threadDelete, which is also how a session frees a thread slot. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset, or delegate again with a larger maxChars. A cancelled or failed child still returns its partialContent and cancelledAtMessage instead of an empty record, so you can see what it had produced and how far it got. maxTurns caps the child's model turns (1-64) when you want a deliberately short run; omit it and the harness-wide limit applies. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder.`,
+        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset and durationMs, and - when the run is identifiable - invocationId, threadId and status; a child whose ledger entry cannot be resolved (released with its thread, or aged out of the bounded result ledger) reports its answer with those three keys ABSENT rather than inventing an identity, and a run that did not complete adds error, partialContent, and cancelledAtMessage. threadId and invocationId are HANDLES, not bookkeeping: threadId is the conversation the child ran in, so post a follow-up message into it with threadSend and read its transcript with threadRead, while agentResult pages that answer by invocationId; a finished child thread stays addressable until it is released with threadDelete, which is also how a session frees a thread slot. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset, or delegate again with a larger maxChars. A cancelled or failed child still returns its partialContent and cancelledAtMessage instead of an empty record, so you can see what it had produced and how far it got. maxTurns caps the child's model turns (1-64) when you want a deliberately short run; omit it and the harness-wide limit applies. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder.`,
         tags: [...baseline.tags],
         visibility: 'core',
         parameters: {

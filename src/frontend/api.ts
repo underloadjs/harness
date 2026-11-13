@@ -1040,6 +1040,49 @@ export const updatePluginSettings = (
         body: JSON.stringify({ settings } satisfies PluginSettingsUpdate)
     }).then((body) => body.plugin);
 
+// ---------------------------------------------------------------------------
+// Session plugins (R4: one session's OWN plugin settings)
+// ---------------------------------------------------------------------------
+//
+// The session-scoped twin of the two calls above, for a pane that owns ONE
+// conversation. A session copies the template's plugin settings at creation and owns
+// that copy afterwards, so these reads answer "what does THIS conversation run with"
+// and the global pair answers "what does the next session here start with". The rows
+// are the same `PluginSummary` schema and the PATCH body is the same
+// `PluginSettingsUpdate`, so one form component serves either scope — only the route
+// (and therefore the scope) differs. An accepted PATCH is live for that session on
+// its next turn with no rebuild, durable before the response, and reaches no other
+// session and not the template.
+
+// `GET /sessions/{id}/plugins` — every built-in, with THIS session's `enabled` and
+// `values`. `revision` on the page is that session's own settings counter.
+export const listSessionPlugins = (id: string, query: PageQuery = {}): Promise<Page<PluginSummary>> =>
+    request<PluginSummaryPage>(
+        `${HARNESS_ROUTES.sessionsBySessionIdPlugins(encodeURIComponent(id))}${pageParams(query)}`
+    ).then(pageOf);
+
+// `GET /sessions/{id}/plugins/{pluginId}` — one row, this session's values. 404 for an
+// unknown session or a plugin this build does not ship.
+export const getSessionPlugin = (id: string, pluginId: string): Promise<PluginSummary> =>
+    request<PluginDetailResponse>(
+        HARNESS_ROUTES.sessionsBySessionIdPluginsByPluginId(encodeURIComponent(id), encodeURIComponent(pluginId))
+    ).then((body) => body.plugin);
+
+// `PATCH /sessions/{id}/plugins/{pluginId}` — edit one plugin FOR THIS SESSION and get
+// the row back: a value replaces this session's override, `null` clears it back to the
+// plugin's declared default, an omitted key is untouched, and `enabled` is the reserved
+// switch. Write-anytime (no idle window), and the next turn of THIS session is the one
+// that changes.
+export const updateSessionPluginSettings = (
+    id: string,
+    pluginId: string,
+    settings: Record<string, number | string | boolean | null>
+): Promise<PluginSummary> =>
+    request<PluginDetailResponse>(
+        HARNESS_ROUTES.sessionsBySessionIdPluginsByPluginId(encodeURIComponent(id), encodeURIComponent(pluginId)),
+        { method: 'PATCH', body: JSON.stringify({ settings } satisfies PluginSettingsUpdate) }
+    ).then((body) => body.plugin);
+
 // Compact, deterministic description of a parsed JSON body, for the discovery
 // failure below. Only the SHAPE is reported: a proxy body can be megabytes of
 // provider HTML that happens to parse, and the operator needs "an object with

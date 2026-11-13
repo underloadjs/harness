@@ -79,14 +79,17 @@ export type LaneTarget = { kind: 'thread'; threadId: string } | { kind: 'root'; 
 // but a rebuild from committed state.
 //
 // `disabledTools` and `pluginSettings` (both R3) join the same list because they are the
-// same KIND of value: durable, deployment-wide settings the coordinator can only hand over as
-// data. The store reads both at THIS moment (../sessions.ts `blueprintFor`, from
-// ../tool-settings.ts `disabled()` and ../plugins.ts `snapshot()`), the host merges them into
-// the `hello` blueprint verbatim below, and the worker turns each back into the provider its
-// harness is built with (./lane-worker-loop.ts `laneToolSettingsProvider` /
-// `lanePluginSettingsProvider`). They are therefore LANE-CREATION snapshots, not live reads -
-// the documented lane semantics for every value that crosses here
-// (../harness.swagger.yaml, the plugin-settings PATCH).
+// same KIND of value: durable settings the coordinator can only hand over as data - but they
+// come from DIFFERENT scopes, and a lane replica must not read that as one deployment-wide
+// pair. `disabledTools` IS process-wide (../tool-settings.ts `disabled()`, one switch for
+// every session), while `pluginSettings` is the SESSION's own snapshot: ../sessions.ts
+// `blueprintFor` hands over `session.plugins.snapshot()`, that conversation's copy made at
+// its creation (../plugins.ts `copyPluginSettingsStore`), never the template store. The
+// store reads both at THIS moment, the host merges them into the `hello` blueprint verbatim
+// below, and the worker turns each back into the provider its harness is built with
+// (./lane-worker-loop.ts `laneToolSettingsProvider` / `lanePluginSettingsProvider`). They are
+// therefore LANE-CREATION snapshots, not live reads - the documented lane semantics for every
+// value that crosses here (../harness.swagger.yaml, the plugin-settings PATCH).
 export type LaneBlueprintSource = Pick<
     LaneBlueprint,
     'record' | 'settings' | 'apiKey' | 'memoryKeys' | 'disabledTools' | 'pluginSettings'

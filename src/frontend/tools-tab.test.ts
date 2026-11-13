@@ -44,20 +44,36 @@
 //     `listAllTools`, and here by the head count equaling the rendered row count);
 //   - R5: NO `.tool-tab-group` heading is emitted and the rows are strictly A–Z by tool name.
 //
-// R1 + R3 (this pass) — the page is ALWAYS reachable and every row states its switch:
-//   - no run gate: the tick box, the rows and the identified-detail read all work while a
-//     conversation is streaming (`setToolsView`/`selectTool` dropped their `running`
-//     guards, and `paintControls` now gates the controls on `booted` alone);
+// R1 + R3 (that pass) — the page is ALWAYS reachable and every row states its switch:
+//   - no run gate on the rows or the identified-detail read (`setToolsView`/`selectTool`
+//     dropped their `running` guards, and `paintControls` gates the controls on `booted`);
 //   - each row carries a corner `input[type=checkbox]` (a `<button>` cannot contain a
-//     control, hence the `.tool-tab-row` wrapper and the absolutely positioned box)
-//     painted from the row's own `enabled`, and one click writes
-//     `PATCH /tools/{tool_id}` `{ enabled: <next> }` — the answer is the whole updated
-//     row, which is what the row repaints from;
-//   - EVERY row gets one, the harness-owned core entries included: the pinned-set flag
-//     and its "core" pin are gone, so there is no affordance-less row shape left.
+//     control, hence the `.tool-tab-row` wrapper and the absolutely positioned box);
+//   - EVERY row gets one, the harness-owned core entries included, so there is no
+//     affordance-less row shape left.
+//
+// T4 (this pass) — the pane describes ONE CONVERSATION, not the deployment:
+//   - it lists `GET /sessions/{id}/tools` for the conversation the card points at
+//     (`src/frontend/main.ts` `configScope`/`loadSessionTools`), read on the pane's FIRST open
+//     and dropped on every conversation change, so the rows can never be the previous
+//     session's;
+//   - the switch writes `PATCH /sessions/{id}/tools/{tool_id}` `{ enabled }` — the conversation
+//     only, never `PATCH /tools/{tool_id}` — and repaints from the session re-read that follows
+//     the accepted write (`main.ts` `setToolEnabled`/`applySessionToolRows`), which is why every
+//     switch assertion below pins a PATCH and the re-read that follows it;
+//   - a row the conversation cannot switch (`protected`: harness-owned core control, or declared
+//     by its frozen definition — ../shared/harness-api.ts:1885) renders a LOCKED box, and a run
+//     in flight locks every box, because that PATCH answers 403 and 409 respectively;
+//   - with NO conversation bound both header toggles are `hidden` (`main.ts` `syncConfigScope`,
+//     `styles.css` `.tools-toggle[hidden]`), so these fixtures boot with one session in the
+//     roster (`bootstrap` below) — the playground runner's own temporary session is a separate
+//     conversation and is still created by the call itself.
 
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
+import type { SessionToolSummary } from '../shared/harness-api';
+import type { SessionToolRowSeed } from './session-config-test-support';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { sessionConfigDouble, sessionToolPage, sessionToolRow } from './session-config-test-support';
 import { viewAwareFetch } from './view-test-support';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
@@ -136,6 +152,32 @@ const toolRequestTool = coreTool('toolRequest', {
     }
 });
 
+// T4: the pane's rows are this CONVERSATION's toolbox, in the spelling `GET /sessions/{id}/tools`
+// serves (`SessionToolSummary`, ../shared/harness-api.ts:1852-1900). The two facts a catalogue row
+// never carried follow the SERVER's rule (`sessionToolRowsOf`, src/server/api-reads.ts:959-994):
+// a harness-owned core name is `protected`, and so is any name the frozen definition declares.
+// The ordinary tools here got in through `toolRequest`, so they are `declared: false` +
+// `origin: 'discovered'` — the only shape whose PATCH the server accepts, which is what makes the
+// switch tests below legal. A core row states `enabled: false` (a core tool never enters the
+// enabled set) and is still in context, which is exactly what `toolRowInContext` in main.ts reads.
+const sessionRow = (tool: WireTool, overrides: Partial<Omit<SessionToolSummary, 'name'>> = {}): SessionToolRowSeed => ({
+    name: tool.name,
+    group: tool.group,
+    description: tool.description,
+    tags: [...tool.tags],
+    visibility: tool.visibility,
+    session_bound: tool.sessionBound ?? false,
+    enabled: tool.visibility === 'core' ? false : tool.enabled,
+    declared: false,
+    origin: tool.visibility === 'core' ? 'catalogue' : 'discovered',
+    protected: tool.visibility === 'core',
+    source_available: false,
+    ...overrides
+});
+
+// The toolbox a fixture's boot tools add up to, in server order (the pane sorts for display).
+const sessionRows = (tools: readonly WireTool[]): SessionToolRowSeed[] => tools.map((tool) => sessionRow(tool));
+
 const snapshot = (overrides: Partial<SessionSnapshot> = {}): SessionSnapshot =>
     ({
         id: 's1',
@@ -168,7 +210,11 @@ const bootstrap = (overrides: Record<string, unknown> = {}): Record<string, unkn
     presets: [descriptor()],
     tools: [toolRequestTool, fileReadTool],
     defaults,
-    sessions: [],
+    // T4: the ⚒ and ⚙ panes describe the conversation the card points at, and with NO conversation
+    // bound both header toggles are `hidden` (main.ts `syncConfigScope`), so a fixture that opens a
+    // pane needs one session in the roster. The playground runner's temporary session is a SEPARATE
+    // conversation the call itself creates, so binding one here changes nothing about execution.
+    sessions: [snapshot()],
     agents: [],
     ...overrides
 });
@@ -198,9 +244,41 @@ const openTools = (): void => {
 // opens on boot — the pending state the catalogues used to hide behind.
 const stubFetch = (
     handler: (url: string, method: string | undefined, body: unknown) => Response | undefined = () => undefined,
-    runningSession?: SessionSnapshot
+    runningSession?: SessionSnapshot,
+    // T4: the toolbox this conversation's pane lists. It defaults to the boot document's own
+    // tools; a test that overrides the boot `tools` page passes the tools that match it, so the
+    // list it asserts is the list its server stated. They are given in the boot document's shape
+    // because the runner's schema read below answers from the same descriptors.
+    sessionTools?: readonly WireTool[]
 ): Call[] => {
     const calls: Call[] = [];
+    const servedTools = sessionTools ?? [toolRequestTool, fileReadTool];
+    // The conversation's configuration routes (`GET /sessions/s1/tools`, `PATCH
+    // /sessions/s1/tools/{tool}` and the plugin pair) come from the shared double, whose store
+    // APPLIES an accepted switch — so the repaint every switch test below asserts is provably
+    // the figure the next server read carries, not a client-side guess. See
+    // ./session-config-test-support.ts for why its semantics are the server's own.
+    const config = sessionConfigDouble({ tools: () => sessionRows(servedTools) });
+
+    // T4: a toolbox page row carries NO argument schema (../shared/harness-api.ts
+    // `SessionToolSummary` states none), so the runner pays the deployment's identified detail read
+    // (`GET /tools/{name}`, ./api.ts `getTool`) — the schema a manual call is built from is
+    // execution, and T4 left execution global. These fixtures answer it from the same descriptor
+    // the boot document describes, so the runner's card is the one these tests pinned before the
+    // pane moved.
+    const detailOf = (name: string): Response | undefined => {
+        const tool = servedTools.find((candidate) => candidate.name === name);
+
+        if (tool === undefined) return undefined;
+
+        return json({
+            tool: {
+                ...tool,
+                session_bound: tool.sessionBound ?? false,
+                execution: { scope: tool.visibility === 'core' ? 'session_required' : 'global', manual: true }
+            }
+        });
+    };
 
     const raw = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
         const url = String(input);
@@ -209,11 +287,35 @@ const stubFetch = (
 
         calls.push({ url, method, body });
 
-        const declared = handler(url, method, body);
+        // The test's own route wins, so a refusal (403/409) or a hand-built payload can be pinned
+        // per test. A paged read arrives WITH its query string (`?limit=25`, ./api.ts
+        // `pageParams`), and these fixtures match pathnames, so the bare spelling is offered as the
+        // second attempt — before the shared double, which would otherwise answer its own default
+        // page for a route the test means to own.
+        const bare = url.split('?')[0];
+        const declared =
+            handler(url, method, body) ?? (bare === url ? undefined : handler(bare, method, body)) ?? config.respond(url, method, body);
 
         if (declared !== undefined) return declared;
+        // The runner's identified schema read (`GET /api/tools/{name}`, see `detailOf`). It sits
+        // after the test's own handler so a fixture that pins that read keeps authority.
+        const detailName = /^\/api\/tools\/([^/?]+)$/.exec(bare);
+
+        if (detailName !== null && method === undefined) {
+            const answer = detailOf(decodeURIComponent(detailName[1]));
+
+            if (answer !== undefined) return answer;
+        }
         if (url === '/api') return json(bootstrap(runningSession === undefined ? {} : { sessions: [runningSession] }));
         if (url === '/api/models') return json({ models: ['m1'] });
+        // T4: a boot roster that names a conversation makes the shell OPEN it, and every canonical
+        // read of that conversation (the view open, the frozen definition, the history page) is
+        // composed from this ONE raw record by ./view-test-support. A fixture whose own handler
+        // answers `/api/sessions/s1` stays authoritative.
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: runningSession ?? snapshot() });
+        if (url === '/api/sessions' && method === undefined) {
+            return json({ sessions: [runningSession ?? snapshot()] });
+        }
 
         throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
     };
@@ -267,6 +369,28 @@ it('lists core tools in the global tools view, calls with the captured session a
 
             if (url === '/api') return json(bootstrap());
             if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+
+            // T4: the pane's rows are THIS conversation's toolbox (`GET /sessions/s1/tools`), and
+            // it is the only thing the double answers here beyond the routes this test already
+            // declares — the runner's call routes below are execution, which T4 left alone.
+            const configAnswer = sessionConfigDouble({ tools: () => sessionRows([toolRequestTool, fileReadTool]) }).respond(
+                url,
+                method,
+                body
+            );
+
+            if (configAnswer !== undefined) return configAnswer;
+
+            // T4: a toolbox page row carries no argument schema, so an opened runner pays the
+            // identified detail read (`GET /tools/{name}`, ./api.ts `getTool`) — execution, which
+            // T4 left on the deployment surface.
+            if (url === '/api/tools/toolRequest' && method === undefined) {
+                return json({ tool: { ...toolRequestTool, session_bound: true, execution: { scope: 'session_required', manual: true } } });
+            }
+
+            if (url === '/api/tools/read' && method === undefined) {
+                return json({ tool: { ...fileReadTool, session_bound: false, execution: { scope: 'global', manual: true } } });
+            }
 
             if (url === '/api/sessions' && method === 'POST') {
                 return json({ session: snapshot() }, 201);
@@ -371,12 +495,14 @@ it('lists core tools in the global tools view, calls with the captured session a
     expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
     expect(byClass('.harness-id', 'span').hidden).toBe(true);
     expect(byClass('.harness-id', 'span').textContent).toBe('');
-    // R4: the head's count and the rendered rows are the SAME figure — the catalogue the
-    // server lists is the catalogue the pane paints, page by page until the cursor runs out
-    // (./api.ts `listAllTools`), so nothing is silently truncated at a 25-row page.
+    // R4: the head's count and the rendered rows are the SAME figure — the toolbox the server
+    // listed for THIS conversation is the toolbox the pane paints, page by page until the cursor
+    // runs out (./api.ts `listAllTools`), so nothing is silently truncated at a 25-row page. The
+    // sentence names its subject (main.ts `paintToolsHead`): these are the tools of the
+    // conversation on screen, not of the deployment.
     expect(document.querySelectorAll('.tool-tab-row')).toHaveLength(2);
     expect(document.querySelector('.harness-note')?.textContent).toBe(
-        '2 tools · calls run on the harness server'
+        '2 tools · the toolbox of this conversation'
     );
 
     // Activating the core entry adopts the persistent runner into the shared modal.
@@ -442,9 +568,14 @@ it('lists core tools in the global tools view, calls with the captured session a
     // The post-call snapshot refresh surfaced the discovery in the tools view, while
     // the tools view still owns the centre (R21.2: this replaced the removed
     // right-rail core dropdown).
-    // One canonical session-row read for the refresh (`GET /v1/harness/sessions/{id}`), and one
-    // frozen-definition read for the discovery line — each exactly once, no storms.
-    expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s1')).toHaveLength(1);
+    // One canonical session-row read for the refresh (`GET /v1/harness/sessions/{id}`) plus the
+    // one the boot paid to open the conversation it restored, and one frozen-definition read for
+    // the discovery line — each exactly once per concern, no storms. T4 bound the conversation at
+    // boot (the pane describes it), which is why the session-row figure is two and not one.
+    expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s1')).toHaveLength(2);
+    // T4: the toolbox itself is read once for the pane's first open and never again — neither the
+    // core call, the refresh it triggers, nor the second selection re-dials it.
+    expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s1/tools?limit=25')).toHaveLength(1);
     expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s1/definition').length).toBeGreaterThanOrEqual(1);
     // R3: the pane no longer narrates the playground context, so the discovery refresh
     // above changes no DOM at all — the note element is gone and the head is still exactly
@@ -484,20 +615,12 @@ it('lists core tools in the global tools view, calls with the captured session a
 // one-at-a-time replacement, and the close reset (head back to the catalogue,
 // `aria-pressed` false, focus back on the entry that opened it).
 it('opens the tool runner in the shared dialog and restores the list on close', async () => {
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
-            const url = String(input);
-            if (url === '/api') return json(bootstrap());
-            if (url === '/api/models') return json({ models: ['m1'] });
+    // T4: the pane lists the bound conversation's toolbox, which the shared stub serves (its own
+    // routes are exactly the boot document, the session record the view double composes from, and
+    // the toolbox page) — so this test's bespoke "boot + models only" stub is replaced by it.
+    stubFetch();
 
-            throw new Error(`unexpected request: ${url}`);
-        }, { root: '/api' }))
-    );
-
-    await import('./main');
-    await flush();
-    await flush();
+    await boot();
 
     openTools();
     await flush();
@@ -511,7 +634,7 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
     expect(byClass('.harness-id', 'span').hidden).toBe(true);
     expect(byClass('.harness-id', 'span').textContent).toBe('');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
-        '2 tools · calls run on the harness server'
+        '2 tools · the toolbox of this conversation'
     );
 
     const toolRequestButton = byClass('.tool-tab-button[data-tool="toolRequest"]', 'button');
@@ -559,7 +682,7 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
     expect(byClass('.harness-id', 'span').hidden).toBe(true);
     expect(byClass('.harness-id', 'span').textContent).toBe('');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
-        '2 tools · calls run on the harness server'
+        '2 tools · the toolbox of this conversation'
     );
     expect(document.activeElement).toBe(fileReadButton);
 
@@ -576,7 +699,7 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
     expect(byClass('.harness-id', 'span').hidden).toBe(true);
     expect(byClass('.harness-id', 'span').textContent).toBe('');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
-        '2 tools · calls run on the harness server'
+        '2 tools · the toolbox of this conversation'
     );
     expect(document.activeElement).toBe(fileReadButton);
 
@@ -586,28 +709,21 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
 });
 
 it('shows a server request failure for a core call instead of pretending it ran', async () => {
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
+    // T4: the shared stub carries the bound conversation and its toolbox; this fixture adds only
+    // the playground create and the 409 the manual call answers.
+    stubFetch((url, method) => {
+        if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot() }, 201);
 
-            if (url === '/api') return json(bootstrap());
-            if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() }, 201);
+        if (url === '/api/tools/toolRequest' && method === 'POST') {
+            // 409: the session is mid-run. The client reports the server's
+            // message and must NOT refresh as if the call had applied.
+            return json({ error: { message: 'Session "s1" is running; retry when it is idle.' } }, 409);
+        }
 
-            if (url === '/api/tools/toolRequest' && init?.method === 'POST') {
-                // 409: the session is mid-run. The client reports the server's
-                // message and must NOT refresh as if the call had applied.
-                return json({ error: { message: 'Session "s1" is running; retry when it is idle.' } }, 409);
-            }
+        return undefined;
+    });
 
-            throw new Error(`unexpected request: ${url}`);
-        }, { root: '/api' }))
-    );
-
-    await import('./main');
-    await flush();
-    await flush();
+    await boot();
 
     openTools();
     await flush();
@@ -648,12 +764,14 @@ const agentDelegateTool = coreTool('delegate', {
 });
 
 it('fills the delegation presets from the playground harness, not a hard-coded agent', async () => {
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
-            const url = String(input);
-            if (url === '/api') {
-                return json(
+    // T4: the pane lists the bound conversation's toolbox, so the two tools this fixture cares
+    // about are stated twice on purpose — as the deployment catalogue the boot document describes
+    // and as the toolbox the conversation's page serves (the third `stubFetch` argument, which
+    // also answers the runner's schema read from the same descriptors).
+    stubFetch(
+        (url) =>
+            url === '/api'
+                ? json(
                     bootstrap({
                         presets: [
                             descriptor({
@@ -663,16 +781,13 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
                         ],
                         tools: [agentDelegateTool, fileReadTool]
                     })
-                );
-            }
-            if (url === '/api/models') return json({ models: ['m1'] });
-
-            throw new Error(`unexpected request: ${url}`);
-        }, { root: '/api' }))
+                )
+                : undefined,
+        undefined,
+        [agentDelegateTool, fileReadTool]
     );
 
-    await import('./main');
-    await flush();
+    await boot();
     await flush();
 
     openTools();
@@ -700,23 +815,15 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
 });
 
 it('reports delegation as unavailable when the playground harness has no subagents', async () => {
-    const calls: Call[] = [];
-
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
-            calls.push({ url, method: init?.method, body: undefined });
-
-            if (url === '/api') return json(bootstrap({ tools: [agentDelegateTool] }));
-            if (url === '/api/models') return json({ models: ['m1'] });
-
-            throw new Error(`unexpected request: ${url}`);
-        }, { root: '/api' }))
+    // T4: the same shift as the test above — the toolbox page and the runner's schema read are
+    // both served from the `[agentDelegateTool]` list this fixture states.
+    const calls = stubFetch(
+        (url) => (url === '/api' ? json(bootstrap({ tools: [agentDelegateTool] })) : undefined),
+        undefined,
+        [agentDelegateTool]
     );
 
-    await import('./main');
-    await flush();
+    await boot();
     await flush();
 
     openTools();
@@ -787,8 +894,84 @@ const toolRowAnswer = (name: string, enabled: boolean): Record<string, unknown> 
 const toolBox = (name: string): HTMLInputElement =>
     byClass(`.tool-tab-enable[data-tool="${name}"]`, 'input');
 
+// T4: every read and write the tools pane makes lives under one path — the bound conversation's
+// toolbox — and a paged read carries `?limit=25` (./api.ts `pageParams`). This filter collects
+// that traffic IN ORDER, which is what lets the switch tests pin "the write, then the read that
+// repaints the row from it" instead of trusting a local flip.
+const toolboxTraffic = (calls: readonly Call[]): Call[] =>
+    calls.filter((call) => {
+        const path = call.url.split('?')[0];
+
+        return path === '/api/sessions/s1/tools' || path === '/api/sessions/s1/tools/read';
+    });
+
+// The exact url a toolbox page read is dialled at, query included, because the query is part of
+// the contract (`limit` is always sent).
+const TOOLBOX_PAGE_URL = '/api/sessions/s1/tools?limit=25';
+
+// The toolbox page one conversation's `GET /sessions/{id}/tools` answers: the same tool
+// descriptors the boot document describes, restated in the session row shape
+// (`sessionRows` → `sessionToolRow`, ./session-config-test-support.ts).
+const toolboxPage = (tools: readonly WireTool[]): Response =>
+    json(sessionToolPage(sessionRows(tools).map(sessionToolRow)));
+
+// T4's cache discipline: the toolbox belongs to ONE conversation, so moving the card to another
+// conversation must drop the old rows and ask again — never paint a list that belongs to a
+// conversation the reader has left.
+it('moves to a new conversation without ever painting the previous one’s toolbox', async () => {
+    // s2 is a different conversation: the server lists only `read` in its toolbox, and it is not
+    // the `read` + `toolRequest` pair the boot conversation (s1) carries.
+    const calls = stubFetch((url, method) => {
+        if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot({ id: 's2' }) }, 201);
+
+        if (url === '/api/sessions/s2/tools' || url === '/api/sessions/s2/tools?limit=25') return toolboxPage([fileReadTool]);
+
+        return undefined;
+    });
+
+    await boot();
+    openTools();
+    await flush();
+
+    // The conversation the card opened on owns the list: both of its rows, and the read that
+    // paid for them names s1.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
+    ).toEqual(['read', 'toolRequest']);
+    expect(calls.filter((call) => call.url === TOOLBOX_PAGE_URL)).toHaveLength(1);
+
+    byClass('.session-new', 'button').click();
+    await flush();
+    await flush();
+
+    // The pointer was RELEASED for a moment (`+` tears the old conversation down before the
+    // server mints the new one), and a released pointer closes the pane (main.ts
+    // `syncConfigScope` → `closeConfigPanes`). The chat is back and the new conversation is bound:
+    // the pill says s2, and both toggles are rendered again.
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s2');
+    expect(toolsToggle().hasAttribute('hidden')).toBe(false);
+    expect(byClass('.tools-toggle', 'button').getAttribute('aria-pressed')).toBe('false');
+
+    // Re-opening is where the cache discipline shows: the pane asks for s2, and the rows it paints
+    // are s2's ONE tool — never the pair it was showing a moment ago. `loadSessionTools` would
+    // answer from `toolEntries` for a conversation it already read, so reaching the network for
+    // s2 at all is the proof `invalidateConfigPanes` ran.
+    openTools();
+    await flush();
+
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
+    ).toEqual(['read']);
+    expect(document.querySelector('.harness-note')?.textContent).toBe('1 tool · the toolbox of this conversation');
+    expect(calls.filter((call) => call.url === TOOLBOX_PAGE_URL)).toHaveLength(1);
+    expect(calls.filter((call) => call.url === '/api/sessions/s2/tools?limit=25')).toHaveLength(1);
+    // The write route follows the same scope: nothing was written here, and the deployment route
+    // is never dialled by this pane.
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+});
+
 it('paints one corner tick box on EVERY row, the harness-owned core row included', async () => {
-    stubFetch();
+    const calls = stubFetch();
     await boot();
 
     openTools();
@@ -810,7 +993,8 @@ it('paints one corner tick box on EVERY row, the harness-owned core row included
     const readSwitch = toolBox('read');
 
     // A real checkbox: `checked` IS the state (so no `role`, no `aria-checked` to keep
-    // honest), the accessible name is the ACTION, and the title states the scope.
+    // honest), the accessible name is the ACTION, and the title states the SCOPE — T4 moved that
+    // scope from the deployment to this conversation (main.ts `toolSwitchTitleOf`).
     expect(readSwitch.type).toBe('checkbox');
     expect(readSwitch.checked).toBe(true);
     expect(readSwitch.dataset.enabled).toBe('true');
@@ -818,9 +1002,10 @@ it('paints one corner tick box on EVERY row, the harness-owned core row included
     expect(readSwitch.getAttribute('aria-checked')).toBeNull();
     expect(readSwitch.getAttribute('aria-label')).toBe('Disable read');
     expect(readSwitch.title).toBe(
-        'Enabled for every conversation on this harness server · click to switch this tool off'
+        'Enabled for this conversation · click to switch this tool off'
     );
-    // R1: a control that is not waiting on its own write is never disabled.
+    // A control that is neither waiting on its own write nor locked by the conversation, and not
+    // yet disabled by the transport.
     expect(readSwitch.disabled).toBe(false);
 
     // The box is NOT inside the tile, and the tile carries the SAME figure — which is what
@@ -833,15 +1018,22 @@ it('paints one corner tick box on EVERY row, the harness-owned core row included
     expect(readSwitch.closest('.tool-tab-button')).toBeNull();
     expect(readRow.dataset.enabled).toBe('true');
 
-    // The harness-owned core row is switchable like any other: the store no longer
-    // refuses its PATCH, so the "core" pin is gone and its box is ticked, not absent.
+    // T4: the harness-owned core row still gets a box — every row that states an enablement does —
+    // but the box is LOCKED. `protected` is the server's figure (src/server/api-reads.ts:959-994:
+    // a core control tool, or a name the frozen definition declares) and its PATCH answers 403, so
+    // main.ts states that refusal on the control before the click instead of after it.
     const coreRow = byClass('.tool-tab-button[data-tool="toolRequest"]', 'button');
     const coreSwitch = toolBox('toolRequest');
 
+    // A core row reads `enabled: false` on the session route and is STILL in context, which is
+    // what `toolRowInContext` (main.ts:8745) decides from `protected` — so the tick is on.
     expect(coreRow.dataset.enabled).toBe('true');
     expect(coreSwitch.checked).toBe(true);
-    expect(coreSwitch.disabled).toBe(false);
+    expect(coreSwitch.disabled).toBe(true);
     expect(coreSwitch.getAttribute('aria-label')).toBe('Disable toolRequest');
+    expect(coreSwitch.title).toBe(
+        'Harness-owned or declared by this conversation’s team · it cannot be switched here'
+    );
 
     // Nothing is left of the old pill or the pin, in the document or in the markup.
     expect(document.querySelectorAll('.tool-tab-toggle')).toHaveLength(0);
@@ -876,7 +1068,19 @@ it('renders no tick box and no enablement attribute for a row whose server never
     const legacyRow: Record<string, unknown> = { ...fileReadTool };
     delete legacyRow.enabled;
 
-    stubFetch((url) => (url === '/api' ? json(bootstrap({ tools: [legacyRow] })) : undefined));
+    // T4 moved the surface: the row that omits the figure is now a `GET /sessions/s1/tools` row.
+    // `enabled` is a REQUIRED field of ../shared/harness-api.ts `SessionToolSummary`, so the
+    // fixture drops the KEY the way JSON does — an `undefined` value is omitted by
+    // `JSON.stringify`, which is exactly the payload an older server would send.
+    const statedRow = { ...sessionToolRow(sessionRow(fileReadTool)), enabled: undefined } as unknown as SessionToolSummary;
+
+    stubFetch((url, method) =>
+        url === '/api'
+            ? json(bootstrap({ tools: [legacyRow] }))
+            : url === '/api/sessions/s1/tools' && method === undefined
+              ? json(sessionToolPage([statedRow]))
+              : undefined
+    );
     await boot();
 
     openTools();
@@ -891,22 +1095,15 @@ it('renders no tick box and no enablement attribute for a row whose server never
     expect(row.getAttribute('aria-haspopup')).toBe('dialog');
 });
 
-it('switches a tool off and back on with one click, and repaints the row from the server answer', async () => {
-    // The double applies the switch the way the store does and answers the updated row, so
-    // the repaint below is provably the SERVER's figure.
-    let enabled = true;
-
-    const calls = stubFetch((url, method, body) => {
-        if (url === '/api/tools/read' && method === 'PATCH') {
-            const patch = body as { enabled?: boolean };
-
-            enabled = patch.enabled !== false;
-
-            return json({ tool: toolRowAnswer('read', enabled) });
-        }
-
-        return undefined;
-    });
+it('switches a tool off and back on with one click, and repaints the row from the conversation re-read', async () => {
+    // T4: the switch is this conversation's, and the shared double's store APPLIES the accepted
+    // write (./session-config-test-support.ts), so the figure the row repaints below can only come
+    // from the `GET /sessions/s1/tools` re-read main.ts performs after the PATCH (`setToolEnabled`
+    // → `applySessionToolRows`). No handler below answers a tool route at all.
+    const calls = stubFetch();
+    // The whole traffic of one switch, in order: the read that opened the pane, then the write and
+    // the read that followed it. A local flip with no re-read could not produce this list.
+    const traffic = (): Call[] => toolboxTraffic(calls);
 
     await boot();
     openTools();
@@ -927,9 +1124,17 @@ it('switches a tool off and back on with one click, and repaints the row from th
     await flush();
     await flush();
 
-    expect(calls.filter((call) => call.url === '/api/tools/read' && call.method === 'PATCH')).toEqual([
-        { url: '/api/tools/read', method: 'PATCH', body: { enabled: false } }
+    // One write, on the SESSION route, with the contract's body (../shared/harness-api.ts
+    // `UpdateSessionToolRequest`), and the read that repaints the row after it. The deployment
+    // route `PATCH /api/tools/read` is never dialled: this pane cannot move a switch that belongs
+    // to every conversation.
+    expect(traffic()).toEqual([
+        { url: TOOLBOX_PAGE_URL, method: undefined, body: undefined },
+        { url: '/api/sessions/s1/tools/read', method: 'PATCH', body: { enabled: false } },
+        { url: TOOLBOX_PAGE_URL, method: undefined, body: undefined }
     ]);
+    expect(calls.filter((call) => call.url === '/api/tools/read' && call.method === 'PATCH')).toEqual([]);
+
 
     // The SAME nodes repaint from the answer: no list rebuild, so the row stays the node
     // the runner dialog would hand focus back to. The box, its `data-enabled` and the
@@ -948,22 +1153,27 @@ it('switches a tool off and back on with one click, and repaints the row from th
     expect(document.querySelector('.tools-tab-note')).toBeNull();
     expect(byClass('.status-text', 'span').textContent).toBe('idle');
 
-    // A second press inverts what the SERVER reported (the cache moved with the answer),
-    // and no catalogue page was re-read to paint it.
+    // A second press inverts what the SERVER reported (the cache moved with the re-read), and the
+    // traffic of the second switch is the same write-then-read pair — the pane never paints a
+    // figure it did not get back from the conversation's own route.
     control.click();
     await flush();
     await flush();
 
-    expect(calls.filter((call) => call.url === '/api/tools/read' && call.method === 'PATCH')).toHaveLength(2);
+    expect(calls.filter((call) => call.url === '/api/sessions/s1/tools/read' && call.method === 'PATCH')).toHaveLength(2);
+    expect(traffic()).toHaveLength(5);
     expect(control.checked).toBe(true);
     expect(control.className).toBe('tool-tab-enable is-on');
     expect(row.dataset.enabled).toBe('true');
 });
 
 it('pulls a refused switch back to the server figure and keeps the server sentence on the pill', async () => {
-    const message = 'read cannot be switched off while its harness is being rebuilt.';
+    // The conversation's own route refuses the write (409 while it is working, 403 for a protected
+    // name — ../shared/harness-api.ts:1885). The sentence is the server's, and it is the ONLY new
+    // figure the refusal leaves anywhere: nothing was written, and no re-read follows a failure.
+    const message = 'read cannot be switched off while this conversation is working.';
     const calls = stubFetch((url, method) => {
-        if (url === '/api/tools/read' && method === 'PATCH') return json({ error: { message } }, 403);
+        if (url === '/api/sessions/s1/tools/read' && method === 'PATCH') return json({ error: { message } }, 409);
 
         return undefined;
     });
@@ -974,6 +1184,7 @@ it('pulls a refused switch back to the server figure and keeps the server senten
 
     const row = byClass('.tool-tab-button[data-tool="read"]', 'button');
     const control = toolBox('read');
+    const trafficBefore = toolboxTraffic(calls).length;
 
     control.click();
     // A native checkbox flipped itself on the click — this is exactly the state a refusal
@@ -983,7 +1194,13 @@ it('pulls a refused switch back to the server figure and keeps the server senten
     await flush();
     await flush();
 
-    expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(1);
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/sessions/s1/tools/read', method: 'PATCH', body: { enabled: false } }
+    ]);
+    // A refusal wrote nothing, so the pane asks for nothing: the toolbox traffic is exactly the
+    // write plus the read that opened the pane, and there is no retry control either.
+    expect(toolboxTraffic(calls)).toHaveLength(trafficBefore + 1);
+    expect(document.querySelector('.tools-tab-retry')).toBeNull();
 
     // The refusal leaves nothing in the pane that could lie: there is no line to contradict
     // the server (the live element is gone), and the row still states the figure the server
@@ -1005,17 +1222,11 @@ it('pulls a refused switch back to the server figure and keeps the server senten
 // R1's click separation: the box and the tile are two controls in one row, and each owns
 // exactly one of the two actions.
 it('writes enablement from the corner box without opening the runner, and the tile click still opens it', async () => {
-    let enabled = true;
-
-    const calls = stubFetch((url, method, body) => {
-        if (url === '/api/tools/read' && method === 'PATCH') {
-            enabled = (body as { enabled?: boolean }).enabled !== false;
-
-            return json({ tool: toolRowAnswer('read', enabled) });
-        }
-
-        // The schema read the runner costs when (and only when) the TILE is clicked.
-        if (url === '/api/tools/read' && method === undefined) return json({ tool: toolRowAnswer('read', enabled) });
+    // T4: the corner box writes the conversation (`PATCH /sessions/s1/tools/read`, answered by the
+    // shared double), while the TILE still pays the deployment's identified detail read for the
+    // runner's schema — that read is execution, and T4 left it global.
+    const calls = stubFetch((url, method) => {
+        if (url === '/api/tools/read' && method === undefined) return json({ tool: toolRowAnswer('read', false) });
 
         return undefined;
     });
@@ -1032,9 +1243,9 @@ it('writes enablement from the corner box without opening the runner, and the ti
     await flush();
     await flush();
 
-    // The write went, and NO runner layer was adopted over the list.
+    // The write went, on the conversation's route, and NO runner layer was adopted over the list.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/tools/read', method: 'PATCH', body: { enabled: false } }
+        { url: '/api/sessions/s1/tools/read', method: 'PATCH', body: { enabled: false } }
     ]);
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.querySelector('.tool-args')).toBeNull();
@@ -1056,7 +1267,7 @@ it('writes enablement from the corner box without opening the runner, and the ti
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').dataset.enabled).toBe('false');
 });
 
-it('keeps the tools page, its rows and its switch usable while a run is pending', async () => {
+it('keeps the tools page and its rows usable while a run is pending, and locks every switch that route would refuse', async () => {
     // The conversation the shell opens on boot still holds work, so the whole shell is in
     // its pending state — the state that used to hide the tools page entirely.
     const running = snapshot({
@@ -1074,15 +1285,15 @@ it('keeps the tools page, its rows and its switch usable while a run is pending'
         ]
     });
 
-    const calls = stubFetch((url, method) => {
-        if (url === '/api/sessions/s1' && method === undefined) return json({ session: running });
-        if (url === '/api/sessions' && method === undefined) return json({ sessions: [running] });
-        if (url === '/api/tools/read' && method === 'PATCH') {
-            return json({ tool: toolRowAnswer('read', false) });
-        }
+    const calls = stubFetch(
+        (url, method) => {
+            if (url === '/api/sessions/s1' && method === undefined) return json({ session: running });
+            if (url === '/api/sessions' && method === undefined) return json({ sessions: [running] });
 
-        return undefined;
-    }, running);
+            return undefined;
+        },
+        running
+    );
 
     await boot();
     await flush();
@@ -1101,7 +1312,15 @@ it('keeps the tools page, its rows and its switch usable while a run is pending'
 
     expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').disabled).toBe(false);
-    expect(byClass('.tool-tab-enable[data-tool="read"]', 'input').disabled).toBe(false);
+
+    // T4: the SWITCH is a different story. `PATCH /sessions/{id}/tools/{id}` answers 409 unless the
+    // session is idle (../shared/harness-api.ts:1873, `assertIdleForToolMutation` in
+    // src/server/api.ts), so main.ts states that rule on the control BEFORE the click
+    // (`toolSwitchLockOf` → 'running') instead of taking the refusal on the chin afterwards.
+    const runningSwitch = byClass('.tool-tab-enable[data-tool="read"]', 'input');
+
+    expect(runningSwitch.disabled).toBe(true);
+    expect(runningSwitch.title).toBe('This conversation is working · the switch unlocks when its run ends');
 
     // A row is clickable mid-run: its runner opens over the list, schema read and all.
     byClass('.tool-tab-button[data-tool="toolRequest"]', 'button').click();
@@ -1110,16 +1329,17 @@ it('keeps the tools page, its rows and its switch usable while a run is pending'
     await flush();
     expect(byClass('.stage', 'div').querySelector('.tools-pane')?.isConnected).toBe(true);
 
-    // And the global switch WRITES mid-run — the route has no idle window, and the run in
-    // flight keeps the tool list it was already given.
-    byClass('.tool-tab-enable[data-tool="read"]', 'input').click();
+    // A locked native control swallows the press, so the run costs the conversation no write and
+    // no 409: the toolbox traffic of this fixture is the single read that opened the pane.
+    runningSwitch.click();
     await flush();
     await flush();
 
-    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
-        { url: '/api/tools/read', method: 'PATCH', body: { enabled: false } }
-    ]);
-    expect(byClass('.tool-tab-enable[data-tool="read"]', 'input').checked).toBe(false);
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+    // The whole toolbox traffic of this fixture is the ONE read that opened the pane: the locked
+    // control costs the conversation no write and no 409 round-trip.
+    expect(toolboxTraffic(calls)).toEqual([{ url: TOOLBOX_PAGE_URL, method: undefined, body: undefined }]);
+    expect(byClass('.tool-tab-enable[data-tool="read"]', 'input').checked).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -1165,7 +1385,10 @@ it('lists the whole catalogue as ONE alphabetical list with no group headings, a
         catalogueRow('appleTool', 'Package presets')
     ];
 
-    stubFetch((url) => (url === '/api' ? json(bootstrap({ tools: served })) : undefined));
+    // T4: the rows the pane lists are the CONVERSATION's, so the toolbox served for this fixture
+    // is the same nine-name catalogue, restated as session rows (`sessionRows` keeps the server's
+    // core/declared rule for `protected`).
+    stubFetch((url) => (url === '/api' ? json(bootstrap({ tools: served })) : undefined), undefined, served);
     await boot();
 
     openTools();
@@ -1196,6 +1419,6 @@ it('lists the whole catalogue as ONE alphabetical list with no group headings, a
     // print a confident count (the paging itself is pinned in ./api.test.ts `listAllTools`).
     expect(document.querySelectorAll('.tool-tab-row')).toHaveLength(9);
     expect(document.querySelector('.harness-note')?.textContent).toBe(
-        '9 tools · calls run on the harness server'
+        '9 tools · the toolbox of this conversation'
     );
 });

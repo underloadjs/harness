@@ -65,12 +65,15 @@
 // the whole transcript. An exhausted budget throws a HarnessError naming the tool
 // and the likely cause instead of returning a silently partial answer.
 //
-// RESULT BUDGET (R3):
-// the harness caps any model-facing tool result at 64 KiB of serialized text
-// (core/result-budget.ts, MODEL_TOOL_RESULT_BUDGET_BYTES). A page of 20 × 4000
-// characters would blow past that and come back as an opaque truncation envelope,
-// so this reader applies its OWN, smaller 32 KiB budget to the text it returns
-// (`contentBudget`) and reports exactly what was cut: per-message
+// RESULT BUDGET (R3, restated 2026-11-13):
+// the harness caps any model-facing tool result at 256 KiB of serialized text
+// (core/result-budget.ts, MODEL_TOOL_RESULT_BUDGET_BYTES — the "64 KiB" this header
+// used to cite was that constant's value before the read budget was raised 4x). A
+// page of 20 × 4000 characters would still be a wall of text the envelope has to
+// police, so this reader applies its OWN, much smaller 32 KiB budget to the text it
+// returns — an EIGHTH of the model-facing cap, which is what leaves the envelope, the
+// per-field JSON overhead and any escaping inflation room to stay inside it — as
+// `contentBudget`, and reports exactly what was cut: per-message
 // `contentHasMore`/`nextContentOffset`, `argumentsTruncated`,
 // `reasoningTruncated`, plus top-level `truncated`/`hasMore`/`nextOffset`. The
 // number is a literal because a runtime entry (and the helper it captures) must
@@ -94,7 +97,7 @@
 //   - ./threadRead.tool.ts            — the scanned entry (identity + schema + fetch)
 //   - ../files/bounded-regex.ts       — the node:vm timeout technique this mirrors
 //   - ../../harness.ts `resultPageOf` (~2620) — the surrogate-pair-safe slicing rule
-//   - ../../core/result-budget.ts     — the 64 KiB model-facing cap this stays under
+//   - ../../core/result-budget.ts     — the 256 KiB model-facing cap this stays under
 //   - ../../types `HarnessMessage` / `HarnessThreadRecord` — the shapes read here
 //   - ./threadList.tool.ts            — where a model observes the thread ids
 
@@ -107,8 +110,11 @@ import type { HarnessAttachment, HarnessMessage, HarnessThreadRecord } from '../
 // into ../../core for them); the entry's JSON schema states the same numbers.
 // ---------------------------------------------------------------------------
 
-// UTF-8 bytes of returned TEXT one `threadRead` page may carry. Half the harness
-// result cap, which leaves room for the envelope, per-field JSON overhead and any
+// UTF-8 bytes of returned TEXT one `threadRead` page may carry. An EIGHTH of the
+// harness's serialized tool-result bound (`MODEL_TOOL_RESULT_BUDGET_BYTES` is 256 KiB
+// in ../../core/result-budget.ts — this used to say "half the 64 KiB cap", which was
+// true of that smaller constant and is false of the current one), which leaves room
+// for the envelope, per-field JSON overhead and any
 // escaping inflation, so the model always gets the structured pagination metadata
 // instead of a truncated-JSON wrapper.
 export const THREAD_READ_CONTENT_BUDGET_BYTES = 32 * 1024;

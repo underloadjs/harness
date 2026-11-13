@@ -5,8 +5,11 @@ import type { ToolContext } from '../../types';
 export const AGENT_RESULT_NAME = 'agentResult';
 
 // Full retrieval. `agent` is required; omitting `invocationId` selects that
-// agent's latest completed result. `offset`/`limit` page a long answer without
-// relying on the harness's 64 KiB result cap.
+// agent's latest FINISHED result (newest completed, else newest failed/cancelled —
+// see the STATUS PROSE block). `offset`/`limit` page a long answer without relying
+// on the harness's serialized tool-result bound (`MODEL_TOOL_RESULT_BUDGET_BYTES`,
+// 256 KiB in core/result-budget.ts — the 64 KiB figure this comment used to quote is
+// the value that constant held before the read budget was raised).
 //
 // The page bounds below (4000 default, 8000 maximum) mirror
 // AGENT_RESULT_PAGE_CHARS / AGENT_RESULT_PAGE_MAX_CHARS in core/agent-limits.ts.
@@ -14,18 +17,28 @@ export const AGENT_RESULT_NAME = 'agentResult';
 // dependencies and must not value-import ../core (that closes a cycle through
 // core/metadata.ts); core/metadata.ownership.test.ts pins the equality.
 //
-// STATUS PROSE (2026-11-13). The description used to claim "a failed or cancelled
-// invocation reports its error and no content", which stopped being true when T28
-// added `partialContent`, and it described only "an agent that has not run yet" as
-// the empty case. Both halves are restated to match what `agentResultFor` actually
-// answers (src/harness.ts ~3798-3930), so every promise here is literally true:
-//   - NO COMPLETED result for that agent -> status "empty" with empty content. The
-//     omitted-`invocationId` selector picks the latest COMPLETED record, so an
-//     in-flight or failed-only agent must not answer with that record's identity.
+// STATUS PROSE (2026-11-13, corrected in the same review wave that fixed the selector).
+// The description used to claim "a failed or cancelled invocation reports its error and
+// no content", which stopped being true when T28 added `partialContent`, and it described
+// only "an agent that has not run yet" as the empty case. Both halves were restated to
+// match what `agentResultFor` actually answers (src/harness.ts ~3798-3930), so every
+// promise here is literally true:
+//   - THE OMITTED-`invocationId` SELECTOR picks the newest TERMINAL record: the newest
+//     COMPLETED one, else the newest failed/cancelled one (src/harness.ts ~3935-3939).
+//     The sentence this entry used to carry — "when that agent has no completed result
+//     the answer is status empty" — contradicted that fallback outright: an agent whose
+//     only finished runs failed got `status: 'empty'` in prose and a failed record in
+//     fact. The prose now names the fallback, and reserves "empty" for an agent with
+//     NOTHING finished (never ran, or every invocation still in flight).
 //   - an explicitly addressed RUNNING invocation -> status "running" with empty
 //     content: no partial text is ever passed off as a finished answer.
 //   - CANCELLED / FAILED -> the error plus paged `partialContent` and
 //     `cancelledAtMessage` (that is the surviving account of a rolled-back run).
+//     B3 (2026-11-13) made the prose literal: `content` carries one page of the
+//     partial and `partialContent` now exists as its own field holding the WHOLE
+//     text, mirroring the unfinished-run envelope `delegate` has always returned
+//     (src/harness.ts `agentResultFor` / `delegateFor`) and matching the sentence
+//     `threadFork` gives a caller when a branch dies.
 // The two pinned fragments below — "latest completed result" (the parameter
 // description, pinned by src/harness.agent-results.test.ts:169) and "at most 8000
 // characters (default 4000)" (pinned by core/metadata.ownership.test.ts:424) — are
@@ -33,7 +46,7 @@ export const AGENT_RESULT_NAME = 'agentResult';
 export const AGENT_RESULT_METADATA: CoreToolMetadata = {
     name: AGENT_RESULT_NAME,
     description:
-        `Read the completed result of one agent invocation. Pass "agent"; optionally pass "invocationId" from agentManage (omit it for that agent's latest completed result - when that agent has no completed result the answer is status "empty" with empty content, not somebody else's run and not one that is still in flight). The result contains content, contentLength, offset, limit, hasMore, and nextOffset when more remains; page through by passing nextOffset back as offset. Each page is at most 8000 characters (default 4000), so a long answer is returned in full across pages instead of being silently truncated. What each status means: "empty" - no completed result is available for that agent, so nothing of yours has finished yet; "running" - an invocation you addressed by id is still running, and it reports empty content because a partial answer is never presented as a finished one; "cancelled" or "failed" - the run did not complete, and it reports its error together with the partialContent it had produced and the cancelledAtMessage showing how far it got, paged exactly like a completed answer; an unknown invocationId, or one that belongs to another agent, is an error. Only answer text is exposed - a finished answer in content, an unfinished one in partialContent - never system instructions, transcripts, tool arguments, or tool bodies.`,
+        `Read the completed result of one agent invocation. Pass "agent"; optionally pass "invocationId" from agentManage (omit it for that agent's latest FINISHED result - the newest COMPLETED one, or the newest failed or cancelled one when nothing has completed, and an explicitly addressed id always answers whatever that run did). Only an agent with NOTHING finished at all - no completed, failed or cancelled run - gets status "empty" with empty content; that is never somebody else's run and never one that is still in flight. The result contains content, contentLength, offset, limit, hasMore, and nextOffset when more remains; page through by passing nextOffset back as offset. Each page is at most 8000 characters (default 4000), so a long answer is returned in full across pages instead of being silently truncated. What each status means: "empty" - nothing has finished for that agent at all, so there is no answer to read yet; "running" - an invocation you addressed by id is still running, and it reports empty content because a partial answer is never presented as a finished one; "cancelled" or "failed" - the run did not complete, and it reports its error together with the partialContent it had produced and the cancelledAtMessage showing how far it got, paged exactly like a completed answer (content is ONE page of that partial, partialContent is the whole text in one field, so a short unfinished answer needs no second call); an unknown invocationId, or one that belongs to another agent, is an error. Only answer text is exposed - a finished answer in content, an unfinished one in partialContent - never system instructions, transcripts, tool arguments, or tool bodies.`,
     tags: ['agents', 'result', 'answer', 'output', 'subagent', 'inspect'],
     // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
     // and enables it for this session instead of seeing it declared on every request.

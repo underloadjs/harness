@@ -88,7 +88,10 @@ The runtime has three levels, and the distinction is load-bearing:
   a session.
 - **Session** — server-controlled shared memory: one harness instance plus the
   record stores (tasks, profiles, chapters, locations), the terminal agent-result
-  archive, and `snapshot()`/`restore()`.
+  archive, and `snapshot()`/`restore()`. It also owns its OWN plugin configuration —
+  a copy of the server's template taken when the session was created, durable on the
+  session's own record — so editing one conversation's plugin settings changes no other
+  conversation.
 - **Thread** — one persistent, agent-owned conversation. It has a stable id and
   its OWN transcript, and shares the session's tools, stores, discovery state,
   and creation budget.
@@ -685,6 +688,7 @@ claiming nothing matched. These entries are never enabled, never count against
 | No match | when neither a searchable nor an already-available core tool matches, the result carries `unmatchedTags` and the full searchable `availableTags`, so the model retries with real vocabulary. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
 | Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. `harness.discoveredTools` exposes the enabled names. |
+| Scope on the server | The enabled set is per harness and ONE session owns one harness, so discovery is per conversation — and a CPU-isolated lane replica resolves that same session's enabled names (`src/server/workers/lane-authority.ts:381`, `:534`). Two switches sit ABOVE that set and are deliberately not per conversation: the deployment **tool deny list** (`PATCH /v1/harness/tools/:id`, one store per process, honoured on the next turn of every session AND thread, `src/server/tool-settings.ts:1-2`) and the plugin **template** (`PATCH /v1/harness/plugins/:id`, inherited by sessions created after the write). Plugin settings proper are per conversation — `PATCH /v1/harness/sessions/:id/plugins/:pluginId` (`src/server/plugins.ts`, "THE TWO SCOPES"). A session CAN withhold or re-enable a name in its own toolbox (`PATCH /v1/harness/sessions/:id/tools/:tool_id`), but that is not a copy of the deny list: every harness re-filters the request list through the provider (`src/harness.ts:4567-4581`) and refuses to launch a denied name (`:7845-7853`), so a session cannot lift a deployment denial — while the MANUAL path (`harness.executeTool`, both tool-execution routes) is not gated by it at all, which is what lets an operator run a name the model was refused. |
 | Reserved names | `toolRequest`, `toolList`, `toolManage`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, and `agentResult` belong to the harness, and `delegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
 | Manual call | an operator may run any registered tool through `harness.executeTool()` /
   `POST /v1/harness/tools/:id/executions` (or the session-scoped form of it); discovery gates the model, not the user. Core file tools need no session; the harness-owned set does. `actionRequest` and `threadFork` are the exception: they need the run that owns the conversation and are refused by the manual path. |
@@ -2620,7 +2624,7 @@ this package's source through the workspace script; the published package remain
 the library.
 
 ```bash
-yarn cli --list                                     # the seven shipped presets
+yarn cli --list                                     # the eight shipped presets
 yarn cli "Write an opening."                        # default preset: general (live)
 yarn cli --preset planner "Plan the release."       # plans, then delegates to its specialists
 yarn cli --preset workspace --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
@@ -2899,6 +2903,48 @@ later create/patch never changes which agents a running session has, its primary
 or the history it reports. The UI's Endpoint panel is sent when a session is
 created; changing it starts a fresh session on the next run.
 
+**A session is created on demand, not on first use.** `POST /v1/harness/sessions` needs a
+harness name and nothing else; the id is the server's own `randomUUID()`, and the record is
+written before the `201` answers — a failed write rolls the in-memory entry back, so a retry
+can never observe a session that was never durable (`src/server/sessions.ts:2269-2278`). A
+client holding a `201` may therefore `POST …/tasks` immediately, with no probe-and-retry loop.
+The UI depends on that ordering: `+` calls this route the moment it is pressed, including
+while another conversation is still streaming, because starting a conversation cancels nothing
+and the `+` deliberately has no run guard (`paintSessionActions`,
+`src/frontend/main.ts:11220-11225`; pinned against a live run by
+`src/frontend/canonical-directory-live-main.test.ts:304`). Each `+` press creates a NEW
+session — no dedup, no reuse, no client-side cap — and a failed create leaves an empty draft
+plus one error in the status pill, never a half-bound conversation. There is no Reset control
+in the page at all: starting over IS New session, while `POST /v1/harness/sessions/:id/reset`
+stays alive for other clients (`src/frontend/main.ts:4086-4088`).
+
+**Plugin settings are per conversation; the tool switch is per deployment.** A session owns a
+copy of the plugin-settings store, taken from the template at creation
+(`copyPluginSettingsStore`, `src/server/plugins.ts:713` → `src/server/sessions.ts:2186`) and
+persisted on the session's own record (`src/server/persistence.ts:293`), so
+`PATCH /v1/harness/sessions/:id/plugins/:pluginId` moves ONE conversation from its next turn
+and no other, while `PATCH /v1/harness/plugins/:id` changes what sessions created after it
+inherit and touches no live one. A CPU-isolated lane replica is built from that session's
+snapshot, never the template's (`src/server/plugins.ts:107-121`). The tool deny list has no
+session-scoped twin: `PATCH /v1/harness/tools/:id` is honoured on the next turn of every
+session AND thread (`src/server/tool-settings.ts:1-2`), and a session's own tool routes change
+what that session declares without ever lifting a deployment denial
+(`src/harness.ts:4567-4581`) — though the manual execution path is not gated by the switch at
+all, which is how an operator runs a name the model was refused (`src/harness.ts:7848-7850`).
+The page follows the same line — with no conversation open, the Tools
+and Plugins panes are hidden rather than quietly repointed at the template
+(`src/frontend/main.ts:14021-14024`). One carve-out is worth stating because it is the easy
+misreading: pressing Call in the tools pane does NOT run the tool inside the conversation you
+are configuring. A `sessionBound` call runs in the playground's own throwaway session, created
+for the purpose and cleaned up after it (`src/frontend/main.ts:2253-2292` wires
+`ensurePlaygroundSession`, then `callTool(name, parameters, sessionId)`), so inspecting a tool
+never writes into the transcript on screen. And note the shape of the surface: plugin
+configuration has exactly TWO scopes today — the template and one conversation. A harness
+template carries no plugin settings of its own (`src/server/persistence.ts`,
+`HarnessPresetRecord`), and a thread has none either: its turns and its lane worker resolve the
+SESSION's store (`src/server/plugins.ts:107-121`). A per-harness or per-thread scope is open
+work, not something to infer.
+
 One field is deliberately not frozen: an agent's **model**. `PATCH
 /v1/harness/sessions/:id` with `{ agent_models: { <agent>: <model> } }` retargets an
 existing session in place (see the session table below). The map MERGES into the
@@ -2976,11 +3022,11 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/tools/:id` | One catalogue entry with its argument schema |
 | `PATCH /v1/harness/tools/:id` | Enable or disable one catalogue entry for EVERY session (no un-register, so a run in flight keeps the declarations it was given) |
 | `POST /v1/harness/tools/:id/executions` | Execute a catalogue tool without a session, against the deployment catalogue; a session-bound name is a `403` naming the session route; an unconfigured tool answers `200 { ok: false }`. See [the call body](#the-tool-call-body) |
-| `GET /v1/harness/plugins` | The built-in plugins with their settings and current values (answerable with no harness and no model) |
-| `PATCH /v1/harness/plugins/:id` | Change one plugin's settings — write-anytime, honoured from the next turn of every session; `{ settings: { enabled: false } }` is the global off switch |
+| `GET /v1/harness/plugins` | The built-in plugins with their settings and the TEMPLATE's current values (answerable with no harness and no model) |
+| `PATCH /v1/harness/plugins/:id` | Change one plugin's settings **in the template**: write-anytime, and the change is inherited by every session created AFTER it — an existing session answers from its own copy (see the per-session rows below). `{ settings: { enabled: false } }` is the off switch for everything started from now on; `X-Harness-Revision` here is the template counter |
 | `POST /v1/harness/models` | Server-side `GET {base_url}/models`; returns `{ models, observed_at }` for the UI dropdown |
 | `GET /v1/harness/sessions` | Sessions as bounded summaries — paged (`limit` 25 default / 100 max, `cursor`, `status`, `harness`); turns and threads are separate routes |
-| `POST /v1/harness/sessions` | Create a session from a harness definition — `{ harness, title?, settings? }` → `201 { session }` |
+| `POST /v1/harness/sessions` | Create a session from a harness definition — `{ harness, title?, settings?, messages? }` → `201 { session }`; `messages` is the transcript the new conversation starts with (below, "Seeding a new conversation") |
 | `GET /v1/harness/sessions/:id` | One session's metadata plus its live model map and counters — still no turns, threads, transcripts or display trees |
 | `PATCH /v1/harness/sessions/:id` | Retarget models in a live session: body `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key/value, applies all-or-nothing, and is allowed while the session is running (the next request uses the new model; the current one keeps its own). See [Server and UI](#server-and-ui) |
 | `DELETE /v1/harness/sessions/:id` | Dispose a session — `{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }` |
@@ -3008,6 +3054,9 @@ were deleted rather than kept behind a flag. See
 | `DELETE /v1/harness/sessions/:id/tools/:toolId` | Remove one registration — the implementation, its captured revision, its created-tool record and its enabled slot go in one step, so a restart does not resurrect the name |
 | `GET /v1/harness/sessions/:id/tools/:toolId/source` | One tool's installed source revision |
 | `POST /v1/harness/sessions/:id/tools/:toolId/executions` | Execute a tool through THIS session's registry (a replaced preset, a created tool and a session-owned core tool all run what the session holds); a busy session is a `409`. See [the call body](#the-tool-call-body) |
+| `GET /v1/harness/sessions/:id/plugins` | THIS conversation's plugin rows — the same catalogue, the same paging, and THIS session's `enabled`/`values`. `X-Harness-Revision` is that session's own counter: 0 until its first `PATCH`, and it never moves the template counter |
+| `GET /v1/harness/sessions/:id/plugins/:pluginId` | One row with this session's values; `404` unknown session first, then unknown plugin |
+| `PATCH /v1/harness/sessions/:id/plugins/:pluginId` | `{ settings }` → `{ plugin }`, changing one plugin **for this conversation** from its next turn. Write-anytime: no `409` path at all (unlike a session TOOL write, which needs the session idle), because a settings value moves no registration. `404` resolves before the body is read; an unknown key/type/range is a `400` that changes nothing; the write is durable before the answer |
 | `GET /v1/harness/sessions/:id/threads` | This session's conversations |
 | `POST /v1/harness/sessions/:id/threads` | Open an additional conversation |
 | `GET /v1/harness/sessions/:id/threads/:threadId` | One conversation's metadata |
@@ -3756,9 +3805,15 @@ an unrelated stream frame cannot destroy an in-progress repair.
 - **The UI can keep submitting.** Run stays enabled while a task runs (only the
   short `POST /tasks` round trip locks it), Stop is enabled whenever work is
   pending, and Stop sends `{ all: true }` so both the active task and the retained
-  queue are cancelled. Reset, New session, and tab switches stay locked while work
-  is pending; switching harness or session is allowed and only unsubscribes the
-  observer, because the work belongs to the server.
+  queue are cancelled. CORRECTED IN PLACE 2026-11-13: this bullet then claimed "Reset,
+  New session, and tab switches stay locked while work is pending" — none of that shipped.
+  New session (`+`) stays ENABLED during a live run, which is how a second independent
+  conversation is started while the first one streams (its gate is
+  `submitting || !booted || archivedSelection`, `src/frontend/main.ts:11220-11225`, and a
+  run is not in that expression); switching conversation is a view change that only
+  unsubscribes the observer, and the header cycler is never disabled by pending work.
+  There is no Reset button to lock: starting over is New session, and
+  `POST /v1/harness/sessions/:id/reset` remains a server route for other clients.
 - **Reload and switching recover from the record.** Selecting a session that still
   has work opens one `GET /v1/harness/stream` observer (a submit also opens or reopens
   it); a lost socket is re-opened with its
@@ -4145,8 +4200,8 @@ GET/PATCH/DELETE /v1/harness/agents/:id   trusted agent profiles
 GET    /v1/harness/tools[/:id]            catalogue
 PATCH  /v1/harness/tools/:id              enable/disable one entry for every session
 POST   /v1/harness/tools/:id/executions   run a catalogue tool, no session
-GET    /v1/harness/plugins                built-in plugins + their settings
-PATCH  /v1/harness/plugins/:id            change one plugin's settings
+GET    /v1/harness/plugins                built-in plugins + the TEMPLATE's settings
+PATCH  /v1/harness/plugins/:id            change one plugin's settings for sessions created after it
 POST   /v1/harness/models                 server-side GET {base_url}/models
 GET    /v1/harness/sessions               paged SessionSummary rows (no children)
 POST   /v1/harness/sessions               create → 201 { session }
@@ -4161,6 +4216,8 @@ GET    /v1/harness/sessions/:id/queue|actions
 POST   /v1/harness/sessions/:id/actions/:request_id/answer   answer one pending actionRequest
 GET    /v1/harness/sessions/:id/agents[/:agentId] · tools · threads
 POST   /v1/harness/sessions/:id/tools[/:tool_id][/executions]
+GET    /v1/harness/sessions/:id/plugins[/:plugin_id]      this conversation's rows
+PATCH  /v1/harness/sessions/:id/plugins/:plugin_id        one plugin for this conversation only
 GET/PUT /v1/harness/sessions/:id/threads/:thread_id/transcript[/messages|/document]
 POST   /v1/harness/sessions/:id/threads/:thread_id/cancel|resume
 GET    /v1/harness/stream                 the harness.v1 WebSocket (live updates)

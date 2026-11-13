@@ -17,6 +17,7 @@
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 
 // T17: `GET /harnesses` publishes contract CARDS, which are snake_case, and the shell
 // maps them through `descriptorOf` (./api.ts:1203) — a mapping that reads
@@ -48,7 +49,40 @@ const WEBSEARCH_PARAMETERS = {
 const json = (value: unknown): Response =>
     new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } });
 
+// The conversation the card opens on. T4: the ⚒ pane lists the toolbox of the CONVERSATION on
+// screen and main.ts hides both header toggles while none is bound, so a catalogue test needs one
+// — and `harness: 'demo'` is what makes the shell open it on this fixture's only harness.
+const SESSION = {
+    id: 's1',
+    harness: 'demo',
+    status: 'idle',
+    model: 'm1',
+    createdAt: 1,
+    updatedAt: 2,
+    messages: [],
+    turns: []
+};
+
+// The one tool this fixture ships, stated ONCE: the boot document, the pane's toolbox row and the
+// runner's identified schema read all come out of this record, so the availability figure under
+// test is the same figure everywhere the shell looks (./session-config-test-support.ts).
+const toolOf = (availability: unknown): Record<string, unknown> => ({
+    name: 'search',
+    group: 'Web search',
+    description: 'Search the web with Exa or Tavily.',
+    tags: ['web', 'search', 'internet', 'news', 'research'],
+    // R18: a configured (or listed) search is core.
+    visibility: 'core',
+    // A direct call, not a session-registry tool (`session_bound` is the contract's spelling,
+    // shared/harness-api.ts:647).
+    session_bound: false,
+    parameters: WEBSEARCH_PARAMETERS,
+    availability
+});
+
 const stubFetch = (availability: unknown): void => {
+    const tools = [toolOf(availability)];
+
     vi.stubGlobal(
         'fetch',
         vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
@@ -64,25 +98,21 @@ const stubFetch = (availability: unknown): void => {
                 return json({
                     rootPath: 'D:/repo',
                     presets: [card],
-                    tools: [
-                        {
-                            name: 'search',
-                            group: 'Web search',
-                            description: 'Search the web with Exa or Tavily.',
-                            tags: ['web', 'search', 'internet', 'news', 'research'],
-                            // R18: a configured (or listed) search is core.
-                            visibility: 'core',
-                            // A direct call, not a session-registry tool (`session_bound`
-                            // is the contract's spelling, shared/harness-api.ts:647).
-                            session_bound: false,
-                            parameters: WEBSEARCH_PARAMETERS,
-                            availability
-                        }
-                    ],
+                    tools,
                     defaults: { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false },
-                    sessions: []
+                    // T4: the catalogue pane describes a conversation, so the roster names one.
+                    sessions: [SESSION]
                 });
             }
+
+            // T4: the conversation the roster points at (the rail's roster read, the view open, and
+            // the toolbox page the pane asks for on first open), all from the ONE tool record above.
+            if (url === '/api/sessions' || url === '/api/sessions?limit=25') return json({ sessions: [SESSION] });
+            if (url === '/api/sessions/s1') return json({ session: SESSION });
+
+            const toolReads = sessionToolReads(tools, url);
+
+            if (toolReads !== undefined) return toolReads;
 
             // Boot also refreshes the model catalogue in the background.
             if (url.endsWith('/api/models')) return json({ models: ['m1'] });
@@ -105,10 +135,15 @@ const boot = async (): Promise<void> => {
 // R21.2/R3: the tools view is the only catalogue. Selecting a tool means clicking
 // its keyed button there, so the global topbar toggle is pressed first (there is no
 // tab strip any more).
-const openToolsTab = (): void => {
+//
+// T4: the press is no longer the ANSWER. The pane lists the conversation's toolbox, which it
+// reads on first open, so the rows arrive a turn later — the caller has to wait for them. Before
+// T4 the list came out of the boot document and was on screen the moment the swap painted.
+const openToolsTab = async (): Promise<void> => {
     const found = document.querySelector<HTMLButtonElement>('.tools-toggle');
     if (found === null) throw new Error('the global Tools toggle did not render');
     if (found.getAttribute('aria-pressed') !== 'true') found.click();
+    await flush();
 };
 
 const toolButtons = (): HTMLButtonElement[] => [
@@ -140,14 +175,23 @@ it('lists an unconfigured search, explains it, and disables the call', async () 
     expect(document.querySelector('.rail-right .tool-list')).toBeNull();
     expect(document.querySelector('.rail-right .core-tools')).toBeNull();
 
-    openToolsTab();
+    // T4: the press opens the pane, and the pane's FIRST answer is that it is reading THIS
+    // conversation's toolbox — an empty list and a reading list are different states, and the head
+    // line is what tells them apart. The rows only land once the read lands, so the frame is
+    // asserted BEFORE the promise is awaited.
+    const toolsTab = openToolsTab();
 
-    // R5 (Tools Catalogue): NO group heading is emitted — the pane is one flat A–Z list, and
-    // the "Web search" label the list used to print above the row is gone. The group is still
-    // where it is useful: the runner head's badge (asserted below) and `GET /tools?group=`.
-    expect(document.querySelectorAll('.tool-tab-group')).toHaveLength(0);
+    expect(document.querySelector('.tool-tab-group')).toBeNull();
+    expect(document.querySelector<HTMLElement>('.tools-loading')?.textContent).toBe(
+        'Reading this conversation’s toolbox…'
+    );
+
+    await toolsTab;
 
     const button = toolButtons()[0];
+
+    expect(toolButtons()).toHaveLength(1);
+    expect(button.dataset.tool).toBe('search');
     expect(button.dataset.availability).toBe('unconfigured');
     expect(button.querySelector('.tool-tab-kind')?.textContent).toBe('core · unconfigured');
 
@@ -189,9 +233,13 @@ it('enables the same entry when the server reports it configured', async () => {
     stubFetch({ state: 'available', environment: ['EXA_API_KEY', 'TAVILY_API_KEY'] });
     await boot();
 
-    openToolsTab();
+    const toolsTab = openToolsTab();
+
+    await toolsTab;
 
     const button = toolButtons()[0];
+
+    expect(button.dataset.tool).toBe('search');
     expect(button.dataset.availability).toBeUndefined();
     expect(button.querySelector('.tool-tab-kind')?.textContent).toBe('core');
 

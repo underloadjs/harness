@@ -105,9 +105,9 @@ describe('harness contract root and headers', () => {
 });
 
 describe('harness contract route tables', () => {
-    it('covers all 49 spec paths', () => {
-        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(49);
-        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(49);
+    it('covers all 51 spec paths', () => {
+        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(51);
+        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(51);
         // R1: the stop's counterpart is addressable with the same two ids, in the same
         // order, so a client builds it exactly the way it builds `cancel`.
         expect(HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdResume('ses_1', 'thr_3')).toBe(
@@ -171,6 +171,13 @@ describe('harness contract route tables', () => {
         expect(HARNESS_ROUTES.plugins()).toBe('/v1/harness/plugins');
         expect(HARNESS_ROUTES.pluginsByPluginId('context-compaction')).toBe(
             '/v1/harness/plugins/context-compaction',
+        );
+        // R4: the SESSION-scoped pair. Same item shape as the global pair, addressed by the
+        // session first — and the row/body schemas are the same generated types, which is why
+        // the regenerated contract grew by exactly these two templates and no new schema.
+        expect(HARNESS_ROUTES.sessionsBySessionIdPlugins('ses_1')).toBe('/v1/harness/sessions/ses_1/plugins');
+        expect(HARNESS_ROUTES.sessionsBySessionIdPluginsByPluginId('ses_1', 'context-compaction')).toBe(
+            '/v1/harness/sessions/ses_1/plugins/context-compaction',
         );
     });
 });

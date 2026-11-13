@@ -86,6 +86,8 @@ export const HARNESS_PATH_TEMPLATES = {
     sessionsBySessionIdToolsByToolId: '/v1/harness/sessions/{session_id}/tools/{tool_id}',
     sessionsBySessionIdToolsByToolIdSource: '/v1/harness/sessions/{session_id}/tools/{tool_id}/source',
     sessionsBySessionIdToolsByToolIdExecutions: '/v1/harness/sessions/{session_id}/tools/{tool_id}/executions',
+    sessionsBySessionIdPlugins: '/v1/harness/sessions/{session_id}/plugins',
+    sessionsBySessionIdPluginsByPluginId: '/v1/harness/sessions/{session_id}/plugins/{plugin_id}',
     sessionsBySessionIdThreads: '/v1/harness/sessions/{session_id}/threads',
     sessionsBySessionIdThreadsByThreadId: '/v1/harness/sessions/{session_id}/threads/{thread_id}',
     sessionsBySessionIdThreadsByThreadIdCancel: '/v1/harness/sessions/{session_id}/threads/{thread_id}/cancel',
@@ -173,6 +175,10 @@ export const HARNESS_ROUTES = {
     sessionsBySessionIdToolsByToolIdSource: (sessionId: string, toolId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/tools/${toolId}/source`,
     /** `/v1/harness/sessions/{session_id}/tools/{tool_id}/executions` */
     sessionsBySessionIdToolsByToolIdExecutions: (sessionId: string, toolId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/tools/${toolId}/executions`,
+    /** `/v1/harness/sessions/{session_id}/plugins` */
+    sessionsBySessionIdPlugins: (sessionId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/plugins`,
+    /** `/v1/harness/sessions/{session_id}/plugins/{plugin_id}` */
+    sessionsBySessionIdPluginsByPluginId: (sessionId: string, pluginId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/plugins/${pluginId}`,
     /** `/v1/harness/sessions/{session_id}/threads` */
     sessionsBySessionIdThreads: (sessionId: string) => `${HARNESS_API_ROOT}/sessions/${sessionId}/threads`,
     /** `/v1/harness/sessions/{session_id}/threads/{thread_id}` */
@@ -1853,8 +1859,12 @@ export type SessionToolSummary = ToolSummary
      */
     declared: boolean;
     /**
-     * True when the tool is callable in this session right now - the live enabled set, whether the name is
-     * declared, was discovered through `toolRequest`, or was created at runtime. `PATCH` toggles it. `false`
+     * Membership in THIS SESSION's live enabled/discovered set - the capped set the running harness currently
+     * keeps switched on (`harness.discoveredTools`, read in `./api-reads.ts` `sessionToolRowsOf`). It is NOT
+     * "is this name in the model's context": a freshly created session answers `false` for EVERY row here, its
+     * harness-owned control tools included, because those arrive in context through the FROZEN definition and
+     * the runtime manifest and never occupy an enabled slot. `declared` and `protected` are the two fields that
+     * state whether a name is in context regardless of this one. `PATCH` toggles membership in the set. `false`
      * withdraws the name without losing its registration or its captured source revision, and `true` switches
      * that same live slot back on: it does NOT restore an inherited binding, because a removal or an override
      * here never keeps a superseded copy to hand back. Toggling requires an idle session (409) and is refused

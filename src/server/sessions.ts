@@ -266,7 +266,7 @@ import type { HarnessDatabase, HarnessGlobalSettingsRecord, HarnessInvalidThread
 // T5 (R2/R3): the runtime-level plugin settings store. The store OWNS it (one per SessionStore,
 // hence one per HarnessRuntime / standalone listener) because it is durable registry-adjacent
 // state written through the same `state.json` commit as everything else here.
-import { createPluginSettingsStore } from './plugins';
+import { createPluginSettingsStore, copyPluginSettingsStore } from './plugins';
 import type { HarnessPluginSettingsStore, HarnessPluginSettingValues } from './plugins';
 import { createToolSettingsStore } from './tool-settings';
 import type { HarnessToolSettingsStore } from './tool-settings';
@@ -662,6 +662,24 @@ export type Session = {
     // scheduling a whole-document rewrite for it would let a chatty plugin drive the save rate
     // (the standing coalescing rule, docs/tasks/2026-11-09-context-inclusion-followups.md F6).
     pluginDiagnostics: SessionPluginDiagnostic[];
+    // R4 (session-scoped plugin settings): THIS SESSION'S OWN plugin-settings store — one
+    // `Map<plugin, Map<key, value>>` of overrides, per session, and the ONLY thing its
+    // harness's live provider reads.
+    //
+    // It is created by `copyPluginSettingsStore(processStore)` immediately BEFORE
+    // `buildHarness` in `create` (so the harness's provider reference is the session's map
+    // from its very first read), and by `createPluginSettingsStore({ values:
+    // record.pluginSettings })` on a restore (so a restart rehydrates the session's own copy,
+    // not today's template). After that, only the session-scoped routes write it.
+    //
+    // WHY IT RIDES ON THE RECORD (rather than a `Map<sessionId, store>` on the store): the
+    // harness's provider closure, `sessionRecord` (the durable projection), `blueprintFor`
+    // (the lane replica's snapshot) and the REST row builder all need it, and all of them
+    // already hold this object — a side map would be one more thing to keep in step with
+    // `sessions.delete` and with a harness replacement. It is runtime state, never serialized
+    // directly: `sessionRecord` writes `plugins.snapshot()`, the same way `harness` is
+    // serialized as `core`.
+    plugins: HarnessPluginSettingsStore;
     // True while a LEGACY /messages run owns this harness. Manual calls set `busy`
     // without changing `status`, so the aggregate status needs its own flag to know
     // when a real run is active.
@@ -1548,10 +1566,18 @@ export class SessionStore {
     // `HarnessGlobalSettingsRecord`). `undefined` means "the shipped environment defaults".
     private global: HarnessGlobalSettingsRecord | undefined;
 
-    // T5 (R2/R3): the plugin settings store for THIS runtime. Built in the constructor from
-    // the generated built-in manifest plus the overrides this database's document carried, so
-    // a restored process reads exactly what the operator last saved, and `buildHarness` hands
-    // every session (fresh or restored) this one object's LIVE provider.
+    // T5 (R2/R3): the plugin settings store for THIS runtime — the PROCESS/TEMPLATE scope.
+    // Built in the constructor from the generated built-in manifest plus the overrides this
+    // database's document carried, so a restored process reads exactly what the operator
+    // last saved.
+    //
+    // R4 changed exactly one thing about it: it is no longer the store every harness reads.
+    // It is (a) the SEED every new session copies down at creation (see
+    // ./plugins.ts `copyPluginSettingsStore`) and (b) the store the two global routes
+    // (`GET /v1/harness/plugins`, `PATCH /v1/harness/plugins/{plugin_id}`) read and write,
+    // whose meaning is unchanged. A write here therefore reaches the sessions created AFTER
+    // it; a session that already exists owns its own copy (`Session.plugins`) and keeps it
+    // until it is removed.
     private readonly plugins: HarnessPluginSettingsStore;
     // R3: the global tool switch's store — the deny list this process runs with, and the
     // LIVE provider every harness in this store is built with (./tool-settings.ts).
@@ -1629,6 +1655,9 @@ export class SessionStore {
         // loaded (./persistence.ts `pluginSettings`). Declared defaults come from the generated
         // built-in manifest, so a plugin file stays the single owner of its own settings and a
         // deployment that never touched the Plugins pane stores nothing.
+        //
+        // R4: this is the TEMPLATE scope. Every session created later copies these overrides
+        // down into its own store; nothing here is read by a session's harness any more.
         this.plugins = createPluginSettingsStore({
             ...(options.database === undefined ? {} : { values: options.database.pluginSettings })
         });
@@ -1958,6 +1987,13 @@ export class SessionStore {
      * operator's overrides, and the LIVE provider every harness in this store is built with.
      * Reads (`values`, `get`, `snapshot`, `revision`) are synchronous; writes go through
      * `updatePluginSettings` so the durable commit happens before the caller answers.
+     *
+     * R4 — this is the PROCESS/TEMPLATE scope, not the answer for a session. Reach a
+     * session's own copy through its record: `liveSession(id).plugins` (rows, `enabled`,
+     * `values`), and write it through `updateSessionPluginSettings` so the same durability
+     * rule applies. `GET /v1/harness/plugins` and `PATCH /v1/harness/plugins/{plugin_id}`
+     * are exactly this store; `GET/PATCH /v1/harness/sessions/{id}/plugins/**` are the
+     * session's (./api.ts).
      */
     get pluginSettings(): HarnessPluginSettingsStore {
         return this.plugins;
@@ -1967,6 +2003,12 @@ export class SessionStore {
      * T5 (R2/R3): change one plugin's settings (`PATCH /v1/harness/plugins/{plugin_id}`) and
      * make the change durable BEFORE the answer, which is this store's rule for every
      * structural mutation (see `updateGlobalSettings`, the same discipline one feature earlier).
+     *
+     * R4 — SCOPE. This writes the PROCESS/TEMPLATE store: the value lands in the map every
+     * session CREATED AFTER THIS copies down at creation, and in nothing that already exists.
+     * The pre-R4 sentence "one click reaches every session, live, with no rebuild" is no
+     * longer true of this method; `updateSessionPluginSettings` is the one that moves a live
+     * session, and `./plugins-api.test.ts` states both halves.
      *
      * Validation is the store's (`./plugins.ts`), and it throws a status-carrying
      * `HarnessPluginSettingsError` (404 unknown plugin, 400 unknown key / mistyped /
@@ -1982,6 +2024,43 @@ export class SessionStore {
         settings: Record<string, unknown>
     ): Promise<HarnessPluginSettingValues> {
         const values = this.plugins.update(plugin, settings);
+
+        await this.persistOrThrow();
+
+        return values;
+    }
+
+    /**
+     * R4 — change one plugin's settings FOR ONE SESSION
+     * (`PATCH /v1/harness/sessions/{session_id}/plugins/{plugin_id}`), durable BEFORE the
+     * answer, with the same commit discipline `updatePluginSettings` uses.
+     *
+     * Three properties the caller can rely on:
+     *   - SCOPE. Only this session's store moves. Its harness holds this store's live
+     *     provider (./sessions.ts `buildHarness`), so the change is real on the session's
+     *     very NEXT turn with no rebuild, and no other session — and not the template —
+     *     sees any of it;
+     *   - WRITE-ANYTIME. No idle gate, exactly like the global route (./api.ts
+     *     `patchPlugin`): a settings write moves no registration and removes no schema the
+     *     model was promised, unlike a session TOOL switch (`assertIdleForToolMutation`),
+     *     which does mutate one live harness. A run in flight keeps what it was given;
+     *   - VALIDATION BEFORE MUTATION. The store throws its status-carrying
+     *     `HarnessPluginSettingsError` (404 unknown plugin, 400 unknown key / mistyped /
+     *     out-of-range) before touching the map, and an unknown SESSION is a 404
+     *     `SessionError` thrown before anything else is read.
+     *
+     * A failed durable write leaves the value applied and reports the 500, the same honest
+     * trade as the two writes above: the session already runs with the new value, so a
+     * rollback would claim a failure the running conversation did not have.
+     */
+    async updateSessionPluginSettings(
+        sessionId: string,
+        plugin: string,
+        settings: Record<string, unknown>
+    ): Promise<HarnessPluginSettingValues> {
+        const session = this.require(sessionId);
+
+        const values = session.plugins.update(plugin, settings);
 
         await this.persistOrThrow();
 
@@ -2091,8 +2170,23 @@ export class SessionStore {
         this.assertWorkerCapable(preset);
 
         let harness: Harness;
+
+        // R4 — THE COPY-DOWN, before the harness exists. A new session gets its OWN plugin
+        // settings store, seeded from the process/template store
+        // (`child.restore(parent.snapshot())`, ./plugins.ts `copyPluginSettingsStore`), and
+        // THAT store's live provider is what the harness is built with. Seeding has to happen
+        // here rather than when the Session object is assembled, because the provider
+        // reference is captured inside the preset factory: a harness built with the template
+        // provider would keep reading the template after the session was created, which is
+        // exactly the coupling R4 removes.
+        //
+        // Consequence an operator can rely on (and the one `./plugins-api.test.ts` pins):
+        // a `PATCH /v1/harness/plugins/{plugin_id}` changes what a session created AFTER the
+        // write starts with, and changes nothing about a session that already exists.
+        const plugins = copyPluginSettingsStore(this.plugins);
+
         try {
-            harness = this.buildHarness(preset, settings, () => session);
+            harness = this.buildHarness(preset, settings, () => session, plugins);
         } catch (error) {
             // T27: a build failure that ALREADY carries an HTTP status is propagated, not
             // re-numbered. The case that matters is a retired agent profile: `agent-state`
@@ -2142,6 +2236,10 @@ export class SessionStore {
             invalidThreads: new Map(),
             // T1.5 last mile: no plugin has failed on it yet.
             pluginDiagnostics: [],
+            // R4: the session's own plugin settings, seeded from the template store ABOVE and
+            // already the provider the harness above holds. Nothing has been edited for this
+            // session, so its snapshot equals the seed and its `revision()` is 0.
+            plugins,
             // T27: a fresh session has exactly the members its definition shipped with.
             sessionAgents: [],
             legacyRunning: false,
@@ -2187,10 +2285,17 @@ export class SessionStore {
     // whichever turn is currently streaming, and every core state change becomes a
     // durable save. The callbacks read `session` lazily because the harness is
     // constructed before the session object exists.
+    //
+    // `plugins` is the SESSION'S OWN plugin-settings store (R4), supplied by the caller
+    // because the provider reference has to exist before the factory runs: `create` copies
+    // the template store down, `restoreSession` rebuilds the session's persisted copy. Both
+    // build paths therefore pass a per-session store, and no build path passes the process
+    // store's provider any more.
     private buildHarness(
         preset: HarnessPreset,
         settings: RunnerSettings,
-        current: () => Session | undefined
+        current: () => Session | undefined,
+        plugins: HarnessPluginSettingsStore
     ): Harness {
         // Progress routing (R1-R6). The runtime has ONE progress hook per harness,
         // so two concurrent root thread runs would otherwise be indistinguishable
@@ -2251,15 +2356,18 @@ export class SessionStore {
             // schedule a whole-document save on its own (src/types/index.ts
             // `HarnessDiagnosticEvent`, and `notePluginDiagnostic` below for the journal rule).
             diagnostic: (event: HarnessDiagnosticEvent): void => this.notePluginDiagnostic(current(), event),
-            // T5 (R2/R3): the runtime's LIVE plugin settings provider. Every build path lands
-            // here — `create` (a fresh session, line ~1875 above) and the restore path (line
-            // ~3044 below) — so both a new conversation and one rebuilt from `state.json` read
-            // operator edits. The harness stores the REFERENCE and each plugin's `api.settings`
-            // re-reads it on every call (../plugin/settings.ts, ../plugin/host.ts:151), which is
-            // why a PATCH takes effect with no rebuild. Proven by src/server/plugins-api.test.ts
-            // ("the live settings provider reaches an existing session"): with this line removed,
-            // a plugin's `turn.before` read still sees the declared default on turn 2.
-            pluginSettings: this.plugins.provider,
+            // T5 (R2/R3) + R4: THIS SESSION'S live plugin settings provider. Every build path
+            // lands here — `create` (a fresh session, seeded by copying the template store
+            // down) and the restore path (a session rebuilt from its own persisted copy) — so
+            // both a new conversation and one restored from `state.json` read the values that
+            // belong to THEM. The harness stores the REFERENCE and each plugin's
+            // `api.settings` re-reads it on every call (../plugin/settings.ts,
+            // ../plugin/host.ts:151), which is why a `PATCH /v1/harness/sessions/{id}/plugins/
+            // {plugin_id}` takes effect on the next turn with no rebuild. Proven by
+            // src/server/plugins-api.test.ts ("a session-scoped PATCH reaches that session's
+            // next turn, live, with no rebuild"): with this line back to `this.plugins.provider`,
+            // a plugin's `turn.before` read still sees the template value.
+            pluginSettings: plugins.provider,
             // R3: the runtime's LIVE global tool provider, on the same by-reference rule as
             // the line above. `harness()` stores the object and calls `isToolDisabled` while
             // it builds every request's tool list, while the launch gate and `toolRequest`'s
@@ -2460,13 +2568,19 @@ export class SessionStore {
     // other field below. `disabled()` is the store's sorted snapshot of the SAME names the
     // durable document carries (its `snapshot()`), just unwrapped for the wire.
     //
-    // R3 (plugins): `pluginSettings` is the twin read — `this.plugins.snapshot()` is the
-    // operator's override map in exactly the shape `state.json` stores it, so a lane replica's
-    // plugin-settings view resolves the SAME `enabled` switch and the SAME numeric/string knobs
-    // the host's live provider answers, and the framework's hook gate
+    // R3 (plugins) + R4: `pluginSettings` is the twin read — a SESSION's OWN override map, in
+    // exactly the shape `state.json` stores it, so a lane replica's plugin-settings view
+    // resolves the SAME `enabled` switch and the SAME numeric/string knobs the SESSION (not
+    // the deployment) runs with, and the framework's hook gate
     // (src/plugin/host.ts `settings.boolean('enabled', true)`) decides identically on both
-    // sides of the thread boundary. Empty means "nothing has ever been changed", and the
+    // sides of the thread boundary. Empty means "this session has changed nothing", and the
     // worker then installs no provider at all.
+    //
+    // The scope is the point: reading `this.plugins.snapshot()` here (the pre-R4 process
+    // store) would give a lane the template's answer while the inline session it mirrors runs
+    // with its own, so the same turn would compact in a worker and not inline. `disabledTools`
+    // deliberately keeps reading the PROCESS store — the tool deny list is deployment-wide by
+    // its own contract (./tool-settings.ts), and only plugin settings moved per session.
     private blueprintFor(session: Session): LaneBlueprintSource {
         return {
             record: presetToRecord(session.preset),
@@ -2474,7 +2588,7 @@ export class SessionStore {
             apiKey: session.settings.apiKey,
             memoryKeys: this.memoryKeysFor(session),
             disabledTools: this.tools.disabled(),
-            pluginSettings: this.plugins.snapshot()
+            pluginSettings: session.plugins.snapshot()
         };
     }
 
@@ -3029,6 +3143,22 @@ export class SessionStore {
             ...(session.pluginDiagnostics.length === 0
                 ? {}
                 : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
+            // R4 (durability, and the ONLY record of a session's own plugin settings): the
+            // SESSION's override map, written only when this session has changed anything, so a
+            // session nobody configured keeps its exact pre-R4 `state.json` shape — the same
+            // omit-when-empty rule the document-level `pluginSettings` block follows in
+            // `databaseRecord` below, and the reason no database version bump is needed.
+            //
+            // A restore reads THIS and never the process store, which is what makes a
+            // per-session edit survive a restart. An absent field therefore means "this session
+            // has never edited a plugin setting", and restores at the declared defaults rather
+            // than at whatever the template happens to say TODAY — a template edit made after
+            // this session was created must not reach it, in either direction.
+            ...(() => {
+                const pluginSettings = session.plugins.snapshot();
+
+                return Object.keys(pluginSettings).length === 0 ? {} : { pluginSettings };
+            })(),
             // The last committed snapshot. During an active run this is the latest
             // mutation boundary the observer captured (a completed tool's store
             // writes and tool-result message together), plus the event log above.
@@ -3061,10 +3191,15 @@ export class SessionStore {
             // T16: the operator's global defaults, written only once they have been changed, so a
             // document from a deployment that never touched `/config` keeps its exact shape.
             ...(this.global === undefined ? {} : { globalSettings: { ...this.global } }),
-            // T5 (R2/R3): the operator's per-plugin setting OVERRIDES, written only once any
-            // exist (a deployment that never opened the Plugins pane keeps its exact previous
-            // document). The store returns catalogue-ordered, defaults-free maps, so this is a
-            // delta and not a copy of anything the shipped plugin metadata already declares.
+            // T5 (R2/R3): the operator's per-plugin setting OVERRIDES for the PROCESS/TEMPLATE
+            // scope, written only once any exist (a deployment that never opened the Plugins
+            // pane keeps its exact previous document). The store returns catalogue-ordered,
+            // defaults-free maps, so this is a delta and not a copy of anything the shipped
+            // plugin metadata already declares.
+            //
+            // R4 did NOT change this block or the two global routes that read it: it is the
+            // seed for the next session, and a session's own values live in that session's
+            // record (`sessionRecord.pluginSettings`), never here.
             ...(() => {
                 const pluginSettings = this.plugins.snapshot();
 
@@ -3524,12 +3659,31 @@ export class SessionStore {
 
             let session: Session | undefined;
 
+            // R4 — rehydrate THIS session's own plugin settings, from its own record, before
+            // the harness is built (the same ordering rule `create` follows: the provider
+            // reference the factory captures has to be the session's store).
+            //
+            // TOLERANT by construction: the seed goes through ./plugins.ts `restore`, which
+            // drops a plugin this build no longer ships, a key it no longer declares, and a
+            // value whose type has since been tightened — none of which may drop the session
+            // (the per-session drop policy in the load loop is for a record that cannot be
+            // rebuilt at all, not for one stale override).
+            //
+            // An ABSENT field is restored as an EMPTY store, deliberately. A pre-R4 document
+            // never recorded per-session values, and inventing a fallback to today's process
+            // store would move a session that had never been configured the moment someone
+            // edited the template and restarted — the exact coupling R4 removes. `?? {}` keeps
+            // the rule one-sided: the session's own copy is the only source.
+            const plugins = createPluginSettingsStore({
+                ...(record.pluginSettings === undefined ? {} : { values: record.pluginSettings })
+            });
+
             // T5: a restored session is checked again, because the registry may have replaced
             // the preset this record rebuilds from with an injected one. A refusal here lands
             // in the per-session restore failure (noteRestoreError), not in a dropped database.
             this.assertWorkerCapable(preset);
 
-            const harness = this.buildHarness(preset, settings, () => session);
+            const harness = this.buildHarness(preset, settings, () => session, plugins);
 
             session = {
                 id: record.id,
@@ -3612,6 +3766,11 @@ export class SessionStore {
                 // dropped malformed entries and re-applied the cap). Absent means "nothing was
                 // ever reported", which is every document written before this field existed.
                 pluginDiagnostics: [...(record.pluginDiagnostics ?? [])],
+                // R4: the session's own plugin settings, rebuilt from `record.pluginSettings`
+                // ABOVE — before the harness was built, so the harness this record just rebuilt
+                // already holds this store's live provider. A pre-R4 document (no field) rebuilds
+                // an empty store: the declared defaults, not today's template.
+                plugins,
                 legacyRunning: false,
                 watchers: new Set(),
                 pumping: false,

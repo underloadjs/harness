@@ -1,5 +1,31 @@
-// Runtime-level PLUGIN SETTINGS (T5 / R2-R3): the one place the server decides what a
-// built-in plugin's setting is worth, for EVERY session in this process.
+// Runtime-level PLUGIN SETTINGS (T5 / R2-R3, session-scoped by R4): the one place the
+// server decides what a built-in plugin's setting is worth — ONE STORE PER SCOPE.
+//
+// THE TWO SCOPES (R4 — "once a session exists, its plugin configuration is its own")
+// ----------------------------------------------------------------------------------
+// `createPluginSettingsStore` builds a scope. There are exactly two kinds of scope in the
+// server, and `./sessions.ts` owns both:
+//
+//   - THE PROCESS/TEMPLATE STORE — one per runtime, seeded from the durable document
+//     (`state.json`'s top-level `pluginSettings`). It is the seed source AND the answer of
+//     `GET /v1/harness/plugins` + `PATCH /v1/harness/plugins/{plugin_id}`, whose meaning is
+//     unchanged: a write there changes what EVERY SESSION CREATED AFTER IT inherits, and
+//     nothing that already exists.
+//   - ONE STORE PER SESSION — created at `SessionStore.create` by copying the process
+//     store's overrides down, literally `child.restore(parent.snapshot())`, and therefore
+//     nothing more than a detached `HarnessPluginSettingsRecord` moved between two stores
+//     that share one catalogue. `copyPluginSettingsStore` is that copy-down; a
+//     restored session instead restores ITS OWN persisted copy
+//     (`HarnessSessionRecord.pluginSettings`). From the moment the session exists, only
+//     writes through its store (the `/sessions/{id}/plugins/**` routes) move its values, and
+//     a template write never reaches it.
+//
+// The property this design buys, and the one it gives up, are both worth stating: a
+// harness's provider is live BY REFERENCE, so within one scope an edit reaches a running
+// session on its next turn with no rebuild (unchanged, and still pinned by
+// ./plugins-api.test.ts); ACROSS scopes an edit reaches nothing, because two stores share
+// no map. That is the whole mechanism — there is no per-session override layer, no merge,
+// and no "inherit unless changed" flag to reason about.
 //
 // WHY THIS LIVES IN THE SERVER, NOT IN THE HARNESS
 // ------------------------------------------------
@@ -40,8 +66,11 @@
 // filter. A plugin that declares `enabled` itself (context-compaction) keeps its own
 // descriptor, so its Rule-0 read and the framework gate are one value with one write
 // path. Consequences an operator can rely on:
-//   - one click, every thread: the provider is process-wide and read live, so a running
-//     session honours the switch on its next turn, with no rebuild and no re-registration;
+//   - one click, every thread OF THAT SCOPE: a store has one provider, it is read live, so
+//     a running session honours the switch on its next turn, with no rebuild and no
+//     re-registration. Which sessions a click reaches is the SCOPE's rule, not the plugin's:
+//     a `/sessions/{id}/plugins/**` write moves that one session, a `/plugins/{id}` write
+//     moves the template every LATER session copies (R4);
 //   - a disabled plugin stays LOADED and LISTED - its tools, agents, commands and
 //     settings are untouched, and `GET /plugins` reports the row with `enabled: false`;
 //   - `values` keeps reporting only DECLARED keys (the contract states a key absent from
@@ -80,14 +109,16 @@
 // A lane worker rebuilds its replica from the preset RECORD in the `hello` blueprint
 // (src/server/workers/lane-worker-loop.ts `sayHello`) and passes `{ stateChange, interaction,
 // toolSettings, pluginSettings }` as the report. The LIVE provider is a closure, so it can
-// never cross a `worker_threads` boundary; what crosses instead is this store's `snapshot()`
+// never cross a `worker_threads` boundary; what crosses instead is a store's `snapshot()`
 // - the override map in exactly the shape `state.json` holds it - carried as
 // `LaneBlueprint.pluginSettings` (src/server/workers/protocol.ts), read at lane creation by
-// src/server/sessions.ts `blueprintFor`, and turned back into a read-only provider by
-// `lanePluginSettingsProvider`. A replica therefore resolves the operator's `enabled` switch
-// (the framework's hook gate, src/plugin/host.ts + src/plugin/hooks.ts) and every other knob
-// exactly like an inline session, and a value changed while a lane was running reaches that
-// lane when the lane is next created - the semantics the plugin PATCH documents.
+// src/server/sessions.ts `blueprintFor` from THE SESSION'S OWN store (R4 — the lane replica
+// resolves that session's values, not the template's), and turned back into a read-only
+// provider by `lanePluginSettingsProvider`. A replica therefore resolves that session's
+// `enabled` switch (the framework's hook gate, src/plugin/host.ts + src/plugin/hooks.ts) and
+// every other knob exactly like the inline session it mirrors, and a value changed while a
+// lane was running reaches that lane when the lane is next created - the semantics the two
+// plugin PATCH routes document.
 //
 // The one deliberate difference: a lane's provider has no `set`, so a plugin calling
 // `api.settings.setOwn` on a replica gets the library's stated "read-only (no writer)"
@@ -98,9 +129,15 @@
 //   - ../plugin/manifest.ts       — BUILTIN_PLUGIN_DESCRIPTORS: the seeded catalogue + defaults
 //   - ../plugin/settings.ts       — the per-plugin view this module projects `values` through
 //   - ../types/index.ts:3434-3507 — the descriptor, metadata, and provider contracts
-//   - ./persistence.ts            — `HarnessPluginSettingsRecord`, the durable override map
-//   - ./sessions.ts               — owns one store per runtime, passes `provider` to buildHarness
-//   - ./api.ts                    — `GET /plugins`, `PATCH /plugins/{plugin_id}`
+//   - ./persistence.ts            — `HarnessPluginSettingsRecord`, the durable override map,
+//                                    on the DOCUMENT (`pluginSettings`) and per session
+//                                    (`HarnessSessionRecord.pluginSettings`)
+//   - ./sessions.ts               — owns the process store AND one store per session, passes
+//                                    each session's `provider` to buildHarness, and commits
+//                                    both kinds of write before the caller answers
+//   - ./api.ts                    — `GET /plugins`, `PATCH /plugins/{plugin_id}`,
+//                                    and the session-scoped `GET/PATCH
+//                                    /sessions/{session_id}/plugins/{plugin_id}` pair
 
 import { createPluginSettingsView } from '../plugin/settings';
 import { BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
@@ -211,19 +248,33 @@ export type HarnessPluginSettingsStore = {
      * Validate and apply one plugin's patch, returning the new effective map. Throws
      * `HarnessPluginSettingsError` (404/400) BEFORE mutating anything, so a rejected patch
      * is a no-op rather than a partial write. Durability and the revision bump are the
-     * store owner's decision (./sessions.ts `updatePluginSettings`).
+     * store owner's decision (./sessions.ts `updatePluginSettings` for the process/template
+     * store, `updateSessionPluginSettings` for one session's store).
      */
     update: (plugin: string, patch: Record<string, unknown> | undefined) => HarnessPluginSettingValues;
     /** Only what the operator changed, in catalogue order - the `state.json` projection. */
     snapshot: () => HarnessPluginSettingsRecord;
-    /** Replace every override with a restored document (no revision bump: a boot is not a write). */
+    /**
+     * Replace every override with a restored document (no revision bump: a boot is not a
+     * write). Tolerant by construction — an unknown plugin, key or value type is dropped —
+     * which is ALSO what makes this the safe copy-down primitive: `child.restore(parent.snapshot())`
+     * moves a scope's values without any chance of the child rejecting what the parent held
+     * (a plugin may stop shipping a key between the two reads).
+     */
     restore: (values?: HarnessPluginSettingsRecord) => void;
-    /** Reads that mutate: one bump per accepted patch, so a page's `revision` is a staleness test. */
+    /**
+     * Reads that mutate: one bump per accepted patch, so a page's `revision` is a staleness
+     * test. PER SCOPE, deliberately: the counter belongs to the store, so a session's page
+     * revisions move only when THAT session was written, and a template write moves only the
+     * template's counter. Two stores never share a number (./api.ts `getSessionPlugins` /
+     * `patchSessionPlugin` vs `getPlugins` / `patchPlugin`).
+     */
     revision: () => number;
     /**
-     * THE provider handed to every harness report. It reads the live map on every call, which
-     * is what makes an edit reach an existing session; identity is stable for the process, so
-     * a harness that captured it at construction still sees tomorrow's value.
+     * THE provider handed to every harness built in THIS scope. It reads the live map on
+     * every call, which is what makes an edit reach an existing session; identity is stable
+     * for the store's lifetime, so a harness that captured it at construction still sees
+     * tomorrow's value — of THIS scope.
      */
     provider: HarnessPluginSettingsProvider;
 };
@@ -635,3 +686,36 @@ export const createPluginSettingsStore = (
  */
 export const pluginSettingsProviderOf = (store: HarnessPluginSettingsStore): HarnessPluginSettingsProvider =>
     store.provider;
+
+/**
+ * R4 — THE COPY-DOWN. A new session's own settings store, seeded from the scope it was
+ * created in (the process/template store, or a scope a session is cloned from).
+ *
+ * The body is the whole rule and it is one line long on purpose: `child.restore(parent
+ * .snapshot())`. A snapshot is the operator's overrides in exactly the shape the durable
+ * document holds them, and `restore` is the tolerant direction of the same projection, so
+ * the copy needs no merge, no delta, and no version rule — and once it has run the two maps
+ * are INDEPENDENT: `descriptors` is shared (one catalogue, one set of defaults, so a row can
+ * never disagree between scopes), `overrides` is not.
+ *
+ * What that buys and what it costs, both stated:
+ *   - the new session reads the seed on its very first turn, live by reference, exactly like
+ *     an inline session of the parent scope used to;
+ *   - a LATER write in the parent scope reaches nothing here — no provider is shared, so no
+ *     live read can move. That is the point of R4 ("once the session is created, the tools
+ *     and plugins configuration belongs to that session alone"), and it is why a lane
+ *     blueprint, a session record, and a session's REST rows all read THIS store.
+ *
+ * `revision()` starts at 0 in the copy: the seed is not a write by this session, and an
+ * operator's page of one session's plugins should not move because someone edited the
+ * template.
+ */
+export const copyPluginSettingsStore = (parent: HarnessPluginSettingsStore): HarnessPluginSettingsStore => {
+    // Same catalogue as the parent (defaults and the accepted-key allowlist stay identical),
+    // and `restore` — not a shared map — carries the values, which is what detaches them.
+    const child = createPluginSettingsStore({ descriptors: parent.descriptors });
+
+    child.restore(parent.snapshot());
+
+    return child;
+};

@@ -42,7 +42,13 @@ import {
     AGENT_RESULT_PAGE_CHARS,
     AGENT_RESULT_PAGE_MAX_CHARS,
     AGENT_RESULT_RETENTION,
+    // 2026-11-13 (findings B5/C1): the bounds a MODEL may set. `core/agent-limits.ts`
+    // is the canonical value; `core/metadata.ts` re-exports it so this file has ONE
+    // import site, exactly like `DELEGATE_TIMEOUT_MS` above.
+    DELEGATE_MAX_TURNS_MAX,
     DELEGATE_TIMEOUT_MS,
+    FORK_TIMEOUT_MS,
+    MODEL_TIMEOUT_MAX_MS,
     TOOL_MANAGE_METADATA,
     TOOL_REQUEST_METADATA,
     coreToolMetadata
@@ -68,6 +74,9 @@ import * as threadForkEntry from '../tools/runtime/threadFork.tool';
 import * as threadSendEntry from '../tools/runtime/threadSend.tool';
 import * as threadReadEntry from '../tools/runtime/threadRead.tool';
 import * as threadListEntry from '../tools/runtime/threadList.tool';
+// Issue 0027: the release door for a finished conversation. Projected through the
+// facade now that the generated manifest carries the row (see core/metadata.ts).
+import * as threadDeleteEntry from '../tools/runtime/threadDelete.tool';
 
 const sourceOf = (relativePath: string): string =>
     readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8');
@@ -216,6 +225,16 @@ const runtimeEntries: RuntimeEntry[] = [
         metadata: threadListEntry.THREAD_LIST_METADATA,
         moduleMetadata: threadListEntry.metadata,
         aggregated: coreMetadata.THREAD_LIST_METADATA
+    },
+    // The release door (issue 0027). Declared in the same 'threads' activation group,
+    // so it belongs in this matrix as soon as the manifest carries it — the manifest
+    // regeneration is what made the `aggregated` half resolvable at all.
+    {
+        wireName: 'threadDelete',
+        sourcePath: '../tools/runtime/threadDelete.tool.ts',
+        metadata: threadDeleteEntry.THREAD_DELETE_METADATA,
+        moduleMetadata: threadDeleteEntry.metadata,
+        aggregated: coreMetadata.THREAD_DELETE_METADATA
     }
 ];
 
@@ -388,6 +407,9 @@ describe('runtime entry metadata ownership', () => {
             'maxChars',
             'requireClarification',
             'timeoutMs',
+            // C1 (2026-11-13): the optional turn cap, declared between the wall clock
+            // and `scope` so the two optional bounds sit together.
+            'maxTurns',
             'scope'
         ]);
         // The entry annotates the factory with the leaf type through a TYPE-ONLY
@@ -468,6 +490,71 @@ describe('runtime entry metadata ownership', () => {
         ).toEqual(timeout);
         expect(sourceOf('./tool-manifest.ts')).toContain('OMIT IT FOR NO TIME LIMIT');
         expect(sourceOf('./tool-manifest.ts')).not.toContain('Defaults to 300000 (5 minutes)');
+    });
+
+    it('pins the model-settable run bounds against the entry literals (B5/C1)', () => {
+        // 2026-11-13. Three bounds entered the model-facing surface in this step: the
+        // shared wall-clock ceiling, the fork default, and the turn cap. Every entry
+        // restates them as LITERALS (a runtime entry keeps zero captured local
+        // dependencies and must not value-import ../core — see the header of
+        // delegate.tool.ts), so the equality is only real because it is asserted.
+        // A drift here means the schema and the runtime disagree about what a caller
+        // may ask for, which is exactly the failure class this file exists to catch.
+        const delegateProps = agentDelegateEntry.metadata.parameters.properties as Record<
+            string,
+            any
+        >;
+        const threadForkProps = threadForkEntry.THREAD_FORK_METADATA.parameters.properties as Record<
+            string,
+            any
+        >;
+
+        // THE SHARED CEILING. `delegate.timeoutMs` and `threadFork.timeoutMs` advertise
+        // the same 1-3600000 range, so both literals equal ONE constant.
+        expect(MODEL_TIMEOUT_MAX_MS).toBe(3600000);
+        expect([
+            delegateProps.timeoutMs.type,
+            delegateProps.timeoutMs.minimum,
+            delegateProps.timeoutMs.maximum
+        ]).toEqual(['integer', 1, MODEL_TIMEOUT_MAX_MS]);
+        expect([
+            threadForkProps.timeoutMs.type,
+            threadForkProps.timeoutMs.minimum,
+            threadForkProps.timeoutMs.maximum
+        ]).toEqual(['integer', 1, MODEL_TIMEOUT_MAX_MS]);
+
+        // THE FORK DEFAULT IS "NO LIMIT", spelled as one constant and restated in the
+        // entry's prose. The entry declares NO schema `default` on purpose: an omitted
+        // argument must fall through to the harness option (`threadForkTimeoutMs`), not
+        // to a number the schema invented — see `resolveForkTimeoutMs` in src/harness.ts.
+        expect(FORK_TIMEOUT_MS).toBe(Number.POSITIVE_INFINITY);
+        expect(threadForkProps.timeoutMs).not.toHaveProperty('default');
+        expect(threadForkProps.timeoutMs.description).toContain('1-3600000');
+        expect(threadForkProps.timeoutMs.description).toContain('OMIT IT FOR NO TIME LIMIT');
+        // The harness mirrors the same fact as its own literal default.
+        expect(sourceOf('../harness.ts')).toContain(
+            'const FORK_TIMEOUT_DEFAULT_MS = Number.POSITIVE_INFINITY;'
+        );
+
+        // THE TURN CAP. `delegate.maxTurns` may only ever LOWER the harness-wide
+        // `maxIterations` bound, and the entry's `64` is the same number.
+        expect(DELEGATE_MAX_TURNS_MAX).toBe(64);
+        expect([
+            delegateProps.maxTurns.type,
+            delegateProps.maxTurns.minimum,
+            delegateProps.maxTurns.maximum
+        ]).toEqual(['integer', 1, DELEGATE_MAX_TURNS_MAX]);
+        expect(delegateProps.maxTurns.description).toContain('1-64');
+
+        // The catalogue projection carries the identical rows, so the server-facing
+        // schema cannot advertise a smaller surface than the live entry.
+        const projected = (coreMetadata.agentDelegateMetadata().parameters as Record<
+            string,
+            any
+        >).properties;
+        expect(projected.maxTurns).toEqual(delegateProps.maxTurns);
+        expect(projected.timeoutMs).toEqual(delegateProps.timeoutMs);
+        expect(sourceOf('./tool-manifest.ts')).toContain('OMIT IT to use the harness-wide limit');
     });
 
     it('inlines the actionRequest/threadFork bounds equal to ACTION_REQUEST_LIMITS', () => {

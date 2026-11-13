@@ -18,6 +18,7 @@
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolPage, sessionToolRow } from './session-config-test-support';
 
 const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -129,6 +130,48 @@ const stubServer = (options: {
             });
         }
         if (url === '/api/models') return json({ models: ['m1'] });
+
+        // T4: the ⚒ pane lists the CONVERSATION's toolbox (`GET /sessions/{id}/tools`), and a
+        // toolbox row carries NO argument schema (../shared/harness-api.ts `SessionToolSummary`),
+        // so the runner pays the deployment's identified detail read (`GET /tools/{name}`,
+        // ./api.ts `getTool`) — execution stayed deployment-scoped. Both come from the same
+        // `tools` list these fixtures already state, and `sessionToolRow` gives the row the
+        // SERVER's semantics for `protected`/`declared`/`origin`
+        // (./session-config-test-support.ts, src/server/api-reads.ts:959-994).
+        const toolboxMatch = /^\/api\/sessions\/[^/]+\/tools/.exec(url);
+
+        if (toolboxMatch !== null && method === undefined) {
+            return json(
+                sessionToolPage(
+                    (options.tools ?? []).map((tool) =>
+                        sessionToolRow({
+                            name: tool.name,
+                            group: tool.group,
+                            description: tool.description,
+                            tags: tool.tags,
+                            visibility: tool.visibility,
+                            enabled: true
+                        })
+                    )
+                )
+            );
+        }
+
+        const toolDetail = /^\/api\/tools\/([^/?]+)$/.exec(url);
+
+        if (toolDetail !== null && method === undefined) {
+            const tool = (options.tools ?? []).find((candidate) => candidate.name === decodeURIComponent(toolDetail[1]));
+
+            if (tool === undefined) return json({ error: { message: `Unknown tool ${toolDetail[1]}` } }, 404);
+
+            return json({
+                tool: {
+                    ...tool,
+                    session_bound: tool.sessionBound ?? false,
+                    execution: { scope: tool.visibility === 'core' ? 'session_required' : 'global', manual: true }
+                }
+            });
+        }
 
         if (url === '/api/tools/toolRequest' && method === 'POST') {
             return json({ ok: true, result: { enabled: [], tools: [], truncated: false, remaining: 0 }, durationMs: 4 });
@@ -430,7 +473,14 @@ it('sends one delete for a double press and preserves the selection of another h
 });
 
 it('survives an empty roster and releases the playground session bound to the deleted harness', async () => {
-    const calls = stubServer({ presets: [descriptor('alpha')], tools: [coreTool] });
+    // T4: the tools toggle only renders while a conversation is bound, so the harness that is
+    // about to disappear is shown with one of its own. The PLAYGROUND session is a separate
+    // conversation the session-bound call itself mints (`temp-1`), and that is what R7 releases.
+    const calls = stubServer({
+        presets: [descriptor('alpha')],
+        tools: [coreTool],
+        sessions: [snapshot('chat-a', 'alpha')]
+    });
     await boot();
 
     // Build a playground context first: a session-bound call creates the temporary

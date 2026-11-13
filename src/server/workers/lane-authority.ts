@@ -135,6 +135,11 @@ export type LaneRuntimeCall =
     // harness resolves the identity and returns the transcript. The pure paging/filtering
     // half of `threadRead` still runs on the LANE (that is the CPU isolation), so only the
     // state read crosses.
+    //
+    // R2-F14 (2026-11-13, independent review): `identity.threadId` is the CALLER's thread, and it
+    // is not decorative — both seams below take it as `callerThreadId`, which is what switches on
+    // the core's thread-family gate (`isAddressVisible` in src/harness.ts) and the branch-address
+    // fallback. A read that arrives with an EMPTY identity stays unscoped, exactly like a host read.
     | { op: 'thread:read'; threadId: string; identity: LaneCallIdentity };
 
 // Everything else the authority answers for a lane.
@@ -780,14 +785,29 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
             // or one another lane created - sees the session, not its private replica. The
             // paging, regex filtering and byte budgeting stay on the lane (the CPU work
             // isolation exists for), so the coordinator only answers the read.
+            //
+            // R2-F14 (2026-11-13, independent review): the read is answered with the LANE'S CALLER
+            // as scope, not unscoped. `identity.threadId` is the conversation the lane's
+            // `threadRead` is running in (src/tools/runtime/threadRead.tool.ts passes
+            // `context.threadId` as the second argument of both seams), and both seams below take
+            // it as `callerThreadId`. Two things follow, and BOTH are the point:
+            //   - VISIBILITY: an address outside that caller's thread family is refused with the
+            //     core's own "not visible" sentence, so a model on a lane cannot read a foreign
+            //     family's transcript in full where the identical inline call refuses it;
+            //   - BRANCH RESOLUTION: a finished fork's `branch-N` is resolved through the caller's
+            //     branch ledger, so the one id `threadFork` handed back keeps addressing its
+            //     transcript in worker mode exactly as it does inline.
+            // An EMPTY identity (a host-side read, or a caller id the canonical harness no longer
+            // has) stays unscoped, which is the historical host view.
             case 'thread:read': {
-                const record = harness.thread(request.threadId);
+                const callerThreadId = request.identity.threadId;
+                const record = harness.thread(request.threadId, callerThreadId);
 
                 if (record === undefined) {
                     throw new Error(`Thread "${request.threadId}" has no record in this session; it was never created, or it was deleted.`);
                 }
 
-                const messages = harness.threadMessages(request.threadId);
+                const messages = harness.threadMessages(request.threadId, callerThreadId);
 
                 return { value: { threadId: request.threadId, record, messages, length: messages.length } };
             }

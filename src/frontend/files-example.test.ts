@@ -14,6 +14,7 @@
 import type { ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 
 const filesTool: ToolDescriptor = {
     name: 'files',
@@ -70,6 +71,19 @@ const openTools = (): void => {
     if (found === null) throw new Error('missing global Tools toggle');
     if (found.getAttribute('aria-pressed') !== 'true') found.click();
 };
+// T4: the conversation the ⚒ pane configures. Without one the pane has no subject and main.ts
+// does not render its toggle at all, so a fixture that opens the runner has to name one.
+const SESSION = {
+    id: 's1',
+    harness: 'instruct',
+    status: 'idle',
+    model: 'm1',
+    createdAt: 1,
+    updatedAt: 2,
+    messages: [],
+    turns: []
+};
+
 const calls: Call[] = [];
 
 beforeEach(() => {
@@ -110,12 +124,20 @@ beforeEach(() => {
                     ],
                     tools: [filesTool],
                     defaults: { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false },
-                    sessions: [],
+                    sessions: [SESSION],
                     agents: []
                 });
             }
 
             if (url === '/api/models') return json({ models: ['m1'] });
+
+            // T4: the ⚒ pane lists the toolbox of the CONVERSATION on screen (and main.ts hides
+            // the toggle while none is bound), so the roster names one — `harness: 'instruct'`
+            // is what makes boot resolve it. The toolbox row and the identified-schema read come
+            // from the SAME `filesTool` record below, which is why the argument example asserted
+            // here is the one the runner really fills.
+            if (url === '/api/sessions' || url === '/api/sessions?limit=25') return json({ sessions: [SESSION] });
+            if (url === '/api/sessions/s1') return json({ session: SESSION });
 
             // T17: an argument schema exists only on the identified tool read
             // (`GET /v1/harness/tools/{id}` → `ToolDetail`, ../shared/harness-api.ts:654;
@@ -151,6 +173,13 @@ beforeEach(() => {
                     durationMs: 3
                 });
             }
+
+            // T4: the pane's toolbox page. Kept AFTER this fixture's own identified-read branch
+            // so the `execution` scope stated above stays the authority for how the runner calls
+            // `files`; the helper answers nothing else (`undefined` = not its route).
+            const toolReads = sessionToolReads([filesTool], url, method);
+
+            if (toolReads !== undefined) return toolReads;
 
             // T45: the shell dials the canonical control plane (service document, global
             // config, one page per catalogue) and `POST /tools/{id}/executions`; the

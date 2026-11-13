@@ -338,6 +338,34 @@ export const requestToolsRoutePayload = (
     identity: identityOf(caller)
 });
 
+// THE ROUTED CONVERSATION READ, as a pinnable payload builder (2026-11-13, independent review).
+// Exported for exactly the reason `requestToolsRoutePayload` above is: the CALLER identity is the
+// only thing that makes the authority's thread-family gate agree with what the same read refuses
+// inline, and the two handle members in `installAuthorityRuntime` used to send `identity: {}`, so
+// a lane-worker's `threadRead` of a foreign-family thread returned the whole transcript where the
+// same call inline answers "not visible". A test over THIS function fails the moment the caller
+// id is dropped again; before this, no suite could see the drop.
+//
+// `identityOf(undefined, …)` is the same carrier `threadList` and `threadDelete` use: the caller is
+// a thread id, never a model argument, and the lane has no live `ToolContext` at this point (the
+// seam is a handle member, not a runtime method), so only `threadId` is knowable and only
+// `threadId` is what the gate on the other side reads (`familyOfCaller`).
+//
+// The NEW `threadRead` page parameters (`includeSystem` / `toolArgs` / `regexFields`, plus every
+// other filter) deliberately do NOT ride on this request: the routed read answers the page's two
+// INPUTS (the record and the canonical transcript), and the page build itself —
+// `readThreadTranscript(record, messages, parameters)` in src/tools/runtime/threadRead.tool.ts —
+// still runs inside the LANE's own tool body. So the filters, the paging and the 32 KiB budget are
+// applied to canonical data on the lane, which is the CPU split ./lane-authority.ts documents
+// ("the paging, regex filtering and byte budgeting stay on the lane").
+export const threadReadRoutePayload = (
+    threadId: string,
+    callerThreadId?: string
+): { threadId: string; identity: { agent?: string; threadId?: string; runDepth?: number } } => ({
+    threadId,
+    identity: identityOf(undefined, { threadId: callerThreadId })
+});
+
 export const installAuthorityRuntime = (replica: Harness): void => {
     const runtime = replica.runtime as unknown as Record<string, unknown>;
 
@@ -403,9 +431,16 @@ export const installAuthorityRuntime = (replica: Harness): void => {
     // request's `threadId` (the thing to remove) and the CALLER travels inside `identity`,
     // exactly like `threadList` carries its reader — the authority scopes the delete to that
     // caller's own descendants, so a lane cannot release a sibling subtree through a replica
-    // copy. The receipt (`deleted`, `removedThreadIds`) comes back from the canonical
-    // harness, and `applySync` in the route helper rebases this lane's mirror of every
-    // conversation the cascade removed.
+    // copy. The receipt (`deleted`, `removedThreadIds`) comes back from the canonical harness.
+    //
+    // CORRECTED 2026-11-13 (independent review): the sentence this comment used to close with
+    // credited `applySync` with "rebasing this lane's mirror of every conversation the cascade
+    // removed". It does not rebase anything: `applySync` (below this function) replays the
+    // authority's TOOL-side decisions only — the enabled set, registry revisions, declared
+    // memory keys and identity watermarks. Transcript mirrors move through `transcript:sync` /
+    // `adoptCommittedBase`, and a cascade target is never the lane's own conversation (that one
+    // read stays local), so a later read of a released id is ROUTED and answers the canonical
+    // harness's own "no record in this session" error instead of a stale local copy.
     route('threadDelete', (callerThreadId, threadId) => ({
         threadId: threadId as string,
         identity: identityOf(undefined, { threadId: callerThreadId as string | undefined })
@@ -425,9 +460,20 @@ export const installAuthorityRuntime = (replica: Harness): void => {
     //
     // The lane's OWN conversation stays local: this replica is the only place its uncommitted
     // tail exists, so routing that read backwards would hide the run's own work.
+    //
+    // R2-F14 (2026-11-13, independent review): the SECOND argument of both members is the
+    // CALLER's thread id, which `src/tools/runtime/threadRead.tool.ts` passes from `context.threadId`.
+    // It used to be dropped on the way to the authority (`identity: {}`), and the authority then read
+    // the canonical harness UNSCOPED — so a lane-worker model caller could read a foreign-family
+    // transcript in full where the same call inline is refused "not visible" (harness.ts
+    // `isAddressVisible`). Both routed reads now carry the caller in `identity.threadId`, the same
+    // carrier `threadList`/`threadDelete` use, and ./lane-authority.ts hands it to both seams as
+    // `callerThreadId`, so the lane and the inline path give the same answer for the same address.
+    // The lane's own conversation stays local AND unscoped: reading the conversation you are
+    // standing in is never a lineage question.
     const handle = replica as unknown as {
-        threadMessages: (threadId: string) => unknown;
-        thread: (threadId: string) => unknown;
+        threadMessages: (threadId: string, callerThreadId?: string) => unknown;
+        thread: (threadId: string, callerThreadId?: string) => unknown;
     };
     const localMessages = replica.threadMessages.bind(replica);
     const localRecord = replica.thread.bind(replica);
@@ -437,10 +483,10 @@ export const installAuthorityRuntime = (replica: Harness): void => {
     // member back at call time would get a promise.
     localThreads = { messages: localMessages, record: localRecord };
 
-    handle.threadMessages = (threadId: string): unknown =>
-        threadId === state.targetId ? localMessages(threadId) : raise({ op: 'thread:read', threadId, identity: {} }).then((reply) => (reply.value as { messages: unknown[] }).messages);
-    handle.thread = (threadId: string): unknown =>
-        threadId === state.targetId ? localRecord(threadId) : raise({ op: 'thread:read', threadId, identity: {} }).then((reply) => (reply.value as { record: unknown }).record);
+    handle.threadMessages = (threadId: string, callerThreadId?: string): unknown =>
+        threadId === state.targetId ? localMessages(threadId) : raise({ op: 'thread:read', ...threadReadRoutePayload(threadId, callerThreadId) } as LaneAuthorityRequest).then((reply) => (reply.value as { messages: unknown[] }).messages);
+    handle.thread = (threadId: string, callerThreadId?: string): unknown =>
+        threadId === state.targetId ? localRecord(threadId) : raise({ op: 'thread:read', ...threadReadRoutePayload(threadId, callerThreadId) } as LaneAuthorityRequest).then((reply) => (reply.value as { record: unknown }).record);
 
     // Asserted, not assumed: a NEW runtime method must be classified as routed or local or local
     // before a lane may run it, and this is where that rule bites at hello time.

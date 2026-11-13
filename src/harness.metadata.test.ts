@@ -694,6 +694,9 @@ describe('core tool metadata', () => {
             'maxChars',
             'requireClarification',
             'timeoutMs',
+            // C1 (2026-11-13): the optional turn cap rides on the LIVE declaration too,
+            // derived from the entry literal like every other argument.
+            'maxTurns',
             'scope'
         ]);
         expect(parameters.required).toEqual(['agent', 'input']);

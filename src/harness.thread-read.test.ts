@@ -157,8 +157,10 @@ describe('threadRead registration (R1)', () => {
             presets: false
         });
 
-        // Descending `order` inside the 'threads' group (270/265/260), so a model
-        // always sees the id source before the tools that address an id.
+        // Descending `order` inside the 'threads' group (270/265/260/255), so a model
+        // always sees the id source before the tools that address an id — and the
+        // release door (threadDelete, 255) last, because it is meaningless before the
+        // roster has been read.
         writer.createThread('writer');
         await writer('read my thread');
 
@@ -167,7 +169,8 @@ describe('threadRead registration (R1)', () => {
             'tasks',
             'threadList',
             'threadRead',
-            'threadSend'
+            'threadSend',
+            'threadDelete'
         ]);
     });
 
@@ -448,7 +451,12 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
         const page = pageOf(await writer.executeTool('threadRead', { thread: target.id }));
         const serialized = JSON.stringify(page);
 
-        expect(page.messages[1].attachments).toEqual([ATTACHMENT_VIEW]);
+        // Index 0, NOT 1: `includeSystem` defaults to false, so the seeded system
+        // preamble is off the page and the user turn that carries the attachment is the
+        // first row a caller reads. `index` still addresses the FULL transcript, which
+        // is why that field stays 1.
+        expect(page.messages[0].attachments).toEqual([ATTACHMENT_VIEW]);
+        expect(page.messages[0].index).toBe(1);
         // `PNG_DATA` is the whole `data` value: one character of it in the result
         // would fail this. The marker stays inside `content`, where it already is.
         expect(serialized.includes(PNG_DATA)).toBe(false);
@@ -763,5 +771,93 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
         await expect(
             writer.executeTool('threadRead', { thread: target.id, nope: true })
         ).rejects.toThrow(/nope/);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// B1 (2026-11-13) — A BRANCH ID IS A threadRead ADDRESS
+// ---------------------------------------------------------------------------
+//
+// `threadFork` hands back `{ branchId, threadId, content }` where both ids are the same
+// generated `branch-N`, so the transcript it produced has to stay readable through the
+// ordinary reader after the branch settles. The fork suite pins that end-to-end from a
+// LINEAGE caller; this pins the same door from the reader's own file, because the shape
+// a caller sees here is the read tool's contract, not the fork's: a synthesized thread
+// record (`origin: 'host'`, `status: 'idle'` once finished), the branch's committed
+// transcript addressed by the branch id, and the same default page rules a live
+// conversation gets — notably `toolArgs: "reference"`, so the fork call that created
+// the branch arrives as `{ id, name, argumentsLength }` instead of a quoted payload.
+describe('threadRead addresses a finished fork by its branch id (B1)', () => {
+    it('reads the branch transcript through the same tool and the same defaults', async () => {
+        // One transport, three requests, in this exact order: the origin asks for a
+        // fork, the branch answers, the origin closes on the delivery. An async fork
+        // parks its origin, so `scripted`'s request-index replay IS the schedule.
+        const writer = harness({
+            agents: {
+                writer: brain(
+                    scripted([
+                        callTool('f1', 'threadFork', '{"input":"inspect the notes"}'),
+                        answer('two TODOs remain'),
+                        answer('forked')
+                    ])
+                )
+            },
+            presets: false
+        });
+        const origin = writer.createThread('writer', { label: 'Origin' });
+        await writer.sendThreadInput(origin.id, 'start');
+
+        // The ledger holds exactly one branch, and its id is the address the origin got.
+        expect(writer.branches().map((record) => [record.branchId, record.status])).toEqual([
+            ['branch-1', 'completed']
+        ]);
+
+        const page = pageOf(await writer.executeTool('threadRead', { thread: 'branch-1' }));
+
+        // The thread half is the SYNTHESIZED record (there is no thread state behind a
+        // branch): host origin, idle because the branch is finished, and the branch id
+        // as both `id` and the handle a caller would page by.
+        expect({
+            id: page.thread.id,
+            agent: page.thread.agent,
+            origin: page.thread.origin,
+            status: page.thread.status
+        }).toEqual({ id: 'branch-1', agent: 'writer', origin: 'host', status: 'idle' });
+
+        // The branch's committed transcript, through the DEFAULT page. What that page is
+        // made of: the fork call the branch was created from (as a `threadFork`
+        // REFERENCE with `argumentsLength`, never the quoted argument payload), the
+        // pending tool row the origin left behind, the branch's own input, and its
+        // answer last. `total` counts the same transcript the page returns, because a
+        // host thread of a `presets: false` agent carries no system row to hide — so the
+        // indices here run 0..4 and `includeSystem` has nothing to filter. The point of
+        // the assertion is that a branch page is addressed and shaped like any live
+        // conversation's, not that it is empty.
+        expect({
+            total: page.total,
+            roles: page.messages.map((message) => message.role),
+            indices: page.messages.map((message) => message.index),
+            toolCalls: page.messages.map((message) => message.toolCalls),
+            last: page.messages[page.messages.length - 1]
+        }).toEqual({
+            total: 5,
+            roles: ['user', 'assistant', 'tool', 'user', 'assistant'],
+            indices: [0, 1, 2, 3, 4],
+            toolCalls: [
+                undefined,
+                [{ id: 'call_branch-1_1', name: 'threadFork', argumentsLength: 29 }],
+                undefined,
+                undefined,
+                undefined
+            ],
+            last: {
+                index: 4,
+                role: 'assistant',
+                content: 'two TODOs remain',
+                contentLength: 16,
+                contentOffset: 0,
+                contentHasMore: false
+            }
+        });
     });
 });

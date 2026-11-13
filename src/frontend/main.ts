@@ -121,7 +121,7 @@ import type { DisplayStep, TurnDisplayOp, TurnSummary, TurnStepDetail, TurnBlock
 // `loadAgentPresetTexts`): the ONLY response that states an agent's preset
 // instruction text, because `GET /agents` rows are text-free summaries
 // (../shared/harness-api.ts:552-563).
-import type { AgentProfile, HarnessInstructionSummaryEntry, HarnessPendingTool, PluginSetting, PluginSummary, TaskReceipt, ToolDetail } from '../shared/harness-api';
+import type { AgentProfile, HarnessInstructionSummaryEntry, HarnessPendingTool, PluginSetting, PluginSummary, SessionToolSummary, TaskReceipt, ToolDetail } from '../shared/harness-api';
 // The display wire (T5) is the shell's DEFAULT surface: every fetch, every stream
 // and every submit below speaks `/views`, so no round trip on this path can carry a
 // recorded event. The raw client (./api.ts) stays imported for the catalogue routes
@@ -245,12 +245,16 @@ import {
     // configuration dialog needs that text, exactly as `getTool` is asked for when a
     // tool is opened (T50).
     getAgent,
-    // T7 (R2/R3): the plugin catalogue read and the ONE write the Plugins pane makes.
-    // `listPlugins` is `GET /plugins` (every auto-scanned built-in, its declared
-    // settings and the effective values), `updatePluginSettings` is
-    // `PATCH /plugins/{id}` (settings-only; the answer is the whole row).
-    listPlugins,
-    updatePluginSettings,
+    // T4 (this pass): the SESSION plugin surface, which is what the Plugins pane reads and
+    // writes now. `listSessionPlugins` is `GET /sessions/{id}/plugins` (the same
+    // `PluginSummary` rows as the deployment catalogue, with THIS conversation's `enabled`
+    // and `values`), and `updateSessionPluginSettings` is `PATCH /sessions/{id}/plugins/{id}`
+    // (settings-only; the answer is the whole row; `enabled` is the reserved switch key and
+    // there is NO idle window). The global pair (`listPlugins` / `updatePluginSettings`)
+    // stays in ./api.ts as the template surface — other clients use it — but no pane here
+    // calls it any more.
+    listSessionPlugins,
+    updateSessionPluginSettings,
     // T7b (R5/R6/R7): the SESSION-scoped roster surface. A saved conversation owns its own
     // members, their models and their complete prompts, and these are the only routes that
     // read or write them (`GET/POST /sessions/{id}/agents`,
@@ -266,10 +270,16 @@ import {
     // mapper it shares with the page. A `ToolSummary` row has no schema; this is the read
     // that supplies one, asked for only when a tool is opened.
     getTool,
-    // R3: the ONE global write a catalogue entry has — `PATCH /tools/{id}` with
-    // `{ enabled }`, answered by the whole updated row. The Tools pane's switch is its
-    // only caller, and the write is anytime (no idle window on the server).
-    updateToolEnabled,
+    // T4 (this pass): the SESSION toolbox surface, which is what the Tools pane reads and
+    // writes now. `listSessionTools` is `GET /sessions/{id}/tools` (the catalogue projection
+    // plus the per-conversation facts `declared` / `enabled` / `origin` / `protected`), and
+    // `updateSessionTool` is `PATCH /sessions/{id}/tools/{id}` with `{ enabled }` — refused
+    // 403 on a protected name and 409 unless this conversation is idle, and answered by a
+    // REGISTRATION envelope rather than a row (so the row is re-read, never patched). The
+    // global pair (`listAllTools` / `updateToolEnabled`) stays in ./api.ts as the template
+    // surface; no pane here calls it any more.
+    listSessionTools,
+    updateSessionTool,
     toolRowOf
 } from './api';
 import type { HarnessBootstrap } from './api';
@@ -3607,8 +3617,12 @@ sessionNew.disabled = true;
 sessionNew.title = 'New session';
 sessionNew.setAttribute('aria-label', 'New session');
 // Same temporal-dead-zone discipline as the cycler below: `newSession` is a module-level
-// `const` declared far away, so the arrow defers the read to click time.
-sessionNew.addEventListener('click', () => newSession());
+// `const` declared far away, so the arrow defers the read to click time. The handler is
+// fire-and-forget: `newSession` is async because it creates the conversation on the server
+// (T3 R1), and every state change it makes on the way is already painted.
+sessionNew.addEventListener('click', () => {
+    void newSession();
+});
 
 // R2 (T9): one painter for the title trigger's state. The button is ALWAYS a real dialog
 // trigger now: the chat head opens the harness details (whose Sessions dashboard is the
@@ -5820,13 +5834,110 @@ let currentTool: ToolRowEntry | undefined;
 // The corner tick box replaced the old "core" pin: EVERY catalogue entry — the
 // harness-owned core set included — is switchable now, so the frontend reads no
 // pinned-set flag anywhere and never renders an affordance-less row.
+//
+// T4 (this pass): the pane lists ONE CONVERSATION's toolbox, so the row also carries the
+// three session facts `GET /sessions/{id}/tools` states and the catalogue row never could
+// (../shared/harness-api.ts `SessionToolSummary`:1852-1900):
+//   - `declared`  — this conversation's FROZEN definition registers the name, so it is in
+//                   context on every request whatever the live gate says;
+//   - `protected` — harness-owned core control, or declared by that definition: the name
+//                   this conversation can neither drop nor switch off (its PATCH answers
+//                   403), so its tick box renders LOCKED, not togglable;
+//   - `origin`    — `catalogue` / `discovered` / `created`, i.e. how it got in here.
+// All three are OPTIONAL: a deployment-catalogue row (the only other thing that ever reaches
+// this type) states none of them, and a row that states no enablement renders no switch.
 type ToolRowEntry = ToolDescriptor & {
     enabled?: boolean;
+    declared?: boolean;
+    protected?: boolean;
+    origin?: 'catalogue' | 'discovered' | 'created';
 };
 
-// The complete server catalogue (core entries included) for the global tools view —
-// the ONLY tool listing after R21.2. Boot replaces it from the bootstrap document.
+// The complete toolbox of THE CONVERSATION on screen — the pane's whole read model, and it
+// belongs to exactly one session id (see `configScope`). Boot no longer seeds it from the
+// deployment catalogue: a conversation's rows arrive from `GET /sessions/{id}/tools` the
+// first time the pane is opened for that conversation, and a session change drops them.
 let toolEntries: readonly ToolRowEntry[] = [];
+// The three transient read states of that read, mirroring the Plugins pane below: the
+// catalogue has to be able to say "not asked yet", "reading" and "asked and refused" apart,
+// because a session read can fail for a conversation the server has already dropped.
+let toolsLoaded = false;
+let toolsLoading = false;
+let toolsError: string | undefined;
+
+// ---------------------------------------------------------------------------
+// The configuration scope: the two panes belong to ONE conversation
+// ---------------------------------------------------------------------------
+//
+// The Tools and Plugins panes are CONVERSATION configuration surfaces: what a tool switch
+// changes is which tools THIS conversation can call, and what a plugin setting changes is
+// what THIS conversation runs with next turn. Everything they cache is therefore owned by
+// one session id, and that id is the pointer the centre column is showing — `current`'s
+// `sessionId`. `configScope` records it so the pane caches can be dropped the moment a
+// different conversation (or none) becomes the subject.
+//
+// Why a separate figure rather than reading `current?.sessionId` at paint time: the panes
+// hold ROWS, and rows are only correct for the session they were read from. Comparing the
+// pointer on every paint is what makes "never paint the previous conversation's rows over a
+// new one" a structural property instead of a discipline every painter has to remember.
+let configScope: string | undefined;
+
+// Is the centre column showing a conversation at all? With no session bound there is nothing
+// for either pane to configure, so BOTH header toggles stop being rendered (Decision: hide,
+// never disable-and-explain) and the panes themselves are closed.
+const sessionIsBound = (): boolean => current?.sessionId !== undefined;
+
+// Drops every row either pane holds, so the next open re-reads the new subject. Called
+// exactly once per scope change, from `syncConfigScope`.
+const invalidateConfigPanes = (): void => {
+    toolEntries = [];
+    // A row read is scoped to the pane's subject too: the memoized identified schema describes
+    // the page it came from, and that page is gone.
+    toolDetails.clear();
+    toolsLoaded = false;
+    toolsLoading = false;
+    toolsError = undefined;
+    buildToolsTab(toolEntries);
+
+    pluginRows = [];
+    pluginsLoaded = false;
+    pluginsLoading = false;
+    pluginsError = undefined;
+    buildPluginsTab();
+};
+
+// Releases a pane whose subject has gone away. `setToolsView(false)`/`setPluginsView(false)`
+// are the full close paths (dialog dismissed, playground released, chat chrome restored), so
+// releasing a pointer converges on the same reset a second toggle press performs.
+const closeConfigPanes = (): void => {
+    if (showingTools) setToolsView(false);
+    if (showingPlugins) setPluginsView(false);
+};
+
+// The ONE place the two panes learn which conversation they describe. Every path that moves
+// the bound session — a pill open, the harness switch, `+ New session`, a delete, a create
+// being adopted — repaints the controls, and the controls pass calls this first. Closing
+// happens BEFORE the caches drop so a pane's own restore path paints the chat from state that
+// is still consistent, and only then does the row cache go empty for the new subject.
+const syncConfigScope = (): void => {
+    const sessionId = current?.sessionId;
+
+    if (sessionId === configScope) return;
+
+    configScope = sessionId;
+
+    if (sessionId === undefined) closeConfigPanes();
+
+    invalidateConfigPanes();
+
+    // A pane that stays OPEN across a conversation switch must not sit on an emptied list: the
+    // reader is still looking at it, and "no tools to list" would be a lie about a subject that
+    // has simply not been read yet. Reading now paints `.tools-loading` for the window and then
+    // the new conversation's rows. A closed pane stays lazy — its read happens on the next open.
+    if (sessionId !== undefined && showingTools) void loadSessionTools(sessionId);
+    if (sessionId !== undefined && showingPlugins) void loadPlugins();
+};
+
 // Which centre view is showing: the chat (transcript + composer) or the GLOBAL tools
 // view (catalogue + manual runner). There is no tab strip (R3); the icon-only
 // Tools toggle on the harness title row drives this through `setToolsView`.
@@ -5874,13 +5985,25 @@ let watch: { instance: Instance; sessionId: string; controller: AbortController 
 // closing — is housekeeping and records NOTHING, so it can never cancel a gesture the reader
 // is still waiting for.
 //
-// Why the check cannot be opt-in: `newSession` leaves `instance.sessionId === undefined`, and
-// `applyView` adopts a document whenever the card has no pointer (the remembered-pointer boot
-// needs exactly that), so a released card is ACCEPTING by construction. Without this counter,
-// a `+` pressed while a conversation's read was in flight let that answer re-bind the card the
-// reader had just released: the transcript came back, `setBusy(instance.pending)` restored the
-// pending figure, and `rememberSession` wrote back the pointer `forgetRememberedSession` had
-// cleared. Two rapid opens failed the same way — last RESPONSE won, not last CLICK.
+// Why the check cannot be opt-in: `newSession` clears `instance.sessionId` and holds it
+// undefined for the whole window the create request is open, and `applyView` adopts a
+// document whenever the card has no pointer (the remembered-pointer boot needs exactly that),
+// so a released card is ACCEPTING by construction. Without this counter, a `+` pressed while
+// a conversation's read was in flight let that answer re-bind the card the reader had just
+// released: the transcript came back, `setBusy(instance.pending)` restored the pending
+// figure, and `rememberSession` wrote back the pointer `forgetRememberedSession` had cleared.
+// Two rapid opens failed the same way — last RESPONSE won, not last CLICK.
+//
+// T3 re-derivation (eager create): the `+` now ends by ADOPTING the record it creates, so the
+// released card is only pointer-free until the POST answers. Two facts keep the guard just as
+// necessary, and keep the failure above from reappearing in a new form:
+//   - the guard still has to fire BEFORE `markNavigationIntent`'s own window opens, because
+//     an open that was already in flight can answer inside the create window and re-bind the
+//     card with the OLD conversation — the exact race the original comment describes;
+//   - the adoption itself is unconditional, and it lands LAST for the click that was made
+//     first, so two rapid `+` presses leave the card on the second record while both exist on
+//     the server. That is the user's stated rule ("it is up to user to spam them"), and the
+//     directory row for the other record is reachable from the dashboard either way.
 let navigationIntent = 0;
 
 // Records a navigation gesture. The only reader is the `openSession` continuation that
@@ -8269,6 +8392,11 @@ let toolDialog: DialogHandle | undefined;
 // `renderHarnessChrome` returns early whenever `showingTools` is true, so this is
 // the only writer of the title/note in that state (a background snapshot or a
 // pending-state repaint can never repaint the chat title under the list).
+//
+// T4: the note describes ONE CONVERSATION's toolbox, and it states the read's actual state.
+// The old sentence ("N tools · calls run on the harness server") asserted the deployment
+// scope the pane no longer reads; the manual runner's own scope is a separate, still-true
+// fact and it lives on the runner (`createToolRunner`'s playground notes), not here.
 const paintToolsHead = (): void => {
     const count = toolEntries.length;
     headTitleText.textContent = 'Tools Catalogue';
@@ -8288,10 +8416,16 @@ const paintToolsHead = (): void => {
     // writer must un-hide it again — otherwise the catalogue line would be painted into a
     // `hidden` element the reader never sees.
     headNote.hidden = false;
+    // A failed or in-flight read is reported here rather than as a silent zero count: the
+    // pane's list is empty in all three states, and only this line says which one it is.
     headNote.textContent =
-        count === 0
-            ? 'The server reported no tools.'
-            : `${count} tool${count === 1 ? '' : 's'} · calls run on the harness server`;
+        toolsLoading && count === 0
+            ? 'Reading this conversation’s toolbox…'
+            : toolsError !== undefined && count === 0
+              ? `This conversation’s toolbox could not be read: ${toolsError}`
+              : count === 0
+                ? 'This conversation has no tools to list.'
+                : `${count} tool${count === 1 ? '' : 's'} · the toolbox of this conversation`;
 };
 
 // Close the tool dialog if one is open. Idempotent; `onClose` performs the local
@@ -8502,6 +8636,14 @@ const setToolsView = (open: boolean): void => {
     currentTool = undefined;
     for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
 
+    // T4: opening the pane IS the request for THIS conversation's toolbox. The read is paid
+    // for here and never at boot (the bootstrap document describes the deployment, not this
+    // conversation), and `loadSessionTools` no-ops on a page it already holds for this scope,
+    // so a second open of the same conversation costs nothing.
+    const scope = configScope;
+
+    if (scope !== undefined) void loadSessionTools(scope);
+
     // R7: a fresh playground visit starts with a fresh context (the previous one was
     // released when the view closed).
     // T29: the tools view is the surface that shows the playground context's discovered
@@ -8541,13 +8683,11 @@ toolsToggle.addEventListener('click', () => {
 // The row's enablement control (R1). A row is one `.tool-tab-row` holding the listing
 // button and, in the wrapper's top-right corner, ONE tick box:
 //
-//   - every catalogue entry gets one, harness-owned core tools included — the server
-//     makes every tool switchable and no longer states a pinned set, so there is no
-//     affordance-less row shape left to render (the old "core" pin is gone);
+//   - every row that states an enablement gets one, harness-owned core entries included;
 //   - the box is a real `input[type=checkbox]`, so `checked` IS the state for assistive
-//     tech (no `role`/`aria-checked` to keep honest), and one click writes it for EVERY
-//     session (`PATCH /tools/{tool_id}`); the row is repainted from the answer, never
-//     from a guess.
+//     tech (no `role`/`aria-checked` to keep honest);
+//   - T4: one click writes it for THIS CONVERSATION (`PATCH /sessions/{id}/tools/{tool_id}`
+//     `{ enabled }`) — not for every conversation on the server.
 //
 // The box is the button's SIBLING and absolutely positioned in the wrapper (see
 // styles.css `.tool-tab-enable`), which is what keeps the two activations apart: a click
@@ -8558,36 +8698,26 @@ toolsToggle.addEventListener('click', () => {
 // modelling one) renders NEITHER control nor state attribute: inventing a tick for a
 // state the server never reported is a lie the reader cannot act on.
 //
-// The box itself. The accessible name is the ACTION (`Enable`/`Disable` + the tool name),
-// `checked` carries the state, and the tile's green edge (`.tool-tab-button[data-enabled]`
-// takes an `--ok-line` border, no background wash — styles.css:1042-1058) is painted from the
-// same figure by `paintToolRowEnablement` — three readings of one state, never a colour-only
-// signal.
+// The box itself carries NO state of its own: `paintToolRowEnablement` below is the single
+// painter of its class, `checked`, `data-enabled`, labels and lock, so the box a list build
+// creates and the box a write repaints can never disagree about what "on" looks like.
 const toolEnableCheckboxOf = (entry: ToolRowEntry): HTMLInputElement => {
-    const enabled = entry.enabled === true;
-    const control = el('input', enabled ? 'tool-tab-enable is-on' : 'tool-tab-enable is-off');
+    const control = el('input', 'tool-tab-enable');
 
     control.type = 'checkbox';
-    // The native state, not an ARIA mirror: assistive tech, the keyboard and the CSS all
-    // read this one figure.
-    control.checked = enabled;
     control.dataset.tool = entry.name;
-    control.dataset.enabled = enabled ? 'true' : 'false';
-    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name}`);
-    control.title = enabled
-        ? 'Enabled for every conversation on this harness server · click to switch this tool off'
-        : 'Disabled for every conversation on this harness server · click to switch it on';
-    // R1: a run never locks this control — the only thing that can is its own write
-    // (the same rule `paintControls` paints from).
-    control.disabled = togglingTools.has(entry.name);
-    // The click reads the CACHED row, not the `entry` this node was built from: a
-    // successful write replaces the cache, and a second press must invert the figure the
-    // server last reported rather than the one this frame was painted with. The value the
-    // browser just ticked is deliberately ignored — the server's answer is what repaints
-    // it, and the busy pass in `setToolEnabled`'s `finally` pulls the tick back to the
-    // cached figure when the write is refused.
+    // The click reads the CACHED row, not the `entry` this node was built from: a successful
+    // write re-reads the collection, and a second press must invert the figure the server
+    // last reported rather than the one this frame was painted with. The value the browser
+    // just ticked is deliberately ignored — the re-read is what repaints it, and the busy pass
+    // in `setToolEnabled`'s `finally` pulls the tick back to the cached figure when the write
+    // is refused (a 403 on a protected name, a 409 while this conversation works).
     control.addEventListener('click', () => {
-        void setToolEnabled(entry.name, !(toolEntryOf(entry.name)?.enabled ?? false));
+        const row = toolEntryOf(entry.name);
+
+        if (row === undefined || row.protected === true) return;
+
+        void setToolEnabled(entry.name, !(row.enabled ?? false));
     });
 
     return control;
@@ -8598,47 +8728,85 @@ const toolEnableCheckboxOf = (entry: ToolRowEntry): HTMLInputElement => {
 const toolEntryOf = (name: string): ToolRowEntry | undefined =>
     toolEntries.find((entry) => entry.name === name);
 
-// Repaint ONE row's tick box from the row's own enablement figure, in place (no list
-// rebuild, so focus and the dialog's `returnFocus` target survive). The box's `checked`,
-// its `data-enabled` and the tile button's `data-enabled` move together, so the list can
-// never show a tick on a row the server says is off (or the green edge without the tick).
+// Repaint ONE row's tick box from the row's own figures, in place (no list rebuild, so focus
+// and the dialog's `returnFocus` target survive). The box's `checked`, its `data-enabled` and
+// the tile button's `data-enabled` move together, so the list can never show a tick on a row
+// the server says is off (or the green edge without the tick).
 //
-// The parameter is the ENABLEMENT figure, not a whole row: a `ToolRowView` (what
-// `toolRowOf` maps a PATCH answer into) has no `parameters` field, and this painter reads
-// exactly two fields, so widening it to the full entry would only add a cast.
-type ToolEnablement = { name: string; enabled?: boolean };
+// The parameter is the ENABLEMENT figure, not a whole row: this painter reads exactly these
+// fields, and the row it maps into a tick has no argument schema.
+type ToolEnablement = { name: string; enabled?: boolean; declared?: boolean; protected?: boolean };
+
+// What the tick STATES for one row: whether the name is callable in this conversation right
+// now. A `protected` row is always in — it is either the harness-owned control plane this
+// session runs on or a name its FROZEN definition declares — and the server deliberately
+// reports `enabled: false` for a core tool, because that field is membership in the live
+// DISCOVERED set (`harness.discoveredTools`, ../server/api-reads.ts:959-987), not "in context".
+// Painting a core row from `enabled` alone would show the control plane as switched off.
+const toolRowInContext = (row: ToolEnablement): boolean => row.protected === true || row.enabled === true;
+
+// Why one row's switch is locked, in the order the reader needs to hear it. `protected` is a
+// property of the NAME (403 on the server: this conversation can neither drop its control
+// plane nor switch off a tool its own team declared), `writing` is this control's own
+// in-flight PATCH, and `running` is the conversation having work queued — the session route
+// answers 409 unless the session is idle (`assertIdleForToolMutation`, ../server/api.ts), so
+// the lock here is the server's rule stated before the click instead of after it.
+type ToolSwitchLock = 'protected' | 'writing' | 'running';
+
+const toolSwitchLockOf = (row: ToolEnablement): ToolSwitchLock | undefined => {
+    if (row.protected === true) return 'protected';
+    if (togglingTools.has(row.name)) return 'writing';
+    if (current?.pending === true) return 'running';
+
+    return undefined;
+};
+
+// The tooltip for one state of one switch. Every sentence names THIS conversation, because
+// that is the scope the write has; the old "every conversation on this harness server" copy
+// promised a deployment-wide change the route no longer makes.
+const toolSwitchTitleOf = (inContext: boolean, lock: ToolSwitchLock | undefined): string => {
+    if (lock === 'protected') return 'Harness-owned or declared by this conversation’s team · it cannot be switched here';
+    if (lock === 'running') return 'This conversation is working · the switch unlocks when its run ends';
+    if (lock === 'writing') return 'Switching this tool for this conversation…';
+
+    return inContext
+        ? 'Enabled for this conversation · click to switch this tool off'
+        : 'Disabled for this conversation · click to switch it on';
+};
 
 const paintToolRowEnablement = (entry: ToolEnablement): void => {
     const control = toolEnableBoxes.get(entry.name);
     const button = toolTabButtons.get(entry.name);
+    const inContext = toolRowInContext(entry);
+    const lock = toolSwitchLockOf(entry);
 
     if (button !== undefined && entry.enabled !== undefined) {
-        button.dataset.enabled = entry.enabled ? 'true' : 'false';
+        button.dataset.enabled = inContext ? 'true' : 'false';
     }
 
     if (control === undefined || entry.enabled === undefined) return;
 
-    const enabled = entry.enabled;
-
-    control.className = enabled ? 'tool-tab-enable is-on' : 'tool-tab-enable is-off';
+    control.className = inContext ? 'tool-tab-enable is-on' : 'tool-tab-enable is-off';
     // THE state. A native checkbox carries no `aria-checked` to keep honest, so `checked`
     // is the single figure assistive tech reads — and it is also what the CSS tick and the
     // row's green edge follow.
-    control.checked = enabled;
-    control.dataset.enabled = enabled ? 'true' : 'false';
-    control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name}`);
-    control.title = enabled
-        ? 'Enabled for every conversation on this harness server · click to switch this tool off'
-        : 'Disabled for every conversation on this harness server · click to switch it on';
+    control.checked = inContext;
+    control.dataset.enabled = inContext ? 'true' : 'false';
+    control.setAttribute('aria-label', `${inContext ? 'Disable' : 'Enable'} ${entry.name}`);
+    control.title = toolSwitchTitleOf(inContext, lock);
+    // `!booted` is the transport state (there is no server to write to); the three locks above
+    // are the conversation's own. `paintControls` re-derives the same expression on every busy
+    // pass, so a run starting or ending while the pane is open moves these switches.
+    control.disabled = lock !== undefined || !booted;
 };
 
-// Lock/unlock one row's tick box while ITS OWN write is in flight. This is the only
-// disabled state the control has after R1 removed the run/pending lock.
+// Lock/unlock one row's tick box while ITS OWN write is in flight, and repaint the row from
+// the cache when the write lands or is refused.
 //
-// Unlocking also REPAINTS from the cache, which is the revert path: a native checkbox
-// flips itself the instant it is clicked, so a REFUSED write must have its tick pulled
-// back to the figure the server actually holds. The cache only ever moves with a
-// successful answer, so repainting from it is exactly "what the server says".
+// Repainting is also the revert path: a native checkbox flips itself the instant it is
+// clicked, so a REFUSED write must have its tick pulled back to the figure the server actually
+// holds. The cache only ever moves with a successful answer, so repainting from it is exactly
+// "what the server says".
 const paintToolEnableBusy = (name: string, busy: boolean): void => {
     const control = toolEnableBoxes.get(name);
 
@@ -8654,60 +8822,83 @@ const paintToolEnableBusy = (name: string, busy: boolean): void => {
     }
 };
 
-// Take the PATCH answer as the new state of one row. The answer is a whole `ToolDetail`,
-// so the cache, the memoized identified read (its schema stays where it was) and the
-// runner all move to the server's figure.
-const rememberToolRow = (detail: ToolDetail): void => {
-    const row = toolRowOf(detail);
-    toolEntries = toolEntries.map((entry) =>
-        entry.name === row.name ? { ...entry, enabled: row.enabled } : entry
-    );
+// Take a re-read of THIS conversation's toolbox as the pane's new rows. The row state moves
+// IN PLACE (`paintToolRowEnablement` per name) rather than through a list rebuild, because the
+// control that performed the write is the node the reader is still on — and the dialog's
+// `returnFocus` target has to stay connected for `ui/dialog.ts` to restore focus at all.
+//
+// The row SET is not reconciled here on purpose: `enabled` gates a name in and out of the
+// conversation's callable set without touching its registration, so the live registry — which
+// is what the page lists (../server/api-reads.ts:989-994) — cannot gain or lose a row from a
+// gate write. A read that DOES change the set lands through `buildTools` on the next open.
+const applySessionToolRows = (rows: readonly ToolRowEntry[]): void => {
+    toolEntries = rows;
 
-    const known = toolDetails.get(row.name);
+    for (const row of rows) {
+        const known = toolDetails.get(row.name);
 
-    if (known !== undefined) {
-        toolDetails.set(row.name, { ...known, enabled: row.enabled });
+        if (known !== undefined) {
+            toolDetails.set(row.name, {
+                ...known,
+                enabled: row.enabled,
+                declared: row.declared,
+                protected: row.protected
+            });
+        }
+
+        paintToolRowEnablement(row);
     }
 
-    paintToolRowEnablement(row);
-    // The dialog's runner is showing this tool: its availability line is the same figure.
-    if (currentTool !== undefined && currentTool.name === row.name) {
-        currentTool = { ...currentTool, enabled: row.enabled };
-    }
-
-    // A refused or accepted switch is a fact about the LISTING, and the list is what the
-    // head describes; keep the row states in sync with the cache.
+    // The switch states are a fact about the LISTING, and the list is what the head describes.
     if (showingTools && currentTool === undefined) paintToolsHead();
 };
 
-// R3's one global write. Deliberately NOT guarded by `running`/`submitting`: the route
-// is write-anytime (../server/api.ts `patchTool` — no `assertIdleForToolMutation`), and
-// the request being served keeps the tool list it was given, so the switch simply takes
-// effect on the NEXT request.
+// The ONE write this pane makes, and it is a SESSION write: `PATCH /sessions/{id}/tools/{id}`
+// with `{ enabled }`, scoped to the conversation the centre column is showing.
 //
-// Single-flight per name (a double press must not send two PATCHes), and every repaint
-// comes from the server's answer: the PATCH returns the whole updated `ToolDetail`, so
-// the row shows the figure the store holds, not the value that was sent.
+// Two server facts shape the flow (../shared/harness-api.ts:2041-2048):
+//   - the answer is a REGISTRATION envelope (`{ registration: { name, source_revision,
+//     created, replaced, budget } }`), NOT a row, so nothing about the row's state can be read
+//     out of it — the row comes back the honest way, by re-reading the same collection the list
+//     was built from;
+//   - the route is refused 409 unless this conversation is idle and 403 for a protected name.
+//     The switches are locked for both states, and if the reader beats the lock anyway the
+//     server's own sentence goes on the topbar pill verbatim: no silent retry, no global
+//     rewrite, nothing is invented about the refusal.
+//
+// Single-flight per name (a double press must not send two PATCHes).
 const setToolEnabled = async (name: string, enabled: boolean): Promise<void> => {
     if (togglingTools.has(name)) return;
 
+    // No conversation bound means nothing to configure; the pane is closed and its toggle is
+    // not even rendered in that state, so this is the race guard, not the UI rule.
+    const sessionId = configScope;
+
+    if (sessionId === undefined) return;
+
     togglingTools.add(name);
     paintToolEnableBusy(name, true);
-    // An app-scoped config write: the topbar pill reports the window exactly like the
-    // plugin settings save does.
+    // A config write: the topbar pill reports the window exactly like the plugin writes do.
     setStatus('saving', `tool enablement: ${name}`);
 
     try {
-        const detail = await updateToolEnabled(name, enabled);
+        await updateSessionTool(sessionId, name, { enabled });
 
-        rememberToolRow(detail);
+        const rows = await readSessionToolRows(sessionId);
+
+        // The reader may have switched conversations while the write was out. The rows that
+        // answer now belong to a conversation that is no longer on screen, so they are dropped
+        // — `syncConfigScope` already cleared the caches for the new subject.
+        if (sessionId !== configScope) return;
+
+        applySessionToolRows(rows.map(sessionToolEntryOf));
         setStatus('idle');
     } catch (error) {
-        // The server's own sentence (a 404 for an unknown name, a 4xx for a write this
-        // server refuses) goes on the topbar pill — the one surface this pane still
-        // reports a refusal on, since the reader asked for no line under the title.
-        // Nothing was written, so the `finally` pass pulls the tick, the control's
-        // `data-enabled` and the tile's green edge back to the figure the cache holds.
+        // The server's own sentence (403 for a protected name, 409 for a working conversation,
+        // 404 for a session this server has already dropped) goes on the topbar pill — the one
+        // surface this pane still reports a refusal on, since the reader asked for no line
+        // under the title. Nothing was written, so the `finally` pass pulls the tick, the
+        // control's `data-enabled` and the tile's green edge back to the figure the cache holds.
         const message = messageOf(error);
 
         setStatus('error', `tool enablement: ${message}`);
@@ -8760,6 +8951,24 @@ const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
     toolTabButtons.clear();
     toolEnableBoxes.clear();
 
+    // T4: a read in flight and a read that REFUSED are states of this surface, not a blank
+    // column. The head note (`paintToolsHead`) carries the same two sentences, and these lines
+    // are what the list itself says — the plugin pane below has had this shape all along.
+    if (toolsLoading && entries.length === 0) {
+        toolsTabList.append(el('p', 'field-hint tools-loading', 'Reading this conversation’s toolbox…'));
+
+        return;
+    }
+
+    if (toolsError !== undefined && entries.length === 0) {
+        // The server's own sentence, verbatim (./api.ts `readError` flattens `ErrorBody` into
+        // exactly that). No Retry button: closing and re-opening the pane IS the re-read, since
+        // a failed read never sets `toolsLoaded`.
+        toolsTabList.append(el('p', 'field-hint tools-error', toolsError));
+
+        return;
+    }
+
     // A copy, sorted: the caller's array stays the server's order for every other reader.
     for (const entry of [...entries].sort(byToolName)) {
         const row = el('div', 'tool-tab-row');
@@ -8774,6 +8983,12 @@ const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
         button.setAttribute('aria-haspopup', 'dialog');
 
         const unavailable = entry.availability?.state === 'unconfigured';
+        // T4: the kind line is UNCHANGED by the session scoping. `declared`/`origin`/`protected`
+        // are per-conversation facts the reader needs next to the SWITCH, and that is where they
+        // surface — the locked switch's title (`toolSwitchTitleOf`, "…declared by this
+        // conversation's team…"). Prefixing the kind with `catalogue`/`discovered`/`created`
+        // would rename every row's meta line for a fact most rows never state, so the pane keeps
+        // the catalogue words it has always printed here.
         const kind = [
             entry.visibility,
             ...(entry.sessionBound === true ? ['session'] : []),
@@ -8782,8 +8997,9 @@ const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
         if (unavailable) button.dataset.availability = 'unconfigured';
         // R1: the tile states the tick box's state too, so the list is readable with the
         // control off-screen — and `data-enabled='true'` is what paints the green edge
-        // (an `--ok-line` border on the tile, no background wash; styles.css:1042-1058).
-        if (entry.enabled !== undefined) button.dataset.enabled = entry.enabled ? 'true' : 'false';
+        // (an `--ok-line` border on the tile, no background wash; styles.css:1042-1058). The
+        // figure is the SAME one the box paints below (`toolRowInContext`), never the raw gate.
+        if (entry.enabled !== undefined) button.dataset.enabled = toolRowInContext(entry) ? 'true' : 'false';
 
         button.append(
             el('span', 'tool-tab-name', entry.name),
@@ -8793,12 +9009,15 @@ const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
         row.append(button);
 
         // The enablement affordance: one corner tick box for EVERY row that states an
-        // enablement (core tools included), and NOTHING for a row that never stated one.
+        // enablement (core tools included, locked), and NOTHING for a row that never stated one.
+        // The box is registered BEFORE it is painted because `paintToolRowEnablement` is the
+        // single painter of state, labels and lock, and it finds the control by name.
         if (entry.enabled !== undefined) {
             const control = toolEnableCheckboxOf(entry);
 
             row.append(control);
             toolEnableBoxes.set(entry.name, control);
+            paintToolRowEnablement(entry);
         }
 
         toolTabButtons.set(entry.name, button);
@@ -8807,7 +9026,7 @@ const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
 
     if (entries.length === 0) {
         toolsTabList.append(
-            el('p', 'field-hint', 'The server reported no tools. Check that the harness server is reachable.')
+            el('p', 'field-hint', 'This conversation has no tools to list. Check that the harness server is reachable.')
         );
     }
 };
@@ -8831,9 +9050,15 @@ const toolDetails = new Map<string, ToolRowEntry>();
 
 // Row + identified read, as one descriptor. The row's display facts stay (that is what the list
 // showed and what the click was made on); the schema, availability and session scope come from
-// the detail, because that is the only read that states them. R3: so does `enabled` — the
-// identified row is the fresher statement of the tick box, and a runner opened from an older
-// page must not describe a switch the server has since moved.
+// the detail, because that is the only read that states them.
+//
+// T4: `enabled` is the ONE field the detail does NOT get to restate. `GET /tools/{tool_id}`
+// answers the DEPLOYMENT switch (../shared/harness-api.ts:1091-1100), while the pane's tick
+// states this conversation's gate, which only the session row carries. Taking the catalogue
+// figure here would silently repaint a conversation's switch with the server's, so the row
+// keeps its own and the memo never mixes the two scopes. The schema read itself stays global on
+// purpose: the argument shape is a catalogue fact, and re-pointing the RUNNER at this
+// conversation is a separate change (see the playground note in `createToolRunner`).
 const toolDescriptorOf = (row: ToolRowEntry, detail: ToolDetail): ToolRowEntry => {
     const merged = toolRowOf(detail);
 
@@ -8841,8 +9066,6 @@ const toolDescriptorOf = (row: ToolRowEntry, detail: ToolDetail): ToolRowEntry =
         ...row,
         ...(merged.availability === undefined ? {} : { availability: merged.availability }),
         sessionBound: merged.sessionBound,
-        // R3: the switch's state comes from the read that states it freshest.
-        enabled: merged.enabled,
         parameters: (detail.parameters ?? {}) as Record<string, unknown>
     };
 };
@@ -8865,15 +9088,109 @@ const hydrateToolDetail = async (row: ToolRowEntry): Promise<void> => {
     runner.show(merged, true);
 };
 
-// Boot entry for the catalogue. R21.2: the tools view is the sole listing, so this
-// only caches the entries (for `setToolsView`) and rebuilds that list — no
-// right-rail duplicate to keep in sync any more.
+// The whole list render for one conversation's toolbox: cache it, drop every memoized schema
+// (they describe the page this replaces), and rebuild the list.
 const buildTools = (entries: readonly ToolRowEntry[]): void => {
     toolEntries = entries;
     // A new catalogue page is a new revision of every row in it, so every memoized identified
     // read describes a list the server has since replaced.
     toolDetails.clear();
     buildToolsTab(entries);
+};
+
+// One `GET /sessions/{id}/tools` row as the pane's row shape. The display facts come through
+// the shared mapper (`toolRowOf` reads the `ToolSummary` half, which a session row carries
+// verbatim); `parameters` is EMPTY because a page row never carries a schema — the identified
+// read supplies it when a tool is opened, exactly as it always has.
+const sessionToolEntryOf = (row: SessionToolSummary): ToolRowEntry => ({
+    ...toolRowOf(row),
+    parameters: {},
+    // The three conversation facts, kept under their contract names so a reader of the row can
+    // trace them back to ../shared/harness-api.ts `SessionToolSummary`:1852-1900.
+    declared: row.declared,
+    protected: row.protected,
+    origin: row.origin,
+    enabled: row.enabled
+});
+
+// Every row of THIS conversation's toolbox, page by page. The head sentence is "N tools · the
+// toolbox of this conversation", so a page boundary must never drop rows and still let the count
+// read as complete — the same completeness the deployment-catalogue read had (`./api.ts`
+// `listAllTools`:927), now on the session route. `next_cursor` is the contract's own
+// end-of-collection signal (../shared/harness-api.ts `PageMeta`:290), and a cursor the server
+// repeats is a broken server rather than more data, so the walk is bounded twice over.
+const SESSION_TOOL_PAGE_PASSES = 20;
+
+const readSessionToolRows = async (sessionId: string): Promise<SessionToolSummary[]> => {
+    const rows: SessionToolSummary[] = [];
+    // The empty string is seeded so a server that answers `cursor: ''` for the first page cannot
+    // loop the walk forever.
+    const seen = new Set<string>(['']);
+
+    let cursor: string | undefined;
+
+    for (let pass = 0; pass < SESSION_TOOL_PAGE_PASSES; pass += 1) {
+        const page = await listSessionTools(sessionId, cursor === undefined ? {} : { cursor });
+
+        rows.push(...page.items);
+
+        const next = page.nextCursor;
+
+        if (next === null || next === undefined || next.length === 0 || seen.has(next)) return rows;
+
+        seen.add(next);
+        cursor = next;
+    }
+
+    return rows;
+};
+
+// Read THIS conversation's toolbox. `force` is the post-write re-read; without it a page this
+// browser already holds for this scope is painted from, which is what keeps the second (and
+// every later) open of one conversation free of traffic.
+//
+// The read is paid for on the FIRST OPEN of the pane, never at boot and never on a session
+// switch: the pane is a thing the reader asked for, and every other surface here follows the
+// same discipline (the plugin catalogue below, the agent instruction reads, the schema memo).
+const loadSessionTools = async (sessionId: string, force = false): Promise<void> => {
+    // The stale-pointer idiom this file uses everywhere: an answer for a conversation the
+    // reader already left paints nothing and caches nothing.
+    if (sessionId !== configScope) return;
+    if (toolsLoading) return;
+
+    if (toolsLoaded && !force) {
+        buildToolsTab(toolEntries);
+        if (showingTools && currentTool === undefined) paintToolsHead();
+
+        return;
+    }
+
+    toolsLoading = true;
+    toolsError = undefined;
+    buildToolsTab(toolEntries);
+    if (showingTools && currentTool === undefined) paintToolsHead();
+
+    try {
+        const rows = await readSessionToolRows(sessionId);
+
+        if (sessionId !== configScope) return;
+
+        buildTools(rows.map(sessionToolEntryOf));
+        toolsLoaded = true;
+        toolsError = undefined;
+    } catch (error) {
+        // NOT memoized: the next open asks again. The refusal is the server's own sentence.
+        if (sessionId !== configScope) return;
+
+        toolsError = messageOf(error);
+    } finally {
+        toolsLoading = false;
+
+        if (sessionId === configScope) {
+            buildToolsTab(toolEntries);
+            if (showingTools && currentTool === undefined) paintToolsHead();
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -8884,14 +9201,14 @@ const buildTools = (entries: readonly ToolRowEntry[]): void => {
 // the shipped Context Compaction plugin with an EDITABLE context limit. The two halves
 // of that answer are deliberately different:
 //
-//   - ENABLEMENT is a ONE-CLICK GLOBAL WRITE (R2, this pass). Loading is still
+//   - ENABLEMENT is a ONE-CLICK SESSION WRITE (R2, scoped by T4). Loading is still
 //     auto-scanned — nothing here installs or uninstalls a plugin — but every row carries
 //     a switch, and `PluginSummary.enabled` is the TOP-LEVEL field it paints from
 //     (../shared/harness-api.ts:676-689). The write is the ordinary settings PATCH with
 //     the framework's RESERVED `enabled` key:
-//     `PATCH /plugins/{id}` `{ settings: { enabled: <boolean> } }`. It is accepted for
-//     EVERY plugin, whether or not that plugin declares the key itself, it has no idle
-//     window, and it takes effect in every conversation from its next turn
+//     `PATCH /sessions/{id}/plugins/{id}` `{ settings: { enabled: <boolean> } }`. It is
+//     accepted for EVERY plugin, whether or not that plugin declares the key itself, it has
+//     no idle window, and it takes effect in THIS conversation from its next turn
 //     (../server/plugins.ts "THE RESERVED `enabled` KEY").
 //
 //     WHY `values.enabled` IS NEVER READ: `values` reports DECLARED settings only
@@ -8900,7 +9217,7 @@ const buildTools = (entries: readonly ToolRowEntry[]): void => {
 //     the row's own `enabled` field still states the switch. Painting the toggle from
 //     `values` would show every undeclared plugin as off.
 //   - SETTINGS stay editable, and the row dialog is the only write path for them:
-//     `PATCH /plugins/{id}` with `{ settings: { key: value } }`.
+//     `PATCH /sessions/{id}/plugins/{id}` with `{ settings: { key: value } }`.
 //
 // STRUCTURE mirrors the tools view (the code directly above) on purpose: an icon-only
 // toggle on the harness title row, a full-width `.plugins-pane` in `stage`, `.plugin-tab-row`
@@ -8910,17 +9227,19 @@ const buildTools = (entries: readonly ToolRowEntry[]): void => {
 //
 // WHY THE PAGE IS CACHED AND RE-READ BY HAND
 // ------------------------------------------
-// `GET /plugins` answers the whole surface in one document (descriptor + effective
-// values), and the server publishes NO stream update kind for plugins (T5): the only way
-// a row goes stale is another visitor writing it. So the first open pays for the read,
-// every later open repaints from `pluginRows`, and `Reload plugins` (plus the Retry
-// button on a failed read) is the explicit re-read. A SAVE merges the PATCH answer into
-// the same cache, which is why reopening a row shows the saved figure without a second
-// request.
+// `GET /sessions/{id}/plugins` answers the whole surface of ONE conversation in one document
+// (descriptor + that conversation's effective values), and the server publishes NO stream
+// update kind for plugins (T5): the only way a row goes stale is another visitor writing the
+// SAME conversation. So the first open pays for the read, every later open repaints from
+// `pluginRows`, and `Reload plugins` (plus the Retry button on a failed read) is the explicit
+// re-read. A SAVE merges the PATCH answer into the same cache, which is why reopening a row
+// shows the saved figure without a second request. The cache is dropped the moment a different
+// conversation becomes the subject (`syncConfigScope`), so no conversation can ever be painted
+// with another one's settings.
 //
 // WHY A SAVE REPAINTS IN PLACE
 // ----------------------------
-// `updatePluginSettings` returns the WHOLE row (the values it reports ARE the result of
+// `updateSessionPluginSettings` returns the WHOLE row (the values it reports ARE the result of
 // the write). The dialog therefore keeps its own DOM, takes the server's figures as the
 // new form values, and repaints exactly one list row's settings line. Rebuilding the
 // list would replace the button that opened the dialog, and `ui/dialog.ts` restores
@@ -9048,8 +9367,8 @@ const pluginsCountNote = (): string => {
     const count = pluginRows.length;
 
     return count === 0
-        ? 'The server reported no plugins.'
-        : `${count} plugin${count === 1 ? '' : 's'} · auto-scanned · settings save on the harness server`;
+        ? 'This conversation has no plugins to list.'
+        : `${count} plugin${count === 1 ? '' : 's'} · auto-scanned · settings save for this conversation`;
 };
 
 // The head while the Plugins view owns the centre and no dialog is open. Same contract
@@ -9144,10 +9463,16 @@ const paintPluginToggle = (control: HTMLInputElement, plugin: PluginSummary): vo
     control.checked = enabled;
     control.dataset.enabled = enabled ? 'true' : 'false';
     control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${plugin.title}`);
+    // T4: the write is scoped to the conversation on screen (`PATCH /sessions/{id}/plugins/…`),
+    // so the tooltip says which conversation changes — the deployment-wide sentence below the
+    // old copy promised a scope this route does not have.
     control.title = enabled
-        ? `Enabled for every conversation on this server · click to switch ${plugin.name} off`
-        : `Disabled for every conversation on this server · click to switch ${plugin.name} on`;
-    // R1: the only lock this control answers to is its OWN in-flight write.
+        ? `Enabled for this conversation · click to switch ${plugin.name} off`
+        : `Disabled for this conversation · click to switch ${plugin.name} on`;
+    // R1: the only lock this control answers to is its OWN in-flight write. Unlike a tool gate,
+    // a plugin setting has NO idle window on the server (../api.ts session plugin PATCH), so a
+    // working conversation still switches its plugins — that asymmetry is the server's, not a
+    // client rule.
     control.disabled = togglingPlugins.has(plugin.name) || !booted;
 };
 
@@ -9210,10 +9535,11 @@ const notePluginToggleResult = (text: string, failed: boolean): void => {
     pluginsTabStatus.className = failed ? 'plugins-tab-status plugins-tab-status-error' : 'plugins-tab-status field-hint';
 };
 
-// R2's one global write. Like the tool switch it is NOT gated by `running`/`submitting`:
-// `PATCH /plugins/{id}` with the reserved `enabled` key takes effect in every session
-// from its next turn and has no idle window (../shared/harness-api.ts
-// `PluginSettingsUpdate`, ../server/plugins.ts "THE RESERVED `enabled` KEY").
+// The plugin switch, and it is a SESSION write: `PATCH /sessions/{id}/plugins/{id}` with the
+// reserved `enabled` key takes effect in THIS conversation from its next turn and has no idle
+// window (../shared/harness-api.ts `PluginSettingsUpdate`, ../server/plugins.ts "THE RESERVED
+// `enabled` KEY"). Unlike a tool gate the route is therefore write-anytime, and the pane keeps
+// it that way.
 //
 // The answer is the WHOLE row, so the cache, the row and the head all take the server's
 // figure; a refusal touches none of them (nothing was written) and prints the server's
@@ -9221,13 +9547,23 @@ const notePluginToggleResult = (text: string, failed: boolean): void => {
 const setPluginEnabled = async (name: string, enabled: boolean): Promise<void> => {
     if (togglingPlugins.has(name)) return;
 
+    // T4: the write belongs to the conversation the centre column is showing. With no session
+    // bound the pane is closed and its toggle is not rendered, so this is the race guard.
+    const sessionId = configScope;
+
+    if (sessionId === undefined) return;
+
     togglingPlugins.add(name);
     paintPluginToggleBusy(name, true);
-    // An app-scoped config write, exactly like the settings save.
+    // A config write, exactly like the settings save.
     setStatus('saving', `plugin enablement: ${name}`);
 
     try {
-        const updated = await updatePluginSettings(name, { enabled });
+        const updated = await updateSessionPluginSettings(sessionId, name, { enabled });
+
+        // The reader may have switched conversations while the write was out; the answer
+        // describes a conversation no longer on screen, so it merges into nothing.
+        if (sessionId !== configScope) return;
 
         replacePluginRow(updated);
         paintPluginRow(updated);
@@ -9236,7 +9572,7 @@ const setPluginEnabled = async (name: string, enabled: boolean): Promise<void> =
         // pane line used — the row count cannot move on an enablement write anyway.
         if (showingPlugins) paintPluginsChrome();
         notePluginToggleResult(
-            `${updated.title} is now ${updated.enabled ? 'enabled' : 'disabled'} for every conversation.`,
+            `${updated.title} is now ${updated.enabled ? 'enabled' : 'disabled'} for this conversation.`,
             false
         );
         setStatus('idle');
@@ -9260,6 +9596,9 @@ const buildPluginsTab = (): void => {
     pluginRowNodes.clear();
     // The tick boxes are rebuilt with the list, so the key set follows the nodes exactly.
     pluginEnableBoxes.clear();
+    // T4: the re-read control is gated exactly as the pane's entry point is: boot or a read in
+    // flight. With no conversation bound the pane cannot even be open (`paintControls` hides the
+    // toggle and `syncConfigScope` closes an open pane), so no separate unbound gate is needed.
     pluginsRefresh.disabled = pluginsLoading || !booted;
 
     if (pluginsLoading && pluginRows.length === 0) {
@@ -9348,9 +9687,17 @@ const buildPluginsTab = (): void => {
     }
 };
 
-// Read the catalogue. `force` is the Reload/Retry path; without it a cached page is
-// painted from, which is what keeps the second (and every later) open free of traffic.
+// Read THIS conversation's plugin rows. `force` is the Reload/Retry path; without it a page
+// this browser already holds FOR THIS CONVERSATION is painted from, which is what keeps the
+// second (and every later) open free of traffic. The page is invalidated on every scope change
+// (`syncConfigScope`), so a conversation switch is by construction a re-read.
 const loadPlugins = async (force = false): Promise<void> => {
+    // T4: the read is scoped to the conversation on screen. No session, nothing to read — the
+    // pane is closed and its toggle is not rendered in that state.
+    const sessionId = configScope;
+
+    if (sessionId === undefined) return;
+
     // Single-flight: a double press of Reload, or an open while a read is in flight,
     // must not race two answers into the cache.
     if (pluginsLoading) return;
@@ -9366,18 +9713,28 @@ const loadPlugins = async (force = false): Promise<void> => {
     if (showingPlugins) paintPluginsChrome();
 
     try {
-        const page = await listPlugins();
+        const page = await listSessionPlugins(sessionId);
+
+        // The stale-pointer idiom: an answer for a conversation the reader already left paints
+        // nothing and caches nothing (the cache now belongs to the new subject).
+        if (sessionId !== configScope) return;
+
         pluginRows = [...page.items];
         pluginsLoaded = true;
         pluginsError = undefined;
     } catch (error) {
         // NOT memoized: the next open (or Retry) asks again, exactly like the tool
         // detail read above.
+        if (sessionId !== configScope) return;
+
         pluginsError = messageOf(error);
     } finally {
         pluginsLoading = false;
-        buildPluginsTab();
-        if (showingPlugins) paintPluginsChrome();
+
+        if (sessionId === configScope) {
+            buildPluginsTab();
+            if (showingPlugins) paintPluginsChrome();
+        }
     }
 };
 
@@ -9726,6 +10083,15 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
     // answer can never paint figures from a superseded read.
     let shown = plugin;
     let saving = false;
+    // T4: the conversation this dialog WRITES INTO, captured at open. A settings save is a
+    // session write, and the scope cannot drift underneath a live form: every path that moves
+    // the bound session closes this layer first (`selectHarness`, `setToolsView`,
+    // `syncConfigScope` → `setPluginsView(false)`). The guard in the save handler is what makes
+    // that true even for an answer that lands while the close is running.
+    const scope = configScope;
+
+    if (scope === undefined) return;
+
     const fields: PluginField[] = [];
     // key -> its field. The save loop needs this for ONE thing (D4): a `parentKey` chain is
     // spelled in KEYS, and revealing a row its own tick hides means finding the ancestor
@@ -9939,7 +10305,13 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
                 setStatus('saving', `plugin settings: ${shown.name}`);
 
                 try {
-                    const updated = await updatePluginSettings(shown.name, patch);
+                    // T4: the write names the conversation this dialog was opened for, and only
+                    // its answer may merge into the cache. A PATCH that answers after the reader
+                    // switched describes a conversation that is no longer on screen.
+                    const updated = await updateSessionPluginSettings(scope, shown.name, patch);
+
+                    if (scope !== configScope) return;
+
                     // The answer IS the new state: merge it into the cache, repaint this
                     // row's settings line, and re-take the form's values from it.
                     shown = updated;
@@ -10833,6 +11205,13 @@ const renderSessions = (): void => {
 // running server-side (R4) — which is exactly why the reader can start a fresh conversation
 // while one is already working. Sessions are independent; only the shared client state below
 // is reset, and it belongs to the conversation being left.
+//
+// T3 (this pass): the create is a REAL write — `+` POSTs `/sessions` immediately — but a
+// create already in flight is still NOT part of the contract either. `ensureSession` never
+// deduplicates by button state (it deduplicates only by `instance.sessionId`, which the
+// teardown clears first), so spamming `+` means what the user asked it to mean: more
+// conversations. `creatingSessions` still gates the writes that could genuinely race the
+// freeze (deletion, agent saves) without touching this control.
 //
 // R6: a NEW session needs a harness the registry still has. An archived conversation
 // (its harness deleted) is readable and can keep queuing tasks into its own record, but
@@ -13409,10 +13788,19 @@ const openSession = async (
     // `applyView`; the topbar pill stays app-scoped (R1).
 };
 
-// Explicit new conversation: forget the pointer and drop the local projection.
-// The previous session stays on the server and can be reopened from the rail;
-// clearing the pointer is also what unlocks agent editing again.
-const newSession = (): void => {
+// `+ New session`: create a REAL conversation on the server immediately, and drop the local
+// projection of whatever this card pointed at before. The previous session stays on the
+// server and can be reopened from the dashboard; releasing the pointer is also what unlocks
+// agent editing again for the moment the new record's answer lands.
+//
+// T3 (this pass): the create is EAGER. The user's rule is "every click makes a session" — a
+// conversation exists (server-assigned uuid, frozen team, endpoint settings) from the moment
+// `+` is pressed, even with 0 turns and 0 threads, so the plugins/tools surfaces have a real
+// session id to configure against before anything is submitted. The local teardown therefore
+// runs FIRST and `ensureSession(instance)` runs last: it is the one code path that owns
+// `creatingSessions` and the adoption (bind, frozen team, model map, roster, store, panels,
+// directory row, repaint), and the submit path keeps using the same call as its fallback.
+const newSession = async (): Promise<void> => {
     const instance = current;
     if (instance === undefined) return;
 
@@ -13420,17 +13808,33 @@ const newSession = (): void => {
     // programmatic call from starting a session the server cannot resolve.
     if (descriptorFor(instance.descriptor.name) === undefined) return;
 
-    // NO run guard (R4): a conversation is created by forgetting the local pointer, not by
-    // cancelling anything. Whatever the previous conversation has queued keeps running on the
-    // server, so starting a new session while it works is the normal way to open a second,
-    // independent conversation. The `running` flag itself is released below, with the rest of
-    // the state that belonged to the conversation being left.
+    // F1 (R1): the SAME no-endpoint refusal `run()` performs below, and it has to sit HERE —
+    // before every line of the teardown — because the create is eager. A harness whose
+    // descriptor sets `requiresEndpoint` is refused by the server (`sessions.ts` `create`
+    // answers `Harness "general" needs a provider base URL.`), so the old order shipped a
+    // request that could only fail AND had already dropped the `localStorage` pointer, which
+    // meant the reader lost the conversation they were reading on top of the refusal. Refusing
+    // here: no POST, no teardown, so the open conversation, its pill and its remembered
+    // pointer are exactly as they were, and the only thing that changes is what the reader is
+    // told. Text and status are `run()`'s, verbatim — one sentence for one missing setting.
+    if (instance.descriptor.requiresEndpoint && settings.baseURL.trim().length === 0) {
+        instance.view.notice('set a base URL in Endpoint & model, then run again');
+        setStatus('error', 'no endpoint configured');
+        return;
+    }
+
+    // NO run guard (R4): a new conversation cancels nothing. Whatever the previous
+    // conversation has queued keeps running on the server, so starting a new session while it
+    // works is the normal way to open a second, independent conversation. The `running` flag
+    // itself is released below, with the rest of the state that belonged to the conversation
+    // being left.
 
     // R3: an empty composer is a navigation intent, so it supersedes every conversation read
-    // still in flight. This is the guard the run lock used to provide by accident: the card is
-    // about to have NO pointer, and `applyView` binds any document that arrives for a
+    // still in flight. The card is about to have NO pointer for the whole window that the
+    // create request is open, and `applyView` binds any document that arrives for a
     // pointer-free card, so without this the conversation just released would re-bind this
     // card from its own late answer — transcript, pending figure and the remembered pointer.
+    // (See the `navigationIntent` declaration for the full race.)
     markNavigationIntent();
 
     // New session is reachable from the phone rail: collapse it so the started
@@ -13502,6 +13906,33 @@ const newSession = (): void => {
     // R8: starting a new session must not move focus into the composer. The draft is
     // module-scoped and survives session switches, so there is nothing to re-enter;
     // the user clicks the field when they want to type.
+
+    // --- R1: the create itself, AFTER the teardown above -------------------------------
+    // `instance.sessionId` is undefined at this point, which is exactly what makes
+    // `ensureSession` issue the POST rather than hand back a stale id — and what makes a
+    // REPEAT click create again (R2: no dedup, no reuse, no client-side cap; the teardown
+    // above is the reset, so nothing has to be remembered about how many times `+` was
+    // pressed). A second click that lands while this request is still open re-runs the
+    // teardown and issues its own POST; both records exist on the server and the last
+    // answer to arrive is the one this card ends up pointing at, which is the honest
+    // reading of "the user chose to spam them".
+    //
+    // NO `creatingSessions` gate on the button: `+` stays clickable during a live run AND
+    // during another create (R4), and `paintSessionActions` is the only writer of `disabled`.
+    // The counter is still raised inside `ensureSession`, which is what keeps harness/session
+    // deletion (`deletionBlocked` / `harnessDeletionBlocked`) and agent saves out of the
+    // creation window.
+    try {
+        await ensureSession(instance);
+    } catch (error) {
+        // R3: the create failed, and the state the teardown left IS the coherent state —
+        // no `instance.sessionId`, so no pill claims an active conversation, no directory
+        // row was added (`upsertSession` never ran), the empty transcript and the surviving
+        // draft are ready for a retry, and the next submit falls back to `ensureSession`.
+        // The topbar pill is the app-scoped surface for exactly this kind of failed write
+        // (R1), so the failure is reported there and nowhere else.
+        setStatus('error', `new session: ${messageOf(error)}`);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -13528,13 +13959,26 @@ const newSession = (): void => {
 //     keep the windows that can genuinely race — `submitting`, `!booted`, and an archived
 //     harness for the create — see `paintSessionActions`, `paintSessionCycle` and the strip
 //     pass below. Reset is gone (R10), so there is no third composer control to paint.
-//   - R1: the TWO CATALOGUES (Tools and Plugins) are NOT locked by a run. They are
-//     server-wide surfaces whose own writes have no idle window, and every transcript
-//     painter early-returns while a catalogue owns the centre column, so a stream keeps
-//     being folded into the conversation underneath the pane. Their only remaining gate
-//     is `!booted` (there is nothing to list before the catalogue answers) — plus
-//     `pluginsLoading` for the plugin re-read.
+//   - R1/T4: the TWO CATALOGUES (Tools and Plugins) are NOT locked by a run. They are
+//     surfaces the reader asked for, and every transcript painter early-returns while a
+//     catalogue owns the centre column, so a stream keeps being folded into the conversation
+//     underneath the pane. Their ENABLEMENT gate stays `!booted` alone — the honest meaning of
+//     `disabled` on these two is "the server never answered", the state `showOffline` leaves
+//     behind. A conversation-less centre column is a different fact and is stated structurally:
+//     with nothing to configure, both toggles stop being RENDERED (`hidden` on the group and on
+//     each button, T4: hidden rather than disabled-and-explained) and a pane left open when the
+//     pointer is released is closed by `syncConfigScope`. Individual switches follow the
+//     server's own rules: a plugin write has no idle window (never locked by a run), while a
+//     tool gate is refused 409 unless the conversation is idle and 403 for a protected name, so
+//     BOTH states lock that switch — plus `pluginsLoading` for the plugin re-read.
 const paintControls = (): void => {
+    // T4: BEFORE anything is painted from the busy state, the two configuration panes learn
+    // which conversation they describe. Every path that moves the bound session repaints the
+    // controls (a pill open and the harness switch go through `setBusy`, `+` and a delete call
+    // `setBusy(false)`, boot paints once at the end), so this is the one place the panes'
+    // per-session caches can be dropped without a painter having to remember to.
+    syncConfigScope();
+
     const pending = running || current?.pending === true;
 
     // R9/R10: the composer's single action is painted from the same state as every
@@ -13559,32 +14003,49 @@ const paintControls = (): void => {
     for (const [name, button] of harnessDeleteButtons) {
         button.disabled = harnessDeletionsBlocked || removingHarnesses.has(name);
     }
-    // R1: the tool rows are a server listing, not a conversation affordance — pressing
-    // one opens a modal runner whose call goes straight to the server. Nothing here
-    // tears down the transcript, so a run never dims the list.
-    //
-    // R3: the row's ENABLEMENT tick box is not painted from run state either; it is
-    // painted from ITS OWN in-flight write (`togglingTools`), because that is the only
-    // race the control can create with itself.
+    // T4: the row's ENABLEMENT tick box is painted by ONE painter (`paintToolRowEnablement`),
+    // and this pass is what keeps it honest when a run starts or ends while the pane is open.
+    // The lock set is the server's own: a `protected` name refuses the PATCH with 403, a
+    // conversation with queued work refuses it with 409 (`assertIdleForToolMutation`,
+    // ../server/api.ts:3888-3899), and the control's own in-flight write must not be dialled
+    // twice. `paintToolRowEnablement` re-derives the identical figure for the tooltip, so a
+    // locked switch always says WHICH of the three locks it is showing.
     for (const [name, control] of toolEnableBoxes) {
-        control.disabled = togglingTools.has(name) || !booted;
+        const row = toolEntryOf(name);
+
+        control.disabled =
+            (row !== undefined && toolSwitchLockOf(row) !== undefined) || togglingTools.has(name) || !booted;
     }
 
-    // R3 + R1: the global tools toggle is gated by ONE thing — the catalogue has to
-    // exist before the pane can list it. The run lock the removed tabs carried is gone
-    // (`setToolsView` has no `running` gate), and `showOffline` disables the control
-    // again the moment the transport is lost.
+    // T4: BOTH catalogues configure ONE conversation, so with no conversation bound there is
+    // nothing for these two buttons to open — and they are NOT rendered at all. A greyed-out
+    // button that opens an empty pane would advertise a surface that cannot answer.
+    //
+    // `hidden` is the only thing that changes, and it goes on the GROUP (its `display: flex` rule
+    // outranks the UA stylesheet's `[hidden] { display: none }`, hence the explicit
+    // `.harness-title-tools[hidden]` in styles.css) AND on each button, so a reader of the DOM
+    // and a reader of a screen get the same answer — both halves are pinned in
+    // ./compact-ui.test.ts.
+    //
+    // `disabled` keeps its baseline meaning ("the server never answered", the state `showOffline`
+    // leaves behind) so a hidden control never has to explain a second reason, exactly as R1 left
+    // it: a plugin write has no idle window, and a tool gate locks its OWN switch instead of
+    // hiding the pane. A pane opened programmatically while unbound is guarded at its own edge
+    // (`loadSessionTools`/`loadPlugins` never dial for a missing id), not by a button state.
+    const bound = sessionIsBound();
+
+    harnessTitleTools.hidden = !bound;
+    toolsToggle.hidden = !bound;
+    pluginsToggle.hidden = !bound;
     toolsToggle.disabled = !booted;
-    // T7 (R2) + R1: the Plugins toggle answers to the identical gate. Its writes
-    // (`PATCH /plugins/{id}`, including the reserved `enabled` key) are write-anytime
-    // on the server, so nothing here has to fear a streaming queue.
     pluginsToggle.disabled = !booted;
     // The re-read keeps its own extra gate: a read already in flight must not be
     // dialled twice (`loadPlugins` is single-flight, and a disabled control says so).
     pluginsRefresh.disabled = pluginsLoading || !booted;
 
     // R1: plugin rows are always clickable once boot has answered; their tick box is
-    // locked only while ITS OWN write is in flight (`togglingPlugins`).
+    // locked only while ITS OWN write is in flight (`togglingPlugins`). A working conversation
+    // locks NOTHING here — unlike a tool gate, the session plugin PATCH has no idle window.
     for (const [name, control] of pluginEnableBoxes) {
         control.disabled = togglingPlugins.has(name) || !booted;
     }
@@ -13675,11 +14136,20 @@ const setStatus = (state: AppStatus, detail?: string): void => {
     statusDetail.textContent = detail;
 };
 
-// Create a session only when this harness has none. Settings drafts are read here
-// and nowhere else: editing the endpoint, model or key afterwards must not
-// recreate, replace or delete the conversation the user already has (H4). A new
-// session is an explicit "New session" click, and the first submit after it
-// creates the server record.
+// Create the server record for this card, or hand back the one it already has.
+//
+// T3 (this pass): `+ New session` calls this DIRECTLY, so the record exists the moment the
+// reader presses `+` — a session with 0 turns and 0 threads is a valid server state, and the
+// session-scoped surfaces (plugins/tools configuration) need the id before any task is sent.
+// `run()` still calls it too, as the FALLBACK for the one way a card can reach a submit with
+// no pointer: a boot with zero sessions, or a `+` whose create failed (R3). The dedup is the
+// early return below — the submit never creates a SECOND record for a card that already has
+// one, which is what `session-cycle.test.ts` and `session-pills.test.ts` count.
+//
+// Settings drafts are read here and nowhere else (H4): editing the endpoint, model or key
+// AFTER a session exists must not recreate, replace or delete the conversation the reader
+// already has. Because the `+` now spends those settings immediately, changing the endpoint
+// from then on only affects later sessions — exactly the guarantee H4 states.
 const ensureSession = async (instance: Instance): Promise<string> => {
     if (instance.sessionId !== undefined) return instance.sessionId;
 
@@ -13695,9 +14165,10 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     }
 
     instance.sessionId = session.id;
-    // N3: the first submit of a new conversation creates the session before the
-    // task is enqueued, so bind here: any action card that arrives with the run is
-    // answerable against this id.
+    // T3: bind the board to the id NOW, not at the first submit. Both callers can leave
+    // this card with live work to answer: the `+` path adopts the record it just created,
+    // and the submit path creates it before the task is enqueued. An action card that
+    // arrives with the run is only answerable against this id (`View.bindSession`).
     instance.view.bindSession(session.id);
     instance.frozen = frozenTeamOf(session);
     // The creation answer carries this session's effective model map, which is also
@@ -13736,13 +14207,30 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     // it both empties the board and guarantees nothing from a previously viewed
     // session survives a New session.
     derivePanels(instance);
-    rememberSession(session.id);
+    // T3: the localStorage pointer names the conversation THIS BROWSER has open, so only
+    // the card on screen may move it. `ensureSession` used to run exclusively under `run()`,
+    // where `current === instance` always held; with `+ New session` creating eagerly, a
+    // background card can finish its create while another card is on screen (the reader
+    // switched harness mid-flight), and writing that new id here would reopen the background
+    // conversation on the next load and repaint the pill for it as active.
+    if (current === instance) rememberSession(session.id);
     upsertSession(session);
     renderSessions();
 
     // A manual core call may have created this session; its runner shows the
     // session id now instead of "no session yet".
     if (current === instance) {
+        // T4: this is the ONE adoption that would otherwise repaint without a controls pass, and
+        // it is the `+ New session` one — the teardown cleared the pointer (which hid both
+        // configuration toggles and closed any open pane), and the answer just minted a real
+        // conversation id for them to describe. `paintControls` IS the controls pass: it opens by
+        // re-scoping the panes to this id (`syncConfigScope`, so a pane that stayed open across
+        // the create re-reads the new conversation instead of sitting on the released one) and
+        // then re-derives every figure derived from the pointer — including the two `hidden`
+        // flags. Calling `syncConfigScope` alone would move the scope and leave the toggles
+        // hidden until some unrelated busy repaint, i.e. a fresh session would look
+        // unconfigured-but-unreachable.
+        paintControls();
         renderHarnessChrome();
         paintPanels();
         runner.sync();
@@ -13862,9 +14350,10 @@ const run = async (): Promise<void> => {
     let sessionId: string | undefined;
 
     try {
-        // Session creation is part of the submit. `ensureSession` is deduplicated:
-        // a task enqueued while another session creation is settling still gets
-        // exactly one session (creatingSessions + the instance id).
+        // Session creation is part of the submit ONLY as the fallback: after `+ New session`
+        // created the record eagerly this call returns `instance.sessionId` immediately and
+        // costs no request. The path that still creates here is a card with no pointer — a
+        // boot with zero sessions, or a `+` whose create failed (R3).
         sessionId = await ensureSession(instance);
 
         // 202 on the canonical wire: a TASK RECEIPT, never a document. The row the receipt
@@ -14491,7 +14980,14 @@ const boot = async (): Promise<void> => {
         configureBaselineAgentColors();
 
         buildHarnesses();
-        buildTools(data.tools as unknown as readonly ToolRowEntry[]);
+        // T4: the bootstrap catalogue is NOT the Tools pane's content any more. The pane lists
+        // ONE CONVERSATION's toolbox (`GET /sessions/{id}/tools`), read the first time the pane
+        // is opened, so boot seeds NO rows here — seeding them would have the pane show
+        // deployment rows under a conversation whose own rows were never read, which is the
+        // exact lie this change removes. `data.tools` still arrives (./api.ts `loadBootstrap`
+        // keeps the read for its other consumer, the template surface) and is simply not what
+        // this pane paints. The pane's own empty-and-not-yet-read state is what `buildToolsTab`
+        // shows until a conversation is opened and the toggle pressed.
 
         // T5 R1 / T38: the conversation directory is the COMPACT surface. The bootstrap already
         // embedded one row per conversation, and a row is the CONTRACT's snake_case metadata

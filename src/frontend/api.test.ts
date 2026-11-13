@@ -1248,6 +1248,145 @@ describe('plugin settings client (R2/R3)', () => {
     });
 });
 
+// R4: the three calls of a plugin pane that belongs to ONE session. The row and body types
+// are the ones the global pair uses (one `PluginSummary`, one `PluginSettingsUpdate`), so
+// what these pins actually hold is the SCOPE: the session id is the first path segment, it
+// is encoded like any other user-supplied segment, and the client never falls back to the
+// global route when a session-scoped read is asked for.
+describe('session plugin settings client (R4)', () => {
+    // Same row shape as the global block above — the point is that it is the SAME shape,
+    // resolved through the session's own store (`enabled: false` here, `true` globally).
+    const sessionRow: PluginSummary = {
+        name: 'context-compaction',
+        title: 'Context Compaction',
+        description: 'Compacts a conversation at the turn boundary.',
+        version: '1.0.0',
+        tags: ['context'],
+        hooks: ['turn.before'],
+        builtin: true,
+        enabled: false,
+        settings: [
+            {
+                key: 'contextLimit',
+                label: 'Context limit (tokens)',
+                type: 'number',
+                default: 100000,
+                min: 1000,
+                step: 1000
+            }
+        ],
+        values: { contextLimit: 24000 }
+    };
+
+    it('pages ONE session\'s plugins, addressed by the session id', async () => {
+        serve({ 'GET /v1/harness/sessions/ses_1/plugins?limit=25&q=compact': pageOf([sessionRow]) });
+
+        const module = await import('./api');
+        const page = await module.listSessionPlugins('ses_1', { q: 'compact' });
+
+        expect(page.items).toEqual([sessionRow]);
+        expect(page.nextCursor).toBeNull();
+        expect(page.limit).toBe(25);
+        // The page revision is the SESSION's own counter (the stub page says 9), not a
+        // host-wide plugin counter.
+        expect(page.revision).toBe(9);
+
+        expect(calls).toEqual([
+            {
+                method: 'GET',
+                url: '/v1/harness/sessions/ses_1/plugins?limit=25&q=compact',
+                body: undefined,
+                keepalive: undefined
+            }
+        ]);
+    });
+
+    it('reads one plugin for one session and unwraps the row', async () => {
+        serve({ 'GET /v1/harness/sessions/ses_1/plugins/context-compaction': { plugin: sessionRow } });
+
+        const module = await import('./api');
+        const row = await module.getSessionPlugin('ses_1', 'context-compaction');
+
+        expect(row).toEqual(sessionRow);
+        expect(calls).toEqual([
+            {
+                method: 'GET',
+                url: '/v1/harness/sessions/ses_1/plugins/context-compaction',
+                body: undefined,
+                keepalive: undefined
+            }
+        ]);
+    });
+
+    it('patches one plugin for one session only, with the same body the global route takes', async () => {
+        serve({ 'PATCH /v1/harness/sessions/ses_1/plugins/context-compaction': { plugin: sessionRow } });
+
+        const module = await import('./api');
+        const updated = await module.updateSessionPluginSettings('ses_1', 'context-compaction', {
+            contextLimit: 24000,
+            enabled: false
+        });
+
+        expect(updated).toEqual(sessionRow);
+        expect(calls).toEqual([
+            {
+                method: 'PATCH',
+                url: '/v1/harness/sessions/ses_1/plugins/context-compaction',
+                // Identical body spelling to `updatePluginSettings` above: the route is the only
+                // difference between a template write and a session write.
+                body: { settings: { contextLimit: 24000, enabled: false } },
+                keepalive: undefined
+            }
+        ]);
+    });
+
+    it('encodes a session id and a plugin id like any other path segment, and resets with null', async () => {
+        serve({ 'PATCH /v1/harness/sessions/s-1%2Fa/plugins/a%2Fb': { plugin: sessionRow } });
+
+        const module = await import('./api');
+
+        await module.updateSessionPluginSettings('s-1/a', 'a/b', { contextLimit: null });
+
+        expect(calls).toEqual([
+            {
+                method: 'PATCH',
+                url: '/v1/harness/sessions/s-1%2Fa/plugins/a%2Fb',
+                // `null` is the documented reset, and it survives both ids being encoded.
+                body: { settings: { contextLimit: null } },
+                keepalive: undefined
+            }
+        ]);
+
+        serve({ 'GET /v1/harness/sessions/s-1%2Fa/plugins?limit=25': pageOf([sessionRow]) });
+
+        await module.listSessionPlugins('s-1/a');
+
+        expect(calls[1].url).toBe('/v1/harness/sessions/s-1%2Fa/plugins?limit=25');
+    });
+
+    it('surfaces a 404 for an unknown session and a 400 for a rejected setting', async () => {
+        serve(
+            {
+                'GET /v1/harness/sessions/gone/plugins?limit=25': { error: { message: 'Unknown session "gone".' } },
+                'PATCH /v1/harness/sessions/ses_1/plugins/async-ping': {
+                    error: { message: '"intervalMs" of plugin "async-ping" must be a finite number (it is declared "number").' }
+                }
+            },
+            {
+                'GET /v1/harness/sessions/gone/plugins?limit=25': 404,
+                'PATCH /v1/harness/sessions/ses_1/plugins/async-ping': 400
+            }
+        );
+
+        const module = await import('./api');
+
+        await expect(module.listSessionPlugins('gone')).rejects.toThrow('Unknown session "gone".');
+        await expect(module.updateSessionPluginSettings('ses_1', 'async-ping', { intervalMs: 'soon' })).rejects.toThrow(
+            '"intervalMs" of plugin "async-ping" must be a finite number (it is declared "number").'
+        );
+    });
+});
+
 // R6 — the harness delete receipt, and the unload-only session delete.
 describe('harness delete (R6)', () => {
     it('deletes one harness by encoded name and answers the removal receipt', async () => {

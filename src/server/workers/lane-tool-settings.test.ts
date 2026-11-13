@@ -1,11 +1,20 @@
 // R3 (the two DEPLOYMENT-WIDE switches) x worker lanes: the deny list and the plugin
 // overrides reach a lane worker as DATA.
 //
+// R4 moved ONE of the two switches down a scope, and these lane claims are what that move has to
+// keep true: the tool deny list is still process-wide (../tool-settings.ts), while the plugin
+// overrides are now THIS SESSION's own map - `blueprintFor` reads `session.plugins.snapshot()`,
+// and the write that a lane can ever see is the session-scoped one
+// (`store.updateSessionPluginSettings`, ../sessions.ts). A TEMPLATE plugin write therefore
+// reaches no lane that already exists; it seeds a session created AFTER it, and that split is
+// pinned in the plugin-blueprint describe below.
+//
 // WHY THIS FILE EXISTS
 // --------------------
-// The coordinator hands every harness the stores' LIVE providers (../sessions.ts
+// The coordinator hands every harness the settings providers LIVE (../sessions.ts
 // `buildHarness` -> `HarnessPresetReport.toolSettings` / `.pluginSettings` ->
-// ../harnesses/toolbox.ts -> `HarnessConfiguration`), and the runtime re-reads them per
+// ../harnesses/toolbox.ts -> `HarnessConfiguration`) - the TOOL provider from the process store,
+// the PLUGIN provider from the SESSION's own store (R4) - and the runtime re-reads them per
 // decision: src/harness.ts at three tool decisions (declarations, the launch gate, discovery)
 // and src/plugin/host.ts + hooks.ts at every hook delivery (`settings.boolean('enabled',
 // true)`). A CLOSURE cannot cross `worker_threads`, so a lane replica used to be built with
@@ -18,9 +27,10 @@
 // for each switch:
 //
 //   1. THE BLUEPRINT - the store states both values in the data it hands the host at lane
-//      creation (./lane-host.ts merges them into `LaneBlueprint` verbatim), as plain
+//      creation (./lane-host.ts merges them into `LaneBlueprint` verbatim), the deny list from
+//      the process store and the plugin map from that SESSION's own store, as plain
 //      structured-cloneable data (the wire rule), and a value captured at creation does not
-//      move when the operator edits the store afterwards - the documented lane semantics.
+//      move when the operator edits either store afterwards - the documented lane semantics.
 //   2. THE PROVIDER  - the worker's two builders turn the snapshots back into a
 //      `HarnessToolSettingsProvider` / a `HarnessPluginSettingsProvider`, answer per name and
 //      per plugin+key, stay SNAPSHOTS (a later mutation of the shipped map cannot move this
@@ -59,7 +69,9 @@
 //   - ./lane-host.ts                  `LaneBlueprintSource` + the `{...blueprintSource}` merge
 //   - ./lane-worker-loop.ts           `laneToolSettingsProvider`, `lanePluginSettingsProvider`,
 //                                     `sayHello`'s create call
-//   - ../sessions.ts                  `blueprintFor` (the read at lane creation), `buildHarness`
+//   - ../sessions.ts                  `blueprintFor` (the read at lane creation), `buildHarness`,
+//                                     `updatePluginSettings` (TEMPLATE scope) and
+//                                     `updateSessionPluginSettings` (ONE session's store, R4)
 //   - ../tool-settings.ts, ../plugins.ts the two stores these snapshots come from
 //   - ../harnesses/presets.ts         the demo factory's two forwards
 //   - ../../harness.ts                `isToolGloballyDisabled`, `requestToolsFor`
@@ -235,18 +247,24 @@ describe('R3 lane propagation: the blueprint carries the plugin overrides at lan
         const store = storeOf();
         const session = await store.create('demo');
 
-        // "No plugin setting has ever been changed" is an EMPTY map, the same fact the
-        // durable document expresses by omitting the field (../persistence.ts
-        // `pluginSettings`), and the worker reads it as "install no provider".
+        // "This session has never changed a plugin setting" is an EMPTY map, the same fact the
+        // session's own block in the durable document expresses by omitting the field
+        // (../persistence.ts `HarnessSessionRecord.pluginSettings`), and the worker reads it as
+        // "install no provider".
         expect(blueprintOf(store, session.id).pluginSettings).toEqual({});
 
-        await store.updatePluginSettings('context-trimmer', { enabled: false });
+        // R4 SCOPE: `blueprintFor` reads `session.plugins.snapshot()` (../sessions.ts), the
+        // SESSION's own store, so the write that a lane can see is the session-scoped one
+        // (`store.updateSessionPluginSettings`, the twin of `PATCH /sessions/{id}/plugins/{id}`).
+        // A TEMPLATE write (`store.updatePluginSettings`) leaves this blueprint empty - the
+        // companion case below pins both halves of that split.
+        await store.updateSessionPluginSettings(session.id, 'context-trimmer', { enabled: false });
 
         expect(blueprintOf(store, session.id).pluginSettings).toEqual({ 'context-trimmer': { enabled: false } });
 
         // A non-boolean knob crosses too - the plugin gate is not the only value a replica
         // used to answer with its shipped default - and the map keeps catalogue order.
-        await store.updatePluginSettings('context-compaction', { contextLimit: 4096, minTokens: 0 });
+        await store.updateSessionPluginSettings(session.id, 'context-compaction', { contextLimit: 4096, minTokens: 0 });
 
         const blueprint = blueprintOf(store, session.id);
 
@@ -254,32 +272,57 @@ describe('R3 lane propagation: the blueprint carries the plugin overrides at lan
             'context-compaction': { contextLimit: 4096, minTokens: 0 },
             'context-trimmer': { enabled: false }
         });
-        // One source of truth: the SAME map `state.json` carries (../plugins.ts `snapshot`),
-        // and every value is a JSON scalar, so the frame is structured-cloneable data.
-        expect(blueprint.pluginSettings).toEqual(store.pluginSettings.snapshot());
+        // One source of truth: the SAME map this session's durable block carries (../sessions.ts
+        // `sessionRecord` writes `session.plugins.snapshot()`), and every value is a JSON scalar,
+        // so the frame is structured-cloneable data.
+        expect(blueprint.pluginSettings).toEqual(store.liveSession(session.id).plugins.snapshot());
         expect(structuredClone(blueprint.pluginSettings)).toEqual({
             'context-compaction': { contextLimit: 4096, minTokens: 0 },
             'context-trimmer': { enabled: false }
         });
 
         // A reset drops the key, so the next lane answers that plugin's declared default.
-        await store.updatePluginSettings('context-trimmer', { enabled: null });
+        await store.updateSessionPluginSettings(session.id, 'context-trimmer', { enabled: null });
 
         expect(blueprintOf(store, session.id).pluginSettings).toEqual({
             'context-compaction': { contextLimit: 4096, minTokens: 0 }
         });
+
+        // The other half of the split: none of the above is a TEMPLATE value, so the process
+        // store this runtime seeds new sessions from is still empty. `disabledTools` above keeps
+        // reading that process store - the deny list is deployment-wide by its own contract
+        // (../tool-settings.ts), and only plugin settings moved per session.
+        expect(store.pluginSettings.snapshot()).toEqual({});
     });
 
-    it('is a lane-creation snapshot for the plugin values as well', async () => {
+    it('is a lane-creation snapshot for the plugin values as well, and a template write moves only a later session', async () => {
         const store = storeOf();
         const session = await store.create('demo');
 
         const created = blueprintOf(store, session.id);
 
-        await store.updatePluginSettings('async-ping', { enabled: false });
+        await store.updateSessionPluginSettings(session.id, 'async-ping', { enabled: false });
+
+        // The value the FIRST lane was built with is untouched: a live lane keeps the state it
+        // was created with, and picks the new value up when its lane is next created.
+        expect(created.pluginSettings).toEqual({});
+        // A lane created after the write states this session's current value.
+        expect(blueprintOf(store, session.id).pluginSettings).toEqual({ 'async-ping': { enabled: false } });
+
+        // R4 SCOPE, both halves, in one case: a TEMPLATE write reaches neither the blueprint in
+        // hand nor this session's own store...
+        await store.updatePluginSettings('context-trimmer', { enabled: false });
 
         expect(created.pluginSettings).toEqual({});
         expect(blueprintOf(store, session.id).pluginSettings).toEqual({ 'async-ping': { enabled: false } });
+        expect(store.liveSession(session.id).plugins.snapshot()).toEqual({ 'async-ping': { enabled: false } });
+
+        // ...while a session created AFTER it is seeded from the template, and the lane built
+        // from that session carries the template's value and none of the first session's.
+        const later = await store.create('demo');
+
+        expect(store.liveSession(later.id).plugins.snapshot()).toEqual({ 'context-trimmer': { enabled: false } });
+        expect(blueprintOf(store, later.id).pluginSettings).toEqual({ 'context-trimmer': { enabled: false } });
     });
 });
 
@@ -742,14 +785,17 @@ describe('R3 lane propagation: a lane replica delivers or skips a plugin pass on
 
         const session = await store.create('flaky');
 
-        // Written before the first dispatch, the only moment a lane can learn the value. Both
-        // cases store an EXPLICIT boolean, so the override map crosses in both directions and
-        // neither run is the "no provider at all" default. `supersededTurns: 0` pins the horizon
-        // the fixture needs: the trimmer's tool rules now count TOOL TURNS above a unit and
-        // protect the newest N (default 2, src/plugins/context-trimmer.plugin.ts), and this
-        // transcript has exactly one newer tool turn above the failed block — so the shipped
-        // default would protect it and this case would measure a horizon, not the switch.
-        await store.updatePluginSettings('context-trimmer', { enabled, supersededTurns: 0 });
+        // Written before the first dispatch, the only moment a lane can learn the value, and
+        // SESSION-SCOPED (R4): `blueprintFor` reads `session.plugins.snapshot()`
+        // (../sessions.ts), so a TEMPLATE `store.updatePluginSettings` here would reach this
+        // lane by NOTHING and the third request would answer the shipped defaults. Both cases
+        // store an EXPLICIT boolean, so the override map crosses in both directions and neither
+        // run is the "no provider at all" default. `supersededTurns: 0` pins the horizon the
+        // fixture needs: the trimmer's tool rules now count TOOL TURNS above a unit and protect
+        // the newest N (default 2, src/plugins/context-trimmer.plugin.ts), and this transcript
+        // has exactly one newer tool turn above the failed block — so the shipped default would
+        // protect it and this case would measure a horizon, not the switch.
+        await store.updateSessionPluginSettings(session.id, 'context-trimmer', { enabled, supersededTurns: 0 });
 
         // `timeNow` is searchable: both calls have to EXECUTE (the resolver only counts when it
         // completed), so it goes into the session's enabled set on the canonical harness BEFORE
@@ -768,22 +814,23 @@ describe('R3 lane propagation: a lane replica delivers or skips a plugin pass on
         return ((provider.requests[2]?.messages ?? []) as unknown[]).map((message) => JSON.stringify(message));
     };
 
-    it('withholds the superseded failure when the operator left the plugin on', async () => {
+    it('withholds the superseded failure when this session has the plugin on', async () => {
         const messages = await thirdRequestMessagesFor(true);
 
         // The pass ran on the replica: the failed block is out of the context the model was
-        // given, and the completing block is still in it.
+        // given, and the completing block is still in it. The value that made that happen came
+        // from THIS session's store, on the blueprint - not from the template.
         expect(messages.some((message) => message.includes(FIX_CALL))).toBe(true);
         expect(messages.some((message) => message.includes(FAILED_CALL))).toBe(false);
     }, 180_000);
 
-    it('sends the same transcript untouched when the operator switched the plugin off', async () => {
+    it('sends the same transcript untouched when this session switched the plugin off', async () => {
         const messages = await thirdRequestMessagesFor(false);
 
-        // The gate read the snapshot's `enabled: false` on this thread, so the handler never
-        // ran: the failed block is still in the context, exactly as it was for the two earlier
-        // requests. Same preset, same transcript, same lane mechanism - the value is the only
-        // difference, which is what makes the pair a proof rather than a coincidence.
+        // The gate read this session's snapshot's `enabled: false` on this thread, so the
+        // handler never ran: the failed block is still in the context, exactly as it was for the
+        // two earlier requests. Same preset, same transcript, same lane mechanism - the value is
+        // the only difference, which is what makes the pair a proof rather than a coincidence.
         expect(messages.some((message) => message.includes(FIX_CALL))).toBe(true);
         expect(messages.some((message) => message.includes(FAILED_CALL))).toBe(true);
     }, 180_000);

@@ -13,6 +13,7 @@
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { bumpFixtureEpoch, viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 import type { StreamDouble } from './view-test-support';
 
 // T24: the live case below drives the canonical `harness.v1` WebSocket (./stream.ts), and the
@@ -353,11 +354,18 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
 
     // `calls` is the request log: the assertions below prove the recorded panel values arrive
     // ONLY through the lazy step-detail route (one request, on the reader's click).
+    //
+    // T3 (R1): the header `+` further down CREATES a conversation, so the fixture answers that
+    // create with a fresh 0-turn record — the empty hosts the `+` step asserts are then the
+    // empty CONVERSATION's panels, not the residue of a create that never answered.
+    const created = snapshot({ id: 'made-1', turns: [] });
     const calls = stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap({ sessions: [first, second] }));
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1' && method === undefined) return json({ session: first });
         if (url === '/api/sessions/s2' && method === undefined) return json({ session: second });
+        if (url === '/api/sessions' && method === 'POST') return json({ session: created }, 201);
+        if (url === '/api/sessions/made-1' && method === undefined) return json({ session: created });
         return undefined;
     });
 
@@ -443,14 +451,25 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     expect([...kv.querySelectorAll('dd')].map((node) => node.textContent)).toEqual(['2', '5']);
 
     // New session clears every host; the board explains its empty state. T9: the header `+`
-    // is the no-dashboard path.
+    // is the no-dashboard path. T3 (R1): the press CREATES and ADOPTS, so a conversation IS
+    // bound afterwards — which changes only the board's SHAPE of empty: the scratch host stays
+    // mounted and visible, explaining itself, where an unbound card hid it. What must not
+    // survive is the previous conversation's panels, and the note below is the fresh
+    // conversation's own, not s2's.
     byClass('.harness-title-row .new-session', 'button').click();
     await flush();
+    await flush();
 
+    expect(byClass('.session-cycle', 'button').hidden).toBe(false);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('made-1');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('made-1');
+    // The create ANSWERED (no error stamp on the status pill), so the cleared hosts below are
+    // an empty CONVERSATION's board, not the residue of a create that never landed.
+    expect(document.querySelector<HTMLElement>('.status')?.dataset.state).not.toBe('error');
     expect(panelIds('scratch')).toEqual([]);
     expect(panelIds('center')).toEqual([]);
     expect(panelIds('left')).toEqual([]);
-    expect(host('scratch').hidden).toBe(true);
+    expect(host('scratch').hidden).toBe(false);
     expect(document.querySelector('.scratch-note')?.textContent).toBe(
         'No tool panels yet. A tool that publishes ui/panels lands here.'
     );
@@ -667,9 +686,35 @@ it('keeps a manual playground result out of every conversation board (R7)', asyn
         answer = resolve;
     });
 
+    // T4: the conversation whose toolbox the ⚒ pane lists. It belongs to `alpha`, the harness
+    // boot resolves first, and it is what makes the pane render at all (main.ts hides both header
+    // toggles while no conversation is bound). The harness switch below moves to `beta`, which has
+    // no conversation — the unbound state — and back to `alpha`, which reopens this one.
+    const SESSION = {
+        id: 's1',
+        harness: 'alpha',
+        status: 'idle',
+        model: 'm1',
+        createdAt: 1,
+        updatedAt: 2,
+        messages: [],
+        turns: []
+    };
+
     const calls = stubFetch((url, method) => {
-        if (url === '/api') return json(bootstrap({ presets: [alpha, beta], tools: [publish] }));
+        if (url === '/api') return json(bootstrap({ presets: [alpha, beta], tools: [publish], sessions: [SESSION] }));
         if (url === '/api/models') return json({ models: ['m1'] });
+
+        // The roster pointer boot follows, and the toolbox page the pane reads on its FIRST open
+        // (./session-config-test-support.ts). Both come out of the records this fixture already
+        // states, so the row on screen and the schema the runner fills cannot disagree.
+        if (url === '/api/sessions' || url === '/api/sessions?limit=25') return json({ sessions: [SESSION] });
+        if (url === '/api/sessions/s1') return json({ session: SESSION });
+
+        const toolReads = sessionToolReads([publish], url, method);
+
+        if (toolReads !== undefined) return toolReads;
+
         if (url === '/api/tools/publish' && method === 'POST') return pending;
         return undefined;
     });

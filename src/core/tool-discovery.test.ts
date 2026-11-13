@@ -83,6 +83,9 @@ describe('tools folder consolidation (R7)', () => {
             'records.tool.ts',
             'search.tool.ts',
             'tasks.tool.ts',
+            // Issue 0027: the release door for a finished conversation. Sorted with
+            // the rest of the folder listing (D before F).
+            'threadDelete.tool.ts',
             'threadFork.tool.ts',
             'threadList.tool.ts',
             'threadRead.tool.ts',
@@ -131,6 +134,11 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'download',
             'search',
             'fetch',
+            // Issue 0027: registered inside the 'threads' group at order 255, i.e.
+            // AFTER fetch and BEFORE threadSend in registration order, while the
+            // group itself declares DESCENDING order (threadList, threadRead,
+            // threadSend, threadDelete) so an id is always discoverable first.
+            'threadDelete',
             'threadSend',
             'threadRead',
             'threadList'
@@ -232,6 +240,18 @@ describe('discoverToolMetadata (R8/R9)', () => {
             answerExtraction: undefined,
             sessionBound: true
         });
+        // The release door joins the same conditional 'threads' group: registered with
+        // the first independent thread, no control marker, session-scoped (a delete
+        // without a caller lineage has nothing to scope), and NOT a listed catalogue
+        // row because a manual call outside a session cannot be scoped.
+        expect(policy('threadDelete')).toEqual({
+            activation: 'threads',
+            pendingOnly: undefined,
+            control: undefined,
+            primaryOnly: undefined,
+            answerExtraction: undefined,
+            sessionBound: true
+        });
         expect(policy('threadSend')).toEqual({
             activation: 'threads',
             pendingOnly: undefined,
@@ -281,6 +301,11 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'toolCancel',
             'search',
             'fetch',
+            // Issue 0027: registered inside the 'threads' group at order 255, i.e.
+            // AFTER fetch and BEFORE threadSend in registration order, while the
+            // group itself declares DESCENDING order (threadList, threadRead,
+            // threadSend, threadDelete) so an id is always discoverable first.
+            'threadDelete',
             'threadSend',
             'threadRead',
             'threadList'
@@ -466,10 +491,11 @@ describe('generated manifest parity (R9)', () => {
     });
 
     it('describes every package entry, and no folder entry', () => {
-        // 30 generated rows: the 29 package entries before this change (including
-        // the `download` preset, order 235) plus the `threadRead` runtime entry
-        // (order 265) that reads a thread transcript.
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(31);
+        // 32 generated rows: the 31 package entries before this change (the 29
+        // historical rows including the `download` preset at order 235, plus the
+        // `threadRead` runtime entry at order 265) plus the `threadDelete` runtime
+        // entry (order 255) that releases a finished conversation (issue 0027).
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(32);
 
         for (const descriptor of BUILTIN_TOOL_DESCRIPTORS) {
             expect(descriptor.origin).toBe('package');

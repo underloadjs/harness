@@ -2,7 +2,32 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-11 for this file's documentation-vs-code realignment pass — the
+> **Last verified:** 2026-11-13 for the eager-session-creation and per-session-plugin-settings
+> documentation pass — session creation as its own route and what the UI's `+` actually does,
+> the plugin-settings scope split (the template store vs the store each session owns and
+> persists), the three catalogue scopes (per-session toolbox, process-wide tool deny list,
+> template plugin gate), the `GET/PATCH /v1/harness/sessions/:id/plugins[/:plugin_id]` rows,
+> the eight-entry preset catalogue, and the corrected stale claim that "Reset/New session/tab
+> switches stay locked while pending"; every statement was cross-checked against
+> `src/server/sessions.ts`, `src/server/api.ts`, `src/server/plugins.ts`,
+> `src/server/persistence.ts`, `src/server/tool-settings.ts`, `src/server/api-reads.ts`,
+> `src/server/harnesses/presets.ts`, `src/frontend/main.ts` and
+> `src/frontend/canonical-directory-live-main.test.ts` at source level — the test suite was NOT
+> re-run here (a verification pass owns that), and no code was touched — and 2026-11-13 for the
+> thread-tools documentation pass — the new
+> [model-facing thread tools](#the-model-facing-thread-tools-2026-11-13) section
+> (`threadDelete`, the thread-family scope, the `threadRead` first-page contract, the
+> `threadSend` lineage policy), the `delegate` `maxTurns` / handle bullets, the
+> `threadFork` `timeoutMs` and branch-handle bullets, the 22-entry `src/tools/runtime/`
+> layout and 32-descriptor manifest count, and the corrected stale claim that
+> `agentManage`/`agentResult` names were reserved (that mechanism no longer exists —
+> the registry replaces by name); every statement was cross-checked against
+> `src/harness.ts`, `src/core/agent-limits.ts`, `src/types/index.ts`,
+> `src/tools/runtime/*.tool.ts`, `src/tools/runtime/threadRead.ts`, and
+> `src/server/workers/{capability,lane-authority,lane-worker-loop}.ts` at source level —
+> the test suite was NOT re-run here (an integration pass owns that), and the
+> fork-expiry `partialContent` delivery was documented as the entries' stated contract —
+> and 2026-11-11 for this file's documentation-vs-code realignment pass — the
 > workspace-consumer line, the `Layout` trees (now complete at DIRECTORY level: `src/plugins/`,
 > `src/tools/runtime/`, `src/server/workers/`, `src/server/stream/`, `src/server/tools/shared/`,
 > `src/frontend/extensions/` and the `src/core/`, `src/shared/`, `src/plugin/`, `src/frontend/`
@@ -251,12 +276,13 @@ src/
       *.test.ts
     runtime/            the SESSION-BOUND tool entries: one `.tool.ts` per harness-owned
                         tool, each carrying only its name/description/schema/routing —
-                        the state lives in the harness, not in the entry (21 entries):
+                        the state lives in the harness, not in the entry (22 entries):
                         tasks, records, profiles, chapters, locations, toolRequest,
                         toolList, toolManage, toolRegistry, toolCreate, toolCancel,
                         delegate, threadFork, threadList, threadRead, threadSend,
-                        actionRequest, agentManage, agentResult, search, fetch
-                        (`threadRead.ts` is its shared helper; `threadRead.test.ts` its test)
+                        threadDelete, actionRequest, agentManage, agentResult, search,
+                        fetch (`threadRead.ts` is the reader helper; `threadDelete.test.ts`
+                        and `threadRead.test.ts` test the thread tools' own entries)
     websearch/
       index.ts          createWebSearchTool: key resolution, validation, dispatch
       request.ts        bounds, fetch/timeout, sanitized errors, normalization, redaction
@@ -353,8 +379,11 @@ src/server/
   journal.ts            the per-step durable journal beside the checkpoint (R4)
   turn-projector.ts     the fold from one turn's HarnessEvent stream to a TurnDisplay tree
                         (the work the browser used to do)
-  plugins.ts            the runtime plugin-settings layer: what a built-in plugin's setting
-                        is worth for EVERY session in this process (T5/R2-R3)
+  plugins.ts            the runtime plugin-settings layer: the TEMPLATE value a built-in
+                        plugin's setting has, plus the per-session store forked from it
+                        (`copyPluginSettingsStore`) that that session's harness really
+                        reads, and the reserved `enabled` key whose live gate switches one
+                        plugin's hook delivery (T5/R2-R3, the two scopes are R4)
   tool-settings.ts      the runtime GLOBAL tool switch: which names this deployment runs,
                         for every session and thread at once (R3)
   cli/
@@ -374,7 +403,7 @@ src/server/
   harnesses/
     index.ts            createToolCatalogue: runtime catalogue for CLI and server
     core.ts             core-tool catalogue entries (sessionBound) for the server (R8)
-    presets.ts          the 7 shipped presets and nothing else (the `demo`/`flaky`
+    presets.ts          the 8 shipped presets and nothing else (the `demo`/`flaky`
                     example tier is deleted), legacy defaults,
                         and teamOf() — assembled from src/agents profiles
     registry.ts         in-memory registry: create/patch, aliases, validation, agentModels (R9),
@@ -644,7 +673,8 @@ reach into `src/`.
   the one record engine (`src/core/records.ts`)
 - [Agent results](#agent-results-r3) — Core agentManage/agentResult result inspection
 - [toolCreate](#toolcreate) — Runtime tool creation from an async function body
-- [Delegation](#delegation) — Explicit primary/subagents, one level deep
+- [Delegation](#delegation) — Explicit primary/subagents, one level deep, and the
+  model-facing thread tools (family roster, first-page reads, lineage policy, release)
 - [Owner questions and history forks](#owner-questions-and-history-forks) —
   Conditional `actionRequest`/`threadFork`, autoanswer owner forks, ephemeral branches
 
@@ -847,7 +877,7 @@ Harness tools are named for what the model calls them. Two shapes coexist on pur
 | `location*` | `locations` (session locations/places; renamed from `locationManage`) |
 | `agent*` | `agentManage` (list agents + result previews), `agentResult` (read one completed result) |
 | `action*` | `actionRequest` (conditional owner question; `interaction` configured) |
-| `thread*` | `threadFork` (conditional private history fork; forks enabled), `threadSend`, `threadList`, `threadRead` (paged transcript read: whole thread, one message, regex/role filters, per-message content paging) |
+| `thread*` | `threadFork` (conditional private history fork; forks enabled), `threadSend`, `threadList`, `threadRead` (paged FIRST-page transcript read: one message by index, regex/role/includeSystem filters, per-message content paging under a byte budget), `threadDelete` (release one finished thread you own — issue 0027) |
 | `file*` | `files` (the domain-named manager of list/move/copy/delete/mkdir; the single-action halves stay bare verbs: `read`, `write`, `edit`, `glob`, `grep`) |
 | (verbs) | `read`, `write`, `edit`, `glob`, `grep`, `shell`, `search`, `fetch`, `delegate` |
 | `text*` | `textCount`, `textSummarize` |
@@ -988,6 +1018,42 @@ Only the harness-owned set mutates a session's harness and therefore carries
 `sessionBound: true`. There is no `fileSearch` tool and no mode switch either:
 `glob` lists names and `grep` searches contents, both under their own name, and both
 are core.
+
+**The toolbox is per session; the switches above it are not.** Which names a harness has
+declared — every core tool plus whatever `toolRequest` has enabled — is per-harness state
+(the `Set` cleared by `reset()`, above), and the server keeps one live harness per session,
+so discovery is per conversation. A CPU-isolated lane worker is a REPLICA of that same
+session and reports its `harness.discoveredTools` (`src/server/workers/lane-authority.ts:381`,
+`:534`). Two surfaces sit ABOVE that set, and their scope is a contract, not an
+implementation detail:
+
+- the deployment **deny list** has one store per PROCESS (`src/server/tool-settings.ts:1-2`
+  — "which tool names this deployment runs, for EVERY session and EVERY thread at once").
+  `harness()` consumes it through `configuration.toolSettings` and re-reads the provider on
+  every turn (`src/harness.ts:1540-1543`), so `PATCH /v1/harness/tools/:id` moves the next
+  turn of every session and thread. A session CAN enable or withhold a name in its own
+  toolbox (`PATCH /v1/harness/sessions/:id/tools/:tool_id`), and that is not a copy of this
+  switch: the deployment entry is re-applied on top of it, because every harness filters the
+  request list through the provider (`src/harness.ts:4567-4581`) and refuses the LAUNCH of a
+  denied name (`:7845-7853`) — a session cannot lift a deployment denial. One carve-out is
+  part of the contract: the MANUAL path (`harness.executeTool` and both server
+  tool-execution routes) is not gated by the switch, so an operator can still run a name the
+  model was denied (`src/harness.ts:7848-7850`);
+- **plugin settings** have one store per SCOPE — the template plus a detached copy per
+  session — which is the `src/server/plugins.ts` header's "THE TWO SCOPES" (R4); see
+  [CLI, server, and UI](#cli-server-and-ui).
+
+CORRECTED IN PLACE 2026-11-13: this bullet list is new — the section previously said
+nothing about scope, which read as "process-wide, like the deny list". The copy is taken at
+session creation (`src/server/plugins.ts` `copyPluginSettingsStore:713`, called from
+`src/server/sessions.ts:2186`) and injected with the harness (`src/server/sessions.ts:2370`,
+`pluginSettings: plugins.provider`), so `PATCH /v1/harness/plugins/:id` changes only the
+sessions created AFTER the write while `PATCH /v1/harness/sessions/:id/plugins/:plugin_id`
+(`src/server/api.ts:2828`) changes one live conversation from its next turn. A session's own
+tool REGISTRATIONS were always session-scoped
+(`/v1/harness/sessions/:id/tools[/:tool_id]`) — the distinction worth keeping is that a
+registration changes what THIS session holds, while the deny list changes what the
+DEPLOYMENT runs at all.
 
 **toolRequest is built by the harness**, not shipped in `src/tools/`. It has to be:
 it closes over the live registry and the harness's active set. It is registered
@@ -1436,7 +1502,7 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 | Tool | Input | Result |
 |---|---|---|
 | `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` |
-| `agentResult` | `{ agent, invocationId?, offset?, limit? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` (plus `error` for a failed/cancelled run; `status: 'empty'` before any run) |
+| `agentResult` | `{ agent, invocationId?, offset?, limit? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` — for a failed/cancelled run `content` is the paged partial answer and `error` (plus `cancelledAtMessage` when the run appended anything) comes with it; `status: 'empty'` with empty `content` only when NOTHING has finished for that agent to select (no completed AND no failed/cancelled record — an agent whose only finished runs failed selects the newest of those, per the selector bullet below) |
 
 - **Identity.** `invocationId` is the run id for a root run and the thread id for
   a delegated/ctx.run child; a fork/autoanswer uses its `branchId`. The harness
@@ -1448,11 +1514,18 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   invocation id. Old snapshots without the field restore an empty registry, and
   `reset()` clears it with the conversation.
 - **Completed answers only.** The registry records the value `runAgentCore`
-  returns, never a streamed delta, so a running invocation has `status: 'running'`
-  and no content and is OMITTED from a snapshot (never written as a fabricated or
-  cancelled answer). `agentResult` without an id selects the latest result by
-  COMPLETION order, so a fork that finished earlier cannot mask the root's final
-  answer.
+  returns, never a streamed delta, so an explicitly addressed running invocation
+  has `status: 'running'` and no content and is OMITTED from a snapshot (never
+  written as a fabricated or cancelled answer). `agentResult` without an id
+  selects the latest result by COMPLETION order, so a fork that finished earlier
+  cannot mask the root's final answer — and since 2026-11-13 it SKIPS runs that
+  are still in flight: the default selector takes the latest COMPLETED record,
+  else the latest TERMINAL one (failed/cancelled — the last answer that actually
+  exists), else answers the honest `status: 'empty'` rather than a running
+  record's empty body (`agentResultFor`; the old fallback was the newest STARTED
+  record, which made a finished-earlier child look like it had said nothing).
+  Live invocations are still reported by `agentManage`, and an explicit
+  `invocationId` still reaches a running record.
 - **Durability is strict.** `snapshot.agentResults` is validated before any restore
   mutation: unique `invocationId`/`sequence`/`completedOrder`, an agent present in
   `snapshot.agents`, terminal status only, `error` required exactly for
@@ -1462,17 +1535,31 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   agent and at most 200 characters of each answer (whitespace-trimmed); the full
   answer stays in the registry.
 - **No private data.** Neither tool reads system instructions, transcript
-  messages, tool arguments, or tool bodies. Only the completed answer value and
-  run identity cross the boundary.
+  messages, tool arguments, or tool bodies. Only answer text crosses the
+  boundary — a finished answer in `content`, an unfinished one in
+  `partialContent` — plus run identity.
+- **Names are NOT reserved** (CORRECTED IN PLACE 2026-11-13: this bullet claimed
+  `agentManage` and `agentResult` were in a `RESERVED_TOOL_NAMES` list; that
+  mechanism is gone — the registry starts empty and the comment at
+  `src/harness.ts` "The tool registry starts EMPTY" states "No reserved-name or
+  'already registered' gate exists: later submissions win, including over the
+  harness's own controls," and `registerTool`'s header repeats "names are not
+  reserved, 'already registered' is not an error"). A configured, plugin, or
+  created tool therefore REPLACES `agentManage`/`agentResult` by name
+  intentionally, and the replacement drops the built-in definition's policy —
+  pinned by `src/harness.agent-results.test.ts` and
+  `src/harness.creation.test.ts`.
 - **Paging, not silent truncation.** `agentResult` defaults to 4000 characters per
-  page and caps `limit` at 8000 (far below the 64 KiB serialized tool-result
-  bound even with JSON escaping). `nextOffset` pages the remainder, so a long
+  page and caps `limit` at 8000 (far below the 256 KiB serialized tool-result bound
+  `MODEL_TOOL_RESULT_BUDGET_BYTES` even with JSON escaping — the "64 KiB" this line
+  used to cite was that constant's value before `core/result-budget.ts` raised it 4x;
+  the current figure is stated where the cap itself is documented, `boundToolResult`
+  in the `### API` section's R13 note). `nextOffset` pages
+  the remainder, so a long
   result is read in full instead of being cut by `boundToolResult`. Offsets are
   UTF-16 code-unit indices; both page edges are moved to a surrogate-pair boundary
   so a non-BMP glyph is never split (the returned `offset` is the one actually
   used).
-- **Reserved names.** `agentManage` and `agentResult` are in
-  `RESERVED_TOOL_NAMES`; a configured, plugin, or created tool cannot shadow them.
 
 ---
 
@@ -2186,6 +2273,29 @@ const team = harness({
   `toolCancel` under `alreadyAvailable` in exactly that window (it is a
   `pendingOnly` core control, declared only while work is in flight, so the report —
   not the catalogue — is where it is discoverable).
+- **`maxTurns` is a second OPTIONAL, caller-set bound (I5, 2026-11-13).** A count of
+  model turns (tool rounds) beside `timeoutMs`'s wall clock: an integer 1–64 (the
+  ceiling equals `DELEGATE_MAX_TURNS_MAX` in `core/agent-limits.ts`, restated as a
+  literal in the entry and pinned equal by `core/metadata.ownership.test.ts`),
+  enforced as `min(harness-wide maxIterations, maxTurns)` in `runAgentCore` — an
+  omitted value is `Infinity`, so the argument can only LOWER what one child may do,
+  never raise the session limit. A child that runs out of turns has not answered, and
+  its result is the unfinished-run envelope (status plus `partialContent`), never a
+  final answer it never gave. No scheduling priority was added: per-actor FIFO is
+  unchanged.
+- **The envelope's `threadId` is the follow-up HANDLE (C1, 2026-11-13).** A
+  delegation from a host-thread parent mints its own conversation (the documented
+  sibling-isolation design, issue 0027) and the envelope names it: `threadSend` posts
+  a follow-up message into it, `threadRead` reads its transcript, and `threadDelete`
+  releases it once its answer has been read — the release is also how a session frees
+  a slot under the 256-thread cap. The `agent:<name>` spelling targets the subagent's
+  DEFAULT conversation, which is NOT the live delegation thread (`threadSend` adds a
+  receipt `note` naming the live thread when that distinction matters). The identity
+  fields now report truth, not ceremony: when the ledger entry is unresolvable
+  (purged with its thread mid-run, or evicted from the bounded archive), the envelope
+  OMITS `invocationId`/`status` instead of fabricating `''`/`completed` — absent means
+  "this run produced no ledger entry to point at", and the content/paging fields stay
+  exact either way (`delegateFor`).
 - **`scope.tools` cannot block the discovery door.** The allowlist hides and refuses
   every capability it omits, `toolRequest` excepted: a restricted child must always
   be able to ask for what it is missing. Before this, a child scoped to
@@ -2208,8 +2318,13 @@ then `summarizer`. The five primaries are `instruct`, `research` (title
 - a subagent never re-delegates, so every profile's delegation guideline is
   conditional on BOTH running as the primary AND this harness declaring
   `delegate` to it, and tells a subagent/lone agent to do the work itself;
-- `general` is the only preset with no team, so it is the only one that never registers
-  `delegate`; the other six delegate to each other plus `summarizer`.
+- `general` is the only real ROLE with no team, so it is the only profile that never registers
+  `delegate`; the other six delegate to each other plus `summarizer`. The `chat` CARD is a
+  second team-less shape — the `general` profile with `subagents: []` and `tools: []` on
+  `sharedToolbox: false` (`src/server/harnesses/presets.ts:368-387`) — so it registers no
+  `delegate` and no toolbox tool either, while the profile roster itself is unchanged —
+  `AGENT_PROFILE_NAMES` is still the seven real roles plus `summarizer`
+  (`src/agents/index.ts:80-89`).
 - There are no fixtures in the catalogue. The `demo` (scripted) and `flaky`
   (failure-example) presets, their agent profiles, the `testFlaky` tool and the scanned
   `src/server/tools/examples` folder are DELETED; the server lists exactly the seven
@@ -2229,6 +2344,133 @@ customised row is replayed verbatim. An edited title/description survives a refr
 Frozen sessions never depend on this: `SessionStore.restoreSession` rebuilds from
 the session's own `preset` record, so an old conversation keeps the team it started
 with.
+
+### The model-facing thread tools (2026-11-13)
+
+The thread group — `threadList`, `threadRead`, `threadSend`, `threadDelete` — is
+registered together on the FIRST independent thread (`activation: 'threads'`) and
+then declared for every agent in the session. Declaration order stays roster-first:
+the group registers in DESCENDING `order` (threadList 270, threadRead 265,
+threadSend 260, threadDelete 255), so the declarations arrive roster, reader,
+writer, reaper — an id is always discoverable before a tool that addresses it.
+With `threadDelete` added, the generated `core/tool-manifest.ts` carries **32**
+descriptors (22 runtime entries).
+
+- **THREAD FAMILY is the address space (B3/B4).** A model-facing thread tool is
+  scoped to the caller's thread family: the thread itself, its ancestors and
+  descendants (the `ownerThreadId` lineage, however deep), the DEFAULT
+  `agent:<name>` conversations of the agents the family spans, and a default whose
+  first-wins owner link falls in the family. A SIBLING is deliberately not in the
+  set — it shares an ancestor but was not created by this caller. Threadless
+  callers (the host handle, a plugin `api.threads.*` outside any conversation, a
+  manual `executeTool`) stay UNSCOPED and see everything: the host is the one party
+  that may address any conversation, and the server's thread surfaces depend on
+  that (`threadFamilyOf`/`familyOfCaller`, `src/harness.ts`).
+  - **PERSISTENCE CAVEAT for that last clause.** The first-wins owner link a DEFAULT
+    conversation adopts (`src/harness.ts:11181-11185`, written at a run start with no
+    state-change notification) is NOT persisted: `snapshot()` ships HOST threads only
+    (`src/harness.ts:11424-11444`), because a default IS the registry agent's
+    transcript with a name-derived id. So after a snapshot→restore the link is gone and
+    a default's family visibility is RE-DERIVED from the agents the family spans —
+    which can NARROW what a restored conversation may read or write into: a default
+    that was reachable only through the owner link (an agent the family does not itself
+    span) stops being reachable until a run mints the link again.
+- **`threadList` returns the family roster**, newest last, with `currentThreadId`
+  naming the caller's own thread; a threadless caller gets every thread in the
+  session, as before. Deleted threads are absent by construction — and permanently
+  so: threadList/Read/Send/Delete all treat a released id as unknown ("it was never
+  created, or it was deleted").
+- **`threadRead` reads the FIRST PAGE, not "the whole thread from the start"
+  (I1–I4).** The old docstring promised a full read the tool never performed; the
+  description now states the applied defaults: `limit` 20 messages, per-message
+  `contentLimit` 4000 characters, and a total `contentBudget` of 32,768 UTF-8 bytes
+  per page — the reader's OWN, deliberately smaller bound, so the 20 × 4000 worst
+  case cannot blow past the harness's serialized tool-result cap
+  (`core/result-budget.ts`) and come back as an opaque truncation envelope instead
+  of the pagination metadata (`THREAD_READ_*`, `src/tools/runtime/threadRead.ts`).
+  Nothing is cut silently:
+  `truncated`/`hasMore`/`nextOffset`/`nextContentOffset` are the continuation
+  contract — pass `nextOffset` back as `offset` while `hasMore`, and
+  `nextContentOffset` back as `contentOffset` to finish one long message. New
+  parameters:
+  - `includeSystem` (default **FALSE**) keeps the leading system seed out of the
+    pages AND out of regex matching — one decision, not two — so it no longer
+    occupies every page's budget; `true` restores the old behavior, and `message`
+    mode reads index 0 regardless because that mode addresses a raw transcript
+    position and bypasses the filter. `total` and each message's `index` still
+    address the FULL transcript, so a reported index stays re-readable with
+    `message`.
+  - `toolArgs` (default **`"reference"`**) renders each assistant tool call as
+    `{ id, name, argumentsLength }` with NO arguments text and no byte cost —
+    reading one's own thread no longer re-bills the arguments the caller just sent
+    (a delegation brief used to dominate self-reads); `"full"` restores the paged
+    inline arguments. `regex` matches the RAW arguments either way; the
+    `tool`-role result BODIES are unaffected by the mode, and reference mode
+    reports no truncation flag because nothing was cut.
+  - `regexFields` narrows which fields `regex` searches — `content`, assistant
+    `reasoning`, `toolArguments`, `toolName` (one word covers both an assistant
+    call's name and the tool a tool result answers); the default is all four.
+    Fields are tested SEPARATELY, never concatenated. Every returned message then
+    names its hits in `matchedFields`, including hits in fields the page does not
+    display — which is how the SELF-MATCH (your own earlier call's arguments
+    containing the pattern you just sent) became an explicit report instead of a
+    mystery message.
+  - A FINISHED fork's `branch-N` id is a readable `thread` id: the read seams
+    resolve it through the branch ledger (`threadRecordOfBranch`), which is exactly
+    why forks stay invocations and not roster threads (see
+    [threadFork](#threadfork)).
+- **`threadSend` reaches the LINEAGE, with per-address self-rules (B4).** Own
+  thread, an ancestor, one of your descendants, or a DEFAULT conversation
+  (`agent:<name>`) the caller's roster lists — the defaults of EVERY agent the family
+  spans, not only the sender's own; anything else outside the lineage is refused with a
+  sentence distinct from not-found ("the id exists — it is simply outside your
+  lineage"), so a model can tell a roster problem from a typo. The target's state decides
+  delivery, and the receipt names it: running → `"queued"` (mid-run steering at
+  the next safe model boundary — including a message to your OWN running thread),
+  a PLUGIN-PARKED (`paused`) target → also `"queued"`, and the park is LEFT EXACTLY AS IT
+  WAS — no resume, no run, because the holder of the park is waiting for its own turn
+  (only a host `sendThreadInput` lifts a park from outside, T8) — and an idle target →
+  `"started"` — EXCEPT the two self-calls: asking your own idle thread
+  to start a fresh run is refused (you are already inside that turn), and asking
+  your own idle `agent:<name>` default is refused ("use the current turn"); your
+  own default while it runs is simply `"queued"`. A different agent's idle
+  default conversation still starts a run of its own — the historical cross-agent
+  chat survives, and it is what the family's default-conversation rule exists for.
+  A `note` naming the live thread id is added CONDITIONALLY — exactly when the target is
+  an `agent:` DEFAULT and at least one OTHER thread of that addressed agent is
+  `running` (`liveSiblingNoteFor`, `src/harness.ts`; it prefers a thread the sender
+  owns, and otherwise names the newest): the default conversation is NOT the live
+  delegation, the message went where it was addressed, and the note names the thread
+  whose turn is in flight. A stopped thread remains host-revive-only.
+- **`threadDelete` releases a FINISHED thread you own (B5 — closes issue 0027).**
+  The model-facing counterpart of the host `deleteThread`: explicit and PERMANENT
+  (the issue's rejection of auto-delete holds — a settled child stays readable
+  until its owner says otherwise). `thread` must be a STRICT DESCENDANT of the
+  caller (`threadDeleteFor` walks the persistent owner chain): your own current
+  thread, an ancestor, a sibling, and another agent's conversation are refused by
+  name; a RUNNING thread is refused ("stop it first"); the default `agent:<name>`
+  conversations are refused; a threadless caller gets the unscoped host operation
+  verbatim. Deletion CASCADES (the finished descendants go with the target — a
+  running descendant refuses the whole delete, so no partial removal), and the
+  receipt `{ deleted, removedThreadIds }` (`HarnessThreadDeleteResult`) is the
+  state the caller caused. The purge (`purgeThread`) drops the record plus its
+  invocation and branch lookups, so deleted ids are unknown to every thread door,
+  and the 256-thread cap (`MAX_THREAD_RECORDS`, `core/thread.ts` — `createThreadState`
+  THROWS at it) is finally actionable from inside a session. Worker mode classifies
+  it as authority work: `threadDelete` is in `AUTHORITY_RUNTIME_METHODS`
+  (`src/server/workers/capability.ts`), the target travels as the request's
+  `threadId` and the CALLER inside `identity`, so the canonical harness performs
+  the scoped delete and the lane mirror rebases (`lane-worker-loop.ts`).
+- **Terminal state is ONE synchronous commit (B2).** A finished run's terminal
+  ledger entry (`finishInvocation`) AND its thread-status release to `idle` now
+  happen together in `commitRunTerminal`, BEFORE the post-run hooks and branch
+  release that used to `await` between the two facts — a `run.finished` handler
+  (or a `threadDelete`) that arrives once a run answered never sees a still-`running`
+  record that would refuse with "stop it first", and never a conversation gone
+  while its ledger entry is still open. `thread.invocationId` is stamped only
+  AFTER the invocation record exists, and `runAgent`'s `finally` keeps its release
+  block as an idempotent backstop (event ORDER is preserved — only the STATE moves
+  earlier).
 
 ---
 
@@ -2328,7 +2570,7 @@ type HarnessActionRequest = {
 ### threadFork
 
 ```ts
-threadFork({ input: string; label?: string })
+threadFork({ input: string; label?: string; timeoutMs?: number })
 // -> HarnessForkResult { branchId, threadId, content }
 ```
 
@@ -2357,7 +2599,27 @@ threadFork({ input: string; label?: string })
   `threadId === branchId`. `content` is the branch's final assistant text, trimmed
   and required non-empty (`threadFork branch "…" produced no substantive answer.`
   otherwise). There is no separate summarizer pass and no transcript merge; the
-  full branch transcript stays in the audit record.
+  full branch transcript stays in the audit record. SINCE 2026-11-13 the shared
+  `branch-N` id is a documented HANDLE (finding C1/B1), not a receipt: `threadRead`
+  accepts it to read the branch transcript (the read seams resolve the branch
+  through the branch ledger — the fork remains an INVOCATION, deliberately not a
+  roster thread), and `agentResult` accepts it as `invocationId` to page the
+  answer, including the `partialContent` of a branch that was cancelled, failed,
+  or timed out before it answered.
+- **`timeoutMs` (B1, 2026-11-13)** is the fork half of the 2026-11-09 time policy:
+  an optional 1–3,600,000 ms wall clock on the branch run (the ceiling is
+  `MODEL_TIMEOUT_MAX_MS`, shared with `delegate`'s `timeoutMs` and restated as a
+  literal pinned by `core/metadata.ownership.test.ts`). Omitting it resolves to
+  the harness's `threadForkTimeoutMs` configuration (the host's backstop for the
+  non-tool fork doors — `thread.forkThread()`, `api.threads.fork()`,
+  `runtime.threadFork`), which itself defaults to NO LIMIT (`FORK_TIMEOUT_MS` is
+  `Infinity`); a finite value arms the branch's OWN controller, linked into the
+  scheduler's signal, so the requester's run keeps its signal and still receives
+  a structured outcome. On expiry the branch is recorded `cancelled` (the honest
+  control outcome, not `failed`) and the delivered result carries its partial
+  content instead of a final summary. A cancelled fork's tool-delivery sentence
+  names the branchId and points at `threadRead`/`agentResult` — a fork is the one
+  background call whose work survives its own cancellation.
 - Runtime identity is private: `actorKeyOf(branch)` is `branch:<branchId>`, never
   the display name, so a fork cannot deadlock behind a same-name source run.
   `actorRoles` inherits the source role; `agentBranchOf` reads the `WeakMap`.
@@ -2448,7 +2710,12 @@ await writer('tell me about new year');
   warranted (a model may ask for 1..3600000 ms; the unvalidated host path
   `harness.runtime.delegate` may pass any finite bound and is not clamped), and on
   expiry the child returns the structured `status: "cancelled"` envelope with
-  `partialContent` and `cancelledAtMessage`. CORRECTED IN PLACE: this default used to
+  `partialContent` and `cancelledAtMessage`. ADDED 2026-11-13: `threadFork` now
+  accepts the same OPTIONAL caller-set `timeoutMs` (1..3600000 ms —
+  `MODEL_TIMEOUT_MAX_MS` is the shared ceiling), the unbounded default resolving
+  through the `threadForkTimeoutMs` configuration to `FORK_TIMEOUT_MS`
+  (`Number.POSITIVE_INFINITY`); nothing arms a timer when neither names one.
+  CORRECTED IN PLACE: this default used to
   be a finite 300000 ms (5 minutes) inherited from the T28 hole where a child that ran
   `sleep 600` sat `running` forever — the mechanism survives, the finite default does
   not (`core/agent-limits.ts` `DELEGATE_TIMEOUT_MS` is now `Number.POSITIVE_INFINITY`,
@@ -2458,7 +2725,9 @@ await writer('tell me about new year');
   child never settles never resolves — that is the drain contract above working as
   specified, not a bug. What DOES bound a long run: every tool's own timeout (below),
   the OPTIONAL `maxIterations` REQUEST COUNT (`DEFAULT_MAX_ITERATIONS` is
-  `Infinity` — no limit unless a host names one), `MAX_RUN_DEPTH`,
+  `Infinity` — no limit unless a host names one), `delegate`'s per-child `maxTurns`
+  bound (a `min(maxIterations, maxTurns)` a caller can only LOWER, see
+  [Delegation](#delegation)), `MAX_RUN_DEPTH`,
   the thread/branch/record caps, and — ADDED 2026-11-09 when the plugin-pipeline
   user-facing lists landed — a `turn.before` plugin's `stop` decision
   (`HarnessTurnDecision`, `docs/plugins.md`): a policy assertion by shipped code at
@@ -2500,7 +2769,7 @@ await writer('tell me about new year');
   `records`, `profiles`, `chapters`, `locations`), `toolRequest`, `toolList`,
   `toolManage`, `toolRegistry`, `toolCreate`, `toolCancel`,
   `agentManage`, `agentResult`, the thread surface
-  (`threadList`/`threadRead`/`threadSend`), `threadFork` when forks are
+  (`threadList`/`threadRead`/`threadSend`/`threadDelete`), `threadFork` when forks are
   enabled, `actionRequest` when interaction is configured, and `delegate` when
   there is a subagent; a request declares every core tool
    (`read`/`write`/`edit`/`glob`/`grep`, the environment `search`/`fetch` pair it
@@ -2571,6 +2840,20 @@ await writer('tell me about new year');
   `src/server/harnesses/toolbox.ts`). A finite value must be a positive safe
   integer; `Infinity` is accepted explicitly. On exhaustion the pending work is
   aborted and the transcript rolled back.
+- `threadForkTimeoutMs` — ADDED 2026-11-13 (B1; declared on `HarnessConfiguration`
+  beside `maxIterations`): the DEFAULT wall clock for a `threadFork` branch when the
+  caller does not name one, and it therefore covers the `threadFork` TOOL as well.
+  `src/harness.ts:8571-8574` calls `resolveForkTimeoutMs(parameters.timeoutMs,
+  threadForkTimeoutMs)` on the MODEL path too, so an OMITTED tool `timeoutMs` falls
+  through to this configuration — `thread.forkThread()`, `api.threads.fork()` and
+  `runtime.threadFork` resolve the same way, and every fork door takes the same
+  default. Only an EXPLICIT tool value wins over it. (The sentence this bullet used
+  to carry — "the `threadFork` TOOL passes its own schema value, so this is the
+  host's backstop for every other fork door" — contradicted the `threadFork`
+  section's own correct reading above.) Unset
+  means NO LIMIT (`FORK_TIMEOUT_MS`, `core/agent-limits.ts`), the same policy the
+  delegate default follows; a finite value arms a timer, which is how a host lets a
+  stuck branch release its concurrency slot without waiting for `toolCancel`.
 - `toolCreation` (`:3117`) — who may create tools at runtime (R12): `'all'` (default)
   or `'primary'`. A gated agent neither sees nor calls `toolCreate`; the host path
   `harness.toolCreate()` still works, because an operator action is not a model
@@ -2591,11 +2874,20 @@ await writer('tell me about new year');
   advisory, runs after a snapshot-recorded mutation, and its errors are ignored.
 - `report.diagnostic` (`:3223`) — the plugin diagnostics channel (T1.5), the one place
   a BROKEN plugin becomes visible instead of looking like a plugin that did nothing.
-- `pluginSettings` (`:3241`) — the host's read-only per-plugin settings provider
-  (`<pluginName>.<key>`); absent means an in-memory provider seeded from each plugin's
-  declared defaults.
-- `toolSettings` (`:3256`) — the host's GLOBAL tool switch (R3): one live provider over
-  the names this deployment disables for every session, core control plane included.
+- `pluginSettings` (`:3658`) — the host's read-only per-plugin settings provider
+  (`<pluginName>.<key>`); absent means the library's own in-memory provider seeded from each
+  plugin's declared defaults (`src/plugin/settings.ts:60`, installed per harness at
+  `src/harness.ts:1517-1518`) — so the fallback's lifetime is ONE HARNESS, not the process.
+  CORRECTED IN PLACE 2026-11-13: this bullet described the shipped server as if one provider
+  covered every session. It no longer does — each session's harness is built with ITS OWN
+  store's provider (`src/server/sessions.ts:2370`), while this config field keeps the same
+  read-only contract. That provider is still `get`-only (`src/server/plugins.ts:439-441`),
+  which is exactly why a plugin calling `api.settings.setOwn` on the shipped server gets the
+  library's "read-only (no writer)" refusal (`src/plugin/settings.ts:329-333`).
+- `toolSettings` (`:3673`) — the host's GLOBAL tool switch (R3): one live provider over
+  the names this deployment disables for every session, core control plane included. The two
+  settings surfaces are deliberately asymmetric: a plugin's knobs belong to the conversation
+  that runs it, the deny list belongs to the deployment (`src/server/tool-settings.ts:1-2`).
 
 **Members:** callable, `name`, `agent`, `agents`, `subagents`, `tools`, `plugins`,
 `discoveredTools`, `toolCreate(config)`, `registerTool(candidate)` (`src/types/index.ts:3292`),
@@ -2605,9 +2897,12 @@ registry-resolving twin that keeps caller/thread/signal),
 `commands`, `executeCommand(input)`, `registerCommand(command)`, `branches()`,
 `branch(id)`, `memory` (`:3313`), `runtime` (`:3316`), `nestedRuns()` (`:3590`),
 `records()` / `recordsChanges(since)` / `onRecordsChange(listener)` (`:3441-3443`),
-`reset()` — plus the thread surface (`threads()`, `thread(id)`,
-`threadMessages(id)`, `setThreadMessages(id, messages)`, `createThread()`,
-`sendThreadInput()`, `steerThread()`, `stopThread()`, `deleteThread()`) and
+`reset()` — plus the thread surface (`threads()`, `thread(id, callerThreadId?)`,
+`threadMessages(id, callerThreadId?)`, `setThreadMessages(id, messages)`,
+`createThread()`, `sendThreadInput()`, `steerThread()`, `stopThread()`,
+`deleteThread()` — the optional caller thread is what narrows a host read to one
+family; omitted means the unscoped host view, and `deleteThread()` answers with the
+same `{ deleted, removedThreadIds }` receipt the `threadDelete` tool reports) and
 `snapshot()`/`restore()`.
 
 ### The loop
@@ -2753,7 +3048,9 @@ implementation per name — which is the invariant this whole layer exists to pr
   `Tool "search" is not registered`. Nothing in the built-ins throws: a usage
   mistake, an unregistered tool, or a rejected tool call returns
   `{ content, isError: true }`; `executeCommand` is the only thrower. Bodies share the
-  model's 64 KiB budget (`MODEL_TOOL_RESULT_BUDGET_BYTES`) but append a plain
+  model's 256 KiB budget (`MODEL_TOOL_RESULT_BUDGET_BYTES` — the "64 KiB" this line
+  used to name was that constant's value before `core/result-budget.ts` raised it 4x)
+  but append a plain
   `… truncated: …` marker (`capText`), because a command result is human-facing.
 - **Ordering and asymmetric collisions (`src/harness.ts`).** built-ins →
   `configuration.commands` → plugins (`api.addCommand`) → runtime
@@ -3335,7 +3632,8 @@ normalizer and the exported `TOOL_UI_LIMITS`.
 - **Preload the catalogue, declare only the core.** Shipping the presets into
   every harness by default stays cheap: only the `visibility: 'core'` rows are declared
   up front — the five core file tools (`read`/`write`/`edit`/`glob`/`grep`), `tasks`,
-  `toolRequest`, `toolCancel`, the thread trio (`threadList`/`threadRead`/`threadSend`)
+  `toolRequest`, `toolCancel`, the thread group (`threadList`/`threadRead`/
+  `threadSend`/`threadDelete`)
   when the harness has threads, the configured `search`/`fetch` pair, and `delegate` for
   the primary — while every searchable row costs no context until discovered: the
   record wrappers `records`/`profiles`/`chapters`/`locations`, `agentManage`/
@@ -3403,7 +3701,29 @@ as their own entries.
   keeps one `Harness` per session and owns each run's `SessionTurn`s plus the FIFO
   task queue, so a second task continues the conversation in order, a reload can
   replay the transcript from `list()`/`get()`, and a watcher can reattach through
-  `watch()`. `dispatch()` is the submit surface `POST /sessions/:id/tasks` calls and
+  `watch()`. Creating a session is its own operation, not a by-product of a first task:
+  `create()` (`src/server/sessions.ts:2141`) needs the harness NAME and nothing else
+  (`src/server/api.ts:2959`), mints the id itself with `randomUUID()`
+  (`src/server/sessions.ts:2211`) — the id is the server's, never the client's — copies the
+  template plugin-settings store down BEFORE the factory runs (`copyPluginSettingsStore`,
+  `src/server/plugins.ts:713`, called at `src/server/sessions.ts:2186`, because the provider
+  reference has to exist for `buildHarness` at `:2294`), and writes the record through before
+  the `201`, deleting the in-memory entry when that write fails (`:2269-2278`). The ordering is
+  load-bearing for the UI: `+` calls this route the moment it is pressed
+  (`src/frontend/main.ts:13803` `newSession` → `:14138` `ensureSession`), so a first task never
+  has to discover an id and a failed create is one visible error instead of a deferred one; a
+  repeat `+` creates again, because the teardown in `newSession` IS the reset — no dedup, no
+  reuse, no client-side cap (`src/frontend/main.ts:13897-13905`). CORRECTED IN PLACE
+  2026-11-13: the eager-creation pass rewrote this bullet to state what the server already
+  guaranteed; the client used to create lazily on the first submit.
+  The store owns TWO plugin-settings scopes (`src/server/plugins.ts`, "THE TWO SCOPES"): the
+  template store the global routes edit, and one detached store per session whose live provider
+  is the one that session's harness reads (`src/server/sessions.ts:2370`), persisted on the
+  session's own record (`src/server/persistence.ts:293`) and rebuilt from it on restore
+  (`src/server/sessions.ts:3677`). The TOOL switch beside it keeps the PROCESS scope alone
+  (`toolSettings: this.tools.provider`, `:2380`) — the asymmetry is deliberate, and it is why
+  the plugin docs now separate "this conversation" from "sessions created after this".
+  `dispatch()` is the submit surface `POST /sessions/:id/tasks` calls and
   the only place a slash line is split from a prompt: non-command text is queued, a
   `/command` becomes a terminal command turn executed in this process (no model, no
   lane). The store also owns the editable per-thread transcript
@@ -3475,8 +3795,14 @@ as their own entries.
 - **Catalogue (`src/server/harnesses/`)** holds the presets and harness-level tools shared by
   the CLI and server. Presets are factories because a harness bakes its transport
   at construction. `toolbox.ts` owns the one shared toolbox and the factory every
-  live preset uses, so all seven shipped presets
-  register the same tools and differ only in agents/instructions/routing. There is no
+  live preset uses, so the seven tool-bearing presets
+  register the same tools and differ only in agents/instructions/routing. `chat` is the one
+  card that opts out: `createProfiledHarness('general', [], …, { sharedToolbox: false })`
+  (`presets.ts:387`) ships it with NO toolbox tools — only the harness-owned core rows
+  (`toolRequest`, `tasks`) — and that posture belongs to the shipped TEMPLATE, not to a
+  durable column: an executable patch that gives the card a TEAM rebuilds it through
+  `liveFactory` → `createProfiledHarness(...)` with no toolbox argument
+  (`src/server/harnesses/registry.ts:698-706`), which hands the shared toolbox back. There is no
   scripted template and no preset-specific extra tool any more: the `demo` and `flaky`
   example tier, the `testFlaky` tool and the scanned `examples` folder are deleted, so
   every shipped card is a live profiled harness that requires an endpoint. Every template is
@@ -3612,9 +3938,12 @@ table.
 | `GET /v1/harness/tools` | The host-wide catalogue, **paged**: session-bound core entries (`group: 'Core tools'`, `sessionBound: true`) plus every directly callable tool (including the core file tools); `search` always present with `availability` |
 | `GET /v1/harness/tools/:id` | One catalogue entry with its argument schema. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `GET /api/tools/bootstrap` alias ("the list the root bootstrap document carries") — the boot document carries no catalogue any more |
 | `POST /v1/harness/tools/:id/executions` | `{ parameters }` (the only accepted body field) → `200 { ok, result \| error, duration_ms, panels?, media? }`, run against the DEPLOYMENT catalogue with no session. A `sessionBound` name is a `403` naming the session route (`src/server/api.ts:2277-2282`); a listed-but-unconfigured tool is `200 { ok: false, error, duration_ms }` carrying the catalogue hint (`:2290-2297`); an unknown name is `404` whatever the body. CORRECTED IN PLACE 2026-11-11: the deleted `POST /api/tools/:name` route took `sessionId` in the BODY instead. See the R8/N4 note below |
+| `GET /v1/harness/sessions/:id/plugins` | ONE conversation's plugin rows, **paged** by the global read's rules (`limit`/`cursor`/`q`; the catalogue itself is not session state — every store is seeded from the same generated manifest, so rows and defaults are identical and only the resolved `enabled`/`values` differ). Identity FIRST: an unknown session is a `404` before any paging parameter is read (`src/server/api.ts:2771`). `X-Harness-Revision` is that session's OWN store counter — 0 until this session accepts a `PATCH`, one bump per accepted write, and it never moves the template counter or vice versa |
+| `GET /v1/harness/sessions/:id/plugins/:plugin_id` | One row of that conversation's store (`src/server/api.ts:2811`) |
+| `PATCH /v1/harness/sessions/:id/plugins/:plugin_id` | `{ settings }` → `{ plugin }`, write-anytime: no idle gate and no `409` path at all, because a settings write moves no registration and removes no schema the model was promised (the deliberate split from the session TOOL switch, `assertIdleForToolMutation`, `src/server/api.ts:4044`). Unknown session/plugin is `404` BEFORE the body is read; an unknown key, a wrong type or an out-of-range value is the store's `400`, thrown before it mutates, so a refused patch is a no-op on this conversation. Durable before the answer, and honoured from this session's next turn (`src/server/api.ts:2828` → `SessionStore.updateSessionPluginSettings`, `src/server/sessions.ts:2055`) |
 | `POST /v1/harness/sessions/:id/tools/:toolId/executions` | Same body, executed through THIS session's registry (`SessionStore.callTool`, `src/server/api.ts:3950-3979`): a replaced preset, a created tool and a session-owned core tool all run what the session holds. `404` a name the session does not list, `409` a busy session, `403` a name whose execution scope is not manual. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `POST /api/tools/:name/call` alias |
 | `POST /v1/harness/models` | `{ settings? }` → `{ models, observed_at }` (the generated `ModelIndex`); server-side `listModels`. CORRECTED IN PLACE 2026-11-11: the old answer was the bare `{ models: string[] }`, and `observed_at` is now part of the contract (`src/server/models.test.ts:16-18`) |
-| `POST /v1/harness/sessions` | `{ harness, title?, settings? }` → `201 { session }` |
+| `POST /v1/harness/sessions` | `{ harness, title?, settings?, messages? }` → `201 { session }`. The harness NAME is the only requirement (`src/server/api.ts:2959`), and `messages` is the optional seeded transcript, validated BEFORE anything exists (`src/server/api.ts:2964-2972`). Session creation is its own operation, not a side effect of a first task: the id is the server's `randomUUID()` (`src/server/sessions.ts:2211`), the session's plugin-settings store is copied from the template at this moment (`:2186`), and the record is written before the answer — a failed write deletes the in-memory entry so a retry cannot observe a phantom (`:2269-2278`). A client holding a `201` may therefore `POST /sessions/:id/tasks` immediately with no retry loop, which is exactly what the UI's `+` relies on (`src/frontend/main.ts:14138` `ensureSession`) |
 | `GET /v1/harness/sessions`, `GET /v1/harness/sessions/:id` | BOUNDED reads, never a snapshot: the list is paged (`limit`/`cursor`, plus `status`/`harness` filters) and one session is its metadata + live `agent_models` + counters. CORRECTED IN PLACE 2026-11-11: this row used to promise "always including `turns` (with `eventTimes`) and the frozen `harnessDefinition`" — turns (`/turns`), threads (`/threads`), the queue (`/queue`), the frozen definition (`/definition`) and the display trees (`/turns/:turnId/display`) are each their own route, and no route assembles a session aggregate (`src/server/api.ts:22-23`). The old additive `invalidThreads` roster is not a session field on this contract either: an unreadable conversation is reported on the transcript read (`transcript_state: 'unreadable'` + `unreadable_reason`, `src/shared/harness-api.ts:1763-1779`) |
 | `PATCH /v1/harness/sessions/:id` | `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key against the session's agents and every value as a model id (400 with nothing applied), rejects `{}` as a no-op, is allowed while the session is busy (no abort/rebuild), and leaves the frozen definition untouched. The current request keeps the model it started with; the next request uses the new one. CORRECTED IN PLACE 2026-11-11: the body field is `agent_models`, not `agentModels` |
 | `POST /v1/harness/sessions/:id/tasks` | `{ input, attachments?, references?, thread_id? }` → `202` **`TaskReceipt`** (`{ session_id, turn_id, status, thread_id, … }`, `src/shared/harness-api.ts:1366-1382`) — a task receipt, never the mutated document. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); queued turns are durable with a database root and paused after a restart. An `input` starting with `/` is a **slash command**: `dispatch()` runs it in this process through `harness.executeCommand`, never calls the model, never enters a lane, and returns the ALREADY-TERMINAL turn (`status: 'done' \| 'error'`, events `start`/`tool_call`/`tool_result`, no `usage`); `attachments`/`references` are `400` and `thread_id` is accepted and ignored. A `thread_id` that is RUNNING steers instead of queueing. CORRECTED IN PLACE 2026-11-11: the old answer was `202 { session, turn }` and the field was camelCase `threadId` |
@@ -3628,6 +3957,49 @@ table.
 | `POST /v1/harness/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', option_id } \| { kind: 'custom', text } }` (the generated `AnswerActionRequest`, `src/shared/harness-api.ts:1592-1594`; the domain type is `HarnessActionChoice`) → `{ ok: true, request_id, resolved_at }` (`src/server/api.ts:3056`). Settles one pending `actionRequest`; 400 invalid body/unknown option/out-of-bounds text, 404 unknown session or request id, 409 answered or expired. Allowed while busy |
 | `DELETE /v1/harness/sessions/:id` | Forget the session → the **`DeleteSessionResult`** receipt (`{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }`, `src/shared/harness-api.ts:1000-1005`): abort active work, drop queued work, close watchers |
 | `GET /v1/harness` | The **boot document**, on this host AND on the standalone listener: `{ api_root, service, api_version, server_time, epoch, capabilities, limits, links }` — CONSTANT SIZE, no catalogue, no defaults, no sessions (`src/server/api.ts:1643-1670`). CORRECTED IN PLACE 2026-11-11: this row was "Service only: bootstrap `{ rootPath, presets, agents, tools, defaults, sessions }`" — both the fat `{ rootPath, presets, … }` payload and the "service only" asymmetry are gone |
+
+**Two settings scopes, three catalogue scopes.** The table's process-level rows and its
+session-level rows are not two views of one store, and the difference is a contract:
+
+- **Plugin settings** have BOTH scopes. `GET/PATCH /v1/harness/plugins[/:plugin_id]` read
+  and write the TEMPLATE store (`src/server/api.ts:2594` → `SessionStore.pluginSettings`,
+  `src/server/sessions.ts:1998`), so an accepted write changes what every session CREATED
+  AFTER IT inherits and nothing that already exists; `GET /v1/harness/sessions/:id/plugins[/:plugin_id]`
+  and `PATCH /v1/harness/sessions/:id/plugins/:plugin_id` move ONE conversation's values,
+  honoured from its next turn (`SessionStore.updateSessionPluginSettings`,
+  `src/server/sessions.ts:2055`). A session's store is a detached copy taken at creation
+  (`copyPluginSettingsStore`, `src/server/plugins.ts:713` → `src/server/sessions.ts:2186`) and
+  persisted on its own record (`src/server/persistence.ts:293`, restored at
+  `src/server/sessions.ts:3677`), so there is no override layer, no merge and no
+  "inherit unless changed" flag to reason about — two stores simply share no map
+  (`src/server/plugins.ts:23-28`). A CPU-isolated lane replica gets the SESSION's snapshot in
+  its `hello` blueprint, never the template's (`src/server/plugins.ts:107-121`).
+  **There is no third plugin scope, in either direction.** A harness TEMPLATE carries no
+  plugin settings at all — `HarnessPresetRecord` has no such field, and the two durable homes
+  are the document and the session record (`src/server/persistence.ts:293` and `:415`) — so a
+  "this harness's plugins" scope does not exist yet, and neither does a per-THREAD one: a
+  conversation shares its session's store, which is why a lane replica resolves the SESSION's
+  values (`src/server/plugins.ts:107-121`). Both are open work, not an omission of this
+  document.
+- **Tool settings** have ONE scope: the deployment deny list is one store per process
+  (`src/server/tool-settings.ts:1-2`), consumed live by every harness, so
+  `PATCH /v1/harness/tools/:id` is honoured on the next turn of every session and thread —
+  for the MODEL path only, because the manual execution path is deliberately not gated by it
+  (`src/harness.ts:7848-7850`). A session's own tool routes change what that session DECLARES
+  and cannot lift a deployment denial (`src/harness.ts:4567-4581`).
+  `GET /v1/harness/sessions/:id/tools[/:tool_id]` reports that session's live toolbox
+  on top of the global rows (`sessionToolRowsOf`, `src/server/api-reads.ts:951-985`), and the
+  writes are gated where the plugin writes are not: a session tool write needs the session
+  idle (`assertIdleForToolMutation`, `src/server/api.ts:4044` → `409`) and a core or
+  declared name refuses a disable/unregister with `403` (`:4077-4081`, `:4388`).
+- **A harness template** is a third scope again: `GET/PATCH/DELETE /v1/harness/harnesses/:name`
+  edit the definition, and an existing session keeps the definition and the agent-model map
+  it froze at creation, so a template write never reaches a live conversation either.
+
+CORRECTED IN PLACE 2026-11-13: this paragraph is new, and it retires the sentence in
+`docs/plugins.md` ("an accepted PATCH changes what every existing session and thread does
+on its very next turn") as the description of the plugin routes — that survives only for the
+TOOL switch and for a write inside one scope.
 
 There is ONE mount and no alias left. CORRECTED IN PLACE 2026-11-11: this paragraph
 still described `/api` as a live second root with `/presets` aliases. The `/presets`,
@@ -3707,8 +4079,8 @@ and cited the path without its `server/` segment). The rows are every
 `src/tools/descriptors.ts:326-327`, which today is `toolRegistry`, `toolRequest`,
 `toolList`, `toolManage`, `toolCreate`, `tasks`, `records`, `profiles`, `chapters`,
 `locations`, `agentManage`, `agentResult`, `delegate`, `threadFork` and `actionRequest`;
-`search`/`fetch`/`toolCancel`/`threadList`/`threadRead`/`threadSend` set
-`listed: false` and stay out of the host-wide list) — added to the host-wide listing
+`search`/`fetch`/`toolCancel`/`threadList`/`threadRead`/`threadSend`/`threadDelete`
+set `listed: false` and stay out of the host-wide list) — added to the host-wide listing
 (`GET /v1/harness/tools`), in the kernel's registration order. CORRECTED IN PLACE
 2026-11-11: that list used to name the `/tools/bootstrap` alias and the root bootstrap
 document — the alias was deleted with the legacy mount (`src/server/api.ts:12-15`) and
@@ -3868,9 +4240,43 @@ Retired SSE frames (history only — these routes answer `404` now):
   `running` turn does.
 - **Controls.** Run stays enabled while work is pending — only the short POST
   `/tasks` round trip locks it — so the queue grows by submitting again. Stop is
-  enabled whenever work is pending and sends `{ all: true }` (active + queued);
-  Reset/New session/tab switches stay locked while pending. Harness/session
-  switching is allowed and only unsubscribes, because work is server-owned.
+  enabled whenever work is pending and sends `{ all: true }` (active + queued).
+  CORRECTED IN PLACE 2026-11-13: the rest of this bullet used to read "Reset/New
+  session/tab switches stay locked while pending", and none of that is the shipped
+  contract. There is NO Reset control at all (R10 — starting over IS New session, while
+  `POST /sessions/:id/reset` stays alive for other clients,
+  `src/frontend/main.ts:4086-4088`). `+` has exactly one writer of `disabled`,
+  `paintSessionActions` (`src/frontend/main.ts:11220-11225`):
+  `submitting || !booted || archivedSelection` — a live run is deliberately NOT in that
+  expression, so a second independent conversation can start while the first one streams,
+  and its `POST /sessions` create is eager (the SessionStore bullet above);
+  `src/frontend/canonical-directory-live-main.test.ts:304` pins
+  `expect(newSessionButton().disabled).toBe(false)` against a live run. Switching
+  conversation is a view change, never a cancellation: the header cycler
+  (`src/frontend/main.ts:3591-3602`) is never disabled by pending work — it is only
+  `hidden` while no conversation is open — and switching away just unsubscribes, because
+  the work is server-owned.
+- **Configuration scope follows the pointer.** The Tools and Plugins pane toggles are hidden
+  while no session is bound (`harnessTitleTools.hidden = toolsToggle.hidden =
+  pluginsToggle.hidden = !bound`, `src/frontend/main.ts:14021-14024`, pinned by
+  `src/frontend/compact-ui.test.ts:401-435`), because what they edit is THIS conversation:
+  `sessionIsBound()` / `configScope` (`src/frontend/main.ts:5888`) decide which routes the
+  panes dial — `GET /sessions/:id/tools` for tools (rows built by `sessionToolRowsOf`,
+  `src/server/api-reads.ts:951-985`) and `GET /sessions/:id/plugins` for plugins
+  (`src/frontend/main.ts:256` `listSessionPlugins`, read at `:9716`) — and a write answers
+  with the copy "… for this conversation." (`src/frontend/main.ts:9562`, `:9573`). The pane
+  hides rather than disables because a hidden control needs no second explanation
+  (`src/frontend/main.ts:14015-14020`); `disabled` keeps its old meaning of "the server never
+  answered". One carve-out stays, and it is the one a reader is most likely to get wrong:
+  RUNNING a tool from the tools pane executes in the playground's own throwaway session, not
+  in the conversation being configured (`src/frontend/main.ts:2253-2292` wires
+  `options.ensureSession` to `ensurePlaygroundSession`, then
+  `callTool(name, parameters, sessionId)`), so a pane tool call never mutates the transcript
+  it is inspecting. Neither pane dials the TEMPLATE pair any more:
+  `listPlugins` (`src/frontend/api.ts:1024`) / `updatePluginSettings` (`:1034`) and
+  `listAllTools` (`:927`) / `updateToolEnabled` (`:975`) stay in the client as the deployment
+  surface for other clients, and the page's own imports say so in as many words
+  (`src/frontend/main.ts:240-262`, `:273-282` — "no pane here calls it any more").
 - **Presentation.** The turn board is one linear timeline: completed = grey, the
   single active task = green (amber while its request is on the wire), queued =
   neutral, error = red, cancelled = muted. Assistant Markdown is GFM via `marked`,
@@ -3983,7 +4389,11 @@ not send `threads`/`threadId` renders exactly the old UI (`sessionThreadsOf` →
   session, delegated children of host threads included; creating one past the bound
   is the runtime's "already has N independent threads; delete a terminal one"
   refusal, mapped to `429` on the server's thread routes. Deleting a terminal
-  thread removes its record and frees the slot again. The UI does NOT auto-prune:
+  thread removes its record and frees the slot again — and since 2026-11-13 the
+  model itself can free one: `threadDelete` is the model-facing release of a
+  finished child it owns (issue 0027, see
+  [the model-facing thread tools](#the-model-facing-thread-tools-2026-11-13)),
+  so the cap is no longer host-only. The UI does NOT auto-prune:
   reducing thread count is an explicit per-row delete. Deletion purges only that
   conversation — not what other histories were told, not what it wrote to shared
 memory (tasks/profiles/chapters/locations), and not a result a connected thread
@@ -4298,8 +4708,14 @@ The three load-bearing decisions:
   A shipped tool with a real local path takes it instead of failing: `textSummarize` reads
   `context.nestedRuns` and condenses the notes on a lane (its documented no-summarizer
   fallback), so worker mode neither loses a child nor bans the toolbox over one call. Cross-thread
-  work is NOT in that set: `threadSend`/`threadList` route to the authority and `threadRead` reads
-  through it, so the roster feature survives worker mode intact.
+  work is NOT in that set: `threadSend`/`threadList`/`threadDelete` route to the authority and
+  `threadRead` reads through it, so the roster feature survives worker mode intact —
+  `threadDelete` (B5, 2026-11-13) is classified in `AUTHORITY_RUNTIME_METHODS`
+  because it moves canonical state (record, transcript, invocation/branch lookups,
+  and the host-thread slot the cap counts); the TARGET travels as the request's
+  `threadId` while the CALLER travels inside `identity`, so the authority scopes the
+  release to the lane caller's own descendants and `applySync` rebases the lane's
+  mirror of every conversation the cascade removed.
 - **A commit is applied through targeted core seams, never `restore()` per commit.**
   `restore()` rebuilds every created tool and thread agent and zeroes each thread's
   generation, i.e. it spends coordinator CPU and disturbs live handles. The four seams
@@ -4653,7 +5069,7 @@ the exception a saved chat exposes directly.
 
 ```bash
 yarn cli "task"           # one-shot as the live default preset (instruct)
-yarn cli --preset planner # any of the seven shipped presets (all need a provider)
+yarn cli --preset planner # any of the eight shipped presets (all need a provider)
 yarn cli                  # interactive Instruct session
 yarn cli --serve          # explicit standalone API + built UI on :5181 (CLI opt-in)
 yarn dev:frontend         # Vite UI on :5180, dual-stack wildcard (localhost + LAN); /v1/harness proxies to the service on :5000
@@ -4731,7 +5147,9 @@ In the order they are expected:
    `scope.tools`, `src/types/index.ts:1008`, carried into `ctx.run`'s `options.tools`,
    `:1902`, and read back by a tool as `ToolContext.toolScope`, `:1923`) and one
    host-WIDE switch (`toolSettings`, `:3256`). Nothing keys a tool set to an agent
-   PROFILE.
+   PROFILE. "Host-wide" now applies to the TOOL switch only: plugin settings became
+   per-session (R4), so the two `harness()` config fields describe different scopes
+   (`pluginSettings`, `src/types/index.ts:3658`; `toolSettings`, `:3673`).
 4. **sandboxed presets and created tools** — the file and command tools, and any
    `toolCreate` body, run with host permissions; a `root`-scoped/fenced variant
    would be the natural next step.
@@ -4754,6 +5172,18 @@ In the order they are expected:
    not a per-thread lane — in worker mode its body still runs on the session's operator
    lane, but there is no command-specific cancel or stream). A built-in that calls a
    tool inherits the tool's own limits.
+8. **no page surface for the two TEMPLATE settings scopes** — the Tools and Plugins panes are
+   scoped to the conversation on screen, so they hide entirely when nothing is bound
+   (`src/frontend/main.ts:14021-14024`) and no pane calls the global pairs any more
+   (`src/frontend/main.ts:240-262`, `:273-282`). What is therefore API-only today is the
+   store a NEW session inherits — `GET/PATCH /v1/harness/plugins[/:plugin_id]` — and the
+   per-name deployment deny list — `PATCH /v1/harness/tools/:id`. This is presentation work
+   only: both routes are live, paged, durable and tested. Harness TEMPLATES themselves are not
+   on this list — the page already edits `primary`, `subagents`, `agent_models` and
+   `agent_instructions` through `PATCH /v1/harness/harnesses/:name`
+   (`src/frontend/main.ts:8198`) — but the third scope this pass introduced (a session's own
+   configuration) has no harness-level twin to fall back on, which is exactly why the panes
+   hide instead of falling back.
 
 Parallel tool execution is no longer on this list: calls are scheduled
 concurrently (see “The loop”). There is no ordered side-effect guarantee, and the

@@ -184,10 +184,13 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
     // the key-free `defaults` document to work from — which is how a placeholder reached the
     // Authorization header.
     //
-    // T5 (R2/R3): this listener's PLUGIN SETTINGS STORE is created inside that SessionStore,
+    // T5 (R2/R3) + R4: this listener's PLUGIN SETTINGS STORE is created inside that SessionStore,
     // seeded from `database.pluginSettings`, and read back by `GET/PATCH /v1/harness/plugins`
     // through `store.pluginSettings` — one per process, exactly like the store itself, so no
-    // separate construction is needed here (see ./runtime.ts for the same note).
+    // separate construction is needed here (see ./runtime.ts for the same note). With R4 that
+    // store is the PROCESS/TEMPLATE: every session copies it at creation (`copyPluginSettingsStore`)
+    // and answers `GET/PATCH /v1/harness/sessions/{id}/plugins/**` from its own copy, so a global
+    // write moves the sessions created after it, not the ones already running.
     const serverSettings = options.settings ?? configuration.settings;
 
     const store = new SessionStore(

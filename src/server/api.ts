@@ -245,8 +245,13 @@ import type { ContextBlock, TurnSection } from '../shared/turn-display';
 import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
 // T5 (R2/R3): the plugin settings store's status-carrying failure (404 unknown plugin, 400
 // unknown key / mistyped / out-of-range value). The store itself is reached through
-// `store.pluginSettings`, so this dispatcher never constructs a second one.
+// `store.pluginSettings` (the PROCESS/TEMPLATE scope) and `requireSession(id).plugins` (R4's
+// per-session scope), so this dispatcher never constructs a second one.
 import { HarnessPluginSettingsError } from './plugins';
+// R4: the store TYPE, because one row builder and one page builder serve both scopes — they
+// take the scope's store as a parameter rather than closing over the process one (see
+// `pluginRowOf`, and the session pair in the route table).
+import type { HarnessPluginSettingsStore } from './plugins';
 // R3: the global tool switch's status-carrying error (400 blank name), mapped exactly like
 // its plugin sibling below. Every listed tool — core tools included — is switchable, so the
 // store never refuses a name for being harness-owned.
@@ -2577,11 +2582,15 @@ export const createHarnessApi = ({
         }
     };
 
-    // ---- plugins (T5 / R2-R3) ---------------------------------------------------
+    // ---- plugins (T5 / R2-R3, session-scoped by R4) -----------------------------
 
-    // The runtime's plugin settings store, reached THROUGH the store that owns it, so this
-    // dispatcher never builds a second catalogue: a `PATCH` here writes the same map that a
-    // running session's `api.settings` reads (./plugins.ts, ./sessions.ts `buildHarness`).
+    // The PROCESS/TEMPLATE store, reached THROUGH the store that owns it, so this dispatcher
+    // never builds a second catalogue: a `PATCH /v1/harness/plugins/{plugin_id}` here writes
+    // the map that every session CREATED AFTER IT copies down (./plugins.ts
+    // `copyPluginSettingsStore`, ./sessions.ts `create`), and the map the two global routes
+    // report. A session's own values come from `requireSession(id).plugins` — R4's per-session
+    // store, whose live provider is the one that session's harness reads (./sessions.ts
+    // `buildHarness`).
     const plugins = store.pluginSettings;
 
     // One declared descriptor -> one wire `PluginSetting`. The spellings already match (the
@@ -2608,14 +2617,25 @@ export const createHarnessApi = ({
 
     /**
      * One built-in plugin as an operator sees it: the metadata the plugin file itself declares
-     * (via the generated manifest) beside the EFFECTIVE values this runtime reads right now.
+     * (via the generated manifest) beside the EFFECTIVE values THIS SCOPE reads right now.
+     *
+     * THE SHARED ROW BUILDER (R4). `settings` is the store the value half of the row resolves
+     * through — the process/template store for `GET /plugins` and `PATCH /plugins/{plugin_id}`,
+     * a session's own store for `GET /sessions/{id}/plugins`, `GET
+     * /sessions/{id}/plugins/{plugin_id}` and its PATCH. Nothing else about the row changes, so
+     * the two surfaces are the SAME `PluginSummary` schema (`PluginSummary` is referenced by
+     * `PluginSummaryPage` and `PluginDetailResponse` on all five routes — the contract states
+     * the shape identity, and this function is the only builder of it), which is what lets the
+     * next task render one settings pane against either scope.
+     *
      * `values` comes from the store's settings-view resolution, so a row and a live plugin can
      * never disagree; `settings[].default` is the reset target a `null` patch restores.
-     * `enabled` is R2's global switch — the reserved key the hook gate consults
-     * (./plugins.ts, ../plugin/host.ts), read through the same live store, so a row that says
-     * `false` means the plugin is not running its hooks in ANY session right now.
+     * `enabled` is R2's switch — the reserved key the hook gate consults (./plugins.ts,
+     * ../plugin/host.ts), read through the same live store, so a row that says `false` means
+     * the plugin is not running its hooks IN THAT SCOPE right now (the template scope's row
+     * states what the NEXT session created here will run with).
      */
-    const pluginRowOf = (metadata: HarnessPluginMetadata): PluginSummary => {
+    const pluginRowOf = (settings: HarnessPluginSettingsStore, metadata: HarnessPluginMetadata): PluginSummary => {
         const tags = metadata.tags === undefined ? undefined : [...metadata.tags];
         const hooks = metadata.hooks === undefined ? undefined : [...metadata.hooks];
 
@@ -2640,14 +2660,18 @@ export const createHarnessApi = ({
             // R2 — read live from the same store the harness's gate consults, so the row
             // and the runtime answer with one voice. A plugin that declares no `enabled`
             // setting still has one (the reserved key); `values` stays declared-only.
-            enabled: plugins.enabled(metadata.name),
+            enabled: settings.enabled(metadata.name),
             settings: (metadata.settings ?? []).map(pluginSettingOf),
-            values: plugins.values(metadata.name)
+            values: settings.values(metadata.name)
         };
     };
 
     // `GET /plugins` — the loaded catalogue plus what each plugin is set to. Answerable with no
     // harness and no model, in the manifest's stable order (path-ascending from the scan).
+    //
+    // R4 SCOPE: the rows report the PROCESS/TEMPLATE store — the values the NEXT session created
+    // here copies down. They are deliberately NOT "what every running session reads" any more;
+    // `GET /sessions/{id}/plugins` is that question, per session, with the identical row shape.
     const getPlugins: Handler = (ctx) => {
         const limit = resolveLimit(ctx.query.get('limit'));
         const cursor = decodeCursor(ctx.query.get('cursor'));
@@ -2673,7 +2697,7 @@ export const createHarnessApi = ({
         // rereads on open and on save. Same epoch, so a client's staleness test still holds.
         return json(
             200,
-            pageMeta({ items: page.items.map(pluginRowOf), next: page.next }, plugins.revision())
+            pageMeta({ items: page.items.map((metadata) => pluginRowOf(plugins, metadata)), next: page.next }, plugins.revision())
         );
     };
 
@@ -2690,6 +2714,12 @@ export const createHarnessApi = ({
     // usable while a conversation is running, so the value simply takes effect on the next turn
     // of every session. `{settings:{enabled:false}}` is the one-click global off switch; the
     // response row reports the new state, so the client never re-reads to confirm its own click.
+    //
+    // R4 SCOPE: this writes the PROCESS/TEMPLATE store, so what it changes is (a) every session
+    // created AFTER the write and (b) nothing that already exists. The pre-R4 wording "changes
+    // what an existing session reads on its next turn" moved to the session route below
+    // (`PATCH /sessions/{session_id}/plugins/{plugin_id}`), and `./plugins-api.test.ts` pins
+    // both halves of the new rule.
     const patchPlugin: Handler = async (ctx) => {
         const name = ctx.params.plugin_id;
         const body = requireObjectBody<PluginSettingsUpdate>(await ctx.body());
@@ -2711,7 +2741,133 @@ export const createHarnessApi = ({
 
         const revision = plugins.revision();
 
-        return json(200, { plugin: pluginRowOf(metadata) } satisfies PluginDetailResponse, revision);
+        return json(200, { plugin: pluginRowOf(plugins, metadata) } satisfies PluginDetailResponse, revision);
+    };
+
+    // ---- session plugin settings (R4) -------------------------------------------
+    //
+    // THE SESSION-SCOPED PAIR. Same row schema, same body schema, same validation and status
+    // codes as the two routes above, and one different word: SCOPE. Everything here reads and
+    // writes `requireSession(id).plugins` — the store that session's harness holds the live
+    // provider of — so:
+    //
+    //   - a PATCH here changes what THAT session reads on its very next turn, with no rebuild,
+    //     because the provider is a live reference into that session's own map (the identical
+    //     mechanism R2 proved process-wide, now per session);
+    //   - it changes nothing else: no other session, and not the template a later session
+    //     copies. That isolation is the requirement, and the response rows of both scopes are
+    //     the evidence a client can read in the same request cycle;
+    //   - the collection `revision` (body and `X-Harness-Revision` header) is THAT SESSION'S
+    //     store counter — 0 until this session has accepted a PATCH, one bump per accepted
+    //     PATCH. It is a per-session staleness test, exactly like the global counter is a
+    //     template staleness test, and the two counters never move each other: a client
+    //     watching a session's plugins pane is not invalidated by someone editing the template,
+    //     and vice versa. Documented in the contract on both new paths.
+    //
+    // The plugin CATALOGUE is not session state: every session's store is seeded from the same
+    // generated manifest, so rows, declared settings and defaults are identical everywhere and
+    // only the resolved `enabled`/`values` differ.
+
+    // `GET /sessions/{session_id}/plugins` — this session's plugin rows.
+    const getSessionPlugins: Handler = (ctx) => {
+        // Identity FIRST: an unknown session is a 404 before any paging parameter is read.
+        const record = requireSession(ctx.params.session_id);
+
+        const limit = resolveLimit(ctx.query.get('limit'));
+        const cursor = decodeCursor(ctx.query.get('cursor'));
+        const search = paramOf(ctx.query, 'q');
+
+        // The session's own store answers `descriptors` too (the same generated manifest), so
+        // the page is built exactly like the global one and cannot drift into a second
+        // catalogue. Filter, order and paging are the global route's rules, unchanged.
+        const all = [...record.plugins.descriptors];
+        const filtered =
+            search === undefined
+                ? all
+                : all.filter((metadata) =>
+                      `${metadata.name} ${metadata.title} ${metadata.description ?? ''} ${
+                          (metadata.tags ?? []).join(' ')
+                      }`
+                          .toLowerCase()
+                          .includes(search.toLowerCase())
+                  );
+
+        const page = slicePage(filtered, cursor, limit, filtered.length);
+
+        const result = pageMeta(
+            {
+                items: page.items.map((metadata) => pluginRowOf(record.plugins, metadata)),
+                next: page.next
+            },
+            record.plugins.revision()
+        );
+
+        // Same header rule as every other page here: the revision the read landed at travels on
+        // the response too, so a client can order it against a stream frame. HERE it is this
+        // SESSION's counter, so the header is a staleness test for this session's pane only.
+        return json(200, result, record.plugins.revision());
+    };
+
+    // `GET /sessions/{session_id}/plugins/{plugin_id}` — one row, this session's values.
+    const getSessionPlugin: Handler = (ctx) => {
+        const record = requireSession(ctx.params.session_id);
+        const name = ctx.params.plugin_id;
+
+        // Plugin identity is the second 404 (session first), and it is answered by the
+        // catalogue, which every session shares — so an unknown plugin is 404 on a session route
+        // exactly like it is on the global one.
+        const metadata = record.plugins.metadata(name);
+
+        if (metadata === undefined) throw missing('plugin', name, record.id);
+
+        const response: PluginDetailResponse = { plugin: pluginRowOf(record.plugins, metadata) };
+
+        return json(200, response, record.plugins.revision());
+    };
+
+    // `PATCH /sessions/{session_id}/plugins/{plugin_id}` — edit one plugin FOR THIS SESSION.
+    //
+    // WRITE-ANYTIME, and for the same reason the global route is: a settings write moves no
+    // registration and removes no schema the model was promised. That is the deliberate split
+    // from a session's TOOL switch (`assertIdleForToolMutation`), which mutates one live harness
+    // and therefore needs the session idle — plugin settings are declarative values a live
+    // provider re-reads, so this route has no 409 path at all.
+    //
+    // DURABLE BEFORE THE ANSWER: `store.updateSessionPluginSettings` commits the session's copy
+    // into the whole-document checkpoint before it resolves, so a 200 here survives a restart
+    // (the same receipt rule as every other structural write, and pinned across a real restart
+    // by ./plugins-api.test.ts). A failed write leaves the value applied in memory and reports
+    // the 500, because the session already runs with it — rolling back would claim a failure the
+    // running conversation did not have.
+    const patchSessionPlugin: Handler = async (ctx) => {
+        const record = requireSession(ctx.params.session_id);
+        const name = ctx.params.plugin_id;
+
+        // Identity (session, then plugin existence via the store's own 404) resolves before the
+        // BODY is read, the order `patchTool` sets: a wrong id is a 404, never a 400 about a
+        // body the client has not sent.
+        const body = requireObjectBody<PluginSettingsUpdate>(await ctx.body());
+
+        requireKnownFields(body, ['settings']);
+
+        if (body.settings === undefined) {
+            throw new HttpError(400, 'A plugin settings patch requires a "settings" object.');
+        }
+
+        // Unknown key / wrong type / out-of-range => the store's 400, thrown BEFORE it mutates
+        // (validate-all-then-mutate), so a refused patch is a no-op on this session.
+        await store.updateSessionPluginSettings(record.id, name, { ...body.settings });
+
+        // Re-read the record: nothing here replaces a session, but reading it again is what
+        // keeps the row honest if a future write path does.
+        const current = requireSession(record.id);
+        const metadata = current.plugins.metadata(name);
+
+        if (metadata === undefined) throw missing('plugin', name, current.id);
+
+        const response: PluginDetailResponse = { plugin: pluginRowOf(current.plugins, metadata) };
+
+        return json(200, response, current.plugins.revision());
     };
 
     // ---- model discovery --------------------------------------------------------
@@ -5258,6 +5414,10 @@ export const createHarnessApi = ({
         sessionsBySessionIdToolsByToolId: { GET: getSessionTool, PATCH: patchSessionTool, DELETE: deleteSessionTool },
         sessionsBySessionIdToolsByToolIdSource: { GET: getSessionToolSource },
         sessionsBySessionIdToolsByToolIdExecutions: { POST: postSessionToolExecution },
+        // R4: the session-scoped plugin pair. Same generated row schema as the two global plugin
+        // routes above, one different scope — `record.plugins` instead of the process store.
+        sessionsBySessionIdPlugins: { GET: getSessionPlugins },
+        sessionsBySessionIdPluginsByPluginId: { GET: getSessionPlugin, PATCH: patchSessionPlugin },
         sessionsBySessionIdThreads: { GET: getSessionThreads, POST: postSessionThread },
         sessionsBySessionIdThreadsByThreadId: { GET: getSessionThread, DELETE: deleteSessionThread },
         sessionsBySessionIdThreadsByThreadIdCancel: { POST: postThreadCancel },

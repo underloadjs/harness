@@ -48,10 +48,13 @@ export type HarnessPresetReport = {
     //
     // It is a PROVIDER, not a snapshot, and that is the whole point: `harness()` stores the
     // reference and each plugin's `api.settings` re-reads it on every call
-    // (src/plugin/settings.ts, src/plugin/host.ts:151), so a `PATCH /v1/harness/plugins/
-    // {plugin_id}` changes what an ALREADY RUNNING session reads on its next turn with no
-    // rebuild. SessionStore passes one provider for the whole process (../sessions.ts
-    // `buildHarness`); the worker lane cannot (see ../plugins.ts, "WORKER MODE").
+    // (src/plugin/settings.ts, src/plugin/host.ts:151), so a settings write reaches an ALREADY
+    // RUNNING session on its next turn with no rebuild. R4 moved the scope of that write:
+    // SessionStore passes ONE PROVIDER PER SESSION (../sessions.ts `buildHarness` receives the
+    // session's own store), so `PATCH /v1/harness/sessions/{id}/plugins/{plugin_id}` moves the
+    // session holding this reference, while `PATCH /v1/harness/plugins/{plugin_id}` moves only the
+    // sessions created afterwards (../sessions.ts `create`, ../plugins.ts `copyPluginSettingsStore`);
+    // the worker lane cannot share it either (see ../plugins.ts, "WORKER MODE").
     pluginSettings?: HarnessPluginSettingsProvider;
     // R3: the host's LIVE global tool provider (the tool names this deployment has switched
     // off for every session), forwarded verbatim into

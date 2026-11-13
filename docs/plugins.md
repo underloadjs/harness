@@ -7,6 +7,17 @@
 > work — the two probes and the boundaries closed by decision). This document
 > describes the code and its tests; it does not assert a passing production
 > verification run.
+> **CORRECTED IN PLACE 2026-11-13 (settings SCOPE only):** the plugin-settings write
+> surface gained a per-conversation scope, and every sentence below that said a settings
+> write reaches "every session" now has to be read against
+> [Global enablement](#global-enablement--the-operators-switch). `GET/PATCH
+> /v1/harness/plugins[/{plugin_id}]` edit the TEMPLATE and reach the sessions created after
+> the write; `GET/PATCH /v1/harness/sessions/{session_id}/plugins[/{plugin_id}]` edit ONE
+> conversation and reach nothing else. Nothing else in this guide changed: the hooks, the
+> pipeline, the mutation API, the reserved `enabled` semantics and the lane-worker limits
+> were re-verified at source level (`src/server/plugins.ts`, `src/server/sessions.ts`,
+> `src/server/api.ts`, `src/server/persistence.ts`, `src/plugin/settings.ts`) on this date,
+> and the test suite was NOT re-run here.
 > **Source of truth:** `src/plugin/hooks.ts` (the dispatch rules, header
 > "THE RULES"), `src/plugin/host.ts` (the per-plugin api view),
 > `src/plugin/settings.ts` (the settings read/write edges), `src/types/index.ts`
@@ -65,7 +76,10 @@ Plugin code is **built-ins plus host-provided only** (pipeline T0, Q1(a)).
 There is no operator-installable plugin mechanism: no registry, no module
 resolution, no supply-chain story — and the shipped server never passes
 `configuration.plugins` at all, so today a running server runs exactly the
-built-ins plus whatever settings an operator edits. A lane replica is built
+built-ins plus whatever settings an operator edits. Those edits are SCOPED, not
+global: the template store decides what the next session inherits, and every existing
+conversation carries its own detached copy of it (see
+[Global enablement](#global-enablement--the-operators-switch)). A lane replica is built
 from the same preset record, which is why the worker problem disappears under
 this answer — and also why a **closure cannot reach a worker**: the settings
 provider and the diagnostic sink are in-process objects, and a lane worker
@@ -81,10 +95,12 @@ does not exist until foreign code is ever loadable.
 ## Global enablement — the operator's switch
 
 Every plugin answers to **one reserved setting key, `enabled`**, and the framework —
-not the plugin — acts on it. An operator flips it with a single click:
+not the plugin — acts on it. An operator flips it with a single click, in ONE of two
+scopes that look identical and are not:
 
 ```http
-PATCH /v1/harness/plugins/{plugin_id}
+PATCH /v1/harness/plugins/{plugin_id}                  # the TEMPLATE: sessions created after it
+PATCH /v1/harness/sessions/{session_id}/plugins/{plugin_id}   # ONE conversation, from its next turn
 { "settings": { "enabled": false } }
 ```
 
@@ -129,15 +145,34 @@ consequences worth knowing:
   rule: a host that cannot read its own settings document must not silence
   every plugin in the process. A skipped delivery is *not* reported through
   `onHandlerError` — an operator turning a plugin off is not a plugin failure.
-* **The switch is live, so it is global.** `harness()` stores the provider by
-  reference and the settings view re-reads it on every access, so an accepted
-  PATCH changes what **every existing session and thread** does on its very next
-  turn: no rebuild, no re-registration, no restart. There is deliberately no
-  idle gate on the route — a settings write moves no registration and removes no
-  schema a model was promised — so the Plugins page is usable while a
-  conversation is running. The value is durable before the response
-  (`state.json`, under `pluginSettings`), and a restart reads it back before the
-  first request.
+* **The switch is live — inside ONE scope.** `harness()` stores the provider by
+  reference and the settings view re-reads it on every access, so an accepted PATCH changes
+  what the sessions of THAT scope do on their very next turn: no rebuild, no re-registration,
+  no restart. CORRECTED IN PLACE 2026-11-13: this bullet used to conclude from that liveness
+  that the switch "is global", and the scope split published on 2026-11-13 makes that
+  misleading. Two stores exist (`src/server/plugins.ts`, "THE TWO SCOPES"), and a route owns
+  exactly one of them: `PATCH /v1/harness/plugins/{plugin_id}` writes the TEMPLATE, and its
+  effect is on every session CREATED AFTER IT — an existing conversation holds a detached copy
+  made at its own creation (`copyPluginSettingsStore:713` →
+  `src/server/sessions.ts:2186`, literally `child.restore(parent.snapshot())`), so a template
+  write never reaches it; `PATCH /v1/harness/sessions/{session_id}/plugins/{plugin_id}`
+  (`src/server/api.ts:2828` → `SessionStore.updateSessionPluginSettings`,
+  `src/server/sessions.ts:2055`) moves ONE conversation from its next turn and nobody else's.
+  There is no override layer and no merge between them: two stores share no map
+  (`src/server/plugins.ts:23-28`). There is deliberately no idle gate on either route — a
+  settings write moves no registration and removes no schema a model was promised — so the
+  Plugins page is usable while a conversation is running. The value is durable before the
+  response and a restart reads it back before the first request, at the scope that owns it:
+  the template under `state.json`'s top-level `pluginSettings`, a conversation's own values on
+  ITS record (`src/server/persistence.ts:293`, rebuilt on restore at
+  `src/server/sessions.ts:3677`).
+* **Two scopes, not four.** There is no per-HARNESS plugin configuration — a harness template
+  record carries no plugin column at all (`src/server/persistence.ts`, `HarnessPresetRecord`;
+  the durable homes are the document at `:415` and the session record at `:293`) — and no
+  per-THREAD one either: every conversation of a session, and the lane workers that run its
+  threads, resolve that SESSION's store (`src/server/plugins.ts:107-121`). A plugin therefore
+  has exactly two settings documents to be edited from, and asking for a third is open work,
+  not behaviour to infer.
 
 `count()` follows dispatch (it answers "how many handlers would this event
 reach right now"), while `live()` stays registration-based on purpose: the
@@ -147,7 +182,13 @@ Plugins pane compares an author's declared `metadata.hooks` with what
 A CPU-isolated **lane worker** sees the same limit as every other settings
 read: a provider closure cannot cross `worker_threads`, so a replica that is
 already running picks the new value up when its lane is next created
-(`src/server/plugins.ts`, `WORKER MODE`).
+(`src/server/plugins.ts`, `WORKER MODE`). WHICH values it picks up is the scope
+question again, and the answer is the honest one: the `hello` blueprint carries the
+SESSION's own `snapshot()` — `blueprintFor` reads that session's store, not the template's
+(`src/server/plugins.ts:107-121`) — so a replica resolves the conversation it mirrors, down to
+its `enabled`. A lane's provider has no `set`, which is why a plugin calling
+`api.settings.setOwn` on a replica gets the library's stated read-only refusal instead of
+writing into a private copy that dies with the lane.
 
 ---
 
@@ -422,10 +463,13 @@ skip filter over canonical history and nothing in it windows, truncates, elides 
 built-ins subscribe `turn.before`, and compaction is dispatched first (manifest order,
 `src/plugin/manifest.ts`).
 
-The trimmer's settings (`PATCH /v1/harness/plugins/context-trimmer`, read live on the next
-turn of every session) ARE the policy surface. The table below is in **declaration order, which
-is the order the pane renders**: every policy sits in its own named category with the settings
-that window it filed under the toggle, and a gated setting is shown only while its switch is on:
+The trimmer's settings ARE the policy surface, and they are read live on the next turn of
+whichever scope the write addressed: `PATCH /v1/harness/plugins/context-trimmer` moves the
+TEMPLATE that later sessions inherit, `PATCH /v1/harness/sessions/{id}/plugins/context-trimmer`
+moves one running conversation (`## Global enablement`). The table below is in **declaration
+order, which is the order the pane renders**: every policy sits in its own named category with
+the settings that window it filed under the toggle, and a gated setting is shown only while its
+switch is on:
 
 | Switch | Default | What it decides |
 |---|---|---|
@@ -584,7 +628,10 @@ the runtime's, not a new phase check, priority, or knob:
   finds the unit already withheld.
 - **Why the prune stays.** It is the eviction path for an operator who wants the compacting pass
   to own it: with `dropSupersededToolCalls` and `trimInvalidTools` off (or
-  `enabled: false` on the whole trimmer, `PATCH /v1/harness/plugins/context-trimmer`),
+  `enabled: false` on the whole trimmer — `PATCH /v1/harness/plugins/context-trimmer` is the
+  TEMPLATE spelling, so it changes what sessions created AFTER it inherit, while
+  `PATCH /v1/harness/sessions/{id}/plugins/context-trimmer` is the one that switches the trimmer
+  off for a conversation that already exists, from its next turn),
   compaction prunes superseded failures under its own floor and horizon — and compaction keeps
   the roles the trimmer can never take: the pressure trigger, the `summarize` retention range,
   and the summary entry that pass commits into the transcript.
@@ -718,16 +765,21 @@ with different rules.
   for a `string` setting), a number must be finite and inside `min`/`max`.
   `step` stays a UI hint and is NOT enforced. `null`/`undefined` are
   refused, not treated as "reset". The write always goes **through the
-  host's provider**, never around it, and the two possible hosts get
-  different, stated answers: a harness with no `configuration.pluginSettings`
-  has the library's in-memory provider, where `setOwn` works for the
-  lifetime of the PROCESS and persists NOTHING — it is not in `snapshot()`
-  and does not survive a restart; and a provider that implements `get`
+  host's provider**, never around it, and the possible hosts get different, stated answers:
+  a harness with no `configuration.pluginSettings` has the library's in-memory provider —
+  created per `harness()` call (`src/harness.ts:1517-1521`), so `setOwn` works for the
+  lifetime of THAT HARNESS and persists NOTHING: it is not in `snapshot()`, a second harness
+  never sees it, and a restart loses it; a CPU-isolated lane replica has a provider rebuilt
+  from the blueprint snapshot with no `set` at all (`src/server/plugins.ts:123-126`); and a
+  provider that implements `get`
   alone — which is the shipped server's live provider, read-only by
   construction so its store stays the one that validates, bumps the
   revision and schedules the save — has NO writer, and `setOwn` THROWS
   saying so rather than keeping a copy nobody reads. Wiring a host store's
-  write path is host work, not a library fallback.
+  write path is host work, not a library fallback: on the shipped server the write path is
+  the two PATCH routes (`/v1/harness/plugins/{plugin_id}` for the template and
+  `/v1/harness/sessions/{session_id}/plugins/{plugin_id}` for one conversation), not
+  `setOwn`.
 - `report.diagnostic({ message, data? })` — the plugin's OWN voice on the
   same advisory channel the framework uses for handler failures
   (`harness({ report.diagnostic })`). Its report is stamped `kind: 'policy'`

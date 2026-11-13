@@ -345,6 +345,10 @@ export {
     // registered by the harness once the session owns an independent thread).
     THREAD_LIST_METADATA,
     THREAD_LIST_NAME,
+    // Issue 0027: the release door of the same conditional group. Projected through the
+    // facade as soon as the generated manifest carried the row.
+    THREAD_DELETE_METADATA,
+    THREAD_DELETE_NAME,
     THREAD_READ_METADATA,
     THREAD_READ_NAME,
     THREAD_SEND_METADATA,

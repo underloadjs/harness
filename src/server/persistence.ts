@@ -267,6 +267,30 @@ export type HarnessSessionRecord = {
     // no field and loads unchanged, and an empty journal is written back as an absent key, so a
     // healthy session's `state.json` stays byte-identical to its pre-T4 shape.
     pluginDiagnostics?: SessionPluginDiagnostic[];
+    // R4 (ADDITIVE, session-scoped config): THIS session's own plugin setting OVERRIDES — the
+    // per-session twin of the document-level `HarnessDatabase.pluginSettings`, same
+    // `plugin -> key -> JSON scalar` shape, and exactly the value `Session.plugins.snapshot()`
+    // writes (./sessions.ts `sessionRecord`).
+    //
+    // WHY IT IS PER SESSION AND NOT JUST THE DOCUMENT FIELD
+    // -----------------------------------------------------
+    // The document field is the TEMPLATE: what a session copies down at creation. Once a
+    // session exists its plugin configuration belongs to it alone, so its values have to be
+    // durable here — otherwise a per-session edit would be re-seeded from the template on the
+    // next restart and the operator's isolation would last exactly one reboot.
+    //
+    // OPTIONAL in both directions, like every additive field here: a pre-R4 document has no
+    // field, loads unchanged, and restores at the plugin's DECLARED defaults (NOT at what the
+    // template happens to say today — a template edit made after this session was created must
+    // not reach a session that never asked for it). An empty map is written back as an absent
+    // key, so a session that changed nothing keeps its exact previous `state.json` bytes.
+    //
+    // The loader is TOLERANT about this block (see ./sessions.ts `restoreSession` and
+    // ./plugins.ts `applyRestore`): a stale plugin name, a retired key, or a hand-edited value
+    // is dropped rather than refusing the record, because a plugin-settings override is
+    // configuration an operator edits, not a load-bearing transcript. What survives is exactly
+    // what the writer would have written.
+    pluginSettings?: HarnessPluginSettingsRecord;
     // Last committed core snapshot. Core permits a synchronous snapshot at each
     // mutation boundary, so an active turn's completed tool/store changes are
     // included as they happen. A tool that is still executing when the process
@@ -383,6 +407,11 @@ export type HarnessDatabase = {
     // setting has ever been changed" (every pre-R3 document), and an absent field stays
     // absent on a round trip. Values are JSON scalars only; the declared defaults they
     // override are NOT stored (they belong to the plugin's own metadata).
+    //
+    // R4: this is the TEMPLATE block — the map a new session copies down at creation
+    // (./sessions.ts `create`, ./plugins.ts `copyPluginSettingsStore`). A session's own values
+    // live beside the session (`HarnessSessionRecord.pluginSettings`), so a document now holds
+    // the deployment's answer and each conversation's, and neither moves the other.
     pluginSettings?: HarnessPluginSettingsRecord;
     // R3 (ADDITIVE): the tool NAMES the operator has switched off GLOBALLY, written by
     // `PATCH /v1/harness/tools/{tool_id}` and read back at construction by the runtime's
@@ -1279,6 +1308,56 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         return text.length === 0 ? undefined : text;
     })();
 
+    // R4 (durability): the SESSION's own plugin setting overrides, the per-session twin of the
+    // document-level `pluginSettings` block below (see `HarnessSessionRecord.pluginSettings`).
+    //
+    // TOLERANT, and that is a deliberate difference from the document-level block, which is
+    // strict about shape. Two reasons, both about blast radius:
+    //   - a throw HERE is not "one bad field", it is `readHarnessDatabase` failing, which costs
+    //     the operator EVERY session in the document — for a settings overlay whose whole
+    //     content the runtime is willing to resolve to a default anyway;
+    //   - the value is produced by `Session.plugins.snapshot()` (./sessions.ts `sessionRecord`),
+    //     which can only ever emit catalogue-ordered JSON scalars, so anything else on disk is a
+    //     hand edit or an older build, i.e. exactly the case the same file's
+    //     `pluginDiagnostics` reader answers by dropping.
+    //
+    // What "tolerant" means concretely: a non-object block is dropped, a non-object plugin entry
+    // is dropped, and a value that is not a finite number / boolean / string is dropped. Names
+    // are NEVER checked against this build's catalogue — the store's own `restore`
+    // (./plugins.ts `applyRestore`) is what decides whether a plugin or key still means anything,
+    // so a plugin that ships again later gets its stored override back.
+    //
+    // Normalization keeps a load -> save round trip byte-stable: entries are re-emitted in the
+    // document's own key order (the writer already emits catalogue order), and a block that ends
+    // up empty — absent, `{}`, or all-dropped — normalizes to ABSENT, which is what the writer
+    // emits for "this session changed nothing".
+    const pluginSettings = (() => {
+        const block = record.pluginSettings;
+
+        if (block === undefined || block === null || typeof block !== 'object' || Array.isArray(block)) {
+            return undefined;
+        }
+
+        const values: HarnessPluginSettingsRecord = {};
+
+        for (const [plugin, raw] of Object.entries(block as Record<string, unknown>)) {
+            if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+
+            const settings: Record<string, number | string | boolean> = {};
+
+            for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+                if (typeof value === 'number' && !Number.isFinite(value)) continue;
+                if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'string') {
+                    settings[key] = value as number | string | boolean;
+                }
+            }
+
+            if (Object.keys(settings).length > 0) values[plugin] = settings;
+        }
+
+        return Object.keys(values).length === 0 ? undefined : values;
+    })();
+
     // T27: the session-scoped binding list. OPTIONAL in both directions; values are trimmed,
     // a blank entry is corruption of the named slot (a roster member name cannot be blank),
     // and duplicates collapse because they name one binding.
@@ -1333,6 +1412,10 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         // T1.5 last mile: restored as written (tolerant — see the reader above), and absent for
         // every document written before the field existed.
         ...(pluginDiagnostics === undefined ? {} : { pluginDiagnostics }),
+        // R4: the session's own plugin overrides, tolerant-read and normalized (see the reader
+        // above). Key order matches the writer (./sessions.ts `sessionRecord`, which emits this
+        // field in the same position), so a load + save lands on the same bytes.
+        ...(pluginSettings === undefined ? {} : { pluginSettings }),
         core: core as unknown as HarnessSnapshot,
         ...(agentModels === undefined ? {} : { agentModels })
     };
@@ -1448,7 +1531,10 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
                   } as HarnessGlobalSettingsRecord;
               })();
 
-    // T5 / R2-R3 (durability): the operator's per-plugin setting overrides.
+    // T5 / R2-R3 (durability): the operator's per-plugin setting overrides FOR THE PROCESS/
+    // TEMPLATE SCOPE (R4 — a session's own values live in its record, `HarnessSessionRecord
+    // .pluginSettings`, and are read TOLERANTLY there; the difference is deliberate and stated
+    // there).
     //
     // STRICT about shape, LENIENT about identity:
     //   - OPTIONAL in both directions: an absent field stays absent, so a document from a

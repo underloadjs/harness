@@ -15,7 +15,7 @@
 //   - the metadata literal: name, tags, visibility, and the FULL parameter schema
 //     with its exact description text (a model's only view of the contract);
 //   - the description's behavioural promises: the issue-0027 reason, permanence,
-//     the descendant scope, the four refusals, the cascade, and both receipt fields;
+//     the descendant scope, the five refusals, the cascade, and both receipt fields;
 //   - the registration literal, exactly, including `order: 255` — the descending
 //     `threads`-group rule at src/harness.ts ~1157-1168 makes that number the
 //     guarantee that the roster is still declared before the tool that names it;
@@ -27,7 +27,12 @@
 //   - `execute` wiring: the CALLER's `context.threadId` and the trimmed `thread`
 //     argument reach `runtime.threadDelete` in that order, the runtime receipt is
 //     returned untouched, and every invalid `thread` is an entry-side error that
-//     never reaches the runtime.
+//     never reaches the runtime;
+//   - BOTH argument shapes: a tool with exactly ONE property has its arguments
+//     UNWRAPPED to that value (`threadDelete` arrives as the bare id string on the model
+//     path AND on `executeTool`), so the unwrapped string and the `{ thread }` wrapper are
+//     each pinned through the same entry — before this case only the wrapper was exercised,
+//     which is the shape the entry does NOT receive in production.
 //
 // Deliberate omissions: `threadRead.tool.ts` is NOT imported, so this file loads
 // without the parallel transcript change, and the read/send orders are asserted by
@@ -123,7 +128,12 @@ describe('threadDelete metadata literal', () => {
 
         // Why the tool exists: reclaiming a one-shot delegation's own thread, and the
         // issue that tracks it (the roster cap is what makes it an availability bug).
-        expect(description).toContain('Every delegation mints its own thread');
+        // The claim is scoped to a delegation FROM A CONVERSATION: a root delegation
+        // reuses the subagent's DEFAULT conversation (`src/harness.ts:10987`,
+        // `defaultThreadOf(brain)`), which this tool refuses to release, so "every
+        // delegation mints its own thread" was promising a slot that never got minted.
+        expect(description).toContain('A delegation FROM A CONVERSATION mints its own thread');
+        expect(description).toContain("reuses that subagent's default conversation");
         expect(description).toContain('issue 0027');
         // Read first: deletion is not a close, it is a purge.
         expect(description).toContain('read what you still need with threadRead or agentResult first');
@@ -135,9 +145,17 @@ describe('threadDelete metadata literal', () => {
         expect(description).toContain(
             'a deleted id becomes unknown to threadList, threadRead, threadSend and this tool'
         );
-        // Scope and refusals.
+        // Scope and refusals — ALL FIVE, in the order the runtime reaches them
+        // (`threadDeleteFor` lineage gate, then `deleteThread`: default conversation,
+        // live target, live descendant, unknown id). The running-descendant refusal is the
+        // one a description used to omit, and it is the one that saves a caller from
+        // believing a delete was half-applied: `deleteThread`'s descendant pass in
+        // `src/harness.ts` throws with the CHILD's id and removes nothing.
         expect(description).toContain('one of YOUR DESCENDANTS that is no longer running');
+        expect(description).toContain('Five things are refused');
         expect(description).toContain('a thread that is RUNNING (stop it first)');
+        expect(description).toContain('a finished target that still has a RUNNING descendant');
+        expect(description).toContain('nothing is half-deleted');
         expect(description).toContain("this agent's default conversation (agent:<name>)");
         expect(description).toContain('a thread outside your lineage');
         // The cascade, and both receipt fields.
@@ -233,6 +251,41 @@ describe('threadDelete execute', () => {
         // The runtime reads `undefined` as "no calling conversation" and leaves that
         // caller unscoped; the entry never substitutes a guess.
         expect(threadDelete.mock.calls).toEqual([[undefined, 'thread-1']]);
+    });
+
+    // THE SHAPE THE LIVE CALL ACTUALLY HANDS OVER. `threadDelete` declares exactly ONE
+    // schema property, so `toolParameterKey` (src/core/tool.ts:65-73) names `thread` and
+    // `resolveToolParameters` UNWRAPS the model's `{ "thread": "…" }` to that property's
+    // VALUE on both the model path and the direct `executeTool` path. Every other case in
+    // this file builds the wrapper object — the shape the schema advertises and a
+    // hand-built context produces — so without this case the entry could have read only
+    // the wrapper and passed every test here while the real call delivered `undefined`
+    // ("threadDelete needs a thread"). Pinned against the entry's own comment at
+    // src/tools/runtime/threadDelete.tool.ts:113-118.
+    it('accepts the single-property UNWRAPPED id the harness actually delivers', async () => {
+        const { threadDelete, context } = stubRuntime('thread-7', ['thread-7', 'thread-9']);
+
+        // `parameters` is the BARE STRING, not `{ thread: 'thread-7' }`, and the caller
+        // thread still travels first. The receipt is returned untouched.
+        await expect(threadDeleteEntry.execute(context('  thread-7  ' as never, 'thread-3'))).resolves.toEqual({
+            deleted: 'thread-7',
+            removedThreadIds: ['thread-7', 'thread-9']
+        });
+        expect(threadDelete.mock.calls).toEqual([['thread-3', 'thread-7']]);
+
+        // Both shapes are read, so the wrapper a hand-built context produces still works
+        // in the same build — asserted as one call list to pin the order too.
+        const both = stubRuntime('thread-8', ['thread-8']);
+
+        await threadDeleteEntry.execute(both.context({ thread: 'thread-8' }, 'thread-4'));
+        expect(both.threadDelete.mock.calls).toEqual([['thread-4', 'thread-8']]);
+
+        // A bare non-string (the unwrap of a wrong-typed argument) is still the entry's own
+        // refusal, and the runtime is not called.
+        const wrong = stubRuntime('thread-1', ['thread-1']);
+
+        expect(() => threadDeleteEntry.execute(wrong.context(42 as never, 'thread-3'))).toThrow(NEEDS_THREAD);
+        expect(wrong.threadDelete.mock.calls).toEqual([]);
     });
 
     it('refuses a call with no live harness', () => {

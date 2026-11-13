@@ -172,11 +172,24 @@ const second = snapshot({
 });
 
 const serve = (): void => {
+    let made = 0;
+
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap({ sessions: [first, second] }));
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1' && method === undefined) return json({ session: first });
         if (url === '/api/sessions/s2' && method === undefined) return json({ session: second });
+
+        // T3 (R1): the header `+` CREATES a conversation. A POST on the directory's own path,
+        // answered with a fresh 0-turn record under the harness the BODY names — the created
+        // row is what the live panel below re-mounts for, so the fixture has to serve it.
+        if (url === '/api/sessions' && method === 'POST') {
+            made += 1;
+
+            return json({ session: snapshot({ id: `made-${made}`, createdAt: 900, updatedAt: 900 }) }, 201);
+        }
+        if (url === '/api/sessions/made-1' && method === undefined)
+            return json({ session: snapshot({ id: 'made-1', createdAt: 900, updatedAt: 900 }) });
 
         return undefined;
     });
@@ -325,9 +338,13 @@ it('mounts, switches and disposes a registered live panel without touching the t
     // live panel is appended after the tool cards, never between them.
     expect(scratchHost().querySelector('.panel')?.getAttribute('data-panel-id')).toBe('other');
 
-    // New session: the conversation is gone, so the live panel is gone with it — and
-    // its listener stops answering. The host's own empty-board behaviour is unchanged.
+    // New session: the conversation the panel was mounted for is gone, so that instance is
+    // disposed and a FRESH one is mounted for the conversation the create opened — T3 (R1)
+    // means the press now lands on a real 0-turn record (`made-1`), and a session-scoped
+    // panel re-mounts for it, exactly as it does for a pill switch. The listener of the old
+    // instance stops answering; the new one's does.
     byClass('.harness-title-row .new-session', 'button').click();
+    await flush();
     await flush();
 
     expect(mountLog).toEqual([
@@ -336,15 +353,20 @@ it('mounts, switches and disposes a registered live panel without touching the t
         'dispose:1',
         'mount:2:s2',
         'resize:2',
-        'dispose:2'
+        'dispose:2',
+        'mount:3:made-1'
     ]);
 
     window.dispatchEvent(new Event('resize'));
-    expect(mountLog[6]).toBeUndefined();
-    // Every live panel is gone with the conversation — the test's `tasks` panel AND the
-    // two the shell registers — and the host falls back to its empty-board behaviour.
-    expect(scratchHost().querySelectorAll('.panel')).toHaveLength(0);
-    expect(scratchHost().hidden).toBe(true);
+    expect(mountLog[7]).toBe('resize:3');
+    // The TOOL pipeline has nothing to draw for a conversation with no turns, so the board's
+    // only nodes are the live panels — the test's `tasks` panel and the two the shell
+    // registers — and the rail's copy says so.
+    expect(toolCardsIn()).toHaveLength(0);
+    expect(extensionNodesIn().map((node) => node.outerHTML)).toEqual([
+        '<div class="panel panel-extension" data-panel-extension="tasks" data-panel-slot="scratch">' +
+            '<h3 class="panel-title">Tasks</h3></div>'
+    ]);
     expect(document.querySelector('.scratch-note')?.textContent).toBe(
         'No tool panels yet. A tool that publishes ui/panels lands here.'
     );
@@ -352,7 +374,7 @@ it('mounts, switches and disposes a registered live panel without touching the t
     // Reopening s1 is a fresh instance, scoped to the conversation it now reads.
     await openSession('s1');
 
-    expect(mountLog.slice(6)).toEqual(['mount:3:s1']);
+    expect(mountLog.slice(7)).toEqual(['resize:3', 'dispose:3', 'mount:4:s1']);
     expect(extensionNodesIn()).toHaveLength(1);
     expect(scratchHost().querySelector('.panel')?.getAttribute('data-panel-id')).toBe('status');
 });

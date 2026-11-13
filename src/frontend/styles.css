@@ -1865,12 +1865,15 @@ body.is-resizing-rail {
 /* The two catalogue toggles (`⚒` tools / `⚙` plugins) moved out of the topbar's right
    corner onto this line because the panes they open are presented for the
    session CURRENTLY in view (this header — and so the pair of toggles — is repainted per
-   session; there is one pair for the session shown, not one per session). What is NOT
-   session-scoped is what those panes WRITE: their enablement switches are deployment-wide
-   (every conversation on the server, from the next turn), and the genuinely per-session
-   tool state (`/sessions/{id}/tools`) lives on a route neither pane calls. The wrapper
-   mirrors `.topbar-right` — a flex group the sheet can position as ONE unit — and
-   `margin-left: auto` pins it to the far right of the row, after the id span.
+   session; there is one pair for the session shown, not one per session). What they WRITE is
+   session-scoped too: a tool gate PATCHes `/sessions/{id}/tools/{tool_id}` and a plugin
+   setting PATCHes `/sessions/{id}/plugins/{plugin_id}`, so both change what THIS conversation
+   runs with and nothing else. With NO session bound the pair has nothing to configure, so
+   `paintControls` puts `hidden` on the group and on both buttons — they are not rendered at
+   all, which is the state the reader described ("there is no tool/plugin button visible since
+   no session of that harness is selected"). The wrapper mirrors `.topbar-right` — a flex group
+   the sheet can position as ONE unit — and `margin-left: auto` pins it to the far right of the
+   row, after the id span.
 
    Box model (jsdom cannot lay this out, so the arithmetic is written down):
    - `flex: 0 0 auto` keeps the group at its content width (30px + 8px + 30px = 68px), so the
@@ -1893,6 +1896,22 @@ body.is-resizing-rail {
     gap: 8px;
     flex: 0 0 auto;
     margin-left: auto;
+}
+
+/* HIDDEN MEANS GONE. `.harness-title-tools` declares `display: flex` and the two buttons
+   declare `display: inline-flex`, and an AUTHOR rule always outranks the UA stylesheet's
+   `[hidden] { display: none }` at equal specificity — so without these rules the unbound state
+   would still show two icons that open nothing. The group rule is what the reader sees (it
+   takes both buttons out in one declaration); the per-button rules exist because
+   `paintControls` sets `hidden` on each control too, and the DOM's answer and the screen's
+   answer must be the same figure. Pinned by name in compact-ui.test.ts. */
+.harness-title-tools[hidden] {
+    display: none;
+}
+
+.tools-toggle[hidden],
+.plugins-toggle[hidden] {
+    display: none;
 }
 
 .harness-note {

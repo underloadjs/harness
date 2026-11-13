@@ -24,10 +24,12 @@ import type {
     HarnessDescriptor,
     SessionSnapshot,
     SessionStreamItem,
-    SessionTurn
+    SessionTurn,
+    ToolDescriptor
 } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { bumpFixtureEpoch, viewAwareFetch } from './view-test-support';
+import { sessionToolPage, sessionToolRow } from './session-config-test-support';
 import type { HarnessStreamOptions, StreamDouble } from './view-test-support';
 
 // T37: canonical request evidence.
@@ -215,6 +217,51 @@ const stubFetch = (
     );
 
     return calls;
+};
+
+// T4: the ⚒ tools and ⚙ plugins panes describe the CONVERSATION the card points at, and main.ts
+// HIDES both header toggles while no conversation is bound (`sessionIsBound`). A test that opens
+// either pane therefore needs BOTH halves of the new subject: a session in the boot roster, and
+// the toolbox page that pane reads (`GET /sessions/{id}/tools`, ./api.ts `listSessionTools`).
+// `withConversation` states the first, `conversationToolbox` the second, and the row semantics are
+// the SERVER's — `sessionToolRow` encodes src/server/api-reads.ts:959-994 for `protected`,
+// `declared` and `origin`, so a core name arrives locked for the right reason.
+const withConversation = (boot: Record<string, unknown> = {}): Record<string, unknown> =>
+    bootstrap({ ...boot, sessions: [snapshot()] });
+
+const conversationToolbox = (tools: readonly ToolDescriptor[] = []): Response =>
+    json(
+        sessionToolPage(
+            tools.map((tool) =>
+                sessionToolRow({
+                    name: tool.name,
+                    group: tool.group,
+                    description: tool.description,
+                    tags: tool.tags,
+                    visibility: tool.visibility,
+                    // A toolbox row is a name this conversation CAN call, so the figure is ON. The
+                    // deployment catalogue's own `enabled` is a different subject and never reaches
+                    // the pane.
+                    enabled: true
+                })
+            )
+        )
+    );
+
+// The routes that make a conversation the pane's subject: the roster that names it, the view open
+// that pointer triggers, and the toolbox page. All three match any conversation id, because the
+// same fixtures are used by tests that move the card.
+const conversationRoutes = (
+    url: string,
+    method: string | undefined,
+    tools: readonly ToolDescriptor[] = []
+): Response | undefined => {
+    if (method !== undefined) return undefined;
+    if (/^\/api\/sessions$/.test(url.split('?')[0])) return json({ sessions: [snapshot()] });
+    if (/^\/api\/sessions\/[^/?]+$/.test(url)) return json({ session: snapshot() });
+    if (/^\/api\/sessions\/[^/]+\/tools/.test(url)) return conversationToolbox(tools);
+
+    return undefined;
 };
 
 // T37: the canonical live surface (replaces the SSE self-stub this file used to hand-roll).
@@ -867,10 +914,13 @@ it('shows the tools badge only in the tools view and keeps it hidden in the chat
         }
     };
 
-    stubFetch((url) => {
-        if (url === '/api') return json(bootstrap({ tools: [tool] }));
+    stubFetch((url, method) => {
+        // T4: the pane this test opens describes a CONVERSATION, so the fixture binds one and
+        // answers its toolbox with the same `read` descriptor the boot document lists.
+        if (url === '/api') return json(withConversation({ tools: [tool] }));
         if (url === '/api/models') return json({ models: ['m1'] });
-        return undefined;
+
+        return conversationRoutes(url, method, [tool]);
     });
 
     await import('./main');
@@ -1229,6 +1279,10 @@ it('restores a remembered session with its frozen team and server timings', asyn
 
     let messageRequests = 0;
     let writes = 0;
+    // T3 (R1): `+ New session` is now a SERVER create, so this test's "opening a session is
+    // read-only" rule has to stay measurable — `writes` keeps counting writes to the RESTORED
+    // record, and `creates` counts the one new record the `+` press is required to make.
+    let creates = 0;
 
     stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap({ presets: [descriptor()], sessions: [restored] }));
@@ -1241,6 +1295,14 @@ it('restores a remembered session with its frozen team and server timings', asyn
             return json({ session: restored });
         }
         if (url === '/api/sessions' && method === undefined) return json({ sessions: [restored] });
+        // The `+` create: a brand-new, 0-turn record under a brand-new id, with the frozen
+        // team the server captured from the live descriptor at create time.
+        if (url === '/api/sessions' && method === 'POST') {
+            creates += 1;
+
+            return json({ session: snapshot({ id: 's-fresh', harnessDefinition: descriptor() }) }, 201);
+        }
+        if (url === '/api/sessions/s-fresh') return json({ session: snapshot({ id: 's-fresh', harnessDefinition: descriptor() }) });
         if (url.endsWith('/messages')) messageRequests += 1;
         return undefined;
     });
@@ -1339,14 +1401,27 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(0);
     byClass('.harness-title-row .new-session', 'button').click();
     await flush();
+    await flush();
 
+    // T3 (R1): the press CREATED a record — exactly one, against the harness on screen — and
+    // the card adopted its id. Nothing was written to the conversation that was left behind:
+    // `writes` still counts writes to `s1`, and the press made none.
+    expect(creates).toBe(1);
+    expect(writes).toBe(0);
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s-fresh');
+
+    // The transcript is the new conversation's: empty, and back to the harness descriptor
+    // rather than the frozen team of the record that was released.
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
-    expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
+    // T3: the header note is the "this card edits the harness TEMPLATE" sentence, and a card
+    // that has just ADOPTED a conversation is locked again — so the note is empty and hidden,
+    // exactly as it is for the restored session higher up in this test.
+    const noteAfterNew = document.querySelector<HTMLElement>('.harness-note');
+    expect(noteAfterNew?.textContent).toBe('');
+    expect(noteAfterNew?.hidden).toBe(true);
     expect(agentNames()).toEqual(['Instruct']);
     expect(instructionBox().disabled).toBe(false);
     expect(applyAction().textContent).toBe('Save configuration');
-    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
-    expect(writes).toBe(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -1798,13 +1873,26 @@ const gammaHarness = (): HarnessDescriptor =>
 // T37: `reads` counts the canonical row page of the conversation the shell opened (see
 // `selectionStub`), and the socket double is installed so no test depends on jsdom's real
 // `WebSocket` answering a dial no fixture drives.
+//
+// T3 (R1): `+ New session` POSTs `/sessions`, so this fixture answers it too — a NEW id
+// (`made-1`, `made-2`, …) under the harness the BODY names, with no turns. `creates` is the
+// log the tests assert against, and a created record joins the readable set at once, because
+// the directory and the cycler both list it from the moment the answer lands.
 const enterStub = async (
     rows: SessionSnapshot[],
     presets: HarnessDescriptor[],
     hold: string[] = []
-): Promise<{ reads: string[]; release: (id: string) => void }> => {
+): Promise<{
+    reads: string[];
+    creates: { url: string; harness: unknown }[];
+    release: (id: string) => void;
+}> => {
     const reads: string[] = [];
+    const creates: { url: string; harness: unknown }[] = [];
     const waiters = new Map<string, (response: Response) => void>();
+    // What this server actually holds: the fixture rows plus everything the shell creates.
+    const records = [...rows];
+    let made = 0;
 
     await installLiveStream({});
 
@@ -1812,14 +1900,27 @@ const enterStub = async (
         const url = String(input);
         const method = init?.method;
 
-        if (url === '/api') return json(bootstrap({ presets, sessions: rows }));
+        if (url === '/api') return json(bootstrap({ presets, sessions: records }));
         if (url === '/api/models') return json({ models: ['m1'] });
-        if (url === '/api/sessions' && method === undefined) return json({ sessions: rows });
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: records });
+
+        // T3: a create is a POST on the SAME path as the directory read, so the METHOD is the
+        // only thing that tells them apart — every filter over these routes has to name it.
+        if (url === '/api/sessions' && method === 'POST') {
+            const body = init?.body === undefined ? {} : JSON.parse(String(init.body));
+            const harness = String((body as { harness?: unknown }).harness ?? '');
+            made += 1;
+            creates.push({ url: '/api/sessions', harness });
+            const created = conversation(`made-${made}`, T, { harness, turns: [] });
+            records.push(created);
+
+            return json({ session: created }, 201);
+        }
 
         const read = /^\/api\/sessions\/([^/]+)$/.exec(url);
         if (read !== null && method === undefined) {
             const id = decodeURIComponent(read[1]);
-            const record = rows.find((row) => row.id === id);
+            const record = records.find((row) => row.id === id);
             if (record === undefined) return json({ error: { message: `unknown session ${id}` } }, 404);
 
             if (hold.includes(id)) {
@@ -1849,9 +1950,10 @@ const enterStub = async (
 
     return {
         reads,
+        creates,
         release: (id: string): void => {
             const settle = waiters.get(id);
-            const record = rows.find((row) => row.id === id);
+            const record = records.find((row) => row.id === id);
             if (settle === undefined || record === undefined) {
                 throw new Error(`no held read for ${id}`);
             }
@@ -2079,7 +2181,7 @@ it('keeps the conversation the reader chose when they leave a harness and come b
     expect(activePillIds()).toEqual(['ws-old']);
 });
 
-it('leaves a harness empty across a switch when the reader started a new session', async () => {
+it('keeps the conversation the reader created across a harness switch, and never re-opens a saved one', async () => {
     const rows = [conversation('in-1', T + 2_000), conversation('ws-1', T + 7_000, { harness: 'workspace' })];
 
     const stub = await enterStub(rows, [descriptor(), workspaceHarness()]);
@@ -2093,13 +2195,26 @@ it('leaves a harness empty across a switch when the reader started a new session
     await flush();
     expect(stub.reads).toEqual(['in-1', 'ws-1']);
 
-    // `+ New session` is the explicit choice of an empty conversation.
+    // T3 (R1): `+ New session` is now an EAGER create — one POST, one new server record — and
+    // the card adopts the id the server assigned. The old rule ("the first submit after it
+    // creates the server record") is gone; this is the evidence that replaced it.
+    stub.creates.length = 0;
     byClass('.harness-title-row .new-session', 'button').click();
     await flush();
-    expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+    await flush();
 
-    // Away and straight back: the empty composer is what the reader left, and the entry
-    // rule does not hand them a saved conversation instead.
+    expect(stub.creates).toEqual([{ url: '/api/sessions', harness: 'workspace' }]);
+    expect(byClass('.session-cycle', 'button').hidden).toBe(false);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('made-1');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('made-1');
+    // A conversation with no turns is a VALID conversation: an empty board, and no extra
+    // read spent on it (the create answer is the initial authority).
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(stub.reads).toEqual(['in-1', 'ws-1']);
+
+    // Away and straight back. The T24 entry rule still refuses to hand the reader a saved
+    // conversation they did not pick — it just no longer lands on an empty composer: the card
+    // keeps the conversation its reader started.
     byClass('.harness-item[data-harness="instruct"]', 'button').click();
     await flush();
     expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('in-1');
@@ -2108,10 +2223,12 @@ it('leaves a harness empty across a switch when the reader started a new session
     await flush();
     await flush();
 
+    // `ws-1` was never re-read: `made-1` is what this card points at, and entering the harness
+    // again does not open a saved row over it.
     expect(stub.reads).toEqual(['in-1', 'ws-1']);
-    expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('made-1');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('made-1');
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
-    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
 });
 
 it('creates a harness from preset agents with an initial primary', async () => {
@@ -4116,14 +4233,21 @@ it('boots into the empty-catalogue guidance when the server reports no harness',
     expect(byClass('.composer', 'form').hidden).toBe(true);
     expect(byClass('.agent-slot', 'div').hidden).toBe(true);
 
-    // Boot completed, so every catalogue-scoped control is live: "+ New" (the way out of
-    // this state), the header "+", and the two server-wide catalogue toggles whose rows
-    // came back with the bootstrap. The header "+" is a no-op with no instance — the same
-    // state the live delete-all path leaves it in.
+    // Boot completed, so the controls that do not describe a conversation are live: "+ New" (the
+    // way out of this state) and the header "+" (a no-op with no instance — the same state the
+    // live delete-all path leaves it in).
     expect(byClass('.new-harness', 'button').disabled).toBe(false);
     expect(byClass('.harness-title-row .new-session', 'button').disabled).toBe(false);
-    expect(byClass('.tools-toggle', 'button').disabled).toBe(false);
-    expect(byClass('.plugins-toggle', 'button').disabled).toBe(false);
+
+    // T4: the two configuration toggles are GONE, not merely idle. They describe the conversation
+    // the card points at, and an empty catalogue has no harness, therefore no conversation — so the
+    // header stops rendering them (main.ts `sessionIsBound`, and styles.css keeps `hidden` winning
+    // over the group's own `display: flex`). The pre-T4 claim "the two server-wide catalogue
+    // toggles are live, their rows came back with the bootstrap" is the deployment scope this task
+    // removed: with nothing to configure, an offer to configure it would be the lie.
+    expect(byClass('.harness-title-tools', 'div').hasAttribute('hidden')).toBe(true);
+    expect(byClass('.tools-toggle', 'button').hasAttribute('hidden')).toBe(true);
+    expect(byClass('.plugins-toggle', 'button').hasAttribute('hidden')).toBe(true);
 
     // A press of the header "+" cannot invent a session out of nowhere: no harness means no
     // `current`, and `newSession`'s guard returns before any request.
@@ -4752,10 +4876,14 @@ it('never resurrects a deleted session from a stale session-list answer', async 
 // ---------------------------------------------------------------------------
 
 it('publishes a 0px composer anchor while the tools view hides the input', async () => {
-    stubFetch((url) => {
-        if (url === '/api') return json(bootstrap());
+    stubFetch((url, method) => {
+        // T4: the tools toggle this test presses only exists while a conversation is bound, so
+        // the fixture binds one. Its toolbox is EMPTY here — the assertion is about the composer,
+        // and an empty toolbox still takes the centre column the same way.
+        if (url === '/api') return json(withConversation());
         if (url === '/api/models') return json({ models: ['m1'] });
-        return undefined;
+
+        return conversationRoutes(url, method);
     });
 
     await import('./main');

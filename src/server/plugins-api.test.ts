@@ -11,10 +11,16 @@
 //   3. REFUSALS  - unknown plugin => 404; unknown key, wrong type, out-of-range, empty patch,
 //                  and an unknown body field => 400 with the exact message; a method the path
 //                  does not declare => 405 naming what it does.
-//   4. LIVE      - the provider `SessionStore.buildHarness` handed the preset is THE store's
-//                  provider object, and a plugin's `api.settings.number('contextLimit')` inside
-//                  an EXISTING session's harness returns the new value on its very next turn -
-//                  same harness object, no rebuild.
+//   4. LIVE      - the provider `SessionStore.buildHarness` handed the preset is THAT SESSION's
+//                  own provider object (R4: one settings store per session, seeded from this
+//                  process/template store at creation, ./sessions.ts `create`), and a plugin's
+//                  `api.settings.number('contextLimit')` inside an EXISTING session's harness
+//                  returns the new value on its very next turn - same harness object, no
+//                  rebuild - when the write is SESSION-SCOPED (`store.updateSessionPluginSettings`,
+//                  the store twin of `PATCH /sessions/{id}/plugins/{plugin_id}` whose REST shape
+//                  ./session-plugins-api.test.ts owns). A TEMPLATE write reaches an existing
+//                  session's plugin by NOTHING; it moves only the store a session created AFTER
+//                  it is seeded from - pinned by the companion case in the R2 block below.
 //   5. DURABLE   - `state.json` carries the override and nothing else, and a fresh runtime on
 //                  the same root boots with it (both through `GET /plugins` and through the
 //                  provider a new session would read). A deployment that never edited anything
@@ -26,7 +32,10 @@
 //
 // Cross-references:
 //   - ./plugins.ts                    — the store these routes read and write
-//   - ./sessions.ts                   — `buildHarness` (the report) and `updatePluginSettings`
+//   - ./sessions.ts                   — `buildHarness` (the report), `updatePluginSettings`
+//                                       (TEMPLATE scope) and `updateSessionPluginSettings`
+//                                       (ONE session's store, the R4 scope)
+//   - ./session-plugins-api.test.ts    — the session-scoped routes on the same probe
 //   - ./harnesses/toolbox.ts          — the factory that forwards it into `harness()`
 //   - ../plugins/context-compaction.plugin.ts — the settings the acceptance criteria name
 //   - ./api.ts                        — `getPlugins` / `patchPlugin` and the route table
@@ -1221,18 +1230,21 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
 });
 
 describe('the live settings provider reaches an existing session', () => {
-    it('passes the store\'s own provider into every harness build, and a PATCH changes the next turn', async () => {
+    it('passes the session\'s own provider into its harness build, and a SESSION-SCOPED write changes the next turn', async () => {
         const runtime = createRuntime();
         const sessionId = await createSession(runtime);
 
-        // The wiring proof: the report `buildHarness` supplied carried THIS store's provider
-        // object (identity, not an equal copy), which is what `createToolboxHarness` forwards
-        // into `harness({ pluginSettings })` for every shipped preset.
+        // The wiring proof (R4): the report `buildHarness` supplied carried THIS SESSION's own
+        // provider object (identity, not an equal copy), which is what `createToolboxHarness`
+        // forwards into `harness({ pluginSettings })` for every shipped preset. The template
+        // store this runtime was seeded from is a DIFFERENT object, so two sessions of one
+        // harness template can never share a provider - and neither one reads the template.
         expect(builtReports).toHaveLength(1);
 
         const report = builtReports[0];
 
-        expect(report?.pluginSettings).toBe(pluginsOf(runtime).provider);
+        expect(report?.pluginSettings).toBe(runtime.store.liveSession(sessionId).plugins.provider);
+        expect(report?.pluginSettings).not.toBe(pluginsOf(runtime).provider);
 
         const record = runtime.store.liveSession(sessionId);
 
@@ -1241,11 +1253,15 @@ describe('the live settings provider reaches an existing session', () => {
 
         expect(probeReads).toEqual([200000]);
 
-        const patched = await patchSettings(runtime, 'context-compaction', { contextLimit: 24000 });
+        // The write is SESSION-SCOPED (the store twin of `PATCH /sessions/{id}/plugins/{id}`,
+        // ./api.ts `patchSessionPlugin`): it moves THIS session's store and nothing else, so the
+        // effective map it answers is that session's, and the provider the harness already holds
+        // is the object that answers the new number.
+        const values = await runtime.store.updateSessionPluginSettings(sessionId, 'context-compaction', { contextLimit: 24000 });
 
-        expect(patched.status).toBe(200);
+        expect(values.contextLimit).toBe(24000);
 
-        // The SAME provider object the harness already holds now answers the new number...
+        // ...on the SAME provider object the harness already holds...
         expect(report?.pluginSettings?.get('context-compaction', 'contextLimit')).toBe(24000);
 
         // ...and the SAME harness object (no rebuild, no new session) reads it on its next turn.
@@ -1255,8 +1271,13 @@ describe('the live settings provider reaches an existing session', () => {
 
         expect(probeReads).toEqual([200000, 24000]);
 
+        // The scope boundary, from the other side: none of this touched the template store, so
+        // `GET /plugins` (this file's own route) still answers the declared default.
+        expect(pluginsOf(runtime).snapshot()).toEqual({});
+        expect((await call(runtime, 'GET', `${MOUNT}/plugins`)).body.items[1].values.contextLimit).toBe(200000);
+
         // A reset is equally immediate: the plugin falls back to the declared default.
-        await patchSettings(runtime, 'context-compaction', { contextLimit: null });
+        await runtime.store.updateSessionPluginSettings(sessionId, 'context-compaction', { contextLimit: null });
         await record.harness('three');
 
         expect(probeReads).toEqual([200000, 24000, 200000]);
@@ -1776,14 +1797,18 @@ describe('R2 — the global plugin switch', () => {
         expect(probeReads).toEqual([200000]);
 
         // The write lands with a session ALIVE and needs no idle window (R1: the page is
-        // reachable while a thread is running, and this route has no 409 path at all).
-        const patched = await patchSettings(runtime, 'context-compaction', { enabled: false });
+        // reachable while a thread is running, and this route has no 409 path at all). It is
+        // SESSION-SCOPED, because that is the only scope that reaches a session that already
+        // exists (R4) - the TEMPLATE `patchSettings` below moves it by nothing, and the
+        // companion case right after this one pins exactly that.
+        const values = await runtime.store.updateSessionPluginSettings(sessionId, 'context-compaction', { enabled: false });
 
-        expect(patched.status).toBe(200);
+        // The store answers the effective map of THAT session, switched off.
+        expect(values.enabled).toBe(false);
         expect(runtime.store.liveSession(sessionId).harness).toBe(record.harness);
 
-        // Turn 2: the gate in ../plugin/host.ts consults the live provider, so this
-        // plugin's handler is NOT delivered — and the run still answers normally.
+        // Turn 2: the gate in ../plugin/host.ts consults the live provider of THIS session, so
+        // this plugin's handler is NOT delivered — and the run still answers normally.
         const second = await record.harness('two');
 
         expect(probeReads).toEqual([200000]);
@@ -1791,7 +1816,7 @@ describe('R2 — the global plugin switch', () => {
 
         // Turn 3 after the click back on: the same registration is live again, with no
         // re-registration and no new session.
-        await patchSettings(runtime, 'context-compaction', { enabled: true });
+        await runtime.store.updateSessionPluginSettings(sessionId, 'context-compaction', { enabled: true });
         await record.harness('three');
 
         expect(probeReads).toEqual([200000, 200000]);
@@ -1799,6 +1824,63 @@ describe('R2 — the global plugin switch', () => {
         // `has()` follows the gate too, so an emit site guarded by it skips the payload
         // construction: a disabled permanent subscriber costs what no subscriber costs.
         expect(runtime.store.liveSession(sessionId).harness).toBe(record.harness);
+
+        // THE SCOPE SPLIT: every write above is the session's, so the template store this file's
+        // routes own still reports the plugin on, with no override of its own.
+        expect(pluginsOf(runtime).snapshot()).toEqual({});
+        expect((await call(runtime, 'GET', `${MOUNT}/plugins`)).body.items[1]).toMatchObject({
+            name: 'context-compaction',
+            enabled: true
+        });
+    });
+
+    it('leaves an EXISTING session alone: a TEMPLATE write moves only a session created after it', async () => {
+        const runtime = createRuntime();
+        const existing = await createSession(runtime);
+
+        await runtime.store.liveSession(existing).harness('one');
+
+        expect(probeReads).toEqual([200000]);
+
+        // The TEMPLATE scope, through the route this file is about: the process store moves, and
+        // it is the store a session created from here on is seeded from (./sessions.ts `create`).
+        const patched = await patchSettings(runtime, 'context-compaction', { enabled: false });
+
+        expect(patched.status).toBe(200);
+        expect(patched.body.plugin).toMatchObject({ name: 'context-compaction', enabled: false });
+        expect(pluginsOf(runtime).snapshot()).toEqual({ 'context-compaction': { enabled: false } });
+
+        // (a) NOTHING that already exists moves. The session's own store still holds no override,
+        // its provider (the object its harness holds) still answers the declared default, and the
+        // hook is delivered on the very next turn - the exact opposite of the case above.
+        await runtime.store.liveSession(existing).harness('two');
+
+        expect(probeReads).toEqual([200000, 200000]);
+        expect(runtime.store.liveSession(existing).plugins.snapshot()).toEqual({});
+        expect(runtime.store.liveSession(existing).plugins.get('context-compaction', 'enabled')).toBeUndefined();
+        expect(runtime.store.liveSession(existing).plugins.enabled('context-compaction')).toBe(true);
+        expect(builtReports[0]?.pluginSettings).toBe(runtime.store.liveSession(existing).plugins.provider);
+
+        // (b) a session created AFTER the write inherits it - its own store, seeded at creation -
+        // and reads it on its first turn, so its hook never fires at all.
+        const created = await createSession(runtime);
+
+        expect(runtime.store.liveSession(created).plugins.snapshot()).toEqual({ 'context-compaction': { enabled: false } });
+        // Two sessions, two providers, and neither is the template's (R4).
+        expect(builtReports[1]?.pluginSettings).toBe(runtime.store.liveSession(created).plugins.provider);
+        expect(builtReports[1]?.pluginSettings).not.toBe(builtReports[0]?.pluginSettings);
+        expect(builtReports[1]?.pluginSettings).not.toBe(pluginsOf(runtime).provider);
+
+        await runtime.store.liveSession(created).harness('one');
+
+        expect(probeReads).toEqual([200000, 200000]);
+        expect(runtime.store.liveSession(created).plugins.enabled('context-compaction')).toBe(false);
+
+        // The pre-existing session is still untouched by the template value afterwards, too.
+        await runtime.store.liveSession(existing).harness('three');
+
+        expect(probeReads).toEqual([200000, 200000, 200000]);
+        expect(runtime.store.liveSession(existing).plugins.snapshot()).toEqual({});
     });
 
     it('persists the reserved key as the only override and restores it on the next boot', async () => {

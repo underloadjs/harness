@@ -21,6 +21,7 @@
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts src/frontend/canonical-shell-flow.test.ts
 import { HARNESS_SERVICE_CAPABILITIES, HARNESS_SERVICE_LIMITS, HARNESS_PAGE_LIMIT } from '../shared/harness-api';
+import { sessionToolPage, sessionToolRow } from './session-config-test-support';
 import type { HarnessStreamOptions, StreamDouble } from './view-test-support';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
@@ -188,6 +189,33 @@ const stub = (sessions: Record<string, unknown>[]): void => {
             if (path === `${ROOT}/agents`) return json(page([]));
             if (path === `${ROOT}/sessions` && method === 'GET') return json(page(sessions));
             if (path === `${ROOT}/models` && method === 'POST') return json({ models: ['m1'] });
+
+            // --- the ⚒ pane: the toolbox of the conversation on screen (T4) -----------------
+            // The pane lists THIS session's registrations, not `GET /tools`. The row is the
+            // server's own projection (`sessionToolRowsOf`, ../server/api-reads.ts:959-994): the
+            // name HARNESS_CARD's frozen definition declares (`core_tools: ['tasks']`), so
+            // `declared`/`protected` are true and `origin` is the catalogue's. It carries NO
+            // `parameters` — that is the whole point of the identified read below.
+            if (path === `${ROOT}/sessions/chat-1/tools` && method === 'GET') {
+                return json(
+                    sessionToolPage([
+                        sessionToolRow(
+                            {
+                                name: 'tasks',
+                                group: 'Core tools',
+                                description: 'Read or update the session task list.',
+                                tags: ['core', 'harness'],
+                                visibility: 'core',
+                                session_bound: true,
+                                declared: true,
+                                origin: 'catalogue',
+                                enabled: true
+                            },
+                            'chat-1'
+                        )
+                    ])
+                );
+            }
 
             // --- the identified tool read: the ONLY place `parameters` exists -------------
             if (path === `${ROOT}/tools/tasks` && method === 'GET') return json({ tool: TASK_DETAIL });

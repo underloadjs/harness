@@ -17,6 +17,7 @@
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 
 const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -86,6 +87,12 @@ type Call = { url: string; method: string | undefined; body: unknown; keepalive:
 // adoption of the playground's session would be visible as a second row.
 const CHAT = 'chat-1';
 
+// The conversation the OTHER harness (beta) owns. T4 makes this fixture necessary rather than
+// optional: the ⚒ pane describes a CONVERSATION, so a card move onto a harness that has none hides
+// the toggle and closes the pane — and "the playground keeps running on its own harness after the
+// chat moved" could no longer be reached at all.
+const CHAT_B = 'chat-2';
+
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
 // A stub server with a queue of created session ids, so a test can see exactly how many
@@ -95,6 +102,11 @@ const stubServer = (options: {
     tools: ToolDescriptor[];
     createdIds?: string[];
     holdCreate?: () => Promise<unknown>;
+    // T4: give the SECOND harness a conversation of its own. The ⚒ pane describes a conversation,
+    // so a card move onto a harness with none hides the toggle and closes the pane; only the
+    // harness-switch case needs the beta conversation, and every other test keeps the single-row
+    // directory its assertions count.
+    withBeta?: boolean;
 }): Call[] => {
     const calls: Call[] = [];
     const pool = [...(options.createdIds ?? ['temp-1', 'temp-2', 'temp-3'])];
@@ -102,6 +114,13 @@ const stubServer = (options: {
     // real roster: the playground's session appears in it while it lives, which is the
     // leak the client-side filters have to stop.
     const made: string[] = [];
+    // The conversations the directory reports: `CHAT` on alpha (the reader's own, open at boot),
+    // the playground's temp sessions while they live, and `CHAT_B` on beta when the fixture asks.
+    const conversations = (): SessionSnapshot[] => [
+        snapshot(CHAT),
+        ...(options.withBeta === true ? [snapshot(CHAT_B, 'beta')] : [])
+    ];
+    const roster = (): SessionSnapshot[] => [...conversations(), ...made.map((id) => snapshot(id))];
 
     vi.stubGlobal(
         'fetch',
@@ -117,15 +136,24 @@ const stubServer = (options: {
                     presets: options.presets,
                     tools: options.tools,
                     defaults,
-                    sessions: [snapshot(CHAT)],
+                    sessions: conversations(),
                     agents: []
                 });
             }
             if (url === '/api/models') return json({ models: ['m1'] });
 
+            // T4: the ⚒ pane lists the CONVERSATION's toolbox, and each row's runner reads the
+            // deployment's identified schema (a toolbox row carries none). Both answers come from
+            // `options.tools`, the same list this fixture puts in its boot document, so the pane,
+            // the catalogue and the runner agree by construction
+            // (./session-config-test-support.ts `sessionToolReads`).
+            const toolReads = sessionToolReads(options.tools, url, method);
+
+            if (toolReads !== undefined) return toolReads;
+
             // The directory the rail reads.
             if (url === '/api/sessions' && method === undefined) {
-                return json({ sessions: [snapshot(CHAT), ...made.map((id) => snapshot(id))] });
+                return json({ sessions: roster() });
             }
 
             if (url === '/api/sessions' && method === 'POST') {
@@ -142,7 +170,13 @@ const stubServer = (options: {
             if (url.startsWith('/api/sessions/') && url.endsWith('/cancel')) return json({ cancelled: false });
 
             if (url.match(/^\/api\/sessions\/[^/]+$/) && method === undefined) {
-                return json({ session: snapshot(url.split('/').pop() as string) });
+                const id = decodeURIComponent(url.split('/').pop() as string);
+                // The roster is the authority on WHICH harness a conversation belongs to (the beta
+                // card opens `CHAT_B`, not an alpha record wearing a beta id); anything else is a
+                // session this stub minted on alpha.
+                const record = roster().find((candidate) => candidate.id === id);
+
+                return json({ session: record ?? snapshot(id) });
             }
 
             if (url.match(/^\/api\/sessions\/[^/]+$/) && method === 'DELETE') return json({ deleted: true });
@@ -188,6 +222,23 @@ const openTool = async (name: string): Promise<void> => {
     button.click();
     await flush();
 };
+
+// T4: opening the ⚒ pane reads the conversation it describes — `GET /sessions/{id}/tools` — and
+// each row's runner reads the deployment's identified schema. The toolbox read is the ONE read of
+// the reader's own conversation the pane owes, so the playground claims these tests pin ("the call
+// ran in its OWN session; the chat was never touched") are stated over everything except that
+// route, and the route itself is pinned separately at each site.
+const excludingToolbox = (entries: readonly Call[]): Call[] =>
+    entries.filter((call) => /^\/api\/sessions\/[^/]+\/tools/.test(call.url) === false);
+
+// The exact toolbox call the pane owes, so "the pane read the conversation" stays a pinned fact
+// rather than a permission slip.
+const TOOLBOX_CALL = (id: string): Call => ({
+    url: `/api/sessions/${id}/tools?limit=25`,
+    method: undefined,
+    body: undefined,
+    keepalive: undefined
+});
 
 const argsBox = (): HTMLTextAreaElement => {
     const found = document.querySelector<HTMLTextAreaElement>('.tool-args');
@@ -294,7 +345,10 @@ it('runs a session-bound call in its own session and never adopts it into the ch
     // No chat traffic from the playground: the runner re-read only its own temporary
     // session. T21 R21 opened the reader's conversation ONCE during boot (it is the newest
     // one alpha owns), so the assertion counts what happened after that.
-    expect(byPrefix(calls.slice(bootCalls), '/api/sessions/chat-1')).toEqual([]);
+    expect(excludingToolbox(byPrefix(calls.slice(bootCalls), '/api/sessions/chat-1'))).toEqual([]);
+    // …and the toolbox read it DOES owe, stated exactly: one paged read of the conversation the
+    // pane describes, made when the pane was opened, and nothing after it.
+    expect(byPrefix(calls.slice(bootCalls), '/api/sessions/chat-1/tools')).toEqual([TOOLBOX_CALL(CHAT)]);
 
     // The temporary session is not a conversation: no row in the directory (the server's
     // list answer literally contains it), and it is not the session this browser remembers
@@ -318,6 +372,9 @@ it('runs a session-bound call in its own session and never adopts it into the ch
 it('keeps the same temporary context across playground calls and stays on its own harness', async () => {
     const calls = stubServer({
         presets: [descriptor('alpha'), descriptor('beta')],
+        // T4: the beta card needs a conversation of its own, or the harness switch closes the pane
+        // (no conversation to describe) and `openTool` below has nothing to click.
+        withBeta: true,
         tools: [coreTool('toolRequest', ['tags']), coreTool('tasks', [])]
     });
     await boot();
@@ -499,7 +556,11 @@ it('calls a tool that needs no session directly, with no session traffic at all'
     });
     expect(posts(calls, '/api/sessions', 'POST')).toHaveLength(0);
     // No session read, refresh or create after the boot open: the runner borrowed nothing.
-    expect(byPrefix(calls.slice(bootCalls), '/api/sessions/')).toEqual([]);
+    // T4: the pane's own toolbox read is the single route under `/sessions/` this visit causes;
+    // the SESSION-FREE call itself adds none. Both halves are stated: what the call did not touch,
+    // and the one read the pane owes.
+    expect(excludingToolbox(byPrefix(calls.slice(bootCalls), '/api/sessions/'))).toEqual([]);
+    expect(byPrefix(calls.slice(bootCalls), '/api/sessions/')).toEqual([TOOLBOX_CALL(CHAT)]);
 
     // The session line is hidden for a tool that needs no context.
     expect(document.querySelector<HTMLElement>('.tool-session')?.hidden).toBe(true);

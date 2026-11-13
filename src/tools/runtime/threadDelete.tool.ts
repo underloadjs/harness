@@ -41,7 +41,7 @@ export const THREAD_DELETE_NAME = 'threadDelete';
 export const THREAD_DELETE_METADATA: CoreToolMetadata = {
     name: THREAD_DELETE_NAME,
     description:
-        'Release one FINISHED conversation for good, from the conversation that owns it. Every delegation mints its own thread, and a session holds only a bounded number of them, so a one-shot child is work you reclaim yourself (issue 0027): read what you still need with threadRead or agentResult first, then delete it. Deletion is PERMANENT - the transcript, its invocation record and its branch lookups all go with it, and a deleted id becomes unknown to threadList, threadRead, threadSend and this tool. Pass `thread` for one of YOUR DESCENDANTS that is no longer running: a thread you created, or one created underneath you. Four things are refused: a thread that is RUNNING (stop it first), this agent\'s default conversation (agent:<name>), a thread outside your lineage (an ancestor, a sibling, or another agent\'s conversation is not yours to delete), and any id this session does not have. Deleting cascades, so the finished threads that thread created are removed with it. The receipt reports `deleted` (the id you named) and `removedThreadIds` (every id that actually went, the cascaded ones included), so the state you caused is the state you can see.',
+        'Release one FINISHED conversation for good, from the conversation that owns it. A delegation FROM A CONVERSATION mints its own thread, and a session holds only a bounded number of them, so a one-shot child is work you reclaim yourself (issue 0027): read what you still need with threadRead or agentResult first, then delete it. (A delegation that comes from the host rather than a conversation reuses that subagent\'s default conversation instead of minting one - and this tool will not release a default, so that child has no slot for you to free.) Deletion is PERMANENT - the transcript, its invocation record and its branch lookups all go with it, and a deleted id becomes unknown to threadList, threadRead, threadSend and this tool. Pass `thread` for one of YOUR DESCENDANTS that is no longer running: a thread you created, or one created underneath you. Five things are refused: a thread that is RUNNING (stop it first), a finished target that still has a RUNNING descendant (the refusal names the running child, and nothing is half-deleted), this agent\'s default conversation (agent:<name>), a thread outside your lineage (an ancestor, a sibling, or another agent\'s conversation is not yours to delete), and any id this session does not have. Deleting cascades, so the finished threads that thread created are removed with it. The receipt reports `deleted` (the id you named) and `removedThreadIds` (every id that actually went, the cascaded ones included), so the state you caused is the state you can see.',
     tags: ['thread', 'threads', 'delete', 'remove', 'release', 'cleanup', 'roster'],
     // Same visibility as the rest of the thread group: registered with the first
     // independent thread, then declared for every agent in the session (not
@@ -103,15 +103,22 @@ export const execute = (context: ToolContext) => {
         throw new Error('threadDelete requires the live harness reference.');
     }
 
-    const parameters = (context.parameters ?? {}) as Record<string, unknown>;
-
-    // `thread` is the model's ONLY argument, and unlike threadRead there is no
-    // honest fallback: defaulting to `context.threadId` would aim the delete at the
-    // conversation the caller is running in, which the runtime refuses anyway. An
-    // absent, blank or whitespace-only id is therefore a clear entry-side error —
-    // the schema's `minLength: 1` gates a model call, but a manual `executeTool`
-    // reaches this function with whatever the host passed.
-    const thread = typeof parameters.thread === 'string' ? parameters.thread.trim() : '';
+    // `thread` is the model's ONLY argument, and unlike threadRead there is no honest
+    // fallback: defaulting to `context.threadId` would aim the delete at the conversation
+    // the caller is running in, which the runtime refuses anyway. An absent, blank or
+    // whitespace-only id is therefore a clear entry-side error — the schema's
+    // `minLength: 1` gates a model call, but a manual `executeTool` reaches this function
+    // with whatever the host passed.
+    //
+    // The value arrives in TWO shapes, and both are correct: a tool that declares EXACTLY
+    // ONE property has its arguments UNWRAPPED to that property's value by
+    // `resolveToolParameters` (core/schema-validation.ts, driven by `toolParameterKey` in
+    // core/tool.ts) on BOTH the model path and the direct `executeTool` path, so the live
+    // call hands over the bare id string. The wrapper object is still read for a
+    // hand-built context (and stays the shape the schema advertises to the model).
+    const raw = context.parameters;
+    const wrapped = raw !== null && typeof raw === 'object' ? (raw as Record<string, unknown>).thread : undefined;
+    const thread = (typeof raw === 'string' ? raw : typeof wrapped === 'string' ? wrapped : '').trim();
 
     if (thread.length === 0) {
         throw new Error('threadDelete needs a thread: pass "thread" (see threadList).');

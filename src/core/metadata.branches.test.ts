@@ -4,7 +4,8 @@
 //   - wire names are `actionRequest` and `threadFork`;
 //   - actionRequest advertises 2-8 unique options, a recommended id, and NO
 //     allowCustom model argument;
-//   - threadFork requires a non-empty input and an optional 120-char label;
+//   - threadFork requires a non-empty input, an optional 120-char label, and an
+//     optional caller-set branch clock (no schema default — "omit it" means no limit);
 //   - both are CONDITIONAL core tools, so coreToolMetadata() (the
 //     always-registered set) must not list them.
 
@@ -115,7 +116,10 @@ describe('metadata: threadFork', () => {
 
         expect(schema.required).toEqual(['input']);
         expect(schema.additionalProperties).toBe(false);
-        expect(Object.keys(schema.properties!)).toEqual(['input', 'label']);
+        // B1 (2026-11-13): `timeoutMs` joined the surface — an OPTIONAL wall clock for
+        // the branch, so it is not in `required` and carries no schema `default`
+        // ("omit it" resolves to the harness option, never to a number invented here).
+        expect(Object.keys(schema.properties!)).toEqual(['input', 'label', 'timeoutMs']);
         expect(schema.properties!.input).toMatchObject({
             type: 'string',
             minLength: 1
@@ -125,6 +129,12 @@ describe('metadata: threadFork', () => {
             minLength: 1,
             maxLength: ACTION_REQUEST_LIMITS.forkLabelMax
         });
+        expect(schema.properties!.timeoutMs).toMatchObject({
+            type: 'integer',
+            minimum: 1,
+            maximum: 3600000
+        });
+        expect(schema.properties!.timeoutMs).not.toHaveProperty('default');
     });
 });
 

@@ -22,6 +22,7 @@
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 
 const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -440,11 +441,24 @@ const boot = async (subagents: readonly string[] = ['research', 'workspace']): P
                     presets: [descriptor({ subagents: [...subagents] })],
                     tools: TOOLS,
                     defaults: { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false },
-                    sessions: [],
+                    // T4: the ⚒ pane describes the CONVERSATION on screen, and main.ts hides both
+                    // header toggles while none is bound — so the fixture boots with one.
+                    sessions: [snapshot()],
                     agents: []
                 });
             }
             if (url === '/api/models') return json({ models: ['m1'] });
+
+            // T4: the pane's toolbox read (`GET /sessions/{id}/tools`) and the runner's identified
+            // schema read (`GET /tools/{name}`, which a toolbox row does not carry) both come out of
+            // the SAME `TOOLS` list this fixture serves in its boot document, so the pane and the
+            // runner cannot disagree about what the server ships. It sits BEFORE the session
+            // catch-all below, which would otherwise answer a toolbox read with a session record.
+            const toolReads = sessionToolReads(TOOLS, url, init?.method);
+
+            if (toolReads !== undefined) return toolReads;
+
+            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [snapshot()] });
             if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() }, 201);
             if (url.startsWith('/api/sessions/') && method_is_get(url, init)) return json({ session: snapshot() });
             if (url.match(/^\/api\/tools\/.+$/) && init?.method === 'POST') {

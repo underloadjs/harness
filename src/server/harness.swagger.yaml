@@ -193,6 +193,10 @@ tags:
     description: Session-local agent bindings, overrides, and effective instruction text.
   - name: Session Tools
     description: Session-local toolbox, registrations, source, and execution.
+  - name: Session Plugins
+    description: >-
+      Per-session plugin settings (R4): the built-in catalogue read and edited THROUGH one session's own
+      settings store, which it copied from the template at creation and owns outright afterwards.
   - name: Tasks
     description: Submits, the queue, steering, reset, and cancel.
   - name: Threads
@@ -892,11 +896,18 @@ paths:
         `default`, and the `min`/`max`/`step` editor hints); `values` is the EFFECTIVE value of each declared key
         right now - the stored override when the operator changed it, otherwise the declared default - resolved
         through the same read a plugin performs, so a row can never disagree with what a running session does.
-        Order is the manifest's own and is stable across restarts. `enabled` is R2's GLOBAL switch: the
+        Order is the manifest's own and is stable across restarts. `enabled` is R2's switch: the
         reserved per-plugin `enabled` setting the runtime consults before delivering ANY lifecycle hook to
-        that plugin, in every session. It is reported on every row - including a plugin that declares no
+        that plugin. It is reported on every row - including a plugin that declares no
         settings of its own, because the key is the framework's, not the plugin's - and a row that says
         `false` means the plugin is loaded and listed but is not running its hooks right now.
+
+
+        SCOPE (R4): this collection is the PROCESS/TEMPLATE store, i.e. the values the NEXT session created
+        here copies down at creation - not an aggregate over the sessions that already exist. A session owns
+        its plugin settings once it exists, so the per-conversation question is answered per session by
+        `GET /sessions/{session_id}/plugins`, whose rows are the SAME `PluginSummary` schema with `enabled` and
+        `values` resolved through that session's own store.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -928,19 +939,26 @@ paths:
       operationId: updatePlugin
       summary: Change one built-in plugin's settings
       description: >-
-        GLOBAL write, declarative only, IMMEDIATE, and WRITE-ANYTIME. The runtime holds ONE live settings
-        provider and a plugin's `api.settings` re-reads it on every access, so an accepted patch changes what an
-        EXISTING session reads on its next turn - no rebuild and no new session. (A CPU-isolated lane worker
-        rebuilds its replica from the frozen blueprint it was handed, so a worker lane that is already running
-        picks the new value up the next time its lane is created; every in-process session sees it at once.)
+        TEMPLATE write, declarative only, IMMEDIATE, and WRITE-ANYTIME. The runtime holds ONE live settings
+        provider PER SCOPE and a plugin's `api.settings` re-reads it on every access, so an accepted patch
+        changes what a session reads on its next turn WITHIN THE SCOPE YOU WROTE. This route writes the
+        process/template scope: what it changes is (a) the settings every session CREATED AFTER THIS copies
+        down at creation and (b) nothing about a session that already exists - a session's plugin configuration
+        belongs to that session alone the moment it is created (R4). To change a conversation that is already
+        running, write its own route, `PATCH /sessions/{session_id}/plugins/{plugin_id}`, which is this same
+        body at session scope and reaches that session live. (A CPU-isolated lane worker rebuilds its replica
+        from the frozen blueprint it was handed at lane creation, so a worker lane that is already running
+        picks a new value up the next time its lane is created - at whichever scope the write went to; every
+        in-process session of that scope sees it at once.)
         There is NO idle gate on this route, unlike a session's tool switch: a settings write moves no
         registration and removes no schema the model was promised, so the Plugins pane stays usable while a
         conversation is running and the Plugins page is reachable with a thread in flight.
         Only `settings` is writable. The accepted keys are the ones the plugin DECLARES plus the framework's
         reserved `enabled` boolean, which every plugin answers to whether or not it declares one:
-        `{ "settings": { "enabled": false } }` is the one-click global off switch for that plugin's lifecycle
-        hooks, in every session, effective from the next turn, and `{ "settings": { "enabled": null } }` puts it
-        back on the plugin's declared default (`true` unless the plugin says otherwise). Turning a plugin off
+        `{ "settings": { "enabled": false } }` is the one-click off switch for that plugin's lifecycle
+        hooks, for every session created after the click, effective from that session's first turn, and
+        `{ "settings": { "enabled": null } }` puts the template back on the plugin's declared default (`true`
+        unless the plugin says otherwise). Turning a plugin off
         does NOT unregister its tools, agents or commands and does not remove its row: the row stays listed with
         `enabled: false`, and the plugin still receives `harness.dispose` so its own cleanup runs. An unknown key
         is a 400 naming the accepted set, a value of the wrong type is a 400 naming the key, and a number
@@ -2204,6 +2222,166 @@ paths:
           $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /v1/harness/sessions/{session_id}/plugins:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      tags: [Session Plugins]
+      operationId: listSessionPlugins
+      summary: List the built-in plugins with THIS SESSION's settings and current values
+      description: >-
+        The SESSION-SCOPED twin of `GET /v1/harness/plugins`, and the row shape is not merely similar: it is the
+        SAME `PluginSummary` schema on both routes, produced by one row builder on the server
+        (`./api.ts pluginRowOf`, which takes the scope's settings store as its parameter). The catalogue, the
+        declared settings and their defaults come from the generated manifest every session shares, and only
+        `enabled` and `values` resolve through THIS session's own settings store. Answerable without a model
+        request, in the manifest's stable order, and it never mutates anything.
+
+
+        WHAT SCOPE MEANS HERE (R4). A session gets its own copy of the plugin settings at creation - the
+        template's overrides, copied down - and after that the copy belongs to that session alone. So this page
+        answers what THIS conversation runs with right now, which is not necessarily what `GET /plugins`
+        reports: a template edit changes what a LATER session starts with, and changes nothing about a session
+        that already exists. A client that owns one conversation renders this page.
+
+
+        THE GLOBAL PAIR IS THE TEMPLATE SCOPE, AND IT IS CURRENTLY REACHABLE OVER HTTP ONLY. `GET /plugins` +
+        `PATCH /plugins/{plugin_id}` read and write the values a session COPIES DOWN AT CREATION - that is
+        their whole effect, and the one a client can observe: they seed every session created after the write.
+        Nothing in this server's own UI calls them any more, because the Plugins pane is session-scoped and a
+        card with NO bound session hides both configuration toggles instead of quietly repointing them at the
+        template (deliberate: editing the template has no UI design yet, so the pair stays an HTTP-only surface
+        for other clients and for the operator).
+
+
+        `revision` is THIS SESSION's own settings counter (0 until a PATCH on this session's plugin route has
+        been accepted, one bump per accepted PATCH, and the same number in the `X-Harness-Revision` response
+        header). It is a per-session staleness test and deliberately not a shared one: editing the template
+        never moves a live session's counter, and a session's own edits never move the template's.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: q
+          in: query
+          required: false
+          description: >-
+            Case-insensitive substring match against `name`, `title`, `description`, and `tags`. It filters the
+            page; it never widens the row shape.
+          schema:
+            type: string
+            maxLength: 200
+      responses:
+        '200':
+          description: Page of plugin rows, resolved against this session's own settings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PluginSummaryPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+  /v1/harness/sessions/{session_id}/plugins/{plugin_id}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+      - $ref: '#/components/parameters/PluginId'
+    get:
+      tags: [Session Plugins]
+      operationId: getSessionPlugin
+      summary: Read one plugin's settings as THIS SESSION runs them
+      description: >-
+        One `PluginSummary` row - the same schema as the collection page above and as the global item route -
+        resolved through this session's store, so `values` are the numbers and switches that session's plugins
+        read on their next turn. Both ids resolve before anything else: an unknown session is 404, and so is a
+        plugin this build does not ship. The catalogue is shared, so the two routes agree about what EXISTS and
+        differ only about what it is SET to.
+      responses:
+        '200':
+          description: The plugin row, with this session's effective values.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PluginDetailResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+    patch:
+      tags: [Session Plugins]
+      operationId: updateSessionPlugin
+      summary: Change one plugin's settings FOR THIS SESSION ONLY
+      description: >-
+        The body, the validation, and the status codes are IDENTICAL to the global `PATCH /plugins/{plugin_id}`,
+        and one word differs: scope. `{ "settings": { ... } }` with the plugin's declared keys plus the
+        framework's reserved `enabled` boolean; a value REPLACES that key's override for this session, an
+        explicit `null` clears the session's override so the plugin's declared default applies again, an omitted
+        key is no change, an unknown key is a 400 naming the accepted set, a value of the wrong type is a 400
+        naming the key, and a number outside the declared `min` or `max` is a 400 naming the bound. `step`
+        stays an editor hint that is deliberately NOT enforced.
+
+
+        LIVE, AND ONLY FOR THIS SESSION. The session's harness holds a live provider into its own store, so an
+        accepted patch changes what THIS session reads on its very next turn - no rebuild, no new session, no
+        re-registration - while every other session and the template keep exactly what they had. `{ "settings":
+        { "enabled": false } }` therefore stops that plugin's lifecycle hooks in this conversation from its next
+        turn, and `{ "settings": { "enabled": null } }` puts the session back on the plugin's declared default.
+        A disabled plugin stays loaded and listed, its tools, agents and commands are untouched, and it still
+        receives `harness.dispose` so its own cleanup runs - the same semantics the global route documents, one
+        session at a time.
+
+
+        WRITE-ANYTIME, and with no 409 path at all: unlike a session's tool switch (which mutates one live
+        harness and so demands an idle session), a settings write moves no registration and removes no schema
+        the model was promised, so the pane stays usable while a thread is running. A run already in flight
+        keeps what it was given.
+
+
+        DURABLE BEFORE THE ANSWER: the session's copy is committed into its record before this route replies, so
+        the value survives a restart and comes back as that session's own - a template edit made afterwards
+        never overwrites it. A plugin or key this build no longer ships is dropped when the copy is restored,
+        never a reason to drop the session. `builtin` metadata, the declared defaults, and which hooks a plugin
+        subscribes to remain unwritable over HTTP: the plugin file owns those. An unknown session or plugin is
+        404, resolved BEFORE the body is read. `revision` in the body and in `X-Harness-Revision` is this
+        session's counter, bumped once by this accepted write.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PluginSettingsUpdate'
+            examples:
+              context-limit:
+                summary: Set a context limit this session honours on its next turn
+                value:
+                  settings:
+                    contextLimit: 24000
+              reset:
+                summary: Put this session back on the plugin's declared default
+                value:
+                  settings:
+                    contextLimit: null
+              disable:
+                summary: Stop this plugin's hooks in THIS session, from its next turn
+                value:
+                  settings:
+                    enabled: false
+      responses:
+        '200':
+          description: The updated plugin row, with the values THIS session now runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PluginDetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
         '500':
           $ref: '#/components/responses/InternalError'
   /v1/harness/sessions/{session_id}/threads:
@@ -6030,12 +6208,17 @@ components:
             enabled:
               type: boolean
               description: >-
-                True when the tool is callable in this session right now - the live enabled set, whether the
-                name is declared, was discovered through `toolRequest`, or was created at runtime. `PATCH`
-                toggles it. `false` withdraws the name without losing its registration or its captured source
-                revision, and `true` switches that same live slot back on: it does NOT restore an inherited
-                binding, because a removal or an override here never keeps a superseded copy to hand back.
-                Toggling requires an idle session (409) and is refused with 403 on a protected entry.
+                Membership in THIS SESSION's live enabled/discovered set - the capped set the running harness
+                currently keeps switched on (`harness.discoveredTools`, read in `./api-reads.ts`
+                `sessionToolRowsOf`). It is NOT "is this name in the model's context": a freshly created
+                session answers `false` for EVERY row here, its harness-owned control tools included, because
+                those arrive in context through the FROZEN definition and the runtime manifest and never
+                occupy an enabled slot. `declared` and `protected` are the two fields that state whether a name
+                is in context regardless of this one. `PATCH` toggles membership in the set. `false` withdraws
+                the name without losing its registration or its captured source revision, and `true` switches
+                that same live slot back on: it does NOT restore an inherited binding, because a removal or an
+                override here never keeps a superseded copy to hand back. Toggling requires an idle session
+                (409) and is refused with 403 on a protected entry.
             origin:
               type: string
               enum: [catalogue, discovered, created]

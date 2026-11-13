@@ -32,6 +32,7 @@
 import type { ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
+import { sessionToolReads } from './session-config-test-support';
 
 const json = (value: unknown, status = 200): Response =>
     new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
@@ -219,6 +220,20 @@ type Call = { url: string; method: string | undefined };
 
 const calls: Call[] = [];
 
+// T4: the ⚒ pane lists the toolbox of the CONVERSATION on screen, and main.ts stops rendering
+// the toggle while none is bound — so this fixture names one. `harness: 'instruct'` matches the
+// only descriptor, which is what makes boot open it instead of an empty harness view.
+const SESSION = {
+    id: 's1',
+    harness: 'instruct',
+    status: 'idle',
+    model: 'm1',
+    createdAt: 1,
+    updatedAt: 2,
+    messages: [],
+    turns: []
+};
+
 beforeEach(() => {
     calls.length = 0;
     vi.resetModules();
@@ -237,12 +252,23 @@ beforeEach(() => {
                     presets: [descriptor],
                     tools: TOOLS,
                     defaults: { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false },
-                    sessions: [],
+                    sessions: [SESSION],
                     agents: []
                 });
             }
 
             if (url === '/api/models') return json({ models: ['m1'] });
+
+            // The conversation boot resolves, and the toolbox + identified-schema reads the pane
+            // and the runner dial — both composed from `TOOLS` above (./session-config-test-support.ts),
+            // so the argument templates asserted below are filled from the very schemas this
+            // fixture ships and the pane's row set can never drift from the catalogue.
+            if (url === '/api/sessions' || url === '/api/sessions?limit=25') return json({ sessions: [SESSION] });
+            if (url === '/api/sessions/s1') return json({ session: SESSION });
+
+            const toolReads = sessionToolReads(TOOLS, url, init?.method);
+
+            if (toolReads !== undefined) return toolReads;
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
         }, { root: '/api' }))

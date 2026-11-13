@@ -727,6 +727,15 @@ it('keeps the open dialog and the focused control across a live snapshot rebuild
             }
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions/s1') return json({ session });
+            // T3 (R1): the `+` this case ends with CREATES a conversation. A create that never
+            // answered would dismiss the dialog for the wrong reason — the failure path closes
+            // it too — so the fixture answers with the fresh 0-turn record a real server hands
+            // back (the id is the one this case never asserts on: only the dialog's lifecycle).
+            if (url === '/api/sessions')
+                return json(
+                    { session: snapshot({ harnessDefinition: descriptor(), createdAt: 12, updatedAt: 12 }) },
+                    201
+                );
 
             throw new Error(`unexpected request: ${url}`);
         }, { root: '/api' }))
