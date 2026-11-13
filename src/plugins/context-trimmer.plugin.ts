@@ -180,7 +180,12 @@
 // its toggle in the declared list, because the descriptor list IS the render order
 // (src/frontend/main.ts `buildSettingField`, the row builder `openPluginDialog` calls per
 // descriptor) and a number separated from the switch
-// it belongs to is a number an operator has to map by name alone.
+// it belongs to is a number an operator has to map by name alone. Since 2026-11-13 that list is
+// ALSO grouped: each policy declares a `group` (its category) and its dependent fields declare a
+// `parentKey` (the checkbox that reveals them), so a strictness knob now sits under the policy it
+// gates — `invalidOutcomes` under the invalid-tools rule, `supersedeMatch` under supersession,
+// `minThoughtChars` under the thinking rule — and the three knobs that gate no policy of their own
+// sit in Global Limits. Display metadata only: nothing at runtime reads it.
 // Three rules every one of them obeys, and none of them is a boolean:
 //   - WITHHOLD-ONLY inside a session: a switch flipped off stops NEW writes and restores
 //     nothing an earlier turn already withheld. That is what lets the compactor skip any
@@ -404,11 +409,21 @@ export const metadata = {
     tags: ['context', 'trimming', 'lifecycle'],
     builtin: true,
     hooks: ['turn.before'],
-    // THE SWITCH SURFACE (the 2026-11-13 trimmer clean-up).
+    // THE SWITCH SURFACE (the 2026-11-13 trimmer clean-up, grouped the same week).
     //
     // DECLARATION ORDER IS RENDER ORDER: the Plugins pane builds one control per descriptor in
-    // this array's order (src/frontend/main.ts `buildSettingField`, inside `openPluginDialog`), so
-    // every toggle sits immediately above the number that windows it.
+    // this array's order (src/frontend/main.ts `buildSettingField`, inside `openPluginDialog`). Two
+    // ADDITIVE, DISPLAY-ONLY fields now say what that order means: `group: {id, title}` files a row
+    // under one named category (the renderer opens a section per `id`, in first-appearance order,
+    // and prints `title` verbatim), and `parentKey: '<boolean key>'` nests a row UNDER that
+    // checkbox — hidden while it is off, indented under it when it is on. A descriptor with neither
+    // renders in the flat top-level run exactly as it did before the fields existed, which is why
+    // `enabled` (no group) and the three Global Limits rows (group, no parent) look unremarkable.
+    // The list is therefore written CATEGORY BY CATEGORY: the policy toggle first, then the
+    // horizons and string tiers that window it, each still immediately after its own toggle — the
+    // adjacency `context-trimmer.test.ts` pins. Neither field is read by the runtime, the validation
+    // edge or the store (../types, ../plugin/settings.ts, ../server/plugins.ts), so
+    // `readTrimmerSettings` below keeps the read order it has always had.
     //
     // THE HINT POLICY (the copy half of that clean-up). A `description` here becomes a
     // `.plugin-setting-hint` under the control — the generic renderer emits one per declared
@@ -441,7 +456,10 @@ export const metadata = {
             // Master switch label (mirrors `title`): `enabled` gates hook delivery for every
             // setting below, so the label names the plugin's whole activity, like compaction's
             // 'Compact conversations'. The framework owns this key (src/plugin/host.ts reads the
-            // same stored value to gate the hook), so its behaviour is unchanged.
+            // same stored value to gate the hook), so its behaviour is unchanged. It declares NO
+            // `group` on purpose: the master switch sits above the policy categories, and filing it
+            // inside one would make "is this plugin running at all" a question about a section it
+            // does not belong to.
             label: 'Context trimming',
             type: 'boolean',
             default: true,
@@ -450,10 +468,17 @@ export const metadata = {
             // is the sentence that answers "I turned it off and my context did not come back".
             description: 'Turns each policy off from the next turn; entries already withheld stay out.'
         },
+
+        // ==== CATEGORY: INVALID TOOLS ======================================================
+        // One policy per category, and the fields that WINDOW that policy carry
+        // `parentKey: '<the toggle>'` so the pane draws them indented under the checkbox and hides
+        // them the moment it is off. `group.id` is the stable identity/order key; `group.title` is
+        // the heading text, spelled the way the operator named the categories.
         {
             // THE INVALID-TOOLS RULE (replaces `dropInvalidToolCallsOnceAnswered`).
             key: 'trimInvalidTools',
-            label: 'Automatic Trim invalid tools',
+            group: { id: 'invalid-tools', title: 'Invalid Tools' },
+            label: 'Automatic Trim Invalid Tools',
             type: 'boolean',
             default: true,
             // THE GATE IS THE COPY (FIX 2). The label reads as unconditional and the rule is the
@@ -470,6 +495,8 @@ export const metadata = {
         },
         {
             key: 'invalidToolTurns',
+            group: { id: 'invalid-tools', title: 'Invalid Tools' },
+            parentKey: 'trimInvalidTools',
             label: 'Invalid tools · trim after (tool turns)',
             type: 'number',
             default: 2,
@@ -485,9 +512,26 @@ export const metadata = {
             description: 'Protects the newest N tool turns; 0 protects none.'
         },
         {
+            key: 'invalidOutcomes',
+            group: { id: 'invalid-tools', title: 'Invalid Tools' },
+            parentKey: 'trimInvalidTools',
+            label: 'Outcomes that count as invalid',
+            type: 'string',
+            default: 'failed,rejected',
+            // THE CLOSED SET, spelled out (nothing else in the pane lists it) AND the separator:
+            // `outcomeSetOf` splits on `,` ONLY, so `"failed; rejected"` parses to an EMPTY set,
+            // which is documented as "the rule is off" rather than a fallback — a silent outcome of
+            // a character the operator picked. `empty` is the dangerous value: it is read off the
+            // result TEXT, so a zero-hit `grep` and a stub are the same thing to this rule.
+            description: 'Comma-separated subset of failed, rejected, cancelled, empty; empty means a blank result.'
+        },
+
+        // ==== CATEGORY: CHAIN OF THOUGHTS ==================================================
+        {
             // THE THINKING RULE (replaces the `dropOldThoughts` tier and `thoughtKeepUnits`).
             key: 'trimThoughts',
-            label: 'Automatic Trim thoughts',
+            group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
+            label: 'Automatic Trim Thoughts',
             type: 'boolean',
             default: true
         },
@@ -495,6 +539,8 @@ export const metadata = {
             // The unit of account is IN THE LABEL ("(thoughts)"), and the rank semantics are stated
             // once on `invalidToolTurns`; nothing left for this row to say.
             key: 'thoughtTurns',
+            group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
+            parentKey: 'trimThoughts',
             label: 'Thoughts · trim after (thoughts)',
             type: 'number',
             default: 2,
@@ -503,28 +549,27 @@ export const metadata = {
             step: 1
         },
         {
-            // THE TRUNCATE RULE (new). Only the assistant REQUEST entry leaves; its tool results
-            // stay in the context, so this is the one axis that does not withhold a whole unit.
-            key: 'truncateToolRequests',
-            label: 'Automatic Truncate Tool Request',
-            type: 'boolean',
-            default: false,
-            // "Truncate" alone reads like the exchange left. The surviving half is the feature, and
-            // it is what `data.truncated[].results` reports, so the row says it.
-            description: 'Drops the request entry only; its tool results stay in the request.'
-        },
-        {
-            key: 'truncateTurns',
-            label: 'Truncate tool requests after (tool turns)',
+            // The floor's thinking twin, filed WITH the rule it gates: it is read at step (5) of the
+            // thinking selector and reaches nothing else (the tool axes are measured by `minTokens`,
+            // and the estimator never counts `reasoning` — ../core/context-estimate.ts:34-35), so an
+            // operator who turns thinking off never has to wonder what this number gates. WHAT a
+            // floor does is stated once, on `minTokens`; this row adds nothing.
+            key: 'minThoughtChars',
+            group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
+            parentKey: 'trimThoughts',
+            label: 'Minimum thinking saved per pass (characters)',
             type: 'number',
-            default: 2,
+            default: 0,
             min: 0,
-            max: 4096,
-            step: 1
+            max: 1000000,
+            step: 50
         },
+
+        // ==== CATEGORY: SUPERSEDED TOOLS ===================================================
         {
             key: 'dropSupersededToolCalls',
-            label: 'Automatic Trim superseded tools',
+            group: { id: 'superseded-tools', title: 'Superseded Tools' },
+            label: 'Automatic Trim Superseded Tools',
             type: 'boolean',
             default: true
             // NO HINT, on purpose: at the shipped `invalidOutcomes` this is the SAME predicate as
@@ -536,6 +581,8 @@ export const metadata = {
         },
         {
             key: 'supersededTurns',
+            group: { id: 'superseded-tools', title: 'Superseded Tools' },
+            parentKey: 'dropSupersededToolCalls',
             label: 'Superseded tools · trim after (tool turns)',
             type: 'number',
             default: 2,
@@ -544,8 +591,26 @@ export const metadata = {
             step: 1
         },
         {
+            // Filed with the supersession rules because that is the only place it is read: BOTH
+            // supersession rules consult it, and the duplicate rule never does (header, "THE TOOL
+            // RULES", rule 3) — which is what `dropDuplicateCalls`'s hint says out loud.
+            key: 'supersedeMatch',
+            group: { id: 'superseded-tools', title: 'Superseded Tools' },
+            parentKey: 'dropSupersededToolCalls',
+            label: 'Supersession match',
+            type: 'string',
+            default: 'name',
+            // The other closed set: two values, both spelled, because `'name'` vs `'fingerprint'`
+            // decides whether a retry with DIFFERENT arguments counts as an answer (header,
+            // "HOW IT DIFFERS FROM CONTEXT COMPACTION").
+            description: "'name' matches any later call of the tool; 'fingerprint' needs identical arguments."
+        },
+
+        // ==== CATEGORY: DUPLICATE TOOLS ====================================================
+        {
             key: 'dropDuplicateCalls',
-            label: 'Automatic Trim duplicate tools',
+            group: { id: 'duplicate-tools', title: 'Duplicate Tools' },
+            label: 'Automatic Trim Duplicate Tools',
             type: 'boolean',
             default: false,
             // Non-inferable and load-bearing: this rule ignores `supersedeMatch` (header, "THE TOOL
@@ -555,6 +620,8 @@ export const metadata = {
         },
         {
             key: 'duplicateTurns',
+            group: { id: 'duplicate-tools', title: 'Duplicate Tools' },
+            parentKey: 'dropDuplicateCalls',
             label: 'Duplicate tools · trim after (tool turns)',
             type: 'number',
             default: 2,
@@ -562,30 +629,38 @@ export const metadata = {
             max: 4096,
             step: 1
         },
+
+        // ==== CATEGORY: TOOL REQUESTS ======================================================
         {
-            key: 'invalidOutcomes',
-            label: 'Outcomes that count as invalid',
-            type: 'string',
-            default: 'failed,rejected',
-            // THE CLOSED SET, spelled out (nothing else in the pane lists it) AND the separator:
-            // `outcomeSetOf` splits on `,` ONLY, so `"failed; rejected"` parses to an EMPTY set,
-            // which is documented as "the rule is off" rather than a fallback — a silent outcome of
-            // a character the operator picked. `empty` is the dangerous value: it is read off the
-            // result TEXT, so a zero-hit `grep` and a stub are the same thing to this rule.
-            description: 'Comma-separated subset of failed, rejected, cancelled, empty; empty means a blank result.'
+            // THE TRUNCATE RULE (new). Only the assistant REQUEST entry leaves; its tool results
+            // stay in the context, so this is the one axis that does not withhold a whole unit.
+            key: 'truncateToolRequests',
+            group: { id: 'tool-requests', title: 'Tool Requests' },
+            label: 'Automatic Truncate Tool Requests',
+            type: 'boolean',
+            default: false,
+            // "Truncate" alone reads like the exchange left. The surviving half is the feature, and
+            // it is what `data.truncated[].results` reports, so the row says it.
+            description: 'Drops the request entry only; its tool results stay in the request.'
         },
         {
-            key: 'supersedeMatch',
-            label: 'Supersession match',
-            type: 'string',
-            default: 'name',
-            // The other closed set: two values, both spelled, because `'name'` vs `'fingerprint'`
-            // decides whether a retry with DIFFERENT arguments counts as an answer (header,
-            // "HOW IT DIFFERS FROM CONTEXT COMPACTION").
-            description: "'name' matches any later call of the tool; 'fingerprint' needs identical arguments."
+            key: 'truncateTurns',
+            group: { id: 'tool-requests', title: 'Tool Requests' },
+            parentKey: 'truncateToolRequests',
+            label: 'Truncate tool requests after (tool turns)',
+            type: 'number',
+            default: 2,
+            min: 0,
+            max: 4096,
+            step: 1
         },
+
+        // ==== CATEGORY: GLOBAL LIMITS ======================================================
+        // The three knobs that gate NO policy of their own: they bound what any pass may write, so
+        // they carry no `parentKey` — they apply whether every policy above is on or off.
         {
             key: 'minTokens',
+            group: { id: 'global-limits', title: 'Global Limits' },
             label: 'Minimum saving per pass (tokens)',
             type: 'number',
             default: 0,
@@ -597,25 +672,15 @@ export const metadata = {
             // the truncate plan running (the gates run PER AXIS, `applyEconomyGates`), and the
             // token floor never touches thinking at all, because the estimator does not count
             // `reasoning` (`../core/context-estimate.ts:34-35`). Both are silent, so both are
-            // stated — and `minThoughtChars` below needs no copy of its own once this row says
-            // tokens stop at the tool axes.
+            // stated — and `minThoughtChars`, now filed with the thinking rule it gates, needs no
+            // copy of its own once this row says tokens stop at the tool axes.
             description: 'Each tool axis must save this many tokens, or it writes nothing; thinking is never gated.'
-        },
-        {
-            // The floor's thinking twin: the label states the unit (characters) and the row above
-            // has already stated what a floor does, so this row adds nothing.
-            key: 'minThoughtChars',
-            label: 'Minimum thinking saved per pass (characters)',
-            type: 'number',
-            default: 0,
-            min: 0,
-            max: 1000000,
-            step: 50
         },
         {
             // The label and `min`/`max` carry this row: units, counted from the END of the
             // transcript, tool rules only. docs/plugins.md has the detail.
             key: 'safetyUnits',
+            group: { id: 'global-limits', title: 'Global Limits' },
             label: 'Recent units to protect',
             type: 'number',
             default: 0,
@@ -625,6 +690,7 @@ export const metadata = {
         },
         {
             key: 'maxUnits',
+            group: { id: 'global-limits', title: 'Global Limits' },
             label: 'Maximum units per pass',
             type: 'number',
             default: 0,
@@ -647,8 +713,10 @@ export const metadata = {
 // The same duplication rule applies to EVERY switch this plugin declares: each constant below
 // is the `default:` of the descriptor above it, written out because the scanner cannot read a
 // computed literal. A drift between a pair is invisible to the manifest and visible on the
-// first turn, so they are kept in DECLARED ORDER here, one line per descriptor, and
-// `context-trimmer.test.ts` pins the descriptor list key-by-key.
+// first turn, so they are kept ONE LINE PER DESCRIPTOR in the order the runtime reads them
+// (`readTrimmerSettings` below — the order the descriptor list had before the pane grouped it,
+// and the order `context-trimmer.test.ts` pins as `TURN_READS`), and that file pins the
+// descriptor list key-by-key.
 const ENABLED_DEFAULT = true;
 // The three toggle+horizon pairs the operator sees first (the 2026-11-13 clean-up). Each `_TURNS`
 // constant is the horizon that protects the N newest tool turns / thoughts; 2 is the shipped
@@ -678,7 +746,8 @@ const MAX_UNITS_DEFAULT = 0;
 // ---------------------------------------------------------------------------
 // THE SETTINGS SURFACE, AS VALUES (not as strings a predicate has to re-parse)
 // ---------------------------------------------------------------------------
-// One read per switch per turn, in DECLARED ORDER, normalised once, and the normalised result
+// One read per switch per turn, in the one PINNED READ ORDER (`context-trimmer.test.ts`
+// `TURN_READS`), normalised once, and the normalised result
 // is what the policy AND the report read. Every `string` tier resolves to a member of its
 // closed set plus the value that was actually submitted, because the WRITE edge does not own
 // the closed set (a `string` setting accepts any string — ../server/plugins.ts validates type
@@ -856,16 +925,19 @@ const olderThanHorizon = (ago: number, horizon: number): boolean => ago >= horiz
 
 // THE ONE SETTINGS READ of a turn. `api.settings` is live by contract (../plugin/settings.ts),
 // so this runs every turn and a `PATCH /v1/harness/plugins/context-trimmer` lands on the next
-// one. Reads happen in DECLARED ORDER and all of them happen here: the read set of a turn is a
-// pinned contract (`context-trimmer.test.ts` asserts it exactly), and it is only pinned because
-// every caller is behind the guards (`guardPasses`), which is what keeps a disabled plugin, a
-// branch round and an internal agent at the one `enabled` read (or none) they always cost.
+// one. Reads happen in the ONE PINNED READ ORDER (the order of the toggles and their horizons,
+// unchanged since before the pane grouped the list) and all of them happen here: the read set of a
+// turn is a pinned contract (`context-trimmer.test.ts` asserts it exactly), and it is only pinned
+// because every caller is behind the guards (`guardPasses`), which is what keeps a disabled plugin,
+// a branch round and an internal agent at the one `enabled` read (or none) they always cost.
 //
 // Numbers are NOT clamped here. `min`/`max` are the plugin's published bounds and the write
 // edge refuses a value outside them (../server/plugins.ts, ../plugin/settings.ts
 // `normalizeNumber`); the read edge is coercion-only by contract, so a hand-edited document
 // keeps its value rather than being silently rewritten. Each horizon is read next to its own
-// toggle, in the order the descriptors are declared, which is also the order the pane renders.
+// toggle. That pairing — not the descriptor list — is what this order tracks: the list is grouped
+// for the operator now (`group`/`parentKey`), and neither field is read at runtime, so a grouping
+// edit here would change the pinned read set for a display reason.
 const readTrimmerSettings = (api: HarnessPluginApi): TrimmerSettings => {
     const trimInvalidTools = api.settings.boolean('trimInvalidTools', TRIM_INVALID_TOOLS_DEFAULT);
     const invalidToolTurns = api.settings.number('invalidToolTurns', INVALID_TOOL_TURNS_DEFAULT);

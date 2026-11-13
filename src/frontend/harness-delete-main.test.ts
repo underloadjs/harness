@@ -457,16 +457,15 @@ it('survives an empty roster and releases the playground session bound to the de
     );
     expect(pressedHarnesses()).toEqual([]);
     expect(document.querySelector('.stage .tools-pane')).not.toBeNull();
-    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
 
     // R7: the temporary session belonged to that harness, so it goes with it.
     expect(deletes(calls, '/v1/harness/sessions/temp-1')).toHaveLength(1);
 
-    // The playground note is honest about having no context, and a session-bound call
-    // answers with an actionable error instead of silently requiring a conversation.
-    expect(document.querySelector('.tools-session-note')?.textContent).toBe(
-        'No harness is reported by this server, so session-bound tools have no context to run in. Create a harness first; every other tool can still be called directly.'
-    );
+    // R3: the playground note that used to say this is gone — the pane never claims a
+    // context it does not have, and a session-bound call answers with an actionable error
+    // instead (asserted below) rather than the heading area guessing about it.
+    expect(document.querySelector('.tools-session-note')).toBeNull();
 
     const toolCallsBefore = byPrefix(calls, '/v1/harness/tools/').length;
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();

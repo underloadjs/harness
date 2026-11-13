@@ -2,8 +2,9 @@
 // and a core call runs on the server inside the selected session.
 //
 // R21.2 acceptance this file also pins: the tools view is the ONLY tool listing —
-// the right rail no longer drops a catalogue or core-tools disclosure — and the
-// enabled-for-session status lives here (`.tools-session-note`).
+// the right rail no longer drops a catalogue or core-tools disclosure. R3 removed the
+// enabled-for-session status line that used to sit under the pane heading, and the
+// enablement write's live line went with it later, so the pane is its title plus the grid.
 //
 // R3 acceptance this file pins:
 //   - there is NO tab strip: no `.tabs`, no tablist/tab/tabpanel and no
@@ -24,12 +25,24 @@
 //     names the remaining count and asks for refined tags.
 //
 // Dialog rework (main.ts `selectTool`/`openToolDialog`/`setToolsView`): opening the
-// tools view shows ONLY the catalogue list (head = "Tools"/"catalogue"/count note)
-// and activating a `.tool-tab-button` opens the runner inside the shared
+// tools view shows ONLY the catalogue list (head title "Tools Catalogue" with the shared
+// `.harness-id` badge HIDDEN, plus the count note) and activating a `.tool-tab-button`
+// opens the runner inside the shared
 // `.dialog` (`.dialog-title` = tool name, `.tool-runner-slot > .pane > .log-wrap >
 // .log > .tool-card`).
 // The runner therefore does not exist in the document until an entry is clicked —
 // every test that reads `.tool-args` must click its `.tool-tab-button` first.
+//
+// Tools Catalogue pass (this pass), pinned below:
+//   - R1: the pane's long "Every tool the server lists…" paragraph is GONE (no
+//     `.tools-tab-hint` element at all); R3 then removed the playground note, and this
+//     pass removes the enablement write's live line, so the head is ONLY its `h2` title;
+//   - R2: the head title is "Tools Catalogue" and the badge next to it is blanked + hidden —
+//     the stray `catalogue` word right of the "+" is what the reader asked to remove;
+//   - R4: the bootstrap tools page is read at the contract's MAXIMUM size and followed to
+//     exhaustion, so a 32-tool catalogue reaches the view complete (pinned in ./api.test.ts
+//     `listAllTools`, and here by the head count equaling the rendered row count);
+//   - R5: NO `.tool-tab-group` heading is emitted and the rows are strictly A–Z by tool name.
 //
 // R1 + R3 (this pass) — the page is ALWAYS reachable and every row states its switch:
 //   - no run gate: the tick box, the rows and the identified-detail read all work while a
@@ -327,23 +340,41 @@ it('lists core tools in the global tools view, calls with the captured session a
     expect(toggle.getAttribute('aria-pressed')).toBe('true');
     expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
 
-    // EVERY bootstrap tool is listed, core tools included, in server group order.
-    expect([...document.querySelectorAll<HTMLElement>('.tool-tab-group')].map((node) => node.textContent)).toEqual(
-        ['Core tools', 'Files']
-    );
+    // R5: EVERY bootstrap tool is listed, core tools included, as ONE flat A–Z list — no
+    // group heading is emitted anywhere in the pane ("Core tools" / "Package presets" and
+    // every registration group are gone; the kind still rides each row's meta line).
+    // `read` precedes `toolRequest` because 'r' < 't' case-insensitively, and the kind line
+    // moves WITH the row it belongs to.
+    expect(document.querySelectorAll('.tool-tab-group')).toHaveLength(0);
+    // R3 + this pass: nothing sits between the heading and the grid any more — neither the
+    // playground's context note nor the switch write's live line — so opening the view paints
+    // the title and the rows only.
+    expect(document.querySelector('.tools-session-note')).toBeNull();
+    expect(document.querySelector('.tools-tab-note')).toBeNull();
+    expect([...byClass('.tools-tab-head', 'div').children].map((node) => node.className)).toEqual([
+        'tools-tab-title'
+    ]);
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
-    ).toEqual(['toolRequest', 'read']);
+    ).toEqual(['read', 'toolRequest']);
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-kind')].map((node) => node.textContent)
-    ).toEqual(['core · session', 'searchable']);
+    ).toEqual(['searchable', 'core · session']);
 
     // Dialog rework: opening the tools view NO LONGER auto-opens a tool. The head
     // describes the catalogue itself and no runner exists until an entry is picked.
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.querySelector('.tool-args')).toBeNull();
-    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
-    expect(document.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    // R2: the head names the view "Tools Catalogue", and the shared `.harness-id` badge that
+    // used to print a stray `catalogue` to the right of the "+" is blanked and HIDDEN — the
+    // same treatment the chat head gives it (main.test.ts pins the round trip).
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
+    expect(byClass('.harness-id', 'span').hidden).toBe(true);
+    expect(byClass('.harness-id', 'span').textContent).toBe('');
+    // R4: the head's count and the rendered rows are the SAME figure — the catalogue the
+    // server lists is the catalogue the pane paints, page by page until the cursor runs out
+    // (./api.ts `listAllTools`), so nothing is silently truncated at a 25-row page.
+    expect(document.querySelectorAll('.tool-tab-row')).toHaveLength(2);
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         '2 tools · calls run on the harness server'
     );
@@ -415,11 +446,15 @@ it('lists core tools in the global tools view, calls with the captured session a
     // frozen-definition read for the discovery line — each exactly once, no storms.
     expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s1')).toHaveLength(1);
     expect(dialed.filter((line) => line === 'GET /v1/harness/sessions/s1/definition').length).toBeGreaterThanOrEqual(1);
-    // R7: the discovery line describes the PLAYGROUND context, and it is refreshed by
-    // the temporary session's snapshot — never by the selected conversation's one.
-    expect(byClass('.tools-session-note', 'p').textContent).toBe(
-        'Session-bound tools run in the playground’s own context: instruct · temporary session s1 · enabled there: read, glob. The conversation you selected is never touched.'
-    );
+    // R3: the pane no longer narrates the playground context, so the discovery refresh
+    // above changes no DOM at all — the note element is gone and the head is still exactly
+    // its heading. The tools the call enabled are still read back from the server (the
+    // definition read asserted above); they are simply no longer printed under the heading.
+    expect(document.querySelector('.tools-session-note')).toBeNull();
+    expect(document.querySelector('.tools-tab-note')).toBeNull();
+    expect([...byClass('.tools-tab-head', 'div').children].map((node) => node.className)).toEqual([
+        'tools-tab-title'
+    ]);
 
     // An ordinary tool is unchanged: no sessionId key, no extra session traffic.
     document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="read"]')?.click();
@@ -471,8 +506,10 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
     // describes the list.
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.querySelector('.tool-args')).toBeNull();
-    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
-    expect(document.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    // R2: the catalogue head says "Tools Catalogue" and keeps the shared badge hidden.
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
+    expect(byClass('.harness-id', 'span').hidden).toBe(true);
+    expect(byClass('.harness-id', 'span').textContent).toBe('');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         '2 tools · calls run on the harness server'
     );
@@ -517,8 +554,10 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
 
     expect(document.querySelector('.dialog')).toBeNull();
     expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
-    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
-    expect(document.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    // R2: the catalogue head says "Tools Catalogue" and keeps the shared badge hidden.
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
+    expect(byClass('.harness-id', 'span').hidden).toBe(true);
+    expect(byClass('.harness-id', 'span').textContent).toBe('');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         '2 tools · calls run on the harness server'
     );
@@ -532,8 +571,10 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
 
     expect(document.querySelector('.dialog')).toBeNull();
     expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
-    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
-    expect(document.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    // R2: the catalogue head says "Tools Catalogue" and keeps the shared badge hidden.
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
+    expect(byClass('.harness-id', 'span').hidden).toBe(true);
+    expect(byClass('.harness-id', 'span').textContent).toBe('');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         '2 tools · calls run on the harness server'
     );
@@ -681,11 +722,12 @@ it('reports delegation as unavailable when the playground harness has no subagen
     openTools();
     await flush();
 
-    // The catalogue is host-wide, but the tab says when the tool is actually
-    // registered for the playground's session, so a subagent-less harness claims nothing.
-    expect(byClass('.tools-tab-hint', 'p').textContent).toContain(
-        'delegate when the playground harness has subagents'
-    );
+    // R1 (Tools Catalogue): the pane's long "Every tool the server lists…" paragraph — the one
+    // that used to name `delegate when the playground harness has subagents` — is GONE, from
+    // the source and from the document. What still states that a subagent-less harness
+    // registers no delegation is the runner this test opens below (`.tool-note`), and the
+    // row's own meta line; nothing is claimed above the list any more.
+    expect(document.querySelector('.tools-tab-hint')).toBeNull();
 
     // Delegation is blocked rather than offered with a target this team lacks.
     // The runner is inside the modal now, so open the entry before reading it.
@@ -753,7 +795,8 @@ it('paints one corner tick box on EVERY row, the harness-owned core row included
     await flush();
 
     // Every row is a wrapper holding the tile and its box as SIBLINGS — a `<button>`
-    // cannot contain a control — in the order the server listed them.
+    // cannot contain a control — and the rows run A–Z by tool name (R5: one flat list, no
+    // group headings; the server's core-first order is not what the reader sees).
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) =>
             [...node.children].map((child) => `${child.tagName.toLowerCase()}.${child.className}`)
@@ -780,9 +823,10 @@ it('paints one corner tick box on EVERY row, the harness-owned core row included
     // R1: a control that is not waiting on its own write is never disabled.
     expect(readSwitch.disabled).toBe(false);
 
-    // The box is NOT inside the tile, and the tile carries the SAME figure — which is
-    // what styles the light-green enabled wash (styles.css
-    // `.tool-tab-button[data-enabled='true']`; an unticked row keeps the plain look).
+    // The box is NOT inside the tile, and the tile carries the SAME figure — which is what
+    // styles the enabled state: an `--ok-line` BORDER on the tile and no green wash behind it
+    // (styles.css:1042-1058 `.tool-tab-button[data-enabled='true']`; an unticked row keeps the
+    // plain surface).
     expect(readRow.parentElement?.className).toBe('tool-tab-row');
     expect(readRow.contains(readSwitch)).toBe(false);
     expect(readSwitch.parentElement?.className).toBe('tool-tab-row');
@@ -805,20 +849,25 @@ it('paints one corner tick box on EVERY row, the harness-owned core row included
     expect(document.querySelectorAll('[role="switch"]')).toHaveLength(0);
     expect(document.querySelectorAll('.tool-tab-enable')).toHaveLength(2);
 
-    // R3: the hint says what the box IS and how far it reaches — every conversation,
-    // from the next request, agents only, and toolCreate's own tools always on.
-    const hint = byClass('.tools-tab-hint', 'p').textContent ?? '';
-
-    expect(hint).toContain('The tick box in a row’s top-right corner is that tool’s switch');
-    expect(hint).toContain('ticked means enabled, unticked means the tool is withheld from agents');
-    expect(hint).toContain('applies to EVERY conversation on this harness server, from the next request onwards');
-    expect(hint).toContain('It gates agents only: a tool may still call any other tool, enabled or not');
-    expect(hint).toContain('a worker lane already running adopts it when next created');
-    expect(hint).toContain('the request being served keeps the tool list it was given');
-    expect(hint).toContain('Tools created with toolCreate are enabled at once and have no switch of their own');
-    // The claim the server no longer honours, and the sentence that replaced it.
-    expect(hint).not.toContain('pinned on and have no switch');
-    expect(hint).not.toContain('core tools are pinned');
+    // R1 (Tools Catalogue): the paragraph that used to explain the switch from above the list
+    // is gone, and the pane adds nothing about the switch of its own: the switch's `title`
+    // (asserted above) carries the explanation, the tick box and the tile's edge carry the
+    // state, and the topbar pill carries a refusal's sentence.
+    expect(document.querySelector('.tools-tab-hint')).toBeNull();
+    // R3 + this pass: the pane head is ONLY its heading — the playground's session note and
+    // the switch write's live line are both gone, so nothing names the temporary context or
+    // narrates a write up front any more.
+    expect(document.querySelector('.tools-tab-note')).toBeNull();
+    expect([...byClass('.tools-tab-head', 'div').children].map((node) => node.className)).toEqual([
+        'tools-tab-title'
+    ]);
+    // …and the pane itself is nothing but that head and the grid: title, tools, done.
+    expect([...byClass('.tools-pane', 'div').children].map((node) => node.className)).toEqual([
+        'tools-tab-head',
+        'tool-tab-list'
+    ]);
+    // The heading is the view's name, not a bare "Tools" with a stray badge word beside it.
+    expect(byClass('.tools-tab-title', 'h2').textContent).toBe('Tools Catalogue');
 });
 
 // The guard main.ts documents: a row that never stated an enablement states NO state,
@@ -884,7 +933,7 @@ it('switches a tool off and back on with one click, and repaints the row from th
 
     // The SAME nodes repaint from the answer: no list rebuild, so the row stays the node
     // the runner dialog would hand focus back to. The box, its `data-enabled` and the
-    // tile's state move together, so the tick and the wash can never disagree.
+    // tile's enabled EDGE move together, so the tick and the green border can never disagree.
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button')).toBe(row);
     expect(byClass('.tool-tab-enable[data-tool="read"]', 'input')).toBe(control);
     expect(row.dataset.enabled).toBe('false');
@@ -894,10 +943,9 @@ it('switches a tool off and back on with one click, and repaints the row from th
     expect(control.getAttribute('aria-label')).toBe('Enable read');
     expect(control.disabled).toBe(false);
 
-    // The pane's own live line states the accepted figure, and the pill returns to idle.
-    expect(byClass('.tools-tab-note', 'p').textContent).toBe('read is now disabled for every conversation.');
-    expect(byClass('.tools-tab-note', 'p').hidden).toBe(false);
-    expect(byClass('.tools-tab-note', 'p').className).toBe('tools-tab-note field-hint');
+    // The pane says NOTHING about the accepted switch: its live line is gone with the
+    // markup, so the box/row figure asserted above IS the report, and the pill returns to idle.
+    expect(document.querySelector('.tools-tab-note')).toBeNull();
     expect(byClass('.status-text', 'span').textContent).toBe('idle');
 
     // A second press inverts what the SERVER reported (the cache moved with the answer),
@@ -912,7 +960,7 @@ it('switches a tool off and back on with one click, and repaints the row from th
     expect(row.dataset.enabled).toBe('true');
 });
 
-it('states a refused switch with the server sentence and pulls the tick back to the server figure', async () => {
+it('pulls a refused switch back to the server figure and keeps the server sentence on the pill', async () => {
     const message = 'read cannot be switched off while its harness is being rebuilt.';
     const calls = stubFetch((url, method) => {
         if (url === '/api/tools/read' && method === 'PATCH') return json({ error: { message } }, 403);
@@ -937,17 +985,21 @@ it('states a refused switch with the server sentence and pulls the tick back to 
 
     expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(1);
 
-    // The server's own sentence, on the classed failure line — and the row still states
-    // the figure the server has, because nothing was written.
-    expect(byClass('.tools-tab-note', 'p').textContent).toBe(message);
-    expect(byClass('.tools-tab-note', 'p').className).toBe('tools-tab-note tools-tab-note-error');
+    // The refusal leaves nothing in the pane that could lie: there is no line to contradict
+    // the server (the live element is gone), and the row still states the figure the server
+    // holds, because nothing was written and the unlock pass repaints from that cache.
+    expect(document.querySelector('.tools-tab-note')).toBeNull();
     expect(control.checked).toBe(true);
     expect(control.className).toBe('tool-tab-enable is-on');
     expect(control.dataset.enabled).toBe('true');
     expect(control.getAttribute('aria-label')).toBe('Disable read');
     expect(control.disabled).toBe(false);
     expect(row.dataset.enabled).toBe('true');
+    // The server's own sentence is NOT dropped with the pane line: the pill reports the state
+    // word, its `title` carries the diagnostic for pointer readers, and the hidden live-region
+    // child announces it — so a refused switch still fails out loud, just not in the pane.
     expect(byClass('.status-text', 'span').textContent).toBe('error');
+    expect(byClass('.status-detail', 'span').textContent).toBe(`tool enablement: ${message}`);
 });
 
 // R1's click separation: the box and the tile are two controls in one row, and each owns
@@ -1068,4 +1120,82 @@ it('keeps the tools page, its rows and its switch usable while a run is pending'
         { url: '/api/tools/read', method: 'PATCH', body: { enabled: false } }
     ]);
     expect(byClass('.tool-tab-enable[data-tool="read"]', 'input').checked).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// R5 + R4 (Tools Catalogue): ONE flat A–Z list of the WHOLE catalogue.
+//
+// The fixture deliberately arrives in the SERVER's order (core tools first, then each
+// registration group) and mixes the groups the pane used to break apart with a
+// `.tool-tab-group` heading, so the rendered order is evidence about the renderer's sort and
+// not about the wire's order.
+//
+// Two names are a deliberate CASE pair (`appleTool` / `ZebraTool`): a case-SENSITIVE compare
+// puts the capital `Z` first, the A–Z the reader asked for puts `appleTool` first, so this
+// list proves the compare ignores case. `toolRegistry` before `toolRequest` is the real
+// catalogue's own pair, and the reason the compare is code-point rather than `localeCompare`
+// (an ICU collator may fold the pair differently across builds).
+// ---------------------------------------------------------------------------
+
+// One wire row of one group, in the shape the double answers (`ToolSummary` + `enabled`).
+const catalogueRow = (
+    name: string,
+    group: string,
+    visibility: 'core' | 'searchable' = 'searchable'
+): WireTool => ({
+    name,
+    group,
+    description: `${name} description`,
+    tags: [group.toLowerCase()],
+    visibility,
+    enabled: true,
+    parameters: { type: 'object', properties: {} }
+});
+
+it('lists the whole catalogue as ONE alphabetical list with no group headings, and counts what it renders', async () => {
+    const served = [
+        catalogueRow('toolRegistry', 'Core tools', 'core'),
+        catalogueRow('toolRequest', 'Core tools', 'core'),
+        catalogueRow('timeNow', 'Core tools', 'core'),
+        catalogueRow('noteSearch', 'Harness tools'),
+        catalogueRow('diceRoll', 'Harness tools'),
+        catalogueRow('search', 'Web search', 'core'),
+        catalogueRow('fetch', 'Web fetch', 'core'),
+        catalogueRow('ZebraTool', 'Package presets'),
+        catalogueRow('appleTool', 'Package presets')
+    ];
+
+    stubFetch((url) => (url === '/api' ? json(bootstrap({ tools: served })) : undefined));
+    await boot();
+
+    openTools();
+    await flush();
+
+    // R5: not ONE group heading in the pane — the "Core tools" / "Package presets" split the
+    // reader could not tell apart is gone from this view (the Plugins pane keeps its own
+    // sections, and a tool's kind still rides its meta line).
+    expect(document.querySelectorAll('.tool-tab-group')).toHaveLength(0);
+
+    // R5: strict A–Z across the whole list, whatever group a row belongs to.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
+    ).toEqual([
+        'appleTool',
+        'diceRoll',
+        'fetch',
+        'noteSearch',
+        'search',
+        'timeNow',
+        'toolRegistry',
+        'toolRequest',
+        'ZebraTool'
+    ]);
+
+    // R4: the head's total is the number of rows on screen. The catalogue that reached the
+    // pane IS the catalogue the pane painted, so a page boundary cannot drop rows and still
+    // print a confident count (the paging itself is pinned in ./api.test.ts `listAllTools`).
+    expect(document.querySelectorAll('.tool-tab-row')).toHaveLength(9);
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        '9 tools · calls run on the harness server'
+    );
 });

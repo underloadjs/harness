@@ -481,6 +481,13 @@ describe('GET /v1/harness/plugins', () => {
         // the descriptor objects themselves.
         for (const setting of page.body.items[1].settings) {
             expect(setting).not.toHaveProperty('description');
+            // THE "PURELY ADDITIVE" HALF OF R1/R2. A plugin that declares no grouping must keep the
+            // exact wire key set it had before `group`/`parentKey` existed — `pluginSettingOf`
+            // (src/server/api.ts) emits each field only when the descriptor carries it, and an
+            // explicit `undefined` on the wire would be a new key for a client to trip over
+            // (`toEqual` alone cannot see the difference, which is why it is asserted structurally).
+            expect(setting).not.toHaveProperty('group');
+            expect(setting).not.toHaveProperty('parentKey');
         }
 
         // The third row: `context-trimmer` (R5, and the 2026-11-13 three-option clean-up). Same
@@ -499,12 +506,15 @@ describe('GET /v1/harness/plugins', () => {
             // Same reserved-switch rule as compaction: the plugin DECLARES `enabled`, so the row
             // field and `values.enabled` are one stored value read two ways.
             enabled: true,
-            // Declared order is the row order the pane renders, and EVERY number publishes its
-            // bounds: the PATCH edge only refuses an out-of-range value the plugin published a
-            // bound for, so a missing `max` is a hole in the write edge (T3b). The rows that still
-            // carry a hint mirror the plugin's own declared copy (`TRIMMER.settings`), and the
-            // eight that no longer declare one carry NO `description` key here — the loop after
-            // this assertion is what pins that split, because `toEqual` alone cannot.
+            // Declared order is the row order the pane renders — and since the 2026-11-13 grouping,
+            // the row order of its CATEGORIES: a policy toggle opens a section (`group`) and the
+            // fields nested under it follow it (`parentKey`), so a flat list that silently lost
+            // either field would still return 200 and render a wall of controls. EVERY number
+            // publishes its bounds: the PATCH edge only refuses an out-of-range value the plugin
+            // published a bound for, so a missing `max` is a hole in the write edge (T3b). The rows
+            // that still carry a hint mirror the plugin's own declared copy (`TRIMMER.settings`),
+            // and the eight that no longer declare one carry NO `description` key here — the loops
+            // after this assertion are what pin both splits, because `toEqual` alone cannot.
             settings: [
                 {
                     key: 'enabled',
@@ -513,12 +523,19 @@ describe('GET /v1/harness/plugins', () => {
                     default: true,
                     description: TRIMMER.settings?.find((setting) => setting.key === 'enabled')?.description
                 },
+                // The 2026-11-13 grouping (R1/R2): `group` and `parentKey` are part of the wire row
+                // the Plugins pane draws its sections from — `group.title` is the heading text and
+                // `parentKey` is the checkbox that reveals the row. Asserted as LITERAL expected
+                // values, not off `TRIMMER.settings`, because the projection (src/server/api.ts
+                // `pluginSettingOf`) is what this file owns: a row that dropped the field, or
+                // projected the wrong section, has to fail here rather than in the pane.
                 {
                     key: 'trimInvalidTools',
-                    label: 'Automatic Trim invalid tools',
+                    label: 'Automatic Trim Invalid Tools',
                     type: 'boolean',
                     default: true,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'trimInvalidTools')?.description
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'trimInvalidTools')?.description,
+                    group: { id: 'invalid-tools', title: 'Invalid Tools' }
                 },
                 {
                     key: 'invalidToolTurns',
@@ -528,13 +545,25 @@ describe('GET /v1/harness/plugins', () => {
                     min: 0,
                     max: 4096,
                     step: 1,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'invalidToolTurns')?.description
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'invalidToolTurns')?.description,
+                    group: { id: 'invalid-tools', title: 'Invalid Tools' },
+                    parentKey: 'trimInvalidTools'
+                },
+                {
+                    key: 'invalidOutcomes',
+                    label: 'Outcomes that count as invalid',
+                    type: 'string',
+                    default: 'failed,rejected',
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'invalidOutcomes')?.description,
+                    group: { id: 'invalid-tools', title: 'Invalid Tools' },
+                    parentKey: 'trimInvalidTools'
                 },
                 {
                     key: 'trimThoughts',
-                    label: 'Automatic Trim thoughts',
+                    label: 'Automatic Trim Thoughts',
                     type: 'boolean',
-                    default: true
+                    default: true,
+                    group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' }
                 },
                 {
                     key: 'thoughtTurns',
@@ -543,31 +572,27 @@ describe('GET /v1/harness/plugins', () => {
                     default: 2,
                     min: 0,
                     max: 4096,
-                    step: 1
+                    step: 1,
+                    group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
+                    parentKey: 'trimThoughts'
                 },
                 {
-                    key: 'truncateToolRequests',
-                    label: 'Automatic Truncate Tool Request',
-                    type: 'boolean',
-                    default: false,
-                    description: TRIMMER.settings?.find(
-                        (setting) => setting.key === 'truncateToolRequests'
-                    )?.description
-                },
-                {
-                    key: 'truncateTurns',
-                    label: 'Truncate tool requests after (tool turns)',
+                    key: 'minThoughtChars',
+                    label: 'Minimum thinking saved per pass (characters)',
                     type: 'number',
-                    default: 2,
+                    default: 0,
                     min: 0,
-                    max: 4096,
-                    step: 1
+                    max: 1000000,
+                    step: 50,
+                    group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
+                    parentKey: 'trimThoughts'
                 },
                 {
                     key: 'dropSupersededToolCalls',
-                    label: 'Automatic Trim superseded tools',
+                    label: 'Automatic Trim Superseded Tools',
                     type: 'boolean',
-                    default: true
+                    default: true,
+                    group: { id: 'superseded-tools', title: 'Superseded Tools' }
                 },
                 {
                     key: 'supersededTurns',
@@ -576,14 +601,26 @@ describe('GET /v1/harness/plugins', () => {
                     default: 2,
                     min: 0,
                     max: 4096,
-                    step: 1
+                    step: 1,
+                    group: { id: 'superseded-tools', title: 'Superseded Tools' },
+                    parentKey: 'dropSupersededToolCalls'
+                },
+                {
+                    key: 'supersedeMatch',
+                    label: 'Supersession match',
+                    type: 'string',
+                    default: 'name',
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'supersedeMatch')?.description,
+                    group: { id: 'superseded-tools', title: 'Superseded Tools' },
+                    parentKey: 'dropSupersededToolCalls'
                 },
                 {
                     key: 'dropDuplicateCalls',
-                    label: 'Automatic Trim duplicate tools',
+                    label: 'Automatic Trim Duplicate Tools',
                     type: 'boolean',
                     default: false,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropDuplicateCalls')?.description
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'dropDuplicateCalls')?.description,
+                    group: { id: 'duplicate-tools', title: 'Duplicate Tools' }
                 },
                 {
                     key: 'duplicateTurns',
@@ -592,21 +629,30 @@ describe('GET /v1/harness/plugins', () => {
                     default: 2,
                     min: 0,
                     max: 4096,
-                    step: 1
+                    step: 1,
+                    group: { id: 'duplicate-tools', title: 'Duplicate Tools' },
+                    parentKey: 'dropDuplicateCalls'
                 },
                 {
-                    key: 'invalidOutcomes',
-                    label: 'Outcomes that count as invalid',
-                    type: 'string',
-                    default: 'failed,rejected',
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'invalidOutcomes')?.description
+                    key: 'truncateToolRequests',
+                    label: 'Automatic Truncate Tool Requests',
+                    type: 'boolean',
+                    default: false,
+                    description: TRIMMER.settings?.find(
+                        (setting) => setting.key === 'truncateToolRequests'
+                    )?.description,
+                    group: { id: 'tool-requests', title: 'Tool Requests' }
                 },
                 {
-                    key: 'supersedeMatch',
-                    label: 'Supersession match',
-                    type: 'string',
-                    default: 'name',
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'supersedeMatch')?.description
+                    key: 'truncateTurns',
+                    label: 'Truncate tool requests after (tool turns)',
+                    type: 'number',
+                    default: 2,
+                    min: 0,
+                    max: 4096,
+                    step: 1,
+                    group: { id: 'tool-requests', title: 'Tool Requests' },
+                    parentKey: 'truncateToolRequests'
                 },
                 {
                     key: 'minTokens',
@@ -616,16 +662,8 @@ describe('GET /v1/harness/plugins', () => {
                     min: 0,
                     max: 1000000,
                     step: 50,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'minTokens')?.description
-                },
-                {
-                    key: 'minThoughtChars',
-                    label: 'Minimum thinking saved per pass (characters)',
-                    type: 'number',
-                    default: 0,
-                    min: 0,
-                    max: 1000000,
-                    step: 50
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'minTokens')?.description,
+                    group: { id: 'global-limits', title: 'Global Limits' }
                 },
                 {
                     key: 'safetyUnits',
@@ -634,7 +672,8 @@ describe('GET /v1/harness/plugins', () => {
                     default: 0,
                     min: 0,
                     max: 4096,
-                    step: 1
+                    step: 1,
+                    group: { id: 'global-limits', title: 'Global Limits' }
                 },
                 {
                     key: 'maxUnits',
@@ -644,7 +683,8 @@ describe('GET /v1/harness/plugins', () => {
                     min: 0,
                     max: 4096,
                     step: 1,
-                    description: TRIMMER.settings?.find((setting) => setting.key === 'maxUnits')?.description
+                    description: TRIMMER.settings?.find((setting) => setting.key === 'maxUnits')?.description,
+                    group: { id: 'global-limits', title: 'Global Limits' }
                 }
             ],
             values: {
@@ -698,6 +738,47 @@ describe('GET /v1/harness/plugins', () => {
             expect(setting.description).toBe(
                 TRIMMER.settings?.find((declared) => declared.key === setting.key)?.description
             );
+        }
+
+        // THE GROUPING SHAPE ON THE WIRE (R1/R2), pinned exactly as strictly as the hints above,
+        // for the same reason: `toEqual` reads an absent key and a `group: undefined` as the same
+        // thing, and a renderer cannot — an explicit null section is not a flat row. `[group.id,
+        // group.title, parentKey]`, `null` for the fields the plugin never declared: `enabled` is
+        // the ONE row with no group at all (the master switch sits above the categories), and the
+        // six policy toggles plus the three Global Limits knobs carry a group with no parent,
+        // because nothing gates them. The headings the pane prints are `title` VERBATIM, so the
+        // heading text an operator asked for ("Invalid Tools", "Chain of Thoughts", …) is part of
+        // this pin, not just the ids.
+        const grouping: Record<string, [string | null, string | null, string | null]> = {
+            enabled: [null, null, null],
+            trimInvalidTools: ['invalid-tools', 'Invalid Tools', null],
+            invalidToolTurns: ['invalid-tools', 'Invalid Tools', 'trimInvalidTools'],
+            invalidOutcomes: ['invalid-tools', 'Invalid Tools', 'trimInvalidTools'],
+            trimThoughts: ['chain-of-thoughts', 'Chain of Thoughts', null],
+            thoughtTurns: ['chain-of-thoughts', 'Chain of Thoughts', 'trimThoughts'],
+            minThoughtChars: ['chain-of-thoughts', 'Chain of Thoughts', 'trimThoughts'],
+            dropSupersededToolCalls: ['superseded-tools', 'Superseded Tools', null],
+            supersededTurns: ['superseded-tools', 'Superseded Tools', 'dropSupersededToolCalls'],
+            supersedeMatch: ['superseded-tools', 'Superseded Tools', 'dropSupersededToolCalls'],
+            dropDuplicateCalls: ['duplicate-tools', 'Duplicate Tools', null],
+            duplicateTurns: ['duplicate-tools', 'Duplicate Tools', 'dropDuplicateCalls'],
+            truncateToolRequests: ['tool-requests', 'Tool Requests', null],
+            truncateTurns: ['tool-requests', 'Tool Requests', 'truncateToolRequests'],
+            minTokens: ['global-limits', 'Global Limits', null],
+            safetyUnits: ['global-limits', 'Global Limits', null],
+            maxUnits: ['global-limits', 'Global Limits', null]
+        };
+
+        expect(page.body.items[2].settings).toHaveLength(Object.keys(grouping).length);
+
+        for (const setting of page.body.items[2].settings) {
+            const [groupId, groupTitle, parentKey] = grouping[setting.key];
+
+            if (groupId === null) expect(setting).not.toHaveProperty('group');
+            else expect(setting.group).toEqual({ id: groupId, title: groupTitle });
+
+            if (parentKey === null) expect(setting).not.toHaveProperty('parentKey');
+            else expect(setting.parentKey).toBe(parentKey);
         }
     });
 
@@ -981,25 +1062,28 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         });
 
         // The descriptors themselves still publish the documented defaults as reset targets, in the
-        // declared order the pane renders — each horizon immediately after the toggle it windows.
+        // declared order the pane renders — by CATEGORY since the 2026-11-13 grouping, each horizon
+        // immediately after the toggle it windows and nested under it by `parentKey`. A PATCH must
+        // not reorder or drop a descriptor, and the reset target of a `null` entry is `default`
+        // wherever the row sits.
         expect(
             patched.body.plugin.settings.map((setting: { key: string; default: unknown }) => [setting.key, setting.default])
         ).toEqual([
             ['enabled', true],
             ['trimInvalidTools', true],
             ['invalidToolTurns', 2],
+            ['invalidOutcomes', 'failed,rejected'],
             ['trimThoughts', true],
             ['thoughtTurns', 2],
-            ['truncateToolRequests', false],
-            ['truncateTurns', 2],
+            ['minThoughtChars', 0],
             ['dropSupersededToolCalls', true],
             ['supersededTurns', 2],
+            ['supersedeMatch', 'name'],
             ['dropDuplicateCalls', false],
             ['duplicateTurns', 2],
-            ['invalidOutcomes', 'failed,rejected'],
-            ['supersedeMatch', 'name'],
+            ['truncateToolRequests', false],
+            ['truncateTurns', 2],
             ['minTokens', 0],
-            ['minThoughtChars', 0],
             ['safetyUnits', 0],
             ['maxUnits', 0]
         ]);

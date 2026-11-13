@@ -3518,21 +3518,49 @@ as their own entries.
   origins. The **saved “Harness server URL”** (step 2 of the ladder) is the other
   source the client trusts, and the only
   one a reader controls: the status pill opens **Endpoint & model**, the field at the
-  top of that dialog edits it, `Apply & reconnect` validates it (a rooted path, or an
-  absolute `http(s)` URL with no query, fragment, credentials or backslashes), stores
-  the NORMALIZED value under its own `underload-harness-app:api-root` key
-  (`src/frontend/api.ts` `API_ROOT_STORAGE_KEY`, `saveApiRootSetting`), strips any
-  `apiRoot` parameter from the address bar (that parameter outranks the saved value for
-  the load it is on, so leaving it would undo the save) and reloads — the root is
-  resolved once at module load, so a reload IS the reconnect. `Reset`, or applying a
-  blank field, deletes the key and restores automatic resolution; a refused value is
-  reported inline and stores nothing. A saved cross-origin host is accepted on the
+  top of that dialog edits it, and `Apply` — the dialog's ONLY button, at the bottom
+  right — is the only thing that commits anything. CORRECTED IN PLACE 2026-11-13: this
+  record named an `Apply & reconnect` action and a secondary `Reset` button; the dialog
+  is one `Apply` and has no reset button. What the dialog shows is a DRAFT: the
+  `Close` button, `Escape` and a backdrop click each discard it, and `Apply` writes the
+  provider triple plus, when the URL changed, this key. A valid URL (a rooted path, or an
+  absolute `http(s)` URL with no query, fragment, credentials or backslashes) is stored
+  in NORMALIZED form under its own `underload-harness-app:api-root` key
+  (`src/frontend/api.ts` `API_ROOT_STORAGE_KEY`, `saveApiRootSetting`), any `apiRoot`
+  parameter is stripped from the address bar (that parameter outranks the saved value
+  for the load it is on, so leaving it would undo the save), and the page reloads — the
+  root is resolved once at module load, so a reload IS the reconnect; an unchanged URL
+  commits with no reload. `Enter` inside any text field of the dialog IS that `Apply`
+  press (`src/frontend/main.ts` `commitFromEnter`), so it is exactly one commit and never a
+  form submit or a bare reload, and it does nothing at all when the keystroke is an
+  input-method confirming a candidate (`isComposing || keyCode === 229`, the same guard the
+  composer's Enter handler runs). Applying a blank field deletes the key and restores automatic
+  resolution, which is now the only reset affordance; a refused value is reported inline
+  and stores nothing. A saved cross-origin host is accepted on the
   reader's own authority, so what decides whether it answers is the service Origin
   gate, CORS and the browser's mixed-content rule (an https page cannot dial a
   plain-http harness). The value never enters a request body: the dialog's base URL /
   API key / model triple is the PROVIDER, and where the UI dials is a separate
-  decision. A saved root also pins a Pages host — the compiled chain is a fallback,
-  never an override. It imports no harness code and no `node:` built-ins, which is why
+  decision; the triple is the same draft, so `Apply` is what saves it, and the model is
+  always one the endpoint advertises — editing the base URL debounces a
+  `POST /v1/harness/models` for the draft settings by ~500 ms, the SERVER performs the
+  upstream `GET {base}/models` because it owns the credential (the key is never sent back
+  to the browser), and the ids it answers repopulate the Model dropdown, which is
+  select-only: there is no input in which to type an id. That debounced lookup is a PREVIEW:
+  its answer paints the dialog's dropdown and nothing else, and an answer from a preview the
+  reader dismissed or overtook is dropped rather than painted (`src/frontend/main.ts`
+  `modelTicket`). The catalogue the rest of the app dials moves only on a COMMITTED lookup —
+  the one boot arms for the saved settings even when the dialog is already open, and the one
+  `Apply` arms once the draft IS the record — and `Apply` publishes only when the list on
+  screen was fetched for exactly that (Base URL, API key) pair, because a blank key on the
+  configured origin means the SERVER's key
+  (`src/shared/harness-api.ts` `RunnerSettingsInput.api_key`), so the same URL legitimately
+  answers with a different list once a key is typed. Reopening spends no request when the
+  published catalogue already answers for that pair: `seedModelPreview` seeds the dropdown
+  from it, and arms exactly ONE committed lookup when nothing is known about it. A saved root
+  also pins a Pages
+  host — the compiled chain is a fallback, never an override. It imports no harness code
+  and no `node:` built-ins, which is why
   `node-stub.ts` and the source alias were deleted. To drive the service host
   from the built UI:
   `http://localhost:5180/?apiRoot=http://localhost:5000/v1/harness` — the Vite

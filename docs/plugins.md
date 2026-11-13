@@ -423,27 +423,27 @@ built-ins subscribe `turn.before`, and compaction is dispatched first (manifest 
 `src/plugin/manifest.ts`).
 
 The trimmer's settings (`PATCH /v1/harness/plugins/context-trimmer`, read live on the next
-turn of every session) ARE the policy surface. Three options each have a toggle with **its own
-horizon immediately after it**, which is the shape the pane renders and the order the table
-below is in:
+turn of every session) ARE the policy surface. The table below is in **declaration order, which
+is the order the pane renders**: every policy sits in its own named category with the settings
+that window it filed under the toggle, and a gated setting is shown only while its switch is on:
 
 | Switch | Default | What it decides |
 |---|---|---|
 | `enabled` | `true` | The framework's reserved key: hook delivery on or off. Off stops every policy below and undoes no flag an earlier turn wrote |
 | `trimInvalidTools` | `true` | A fully answered tool unit whose every committed result came back invalid (see `invalidOutcomes`) stops being sent, as a whole unit — **but only once EVERY tool name it called has a `completed` answer in a still-included later unit.** A failure nobody retried, or one whose retry is itself withheld, is left in the context and nothing is said about it: that is the rule's most common silent no-op, and the row's hint in the pane says so |
 | `invalidToolTurns` | `2` | Protects the newest N **tool turns** from that rule; `0` protects none and anything older is eligible |
+| `invalidOutcomes` | `"failed,rejected"` | The closed set `failed` \| `rejected` \| `cancelled` \| `empty` the invalid-tools rule may act on. Unknown names are dropped (so is `completed`), the pass says which it used, and a set that resolves to nothing disables the rule |
 | `trimThoughts` | `true` | The model's own recorded `reasoning` stops being replayed — a per-entry flag, never a text edit |
 | `thoughtTurns` | `2` | Protects the newest N **thoughts** (entries that actually carry thinking), open turn included; `0` protects none |
-| `truncateToolRequests` | `false` | Withholds an old tool **request** entry while its tool **results** keep riding — the one switch that breaks the unit in half, on purpose. The pass line and `data.truncated[].results` list ONLY the results still being sent, so a result somebody switched off by hand reads `results kept none` rather than an index the provider never receives |
-| `truncateTurns` | `2` | Protects the newest N tool turns from truncation; `0` protects none |
+| `minThoughtChars` | `0` | A THINKING pass under this character floor writes nothing at all, measured over what the horizon actually left to write |
 | `dropSupersededToolCalls` | `true` | The shipped rule, verbatim: a fully answered unit whose every committed result `failed` or `rejected`, where EVERY tool NAME it called has a `completed` answer in a still-included later unit, stops being sent — as a whole unit |
 | `supersededTurns` | `2` | Protects the newest N tool turns from that rule; `0` protects none |
+| `supersedeMatch` | `"name"` | `name` is the shipped loosening; `fingerprint` is compaction's exact rule (`src/core/argument-fingerprint.ts`), which makes the two passes agree by construction — the value that makes compaction's failure-retry prune redundant, per the overlap note below |
 | `dropDuplicateCalls` | `false` | Withhold an earlier unit a later unit re-ran with an identical fingerprint — the only switch that can withhold work the model actually used |
 | `duplicateTurns` | `2` | Protects the newest N tool turns from that rule; `0` protects none |
-| `invalidOutcomes` | `"failed,rejected"` | The closed set `failed` \| `rejected` \| `cancelled` \| `empty` the invalid-tools rule may act on. Unknown names are dropped (so is `completed`), the pass says which it used, and a set that resolves to nothing disables the rule |
-| `supersedeMatch` | `"name"` | `name` is the shipped loosening; `fingerprint` is compaction's exact rule (`src/core/argument-fingerprint.ts`), which makes the two passes agree by construction — the value that makes compaction's failure-retry prune redundant, per the overlap note below |
+| `truncateToolRequests` | `false` | Withholds an old tool **request** entry while its tool **results** keep riding — the one switch that breaks the unit in half, on purpose. The pass line and `data.truncated[].results` list ONLY the results still being sent, so a result somebody switched off by hand reads `results kept none` rather than an index the provider never receives |
+| `truncateTurns` | `2` | Protects the newest N tool turns from truncation; `0` protects none |
 | `minTokens` | `0` | A TOOL pass under the floor writes nothing at all — and the floor is measured **per axis**, so each of the two tool axes has to earn it on its own. It never gates thinking, because the estimator does not count `reasoning` (`src/core/context-estimate.ts`) |
-| `minThoughtChars` | `0` | A THINKING pass under this character floor writes nothing at all, measured over what the horizon actually left to write |
 | `safetyUnits` | `0` | Units at the END of the transcript no tool rule may touch; `0` removes the horizon. Counts UNITS, and is independent of the tool-turn horizons above |
 | `maxUnits` | `0` | Cap on how many candidates ONE axis withholds in one pass; `0` is unbounded |
 
@@ -466,7 +466,7 @@ consequence: turning the headline toggle off changes NOTHING at the defaults, be
 switch is still withholding the same units. They part company only when the operator names a
 wider set — `cancelled`, `empty`, or both — at which point the generalisation is strictly wider
 than the shipped rule and `dropSupersededToolCalls` alone cannot reach those units. Both toggles
-exist because the operator asked for `Automatic Trim invalid tools` as a named switch and the
+exist because the operator asked for `Automatic Trim Invalid Tools` as a named switch and the
 shipped rule keeps its own name for compatibility; a pane showing two indistinguishable switches
 is honest only while the documentation says which pair is redundant, which is this paragraph.
 

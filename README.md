@@ -4211,21 +4211,42 @@ Step 6 is the default the dialog shows and needs no configuration: a UI served a
 
 **Pointing the UI at another harness, from the UI.** Press the status pill at the top
 right to open **Endpoint & model**; the field at the top of that dialog is this
-browser's harness server URL, and the line at the bottom of the dialog prints the root
-actually in use. `Apply & reconnect` validates the value — a rooted path, or an
-absolute `http(s)` URL with no query, fragment, credentials or backslashes — stores it
-in normalized form (so a trailing slash cannot drift between loads), removes the
-`apiRoot` parameter from the address bar (that parameter outranks the saved value, so
-leaving it in place would undo the save; every other parameter and the hash survive),
-and reloads, which re-resolves the root and reconnects the `harness.v1` WebSocket. A
-value the validator refuses is reported inline and nothing is written. `Reset`, or
-applying a blank field, deletes the key and reloads — that restores automatic
-resolution, which on a Pages host means the compiled chain again.
+browser's harness server URL, and a short line in the dialog prints the root actually in
+use. `Apply` at the bottom right is the dialog's only button and the only thing that
+commits anything: what is on screen there is a **draft**, so dismissing the dialog with
+the close button, `Escape` or a click outside leaves every saved value exactly as it was.
+`Apply` validates the URL — a rooted path, or an absolute `http(s)` URL with no query,
+fragment, credentials or backslashes — stores it in normalized form (so a trailing slash
+cannot drift between loads), removes the `apiRoot` parameter from the address bar (that
+parameter outranks the saved value, so leaving it in place would undo the save; every
+other parameter and the hash survive), and reloads, which re-resolves the root and
+reconnects the `harness.v1` WebSocket. That reload happens only when the URL actually
+changed; for an unchanged URL `Apply` writes the draft and closes. `Enter` in any text field of
+the dialog is that same `Apply` press — never a form submit and never a bare reload — and an
+`Enter` that only confirms an input-method candidate is ignored. A value the validator
+refuses is reported inline and nothing is written. Applying a **blank** field deletes the
+key and reloads — the field is now the only reset affordance — and that restores
+automatic resolution, which on a Pages host means the compiled chain again.
 
 The setting has its own storage key and is never serialized into a request body: the
 dialog's Base URL / API key / model triple describes the **provider**, and where the UI
-sends its requests is a separate decision. A saved root also silences the Pages probe
-chain — a deliberate choice is never replaced by a guess.
+sends its requests is a separate decision. That triple is part of the same draft, so
+`Apply` is also what saves it. The model is one the endpoint advertises: editing the Base
+URL debounces a `POST /v1/harness/models` for the draft settings by about 500 ms, the harness server
+performs the upstream `GET {base}/models` (it owns the credential, and the key is never
+sent back to the browser), and the ids it returns repopulate the Model dropdown — a
+select-only control, there is no field in which to type an id. That debounced lookup is a
+**preview**: its answer paints the dialog's dropdown and nothing else, so a URL you typed and
+then dismissed, or overtook with another edit, never changes what a conversation dials. The
+catalogue the rest of the app uses moves only on a **committed** lookup — the one a load makes
+for the saved endpoint, even when the dialog is already open, and the one `Apply` makes once the
+draft is the record — and `Apply` republishes only when the list on screen was fetched for that
+exact Base URL **and** API key, because a blank key on the configured origin means the harness
+server's own key and the same URL can therefore legitimately answer with a different list.
+Reopening the dialog spends no request when the published catalogue already answers for that
+pair: it seeds the dropdown from it, and arms exactly one lookup when nothing is known about it.
+A saved root also
+silences the Pages probe chain — a deliberate choice is never replaced by a guess.
 
 A one-load override looks like this:
 
@@ -4308,7 +4329,8 @@ full reload, which re-probes. Pin one host with
 (a root that names a compiled chain entry exactly is trusted; any other foreign
 absolute root is still ignored), save one in this browser with the dialog's
 “Harness server URL” field (a saved root is trusted across origins, and it silences the
-chain until `Reset` clears it), or bake one in with `VITE_HARNESS_API` at build time.
+chain until that field is applied blank), or bake one in with `VITE_HARNESS_API` at build
+time.
 The host/port constants mirror the monorepo's `config/environment` (`src/host.ts`,
 `src/port.ts`); that package is not published, so they are restated here — update both
 when the LAN address changes.

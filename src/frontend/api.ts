@@ -20,7 +20,10 @@
 // the generated page DTO (`PageMeta` + `items`). `pageParams` clamps `limit` into
 // `HARNESS_PAGE_LIMIT` (default 25, max 100) so a caller cannot ask for an
 // unbounded page by accident. Nothing in this module loops pages implicitly —
-// the caller (./view-api.ts, ./main.ts) decides when the user asked for more.
+// the caller (./view-api.ts, ./main.ts) decides when the user asked for more. The ONE
+// exception is `listAllTools`, the tools-catalogue collector: the Tools view is a
+// catalogue the reader expects complete, so that read asks for the contract's largest
+// page and walks `next_cursor` itself, under a pass guard (see its header).
 //
 // Revisions/epochs: `requestResource` returns the parsed body PLUS the
 // `X-Harness-Epoch` / `X-Harness-Revision` headers, which is how a caller learns
@@ -179,7 +182,8 @@ export type HarnessBootstrap = {
     info: ServiceInfo;
     // Definition cards, first page only, in the shape the rail renders.
     presets: HarnessCardView[];
-    // Catalogue rows, first page only, in the shape the tools view renders.
+    // Catalogue rows, the WHOLE catalogue (R4: `listAllTools` walks every page), in the shape
+    // the tools view renders.
     tools: ToolRowView[];
     // Trusted profile rows, first page only (no instruction TEXT on a row).
     agents: AgentRowView[];
@@ -188,7 +192,9 @@ export type HarnessBootstrap = {
     // Session rows, first page only: metadata + counters, never turns or threads.
     sessions: SessionSummary[];
     // Paging cursors of the four seed pages, so the shell can extend a directory
-    // without re-reading it (`null` = that page was the whole collection).
+    // without re-reading it (`null` = that page was the whole collection). The tools
+    // cursor is `null` by construction: R4 reads that catalogue to its end, so what is
+    // in `tools` is everything the server has.
     cursors: { harnesses: string | null; tools: string | null; agents: string | null; sessions: string | null };
 };
 
@@ -883,6 +889,75 @@ export const deleteAgent = (agentId: string): Promise<DeleteAgentResult> =>
 
 export const listTools = (query: PageQuery = {}): Promise<Page<ToolSummary>> =>
     request<ToolSummaryPage>(`${HARNESS_ROUTES.tools()}${pageParams(query)}`).then(pageOf);
+
+// ---------------------------------------------------------------------------
+// The WHOLE tool catalogue in one read (R4 of the Tools Catalogue pass)
+// ---------------------------------------------------------------------------
+
+// The Tools view is a CATALOGUE, not a page: the reader expects every tool the server
+// lists, whichever group it belongs to. Boot used to dial `GET /tools` at the contract's
+// DEFAULT page size (`HARNESS_PAGE_LIMIT.default` = 25, injected by `pageParams`,
+// api.ts:668-699), and the stock build registers 32 rows (15 core + 10 package presets +
+// 5 harness tools from src/server/tools/shared/ + `search` + `fetch`). Those last 7 sat on
+// page 2 and simply vanished, because nothing in the frontend ever consumed
+// `cursors.tools` — the truncation was invisible, not intentional.
+//
+// The fix is frontend-only (the server's paging semantics are untouched): ask for the
+// largest page the contract allows and keep following `next_cursor` until the server stops
+// handing one back, so `buildTools` receives the complete array and the head count it
+// prints is the number of rows it renders.
+const CATALOGUE_PAGE_SIZE = HARNESS_PAGE_LIMIT.max;
+
+// Hard iteration guard. A malformed or self-referential cursor would otherwise spin
+// forever inside BOOT (the catalogue read is on the boot critical path, so an infinite loop
+// is a white screen, not a slow pane). 20 pages x 100 rows = 2 000 tools, far past any real
+// deployment, and a page whose cursor was already SEEN stops the walk immediately, below.
+const CATALOGUE_PAGE_LIMIT_PASSES = 20;
+
+// Every page of one catalogue, concatenated, in the server's own order (core tools first,
+// then catalogue registration order — the frontend renderer sorts for display, the wire
+// order is left alone). The result keeps the `Page` shape so every existing consumer
+// (`loadBootstrap`'s `.items` and `cursors.tools`) keeps compiling and reading the same
+// fields; `nextCursor` is `null` because the walk ran to the end of the collection.
+//
+// Two independent exits from the loop, so neither a malformed cursor NOR a server that
+// keeps answering can hang boot:
+//   1. the cursor repeats (a page that names a page already read) → stop;
+//   2. the pass guard above is exhausted → stop with what was collected.
+export const listAllTools = async (query: PageQuery = {}): Promise<Page<ToolSummary>> => {
+    const items: ToolSummary[] = [];
+    const seen = new Set<string>();
+
+    let cursor: string | null | undefined;
+    let revision = 0;
+    // `number`, not the literal 100: the figure the collector reports back is the LAST
+    // page's declared limit, which is whatever that page said.
+    let limit: number = CATALOGUE_PAGE_SIZE;
+
+    for (let pass = 0; pass < CATALOGUE_PAGE_LIMIT_PASSES; pass += 1) {
+        const page = await listTools({
+            ...query,
+            limit: CATALOGUE_PAGE_SIZE,
+            ...(cursor === undefined || cursor === null ? {} : { cursor })
+        });
+
+        items.push(...page.items);
+        revision = page.revision;
+        limit = page.limit;
+
+        const next = page.nextCursor;
+        if (next === null || next === undefined || next.length === 0) {
+            return { items, nextCursor: null, revision, limit };
+        }
+
+        // A cursor naming a page already collected from is a broken server, not more data.
+        if (seen.has(next)) break;
+        seen.add(next);
+        cursor = next;
+    }
+
+    return { items, nextCursor: null, revision, limit };
+};
 
 export const getTool = (name: string): Promise<ToolDetail> =>
     request<ToolDetailResponse>(HARNESS_ROUTES.toolsByToolId(encodeURIComponent(name))).then((body) => body.tool);
@@ -1629,7 +1704,7 @@ export const agentRowOf = (agent: AgentSummary | AgentProfile): AgentRowView => 
 //   GET /                      -> ServiceInfo        (constant size: identity, capabilities, limits)
 //   GET /config                -> GlobalConfigDocument (key-free defaults + runtime facts)
 //   GET /harnesses?limit=25    -> first page of CARDS
-//   GET /tools?limit=25        -> first page of rows
+//   GET /tools?limit=100       -> EVERY page of rows, until the cursor runs out (R4)
 //   GET /agents?limit=25       -> first page of summaries (no instruction text)
 //   GET /sessions?limit=25     -> first page of ROWS (metadata + counters only)
 //
@@ -1638,6 +1713,12 @@ export const agentRowOf = (agent: AgentSummary | AgentProfile): AgentRowView => 
 // with the same bytes as one with a single empty session. Catalogue pages beyond
 // the first are pulled by the panes that list them (the harness rail's search, the
 // tools view, the agent picker), which is where a larger page is actually justified.
+//
+// The TOOLS read is the one exception (R4): the Tools view is a catalogue the reader
+// expects complete, and the stock build's 32 rows exceeded a default 25-row page, so the
+// last 7 silently disappeared. `listAllTools` therefore asks for the contract's largest
+// page and follows `next_cursor` to exhaustion, bounded by a pass guard — the tools
+// catalogue is still a bounded read, it is just bounded by what the server actually has.
 //
 // The static-host chain is walked first (see `ensureApiRoot`), so on a Pages
 // deployment every one of these requests already points at the live gateway.
@@ -1648,7 +1729,7 @@ export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
         getServiceInfo(),
         getGlobalConfig(),
         listHarnesses(),
-        listTools(),
+        listAllTools(),
         listAgents(),
         listSessions()
     ]);

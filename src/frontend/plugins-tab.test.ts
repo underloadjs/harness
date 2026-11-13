@@ -4,10 +4,14 @@
 // R3 makes the shipped Context Compaction plugin's `contextLimit` editable there. What
 // this file pins:
 //
-//   topbar (R2)
-//     - `.plugins-toggle` is the tools toggle's IMMEDIATE next sibling and the
-//       `.topbar-right` cluster's last child, with the same accessible-name /
-//       `aria-pressed` / `aria-controls` contract as the tools control;
+//   catalogue toggles (R2, relocated onto the session line)
+//     - `.plugins-toggle` is the tools toggle's IMMEDIATE next sibling inside the
+//       `.harness-title-tools` group, which is the LAST child of `.harness-title-row` (the
+//       line with the harness title, the session id chip and the `+`) — each pane sits with
+//       the session display because it is presented for the session in view, while the
+//       topbar corner is app-wide (the switches inside the panes are themselves
+//       deployment-wide, see main.ts beside `titleRow.append`); the group keeps the same
+//       accessible-name / `aria-pressed` / `aria-controls` contract as before the move;
 //     - it is disabled before boot has answered and after the server is lost, exactly
 //       like the tools toggle;
 //   view switching (R2)
@@ -47,6 +51,49 @@
 //     - a row whose `system_prompt` is an EMPTY string renders the same two sections: the
 //       contract declares `minLength: 1` and nothing enforces it, so the pane reads a blank
 //       as "no prompt declared" instead of opening a section over an empty `<p>`.
+//
+// The GROUPED and GATED settings form (2026-11-13, T5/R3) — the request was that the settings
+// pane "looks highly unorganised", and the target shape was
+//
+//     [[tick] Automatic trim invalid tools]
+//        Trim after (tool turns): [ 2 ]
+//
+// with the indented row present ONLY while the tick is on. Two optional descriptor fields drive
+// it (`group: { id, title }` and `parentKey`, ../shared/harness-api.ts `PluginSetting`), and what
+// this file pins:
+//   - each run of one `group.id` is a `role="group"` block whose accessible name is its VISIBLE
+//     caption (`aria-labelledby` → the block's own `h4`), the blocks in manifest order, and every
+//     gated setting inside that parent's own indented host — including a setting declared BEFORE
+//     its gate, which still renders UNDER it;
+//   - the reveal is SEEDED from the values on the row (an OFF gate opens with its children gone)
+//     and moves with the tick in the SAME turn, no re-open and no request; a parent with a number
+//     child and a string child hides BOTH;
+//   - a hidden row is hidden by `hidden` on the ROW, never by dropping the field: the control
+//     stays registered, keeps its value, and its key still reaches the `PATCH` on Save;
+//   - an indent host hides ITSELF the moment every gated row inside it is hidden (2026-11-13): a
+//     0-height host is still a flex item in the `gap: 8px` column of a block, so a collapsed
+//     branch used to leave a dead gap under its parent, and `:empty` cannot match a host whose
+//     rows are merely HIDDEN;
+//   - a GATED setting is a parent candidate like an ungated one, so a gated switch with a child of
+//     its own keeps that grandchild inside the same block and the same indent at every tick state
+//     — not flushed to the form root behind its block;
+//   - a `parentKey` naming a NON-boolean setting behaves exactly like one naming NOTHING: the
+//     child renders SHOWN, because a number box has no tick that could ever bring the row back;
+//   - Save refusing a value that lives in a hidden row REVEALS that row's whole gate chain and
+//     focuses the box, keeping the same sentence and sending no `PATCH`;
+//   - the plugin's own `enabled` row DIMS the blocks (`plugin-settings-groups--off` on the single
+//     wrapper) and hides NOTHING — every block, caption and control stays on screen. The dim sits
+//     on each row's OWN label and hint, never on `.plugin-setting`, because opacity applies to a
+//     subtree and no descendant can undo an ancestor's value (D1/D2, 2026-11-13);
+//   - a plugin that declares neither field keeps the pre-contract DOM exactly: rows are direct
+//     children of `.plugin-settings-form` in declared order, and NO wrapper, block, caption or
+//     indent element is built at all;
+//   - the CSS half (jsdom runs no cascade): the named 18px indent step and its 600px narrowing, a
+//     block caption one size BELOW `.plugin-detail-section-title`, the off-dim as a TWO-ENTRY
+//     selector list aimed at the row's own label and hint at the app's own 0.82 step — with no
+//     rule left anywhere trying to "restore" a control that sits under it, and a `forced-colors`
+//     fallback — the tick-beside-label row built with `:has()` on the markup that already exists,
+//     and `[hidden] { display: none !important }` still the reveal's only authority.
 //
 // R2 (this pass) FLIPPED the enablement half of that memo: there IS one tick box per
 // row, in the row's top-right corner, and this file pins it end to end —
@@ -258,6 +305,180 @@ const mixedRow = (): Row => ({
         }
     ],
     values: { verbose: false, prefix: 'run' }
+});
+
+// The 2026-11-13 shape the settings-UI request is about: a plugin that DECLARES groups and
+// parent-gated children. The field spellings are the plugin-settings contract's
+// (`group: { id, title }` and `parentKey`, ../shared/harness-api.ts `PluginSetting`), and the
+// row covers every branch of the renderer on purpose:
+//   - `enabled` with NO group — the reserved master switch, and the proof that a grouped
+//     plugin still renders an ungrouped row at the ROOT of the form, exactly as a plugin
+//     without any grouping does;
+//   - three blocks, and each gated child declared next to (or, for `truncateTurns`, BEFORE)
+//     the row that gates it, so nesting cannot depend on declaration order;
+//   - gated NUMBERS and a gated STRING, so the reveal is pinned as not a boolean-only trick;
+//   - two seeded states at once — `trimInvalidTools` ON (children on screen when the dialog
+//     opens) and `trimThoughts` OFF (child already gone when it opens), which pins the SEED,
+//     not only the click path.
+const trimmerRow = (): Row => ({
+    name: 'context-trimmer',
+    title: 'Context Trimmer',
+    description: 'Withholds the parts of a conversation the model no longer needs.',
+    version: '0.4.0',
+    tags: ['context', 'trimming'],
+    hooks: ['turn.before'],
+    builtin: true,
+    enabled: true,
+    settings: [
+        {
+            key: 'enabled',
+            label: 'Automatic trimming',
+            type: 'boolean',
+            default: true,
+            description: 'Turns each policy off from the next turn; entries already withheld stay out.'
+        },
+        { key: 'trimInvalidTools', label: 'Automatic trim invalid tools', type: 'boolean', default: true, group: { id: 'invalid', title: 'Invalid tool calls' } },
+        {
+            key: 'invalidToolTurns',
+            label: 'Trim after (tool turns)',
+            type: 'number',
+            default: 2,
+            min: 0,
+            max: 4096,
+            step: 1,
+            group: { id: 'invalid', title: 'Invalid tool calls' },
+            parentKey: 'trimInvalidTools'
+        },
+        {
+            key: 'invalidOutcomes',
+            label: 'Outcomes that count as invalid',
+            type: 'string',
+            default: 'failed,rejected',
+            description: 'Comma-separated subset of failed, rejected, cancelled, empty.',
+            group: { id: 'invalid', title: 'Invalid tool calls' },
+            parentKey: 'trimInvalidTools'
+        },
+        { key: 'trimThoughts', label: 'Trim recorded thinking', type: 'boolean', default: false, group: { id: 'thoughts', title: 'Recorded thinking' } },
+        {
+            key: 'thoughtTurns',
+            label: 'Trim after (thought entries)',
+            type: 'number',
+            default: 2,
+            min: 0,
+            max: 4096,
+            group: { id: 'thoughts', title: 'Recorded thinking' },
+            parentKey: 'trimThoughts'
+        },
+        // Declared BEFORE its gate on purpose — the pane still nests it UNDER that gate.
+        {
+            key: 'truncateTurns',
+            label: 'Truncate after (tool turns)',
+            type: 'number',
+            default: 2,
+            min: 0,
+            max: 4096,
+            group: { id: 'truncate', title: 'Truncate requests' },
+            parentKey: 'truncateToolRequests'
+        },
+        { key: 'truncateToolRequests', label: 'Truncate tool requests', type: 'boolean', default: true, group: { id: 'truncate', title: 'Truncate requests' } }
+    ],
+    values: {
+        enabled: true,
+        trimInvalidTools: true,
+        invalidToolTurns: 2,
+        invalidOutcomes: 'failed,rejected',
+        trimThoughts: false,
+        thoughtTurns: 2,
+        truncateTurns: 2,
+        truncateToolRequests: true
+    }
+});
+
+// The NESTED case (D5, 2026-11-13): a setting that is GATED and gates a row of its own. The
+// manifest above only ever has a gated setting's siblings as children, so nothing pinned what
+// happens when `parentKey` points at a row that is itself inside another row's indent — while
+// the renderer registered only UNGATED rows in its placement map, the grandchild's host stayed
+// detached and the closing flush dumped that row at the FORM ROOT, outside the block that
+// declares it and outside the indent it belongs to.
+//
+// `innerTurns` is declared BEFORE `middle`, the gated switch that gates it, on purpose: the
+// host has to be relocated under a row that did not exist yet, and that relocation only exists
+// in the walk path a gated parent now shares with an ungated one.
+const nestedRow = (): Row => ({
+    name: 'nested-gates',
+    title: 'Nested Gates',
+    description: 'A gated switch that gates a horizon of its own.',
+    version: '1.0.0',
+    tags: ['context'],
+    hooks: ['turn.before'],
+    builtin: false,
+    enabled: true,
+    settings: [
+        { key: 'outer', label: 'Outer switch', type: 'boolean', default: true, group: { id: 'block', title: 'One block' } },
+        {
+            key: 'middleTurns',
+            label: 'Outer horizon',
+            type: 'number',
+            default: 3,
+            min: 0,
+            max: 10,
+            group: { id: 'block', title: 'One block' },
+            parentKey: 'outer'
+        },
+        // Declared BEFORE the gated switch that gates it — the ordering that used to strand it.
+        {
+            key: 'innerTurns',
+            label: 'Inner horizon',
+            type: 'number',
+            default: 5,
+            min: 0,
+            max: 10,
+            group: { id: 'block', title: 'One block' },
+            parentKey: 'middle'
+        },
+        // Gated AND a parent: the row whose children host used to never be attached.
+        { key: 'middle', label: 'Middle switch', type: 'boolean', default: true, group: { id: 'block', title: 'One block' }, parentKey: 'outer' },
+        { key: 'tail', label: 'Plain row', type: 'number', default: 1, min: 0, max: 10, group: { id: 'block', title: 'One block' } }
+    ],
+    values: { outer: true, middleTurns: 3, innerTurns: 5, middle: true, tail: 1 }
+});
+
+// A gate pointing at the WRONG KIND of setting (D6, 2026-11-13). `underLimit` names a NUMBER
+// setting and `underGhost` names nothing: both are manifest bugs, and before the fix only the
+// second one was survivable. A `parentKey` on a number row read `input.checked` off a text
+// box — `undefined`, so `!== true` — and hid its child forever with no tick anywhere to bring
+// it back, while a dangling key rendered its child shown. Both now mean "no gate".
+const wrongGateRow = (): Row => ({
+    name: 'wrong-gate',
+    title: 'Wrong Gate',
+    description: 'A child gated by a number, and a child gated by nothing.',
+    version: '1.0.0',
+    tags: ['manifest'],
+    hooks: ['turn.before'],
+    builtin: false,
+    enabled: true,
+    settings: [
+        { key: 'limit', label: 'Request limit', type: 'number', default: 4, min: 0, max: 10 },
+        {
+            key: 'underLimit',
+            label: 'Under the limit',
+            type: 'number',
+            default: 2,
+            min: 0,
+            max: 10,
+            parentKey: 'limit'
+        },
+        {
+            key: 'underGhost',
+            label: 'Under nothing',
+            type: 'number',
+            default: 1,
+            min: 0,
+            max: 10,
+            parentKey: 'ghost'
+        }
+    ],
+    values: { limit: 4, underLimit: 2, underGhost: 1 }
 });
 
 // Realistic epoch stamps (the same reason main.test.ts:73-75 states them): the UI formats
@@ -527,6 +748,73 @@ const pluginNames = (): string[] =>
 const texts = (selector: string): string[] =>
     [...document.querySelectorAll<HTMLElement>(selector)].map((node) => node.textContent ?? '');
 
+// --- the grouped/gated form probes (T5/R3) ----------------------------------
+
+// The ROW a control belongs to — the element the reveal puts `hidden` on. A control can be
+// reachable while its row is hidden (that is the whole point: the value is still editable
+// and still savable), so "is the setting shown" is a question about the row, never the input.
+const settingRow = (key: string): HTMLElement => {
+    const input = byClass(`.plugin-setting-input[data-setting="${key}"]`, 'input');
+    const row = input.closest('.plugin-setting');
+
+    if (row === null) throw new Error(`setting ${key} has no .plugin-setting row`);
+
+    return row as HTMLElement;
+};
+
+// The tick of one setting, PRESSED — the way a reader flips it, so the events a real click
+// fires are the events the reveal has to answer.
+const tickOf = (key: string): void => {
+    byClass(`.plugin-setting-input[data-setting="${key}"]`, 'input').click();
+};
+
+// Which rows the form is hiding, stated as the keys they hold (empty when all are shown).
+const hiddenSettingKeys = (): string[] =>
+    [...document.querySelectorAll<HTMLElement>('.dialog .plugin-setting')]
+        .filter((row) => row.hidden)
+        .map((row) => row.querySelector('input')?.dataset.setting ?? '');
+
+// The indent host of one parent, by the `data-parent` main.ts writes on it. The ROW is the
+// element `hidden` goes on for a gated setting; the HOST is the element that hides itself once
+// every row inside it is hidden (D3) — the two are different assertions and the host is the one
+// that decides whether a collapsed branch leaves a dead gap under its parent.
+const childHostOf = (parentKey: string): HTMLElement =>
+    byClass(`.plugin-setting-children[data-parent="${parentKey}"]`, 'div');
+
+// One indent host as DATA: its `data-parent`, then an entry per thing it holds, RECURSING into
+// a nested host — D5 makes that real, because a gated setting is a parent too and its own
+// children host hangs inside the host it lives in.
+const childHostTree = (host: HTMLElement): unknown[] => [
+    `children:${host.dataset.parent ?? ''}`,
+    ...[...host.children].map((child) =>
+        child.className === 'plugin-setting-children' ? childHostTree(child as HTMLElement) : child.querySelector('input')?.dataset.setting
+    )
+];
+
+// The settings form as DATA rather than as prose: one entry per child of
+// `.plugin-settings-form`, a block expanded into its caption, its own rows and, for each
+// gated child host, `children:<parentKey>` plus the keys it holds. One exact structural
+// assertion pins the heading order, the nesting, the indent host and the flat row's place at
+// the root all at once — "the child is somewhere under the parent" would also pass on a form
+// that flattened everything.
+const settingsFormTree = (): unknown[] =>
+    [...byClass('.plugin-settings-form', 'div').children].map((node) => {
+        if (node.className === 'plugin-setting') return node.querySelector('input')?.dataset.setting;
+        // A host whose parent is dangling or wrong-typed is flushed to the form ROOT, and a
+        // nested host is always inside another host, so this branch is the flushed case.
+        if (node.className === 'plugin-setting-children') return childHostTree(node as HTMLElement);
+        if (node.className !== 'plugin-settings-groups') return node.className;
+
+        return [...node.children].map((block) =>
+            [...block.children].map((row) => {
+                if (row.tagName === 'H4') return row.textContent;
+                if (row.className === 'plugin-setting') return row.querySelector('input')?.dataset.setting;
+
+                return childHostTree(row as HTMLElement);
+            })
+        );
+    });
+
 const pluginCountReads = (dialed: readonly string[]): number =>
     dialed.filter((line) => line.startsWith('GET /v1/harness/plugins')).length;
 
@@ -540,7 +828,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-// --- the topbar control (R2) --------------------------------------------------
+// --- the catalogue control (R2, relocated onto the session line) ---------------
 
 it('places the Plugins toggle immediately after the Tools toggle with the same contract', async () => {
     stub();
@@ -548,16 +836,23 @@ it('places the Plugins toggle immediately after the Tools toggle with the same c
 
     const toggle = pluginsToggle();
 
-    // The cluster is status, tools, plugins — and the plugin icon is the tools icon's
-    // IMMEDIATE next sibling, which is the placement the request asked for.
-    expect([...byClass('.topbar-right', 'div').children]).toEqual([
-        byClass('.status-button', 'button'),
-        toolsToggle(),
-        toggle
-    ]);
+    // The session-line group is tools then plugins, and the plugin icon is the tools
+    // icon's IMMEDIATE next sibling — the pairing this control always had, now to the RIGHT
+    // of the session display (this pane is presented for the session in view) instead of in
+    // the app-wide topbar corner.
+    const group = byClass('.harness-title-tools', 'div');
+    expect([...group.children]).toEqual([toolsToggle(), toggle]);
     expect(toolsToggle().nextElementSibling).toBe(toggle);
-    expect(toggle.parentElement?.className).toBe('topbar-right');
-    expect(byClass('.topbar', 'header').contains(toggle)).toBe(true);
+    expect(toggle.parentElement).toBe(group);
+    // The group is the LAST child of the title row, so the line reads
+    // title · id chip · `+` · id span · ⚒ ⚙ with the icons flush right.
+    expect([...byClass('.harness-title-row', 'div').children].at(-1)).toBe(group);
+    expect(byClass('.harness-head', 'header').contains(toggle)).toBe(true);
+    // The corner cluster is the status pill ALONE, and neither toggle is in the topbar.
+    expect([...byClass('.topbar-right', 'div').children]).toEqual([
+        byClass('.status-button', 'button')
+    ]);
+    expect(byClass('.topbar', 'header').contains(toggle)).toBe(false);
 
     // Icon-only toggle with an accessible name: a decorative glyph, `aria-pressed` for
     // the closed view, and `aria-controls` naming the centre region it replaces.
@@ -641,29 +936,44 @@ it('opens the pane from the toggle, reads the catalogue on first open, and lists
         '3 plugins · auto-scanned · settings save on the harness server'
     );
     expect(byClass('.plugins-tab-title', 'h2').textContent).toBe('Plugins');
-    // R2: the copy that used to promise "read-only enablement … nothing to enable or
-    // disable here" is GONE, and the pill wording is gone with it — the pane now names
-    // the corner tick box, says what a tick means, and states how far it reaches (every
-    // conversation, from its next turn, agents only). The auto-scanned fact stays.
-    const hint = byClass('.plugins-tab-hint', 'p').textContent ?? '';
+    // The pane's DESCRIPTIVE copy is gone (2026-11-13): the "Auto-scanned · tick to enable…"
+    // paragraph (`.plugins-tab-hint`) and the count line that repeated the view head's own
+    // subtitle (`.plugins-tab-note`) were deleted from main.ts, and their rules went with them
+    // (pinned in compact-ui.test.ts). The head column is the bare `h2`, exactly like the Tools
+    // pane's `toolsTabHead`.
+    expect(document.querySelector('.plugins-tab-hint')).toBeNull();
+    expect(document.querySelector('.plugins-tab-note')).toBeNull();
+    expect(document.body.textContent).not.toContain('Auto-scanned · tick to enable');
 
-    expect(hint).toContain('Auto-scanned · tick to enable');
-    expect(hint).toContain('the tick box in a row’s top-right corner turns that plugin on or off');
-    expect(hint).toContain('ticked means enabled, unticked means the plugin’s hooks stop firing');
-    expect(hint).toContain('applies to EVERY conversation on this server, from its next turn');
-    expect(hint).toContain('the plugin stays loaded and listed either way');
-    expect(hint).toContain('the tools, agents, and commands it contributed stay registered');
-    expect(hint).toContain('the request being served keeps the plugin set it was given');
-    expect(hint).toContain('It gates agents only: enabling or disabling a plugin never stops one tool from calling another');
-    expect(hint).toContain('to every conversation, from its next turn');
-    expect(hint).not.toContain('read-only enablement');
-    expect(hint).not.toContain('nothing to enable or disable');
-    expect(hint).not.toContain('one-click enable/disable');
-    // The pane note and the head note state the same figure (one writer, no drift).
-    expect(byClass('.plugins-tab-note', 'p').textContent).toBe(
-        '3 plugins · auto-scanned · settings save on the harness server'
-    );
-    expect(byClass('.plugins-refresh', 'button').textContent).toBe('Reload plugins');
+    const head = byClass('.plugins-tab-head', 'div');
+
+    expect([...head.children]).toEqual([byClass('.plugins-tab-title', 'h2')]);
+    // NOTHING was lost by deleting the pane's count line: `pluginsCountNote` has one writer,
+    // and the single surviving copy of that sentence is the `.harness-note` subtitle pinned
+    // immediately above — the pane and the head could never have disagreed, and now they
+    // cannot duplicate either.
+    // The re-read control is the pane's FOOTER action now, not another line of the head copy:
+    // `.plugins-tab-footer` is the LAST child `.plugins-pane` appends, so the button renders
+    // AFTER the list and `.plugins-tab-footer`'s `justify-content: flex-end` (styles.css) puts
+    // it in the bottom-right corner. The move RE-PARENTS the element — exactly one is in the
+    // document, it is no longer inside `.plugins-tab-head`, and it is still the footer's ONLY
+    // button. The enablement line joined that strip in front of it once the head lost its copy
+    // (the head assertions above): a `<p>` of feedback, never a second control.
+    const refresh = byClass('.plugins-refresh', 'button');
+    const statusLine = byClass('.plugins-tab-status', 'p');
+    const pane = byClass('.plugins-pane', 'div');
+    const footer = byClass('.plugins-tab-footer', 'div');
+
+    expect(refresh.textContent).toBe('Reload plugins');
+    expect(document.querySelectorAll('.plugins-refresh')).toHaveLength(1);
+    expect(refresh.closest('.plugins-tab-head')).toBeNull();
+    expect(statusLine.parentElement).toBe(footer);
+    // Sentence first, button LAST, so the right-most element of the strip stays the control.
+    expect([...footer.children]).toEqual([statusLine, refresh]);
+    expect(footer.querySelectorAll('button')).toHaveLength(1);
+    expect(footer.lastElementChild).toBe(refresh);
+    expect([...pane.children]).toEqual([head, byClass('.plugin-tab-list', 'div'), footer]);
+    expect(pane.lastElementChild).toBe(footer);
 
     // Every shipped plugin is a row, in the page order the server sent.
     expect(pluginNames()).toEqual(['async-ping', 'context-compaction', 'quiet-observer']);
@@ -784,7 +1094,7 @@ it('keeps the plugins view and the tools view mutually exclusive in both directi
     expect(pluginsToggle().getAttribute('aria-pressed')).toBe('false');
     expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
     expect(byClass('.stage', 'div').querySelector('.plugins-pane')).toBeNull();
-    expect(byClass('.main-title', 'h1').textContent).toBe('Tools');
+    expect(byClass('.main-title', 'h1').textContent).toBe('Tools Catalogue');
 
     // Closing Tools from its own toggle returns the chat, not the plugin pane.
     toolsToggle().click();
@@ -831,8 +1141,8 @@ it('switches a plugin off and back on with one click, and repaints the row from 
 
     // The answer IS the new state: the SAME nodes are repainted in place (the row stays
     // the trigger the dialog would hand focus back to), and the box now reads off — box,
-    // `data-enabled` and the tile's wash move together, so a tick and a green row can
-    // never disagree.
+    // `data-enabled` and the tile's green `--ok-line` edge move together, so a tick and a
+    // green-edged row can never disagree.
     expect(pluginRow('context-compaction')).toBe(row);
     expect(row.dataset.enabled).toBe('false');
     expect(byClass('.plugin-tab-enable[data-plugin="context-compaction"]', 'input')).toBe(control);
@@ -850,7 +1160,10 @@ it('switches a plugin off and back on with one click, and repaints the row from 
     );
     expect(byClass('.plugins-tab-status', 'p').hidden).toBe(false);
     expect(byClass('.plugins-tab-status', 'p').className).toBe('plugins-tab-status field-hint');
-    expect(byClass('.plugins-tab-note', 'p').textContent).toBe(
+    // The count sentence survives ONLY in the view head subtitle now (the pane's own copy is
+    // deleted), and an enablement write does not repaint the switch line away: the two
+    // channels stay independent, exactly as they were when the pane carried its own line.
+    expect(byClass('.harness-note', 'p').textContent).toBe(
         '3 plugins · auto-scanned · settings save on the harness server'
     );
     expect(pluginRow('async-ping').dataset.enabled).toBe('true');
@@ -916,8 +1229,9 @@ it('states a refused switch with the server sentence and leaves the row exactly 
     expect(control.getAttribute('aria-label')).toBe('Disable Context Compaction');
     expect(control.disabled).toBe(false);
     expect(row.dataset.enabled).toBe('true');
-    // The cache was not touched, so the count line still describes the same three rows.
-    expect(byClass('.plugins-tab-note', 'p').textContent).toBe(
+    // The cache was not touched, so the head subtitle still describes the same three rows
+    // (it is the only place that sentence renders since the pane's own copy was deleted).
+    expect(byClass('.harness-note', 'p').textContent).toBe(
         '3 plugins · auto-scanned · settings save on the harness server'
     );
     expect(byClass('.status-text', 'span').textContent).toBe('error');
@@ -1558,11 +1872,12 @@ it('states a failed catalogue read with the server sentence and reloads on Retry
     await flush();
 
     // A failure is a real state: the server's own sentence plus the one action that can
-    // fix it, and no rows pretending the read succeeded.
+    // fix it, and no rows pretending the read succeeded. The sentence is stated TWICE on
+    // purpose and nowhere else — inside the list (`.plugins-error`, the one place the pane
+    // body speaks for itself) and in the view head subtitle. The pane's old third copy
+    // (`.plugins-tab-note`) is gone with the rest of the pane's descriptive copy.
     expect(byClass('.plugins-error', 'p').textContent).toBe(message);
-    expect(byClass('.plugins-tab-note', 'p').textContent).toBe(
-        `The plugin catalogue could not be read: ${message}`
-    );
+    expect(document.querySelector('.plugins-tab-note')).toBeNull();
     expect(byClass('.harness-note', 'p').textContent).toBe(
         `The plugin catalogue could not be read: ${message}`
     );
@@ -1577,7 +1892,10 @@ it('states a failed catalogue read with the server sentence and reloads on Retry
     await flush();
 
     expect(pluginNames()).toEqual(['async-ping', 'context-compaction', 'quiet-observer']);
-    expect(byClass('.plugins-tab-note', 'p').textContent).toBe(
+    // The head subtitle moved back to the loaded figure with the retry — the one writer
+    // (`pluginsCountNote` → `paintPluginsHead`) is what makes that recovery automatic now
+    // that the pane carries no copy of its own.
+    expect(byClass('.harness-note', 'p').textContent).toBe(
         '3 plugins · auto-scanned · settings save on the harness server'
     );
     expect(document.querySelector('.plugins-error')).toBeNull();
@@ -1606,6 +1924,610 @@ it('re-reads the catalogue from the pane control instead of trusting the cache',
 
     pluginRow('context-compaction').click();
     expect(byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input').value).toBe('100000');
+});
+
+// --- the grouped and gated settings form (T5/R3, 2026-11-13) ----------------
+
+it('draws each declared group as a titled block with its gated settings nested under their own tick', async () => {
+    stub({ rows: () => [trimmerRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-trimmer').click();
+
+    // The manifest order the renderer must NOT reorder at the top level, and the one case
+    // it must reorder inside a block: `truncateTurns` is declared BEFORE the switch that
+    // gates it, and the tree below shows it rendered UNDER that switch.
+    expect(trimmerRow().settings.map((setting) => setting.key)).toEqual([
+        'enabled',
+        'trimInvalidTools',
+        'invalidToolTurns',
+        'invalidOutcomes',
+        'trimThoughts',
+        'thoughtTurns',
+        'truncateTurns',
+        'truncateToolRequests'
+    ]);
+
+    // The whole form, as one exact structure. Read it as the operator does: one ungrouped
+    // row (`enabled`) at the root, then three blocks, each a caption plus its rows, with
+    // every dependent setting inside that parent's own indented host.
+    expect(settingsFormTree()).toEqual([
+        'plugin-settings-form-label',
+        'enabled',
+        [
+            ['Invalid tool calls', 'trimInvalidTools', ['children:trimInvalidTools', 'invalidToolTurns', 'invalidOutcomes']],
+            ['Recorded thinking', 'trimThoughts', ['children:trimThoughts', 'thoughtTurns']],
+            ['Truncate requests', 'truncateToolRequests', ['children:truncateToolRequests', 'truncateTurns']]
+        ]
+    ]);
+
+    // The captions are the block headings IN ORDER, and nothing else in the dialog took the
+    // caption class — `Settings` is still the `h3` above, which the test below pins.
+    expect(texts('.dialog .plugin-setting-group-title')).toEqual([
+        'Invalid tool calls',
+        'Recorded thinking',
+        'Truncate requests'
+    ]);
+    expect(texts('.dialog .plugin-detail-section-title')).toEqual(['Hooks', 'Settings']);
+
+    // Each block is a real `role="group"` whose accessible name is the VISIBLE caption:
+    // `aria-labelledby` names that caption's own id, and the caption is the block's first
+    // child, so a screen reader and a sighted reader get the same words in the same order.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.dialog .plugin-settings-group')].map((block) => {
+            const title = block.querySelector('.plugin-setting-group-title');
+
+            return [
+                block.getAttribute('role'),
+                block.getAttribute('aria-labelledby'),
+                title?.id,
+                title?.tagName,
+                block.firstElementChild === title
+            ];
+        })
+    ).toEqual([
+        ['group', 'plugin-setting-group-context-trimmer-invalid-0', 'plugin-setting-group-context-trimmer-invalid-0', 'H4', true],
+        ['group', 'plugin-setting-group-context-trimmer-thoughts-1', 'plugin-setting-group-context-trimmer-thoughts-1', 'H4', true],
+        ['group', 'plugin-setting-group-context-trimmer-truncate-2', 'plugin-setting-group-context-trimmer-truncate-2', 'H4', true]
+    ]);
+
+    // A gated row keeps the SAME anatomy as any other row — real `<label for>`, control,
+    // hint under it — so nesting is placement, not a second kind of field, and the save
+    // handler's `input[data-setting]` walk is untouched.
+    const horizon = byClass('.plugin-setting-input[data-setting="invalidToolTurns"]', 'input');
+
+    expect(horizon.type).toBe('number');
+    expect(horizon.value).toBe('2');
+    expect(horizon.min).toBe('0');
+    expect(horizon.max).toBe('4096');
+    expect(settingRow('invalidToolTurns').querySelector('label')?.htmlFor).toBe(horizon.id);
+
+    // Seeded visibility, taken from the VALUES on the row and not from a click: the ON
+    // parent shows both of its children (a number AND a string), the OFF parent hides its
+    // one child, and the flat master row is never hidden.
+    expect(hiddenSettingKeys()).toEqual(['thoughtTurns']);
+});
+
+it('reveals a gated setting the same turn its parent tick is pressed, and hides it again', async () => {
+    const { calls } = stub({ rows: () => [trimmerRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-trimmer').click();
+
+    // `trimThoughts` is OFF on the row the server sent, so its horizon starts gone.
+    expect(settingRow('thoughtTurns').hidden).toBe(true);
+
+    // One press, and the dependent row is there in the SAME turn — no re-open, no re-read,
+    // no second dialog, and the control arrives holding its own effective value.
+    tickOf('trimThoughts');
+
+    expect(settingRow('thoughtTurns').hidden).toBe(false);
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+    expect(byClass('.plugin-setting-input[data-setting="thoughtTurns"]', 'input').value).toBe('2');
+    expect(hiddenSettingKeys()).toEqual([]);
+
+    // Pressing it back off takes the row away again — and it takes the row, not the control:
+    // the input is still in the form, still holding 2, which is what keeps it savable.
+    tickOf('trimThoughts');
+
+    expect(settingRow('thoughtTurns').hidden).toBe(true);
+    expect(byClass('.plugin-setting-input[data-setting="thoughtTurns"]', 'input').value).toBe('2');
+    expect(hiddenSettingKeys()).toEqual(['thoughtTurns']);
+
+    // A parent with TWO children gates both of them, whatever their types — the number
+    // horizon and the string outcome list move together with one tick.
+    tickOf('trimInvalidTools');
+
+    expect(hiddenSettingKeys()).toEqual(['invalidToolTurns', 'invalidOutcomes', 'thoughtTurns']);
+
+    tickOf('trimInvalidTools');
+
+    expect(hiddenSettingKeys()).toEqual(['thoughtTurns']);
+
+    // Toggling a policy is not a write: the form only sends what the reader Saves.
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+});
+
+it('keeps a hidden setting registered and savable, and re-takes the reveal from the saved row', async () => {
+    const { calls } = stub({ rows: () => [trimmerRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-trimmer').click();
+
+    // The row is hidden by its OFF parent, and the value on it is still editable.
+    expect(settingRow('thoughtTurns').hidden).toBe(true);
+
+    const horizon = byClass('.plugin-setting-input[data-setting="thoughtTurns"]', 'input');
+
+    horizon.value = '7';
+    horizon.dispatchEvent(new Event('input', { bubbles: true }));
+    byClass('.plugin-setting-save', 'button').click();
+    await flush();
+    await flush();
+
+    // Hiding a dependent row does not drop it from the write: `thoughtTurns` is in the patch
+    // on its own, and nothing else rode along with it.
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/plugins/context-trimmer', method: 'PATCH', body: { settings: { thoughtTurns: 7 } } }
+    ]);
+    expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
+    expect(byClass('.plugin-setting-input[data-setting="thoughtTurns"]', 'input').value).toBe('7');
+
+    // And the reveal is re-taken from the SERVER's answer after the save: the parent is still
+    // OFF, so the row is still hidden — `paintValues` writes `checked` programmatically, which
+    // fires no event, so an explicit re-paint is the only thing that can keep the two honest.
+    expect(settingRow('thoughtTurns').hidden).toBe(true);
+});
+
+// --- the gate fixes (D3/D4/D5/D6, 2026-11-13) --------------------------------
+
+// The `--off` mark and the host/hidden pair in one place, stated as DATA. A host's `hidden` is
+// the D3 claim, and the master switch's mark is the D1/D2 claim — both are attributes jsdom CAN
+// observe; the layout they produce (no dead gap, no dimmed control) cannot be measured here and
+// is pinned as stylesheet text in the CSS contract test below.
+const hostState = (): unknown[] =>
+    [...document.querySelectorAll<HTMLElement>('.dialog .plugin-setting-children')].map((host) => [host.dataset.parent, host.hidden]);
+
+it('hides the indent host itself once every row inside it is hidden, leaving no dead gap', async () => {
+    stub({ rows: () => [trimmerRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-trimmer').click();
+
+    // Seeded state, from the VALUES on the server's row: two parents are ON, so their hosts are
+    // shown, and `trimThoughts` is OFF with its one child hidden — so that host hides itself.
+    expect(hostState()).toEqual([
+        ['trimInvalidTools', false],
+        ['trimThoughts', true],
+        ['truncateToolRequests', false]
+    ]);
+
+    // Hiding the LAST visible row of a branch hides the branch. A 0-height host is still a flex
+    // ITEM inside the `gap: 8px` column of `.plugin-settings-group`, so a host that only holds
+    // hidden rows used to leave ~8px of dead rail under its parent — and `.plugin-setting-
+    // children:empty` can never match, because hidden rows are still DOM children.
+    tickOf('trimInvalidTools');
+
+    expect(hiddenSettingKeys()).toEqual(['invalidToolTurns', 'invalidOutcomes', 'thoughtTurns']);
+    expect(hostState()).toEqual([
+        ['trimInvalidTools', true],
+        ['trimThoughts', true],
+        ['truncateToolRequests', false]
+    ]);
+
+    // ONE visible child is enough to keep an indent on screen: the tally is over the gated rows of
+    // that host, not over every row of the block.
+    tickOf('trimThoughts');
+
+    expect(hostState()).toEqual([
+        ['trimInvalidTools', true],
+        ['trimThoughts', false],
+        ['truncateToolRequests', false]
+    ]);
+
+    tickOf('trimInvalidTools');
+
+    expect(hostState()).toEqual([
+        ['trimInvalidTools', false],
+        ['trimThoughts', false],
+        ['truncateToolRequests', false]
+    ]);
+
+    // The master switch is a DIM and never a hide: switching the plugin off marks the ONE wrapper
+    // element and takes nothing out of the tree — no row, no host, no block.
+    tickOf('enabled');
+
+    expect(byClass('.plugin-settings-groups', 'div').classList.contains('plugin-settings-groups--off')).toBe(true);
+    expect(hostState()).toEqual([
+        ['trimInvalidTools', false],
+        ['trimThoughts', false],
+        ['truncateToolRequests', false]
+    ]);
+    expect([...document.querySelectorAll<HTMLElement>('.dialog .plugin-settings-group')].map((block) => block.hidden)).toEqual([
+        false,
+        false,
+        false
+    ]);
+});
+
+it('keeps a nested reveal inside its own block when a gated setting is itself a parent', async () => {
+    stub({ rows: () => [nestedRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('nested-gates').click();
+
+    // The whole form, exactly. The load-bearing entry is `['children:middle','innerTurns']`
+    // INSIDE `['children:outer', …]`: the grandchild sits immediately after its own parent row, in
+    // that parent's indent, which sits in the block that declares it. Before the fix the gated
+    // branch never registered the row it emitted, so that nested host stayed detached and the
+    // closing flush appended it — and the row with it — to the FORM ROOT, outside the block and
+    // outside the indent.
+    const expectedTree = [
+        'plugin-settings-form-label',
+        [['One block', 'outer', ['children:outer', 'middleTurns', 'middle', ['children:middle', 'innerTurns']], 'tail']]
+    ];
+
+    expect(settingsFormTree()).toEqual(expectedTree);
+
+    // The same claim in DOM terms: three levels of ancestry from the grandchild's row lead to the
+    // block, and the form's own children are only the sr-only name and the wrapper — every setting
+    // of this manifest is grouped, so there is no flat row at the root and, above all, no stray
+    // indent host appended there.
+    const block = byClass('.dialog .plugin-settings-group', 'div');
+
+    expect(settingRow('innerTurns').closest('.plugin-settings-group')).toBe(block);
+    expect(settingRow('innerTurns').parentElement).toBe(childHostOf('middle'));
+    expect(childHostOf('middle').parentElement).toBe(childHostOf('outer'));
+    expect([...byClass('.plugin-settings-form', 'div').children].map((node) => node.className)).toEqual([
+        'plugin-settings-form-label',
+        'plugin-settings-groups'
+    ]);
+
+    // Both switches are ON on the row the server sent, so nothing is hidden anywhere and the
+    // grandchild holds its own seeded figure.
+    expect(hiddenSettingKeys()).toEqual([]);
+    expect([childHostOf('outer').hidden, childHostOf('middle').hidden]).toEqual([false, false]);
+    expect(byClass('.plugin-setting-input[data-setting="innerTurns"]', 'input').value).toBe('5');
+
+    // The grandchild answers to its OWN parent, and only to it: `middle` off takes `innerTurns`
+    // away and hides its own host, while the outer branch stays open because it still shows
+    // `middleTurns`.
+    tickOf('middle');
+
+    expect(hiddenSettingKeys()).toEqual(['innerTurns']);
+    expect(childHostOf('middle').hidden).toBe(true);
+    expect(childHostOf('outer').hidden).toBe(false);
+    expect(settingRow('middleTurns').hidden).toBe(false);
+
+    // Back on: the same row, in the same host — a reveal changes visibility, never placement.
+    tickOf('middle');
+
+    expect(hiddenSettingKeys()).toEqual([]);
+    expect(settingRow('innerTurns').parentElement).toBe(childHostOf('middle'));
+
+    // `outer` off collapses the WHOLE branch: the two rows it gates carry `hidden`, its host
+    // carries `hidden` (D3), and the nested host goes with it, because `display: none` on an
+    // ancestor takes the subtree out of the render tree. jsdom evaluates no cascade, so what this
+    // pins is the attribute on the host plus the fact that the grandchild's OWN flag never moved
+    // — it is hidden by the collapsed branch, not by its own gate.
+    tickOf('outer');
+
+    expect(hiddenSettingKeys()).toEqual(['middleTurns', 'middle']);
+    expect(childHostOf('outer').hidden).toBe(true);
+    expect(settingRow('innerTurns').hidden).toBe(false);
+
+    // And the branch reopens exactly where it was.
+    tickOf('outer');
+
+    expect(hiddenSettingKeys()).toEqual([]);
+    expect(childHostOf('outer').hidden).toBe(false);
+    expect(settingsFormTree()).toEqual(expectedTree);
+});
+
+it('shows a child gated by a non-boolean setting exactly like one gated by nothing', async () => {
+    const { calls } = stub({ rows: () => [wrongGateRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('wrong-gate').click();
+
+    // Both children are SHOWN. `underLimit`'s `parentKey` names a NUMBER setting, and a number box
+    // has no `checked`: reading `undefined !== true` used to decide that gate, so the row hid
+    // forever with no tick anywhere that could bring it back — while a `parentKey` naming nothing
+    // already rendered its child shown. A wrong-typed gate now means the same no-gate does.
+    expect(hiddenSettingKeys()).toEqual([]);
+    expect([settingRow('underLimit').hidden, settingRow('underGhost').hidden]).toEqual([false, false]);
+
+    // Placement is not what the fix touched, and it stays legible in the DOM: a wrong-typed parent
+    // keeps its own indent host under its row, and a dangling one is flushed to the form root so
+    // its row can never be edited out of sight.
+    expect(settingsFormTree()).toEqual(['plugin-settings-form-label', 'limit', ['children:limit', 'underLimit'], ['children:ghost', 'underGhost']]);
+
+    // Editing the number box the `parentKey` names cannot hide the child either: that key IS a
+    // trigger, so `paintGates` really does run on its `input` event — and the answer stays SHOWN.
+    const limit = byClass('.plugin-setting-input[data-setting="limit"]', 'input');
+
+    limit.value = '7';
+    limit.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(hiddenSettingKeys()).toEqual([]);
+    expect([settingRow('underLimit').hidden, settingRow('underGhost').hidden]).toEqual([false, false]);
+
+    // And both rows stay registered and savable, which is the entire reason they are rendered.
+    const orphan = byClass('.plugin-setting-input[data-setting="underGhost"]', 'input');
+
+    orphan.value = '3';
+    orphan.dispatchEvent(new Event('input', { bubbles: true }));
+    byClass('.plugin-setting-save', 'button').click();
+    await flush();
+    await flush();
+
+    expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/plugins/wrong-gate', method: 'PATCH', body: { settings: { limit: 7, underGhost: 3 } } }
+    ]);
+});
+
+it('reveals and focuses the hidden row whose value Save refuses, and still sends nothing', async () => {
+    const { calls } = stub({ rows: () => [trimmerRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-trimmer').click();
+
+    // The refusal case D4 is about: the row is off screen because its own tick is OFF, and the
+    // number box inside it is emptied.
+    const horizon = byClass('.plugin-setting-input[data-setting="thoughtTurns"]', 'input');
+
+    expect(settingRow('thoughtTurns').hidden).toBe(true);
+    horizon.value = '';
+    horizon.dispatchEvent(new Event('input', { bubbles: true }));
+
+    byClass('.plugin-setting-save', 'button').click();
+    await flush();
+
+    // The SAME sentence, word for word — and it now names a row the reader can look at, with the
+    // cursor already in the box to fix.
+    expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Trim after (thought entries) needs a number.');
+    expect(settingRow('thoughtTurns').hidden).toBe(false);
+    expect(document.activeElement).toBe(horizon);
+
+    // Revealing is all that happened: the gate that was hiding the row is ticked (that is what
+    // revealing MEANS), the typed text is still in the box, and nothing was coerced to 0, dropped
+    // or written.
+    expect(byClass('.plugin-setting-input[data-setting="trimThoughts"]', 'input').checked).toBe(true);
+    expect(horizon.value).toBe('');
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+
+    // Fixing the box and Saving again writes, and the patch carries the tick the reveal turned on
+    // along with the value — the honest consequence of revealing a gate, pinned so nobody
+    // "restores" the old behaviour by hiding the row again behind the reader's back.
+    horizon.value = '9';
+    horizon.dispatchEvent(new Event('input', { bubbles: true }));
+    byClass('.plugin-setting-save', 'button').click();
+    await flush();
+    await flush();
+
+    expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/plugins/context-trimmer', method: 'PATCH', body: { settings: { trimThoughts: true, thoughtTurns: 9 } } }
+    ]);
+});
+
+it('dims the declared blocks while the plugin switch is off without hiding anything', async () => {
+    stub({ rows: () => [trimmerRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-trimmer').click();
+
+    const groups = byClass('.plugin-settings-groups', 'div');
+
+    expect(groups.className).toBe('plugin-settings-groups');
+
+    // The plugin's own `enabled` row is a setting like any other, so the dialog can read the
+    // master state off it. Switching it off marks the ONE wrapper element.
+    tickOf('enabled');
+
+    expect(groups.className).toBe('plugin-settings-groups plugin-settings-groups--off');
+
+    // NOTHING is hidden by the master switch: every block, every caption and every control is
+    // still on screen, so an operator can set the policy up and switch the plugin back on
+    // without reopening anything. The only hidden row is still the one its own tick hides.
+    expect([...document.querySelectorAll<HTMLElement>('.dialog .plugin-settings-group')].map((block) => block.hidden)).toEqual([
+        false,
+        false,
+        false
+    ]);
+    expect(texts('.dialog .plugin-setting-group-title')).toEqual(['Invalid tool calls', 'Recorded thinking', 'Truncate requests']);
+    expect(document.querySelectorAll('.dialog .plugin-setting-input')).toHaveLength(8);
+    expect(hiddenSettingKeys()).toEqual(['thoughtTurns']);
+
+    tickOf('enabled');
+
+    expect(groups.className).toBe('plugin-settings-groups');
+});
+
+it('keeps a plugin that declares no grouping byte-for-byte flat, with no group chrome at all', async () => {
+    // Both ungrouped fixtures in one run: a single-setting plugin and a two-setting one, so
+    // "flat" is pinned for one row and for the order of several.
+    stub({ rows: () => [compactionRow(), mixedRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-compaction').click();
+
+    // The pre-contract DOM exactly: the sr-only form name, then one row per setting, direct
+    // children of the form, in the declared order.
+    expect([...byClass('.plugin-settings-form', 'div').children].map((node) => node.className)).toEqual([
+        'plugin-settings-form-label',
+        'plugin-setting'
+    ]);
+
+    // No wrapper, no blocks, no captions, no indent hosts — not even empty ones. A plugin
+    // that declares neither field must not acquire any of the new structure.
+    expect(document.querySelector('.dialog .plugin-settings-groups')).toBeNull();
+    expect(document.querySelector('.dialog .plugin-settings-group')).toBeNull();
+    expect(document.querySelector('.dialog .plugin-setting-group-title')).toBeNull();
+    expect(document.querySelector('.dialog .plugin-setting-children')).toBeNull();
+
+    // The hooks the save path walks are the ones that were always there.
+    expect(texts('.plugin-setting-label')).toEqual(['Context limit (tokens)']);
+    expect(texts('.plugin-setting-hint')).toEqual([String(compactionRow().settings[0]?.description)]);
+
+    byClass('.dialog-close', 'button').click();
+    await flush();
+
+    // The two-setting mixed row: two rows, still in declared order, still no chrome.
+    pluginRow('extras').click();
+
+    expect([...byClass('.plugin-settings-form', 'div').children].map((node) => node.className)).toEqual([
+        'plugin-settings-form-label',
+        'plugin-setting',
+        'plugin-setting'
+    ]);
+    expect(texts('.plugin-setting-label')).toEqual(['Verbose logging', 'Log prefix']);
+    expect(document.querySelector('.dialog .plugin-settings-groups')).toBeNull();
+    expect(document.querySelector('.dialog .plugin-setting-children')).toBeNull();
+    expect(hiddenSettingKeys()).toEqual([]);
+});
+
+// The CSS half of the grouped form (2026-11-13). jsdom runs no cascade, so what gets pinned here
+// is the declaration itself: the indent token, the caption grammar ONE step below the section
+// headings, and the off-dim — whose SELECTOR LIST is the contract, because a dim written on an
+// ancestor of a control cannot be undone by that control no matter what a later rule declares.
+it('styles the settings blocks, the indent and the off dim from the existing grammar', () => {
+    const stylesheet = ['src/frontend/styles.css', 'src/styles.css']
+        .map((candidate) => resolve(process.cwd(), candidate))
+        .find((candidate) => existsSync(candidate));
+
+    if (stylesheet === undefined) throw new Error('styles.css not found');
+
+    const css = readFileSync(stylesheet, 'utf8');
+    const ruleOf = (selector: string): string => {
+        const at = css.indexOf(`\n${selector} {`);
+
+        if (at < 0) throw new Error(`${selector} is missing from styles.css`);
+
+        return css.slice(at, css.indexOf('}', at) + 1);
+    };
+
+    // The off-dim is a TWO-SELECTOR rule and its forced-colours twin is nested inside a media
+    // block, so neither is findable by the exact `\n<selector> {` match `ruleOf` performs. This one
+    // takes a fragment and counts braces to the end of its body — the recipe
+    // `records-style.test.ts` `blockOf` uses — and returns the SELECTORS too, which is the part the
+    // dim contract actually lives in.
+    const ruleBodyOf = (fragment: string): string => {
+        const at = css.indexOf(fragment);
+
+        if (at < 0) throw new Error(`${fragment} is missing from styles.css`);
+
+        const open = css.indexOf('{', at);
+
+        if (open < 0) throw new Error(`${fragment} has no declaration block`);
+
+        let depth = 0;
+
+        for (let index = open; index < css.length; index += 1) {
+            if (css[index] === '{') depth += 1;
+
+            if (css[index] === '}') {
+                depth -= 1;
+                if (depth === 0) return css.slice(at, index + 1);
+            }
+        }
+
+        throw new Error(`${fragment} has no closing brace`);
+    };
+
+    // The indent is ONE named step, the transcript's own 18px, and it is what the rail is
+    // drawn with — `padding-left`, never a margin on the child, so a hidden child cannot
+    // shift the rail.
+    const children = ruleOf('.plugin-setting-children');
+
+    expect(children).toContain('--setting-indent: 18px');
+    expect(children).toContain('padding-left: var(--setting-indent)');
+    expect(children).toContain('border-left: 1px solid var(--border)');
+    // Narrow screens take the same 10px step `.thread-children` takes.
+    expect(css).toContain('.plugin-setting-children {\n        --setting-indent: 10px;');
+
+    // A block caption speaks the caption grammar, at ONE STEP BELOW the section headings:
+    // 9.5px against `.plugin-detail-section-title`'s 10.5px, so a group reads as below
+    // `SETTINGS` instead of competing with it.
+    expect(ruleOf('.plugin-setting-group-title')).toContain('font-family: var(--mono)');
+    expect(ruleOf('.plugin-setting-group-title')).toContain('text-transform: uppercase');
+    expect(ruleOf('.plugin-setting-group-title')).toContain('color: var(--muted)');
+    expect(ruleOf('.plugin-setting-group-title')).toContain('font-size: 9.5px');
+    expect(ruleOf('.plugin-detail-section-title')).toContain('font-size: 10.5px');
+
+    // The off-dim (D1/D2, 2026-11-13) sits on the row's OWN text elements. That shape is the
+    // contract: opacity applies to a whole subtree and no descendant can undo an ancestor's
+    // value, so while the rule was written on `.plugin-setting` it covered the row's own checkbox,
+    // and the `opacity: 1` that followed it was a declaration no browser could honour — the old
+    // assertion grepped for that text and passed anyway. The sheet's own precedent has always had
+    // it right (`panel-tasks-row[data-completed='true'] .panel-tasks-row-text`): dim and restore on
+    // the SAME element, so nothing in between needs rescuing.
+    const dim = ruleBodyOf('.plugin-settings-groups--off .plugin-setting > .plugin-setting-label');
+
+    // The selector list EXACTLY: two entries, each aimed one step below the row at a text element.
+    // Anything higher up re-instates D1, and pulling `.plugin-setting-group-title` into this list
+    // would strip a block of the caption that names it.
+    expect(dim.slice(0, dim.indexOf('{')).split(',').map((entry) => entry.trim())).toEqual([
+        '.plugin-settings-groups--off .plugin-setting > .plugin-setting-label',
+        '.plugin-settings-groups--off .plugin-setting > .plugin-setting-hint'
+    ]);
+
+    // 0.82 is the step that precedent already uses, and it is the contrast half of the fix:
+    // `--muted` (#8b94a7) over `--bg` (#0b0d12) is 6.4:1 undimmed and 4.6:1 at 0.82, which is still
+    // WCAG AA for body text, against the ≈3.1:1 the 0.62 this replaces put the hint at. jsdom
+    // composites nothing, so only the STEP is pinned here; the arithmetic lives in the comment
+    // above the rule in styles.css.
+    expect(dim).toContain('opacity: 0.82');
+
+    // Nothing may dim an ancestor of a control any more, and no "restore the control" rule may
+    // survive to look like it works. Both greps run over the WHOLE sheet, so re-adding the
+    // row-level dim, or the checkbox rule that tried to cancel it, fails here even with the correct
+    // rule sitting beside it — which is precisely the hole that let the no-op through once.
+    expect(css).not.toContain('.plugin-settings-groups--off .plugin-setting {');
+    expect(css).not.toContain(".plugin-settings-groups--off .plugin-setting-input");
+    expect(css).not.toContain('opacity: 0.62');
+
+    // D8: this mode repaints text from the system palette, so a translucent step is a cue the
+    // platform is not obliged to preserve. The sheet's other five forced-colours blocks each give
+    // the state a system colour instead, and this one does the same: `GrayText` is the mode's own
+    // insensitive-text colour, i.e. "declared, not in force" without pretending the row is dead.
+    const forced = ruleBodyOf('@media (forced-colors: active) {\n    .plugin-settings-groups--off');
+
+    expect(forced).toContain('> .plugin-setting-label');
+    expect(forced).toContain('> .plugin-setting-hint');
+    expect(forced).toContain('color: GrayText');
+    expect(forced).toContain('opacity: 1');
+
+    // A tick and its label on ONE line, description underneath — done with `:has()` on the
+    // DOM the renderer already emits, so an ungrouped plugin's markup is untouched.
+    expect(ruleOf(".plugin-setting:has(> .plugin-setting-input[type='checkbox'])")).toContain('flex-wrap: wrap');
+    expect(ruleOf(".plugin-setting:has(> .plugin-setting-input[type='checkbox']) > .plugin-setting-input")).toContain('order: -1');
+    expect(ruleOf(".plugin-setting:has(> .plugin-setting-input[type='checkbox']) > .plugin-setting-hint")).toContain(
+        'flex-basis: 100%'
+    );
+
+    // The reveal's authority is still the one global hiding rule, not a class this form owns:
+    // `hidden` on a row means `display: none` whatever the row's own display is.
+    expect(ruleOf('[hidden]')).toContain('display: none !important');
 });
 
 // The CSS half of the read-only prompt (2026-11-12), pinned against the stylesheet rather

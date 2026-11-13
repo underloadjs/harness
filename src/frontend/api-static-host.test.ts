@@ -101,8 +101,10 @@ const stubGateways = (live: readonly string[]): string[] => {
                 return json({ ok: true, sessions: 0 });
             }
 
-            // The page reads carry `?limit=25` (./api.ts `pageParams`); the ROUTE is what
-            // this stub dispatches on, so the query is dropped before matching.
+            // The page reads carry a `?limit=` (`pageParams` in ./api.ts: the collections at the
+            // default, the tools catalogue at the contract's maximum — R4). The ROUTE is what
+            // this stub dispatches on, so the query is dropped before matching, and every page
+            // it answers is final (`next_cursor: null`), so no cursor walk starts here.
             const path = url.slice(root.length).split('?')[0];
 
             if (path === '') {
@@ -218,7 +220,10 @@ describe('ensureApiRoot on a Pages host', () => {
             live,
             `${live}/config`,
             `${live}/harnesses?limit=${HARNESS_PAGE_LIMIT.default}`,
-            `${live}/tools?limit=${HARNESS_PAGE_LIMIT.default}`,
+            // R4 (Tools Catalogue): the tools page is dialled at the contract's MAXIMUM size
+            // and followed to the end, so a catalogue larger than a default page reaches the
+            // Tools view complete.
+            `${live}/tools?limit=${HARNESS_PAGE_LIMIT.max}`,
             `${live}/agents?limit=${HARNESS_PAGE_LIMIT.default}`,
             `${live}/sessions?limit=${HARNESS_PAGE_LIMIT.default}`
         ]);

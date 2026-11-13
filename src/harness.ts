@@ -621,7 +621,7 @@ const cloneMessages = (messages: readonly HarnessMessage[]): HarnessMessage[] =>
 // `false` on one member was assumed to be a statement about all of them. It is not —
 // `setIncluded` now writes exactly ONE entry and `projectTranscript` skips exactly that
 // entry, which is what lets a policy withhold an old tool REQUEST while its RESPONSE keeps
-// riding in the prompt (context-trimmer "Automatic Truncate Tool Request").
+// riding in the prompt (context-trimmer "Automatic Truncate Tool Requests").
 //
 // The pairing consequence is stated rather than hidden: withholding a request entry leaves
 // its results as ownerless entries, and an ownerless result IS emitted (the transport sends a

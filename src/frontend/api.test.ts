@@ -6,9 +6,12 @@
 //     mount is gone from the client: standalone and gateway-mounted deployments answer the
 //     SAME path, so there is no per-mount root and no root-404 fallback chain.
 //   - `getBootstrap()` (one document at the root) is gone. `loadBootstrap()` now COMPOSES
-//     six bounded reads — `GET /`, `/config`, `/harnesses?limit=25`, `/tools?limit=25`,
+//     six bounded reads — `GET /`, `/config`, `/harnesses?limit=25`, `/tools?limit=100`,
 //     `/agents?limit=25`, `/sessions?limit=25` — so booting against 100 sessions costs the
-//     same bytes as against one (./api.ts:1287).
+//     same bytes as against one (./api.ts:1287). The TOOLS page is the one that asks for the
+//     contract's maximum and then follows `next_cursor` to the end (R4, `listAllTools`): the
+//     Tools view is a catalogue the reader expects complete, and a default 25-row page
+//     silently dropped the stock build's last 7 rows.
 //   - `enqueueTask` → `submitTask`, which answers a `TaskReceipt`, not `{ session, turn }`.
 //   - `observeSession` (SSE `GET /sessions/:id/events`) is gone: realtime lives in
 //     ./stream.ts over the `harness.v1` WebSocket, pinned in ./stream.test.ts. What stays
@@ -789,7 +792,10 @@ describe('loadBootstrap', () => {
             'GET /v1/harness': info,
             'GET /v1/harness/config': config,
             'GET /v1/harness/harnesses?limit=25': pageOf([card]),
-            'GET /v1/harness/tools?limit=25': pageOf([tool]),
+            // R4: the tools page is asked for at the contract's MAXIMUM size. One page is
+            // still one request when the server has nothing more to hand back (the page below
+            // carries `next_cursor: null`), so the boot stays six reads.
+            'GET /v1/harness/tools?limit=100': pageOf([tool]),
             'GET /v1/harness/agents?limit=25': pageOf([agentRow]),
             'GET /v1/harness/sessions?limit=25': pageOf([sessionRow], 'cursor-sessions')
         });
@@ -801,7 +807,7 @@ describe('loadBootstrap', () => {
             'GET /v1/harness',
             'GET /v1/harness/config',
             'GET /v1/harness/harnesses?limit=25',
-            'GET /v1/harness/tools?limit=25',
+            'GET /v1/harness/tools?limit=100',
             'GET /v1/harness/agents?limit=25',
             'GET /v1/harness/sessions?limit=25'
         ]);
@@ -856,6 +862,88 @@ describe('loadBootstrap', () => {
             defaults: config.defaults,
             sessions: [sessionRow],
             cursors: { harnesses: null, tools: null, agents: null, sessions: 'cursor-sessions' }
+        });
+    });
+
+    // R4 of the Tools Catalogue pass: the stock build registers 32 catalogue rows and the
+    // default 25-row page used to drop the last 7 without a trace, because nothing consumed
+    // `cursors.tools`. Boot now asks for the contract's LARGEST page and keeps following
+    // `next_cursor` until the server stops handing one back (./api.ts `listAllTools`), so
+    // `bootstrap.tools` is the WHOLE catalogue and the count the Tools pane prints is the
+    // number of rows it renders.
+    it('follows the tools cursor until the catalogue is exhausted', async () => {
+        const secondPage: ToolSummary = { ...tool, name: 'search', group: 'Web search' };
+
+        serve({
+            'GET /v1/harness': info,
+            'GET /v1/harness/config': config,
+            'GET /v1/harness/harnesses?limit=25': pageOf([card]),
+            'GET /v1/harness/tools?limit=100': pageOf([tool], 'tools-2'),
+            'GET /v1/harness/tools?limit=100&cursor=tools-2': pageOf([secondPage]),
+            'GET /v1/harness/agents?limit=25': pageOf([agentRow]),
+            'GET /v1/harness/sessions?limit=25': pageOf([sessionRow], 'cursor-sessions')
+        });
+
+        const module = await import('./api');
+        const bootstrap = await module.loadBootstrap();
+
+        // Exactly two tools reads, in page order: the max-size first page and the page the
+        // cursor named. Nothing else is dialled twice, and the other five boot reads are
+        // untouched (the full six-read shape is pinned by the test above).
+        expect(calls.filter((call) => call.url.includes('/tools')).map((call) => call.url)).toEqual([
+            '/v1/harness/tools?limit=100',
+            '/v1/harness/tools?limit=100&cursor=tools-2'
+        ]);
+
+        // Every row of every page, through the same `toolRowOf` boot always maps with.
+        expect(bootstrap.tools).toEqual([
+            {
+                name: 'read',
+                group: 'files',
+                description: 'Read a file.',
+                tags: ['files'],
+                visibility: 'core',
+                sessionBound: false,
+                enabled: true
+            },
+            {
+                name: 'search',
+                group: 'Web search',
+                description: 'Read a file.',
+                tags: ['files'],
+                visibility: 'core',
+                sessionBound: false,
+                enabled: true
+            }
+        ]);
+
+        // The walk ran to the end of the collection, so nothing is left behind the cursor.
+        expect(bootstrap.cursors.tools).toBeNull();
+    });
+
+    // The iteration guard the collector documents. A malformed cursor — a page handing back a
+    // cursor that was already read — must not spin inside BOOT, where an endless loop is a
+    // white screen rather than a slow pane: the walk stops the moment a cursor repeats, and
+    // reports the rows it did collect as a finished page (`nextCursor: null`).
+    it('stops a repeating tools cursor instead of looping forever', async () => {
+        serve({
+            'GET /v1/harness/tools?limit=100': pageOf([tool], 'loop'),
+            'GET /v1/harness/tools?limit=100&cursor=loop': pageOf([tool], 'loop')
+        });
+
+        const module = await import('./api');
+        const page = await module.listAllTools();
+
+        // TWO requests, then stop: the second page named the very cursor it was dialled with.
+        expect(calls.map((call) => call.url)).toEqual([
+            '/v1/harness/tools?limit=100',
+            '/v1/harness/tools?limit=100&cursor=loop'
+        ]);
+        expect(page).toEqual({
+            items: [tool, tool],
+            nextCursor: null,
+            revision: 9,
+            limit: HARNESS_PAGE_LIMIT.default
         });
     });
 

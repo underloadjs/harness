@@ -288,12 +288,16 @@ const createFakeApi = (stored: Record<string, unknown> = {}): FakeApi => {
 };
 
 // The EXACT settings read set of one turn that gets past the guards: the `enabled` the guard
-// shares with the framework's hook gate, then every policy switch in DECLARED ORDER, read once
-// per turn. Pinned as one list in every fast-path assertion below, so a switch that ships
+// shares with the framework's hook gate, then every policy switch in the PINNED READ ORDER, read
+// once per turn. Pinned as one list in every fast-path assertion below, so a switch that ships
 // without being consulted — or one consulted twice a turn — fails, and so does a switch that
 // leaks in front of the guards (a branch round, an internal agent or a disabled plugin still
 // cost what invariant 5 promises: one read, or none). A HORIZON is read immediately after the
-// toggle it belongs to, which is the same order the descriptors declare and the pane renders.
+// toggle it belongs to, which is the pairing this order tracks. It is NOT the descriptor order
+// any more: since the 2026-11-13 grouping the list is ordered for the PANE (categories, then the
+// fields nested under each toggle), and `group`/`parentKey` are display-only metadata nothing
+// reads, so the runtime keeps its own order rather than a pinned contract moving for a styling
+// reason.
 const TURN_READS: readonly string[] = [
     'settings.boolean:enabled',
     'settings.boolean:trimInvalidTools',
@@ -2748,10 +2752,11 @@ describe('context-trimmer metadata', () => {
         // and its default: it is the framework's reserved master switch (src/server/plugins.ts
         // `RESERVED_ENABLED_DESCRIPTOR`), so the policy switches below are separate keys.
         //
-        // THE ORDER IS THE PANE'S ORDER. Every HORIZON sits immediately after the toggle it
-        // windows, because the Plugins pane renders one control per descriptor in this array's
+        // THE ORDER IS THE PANE'S ORDER, and since the 2026-11-13 grouping it is the pane's
+        // CATEGORY order: each policy toggle opens a section and the rows that window it follow it
+        // immediately, because the Plugins pane renders one control per descriptor in this array's
         // order — a number separated from the switch it belongs to is a number an operator has to
-        // map by name alone.
+        // map by name alone. The `group`/`parentKey` metadata that says so is pinned below.
         expect(
             metadata.settings?.map((setting: HarnessPluginSettingDescriptor) => [
                 setting.key,
@@ -2765,21 +2770,103 @@ describe('context-trimmer metadata', () => {
             ['enabled', 'boolean', true, undefined, undefined, undefined],
             ['trimInvalidTools', 'boolean', true, undefined, undefined, undefined],
             ['invalidToolTurns', 'number', 2, 0, 4096, 1],
+            ['invalidOutcomes', 'string', 'failed,rejected', undefined, undefined, undefined],
             ['trimThoughts', 'boolean', true, undefined, undefined, undefined],
             ['thoughtTurns', 'number', 2, 0, 4096, 1],
-            ['truncateToolRequests', 'boolean', false, undefined, undefined, undefined],
-            ['truncateTurns', 'number', 2, 0, 4096, 1],
+            ['minThoughtChars', 'number', 0, 0, 1000000, 50],
             ['dropSupersededToolCalls', 'boolean', true, undefined, undefined, undefined],
             ['supersededTurns', 'number', 2, 0, 4096, 1],
+            ['supersedeMatch', 'string', 'name', undefined, undefined, undefined],
             ['dropDuplicateCalls', 'boolean', false, undefined, undefined, undefined],
             ['duplicateTurns', 'number', 2, 0, 4096, 1],
-            ['invalidOutcomes', 'string', 'failed,rejected', undefined, undefined, undefined],
-            ['supersedeMatch', 'string', 'name', undefined, undefined, undefined],
+            ['truncateToolRequests', 'boolean', false, undefined, undefined, undefined],
+            ['truncateTurns', 'number', 2, 0, 4096, 1],
             ['minTokens', 'number', 0, 0, 1000000, 50],
-            ['minThoughtChars', 'number', 0, 0, 1000000, 50],
             ['safetyUnits', 'number', 0, 0, 4096, 1],
             ['maxUnits', 'number', 0, 0, 4096, 1]
         ]);
+
+        // THE GROUPING AND THE NESTING (R1/R2, the 2026-11-13 "it looks unorganised" request), as
+        // `[key, group.id, group.title, parentKey]` with `null` for an absent field. This is the
+        // whole contract the renderer gets: `title` is the heading text it prints verbatim, `id` is
+        // what it orders sections by, and `parentKey` is the checkbox that reveals a row. `enabled`
+        // carries neither (the master switch sits above the categories), and the three Global
+        // Limits rows carry a group but no parent, because they bound every policy at once.
+        expect(
+            metadata.settings?.map((setting: HarnessPluginSettingDescriptor) => [
+                setting.key,
+                setting.group?.id ?? null,
+                setting.group?.title ?? null,
+                setting.parentKey ?? null
+            ])
+        ).toEqual([
+            ['enabled', null, null, null],
+            ['trimInvalidTools', 'invalid-tools', 'Invalid Tools', null],
+            ['invalidToolTurns', 'invalid-tools', 'Invalid Tools', 'trimInvalidTools'],
+            ['invalidOutcomes', 'invalid-tools', 'Invalid Tools', 'trimInvalidTools'],
+            ['trimThoughts', 'chain-of-thoughts', 'Chain of Thoughts', null],
+            ['thoughtTurns', 'chain-of-thoughts', 'Chain of Thoughts', 'trimThoughts'],
+            ['minThoughtChars', 'chain-of-thoughts', 'Chain of Thoughts', 'trimThoughts'],
+            ['dropSupersededToolCalls', 'superseded-tools', 'Superseded Tools', null],
+            ['supersededTurns', 'superseded-tools', 'Superseded Tools', 'dropSupersededToolCalls'],
+            ['supersedeMatch', 'superseded-tools', 'Superseded Tools', 'dropSupersededToolCalls'],
+            ['dropDuplicateCalls', 'duplicate-tools', 'Duplicate Tools', null],
+            ['duplicateTurns', 'duplicate-tools', 'Duplicate Tools', 'dropDuplicateCalls'],
+            ['truncateToolRequests', 'tool-requests', 'Tool Requests', null],
+            ['truncateTurns', 'tool-requests', 'Tool Requests', 'truncateToolRequests'],
+            ['minTokens', 'global-limits', 'Global Limits', null],
+            ['safetyUnits', 'global-limits', 'Global Limits', null],
+            ['maxUnits', 'global-limits', 'Global Limits', null]
+        ]);
+
+        // THE GROUPING INVARIANTS a hand-edit breaks but a deep-equal above only catches by
+        // accident: a category's rows are CONTIGUOUS and a group appears exactly once as a run, so
+        // the renderer opens one heading per section in first-appearance order (a second
+        // `invalid-tools` run below `global-limits` would draw that heading twice); every
+        // `parentKey` names a row declared BEFORE it, and that row is a `boolean`, because a gate
+        // the renderer cannot evaluate is a row that hides forever; and the group heading is
+        // non-empty, since the renderer prints it verbatim.
+        const groupRuns = (metadata.settings ?? []).reduce(
+            (runs: string[], setting: HarnessPluginSettingDescriptor) => {
+                const id = setting.group?.id ?? null;
+
+                if (runs[runs.length - 1] !== id) runs.push(String(id));
+
+                return runs;
+            },
+            []
+        );
+
+        expect(groupRuns).toEqual([
+            'null',
+            'invalid-tools',
+            'chain-of-thoughts',
+            'superseded-tools',
+            'duplicate-tools',
+            'tool-requests',
+            'global-limits'
+        ]);
+        expect(new Set(groupRuns).size).toBe(groupRuns.length);
+
+        for (const setting of metadata.settings ?? []) {
+            if (setting.group === undefined) continue;
+            expect(setting.group.title.length).toBeGreaterThan(0);
+        }
+
+        for (let index = 0; index < (metadata.settings ?? []).length; index += 1) {
+            const setting = metadata.settings![index];
+            if (setting.parentKey === undefined) continue;
+
+            const parentIndex = (metadata.settings ?? []).findIndex(
+                (other: HarnessPluginSettingDescriptor) => other.key === setting.parentKey
+            );
+
+            // A gate that does not exist, or is declared AFTER the row it gates, is a row the
+            // renderer cannot resolve while it builds the pane top-down.
+            expect(parentIndex).toBeGreaterThanOrEqual(0);
+            expect(parentIndex).toBeLessThan(index);
+            expect(metadata.settings?.[parentIndex]?.type).toBe('boolean');
+        }
 
         // THE THREE TOGGLE + HORIZON OPTIONS the operator is meant to see first, each horizon
         // immediately after its toggle (the pairs above, spelled out as pairs so a reordering
@@ -2814,24 +2901,24 @@ describe('context-trimmer metadata', () => {
                 'Trims nothing until a later included completed call answers every tool name it called.'
             ],
             ['invalidToolTurns', 'Protects the newest N tool turns; 0 protects none.'],
+            [
+                'invalidOutcomes',
+                'Comma-separated subset of failed, rejected, cancelled, empty; empty means a blank result.'
+            ],
             ['trimThoughts', null],
             ['thoughtTurns', null],
-            ['truncateToolRequests', 'Drops the request entry only; its tool results stay in the request.'],
-            ['truncateTurns', null],
+            ['minThoughtChars', null],
             ['dropSupersededToolCalls', null],
             ['supersededTurns', null],
+            ['supersedeMatch', "'name' matches any later call of the tool; 'fingerprint' needs identical arguments."],
             [
                 'dropDuplicateCalls',
                 'Needs an exact re-run with identical arguments; supersedeMatch does not widen it.'
             ],
             ['duplicateTurns', null],
-            [
-                'invalidOutcomes',
-                'Comma-separated subset of failed, rejected, cancelled, empty; empty means a blank result.'
-            ],
-            ['supersedeMatch', "'name' matches any later call of the tool; 'fingerprint' needs identical arguments."],
+            ['truncateToolRequests', 'Drops the request entry only; its tool results stay in the request.'],
+            ['truncateTurns', null],
             ['minTokens', 'Each tool axis must save this many tokens, or it writes nothing; thinking is never gated.'],
-            ['minThoughtChars', null],
             ['safetyUnits', null],
             ['maxUnits', 'Tool units one axis may withhold per pass; 0 is unbounded, not disabled.']
         ]);
@@ -2863,14 +2950,24 @@ describe('context-trimmer metadata', () => {
         }
 
         // A toggle's label names the whole action the way compaction's does (`Automatic
-        // Compaction …`), so the three headline options read alike in the pane.
+        // Compaction …`), so the headline options read alike in the pane. The 2026-11-13 grouping
+        // pass also TITLE-CASED the object of every `Automatic …` label ("invalid tools" ->
+        // "Invalid Tools", "Tool Request" -> "Tool Requests"), because these five labels now sit as
+        // the heading row of their own category and a lower-case object reads as a sentence fragment
+        // next to a title-case section heading. Pinned exactly, all five.
         const labelOf = (key: string): string =>
             (metadata.settings ?? []).find((setting) => setting.key === key)?.label ?? '';
 
-        expect(labelOf('trimInvalidTools')).toBe('Automatic Trim invalid tools');
-        expect(labelOf('trimThoughts')).toBe('Automatic Trim thoughts');
-        expect(labelOf('truncateToolRequests')).toBe('Automatic Truncate Tool Request');
+        expect(labelOf('trimInvalidTools')).toBe('Automatic Trim Invalid Tools');
+        expect(labelOf('trimThoughts')).toBe('Automatic Trim Thoughts');
+        expect(labelOf('dropSupersededToolCalls')).toBe('Automatic Trim Superseded Tools');
+        expect(labelOf('dropDuplicateCalls')).toBe('Automatic Trim Duplicate Tools');
+        expect(labelOf('truncateToolRequests')).toBe('Automatic Truncate Tool Requests');
         expect(labelOf('invalidToolTurns')).toBe('Invalid tools · trim after (tool turns)');
+
+        // The master switch keeps the wording that mirrors `title` — it is not one of the five
+        // policy labels, and renaming it would move the framework-reserved row's identity on screen.
+        expect(labelOf('enabled')).toBe('Context trimming');
 
         // The posture, stated by the plugin itself in ONE short sentence (R1): the long form used to
         // restate what every descriptor below already says, and 83 characters is also the number the

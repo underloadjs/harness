@@ -263,7 +263,11 @@ it('lists every saved session of the harness in the dashboard behind the Instruc
         'main-title',
         'session-cycle',
         'new-session session-new',
-        'harness-id'
+        'harness-id',
+        // The right-aligned catalogue group (`⚒` tools / `⚙` plugins) moved here from the
+        // topbar corner. compact-ui.test.ts pins that the phone media block carries no rule
+        // for it, so no layout drops it: it is the row's last child at every width.
+        'harness-title-tools'
     ]);
     // No header strip survives anywhere, at any width.
     expect(document.querySelector('.session-pills-bar-head')).toBeNull();
@@ -695,7 +699,11 @@ it('keeps the same compact header and the same dashboard at a desktop width', as
         'main-title',
         'session-cycle',
         'new-session session-new',
-        'harness-id'
+        'harness-id',
+        // The right-aligned catalogue group (`⚒` tools / `⚙` plugins) moved here from the
+        // topbar corner. compact-ui.test.ts pins that the phone media block carries no rule
+        // for it, so no layout drops it: it is the row's last child at every width.
+        'harness-title-tools'
     ]);
     const pill = byClass('.session-cycle', 'button');
     expect(pill.hidden).toBe(false);

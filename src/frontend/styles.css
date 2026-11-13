@@ -26,12 +26,16 @@
     --accent: #7aa2ff;
     --accent-soft: rgba(122, 162, 255, 0.12);
     --ok: #4ade80;
-    /* Enabled catalogue tile (Tools + Plugins corner tick box). The tick itself is the
-       native mark painted with `--ok`; the tile it belongs to carries the SAME green only
-       as a WASH composited over the tile's own surface (`--ok-wash` under
-       `--ok-line` for the border). These are background values, never text colours, so an
-       enabled row keeps exactly the foreground contrast of a disabled one — the reader is
-       told "live", not "brighter". */
+    /* The enabled pair for the catalogue corner tick box. The tick itself is the native
+       mark painted with `--ok`; BOTH catalogue tiles it belongs to — TOOLS and PLUGINS —
+       carry the SAME green on their EDGE only (`--ok-line` border) and keep their normal
+       `--bg-elevated` surface, because in those panes BACKGROUND is the SELECTION channel:
+       the tile whose runner or plugin dialog is open fills with `--accent-soft`, so an
+       enabled wash there would compete with it.
+       `--ok-wash` is still very much alive: the records feed's completed row and the
+       ok-toned fact chip fill themselves with it. Both are edge/background values, never
+       text colours, so an enabled row keeps exactly the foreground contrast of a disabled
+       one — the reader is told "live", not "brighter". */
     --ok-wash: rgba(74, 222, 128, 0.16);
     --ok-line: rgba(74, 222, 128, 0.5);
     --danger: #f87171;
@@ -184,8 +188,12 @@ summary::-webkit-details-marker {
     font-size: 14px;
 }
 
-/* Right cluster: the app status pill plus the GLOBAL Tools toggle (R3). It is the
-   last topbar child, so the tools icon always sits at the top-right corner. */
+/* Right cluster: the app status pill, ALONE. The two global catalogue toggles that used to
+   sit here (`⚒` tools / `⚙` plugins) moved to the harness title row as `.harness-title-tools`
+   — the panes they open are presented for the session in view, while this pill reports
+   app-wide state — so this wrapper is now
+   just the pill's flex parent. It is still the last topbar child, so the pill stays at the
+   top-right corner. */
 .topbar-right {
     display: flex;
     align-items: center;
@@ -882,14 +890,18 @@ body.is-resizing-rail {
     gap: 9px;
 }
 
-/* The Harness server URL action row (Apply & reconnect / Reset). It sits directly
-   under the field it acts on, so the two buttons are right-aligned like the rest of
-   the sheet's confirmations (`.composer-actions`) and never stretch across the
-   dialog: the primary reads last, which is where a reader expects the commit. */
+/* The dialog's footer: its LAST row, holding its ONE button. Nothing above it is persisted
+   until this button is pressed, so it reads like every other confirmation in the sheet
+   (`.composer-actions`, `.agent-dialog-footer`): right-aligned, and separated from the
+   fields it commits. There is no second button — dismissing the dialog (×, Escape,
+   backdrop, a second pill press) is the discard, so `Reset` had nothing left to do. */
 .endpoint-actions {
     display: flex;
     justify-content: flex-end;
     gap: 8px;
+    margin-top: 4px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
 }
 
 .field {
@@ -954,8 +966,8 @@ body.is-resizing-rail {
 /* Global tools view ---------------------------------------------------- */
 /* Full-width, keyed list of every server tool (core entries included). After R21.2
    this is the ONLY catalogue: the right rail no longer duplicates it, and a call
-   always executes on the server. The view replaces the centre column when the
-   topbar's icon-only Tools toggle is pressed (R3).
+   always executes on the server. The view replaces the centre column when the icon-only
+   Tools toggle on the harness title row is pressed (R3).
 
    The list is the WHOLE content area: the manual runner lives in the shared modal
    (ui/dialog.ts) and opens only when an entry is activated, so there is exactly one
@@ -1032,19 +1044,22 @@ body.is-resizing-rail {
     border-color: var(--border-strong);
 }
 
-/* R1: a TICKED row is enabled and the TILE says so — the green wash composited over the
-   tile's own elevated surface plus a green-tinted border. An unticked row keeps the base
-   rules above EXACTLY as they are: the `[data-enabled='false']` dim is gone, because
-   "off" is now the plain look rather than a de-emphasised one. `background-image` is the
-   wash layer and `background-color` stays `--bg-elevated`, so the tile is opaque.
+/* R1: a TICKED row is enabled and the TILE says so on its EDGE — `--ok-line` border over
+   the tile's own elevated surface. The green WASH is deliberately NOT used here: in this
+   pane the background is the SELECTION channel (`.tool-tab-button[aria-pressed='true']`
+   below fills with `--accent-soft`), so "enabled" rides the border and "selected" rides the
+   background and the two figures can never collide or be mistaken for one another. The
+   corner tick box (`accent-color: var(--ok)`) is the authoritative mark and shares the same
+   green edge. An unticked row keeps the base rules above EXACTLY as they are: the
+   `[data-enabled='false']` dim is gone, because "off" is now the plain look rather than a
+   de-emphasised one. The base rule already declares `border: 1px solid transparent`, so
+   only the colour changes — the tile geometry is identical enabled or not.
    `paintToolRowEnablement` moves this attribute and the tick together.
    Placement matters: this sits BEFORE the `[aria-pressed='true']` rule below, at equal
    specificity, so the accent border of the row whose runner is open still wins —
    "selected" and "enabled" stay two readable, separate figures. */
 .tool-tab-button[data-enabled='true'] {
     border-color: var(--ok-line);
-    background-image: linear-gradient(var(--ok-wash), var(--ok-wash));
-    background-color: var(--bg-elevated);
 }
 
 .tool-tab-button[data-enabled='true']:hover:not(:disabled) {
@@ -1101,12 +1116,14 @@ body.is-resizing-rail {
    assistive tech and the native mark needs no invented glyph. It is the button's
    SIBLING, lifted above the tile by `z-index`, so a click lands on the box and the
    tile's own handler (open the runner) never sees it. `accent-color` paints the tick
-   with `--ok`, the same green as the tile wash, so "ticked" and "green tile" are one
-   figure rather than two signals that could drift. The box keeps its NATIVE painting —
+   with `--ok`, the same green as the tile's enabled BORDER, so "ticked" and "green-edged
+   tile" are one figure rather than two signals that could drift. The box keeps its NATIVE
+   painting —
    `color-scheme: dark` on `:root` already gives it a dark-theme surface, and overriding
    `background`/`border` here would fight `accent-color` in some engines for no gain.
    Styled per pane (no selector list with `.plugin-tab-enable`) for the same reason the
-   two topbar icons are separate: restyling one catalogue must never move the other. */
+   two catalogue toggles keep separate rules: restyling one catalogue must never move the
+   other. */
 .tool-tab-enable {
     position: absolute;
     top: 9px;
@@ -1144,17 +1161,8 @@ body.is-resizing-rail {
     cursor: progress;
 }
 
-/* The pane's enablement line (main.ts `toolsTabNote`): a polite live region, so a
-   refusal is announced without moving focus out of the list. */
-.tools-tab-note {
-    margin: 0;
-    font-size: 11.5px;
-}
-
-.tools-tab-note-error {
-    color: var(--danger);
-    font-weight: 600;
-}
+/* The tools pane owns no enablement line of its own any more (main.ts dropped it with the
+   markup), so a refused switch reports itself on the topbar pill and the row's own edge. */
 
 /* ---------------------------------------------------------------------------
    T7 (R2/R3): the PLUGINS view — the auto-scanned catalogue and the row dialog
@@ -1178,26 +1186,22 @@ body.is-resizing-rail {
     gap: 3px;
 }
 
+/* `.plugins-tab-hint` and `.plugins-tab-note` left the sheet with the markup that built
+   them (main.ts reduced the pane head to the bare `h2`, and the count sentence now lives only
+   in the view head's own subtitle). The head keeps its own rules above; nothing here is shared
+   with the tools pane. */
 .plugins-tab-title {
     margin: 0;
     font-size: 15px;
     font-weight: 600;
 }
 
-.plugins-tab-hint {
-    margin: 0;
-    color: var(--muted);
-    font-size: 12px;
-}
-
-.plugins-tab-note {
-    margin: 0;
-    font-size: 11.5px;
-}
-
+/* The re-read control no longer sits in `.plugins-tab-head`: main.ts appends it to
+   `.plugins-tab-footer`, the row UNDER `.plugin-tab-list`, so that footer rule — not this one
+   — is what parks it in the pane's bottom-right corner. It keeps its own width only, so a wide
+   pane cannot stretch the button across the footer. */
 .plugins-refresh {
-    align-self: flex-start;
-    margin-top: 4px;
+    flex: 0 0 auto;
 }
 
 .plugin-tab-list {
@@ -1211,6 +1215,24 @@ body.is-resizing-rail {
     min-height: 0;
     padding-right: 2px;
     overflow: auto;
+}
+
+/* The pane's footer row — markup order is head, list, footer, so this rule sits after the
+   list's for the same reason. It carries the enablement outcome line (`pluginsTabStatus`) and
+   then the single `Reload plugins` button, as one right-aligned strip: `justify-content:
+   flex-end` puts the BUTTON in the corner and the sentence sits to its left. `align-items:
+   center` is here because the strip now mixes a text line with a padded button — with the
+   default `stretch` the `<p>` would fill the button's height and their baselines would
+   disagree. `flex: 0 0 auto` keeps the strip its own height while `.plugin-tab-list`
+   (`flex: 1`, `min-height: 0`) takes the remaining room and stays the ONLY scroll region; the
+   pane's `gap: 12px` is the separation, so the footer needs no margin of its own.
+   Deliberately NOT `position: fixed`: the control belongs to this pane's box and must
+   disappear with the pane instead of floating over the chat or the tools view. */
+.plugins-tab-footer {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: flex-end;
 }
 
 .plugin-tab-button {
@@ -1230,16 +1252,25 @@ body.is-resizing-rail {
     border-color: var(--border-strong);
 }
 
-/* R2: a TICKED plugin row is enabled and the row carries the same light-green wash the
-   tools pane uses — composited over the row's own `--bg-elevated`, with a green-tinted
-   border. An unticked row keeps the plain look above: the old `[data-enabled='false']`
-   dim is gone, so "off" is the default appearance and not a faded one. Declared BEFORE
-   the `[aria-pressed='true']` rule at equal specificity, so the accent border of the row
-   whose dialog is open still reads as the selected one. */
+/* R2: a TICKED plugin row is enabled and this pane says it on its EDGE — `--ok-line` border
+   over the row's own elevated surface. The green WASH is deliberately NOT used here: in this
+   pane the background is the SELECTION channel (`.plugin-tab-button[aria-pressed='true']`
+   below fills with `--accent-soft`), so "enabled" rides the border and "selected" rides the
+   background and the two figures can never collide or be mistaken for one another — the exact
+   recipe the TOOLS tile already uses (`.tool-tab-button[data-enabled='true']`, above), so the
+   two catalogues now read alike. The corner tick box (`accent-color: var(--ok)`) is the
+   authoritative mark and shares the same green edge. An unticked row keeps the base rules
+   above EXACTLY as they are: the `[data-enabled='false']` dim is gone, because "off" is now
+   the plain look rather than a de-emphasised one. The base rule already declares
+   `border: 1px solid transparent`, so only the colour changes — the row geometry is identical
+   enabled or not. The two catalogues stay styled PER PANE (no selector list with the tools
+   rule), so restyling one can never move the other.
+   `paintPluginToggle` moves this attribute and the tick together.
+   Placement matters: this sits BEFORE the `[aria-pressed='true']` rule below, at equal
+   specificity, so the accent border of the row whose dialog is open still wins —
+   "selected" and "enabled" stay two readable, separate figures. */
 .plugin-tab-button[data-enabled='true'] {
     border-color: var(--ok-line);
-    background-image: linear-gradient(var(--ok-wash), var(--ok-wash));
-    background-color: var(--bg-elevated);
 }
 
 .plugin-tab-button[data-enabled='true']:hover:not(:disabled) {
@@ -1317,7 +1348,7 @@ body.is-resizing-rail {
 /* A real checkbox: `checked` is the state for assistive tech, `accent-color` paints the
    native mark with `--ok`, and `z-index` lifts it above the tile so a click on the box
    never opens the plugin dialog. `paintPluginToggle` moves `checked`, `data-enabled` and
-   the tile's wash together — the three readings of one figure (main.ts). */
+   the tile's green `--ok-line` edge together — the three readings of one figure (main.ts). */
 .plugin-tab-enable {
     position: absolute;
     top: 11px;
@@ -1356,9 +1387,11 @@ body.is-resizing-rail {
     cursor: progress;
 }
 
-/* The enablement outcome line (main.ts `pluginsTabStatus`). Separate from
-   `.plugins-tab-note` on purpose: that one is the catalogue count and the READ failure,
-   and a refused switch must never be read as one. */
+/* The enablement outcome line (main.ts `pluginsTabStatus`) — feedback, so it survived the
+   copy removal that took the pane's hint and count lines. Separate from the view head's count
+   subtitle on purpose: that one is the catalogue count and the READ failure, and a refused
+   switch must never be read as one. main.ts appends this line into `.plugins-tab-footer`, in
+   front of `Reload plugins`, since the pane head is now the bare `h2`. */
 .plugins-tab-status {
     margin: 0;
     font-size: 11.5px;
@@ -1516,6 +1549,157 @@ body.is-resizing-rail {
     color: var(--muted);
     font-size: 11.5px;
     line-height: 1.4;
+}
+
+/* ---------------------------------------------------------------------------
+   Grouped and gated settings (T5/R3, 2026-11-13).
+
+   Two new shapes, both driven by the optional descriptor fields `group` and
+   `parentKey` (main.ts `buildSettingsForm`): a TITLED BLOCK of related settings, and a
+   dependent setting INDENTED under the tick that reveals it. Every rule here reuses the
+   dialog's existing grammar — the caption type of `.plugin-detail-section-title`, the
+   `--border`/`--radius-sm` box of a control, the 18px indent step of `.thread-children` —
+   so a grouped form looks like the rest of the app rather than a second design language.
+   Nothing here restyles a plugin that declares no groups: `.plugin-settings-groups`,
+   `.plugin-settings-group` and `.plugin-setting-children` elements are never BUILT for one
+   (pinned in plugins-tab.test.ts), so these selectors match nothing on a flat form.
+   ------------------------------------------------------------------------- */
+
+/* A boolean setting now reads the way the operator's mock reads — `[tick] Automatic trim
+   of invalid tools` on ONE line, its description on the next — with no change to the DOM
+   `buildSettingField` emits (label, input, hint in that order). `:has()` is what scopes the
+   flip to a row that actually holds a checkbox; a browser without it drops the three rules
+   and gets yesterday's layout (label above the box), which is cosmetics only. `order: -1`
+   pulls the box in front of the label without re-parenting anything, so the real
+   `<label for>` association main.ts builds is untouched, and `flex-basis: 100%` on the hint
+   is what keeps the description on its own full-width line instead of beside the box. */
+.plugin-setting:has(> .plugin-setting-input[type='checkbox']) {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 3px 8px;
+}
+
+.plugin-setting:has(> .plugin-setting-input[type='checkbox']) > .plugin-setting-input {
+    order: -1;
+    /* The same 3px nudge `.action-radio` uses to sit on the label's first line. */
+    margin: 3px 0 0;
+    accent-color: var(--accent);
+}
+
+.plugin-setting:has(> .plugin-setting-input[type='checkbox']) > .plugin-setting-hint {
+    flex-basis: 100%;
+}
+
+/* The one wrapper around every declared group. It exists so "this plugin is switched off"
+   can be marked on ONE element (the `--off` rule below) instead of stamped on every row. */
+.plugin-settings-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+/* A declared group: a bounded box, because a heading alone over a flex column of controls
+   does not read as a unit. `--border` + `--radius-sm` is the same box every other framed
+   control in this dialog uses. The gap is a hair wider than `.plugin-setting`'s 3px so the
+   rows inside a block still separate from each other once they are boxed together. */
+.plugin-settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+
+/* The block caption: the `.plugin-detail-section-title` grammar (mono, uppercase, --muted)
+   taken ONE STEP DOWN — 9.5px/0.08em against that rule's 10.5px/0.09em, the same step
+   `.action-recommended` takes below its row text. It is also the block's accessible name,
+   via the `aria-labelledby` main.ts puts on the `role="group"` box, so the hierarchy is
+   stated to assistive tech and not just drawn. */
+.plugin-setting-group-title {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+/* The indent that says "this belongs to the tick above me". ONE step, declared locally as
+   `--setting-indent` at the same 18px `.thread-children` uses (styles.css:3482), so the
+   transcript can retune its own depth without silently moving the settings form; the
+   narrow-screen step below matches that rule's own narrowing. The 1px left rail is the same
+   device `.thread-outcome` uses to mark "belongs to", at `--border` rather than
+   `--border-strong` because it is hierarchy, not a call-out. */
+.plugin-setting-children {
+    --setting-indent: 18px;
+
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-left: var(--setting-indent);
+    border-left: 1px solid var(--border);
+}
+
+/* The host is built on the first gated child, so it is never empty in practice — this is
+   the `.thread-children:empty` guard restated for the malformed case (a `parentKey` that
+   names nothing gets flushed to the form root by main.ts), so an empty rail can never add
+   a phantom gap line to the form. It is NOT the guard for "every child is hidden": hidden
+   rows are still DOM children, so `:empty` cannot match them, and this host stays a flex
+   ITEM inside the `gap: 8px` column of `.plugin-settings-group` — which is why main.ts
+   `paintGates` puts `hidden` on the host itself (D3) instead of leaving a dead 8px gap
+   under a parent whose whole branch is collapsed. */
+.plugin-setting-children:empty {
+    display: none;
+}
+
+/* The plugin's own master tick (`enabled`, the reserved framework key) is off. The policy
+   blocks stay FULLY VISIBLE and addressable — hiding them would strand exactly the operator
+   who switched the plugin off and now wants to change its policy before switching it back —
+   while their TEXT reads as not in force.
+
+   THE DIM SITS ON THE TEXT ELEMENTS THEMSELVES, never on `.plugin-setting`, and that is the
+   whole fix (D1/D2, 2026-11-13): opacity applies to a subtree and NO descendant can undo an
+   ancestor's value, so while this rule sat on the ROW its own checkbox sat inside it and the
+   `opacity: 1` that followed was a declaration nothing could honour — the live switch looked
+   disabled. The completed-task-row dim far below in this sheet (the `[data-completed='true']`
+   text rule at styles.css:8922) has always had it right: dim and restore on the SAME element,
+   and nothing in between needs rescuing.
+
+   0.82 is the step that precedent already uses, and it is the contrast half of the fix. The
+   hint is `--muted` (#8b94a7) on `--bg` (#0b0d12): 6.4:1 un dimmed, 4.6:1 at 0.82 (still WCAG
+   AA for body text), against the ≈3.1:1 the 0.62 this replaces put it at. The arithmetic is
+   stated here because jsdom runs no cascade — `plugins-tab.test.ts` pins the SELECTORS and the
+   STEP, and cannot pin the rendering.
+
+   The state is never carried by opacity alone: the `enabled` row and its own hint say it in
+   words, the block CAPTIONS keep full contrast and keep naming each block, and nothing here
+   hides, moves or clips a single thing. */
+.plugin-settings-groups--off .plugin-setting > .plugin-setting-label,
+.plugin-settings-groups--off .plugin-setting > .plugin-setting-hint {
+    opacity: 0.82;
+}
+
+/* Forced colours (D8): this mode repaints text from the system palette, so a translucent
+   step is a cue the platform is not obliged to preserve. The insensitive-text system colour
+   carries "declared, not in force" in a palette the mode does own — the same role `CanvasText`
+   and `Highlight` outlines play for the five forced-colours fallbacks above — and the words in
+   the `enabled` row still state the state regardless. */
+@media (forced-colors: active) {
+    .plugin-settings-groups--off .plugin-setting > .plugin-setting-label,
+    .plugin-settings-groups--off .plugin-setting > .plugin-setting-hint {
+        color: GrayText;
+        opacity: 1;
+    }
+}
+
+@media (max-width: 600px) {
+    /* The phone dialog has no width to spare for an 18px rail; `.thread-children` takes the
+       identical 10px step at the identical breakpoint (styles.css:4439). */
+    .plugin-setting-children {
+        --setting-indent: 10px;
+    }
 }
 
 /* The save control is the row's only action, and it belongs on the RIGHT edge — the
@@ -1676,6 +1860,39 @@ body.is-resizing-rail {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+/* The two catalogue toggles (`⚒` tools / `⚙` plugins) moved out of the topbar's right
+   corner onto this line because the panes they open are presented for the
+   session CURRENTLY in view (this header — and so the pair of toggles — is repainted per
+   session; there is one pair for the session shown, not one per session). What is NOT
+   session-scoped is what those panes WRITE: their enablement switches are deployment-wide
+   (every conversation on the server, from the next turn), and the genuinely per-session
+   tool state (`/sessions/{id}/tools`) lives on a route neither pane calls. The wrapper
+   mirrors `.topbar-right` — a flex group the sheet can position as ONE unit — and
+   `margin-left: auto` pins it to the far right of the row, after the id span.
+
+   Box model (jsdom cannot lay this out, so the arithmetic is written down):
+   - `flex: 0 0 auto` keeps the group at its content width (30px + 8px + 30px = 68px), so the
+     two icons are never squeezed. `.main-title` is the row's only item that ELLIPSIZES the
+     title (`flex: 0 1 auto; min-width: 0`, with the ellipsis on `.harness-title-text`), and
+     `.harness-id` is the row's OTHER shrinker: it declares no `flex: 0 0 auto`, so its
+     default `flex-shrink: 1` stands, and its `overflow: hidden` lowers the automatic minimum
+     to 0 (compact-ui.test.ts pins both halves). Those two flexible items are what keep a
+     375px phone fitting: cycler <= 42vw (~157px) + `+` (~24px) + group (68px) + three 10px
+     gaps = ~279px of a 347px line, leaving ~68px for the title and id span to shrink into;
+   - the row already has `min-width: 0`, so the auto margin cannot force sideways overflow;
+   - no breakpoint rules are needed: the group is identical at every width, matching the
+     "one compact header at EVERY WIDTH" rule the session controls above follow.
+
+   The buttons keep their own `.tools-toggle` / `.plugins-toggle` rules (styles.css:210
+   and 259) — none of them were scoped to `.topbar-right`, so nothing was lost by moving. */
+.harness-title-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+    margin-left: auto;
 }
 
 .harness-note {
@@ -6642,13 +6859,9 @@ body.is-resizing-rail {
     overflow-wrap: anywhere;
 }
 
-/* Tools view session status (R21.2) ------------------------------------ */
-/* Informational session binding + tools toolRequest enabled for it. This replaced
-   the removed right-rail core-tools dropdown; the view itself is styled above. */
-.tools-session-note {
-    margin: 0;
-    color: var(--accent);
-}
+/* Tools view runner card (R21.2) --------------------------------------- */
+/* The runner the catalogue dialog adopts. The removed playground-context note that used to
+   open this section is gone with its markup; the pane itself is styled above. */
 
 .tool-card {
     display: flex;
@@ -7003,15 +7216,16 @@ body.is-resizing-rail {
         font-size: 11.5px;
     }
 
-    /* R3/R4: the topbar carries the icon-only Tools button and the live status pill, so
-       the pill must be able to shrink and ellipsize instead of pushing the icon off the
-       line. The width cap itself lives on `.topbar-right .status` (F1); a percentage here
-       would resolve against the shrink-to-fit cluster. */
+    /* R3/R4: the topbar now carries only the live status pill (the catalogue toggles moved
+       to the harness title row), so the pill must still be able to shrink and ellipsize
+       instead of pushing the brand off the line. The width cap itself lives on
+       `.topbar-right .status` (F1); a percentage here would resolve against the
+       shrink-to-fit cluster. */
     .status {
         min-width: 0;
     }
 
-    /* Compact topbar on a phone: brand + tools icon + pill on one line. The two drawers are
+    /* Compact topbar on a phone: brand + pill on one line. The two drawers are
        opened by the brand (the harness listing) and the floating `.scratch-fab` (the scratch
        board, T3/R3) — T8: both into the SAME left-hand sidebar slot, one at a time — so the
        bar spends no room on a rail control. */
@@ -8596,10 +8810,11 @@ body.is-resizing-rail {
    — the glyph's shape (a tick vs a cross), the group heading above the list, and this
    edge-and-wash pair drawn from the row's own `data-completed` — so the tint is the
    fast signal and never the only one, and there is no word and no strike anywhere in
-   the row. Completed borrows the enabled greens (`--ok-wash` / `--ok-line`, the same
-   pairing the catalogue's enabled tile uses); open borrows the amber the chrome
-   already uses for "not settled yet", and it is deliberately NOT the danger red: an
-   open task is unfinished, not wrong.
+   the row. Completed borrows the enabled greens (`--ok-wash` for the fill, `--ok-line` for
+   the edge — the same green the catalogue's enabled tile wears, though there it rides the
+   BORDER only because the tile's background is the selection channel); open borrows the
+   amber the chrome already uses for "not settled yet", and it is deliberately NOT the
+   danger red: an open task is unfinished, not wrong.
 
    These rules come BEFORE the "just landed" rule below on purpose. Equal specificity
    means the later rule wins, and for the ~1.5s a row is fresh, "this one just
@@ -9155,5 +9370,17 @@ body.is-resizing-rail {
     .panel-records-chip[data-active='true'] {
         border-color: Highlight;
         color: Highlight;
+    }
+
+    /* Tools catalogue tile: "enabled" is ALREADY an edge in that pane — the green wash was
+       dropped from it so the background could stay the SELECTION channel — so forced
+       colours has no tint to take away. The tile only needs the green edge pinned to a
+       system colour, because otherwise an enabled tile and a plain one both collapse to the
+       forced `CanvasText` border and stop differing at all. `Highlight` is the same
+       "the salient one" system colour this block already uses for active/completed rows,
+       and the corner box keeps its native `checked` rendering (forced colours paints that
+       itself), so the state is never carried by colour alone. */
+    .tool-tab-button[data-enabled='true'] {
+        border-color: Highlight;
     }
 }

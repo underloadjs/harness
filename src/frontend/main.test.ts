@@ -675,7 +675,11 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
         'main-title',
         'session-cycle',
         'new-session session-new',
-        'harness-id'
+        'harness-id',
+        // The right-aligned catalogue group (`⚒` tools / `⚙` plugins) moved here from the
+        // topbar corner. compact-ui.test.ts pins that the phone media block carries no rule
+        // for it, so no layout drops it: it is the row's last child at every width.
+        'harness-title-tools'
     ]);
     // Nothing is open yet, so the cycler has no conversation to name, while the dashboard
     // behind the title is empty-state only (and so is not announced as a list).
@@ -839,14 +843,15 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     );
 });
 
-// Header badge lifecycle. `<span class="harness-id">` is shared by two heads:
-//   - the CHAT head (`renderHarnessChrome`, main.ts:3206-3213) sets the display
-//     title and BLANKS + HIDES the badge — the harness registry id (`instruct`,
-//     `research`, …) is an internal key for sessions/aliases/API, not reader copy;
-//   - the TOOLS head shows user-facing group labels in it again
-//     (`paintToolsHead` main.ts:3780-3781 → `catalogue`, `selectTool`
-//     main.ts:3867-3868 → the entry's group such as `Files`), so both writers
-//     explicitly un-hide the element the chat head hid.
+// Header badge lifecycle. `<span class="harness-id">` is shared by three heads:
+//   - the CHAT head (`renderHarnessChrome`) sets the display title and BLANKS + HIDES the
+//     badge — the harness registry id (`instruct`, `research`, …) is an internal key for
+//     sessions/aliases/API, not reader copy;
+//   - the TOOLS head hides it too (Tools Catalogue R2): the title itself now reads
+//     "Tools Catalogue", so the badge would only repeat the word — `paintToolsHead` blanks
+//     and hides it, the same treatment the chat head gives it;
+//   - an OPEN tool shows the tool's GROUP in it again (`selectTool` → e.g. `Files`), a
+//     user-facing category, so that writer explicitly un-hides what the other two hid.
 // This walks the whole round trip: chat → catalogue → tool → catalogue → chat.
 it('shows the tools badge only in the tools view and keeps it hidden in the chat head', async () => {
     const tool = {
@@ -879,12 +884,13 @@ it('shows the tools badge only in the tools view and keeps it hidden in the chat
     expect(badge.textContent).toBe('');
     expect(badge.hidden).toBe(true);
 
-    // Tools view: the catalogue label is readable, so the badge is shown.
+    // Tools view (R2): the title itself reads "Tools Catalogue", so the badge beside it is
+    // blanked and hidden rather than repeating the word.
     byClass('.tools-toggle', 'button').click();
     await flush();
-    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
-    expect(badge.textContent).toBe('catalogue');
-    expect(badge.hidden).toBe(false);
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
+    expect(badge.textContent).toBe('');
+    expect(badge.hidden).toBe(true);
 
     // Selected tool: the head names the tool and its GROUP in the badge.
     byClass('.tool-tab-button', 'button').click();
@@ -893,12 +899,12 @@ it('shows the tools badge only in the tools view and keeps it hidden in the chat
     expect(badge.textContent).toBe('Files');
     expect(badge.hidden).toBe(false);
 
-    // Dialog close re-describes the catalogue, badge still shown.
+    // Dialog close re-describes the catalogue: the title names the view, the badge stays hidden.
     byClass('.dialog-close', 'button').click();
     await flush();
-    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
-    expect(badge.textContent).toBe('catalogue');
-    expect(badge.hidden).toBe(false);
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
+    expect(badge.textContent).toBe('');
+    expect(badge.hidden).toBe(true);
 
     // Back to chat: the title returns and the badge is blanked and hidden again.
     byClass('.tools-toggle', 'button').click();
@@ -2818,9 +2824,18 @@ it('keeps the existing session when endpoint settings change', async () => {
     baseURL.value = 'http://other-provider/v1';
     baseURL.dispatchEvent(new Event('input', { bubbles: true }));
 
-    // The edit really hit the provider draft (the payload `underload-harness-app:settings`
-    // is what a session create reads), which is the "endpoint settings change" this test
-    // is named for.
+    // The edit is a DRAFT: `underload-harness-app:settings` only moves when the dialog's
+    // `Apply` commits it, so a keystroke alone still leaves the boot payload in place. That
+    // is also why no session is touched — the record a session create reads is untouched.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(
+        '{"baseURL":"http://provider/v1","apiKey":"","model":"m1"}'
+    );
+
+    // `Apply` with the harness server URL untouched is a plain save: it commits and closes,
+    // and it must NOT reload (`boot()` would tear down the conversation this test keeps).
+    byClass('.dialog .endpoint-actions button', 'button').click();
+
+    expect(document.querySelector('.dialog')).toBeNull();
     expect(localStorage.getItem(SETTINGS_KEY)).toBe(
         '{"baseURL":"http://other-provider/v1","apiKey":"","model":"m1"}'
     );
@@ -4831,7 +4846,11 @@ it('keeps one session dashboard for the dialog across the phone breakpoint (desk
         'main-title',
         'session-cycle',
         'new-session session-new',
-        'harness-id'
+        'harness-id',
+        // The right-aligned catalogue group (`⚒` tools / `⚙` plugins) moved here from the
+        // topbar corner. compact-ui.test.ts pins that the phone media block carries no rule
+        // for it, so no layout drops it: it is the row's last child at every width.
+        'harness-title-tools'
     ]);
 
     byClass('.harness-title-button', 'button').click();
@@ -4979,7 +4998,7 @@ it('opens the session dashboard from the tools-view title at a desktop width, de
     // Enter the global tools view (the catalogue LIST — no runner dialog stacked).
     byClass('.tools-toggle', 'button').click();
     await flush();
-    expect(byClass('.main-title', 'h1').textContent).toBe('Tools');
+    expect(byClass('.main-title', 'h1').textContent).toBe('Tools Catalogue');
     expect(button.disabled).toBe(false);
     expect(button.getAttribute('aria-haspopup')).toBe('dialog');
     expect(button.title).toBe('Show sessions');

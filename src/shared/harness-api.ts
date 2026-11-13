@@ -912,7 +912,8 @@ export interface DeleteAgentResult {
  * runtime reads and the patch writes; `label` and `description` are for a form; `default` is the value the
  * plugin falls back to when nothing is stored, which is also what a `null` patch entry restores. The numeric
  * fields are EDITOR hints: `min` and `max` bound what the server accepts, `step` bounds only what a client
- * offers.
+ * offers. `group` and `parentKey` are DISPLAY hints: they say where the row is drawn, never what its value
+ * means, and validation, defaults and persistence ignore them.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface PluginSetting {
@@ -932,6 +933,27 @@ export interface PluginSetting {
      */
     step?: number;
     description?: string;
+    /**
+     * The visual category this row belongs to, when the plugin grouped it. DISPLAY hint only: the server
+     * validates, stores and returns the value without consulting it. A setting with no `group` renders in the
+     * flat top-level run, exactly as before this field existed. `id` orders and identifies the section; `title`
+     * is the heading a renderer prints verbatim.
+     */
+    group?: {
+      /**
+      * Stable machine id of the section. Rows sharing an `id` render under one heading, in first-appearance
+      * order.
+      */
+      id: string;
+      /** The human heading the renderer displays verbatim. */
+      title: string;
+      };
+    /**
+     * Key of the BOOLEAN setting that gates this one. When present, a renderer hides this row while that
+     * checkbox is off and shows it indented under the parent when it is on; the parent key itself is a plugin
+     * declaration, not a server-enforced reference.
+     */
+    parentKey?: string;
 }
 
 /**

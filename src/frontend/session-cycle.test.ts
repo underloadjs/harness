@@ -314,7 +314,11 @@ describe('the header session cycler and its `+` (T7/T9)', () => {
             'main-title',
             'session-cycle',
             'new-session session-new',
-            'harness-id'
+            'harness-id',
+            // The catalogue group (`⚒` tools / `⚙` plugins) relocated from the topbar
+            // corner; it is pushed flush right by `margin-left: auto` and is NOT one of the
+            // session controls this file pins.
+            'harness-title-tools'
         ]);
         expect(byClass('.harness-title-button', 'button').contains(pill)).toBe(false);
         expect(pill.previousElementSibling?.className).toBe('main-title');

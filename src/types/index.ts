@@ -4129,6 +4129,20 @@ export type HarnessPluginSettingDescriptor = {
     max?: number;
     step?: number;
     description?: string;
+    // THE GROUP THIS ROW BELONGS TO (2026-11-13 settings-UI grouping, R1). Presentational
+    // metadata ONLY: validation, defaults, the PATCH edge and persistence never consult it. `id`
+    // is the stable machine id a renderer orders and identifies a section by; `title` is the
+    // heading text it prints verbatim. Absent means "no section" — the row renders in the flat
+    // top-level run exactly as it did before this field existed, so every plugin that does not
+    // declare it is unaffected.
+    group?: { id: string; title: string };
+    // THE BOOLEAN SETTING THAT GATES THIS ONE (same R1). When present, the renderer hides this row
+    // while that parent checkbox is off and shows it, indented under the parent, when it is on —
+    // which is how a dependent numeric field stops reading as a standalone option. Absent means
+    // "always visible", the behaviour every existing plugin relies on. Not enforced server-side:
+    // the plugin owns the pairing, and a parent key that names no boolean is simply a row the
+    // renderer cannot gate.
+    parentKey?: string;
 };
 
 // Static, JSON-shaped description of a plugin. Lives in the plugin file itself as a

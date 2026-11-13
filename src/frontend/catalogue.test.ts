@@ -9,6 +9,10 @@
 // R21.2 moved this catalogue: the right rail no longer lists tools at all, so the
 // Tools tab is the only place a tool is selected, and the runner opens there.
 //
+// R5 (Tools Catalogue) took the group headings out of that tab: the list is ONE flat A–Z
+// run of every tool, so this file asserts NO `.tool-tab-group` exists and still reads the
+// group from the runner head's badge, which is where the figure is actually useful.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -138,9 +142,10 @@ it('lists an unconfigured search, explains it, and disables the call', async () 
 
     openToolsTab();
 
-    expect([...document.querySelectorAll<HTMLElement>('.tool-tab-group')].map((node) => node.textContent)).toEqual([
-        'Web search'
-    ]);
+    // R5 (Tools Catalogue): NO group heading is emitted — the pane is one flat A–Z list, and
+    // the "Web search" label the list used to print above the row is gone. The group is still
+    // where it is useful: the runner head's badge (asserted below) and `GET /tools?group=`.
+    expect(document.querySelectorAll('.tool-tab-group')).toHaveLength(0);
 
     const button = toolButtons()[0];
     expect(button.dataset.availability).toBe('unconfigured');

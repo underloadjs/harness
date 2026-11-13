@@ -198,9 +198,15 @@ describe('plugin manifest parity', () => {
                         description:
                             'Turns each policy off from the next turn; entries already withheld stay out.'
                     },
+                    // The 2026-11-13 grouping (R1/R2): `group` files a row under a named category
+                    // and `parentKey` nests it under the boolean that reveals it. Display-only
+                    // metadata, and it is part of the descriptor the manifest carries verbatim, so
+                    // the GENERATED wiring's shape changes with it — hence it is pinned here as part
+                    // of the exact catalogue (see the parity case above for the byte-identical file).
                     {
                         key: 'trimInvalidTools',
-                        label: 'Automatic Trim invalid tools',
+                        group: { id: 'invalid-tools', title: 'Invalid Tools' },
+                        label: 'Automatic Trim Invalid Tools',
                         type: 'boolean',
                         default: true,
                         description:
@@ -208,6 +214,8 @@ describe('plugin manifest parity', () => {
                     },
                     {
                         key: 'invalidToolTurns',
+                        group: { id: 'invalid-tools', title: 'Invalid Tools' },
+                        parentKey: 'trimInvalidTools',
                         label: 'Invalid tools · trim after (tool turns)',
                         type: 'number',
                         default: 2,
@@ -218,13 +226,26 @@ describe('plugin manifest parity', () => {
                             'Protects the newest N tool turns; 0 protects none.'
                     },
                     {
+                        key: 'invalidOutcomes',
+                        group: { id: 'invalid-tools', title: 'Invalid Tools' },
+                        parentKey: 'trimInvalidTools',
+                        label: 'Outcomes that count as invalid',
+                        type: 'string',
+                        default: 'failed,rejected',
+                        description:
+                            'Comma-separated subset of failed, rejected, cancelled, empty; empty means a blank result.'
+                    },
+                    {
                         key: 'trimThoughts',
-                        label: 'Automatic Trim thoughts',
+                        group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
+                        label: 'Automatic Trim Thoughts',
                         type: 'boolean',
                         default: true
                     },
                     {
                         key: 'thoughtTurns',
+                        group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
+                        parentKey: 'trimThoughts',
                         label: 'Thoughts · trim after (thoughts)',
                         type: 'number',
                         default: 2,
@@ -232,31 +253,29 @@ describe('plugin manifest parity', () => {
                         max: 4096,
                         step: 1
                     },
+                    // Filed with the thinking rule it gates, not with the economy knobs.
                     {
-                        key: 'truncateToolRequests',
-                        label: 'Automatic Truncate Tool Request',
-                        type: 'boolean',
-                        default: false,
-                        description:
-                            'Drops the request entry only; its tool results stay in the request.'
-                    },
-                    {
-                        key: 'truncateTurns',
-                        label: 'Truncate tool requests after (tool turns)',
+                        key: 'minThoughtChars',
+                        group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
+                        parentKey: 'trimThoughts',
+                        label: 'Minimum thinking saved per pass (characters)',
                         type: 'number',
-                        default: 2,
+                        default: 0,
                         min: 0,
-                        max: 4096,
-                        step: 1
+                        max: 1000000,
+                        step: 50
                     },
                     {
                         key: 'dropSupersededToolCalls',
-                        label: 'Automatic Trim superseded tools',
+                        group: { id: 'superseded-tools', title: 'Superseded Tools' },
+                        label: 'Automatic Trim Superseded Tools',
                         type: 'boolean',
                         default: true
                     },
                     {
                         key: 'supersededTurns',
+                        group: { id: 'superseded-tools', title: 'Superseded Tools' },
+                        parentKey: 'dropSupersededToolCalls',
                         label: 'Superseded tools · trim after (tool turns)',
                         type: 'number',
                         default: 2,
@@ -265,8 +284,19 @@ describe('plugin manifest parity', () => {
                         step: 1
                     },
                     {
+                        key: 'supersedeMatch',
+                        group: { id: 'superseded-tools', title: 'Superseded Tools' },
+                        parentKey: 'dropSupersededToolCalls',
+                        label: 'Supersession match',
+                        type: 'string',
+                        default: 'name',
+                        description:
+                            "'name' matches any later call of the tool; 'fingerprint' needs identical arguments."
+                    },
+                    {
                         key: 'dropDuplicateCalls',
-                        label: 'Automatic Trim duplicate tools',
+                        group: { id: 'duplicate-tools', title: 'Duplicate Tools' },
+                        label: 'Automatic Trim Duplicate Tools',
                         type: 'boolean',
                         default: false,
                         description:
@@ -274,6 +304,8 @@ describe('plugin manifest parity', () => {
                     },
                     {
                         key: 'duplicateTurns',
+                        group: { id: 'duplicate-tools', title: 'Duplicate Tools' },
+                        parentKey: 'dropDuplicateCalls',
                         label: 'Duplicate tools · trim after (tool turns)',
                         type: 'number',
                         default: 2,
@@ -282,23 +314,29 @@ describe('plugin manifest parity', () => {
                         step: 1
                     },
                     {
-                        key: 'invalidOutcomes',
-                        label: 'Outcomes that count as invalid',
-                        type: 'string',
-                        default: 'failed,rejected',
+                        key: 'truncateToolRequests',
+                        group: { id: 'tool-requests', title: 'Tool Requests' },
+                        label: 'Automatic Truncate Tool Requests',
+                        type: 'boolean',
+                        default: false,
                         description:
-                            'Comma-separated subset of failed, rejected, cancelled, empty; empty means a blank result.'
+                            'Drops the request entry only; its tool results stay in the request.'
                     },
                     {
-                        key: 'supersedeMatch',
-                        label: 'Supersession match',
-                        type: 'string',
-                        default: 'name',
-                        description:
-                            '\'name\' matches any later call of the tool; \'fingerprint\' needs identical arguments.'
+                        key: 'truncateTurns',
+                        group: { id: 'tool-requests', title: 'Tool Requests' },
+                        parentKey: 'truncateToolRequests',
+                        label: 'Truncate tool requests after (tool turns)',
+                        type: 'number',
+                        default: 2,
+                        min: 0,
+                        max: 4096,
+                        step: 1
                     },
+                    // The three knobs that gate no policy of their own: a group, no parent.
                     {
                         key: 'minTokens',
+                        group: { id: 'global-limits', title: 'Global Limits' },
                         label: 'Minimum saving per pass (tokens)',
                         type: 'number',
                         default: 0,
@@ -309,16 +347,8 @@ describe('plugin manifest parity', () => {
                             'Each tool axis must save this many tokens, or it writes nothing; thinking is never gated.'
                     },
                     {
-                        key: 'minThoughtChars',
-                        label: 'Minimum thinking saved per pass (characters)',
-                        type: 'number',
-                        default: 0,
-                        min: 0,
-                        max: 1000000,
-                        step: 50
-                    },
-                    {
                         key: 'safetyUnits',
+                        group: { id: 'global-limits', title: 'Global Limits' },
                         label: 'Recent units to protect',
                         type: 'number',
                         default: 0,
@@ -328,6 +358,7 @@ describe('plugin manifest parity', () => {
                     },
                     {
                         key: 'maxUnits',
+                        group: { id: 'global-limits', title: 'Global Limits' },
                         label: 'Maximum units per pass',
                         type: 'number',
                         default: 0,

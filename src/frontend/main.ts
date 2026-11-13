@@ -38,9 +38,9 @@
 //                  agent button on its LEFT edge (R16, opens the shared agent dialog
 //                  — team, models and instructions) and stop/send on the right. The GLOBAL tools view (the
 //                  full-width list of EVERY server tool — core entries included)
-//                  replaces this column when the topbar's icon-only Tools toggle is
-//                  pressed; activating one entry opens its manual runner in the
-//                  shared modal. There is no tab strip (R3);
+//                  replaces this column when the icon-only Tools toggle on the harness
+//                  title row is pressed; activating one entry opens its manual runner in
+//                  the shared modal. There is no tab strip (R3);
 //   - right rail — the tool-contributed SCRATCH BOARD (primary panel host), and nothing
 //                  else since T3/R1 moved the session directory out of it (T9 keeps that
 //                  directory in the title dialog). It is resizable from its own seam,
@@ -51,8 +51,8 @@
 //
 // R21.2 removed the right rail's core-tools dropdown and tool catalogue. They
 // duplicated the tools view, which is now the single place to review and call
-// tools; enabled-for-session status moved next to that list (`.tools-session-note`)
-// instead of floating on the board.
+// tools; the enabled-for-session status that used to sit next to that list is gone
+// too (R3), so the pane is its heading plus the grid and one enablement live line.
 //
 // R21.1: every harness is editable. The legacy `editable:false` flag (old demo/
 // flaky fixtures) is ignored — see contract.ts `editableOf` — so the rail shows
@@ -228,7 +228,11 @@ import {
     listSessions,
     loadBootstrap,
     // The UI-level harness server URL (its own storage key, separate from the provider
-    // settings below): read to prefill the dialog field, written by Apply/Reset.
+    // settings below): read to prefill the dialog field, written by Apply.
+    // `normalizeApiRoot` is the SAME validator `saveApiRootSetting` runs, imported so Apply
+    // can decide "did the reader actually change the root?" WITHOUT writing (an untouched
+    // field must not turn the automatic root into a stored override).
+    normalizeApiRoot,
     saveApiRootSetting,
     storedApiRoot,
     updateHarness,
@@ -524,6 +528,27 @@ const saveSettings = (): void => {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Endpoint dialog DRAFT (the settings dialog is draft-then-apply)
+// ---------------------------------------------------------------------------
+//
+// `settings` above is the COMMITTED record: it is what `POST /sessions` serializes, what
+// `defaultSessionModel()` names and what `localStorage` holds. The Endpoint & model dialog
+// never writes it directly — its fields show `endpointDraft`, a copy taken from the
+// committed record every time the dialog opens (./main.ts `syncEndpointDraft`). Pressing
+// `Apply` is the only thing that copies the draft back into `settings`, because dismissal is
+// the discard: `ui/dialog.ts` already provides ×, Escape, a backdrop click and a second pill
+// press, and "I clicked outside" must mean "nothing changed". Without a draft, every
+// keystroke would persist and the dialog would need a second button to undo itself.
+//
+// The draft is also what the model-catalogue PREVIEW dials (./main.ts `refreshModels`), so
+// pasting a base URL shows what that endpoint serves while still writing nothing.
+//
+// It is a module-scoped copy rather than dialog state because the settings pane is a
+// PERSISTENT node that outlives the layer hosting it (R4/T4): boot paints it
+// (`applyDefaults` → `syncEndpointDraft`, `refreshModels`) whether or not anything is open.
+let endpointDraft: RunnerSettings = { ...settings };
+
 // UI preference only: which server session this browser looked at last. The
 // conversation itself is never stored here — the id is a pointer the server
 // answers for, and an id from a previous server process simply 404s and is
@@ -645,12 +670,13 @@ const hydrateFrozenTeam = (instance: Instance): void => {
     });
 };
 
-// The tools view's lazy reads, fired when the view OPENS (never at boot):
+// The tools view's lazy read, fired when the view OPENS (never at boot):
 //   - the selected conversation's discovered toolbox lands on the render document,
 //     which is where every renderer reads `SessionView.discoveredTools`;
-//   - the playground note's `enabled there` clause comes from the PLAYGROUND session,
-//     whose figure the compact view never carried (`refresh: true` after a tool call so
-//     a fresh discovery shows up).
+//   - the `enabled there` figure of the PLAYGROUND session is recorded on
+//     `playground.discovered` (`refresh: true` after a tool call so a fresh discovery
+//     shows up). The tools pane no longer renders a context note, so this is state the
+//     runner carries, not a paint.
 // Both are guarded on their own conversation, so a late answer cannot paint another
 // session's toolbox, and each costs at most one read per conversation.
 const hydratePlaygroundDiscovered = (refresh = false): void => {
@@ -662,7 +688,6 @@ const hydratePlaygroundDiscovered = (refresh = false): void => {
             if (playground.sessionId !== playgroundSession) return;
 
             playground.discovered = names;
-            renderPlaygroundNote();
         })
         .catch(() => undefined);
 };
@@ -2480,13 +2505,20 @@ const statusText = el('span', 'status-text', 'idle');
 const statusDetail = el('span', 'status-detail', '');
 statusPill.append(statusDot, statusText, statusDetail);
 
-// R3: Tools is a GLOBAL icon-only toggle in the top-right corner, not a centre tab.
-// It opens the same full-width catalogue + manual runner in `stage`; the harness
-// head, composer (with both flanking controls) is hidden while it is open (`setToolsView`).
+// R3: Tools is a GLOBAL icon-only toggle, not a centre tab.
+// It opens the same full-width catalogue + manual runner in `stage`; the
+// composer (with both flanking controls) is hidden while it is open (`setToolsView`). The
+// harness head is NOT hidden — `paintToolsHead` re-titles it — which is what makes the
+// title row a safe home for this control: the second press that closes the pane stays on
+// screen (and `setToolsView` focuses this very button after switching).
 //
 // The glyph is decoration (`aria-hidden`), the accessible name is `aria-label`, and
 // `aria-pressed` reports whether the tools view is showing, so the button is a real
 // toggle for assistive tech rather than an unexplained icon.
+//
+// ASSEMBLY NOTE: the element is still BUILT here, next to the other topbar controls it was
+// built alongside, but it is PARENTED into `harnessTitleTools` on the harness title row —
+// see the `titleRow.append(...)` block. Nothing else about it changes.
 const toolsToggle = el('button', 'tools-toggle');
 toolsToggle.type = 'button';
 toolsToggle.id = 'tools-toggle';
@@ -2503,7 +2535,8 @@ toolsGlyph.setAttribute('aria-hidden', 'true');
 toolsToggle.append(toolsGlyph);
 
 // T7 (R2): the Plugins toggle sits IMMEDIATELY AFTER the Tools toggle in the same
-// right cluster, and is built by exactly the same rules: an icon-only button whose
+// control group (now `harnessTitleTools`, on the harness title row), and is built by exactly
+// the same rules: an icon-only button whose
 // glyph is decoration (`aria-hidden`), whose accessible name is `aria-label`, and
 // whose `aria-pressed` reports whether the Plugins pane owns the centre column.
 //
@@ -2543,16 +2576,19 @@ statusButton.setAttribute('aria-label', 'Endpoint and model settings');
 statusButton.title = 'Endpoint and model settings';
 statusButton.append(statusPill);
 
-// The right cluster keeps the live status pill and the Tools toggle together at the
-// top-right on every width. There is NO rail control in the topbar or on the harness
-// title row any more (T3/R1+R3): the harness listing is opened by the "Harness UI"
-// brand button and the scratch board by the floating `.scratch-fab` below.
+// The right cluster keeps the live status pill alone at the top-right on every width.
+// There is NO rail control in the topbar (T3/R1+R3): the harness listing is opened by
+// the "Harness UI" brand button and the scratch board by the floating `.scratch-fab`
+// below.
 //
-// T7 (R2): the Plugins toggle is appended IMMEDIATELY AFTER Tools, so the two catalogue
-// controls read as one pair in the corner (and `pluginsToggle` is the cluster's last
-// child).
+// RELOCATION (this change): the two catalogue toggles used to be this cluster's last two
+// children and now sit on the harness TITLE ROW (`harnessTitleTools`, assembled with
+// `titleRow` below): the panes they open are presented for the session in view, while this
+// pill is app-wide. The elements are built exactly once, HERE, and only their PARENT
+// changes — `paintToolsToggle`, `paintPluginsToggle` and `paintControls` hold these
+// references, so re-creating them in the new place would silently detach every painter.
 const topbarRight = el('div', 'topbar-right');
-topbarRight.append(statusButton, toolsToggle, pluginsToggle);
+topbarRight.append(statusButton);
 
 const railIcon = (glyph: string): HTMLSpanElement => {
     const icon = el('span', 'rail-toggle-icon', glyph);
@@ -2622,6 +2658,10 @@ const harnessList = el('div', 'harness-list');
 // removes only the overlay — the fields, their values and the `controls` map survive,
 // so `applyDefaults()`/`renderModelOptions()`/`refreshModels()` keep painting the same
 // nodes whether the dialog is open or not.
+//
+// What those nodes show is the DRAFT (`endpointDraft`), never the committed `settings`:
+// `syncEndpointDraft()` re-bases it on what is saved on every open and every close, so
+// walking away from the dialog is the same decision as never opening it.
 const endpointBody = el('div', 'endpoint-body');
 
 const controls = new Map<keyof RunnerSettings, HTMLInputElement>();
@@ -2637,17 +2677,20 @@ const field = (
 
     const control = el('input', 'field-input');
     control.type = type;
-    control.value = settings[key];
+    control.value = endpointDraft[key];
     control.placeholder = placeholder;
     control.spellcheck = false;
     control.autocomplete = 'off';
     control.addEventListener('input', () => {
-        settings[key] = control.value;
-        saveSettings();
+        // The keystroke moves the DRAFT only. `Apply` is the single writer of
+        // `settings`/`localStorage` (./main.ts `commitEndpointDraft`), which is what makes
+        // dismissal (×, Escape, backdrop, a second pill press) mean "no update".
+        endpointDraft[key] = control.value;
 
         // The model catalogue belongs to the provider, so a change to either
         // credential-bearing field invalidates it. Debounced because typing a
-        // base URL would otherwise fire one request per keystroke.
+        // base URL would otherwise fire one request per keystroke. This is a PREVIEW:
+        // it renders what the typed endpoint serves, and persists nothing.
         if (key === 'baseURL' || key === 'apiKey') scheduleModelRefresh();
     });
 
@@ -2661,36 +2704,100 @@ const field = (
 // ---------------------------------------------------------------------------
 //
 // A model id is provider data, not a free-form guess: every OpenAI-compatible
-// endpoint advertises what it serves at GET {baseURL}/models. The dropdown is
-// populated from that list by the harness server (it owns the credentials and
-// the browser is not allowed near them), and refreshed whenever the base URL or
-// key changes.
+// endpoint advertises what it serves at GET {baseURL}/models (the browser posts the
+// pair to `POST /models` and the HARNESS server makes that call — it owns the
+// credentials, and the key never travels back to this page). The dropdown is therefore
+// a PREVIEW of the endpoint: paste a base URL and the list repopulates (debounced),
+// pick one and `Apply` writes it. There is no text box: an id the endpoint does not
+// advertise is not something this dialog invents.
 //
-// The manual input is the fallback for a provider that does not implement the
-// endpoint: the dropdown then shows the current model plus "Custom model…", the
-// input opens automatically, and a session still works. Nothing here ever
-// renders or logs the API key.
+// A stored model the provider does not list stays visible as a `<current> (current)`
+// option, so previewing a different endpoint never silently drops a valid selection.
+// Nothing here ever renders or logs the API key.
 
-const CUSTOM_MODEL = '__custom__';
 const MODEL_REFRESH_DELAY_MS = 500;
 
+// The state line's initial wording, and the wording a dismissed preview is reset to: after
+// a cancel nothing is in flight and nothing is known for the endpoint on screen, so the
+// dropdown must read as if it had never been asked (./main.ts `cancelModelPreview`, F2).
+const MODEL_STATUS_INITIAL = 'Model list not loaded yet.';
+
 const modelSelect = el('select', 'field-input field-select');
-const modelManual = el('input', 'field-input model-manual');
-modelManual.type = 'text';
-modelManual.placeholder = 'model id';
-modelManual.spellcheck = false;
-modelManual.autocomplete = 'off';
-modelManual.hidden = true;
 
-const modelStatus = el('p', 'field-hint', 'Model list not loaded yet.');
+// The ONE line that states what the catalogue preview knows. It is a `.field-hint`
+// sibling of the `<select>`, and it carries terse state only — never instructions.
+const modelStatus = el('p', 'field-hint', MODEL_STATUS_INITIAL);
 
-// Ids from the last successful lookup, in provider order.
+// --- PUBLISHED catalogue vs. PREVIEW list (F1) --------------------------------
+//
+// `modelIds` is the catalogue the whole app shares: every per-agent model dropdown reads it
+// (./main.ts `agentModelSelectOf` → `catalogue: modelIds`). `previewModelIds` is only what the
+// endpoint dialog's `<select>` shows. They are deliberately SEPARATE state: pasting a Base URL
+// is a PREVIEW, and a preview that is dismissed or superseded must leave the published
+// catalogue exactly as it was — otherwise the app-wide dropdowns end up pointing at a provider
+// the reader never applied.
+//
+// An answer belongs to an ENDPOINT PAIR, not to a Base URL alone: `modelCatalogueFor` +
+// `modelCatalogueKey` name the (Base URL, API key) the published ids were fetched with, and
+// `previewFor` + `previewKey` the pair the preview on screen was fetched with. The credential
+// is part of the identity because a blank key on the configured origin means the SERVER's key
+// (../shared/harness-api.ts `RunnerSettingsInput.api_key`, and the same rule the OpenAPI
+// contract states for `POST /models`), so one URL legitimately answers with two different lists
+// depending on which credential it was asked under. A list fetched with the wrong credential is
+// therefore NOT an answer for the committed endpoint, exactly as a list fetched for another URL
+// is not, and a key-only edit has to move or re-ask the catalogue the way a URL edit does.
+//
+// `undefined` in a `…For` slot means nothing has answered for any endpoint yet. That distinction
+// is what lets `seedModelPreview` tell a provider that genuinely serves zero models (no request
+// on reopen) from an endpoint nobody has asked about (exactly one request on reopen), and
+// `previewFor` goes back to `undefined` whenever the list on screen is NOT a real answer — in
+// flight, failed, or cancelled.
 let modelIds: readonly string[] = [];
+let modelCatalogueFor: string | undefined;
+let modelCatalogueKey: string | undefined;
+let previewModelIds: readonly string[] = [];
+let previewFor: string | undefined;
+let previewKey: string | undefined;
+
+// The endpoint a model lookup dials, plus the one fact the caller has to STATE because nothing
+// can infer it: whether that pair IS the saved record. `committed: true` means the answer
+// describes the endpoint the app is actually dialling, so it may move the shared catalogue;
+// `committed: false` means it is a DRAFT preview, so it paints the dialog and nothing else.
+//
+// The flag replaces the previous "does the draft string happen to equal `settings`" comparison.
+// That comparison coupled the app-wide catalogue to whatever the dialog was showing, and
+// `applyDefaults` deliberately does NOT re-base the draft while a layer is open (./main.ts F4),
+// so a reader who opened the dialog before the bootstrap landed left the boot lookup comparing a
+// pre-boot draft URL against the settings that had just arrived, found them different, and the
+// shared catalogue stayed empty for the whole load.
+type ModelLookup = {
+    readonly baseURL: string;
+    readonly apiKey: string;
+    readonly committed: boolean;
+};
+
+// The pair `POST /sessions` will dial, read from `settings` rather than from the draft so a
+// stale draft can never describe it. Boot, the `Apply` re-arm, and the open-time seed use this.
+const committedModelLookup = (): ModelLookup => ({
+    baseURL: settings.baseURL.trim(),
+    apiKey: settings.apiKey,
+    committed: true
+});
+
+// The pair the dialog's fields are showing. Only the debounced keystroke lookup uses it, and its
+// answer never leaves the dialog.
+const previewModelLookup = (): ModelLookup => ({
+    baseURL: endpointDraft.baseURL.trim(),
+    apiKey: endpointDraft.apiKey,
+    committed: false
+});
+
+// Is the shared catalogue an answer for EXACTLY this pair? Both halves must match; a cleared
+// catalogue (`modelCatalogueFor === undefined`) answers for nothing, so it never matches.
+const publishedCatalogueAnswers = (endpoint: ModelLookup): boolean =>
+    modelCatalogueFor === endpoint.baseURL && modelCatalogueKey === endpoint.apiKey;
+
 let modelLoading = false;
-// True whenever the dropdown cannot express the model (the endpoint failed,
-// answered with nothing, or no base URL exists yet). It pins the manual input
-// open instead of making the fallback depend on one successful request.
-let manualFallback = false;
 let refreshTimer: number | undefined;
 let modelRequest: AbortController | undefined;
 // Monotonic ticket: a superseded response must never paint over a newer one.
@@ -2701,12 +2808,51 @@ const setModelStatus = (text: string, isWarning = false): void => {
     modelStatus.classList.toggle('is-warning', isWarning);
 };
 
-// Keep the dropdown and the manual field consistent with `settings.model`.
-const syncModelControls = (): void => {
-    modelManual.hidden = !manualFallback && modelSelect.value !== CUSTOM_MODEL;
-    // Reflect the stored value without stealing a caret from someone typing.
-    if (modelManual.hidden) modelManual.value = settings.model;
-    modelSelect.disabled = modelLoading;
+// The one state line for a SETTLED list of a non-blank Base URL — loaded or empty. Shared by
+// the answer paint and the open-time seed so the two can never drift apart in wording.
+const setModelCatalogueStatus = (ids: readonly string[], baseURL: string): void => {
+    setModelStatus(
+        ids.length === 0
+            ? 'No models returned'
+            : `Loaded ${ids.length} model${ids.length === 1 ? '' : 's'} from ${baseURL}`,
+        ids.length === 0
+    );
+};
+
+// Move the PUBLISHED catalogue onto this answer, and repaint the chrome that reads it. Only a
+// lookup that declared its pair IS the saved record may call this (./main.ts `refreshModels`),
+// which is the whole of F1: a preview of a typed-but-unapplied endpoint never gets here.
+const publishModelCatalogue = (endpoint: ModelLookup, ids: readonly string[]): void => {
+    modelIds = ids;
+    modelCatalogueFor = endpoint.baseURL;
+    modelCatalogueKey = endpoint.apiKey;
+
+    // The per-agent model dropdowns are built from the published catalogue by
+    // `agentModelSelectOf`, so the chrome that hosts them repaints here: the composer's agent
+    // control is rebuilt, and a per-agent dialog opened AFTER this point offers the real ids
+    // rather than only the effective default/current labels (`current` is the ACTIVE
+    // conversation, ./main.ts `current`). What this deliberately does NOT do is repaint a
+    // per-agent dialog that is ALREADY open: `agentDialogSignatureOf` keys on the conversation
+    // view and its own model map, not on the shared catalogue, so `refreshAgentDialog` finds an
+    // unchanged signature and bails. That open dialog picks the new ids up when it is next
+    // opened; widening the signature is out of scope for this pass.
+    const activeInstance = current;
+    if (activeInstance !== undefined) renderHarnessChrome();
+};
+
+// The published catalogue has gone from "known" to "no answer" — a committed lookup that failed,
+// or a committed Base URL that is blank. The chrome repaints for the same reason
+// `publishModelCatalogue` repaints: the per-agent dropdowns read `modelIds`, and after this they
+// must show only the effective default/current labels rather than ids nothing backs any more.
+// (The `Apply` path has its own repaint at ./main.ts `applyEndpointSettings`, so a clear reached
+// from `commitEndpointDraft` is repainted there instead of here.)
+const clearPublishedCatalogue = (): void => {
+    modelIds = [];
+    modelCatalogueFor = undefined;
+    modelCatalogueKey = undefined;
+
+    const activeInstance = current;
+    if (activeInstance !== undefined) renderHarnessChrome();
 };
 
 // Rebuild the option list from the provider catalogue plus the current model.
@@ -2716,7 +2862,8 @@ const syncModelControls = (): void => {
 //      selection survives a provider that hides models or a temporary failure;
 //   2. every advertised id, in provider order (providers tend to list their
 //      preferred model first, so it is preserved rather than sorted);
-//   3. an explicit custom entry, which reveals the manual input.
+//   3. a disabled placeholder when the catalogue is empty, so the control is never a
+//      blank box and the reason is the status line beside it.
 const renderModelOptions = (): void => {
     if (modelLoading) {
         modelSelect.replaceChildren();
@@ -2725,100 +2872,125 @@ const renderModelOptions = (): void => {
         loading.disabled = true;
         modelSelect.append(loading);
         modelSelect.disabled = true;
-        modelManual.hidden = true;
         return;
     }
 
-    const current = settings.model.trim();
+    // The DRAFT is what the control shows, so a preview of another endpoint cannot
+    // rewrite the model that is actually saved.
+    const current = endpointDraft.model.trim();
     modelSelect.replaceChildren();
 
-    if (current.length > 0 && !modelIds.includes(current)) {
+    if (current.length > 0 && !previewModelIds.includes(current)) {
         const option = el('option', undefined, `${current} (current)`);
         option.value = current;
         modelSelect.append(option);
     }
 
-    for (const id of modelIds) {
+    for (const id of previewModelIds) {
         const option = el('option', undefined, id);
         option.value = id;
         modelSelect.append(option);
     }
 
-    if (modelIds.length === 0) {
-        const empty = el('option', undefined, 'No models loaded');
+    if (previewModelIds.length === 0) {
+        const empty = el('option', undefined, 'No models');
         empty.value = '';
         empty.disabled = true;
         modelSelect.append(empty);
     }
 
-    const custom = el('option', undefined, 'Custom model…');
-    custom.value = CUSTOM_MODEL;
-    modelSelect.append(custom);
-
-    // Selecting a listed id requires an option with that value, which exists in
-    // both cases above; an empty stored model lands on the custom entry so the
-    // manual field is the obvious next step.
-    modelSelect.value = current.length > 0 ? current : CUSTOM_MODEL;
-    syncModelControls();
+    // The selection is the draft model, and every branch above guarantees an option with
+    // that value: an advertised id matches itself, and an id the provider hides matches the
+    // `(current)` entry. A blank draft (only reachable from a hand-edited record — this
+    // control can no longer produce one) lands on the placeholder when there is nothing
+    // advertised, and previews the first advertised id otherwise.
+    //
+    // F1: the list is `previewModelIds`, never the published `modelIds`, so this control can
+    // never display a catalogue the reader did not apply.
+    //
+    // F3: what the control DISPLAYS is what `Apply` COMMITS. A blank draft showing the first
+    // advertised id used to be a lie — the `change` listener below only fires on user
+    // interaction, and re-picking the option that is already selected fires nothing at all, so
+    // `Apply` wrote the empty string while the dropdown named a real model. Moving the draft
+    // here, in the same tick as the paint, keeps the two identical without inventing a
+    // `Server default` option. A displayed blank (nothing advertised) writes nothing, so the
+    // stored model survives an endpoint that lists nothing.
+    const displayed = current.length > 0 ? current : (previewModelIds[0] ?? '');
+    modelSelect.value = displayed;
+    if (current.length === 0 && displayed.length > 0) endpointDraft.model = displayed;
+    modelSelect.disabled = false;
 };
 
-// Fetch the catalogue for the current settings and render every outcome as a
-// state the user can act on: loading, loaded, empty, or failed-with-fallback.
-const refreshModels = async (): Promise<void> => {
+// Fetch ONE endpoint's catalogue and render every outcome as one terse state line: loading,
+// loaded, empty, or failed.
+//
+// The caller names the endpoint; the default is the DRAFT preview, which is the only caller that
+// edits the pair on screen (./main.ts `scheduleModelRefresh`). A committed caller passes
+// `committedModelLookup()` so the request carries the pair the app actually dials — which is what
+// makes boot's lookup correct even when the dialog is open with a draft that has not caught up
+// (./main.ts `applyDefaults` skips the draft re-base while a layer is open).
+const refreshModels = async (lookup: ModelLookup = previewModelLookup()): Promise<void> => {
     const ticket = ++modelTicket;
 
     // Drop any in-flight request: its answer describes the previous endpoint.
     modelRequest?.abort();
     modelRequest = undefined;
 
-    const baseURL = settings.baseURL.trim();
-    const apiKey = settings.apiKey;
+    const { baseURL, apiKey, committed } = lookup;
 
     if (baseURL.length === 0) {
-        modelIds = [];
+        // No endpoint to ask: a STATE, not a request. Nothing is known for any endpoint, and a
+        // committed blank base URL means the published catalogue is empty too.
+        previewFor = undefined;
+        previewKey = undefined;
+        previewModelIds = [];
         modelLoading = false;
-        manualFallback = true;
         renderModelOptions();
-        setModelStatus('Set a base URL to load models. Enter a model manually until then.', true);
+        setModelStatus('No base URL set', true);
+        if (committed) clearPublishedCatalogue();
         return;
     }
 
     const controller = new AbortController();
     modelRequest = controller;
 
-    modelIds = [];
+    // Nothing on screen answers for anything while a lookup is in flight (`previewFor` is
+    // published/seeded again only by a settled answer).
+    previewFor = undefined;
+    previewKey = undefined;
+    previewModelIds = [];
     modelLoading = true;
-    manualFallback = false;
     renderModelOptions();
-    setModelStatus(`Loading models from ${baseURL}…`);
+    setModelStatus('Loading models…');
 
     try {
         const ids = await listProviderModels({ base_url: baseURL, api_key: apiKey }, controller.signal);
         if (ticket !== modelTicket) return;
 
-        modelIds = ids;
+        previewModelIds = ids;
+        previewFor = baseURL;
+        previewKey = apiKey;
         modelLoading = false;
-        manualFallback = ids.length === 0;
         renderModelOptions();
-        // Per-agent model dropdowns are built from this catalogue. Re-render the
-        // chrome so an already-open harness (or a boot that opened a remembered
-        // session before the provider answered) offers the real ids instead of
-        // only the effective default/current labels.
-        if (current !== undefined) renderHarnessChrome();
-        setModelStatus(
-            ids.length === 0
-                ? 'The provider returned no models. Enter a model manually.'
-                : `Loaded ${ids.length} model${ids.length === 1 ? '' : 's'} from ${baseURL}.`,
-            ids.length === 0
-        );
+        // F1: the answer is published because the CALLER declared the pair it dials to be the
+        // saved record — not because a draft string happens to match one.
+        if (committed) publishModelCatalogue(lookup, ids);
+        setModelCatalogueStatus(ids, baseURL);
     } catch (error) {
         if (ticket !== modelTicket) return;
 
-        modelIds = [];
+        // A failure is not an answer for this endpoint: the preview goes back to an empty list
+        // with the server's reason on the state line, and nothing is published. A committed
+        // lookup that fails leaves the published catalogue UNKNOWN (`modelCatalogueFor` unset),
+        // so the next dialog open re-arms a fetch instead of trusting a stale list (F2), and the
+        // chrome drops the ids that are no longer backed by an answer.
+        previewModelIds = [];
+        previewFor = undefined;
+        previewKey = undefined;
         modelLoading = false;
-        manualFallback = true;
         renderModelOptions();
-        setModelStatus(`Could not load models: ${messageOf(error)} Enter a model manually.`, true);
+        if (committed) clearPublishedCatalogue();
+        setModelStatus(`Could not load models: ${messageOf(error)}`, true);
     } finally {
         if (ticket === modelTicket) modelRequest = undefined;
     }
@@ -2826,6 +2998,10 @@ const refreshModels = async (): Promise<void> => {
 
 // Typing in the endpoint fields must not produce one provider request per
 // keystroke. 500ms is short enough to feel automatic once a URL is pasted.
+//
+// The debounce is the ONLY preview caller of `refreshModels`: it dials the DRAFT, and its answer
+// paints the dialog's dropdown without ever moving the app-wide catalogue (./main.ts
+// `previewModelLookup`).
 const scheduleModelRefresh = (): void => {
     if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
 
@@ -2835,32 +3011,98 @@ const scheduleModelRefresh = (): void => {
     }, MODEL_REFRESH_DELAY_MS);
 };
 
-modelSelect.addEventListener('change', () => {
-    if (modelSelect.value === CUSTOM_MODEL) {
-        // Keep the current value as the starting point and let the user type.
-        manualFallback = true;
-        syncModelControls();
-        modelManual.focus();
+// Drop the pending debounce AND any in-flight lookup, and put the model group back to the
+// state it had before the dialog was opened (F1/F2). The ticket is what makes a live request
+// ignore its own answer (`refreshModels` compares it before painting) and the abort is what
+// stops the socket work behind it; together they are why a lookup started from a draft the
+// reader walked away from can neither repaint the dropdown nor publish into `modelIds` —
+// the catalogue the per-agent dropdowns share.
+//
+// What this does NOT do is touch the published catalogue: a dismissed preview never reached
+// it in the first place, so nothing needs restoring. Resetting the state line to the initial
+// wording is what stops `Loading models…` from outliving the request it described — the one
+// piece of the preview that stays WRONG after an abort, because the dropdown keeps the ids it
+// was holding while the request was in flight. The option list itself is left alone on
+// purpose: it is a persistent node the reader never sees while detached, and every reopen
+// repaints it from the published catalogue or from a fresh lookup (./main.ts
+// `seedModelPreview`), so a stale list can never be what the reader is looking at.
+// `previewFor`/`previewKey` go back to `undefined` because nothing on screen answers for
+// anything any more — which is also what stops `Apply` from publishing a catalogue a preview left
+// behind.
+const cancelModelPreview = (): void => {
+    if (refreshTimer !== undefined) {
+        window.clearTimeout(refreshTimer);
+        refreshTimer = undefined;
+    }
+
+    modelTicket += 1;
+    modelRequest?.abort();
+    modelRequest = undefined;
+    // The loading paint would otherwise leave a disabled dropdown holding the single
+    // `Loading models…` option for a request that no longer exists (F2).
+    modelLoading = false;
+    previewFor = undefined;
+    previewKey = undefined;
+    setModelStatus(MODEL_STATUS_INITIAL);
+};
+
+// Paint the dialog's dropdown for the endpoint that is COMMITTED, before the reader sees it.
+// `openEndpointDialog` calls this straight after `syncEndpointDraft`, so the draft IS the saved
+// settings here — and the lookup it may arm therefore belongs to the COMMITTED pair, which is
+// what lets its answer become the app-wide catalogue. Without that, a conversation opened against
+// an endpoint whose boot lookup failed would never see the provider's ids, and every reopen would
+// spend a fresh request instead of seeding from the one it just made.
+//
+// It reads `settings` through `committedModelLookup()` rather than the draft, so the pair can
+// never come from a field the reader has already moved on. Three states, each worded exactly like
+// the boot path:
+//
+//   1. no Base URL committed → a state, not a request: no provider call, `No base URL set`;
+//   2. the published catalogue is an answer for exactly that (Base URL, API key) pair → reuse it
+//      and ask nothing. This is the reopen-after-dismiss case (F1/F2): the list the reader needs
+//      is already in `modelIds`, so a reopen cannot say `No models` about a provider that does
+//      serve models, and a provider that serves none does not earn a request per open;
+//   3. a Base URL is committed but nothing is known for that pair (a failed or never-run lookup,
+//      or a catalogue that answers for a different URL OR a different credential) → arm exactly
+//      ONE fetch, which is what keeps a reopen from being a dead end. Bounded on purpose: one
+//      request per open, no polling, no TTL.
+const seedModelPreview = (): void => {
+    const lookup = committedModelLookup();
+
+    if (lookup.baseURL.length === 0) {
+        previewFor = undefined;
+        previewKey = undefined;
+        previewModelIds = [];
+        modelLoading = false;
+        renderModelOptions();
+        setModelStatus('No base URL set', true);
         return;
     }
 
-    manualFallback = false;
-    settings.model = modelSelect.value;
-    saveSettings();
-    syncModelControls();
-});
+    if (publishedCatalogueAnswers(lookup)) {
+        previewFor = lookup.baseURL;
+        previewKey = lookup.apiKey;
+        previewModelIds = modelIds;
+        modelLoading = false;
+        renderModelOptions();
+        setModelCatalogueStatus(modelIds, lookup.baseURL);
+        return;
+    }
 
-modelManual.addEventListener('input', () => {
-    settings.model = modelManual.value;
-    saveSettings();
+    void refreshModels(lookup);
+};
 
-    // When the typed value is already advertised, mirror it in the dropdown so
-    // the two controls cannot disagree; otherwise the dropdown stays on custom.
-    modelSelect.value = modelIds.includes(modelManual.value) ? modelManual.value : CUSTOM_MODEL;
+// The dropdown is the ONLY model control: the ids come from the endpoint, and picking
+// one moves the draft. The committed model changes when `Apply` commits it.
+modelSelect.addEventListener('change', () => {
+    // A disabled placeholder can never become the selection, so this value is a real id;
+    // the guard is only against a programmatic empty selection wiping the draft. The trim is
+    // what keeps `Apply` from committing an id with whitespace a provider will not match.
+    if (modelSelect.value.length > 0) endpointDraft.model = modelSelect.value.trim();
 });
 
 const modelField = el('div', 'field');
-modelField.append(el('span', 'field-label', 'Model'), modelSelect, modelManual, modelStatus);
+modelField.append(el('span', 'field-label', 'Model'), modelSelect, modelStatus);
 
 // ---------------------------------------------------------------------------
 // Harness server URL (the control-plane root) — the UI-level server setting
@@ -2901,37 +3143,33 @@ const serverRootLabel = el('label', 'field-label', 'Harness server URL');
 serverRootLabel.htmlFor = serverRootInput.id;
 serverRootField.append(serverRootLabel, serverRootInput);
 
-const serverRootHint = el(
-    'p',
-    'field-hint',
-    'Relative paths resolve against the page that served this UI, so the default /v1/harness means the harness on the same host and port (a UI at http://localhost:8180 dials http://localhost:8180/v1/harness). Blank restores automatic resolution. An absolute URL may name another host: it must accept this page origin at the service Origin gate and CORS, and an https page cannot dial a plain-http host. ?apiRoot= still overrides for a single load.'
-);
-
 // The refusal line: hidden until Apply rejects the typed value, and a `role="status"`
-// live region so the reason is announced without moving focus out of the field.
+// live region so the reason is announced without moving focus out of the field. It is the
+// ONLY error surface the dialog has, so it stays even though the prose around it went.
 const serverRootStatus = el('p', 'field-hint is-warning');
 serverRootStatus.setAttribute('role', 'status');
 serverRootStatus.hidden = true;
 
-const serverRootApply = el('button', 'button primary', 'Apply & reconnect');
-serverRootApply.type = 'button';
+// The dialog's ONE action, labelled exactly `Apply`. Dismissal (×, Escape, the backdrop, a
+// second press of the pill) already means "discard", so a second button to undo the first
+// was redundant: going back to automatic resolution is a blank field plus Apply, which is
+// the same write the reader is making anyway.
+const endpointApply = el('button', 'button primary', 'Apply');
+endpointApply.type = 'button';
 
-// Secondary on purpose: clearing the setting is the way back to the automatic default,
-// but it is the less common action and a reload either way, so it must not compete
-// with Apply for a stray Enter.
-const serverRootReset = el('button', 'button', 'Reset');
-serverRootReset.type = 'button';
-
-const serverRootActions = el('div', 'endpoint-actions');
-serverRootActions.append(serverRootApply, serverRootReset);
+// The footer row: the last child of the body, right-aligned by `.endpoint-actions`, so the
+// commit is the last thing the reader reaches for (the footer idiom of
+// `.agent-dialog-footer` / `.composer-actions`).
+const endpointActions = el('div', 'endpoint-actions');
+endpointActions.append(endpointApply);
 
 const setServerRootStatus = (message: string): void => {
     serverRootStatus.textContent = message;
     serverRootStatus.hidden = message.length === 0;
 };
 
-// The "which root is live" line. A named node because it is REPAINTED, not written once
-// (see `paintServerRoot`).
+// The "which root is live" line — a terse state line, not an explanation. A named node
+// because it is REPAINTED, not written once (see `paintServerRoot`).
 const serverRootLive = el('p', 'field-hint', '');
 
 // Paint the two root displays from the values that are live AT THE MOMENT OF THE CALL:
@@ -2939,7 +3177,7 @@ const serverRootLive = el('p', 'field-hint', '');
 //     exactly as module load does: a saved URL outranks a one-load `?apiRoot=` here (the
 //     override wins for the load it is on, but pressing Apply must keep the saved value);
 //   - the LINE names what THIS load actually dials, so it reads `API_ROOT` alone. The two
-//     lines disagreeing on such a URL is the documented contract, not a bug to reconcile.
+//     disagreeing on such a URL is the documented contract, not a bug to reconcile.
 //
 // WHY A FUNCTION INSTEAD OF ONE MODULE-SCOPE ASSIGNMENT: on a GitHub Pages host `API_ROOT`
 // is not final when this module finishes. `resolveRoot` returns the compiled local/LAN
@@ -2947,12 +3185,12 @@ const serverRootLive = el('p', 'field-hint', '');
 // AFTER this dialog DOM was built — moves the ESM live binding to the gateway that
 // answered (./api.ts:681). A one-time paint therefore leaves the reader looking at
 // `STATIC_API_CANDIDATES[0]` while every request and the socket go to the host that
-// actually answered. `openEndpointDialog` repaints on every open; Apply/Reset reload the
-// page, so a repaint can never drop edits the reader is about to commit.
+// actually answered. `openEndpointDialog` repaints on every open, and an Apply that moved
+// the root reloads the page, so a repaint can never drop edits the reader is mid-way
+// through committing.
 const paintServerRoot = (): void => {
     serverRootInput.value = storedApiRoot() ?? API_ROOT;
-    serverRootLive.textContent =
-        `API root in use: ${API_ROOT.length > 0 ? API_ROOT : '(origin)'} · every request and the live stream go here. Change it for this browser with the Harness server URL above, or for a single load with ?apiRoot=.`;
+    serverRootLive.textContent = `In use: ${API_ROOT.length > 0 ? API_ROOT : '(origin)'}`;
 };
 
 // Initial paint: the settings root is a PERSISTENT node that exists long before the
@@ -2966,7 +3204,7 @@ paintServerRoot();
 // and does not litter Back with the intermediate URL.
 //
 // A URL this engine cannot round-trip is not worth a failed Apply: the saved value is
-// already written, and the hint above documents the query override.
+// already written, and the field above previews the value that wins next load.
 const dropApiRootQuery = (): void => {
     try {
         const current = new URL(location.href);
@@ -2979,53 +3217,191 @@ const dropApiRootQuery = (): void => {
     }
 };
 
-// Shared by both actions: write, then re-enter the page against the new root. The
-// reload is the reconnect — `boot()` runs again from a clean module graph.
-const applyServerRootSetting = (value: string | null): void => {
+// Copy the draft into the committed record. This is the moment `underload-harness-app:settings`
+// moves, and the ONLY one inside the dialog.
+const commitEndpointDraft = (): void => {
+    // Assigned key by key rather than `Object.assign`, so the record keeps `loadSettings`'
+    // key order — the stored payload's byte order is a contract other tests pin.
+    settings.baseURL = endpointDraft.baseURL;
+    settings.apiKey = endpointDraft.apiKey;
+    settings.model = endpointDraft.model;
+
+    saveSettings();
+
+    // F1: `Apply` is the one moment a preview is ALLOWED to become the app-wide catalogue, and
+    // only when the list on screen is an answer for the endpoint AND the credential that have
+    // just been committed (`previewFor`/`previewKey` name the pair it was fetched for). Anything
+    // else — the reader applied before the debounce fired, the lookup failed, an answer is still
+    // in flight, or the API key moved while the list on screen was still the key-less answer for
+    // the same URL — means NOTHING is known about the pair that was just committed, so the stale
+    // list is dropped rather than left describing the provider or the credential the reader
+    // replaced. The credential belongs in this comparison because a blank key on the configured
+    // origin means the SERVER's key (../shared/harness-api.ts `RunnerSettingsInput.api_key`), so
+    // the same URL legitimately answers with a different list once a key is typed.
+    //
+    // The catalogue then stays unknown until the committed lookup `applyEndpointSettings` arms
+    // with the layer closed refills it with a real answer.
+    //
+    // A blank committed Base URL takes the same branch by construction: `previewFor` is only
+    // ever a non-blank trimmed URL, so the published catalogue goes empty-and-unknown, which
+    // is the state a blank endpoint actually has. (No chrome repaint here on purpose: the Apply
+    // path that gets here repaints two statements after closing the layer.)
+    const committed = committedModelLookup();
+
+    if (
+        committed.baseURL.length > 0 &&
+        previewFor === committed.baseURL &&
+        previewKey === committed.apiKey
+    )
+        publishModelCatalogue(committed, previewModelIds);
+    else {
+        modelIds = [];
+        modelCatalogueFor = undefined;
+        modelCatalogueKey = undefined;
+    }
+};
+
+// Re-base the draft on the committed settings and repaint every control from it. Called
+// when the dialog opens (a previous open's edits are no longer pending) and when it closes
+// (so the persistent pane never shows a value that was never saved).
+const syncEndpointDraft = (): void => {
+    endpointDraft = { ...settings };
+
+    for (const [key, control] of controls) {
+        control.value = endpointDraft[key];
+    }
+
+    // The `<current> (current)` entry and the selected option follow the model that is
+    // actually saved, not whatever the discarded draft named.
+    renderModelOptions();
+};
+
+// The dialog's only action: commit the provider draft, and reconnect only if the harness
+// server URL really moved.
+//
+// The root is validated and written FIRST because it is the only step that can fail, and a
+// failure must change NOTHING: the typed value stays on screen with the reason beside it,
+// the draft stays uncommitted, no key is written and no reload happens (a reload onto the
+// OLD root would read as an Apply that silently did nothing).
+const applyEndpointSettings = (): void => {
+    const typed = serverRootInput.value.trim();
+
+    // `rootMoved` is what separates "the reader pointed this browser at another harness"
+    // from "the reader edited the provider fields and pressed the only button there is".
+    let rootMoved = false;
+
     try {
+        // The field is painted with `storedApiRoot() ?? API_ROOT`, so THAT is the value a
+        // field the reader never touched stands for. `normalizeApiRoot` is the validator
+        // `saveApiRootSetting` itself runs, imported so the comparison happens on the
+        // NORMALIZED value: a trailing slash, or the automatic `/v1/harness` typed back at
+        // the reader, must not become a stored override. A malformed value throws here —
+        // before anything at all is written.
+        const painted = storedApiRoot() ?? API_ROOT;
         // Blank is a real value: it CLEARS the setting, so the next load resolves
-        // automatically again. Everything malformed throws from `normalizeApiRoot`
-        // inside `saveApiRootSetting`, before anything was written.
-        saveApiRootSetting(value);
+        // automatically again — the job the removed `Reset` button used to do.
+        const normalized = typed.length === 0 ? '' : normalizeApiRoot(typed, '');
+
+        rootMoved = normalized !== painted;
+
+        if (rootMoved) saveApiRootSetting(typed);
     } catch (error) {
-        // Nothing was stored and no reload happens: the typed value stays on screen
-        // with the reason beside it.
         setServerRootStatus(messageOf(error));
 
         return;
     }
 
+    commitEndpointDraft();
+
+    if (!rootMoved) {
+        // Nothing about this browser's transport changed, so Apply is a plain save: close
+        // the layer and repaint the chrome that reads the committed model. No reload —
+        // `boot()` would tear down the conversation for nothing.
+        closeEndpointDialog();
+
+        // `current` is the ACTIVE conversation (./main.ts:5449); the alias says so because
+        // the same word names a model string and a URL elsewhere in this dialog.
+        const activeInstance = current;
+        if (activeInstance !== undefined) renderHarnessChrome();
+
+        // F1: with the layer now closed the draft IS the committed settings, so one lookup is
+        // what makes the published catalogue describe the endpoint AND credential that were just
+        // applied — the commit above could only publish when the list on screen already answered
+        // for that exact pair, and an API key typed moments before the press is exactly the case
+        // where it did not. Bounded: exactly one request, and only when nothing is known for the
+        // committed pair (a blank Base URL answers with no request at all, see `refreshModels`).
+        const committed = committedModelLookup();
+        if (!publishedCatalogueAnswers(committed)) void refreshModels(committed);
+
+        return;
+    }
+
+    // The reconnect IS the reload: every request URL and the socket are built from the root
+    // resolved at module load (./api.ts), and `boot()` runs exactly once — the same contract
+    // the offline pane's `Retry` already uses (`showOffline`). The layer is left alone: the
+    // page is going away underneath it.
     dropApiRootQuery();
     location.reload();
 };
 
-serverRootApply.addEventListener('click', () => applyServerRootSetting(serverRootInput.value));
+endpointApply.addEventListener('click', applyEndpointSettings);
 
-// Reset is "stop overriding": drop the saved value AND the per-load query, which
-// restores the automatic chain (page origin `/v1/harness`, then the compiled Pages
-// candidates on a static host).
-serverRootReset.addEventListener('click', () => applyServerRootSetting(null));
+// F7: `Enter` inside a text field means "commit", because `Apply` is the single commit path
+// and the body is a plain `div` — no `<form>`, so the browser fires no submit of its own and a
+// reader who typed a URL and pressed Enter used to get nothing at all. `preventDefault` keeps
+// that browser default (and any future form ancestor) from firing a SECOND commit, and the
+// re-entrancy flag is the guard against the same commit being entered twice — e.g. an Apply
+// that synchronously moves focus and re-dispatches, or a click the key repeat lands on. It is
+// deliberately NOT a per-open latch: two deliberate `Enter` presses are two commits, exactly
+// like two deliberate clicks.
+let committingFromKeyboard = false;
+
+const commitFromEnter = (event: KeyboardEvent): void => {
+    // IME guard FIRST, the same pair the composer's Enter handler runs (./main.ts, the
+    // `isComposing || keyCode === 229` rule documented at the composer keydown block): the Enter
+    // that confirms an input-method candidate belongs to the IME, so here it must neither commit
+    // the draft nor be prevented. Without it, a candidate-confirming Enter in Base URL / API key
+    // persisted the half-typed value and closed the dialog while the control still held the
+    // unconfirmed composition buffer.
+    if (event.isComposing || event.keyCode === 229) return;
+
+    if (event.key !== 'Enter') return;
+
+    event.preventDefault();
+    if (committingFromKeyboard) return;
+
+    committingFromKeyboard = true;
+    try {
+        applyEndpointSettings();
+    } finally {
+        committingFromKeyboard = false;
+    }
+};
 
 endpointBody.append(
     // The server choice reads FIRST: it decides where the provider credentials below
     // are about to be sent.
     serverRootField,
-    serverRootHint,
+    // The refusal line sits directly under the field it describes, so the reason lands
+    // where the eye already is.
     serverRootStatus,
-    serverRootActions,
+    // Terse state line: the root THIS load dials. A deployment question ("is this page
+    // talking to /v1/harness or /api?") stays answerable without devtools.
+    serverRootLive,
     field('Base URL', 'baseURL', 'text', 'http://localhost:5500/providers/private/v1'),
     field('API key', 'apiKey', 'password', 'optional'),
     modelField,
-    el(
-        'p',
-        'field-hint',
-        'Sent to the harness server when a session starts. Leave the key blank to use the key configured on the server. Values are saved in this browser only. The model list is fetched by the server from {base URL}/models.'
-    ),
-    // Show the resolved root so a deployment question ("is this page talking to
-    // /v1/harness or /api?") is answerable without devtools. This is the value ACTUALLY
-    // in use for this load; the field above is how it changes for the next one.
-    serverRootLive
+    // LAST, and right-aligned: the single commit for everything above it.
+    endpointActions
 );
+
+// All three text fields, in the order they read: the harness server URL plus the two provider
+// fields `field` just registered. (`field` fills `controls`, so this list can only be built
+// after the append above.) The model `<select>` is excluded — Enter there is not a commit the
+// reader is reaching for, and its own `change` already moved the draft.
+for (const input of [serverRootInput, ...controls.values()]) {
+    input.addEventListener('keydown', commitFromEnter);
+}
 
 // Initial paint: the stored model is a valid selection even before the server
 // answers, so the dropdown must show it rather than an empty control.
@@ -3039,11 +3415,19 @@ renderModelOptions();
 // The dialog is opened on demand and the persistent `endpointBody` is adopted into a
 // fresh `.endpoint-dialog` wrapper each time — the same move-a-live-pane pattern the
 // tool runner uses (`openToolDialog`, `ui/dialog.ts` adopts `content` instead of
-// cloning it). Nothing here rebuilds a field, so a value typed while open is still
-// there after close/reopen and the debounced refresh keeps running while closed. The
-// harness server URL and its "root in use" line are the one exception: both are
-// repainted from the live values on every open (see `paintServerRoot`), because they
-// describe the deployment rather than a draft the reader is working on.
+// cloning it). Nothing here rebuilds a field, so the listeners and the debounced
+// catalogue refresh keep working while the layer is detached.
+//
+// What the reader edits is the DRAFT (`endpointDraft`, ./main.ts): `openEndpointDialog`
+// re-bases it on the saved settings and `onClose` throws it away. That is the whole
+// reason the footer is a single `Apply` — every dismissal path `ui/dialog.ts` provides
+// (×, Escape, backdrop, a second press of the pill) is already a cancel, and a cancel
+// that had already written to `localStorage` would need a second button to undo it.
+//
+// The harness server URL and its "In use:" line are the one value outside the draft:
+// both are repainted from the live deployment on every open (see `paintServerRoot`),
+// because they describe where this page is dialling rather than what the reader is
+// working on.
 //
 // `endpointDialog` is guarded by identity in `onClose` (a replacement open may already
 // own the variable when a queued close callback runs), and the pill is the trigger so
@@ -3062,6 +3446,15 @@ const openEndpointDialog = (trigger: HTMLElement): void => {
     // A refusal from a PREVIOUS open is stale here: it names a value that is no longer on
     // screen, so re-showing it would claim the freshly painted root had been rejected.
     setServerRootStatus('');
+    // Every open starts from what is SAVED. Whatever the last open left behind was either
+    // applied (this re-base is then a no-op) or dismissed (this is the discard).
+    syncEndpointDraft();
+    // F2: the model group then seeds from what is PUBLISHED for that saved endpoint, or arms
+    // exactly one fetch when nothing is known for it. Without this the dropdown keeps whatever
+    // the previous open's preview painted (or the cleared post-cancel state) and the state line
+    // can still claim `Loading models…` with nothing in flight, leaving a reopened reader with
+    // `No models` and no way to re-trigger except editing the fields again.
+    seedModelPreview();
 
     const body = el('div', 'endpoint-dialog');
     body.append(endpointBody);
@@ -3076,6 +3469,13 @@ const openEndpointDialog = (trigger: HTMLElement): void => {
         onClose: () => {
             if (endpointDialog !== handle) return;
             endpointDialog = undefined;
+
+            // Closing is the discard, and it also stops the preview that closing made
+            // pointless. `syncEndpointDraft` then repaints the detached pane from the
+            // committed settings, so a reopen can never show a value that was never saved
+            // and `refreshModels` (still reachable from boot) reads real state.
+            cancelModelPreview();
+            syncEndpointDraft();
         }
     });
 
@@ -3623,13 +4023,35 @@ headTitleButton.addEventListener('click', () => {
 // title row is `title`, the session cycler, the compact `+`, then the id/group line — one
 // compact, functional session header at desktop AND on a phone, with the directory itself
 // behind the title button.
-titleRow.append(headTitle, sessionCycle, sessionNew, headName);
+//
+// RELOCATION (this change): the two catalogue toggles join that line as a right-aligned
+// group AFTER the id span, because each pane they open is presented for the SESSION
+// currently in view (the header is repainted per session — one pair for the session shown,
+// not one per session). What is NOT session-scoped is what those panes WRITE: their
+// enablement switches are deployment-wide (every conversation, from the next turn), and the
+// genuinely per-session tool state — `/sessions/{id}/tools` — lives on a surface these panes
+// never call. `harnessTitleTools` mirrors the `.topbar-right` wrapper convention (a flex
+// group the stylesheet positions as one unit); `margin-left: auto` pushes it flush right.
+//
+// The two buttons are MOVED, not rebuilt: `toolsToggle`/`pluginsToggle` are the same nodes
+// created in the topbar assembly above, so `paintToolsToggle`, `paintPluginsToggle` and the
+// enable/disable gating in `paintControls` keep working untouched. `DOM.append` on an
+// already-parented node relocates it, so nothing is left behind in `.topbar-right`.
+//
+// The toggles stay reachable in BOTH catalogue views: `setToolsView`/`setPluginsView` hide
+// the composer and the agent slot, never `mainHead` — they RETITLE it through
+// `paintToolsHead`/`paintPluginsHead` — so the second press that closes a pane is always on
+// screen, and both views hand focus to the toggle that performed the switch.
+const harnessTitleTools = el('div', 'harness-title-tools');
+harnessTitleTools.append(toolsToggle, pluginsToggle);
+
+titleRow.append(headTitle, sessionCycle, sessionNew, headName, harnessTitleTools);
 mainHead.append(titleRow, headNote);
 
 const agentSlot = el('div', 'agent-slot');
 
 // `stage` is the single centre surface: the transcript, the global tools view or a
-// status pane. It is NOT a tab panel (R3): the topbar Tools toggle points at it with
+// status pane. It is NOT a tab panel (R3): the title-row Tools toggle points at it with
 // `aria-controls`, and nothing claims a tab/tabpanel relationship.
 const stage = el('div', 'stage');
 stage.id = 'harness-stage';
@@ -5406,8 +5828,8 @@ type ToolRowEntry = ToolDescriptor & {
 // the ONLY tool listing after R21.2. Boot replaces it from the bootstrap document.
 let toolEntries: readonly ToolRowEntry[] = [];
 // Which centre view is showing: the chat (transcript + composer) or the GLOBAL tools
-// view (catalogue + manual runner). There is no tab strip (R3); the topbar's
-// icon-only Tools toggle drives this through `setToolsView`.
+// view (catalogue + manual runner). There is no tab strip (R3); the icon-only
+// Tools toggle on the harness title row drives this through `setToolsView`.
 let showingTools = false;
 // T7 (R2): which centre view is showing is a THREE-way exclusive, not a pair of
 // independent flags: the chat, the GLOBAL tools view, or the Plugins catalogue. Every
@@ -5506,7 +5928,8 @@ type PlaygroundState = {
     harness: string | undefined;
     // The temporary session's id; `undefined` until a session-bound tool is called.
     sessionId: string | undefined;
-    // What toolRequest enabled inside that session (the playground note's truth).
+    // What toolRequest enabled inside that session. Recorded for the runner's own
+    // bookkeeping (the refresh path below); the tools pane shows no context note.
     discovered: string[] | undefined;
     // Bumped by every close/supersede. An in-flight create or call that captured an
     // older generation may not publish anything when it finally lands.
@@ -5565,8 +5988,6 @@ const releasePlaygroundSession = (options?: { unload?: boolean }): void => {
             if (options?.unload !== true) setStatus('error', `playground cleanup: ${messageOf(error)}`);
         }
     );
-
-    renderPlaygroundNote();
 };
 
 // The session a session-bound call runs in, creating the playground's own on demand.
@@ -5609,10 +6030,9 @@ const ensurePlaygroundSession = async (): Promise<string | undefined> => {
         playground.discovered = Array.isArray(session.discoveredTools)
             ? [...session.discoveredTools]
             : undefined;
-        renderPlaygroundNote();
         // T29: the canonical session row no longer carries `discoveredTools`, so the
-        // note's `enabled there` clause comes from the definition read — fired here, on
-        // the surface that shows it, and never at boot.
+        // playground's record of what that session enabled comes from the definition
+        // read — fired here, on the surface that owns the context, and never at boot.
         hydratePlaygroundDiscovered();
 
         return session.id;
@@ -5648,17 +6068,16 @@ const runner = createToolRunner({
         return descriptor === undefined ? [] : subagentsOf(descriptor);
     },
     refreshSession: async (sessionId) => {
-        // Re-read the playground's OWN snapshot for the playground note. The answer is
-        // never applied to an Instance and never enters the sessions roster, so a
-        // discovery inside the temporary context cannot repaint or adopt anything in the
-        // conversation the reader is looking at.
+        // Re-read the playground's OWN snapshot. The answer is never applied to an
+        // Instance and never enters the sessions roster, so a discovery inside the
+        // temporary context cannot repaint or adopt anything in the conversation the
+        // reader is looking at.
         const session = await getView(sessionId);
         if (playground.sessionId !== sessionId) return;
 
         playground.discovered = Array.isArray(session.discoveredTools)
             ? [...session.discoveredTools]
             : undefined;
-        renderPlaygroundNote();
         // T29: a core call may have just enabled a tool, so this is the one place the
         // figure is REFRESHED (the cache is bypassed), and the source is the definition
         // read the compact row can no longer answer with.
@@ -5836,7 +6255,7 @@ const harnessDeleteButtons = new Map<string, HTMLButtonElement>();
 // tool runner, because it needs `toolEntries`), so this is safe to call from
 // selection and busy-state code without re-entering the runner.
 //
-// R3: there is no tab/tablist anywhere. The only visible state is the topbar
+// R3: there is no tab/tablist anywhere. The only visible state is the title-row
 // toggle's pressed flag; the stage is a plain region and its accessible name comes
 // from the heading inside it (the harness title or the selected tool's name).
 const paintToolsToggle = (): void => {
@@ -6120,8 +6539,9 @@ const applyHarnessRemoved = (name: string): void => {
         if (next !== undefined) {
             selectHarness(next.name);
         } else if (showingTools) {
-            // The playground owns the centre column, so it stays: its note now says there
-            // is no context for a session-bound tool, and a direct call still works.
+            // The playground owns the centre column, so it stays; a direct call still
+            // works, and a session-bound one reports the missing context itself (the
+            // runner's `no_harness` answer) rather than the pane guessing up front.
             paintToolsHead();
         } else if (showingPlugins) {
             // T7: same for the Plugins catalogue — it is server-wide, not harness-scoped, so
@@ -6131,8 +6551,8 @@ const applyHarnessRemoved = (name: string): void => {
         } else {
             // Empty roster without crashing: the chat has nowhere to go, so the centre
             // column says what is available instead of showing a dead transcript. The
-            // playground stays reachable from the topbar for direct calls, and `+ New`
-            // is the way back.
+            // playground stays reachable from the title-row Tools toggle for direct calls,
+            // and `+ New` is the way back.
             agentSlot.hidden = true;
             composer.hidden = true;
             stage.replaceChildren(emptyStagePane());
@@ -6144,7 +6564,6 @@ const applyHarnessRemoved = (name: string): void => {
     // R6: the deleted harness's conversations become archived immediately — the group is
     // painted from the same directory cache, which this delete never touches.
     renderSessions();
-    renderPlaygroundNote();
 };
 
 // The centre column shown when no harness exists at all (R6: deleting the last one must
@@ -6304,11 +6723,6 @@ const renderHarnessChrome = (): void => {
     if (instance === undefined) return;
 
     const display = instance.frozen ?? instance.descriptor;
-
-    // The playground's own status line (R7): it describes the temporary context, so
-    // the tools view stays truthful about where a session-bound call runs no matter
-    // which conversation is selected.
-    renderPlaygroundNote();
 
     // The playground runner lives on the tools view and builds its delegate presets
     // from the PLAYGROUND harness's allowlist (see createToolRunner.paintDelegate). A
@@ -7796,34 +8210,6 @@ const patchSessionModels = async (
     }
 };
 
-// R21.2/R7: the tool catalogue is the global playground and nothing else. This line is
-// that playground's OWN context status: which harness/session a session-bound call will
-// mutate, and which tools toolRequest enabled THERE.
-//
-// It is deliberately NOT derived from the selected instance any more. The playground is
-// the same surface from every conversation, so the note names the temporary context (or
-// says why there is none) and states plainly that the reader's chat is untouched.
-const renderPlaygroundNote = (): void => {
-    const harness = playground.sessionId === undefined ? playgroundHarness() : playground.harness;
-
-    if (harness === undefined) {
-        toolsSessionNote.textContent =
-            'No harness is reported by this server, so session-bound tools have no context to run in. Create a harness first; every other tool can still be called directly.';
-        return;
-    }
-
-    const target =
-        playground.sessionId === undefined
-            ? `${harness} (no temporary session yet — the first Call creates one)`
-            : `${harness} · temporary session ${shortId(playground.sessionId)}`;
-    const enabled = playground.discovered ?? [];
-
-    toolsSessionNote.textContent =
-        `Session-bound tools run in the playground’s own context: ${target}` +
-        (enabled.length === 0 ? '' : ` · enabled there: ${enabled.join(', ')}`) +
-        '. The conversation you selected is never touched.';
-};
-
 // ---------------------------------------------------------------------------
 // Tools view: the complete catalogue (centre column) and the tool-testing dialog
 // ---------------------------------------------------------------------------
@@ -7850,23 +8236,25 @@ const togglingTools = new Set<string>();
 // The corner tick boxes, keyed by tool name, so a write repaints its OWN row in place
 // and a busy pass can lock/unlock exactly that control.
 const toolEnableBoxes = new Map<string, HTMLInputElement>();
-// The tools pane's own live line for enablement writes. `toolsSessionNote` belongs to the
-// playground note, and the head note belongs to the count — this is the third state the
-// pane has to say ("the switch was refused, and here is the server's sentence").
-const toolsTabNote = el('p', 'tools-tab-note field-hint', '');
-toolsTabNote.setAttribute('role', 'status');
-toolsTabNote.setAttribute('aria-live', 'polite');
-toolsTabNote.hidden = true;
+// Tools Catalogue: the pane owns NO line of its own under the title. A switch write already
+// reports itself where the reader is looking — the tick box's own `checked`, the row's green
+// `data-enabled` edge, and the topbar pill (`setStatus`), which carries the server's sentence
+// when the write is REFUSED — so the accepted figure and the refusal are stated there, never
+// echoed back into the pane.
 
 const toolsPane = el('div', 'pane tools-pane');
 const toolsTabHead = el('div', 'tools-tab-head');
-const toolsTabHint = el(
-    'p',
-    'tools-tab-hint',
-    'Every tool the server lists, core tools included. Select one to open its runner. The tick box in a row’s top-right corner is that tool’s switch: ticked means enabled, unticked means the tool is withheld from agents. The switch applies to EVERY conversation on this harness server, from the next request onwards; a worker lane already running adopts it when next created. It gates agents only: a tool may still call any other tool, enabled or not, and the request being served keeps the tool list it was given. Tools created with toolCreate are enabled at once and have no switch of their own. Calls execute on the harness server — nothing runs in this browser. This playground is independent of the conversation you have selected: session-bound tools (toolRequest, toolCreate, tasks, and delegate when the playground harness has subagents) run in a temporary session the playground creates for itself and deletes when this view closes, and every other tool, including the core file and search tools, runs directly.'
-);
-const toolsSessionNote = el('p', 'tools-session-note field-hint', '');
-toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools'), toolsTabHint, toolsSessionNote, toolsTabNote);
+// R1 (Tools Catalogue): the pane's long "Every tool the server lists…" paragraph is GONE —
+// the reader does not need it, and the head note above the list already states the count and
+// where calls run. R3: the playground's session-bound context note is gone for the same
+// reason, and so is the enablement write's live line: the head is now ONLY its heading, and
+// the pane is its heading plus the grid. Where a session-bound call actually runs is stated
+// by the runner itself when one is opened (`.tool-session`) or refused (its `no_harness` error).
+//
+// R2: the heading reads "Tools Catalogue", the same label `paintToolsHead` paints in the
+// harness head, so head and pane name the view identically (the pattern every other view here
+// follows — chat, Plugins, workspace).
+toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools Catalogue'));
 const toolsTabList = el('div', 'tool-tab-list');
 // The list is the whole content area. The runner is NOT mounted here any more: it
 // is adopted by `openToolDialog` only while the reader is testing that tool.
@@ -7883,15 +8271,19 @@ let toolDialog: DialogHandle | undefined;
 // pending-state repaint can never repaint the chat title under the list).
 const paintToolsHead = (): void => {
     const count = toolEntries.length;
-    headTitleText.textContent = 'Tools';
+    headTitleText.textContent = 'Tools Catalogue';
     // R2 (T9): a tools heading is not a harness, so the popup it opens is the session
     // dashboard — the only entry point to a saved conversation from this view — never
     // "harness details" for a definition the head is not naming.
     paintHeadTitleTrigger('sessions');
-    // Category label, not a harness id: the chat header hides this badge, the tools
-    // view re-shows it (see renderHarnessChrome).
-    headName.hidden = false;
-    headName.textContent = 'catalogue';
+    // R2 (Tools Catalogue): the shared `.harness-id` badge is HIDDEN here. It used to print
+    // the word `catalogue` next to the title, which read as a stray label hanging to the right
+    // of the "+"; the title now carries that word ("Tools Catalogue"), so the badge has
+    // nothing left to say and is blanked + hidden exactly the way the chat head hides it
+    // (see renderHarnessChrome). Every OTHER writer of this span is untouched: `selectTool`
+    // still names the open tool's GROUP, and the Plugins head still shows `built-ins`.
+    headName.hidden = true;
+    headName.textContent = '';
     // T3/R1: the chat head now HIDES the note for a saved session, so every tools-view
     // writer must un-hide it again — otherwise the catalogue line would be painted into a
     // `hidden` element the reader never sees.
@@ -8045,10 +8437,11 @@ const selectTool = (entry: ToolRowEntry, trigger?: HTMLElement): void => {
 };
 
 // Open or close the GLOBAL tools view (R3). One function for both directions: the
-// topbar icon toggle calls it and harness selection closes it. The panel (`stage`)
-// is shared; the rest of the centre chrome (head and composer, with both flanking
-// controls) is shown or
-// hidden to match.
+// icon-only Tools toggle on the harness title row calls it, and harness selection closes
+// it. The panel (`stage`) is shared and only PART of the centre chrome moves: the composer
+// and the agent slot are hidden while the catalogue owns the column, and the HEAD IS NEVER
+// HIDDEN — `paintToolsHead` re-titles it instead. That is what keeps the session-line
+// toggle on screen (and focused, below) so its second press can close the pane.
 //
 // R1 (this pass): a run in flight NO LONGER locks the view. The catalogue and its
 // runner are server facts, and leaving/entering this column only swaps the centre
@@ -8110,8 +8503,7 @@ const setToolsView = (open: boolean): void => {
     for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
 
     // R7: a fresh playground visit starts with a fresh context (the previous one was
-    // released when the view closed), and the note states that up front.
-    renderPlaygroundNote();
+    // released when the view closed).
     // T29: the tools view is the surface that shows the playground context's discovered
     // toolbox. `GET /sessions/{id}/definition` is the only route that still answers it
     // (the compact session row stopped publishing `discoveredTools`), so the read is
@@ -8139,7 +8531,7 @@ const setToolsView = (open: boolean): void => {
     }
 };
 
-// The topbar icon is a real toggle: pressing it while the tools view is showing
+// The session-line icon is a real toggle: pressing it while the tools view is showing
 // closes it and returns to the selected chat. It is disabled while a run is pending
 // (paintControls), so this handler never has to fight a streaming queue.
 toolsToggle.addEventListener('click', () => {
@@ -8167,8 +8559,10 @@ toolsToggle.addEventListener('click', () => {
 // state the server never reported is a lie the reader cannot act on.
 //
 // The box itself. The accessible name is the ACTION (`Enable`/`Disable` + the tool name),
-// `checked` carries the state, and the tile's green wash is painted from the same figure
-// by `paintToolRowEnablement` — three readings of one state, never a colour-only signal.
+// `checked` carries the state, and the tile's green edge (`.tool-tab-button[data-enabled]`
+// takes an `--ok-line` border, no background wash — styles.css:1042-1058) is painted from the
+// same figure by `paintToolRowEnablement` — three readings of one state, never a colour-only
+// signal.
 const toolEnableCheckboxOf = (entry: ToolRowEntry): HTMLInputElement => {
     const enabled = entry.enabled === true;
     const control = el('input', enabled ? 'tool-tab-enable is-on' : 'tool-tab-enable is-off');
@@ -8207,7 +8601,7 @@ const toolEntryOf = (name: string): ToolRowEntry | undefined =>
 // Repaint ONE row's tick box from the row's own enablement figure, in place (no list
 // rebuild, so focus and the dialog's `returnFocus` target survive). The box's `checked`,
 // its `data-enabled` and the tile button's `data-enabled` move together, so the list can
-// never show a tick on a row the server says is off (or the green wash without the tick).
+// never show a tick on a row the server says is off (or the green edge without the tick).
 //
 // The parameter is the ENABLEMENT figure, not a whole row: a `ToolRowView` (what
 // `toolRowOf` maps a PATCH answer into) has no `parameters` field, and this painter reads
@@ -8229,7 +8623,7 @@ const paintToolRowEnablement = (entry: ToolEnablement): void => {
     control.className = enabled ? 'tool-tab-enable is-on' : 'tool-tab-enable is-off';
     // THE state. A native checkbox carries no `aria-checked` to keep honest, so `checked`
     // is the single figure assistive tech reads — and it is also what the CSS tick and the
-    // row's green wash follow.
+    // row's green edge follow.
     control.checked = enabled;
     control.dataset.enabled = enabled ? 'true' : 'false';
     control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${entry.name}`);
@@ -8258,17 +8652,6 @@ const paintToolEnableBusy = (name: string, busy: boolean): void => {
 
         if (row !== undefined) paintToolRowEnablement(row);
     }
-};
-
-// The pane's one line about a switch write: the server's sentence on a refusal, the
-// accepted figure on a success. `role="status"`, because nothing here moves focus. The
-// ROW itself is repainted by `rememberToolRow` from the server's answer, so this line
-// only ever adds the outcome sentence.
-const noteToolsToggleResult = (text: string, failed: boolean): void => {
-    toolsTabNote.textContent = text;
-    toolsTabNote.hidden = false;
-    // Text AND class: colour is never the only signal (the shell's standing rule).
-    toolsTabNote.className = failed ? 'tools-tab-note tools-tab-note-error' : 'tools-tab-note field-hint';
 };
 
 // Take the PATCH answer as the new state of one row. The answer is a whole `ToolDetail`,
@@ -8318,16 +8701,15 @@ const setToolEnabled = async (name: string, enabled: boolean): Promise<void> => 
         const detail = await updateToolEnabled(name, enabled);
 
         rememberToolRow(detail);
-        noteToolsToggleResult(`${name} is now ${enabled ? 'enabled' : 'disabled'} for every conversation.`, false);
         setStatus('idle');
     } catch (error) {
         // The server's own sentence (a 404 for an unknown name, a 4xx for a write this
-        // server refuses), reported where the reader is looking: the pane's live note
-        // plus the pill. Nothing was written, so the `finally` pass pulls the tick back
-        // to the figure the cache still holds.
+        // server refuses) goes on the topbar pill — the one surface this pane still
+        // reports a refusal on, since the reader asked for no line under the title.
+        // Nothing was written, so the `finally` pass pulls the tick, the control's
+        // `data-enabled` and the tile's green edge back to the figure the cache holds.
         const message = messageOf(error);
 
-        noteToolsToggleResult(message, true);
         setStatus('error', `tool enablement: ${message}`);
     } finally {
         togglingTools.delete(name);
@@ -8344,19 +8726,42 @@ const setToolEnabled = async (name: string, enabled: boolean): Promise<void> => 
 // box is the button's SIBLING inside `.tool-tab-row` (a button inside a button is not
 // valid HTML and assistive tech would read one control where there are two) and CSS
 // pins it to the corner above the tile.
+// R5 (Tools Catalogue): ONE flat A–Z list, no group sections.
+//
+// The pane used to emit a `.tool-tab-group` heading every time the entry's group changed,
+// which split the catalogue into labelled blocks ("Core tools", then each registration
+// group) and forced the reader to scan three sections to find one tool. The reader asked for
+// the whole catalogue in one alphabetical run instead — which also answers the "what is the
+// difference between Core tools and Package presets?" question by removing the distinction
+// from THIS view: a tool's kind is still on its meta line (`core · session`, `searchable`),
+// only the section headings are gone.
+//
+// Only the RENDER order changes. The server's array order (core tools first, then catalogue
+// registration order — src/server/api.ts:1044-1045) and every row's `group` field are left
+// exactly as they arrive: `group` still paints the runner dialog's head badge (`selectTool`)
+// and still feeds the `GET /tools?group=` filter, and `toolEntries` (the head count and the
+// runner lookups) keeps the untouched array.
+//
+// The compare is case-insensitive and code-point based — NOT `localeCompare`, so the order is
+// identical on every ICU build and in every test run — and `Array.prototype.sort` is stable,
+// so two rows that compare equal keep the order the server listed them in. `toolRegistry`
+// precedes `toolRequest` because 'g' < 'q' at the sixth character.
+const byToolName = (left: ToolRowEntry, right: ToolRowEntry): number => {
+    const a = left.name.toLowerCase();
+    const b = right.name.toLowerCase();
+
+    if (a === b) return 0;
+
+    return a < b ? -1 : 1;
+};
+
 const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
     toolsTabList.replaceChildren();
     toolTabButtons.clear();
     toolEnableBoxes.clear();
 
-    let lastGroup = '';
-
-    for (const entry of entries) {
-        if (entry.group !== lastGroup) {
-            toolsTabList.append(el('div', 'tool-tab-group', entry.group));
-            lastGroup = entry.group;
-        }
-
+    // A copy, sorted: the caller's array stays the server's order for every other reader.
+    for (const entry of [...entries].sort(byToolName)) {
         const row = el('div', 'tool-tab-row');
 
         const button = el('button', 'tool-tab-button');
@@ -8376,7 +8781,8 @@ const buildToolsTab = (entries: readonly ToolRowEntry[]): void => {
         ].join(' · ');
         if (unavailable) button.dataset.availability = 'unconfigured';
         // R1: the tile states the tick box's state too, so the list is readable with the
-        // control off-screen — and `data-enabled='true'` is what paints the green wash.
+        // control off-screen — and `data-enabled='true'` is what paints the green edge
+        // (an `--ok-line` border on the tile, no background wash; styles.css:1042-1058).
         if (entry.enabled !== undefined) button.dataset.enabled = entry.enabled ? 'true' : 'false';
 
         button.append(
@@ -8496,11 +8902,11 @@ const buildTools = (entries: readonly ToolRowEntry[]): void => {
 //   - SETTINGS stay editable, and the row dialog is the only write path for them:
 //     `PATCH /plugins/{id}` with `{ settings: { key: value } }`.
 //
-// STRUCTURE mirrors the tools view (the code directly above) on purpose: a topbar
-// icon-only toggle, a full-width `.plugins-pane` in `stage`, `.plugin-tab-row` rows (a
-// dialog trigger plus its own enablement switch), and the SHARED modal (`ui/dialog.ts`)
-// for the detail. The centre column has ONE owner, so `setPluginsView` and `setToolsView`
-// close each other.
+// STRUCTURE mirrors the tools view (the code directly above) on purpose: an icon-only
+// toggle on the harness title row, a full-width `.plugins-pane` in `stage`, `.plugin-tab-row`
+// rows (a dialog trigger plus its own enablement switch), and the SHARED modal
+// (`ui/dialog.ts`) for the detail. The centre column has ONE owner, so `setPluginsView` and
+// `setToolsView` close each other.
 //
 // WHY THE PAGE IS CACHED AND RE-READ BY HAND
 // ------------------------------------------
@@ -8552,24 +8958,20 @@ const togglingPlugins = new Set<string>();
 
 const pluginsPane = el('div', 'pane plugins-pane');
 const pluginsTabHead = el('div', 'plugins-tab-head');
-// R2 (this pass): the copy the old pane carried was WRONG — enablement is no longer
-// "read-only". Every built-in is still auto-scanned (nothing is installed from here),
-// but each row now carries a one-click corner tick box whose effect the server states:
-// every conversation, from its next turn.
-const pluginsTabHint = el(
-    'p',
-    'plugins-tab-hint',
-    'Auto-scanned · tick to enable. Every plugin this harness server ships is listed here, and the tick box in a row’s top-right corner turns that plugin on or off: ticked means enabled, unticked means the plugin’s hooks stop firing. The switch applies to EVERY conversation on this server, from its next turn — the plugin stays loaded and listed either way, and the tools, agents, and commands it contributed stay registered, while the request being served keeps the plugin set it was given. It gates agents only: enabling or disabling a plugin never stops one tool from calling another. The settings a plugin declares are editable in its dialog, and a saved value applies the same way: to every conversation, from its next turn.'
-);
-// The count/error line. `aria-live` carries the load transition to assistive tech
-// because nothing here moves focus.
-const pluginsTabNote = el('p', 'plugins-tab-note field-hint', '');
-pluginsTabNote.setAttribute('role', 'status');
-pluginsTabNote.setAttribute('aria-live', 'polite');
+// The pane head carries the `h2` ONLY (see the append below), like the Tools pane's
+// `toolsTabHead` above. Two lines of descriptive copy left it in this pass:
+//   - the "Auto-scanned · tick to enable…" paragraph (`pluginsTabHint`), and
+//   - the `pluginsTabNote` count line that restated the view head's own subtitle.
+// Both are gone with their rules in styles.css. Nothing else was dropped: every state that
+// line carried still has a home — the loaded count sentence is the head subtitle
+// (`paintPluginsHead` → `headNote`), and the loading and read-failure states are painted
+// INSIDE the list itself (`.plugins-loading` / `.plugins-error` + Retry, in `buildPluginsTab`).
 // The enablement line (R2): the outcome of a row's switch write — the accepted figure or
-// the server's refusal, never a colour-only signal. It is SEPARATE from `pluginsTabNote`
-// (the count/error line that `pluginsCountNote` owns) so a refusal can never be mistaken
-// for a failed catalogue read, and neither writer can paint the other's sentence away.
+// the server's refusal, never a colour-only signal. It is feedback, not description, so it
+// SURVIVES the copy removal; it is SEPARATE from the head subtitle (`pluginsCountNote`) on
+// purpose, so a refusal can never be mistaken for a failed catalogue read and neither
+// writer can paint the other's sentence away. `notePluginToggleResult` is its only writer,
+// and the footer below is what holds it now that the head is the bare title.
 const pluginsTabStatus = el('p', 'plugins-tab-status field-hint', '');
 pluginsTabStatus.setAttribute('role', 'status');
 pluginsTabStatus.setAttribute('aria-live', 'polite');
@@ -8586,16 +8988,25 @@ pluginsRefresh.disabled = true;
 pluginsRefresh.addEventListener('click', () => {
     void loadPlugins(true);
 });
-pluginsTabHead.append(
-    el('h2', 'plugins-tab-title', 'Plugins'),
-    pluginsTabHint,
-    pluginsTabNote,
-    pluginsTabStatus,
-    pluginsRefresh
-);
+pluginsTabHead.append(el('h2', 'plugins-tab-title', 'Plugins'));
 // The list is the whole content area, exactly like `.tool-tab-list`.
 const pluginsTabList = el('div', 'plugin-tab-list');
-pluginsPane.append(pluginsTabHead, pluginsTabList);
+// The re-read control used to be the last line of `.plugins-tab-head`, where it read as part
+// of the descriptive copy. It now owns a FOOTER row appended AFTER the list, and
+// `.plugins-tab-footer` (flex, `justify-content: flex-end`) is what puts it in the pane's
+// bottom-right corner — a static box inside the pane, so it scrolls and sizes with this view
+// and never overlays another one the way `position: fixed` would. Nothing about the control
+// itself moved: same element, same label, same click handler, same `disabled` gates
+// (`buildPluginsTab`/`paintControls`/the offline path are still the only writers).
+//
+// The enablement line joined it in this pass: with the head reduced to the bare title there is
+// no descriptive block left to carry feedback, and the pane's child list must stay
+// `[head, list, footer]`. It sits BEFORE the button, so the pair stays a right-aligned strip
+// (`justify-content: flex-end`) and "Reload plugins" remains the footer's only `<button>`.
+const pluginsTabFooter = el('div', 'plugins-tab-footer');
+
+pluginsTabFooter.append(pluginsTabStatus, pluginsRefresh);
+pluginsPane.append(pluginsTabHead, pluginsTabList, pluginsTabFooter);
 
 // One declared setting's value in the spelling this surface prints. The server's
 // effective value wins and the declared default is the fallback, so a row never claims
@@ -8729,7 +9140,7 @@ const paintPluginToggle = (control: HTMLInputElement, plugin: PluginSummary): vo
 
     control.className = enabled ? 'plugin-tab-enable is-on' : 'plugin-tab-enable is-off';
     // THE state — a native checkbox has no `aria-checked` to maintain, and `checked` is
-    // also what the row's green wash (`.plugin-tab-button[data-enabled='true']`) follows.
+    // also what the row's green edge (`.plugin-tab-button[data-enabled='true']`) follows.
     control.checked = enabled;
     control.dataset.enabled = enabled ? 'true' : 'false';
     control.setAttribute('aria-label', `${enabled ? 'Disable' : 'Enable'} ${plugin.title}`);
@@ -8741,9 +9152,12 @@ const paintPluginToggle = (control: HTMLInputElement, plugin: PluginSummary): vo
 };
 
 // R2's tick box, in the row's top-right corner. A real `input[type=checkbox]`: `checked`
-// is the state for assistive tech, the accessible name is the ACTION, and the tile's wash
-// carries the same figure for the eye — the same three readings the tool rows use, so the
-// two catalogues behave identically. The box is the button's SIBLING and CSS lifts it
+// is the state for assistive tech, the accessible name is the ACTION, and the tile's green
+// edge carries the same figure for the eye — the same three readings the tool rows use, and
+// now the same recipe too: BOTH panes put the green on the tile's BORDER only (see
+// `.plugin-tab-button[data-enabled='true']` and its tools twin in styles.css), because in
+// either pane the background is the SELECTION channel (`--accent-soft` on `[aria-pressed]`).
+// The box is the button's SIBLING and CSS lifts it
 // above the tile, so clicking it writes enablement and never opens the dialog.
 //
 // `PluginSummary.enabled` is the field this paints from. It is a TOP-LEVEL row field,
@@ -8787,8 +9201,8 @@ const paintPluginToggleBusy = (name: string, busy: boolean): void => {
     if (!busy && row !== undefined) paintPluginToggle(control, row);
 };
 
-// The pane's one sentence about a switch write. Separate from `pluginsTabNote` on
-// purpose: that line is the catalogue count and the read failure.
+// The pane's one sentence about a switch write. Separate from the view head's count
+// subtitle on purpose: that line is the catalogue count and the read failure.
 const notePluginToggleResult = (text: string, failed: boolean): void => {
     pluginsTabStatus.textContent = text;
     pluginsTabStatus.hidden = false;
@@ -8817,7 +9231,9 @@ const setPluginEnabled = async (name: string, enabled: boolean): Promise<void> =
 
         replacePluginRow(updated);
         paintPluginRow(updated);
-        pluginsTabNote.textContent = pluginsCountNote();
+        // The head subtitle is the only place the count sentence lives now, and
+        // `paintPluginsChrome` repaints it from the same `pluginsCountNote()` the removed
+        // pane line used — the row count cannot move on an enablement write anyway.
         if (showingPlugins) paintPluginsChrome();
         notePluginToggleResult(
             `${updated.title} is now ${updated.enabled ? 'enabled' : 'disabled'} for every conversation.`,
@@ -8844,7 +9260,6 @@ const buildPluginsTab = (): void => {
     pluginRowNodes.clear();
     // The tick boxes are rebuilt with the list, so the key set follows the nodes exactly.
     pluginEnableBoxes.clear();
-    pluginsTabNote.textContent = pluginsCountNote();
     pluginsRefresh.disabled = pluginsLoading || !booted;
 
     if (pluginsLoading && pluginRows.length === 0) {
@@ -8892,7 +9307,7 @@ const buildPluginsTab = (): void => {
         button.title = plugin.description ?? plugin.title;
         // R2: the row states the tick box's state on the trigger too (`data-enabled`), so
         // the list is readable with the control out of view — and it is the figure CSS
-        // paints the enabled green wash from.
+        // paints the enabled green EDGE (`--ok-line`) from.
         button.dataset.enabled = plugin.enabled === true ? 'true' : 'false';
         // The whole row is kept, never truncated away: the description is the part a
         // reader scans, so CSS clamps it to two lines (`.plugin-tab-desc`) and the full
@@ -9038,6 +9453,270 @@ const buildSettingField = (
 // A field of the form, plus the row it belongs to.
 type PluginField = { setting: PluginSetting; input: HTMLInputElement };
 
+// --- grouped and gated settings (T5/R3) --------------------------------------
+//
+// The TWO OPTIONAL descriptor fields the plugin-settings contract grew (2026-11-13), spelled
+// exactly as the contract spells them:
+//   * `group: { id, title }` — settings sharing an `id` belong to one titled block, so a
+//     seventeen-row manifest reads as six decisions instead of seventeen rows;
+//   * `parentKey` — the key of the BOOLEAN setting whose tick decides whether this row is
+//     shown at all, which is the shape the operator asked for: `Trim after (tool turns)`
+//     sits under a ticked `Automatic trim invalid tools` and disappears when the tick is off.
+// Both are declared on `PluginSetting` (../shared/harness-api.ts:942-956) beside
+// `HarnessPluginSettingDescriptor` (../types/index.ts:4138-4145), and projected onto the wire
+// field by field by `src/server/api.ts` `pluginSettingOf`, so this file reads them straight off
+// the contract type — it adds no field of its own. A plugin that declares NEITHER keeps the
+// flat form exactly as it rendered before, and `plugins-tab.test.ts` pins that claim on the DOM
+// rather than in prose.
+
+// The reserved framework key (../server/plugins.ts): the plugin's own master switch. When a
+// plugin DECLARES it, that row is a setting like any other, and the only thing the pane does
+// with it is DIM the policy blocks it governs — it never hides them, because an operator who
+// switched a plugin off is exactly the reader about to edit its policy. The shipped Context
+// Trimmer declares `enabled` with NO `group` on purpose (../plugins/context-trimmer.plugin.ts
+// :454-471), so the switch sits above the blocks and the dim has something to fall on.
+const MASTER_SETTING_KEY = 'enabled';
+
+// The one safe id fragment: a plugin owns `group.id` as free text, and `ui/action-request.ts`
+// already sanitises the same way when a server string has to become an element id.
+const idFragmentOf = (value: string): string => value.replace(/[^A-Za-z0-9_-]/g, '_');
+
+// Build the whole settings body into `form` and hand back `paintGates`, the function that
+// re-reads every parent tick and re-applies what that makes visible.
+//
+// ONE pass over `plugin.settings`, in the plugin's declared order — no sorting, no
+// re-derivation from a second source — with three placement rules:
+//   1. a setting with no `group` is a plain row on the form, at the index it declares, and
+//      NOTHING else is created (so an ungrouped plugin's DOM is the pre-contract DOM);
+//   2. consecutive settings with the SAME `group.id` share one `role="group"` block, opened
+//      by a new id or by an intervening flat row;
+//   3. a setting with `parentKey` goes into that parent's indented host instead, which is
+//      attached IMMEDIATELY AFTER the parent's own row — inside the same block — whether the
+//      child was declared before or after it.
+// `paintGates` is called once here (the SEEDED state, from the values on the row) and again
+// after every save repaint.
+const buildSettingsForm = (
+    form: HTMLElement,
+    plugin: PluginSummary,
+    register: (field: PluginField) => void
+): (() => void) => {
+    // key -> its control. Every reveal resolves `parentKey` through this map, which is why
+    // declaration order cannot break the nesting.
+    const inputs = new Map<string, HTMLInputElement>();
+    // key -> where that key's OWN row was emitted, so its children can be hung off it. EVERY
+    // setting is registered here, gated or not (D5): a gated setting is a parent candidate
+    // exactly like an ungated one, and `childrenOf` resolves placement through this map, so a
+    // missing entry would leave its children's host detached and flush it at the form root.
+    const emitted = new Map<string, { host: HTMLElement; row: HTMLElement }>();
+    // parentKey -> that parent's indented host, created on its FIRST child and never before,
+    // so a plugin with no gated rows never grows an empty indent box.
+    const childHosts = new Map<string, HTMLElement>();
+    // Every gated row, with the key that decides it AND the indent host it lives in. Recorded
+    // during the walk, applied after it, so a child declared before its parent still sees a
+    // real control. The host travels with the row because `paintGates` has to be able to hide
+    // a host whose whole branch is collapsed (D3) — and only this list knows which rows are
+    // gated, which rows live in which host, and (via nested hosts, D5) that a host can hold
+    // hosts that are NOT gated rows.
+    const gates: Array<{ row: HTMLElement; parentKey: string; host: HTMLElement }> = [];
+    // key -> the DECLARED type of that setting. A gate only counts when the setting its
+    // `parentKey` names is declared `boolean` (D6): reading `input.checked` off a number or
+    // text control gives `undefined`, which would hide the child forever with no switch to
+    // turn it back on. Filled during the walk, read by `paintGates`, because a child may be
+    // declared before its parent and this map is only complete when the walk ends.
+    const declaredTypes = new Map<string, PluginSetting['type']>();
+    // The KEYS whose tick anything depends on — every `parentKey` a gated row named, plus the
+    // master switch. Keys rather than controls, because a child may be declared before its
+    // parent and the control map is only complete when the walk ends.
+    const triggerKeys = new Set<string>();
+    // The single wrapper that holds every block (the dim marks ONE element), the blocks in
+    // the order they were opened (which is what keeps a re-used `group.id` from sharing one
+    // heading across two blocks), and the block the previous setting opened, which is the id
+    // the next setting is compared against.
+    let groupsHost: HTMLElement | undefined;
+    const blocks: HTMLElement[] = [];
+    let openGroup: { id: string; node: HTMLElement } | undefined;
+    let masterSwitch: HTMLInputElement | undefined;
+
+    // The block this setting belongs to, opening a new one when the id changed.
+    const blockOf = (group: PluginSetting['group']): HTMLElement => {
+        if (group === undefined) return form;
+        if (openGroup !== undefined && openGroup.id === group.id) return openGroup.node;
+
+        const node = el('div', 'plugin-settings-group');
+        // `aria-labelledby` (not `aria-label`): the visible caption IS the accessible name,
+        // so the two can never drift apart. The index keeps a re-used id unique, because a
+        // plugin that opens the same block twice gets two headings and two blocks.
+        const title = el('h4', 'plugin-setting-group-title', group.title);
+
+        title.id = `plugin-setting-group-${idFragmentOf(plugin.name)}-${idFragmentOf(group.id)}-${blocks.length}`;
+        node.setAttribute('role', 'group');
+        node.setAttribute('aria-labelledby', title.id);
+        node.append(title);
+
+        // The wrapper only exists for a plugin that groups at all, and it sits at the form's
+        // current end — the position the first block declares.
+        if (groupsHost === undefined) {
+            groupsHost = el('div', 'plugin-settings-groups');
+            form.append(groupsHost);
+        }
+
+        groupsHost.append(node);
+        blocks.push(node);
+        openGroup = { id: group.id, node };
+
+        return node;
+    };
+
+    // The indented host of one parent, attached under that parent's row the moment the row
+    // exists (see the walk).
+    const childrenOf = (parentKey: string): HTMLElement => {
+        const existing = childHosts.get(parentKey);
+
+        if (existing !== undefined) return existing;
+
+        const host = el('div', 'plugin-setting-children');
+        // Read-only handle for CSS and for a reader inspecting the dialog; the reveal itself
+        // resolves through `inputs`, never through this attribute.
+        host.dataset.parent = parentKey;
+        childHosts.set(parentKey, host);
+
+        const parent = emitted.get(parentKey);
+
+        // Parent already emitted → hang the block directly under it, in its own group.
+        // Not emitted yet → the host stays detached until the walk reaches the parent, and
+        // the flush at the end of this function is what guarantees it lands on screen anyway.
+        if (parent !== undefined) parent.host.insertBefore(host, parent.row.nextSibling);
+
+        return host;
+    };
+
+    // What "visible" means for the whole form, re-derived from the controls every time so
+    // the DOM can never disagree with a tick:
+    //   * a gated row is `hidden` while its parent is unticked. `hidden` on the ROW, never a
+    //     class, because `[hidden] { display: none !important }` (styles.css:118) is this
+    //     app's one authoritative hiding rule and a native control inside a hidden subtree is
+    //     unfocusable — the part that keeps a switched-off setting out of the tab order. The
+    //     control stays REGISTERED and savable, because only its visibility changes;
+    //   * ONLY a DECLARED-BOOLEAN `parentKey` gates anything (D6). A key that names no setting
+    //     at all, and a key that names a number or a text setting, are both treated the same
+    //     way — the child renders SHOWN. Both are manifest bugs, and a wrong-typed parent used
+    //     to strand its children permanently: `input.checked` on a number box is `undefined`,
+    //     so the row hid with no checkbox anywhere to bring it back;
+    //   * an indent host hides ITSELF once every gated row inside it is hidden (D3). A host at
+    //     0 height is still a flex item in the `gap: 8px` column of `.plugin-settings-group`,
+    //     so an all-hidden branch used to leave a dead ~8px gap under its parent, and
+    //     `.plugin-setting-children:empty` can never match a host full of HIDDEN rows. Hiding
+    //     the host also hides any nested host it holds (D5), because `display: none` on an
+    //     ancestor takes the whole subtree out of the render tree — which is what keeps a
+    //     grandchild from floating out from under a parent row that is itself hidden.
+    const paintGates = (): void => {
+        // host -> how many of its gated rows exist and how many of those are hidden. The tally
+        // comes from `gates` rather than from `host.children`, because a host's children are
+        // rows AND nested hosts, and only a host with NO visible gated row may hide.
+        const tallies = new Map<HTMLElement, { total: number; hidden: number }>();
+
+        for (const gate of gates) {
+            // A non-boolean `parentKey` resolves to `undefined` here, which is the same branch
+            // a dangling one takes — the two are meant to behave alike, see the note above.
+            const control = declaredTypes.get(gate.parentKey) === 'boolean' ? inputs.get(gate.parentKey) : undefined;
+
+            gate.row.hidden = control === undefined ? false : control.checked !== true;
+
+            const tally = tallies.get(gate.host) ?? { total: 0, hidden: 0 };
+
+            tally.total += 1;
+            if (gate.row.hidden) tally.hidden += 1;
+            tallies.set(gate.host, tally);
+        }
+
+        for (const [host, tally] of tallies) host.hidden = tally.hidden === tally.total;
+
+        if (groupsHost !== undefined && masterSwitch !== undefined)
+            groupsHost.classList.toggle('plugin-settings-groups--off', masterSwitch.checked !== true);
+    };
+
+    for (const setting of plugin.settings) {
+        let input: HTMLInputElement | undefined;
+
+        // `buildSettingField` is untouched: the same row, the same classes, the same order
+        // inside it, whatever the setting is grouped under.
+        const row = buildSettingField(plugin, setting, (field) => {
+            register(field);
+            inputs.set(field.setting.key, field.input);
+            input = field.input;
+        });
+
+        // A local `const` re-widens the callback-assigned `input`: the assignment happens
+        // inside `buildSettingField`'s callback, which control-flow analysis cannot see, so
+        // `input` alone would still read as `undefined` at the line below.
+        const control = input;
+
+        if (control === undefined) continue;
+
+        declaredTypes.set(setting.key, setting.type);
+
+        // ONE host for both branches (D5): the block the setting belongs to when it is
+        // ungated, that parent's indent host when it is gated. Both branches then register the
+        // row in `emitted`, which is what lets a GATED setting act as a parent — while only the
+        // ungated branch registered, a gated parent's own children host stayed detached and
+        // the flush below dumped those rows at the FORM ROOT, outside the block that declares
+        // them and outside the indent they belong to.
+        const host = setting.parentKey === undefined ? blockOf(setting.group) : childrenOf(setting.parentKey);
+
+        host.append(row);
+        emitted.set(setting.key, { host, row });
+
+        if (setting.parentKey !== undefined) {
+            gates.push({ row, parentKey: setting.parentKey, host });
+            triggerKeys.add(setting.parentKey);
+        }
+
+        // A child of this key was declared BEFORE this row, gated or not, so its host has to
+        // move from wherever it was parked to directly under the row that gates it — inside the
+        // same host this row just landed in, which is the whole point of a nested reveal.
+        const children = childHosts.get(setting.key);
+
+        if (children !== undefined) host.insertBefore(children, row.nextSibling);
+
+        if (setting.key === MASTER_SETTING_KEY) {
+            masterSwitch = control;
+            // The dim follows the master tick the same way a reveal follows its parent, so the
+            // master switch joins the same listener set rather than getting its own path.
+            triggerKeys.add(MASTER_SETTING_KEY);
+        }
+    }
+
+    // A `parentKey` naming nothing leaves its host detached, which would drop the row out of
+    // the document while it stayed registered and savable — an invisible field nobody can
+    // edit. Flushing the leftovers keeps every declared control on screen (and `paintGates`
+    // renders those SHOWN, per the rule above).
+    for (const host of childHosts.values()) {
+        if (host.parentElement === null) form.append(host);
+    }
+
+    // One `input` + `change` pair per control anything depends on. `input` is the live-edit
+    // signal this form already listens to for the status line, and `change` is the one a
+    // checkbox fires on every commit; registering BOTH means the reveal lands in the SAME turn
+    // however the reader flipped the tick (click, label click, Space, or an assistive tech
+    // that only commits on blur), and `paintGates` re-derives everything from the controls, so
+    // a doubled signal is free. A key that names no control is skipped — nothing can ever
+    // change it, and its rows are the SHOWN ones `paintGates` already settled.
+    for (const key of triggerKeys) {
+        const control = inputs.get(key);
+
+        if (control === undefined) continue;
+
+        control.addEventListener('input', paintGates);
+        control.addEventListener('change', paintGates);
+    }
+
+    // Seed the initial visibility from the seeded values — a dialog that opens with the tick
+    // off must open with the dependent rows already gone.
+    paintGates();
+
+    return paintGates;
+};
+
 // Open one plugin's detail in the shared modal. The dialog owns Escape/backdrop/focus
 // restore (the tools runner gets the same machinery), and the settings form is built
 // fresh for every open, so the values it shows are always the cache's.
@@ -9048,6 +9727,15 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
     let shown = plugin;
     let saving = false;
     const fields: PluginField[] = [];
+    // key -> its field. The save loop needs this for ONE thing (D4): a `parentKey` chain is
+    // spelled in KEYS, and revealing a row its own tick hides means finding the ancestor
+    // CONTROLS that chain names. Filled by the same registration callback as `fields`, so the
+    // two can never disagree about what the form holds.
+    const fieldsByKey = new Map<string, PluginField>();
+    // Re-applies what each tick makes visible. `buildSettingsForm` seeds it during the build
+    // and the save handler calls it again after every `paintValues()`; the read-only branch
+    // has no settings, so it keeps this no-op.
+    let paintGates: () => void = () => undefined;
 
     const body = el('div', 'plugin-detail');
     body.append(el('p', 'plugin-detail-description', plugin.description ?? 'No description.'));
@@ -9124,9 +9812,14 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
         form.setAttribute('role', 'group');
         form.append(el('span', 'plugin-settings-form-label', 'Plugin settings'));
 
-        for (const setting of plugin.settings) {
-            form.append(buildSettingField(plugin, setting, (field) => fields.push(field)));
-        }
+        // T5/R3: this used to be a flat `for` loop appending one row per descriptor. It now
+        // honours the two optional descriptor fields — titled blocks for a shared `group.id`,
+        // and a gated row nested under the tick that reveals it — while an ungrouped manifest
+        // still gets the identical flat rows in the identical order.
+        paintGates = buildSettingsForm(form, plugin, (field) => {
+            fields.push(field);
+            fieldsByKey.set(field.setting.key, field);
+        });
 
         settingsSection.append(form);
 
@@ -9152,12 +9845,54 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
             if (setting.type === 'boolean') input.checked = current === true;
             else input.value = String(current);
         }
+
+        // A programmatic `checked =` fires NO event, so the gated rows would otherwise keep
+        // whatever visibility the reader last left them in while the SERVER's answer says a
+        // parent moved. The server's figures are the truth here, so the reveal is re-taken
+        // from them in the same pass.
+        paintGates();
     };
 
     const note = (text: string, failed: boolean): void => {
         status.textContent = text;
         // Text AND class: colour is never the only signal (the shell's standing rule).
         status.className = failed ? 'plugin-setting-status plugin-setting-status-error' : 'plugin-setting-status field-hint';
+    };
+
+    // Reveal the whole gate chain of one setting (D4, 2026-11-13). A row its own tick hides is
+    // STILL registered and still savable — that is the contract this form pins — so a value the
+    // save loop refuses can sit in a field that is not on screen, and a refusal naming a row the
+    // reader cannot see is only half actionable. Walking `parentKey` upward and ticking every
+    // ancestor makes the offending row visible BEFORE the message is written, and the reader's
+    // own tick chain is restored by the same paint.
+    //
+    // Nothing else moves: the typed text stays, the value is neither coerced nor dropped, no
+    // `PATCH` leaves the browser, and the message keeps its exact wording.
+    //
+    // The walk stops at a `parentKey` naming nothing or naming a NON-boolean setting — those
+    // gate nothing at all, which is exactly how `paintGates` treats them (D6), so there is no
+    // tick to flip past that point. `visited` is the guard against a third-party manifest whose
+    // keys point at each other in a cycle, which would otherwise spin here forever.
+    const revealGateChain = (setting: PluginSetting): void => {
+        const visited = new Set<string>();
+        let parentKey = setting.parentKey;
+
+        while (parentKey !== undefined && !visited.has(parentKey)) {
+            visited.add(parentKey);
+
+            const parent = fieldsByKey.get(parentKey);
+
+            if (parent === undefined || parent.setting.type !== 'boolean') break;
+
+            // A programmatic `checked =` fires NO event, which is why the reveal has to re-paint
+            // by hand: the `input`/`change` listeners `buildSettingsForm` registered are what
+            // normally carry a tick into the DOM, and a click that never happened cannot be
+            // waited for here.
+            parent.input.checked = true;
+            parentKey = parent.setting.parentKey;
+        }
+
+        paintGates();
     };
 
     if (save !== undefined) {
@@ -9173,7 +9908,13 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
                     if (value === undefined) {
                         // A cleared number box has no value to send; naming the field is
                         // the actionable part, and the typed text stays for the fix.
+                        // D4: the row is revealed FIRST, then focused, so the sentence names
+                        // something on screen and the cursor lands on the box to fix. Revealing
+                        // is the only liberty taken here — the message text, the untouched value
+                        // and the "no request" behaviour are all unchanged.
+                        revealGateChain(setting);
                         note(`${setting.label} needs a number.`, true);
+                        input.focus();
 
                         return;
                     }
@@ -9205,7 +9946,8 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
                     rememberPlugin(updated);
                     paintPluginRow(updated);
                     paintValues();
-                    pluginsTabNote.textContent = pluginsCountNote();
+                    // Same reason as in `setPluginEnabled`: the count sentence lives only in
+                    // the head subtitle, and `paintPluginsChrome` re-takes it from the cache.
                     if (showingPlugins) paintPluginsChrome();
                     note('Saved', false);
                     setStatus('idle');
@@ -9303,8 +10045,8 @@ const selectPlugin = (plugin: PluginSummary, trigger?: HTMLElement): void => {
 };
 
 // Open or close the PLUGINS view. One function both directions, exactly like
-// `setToolsView`: the topbar toggle calls it, harness selection and the Tools toggle
-// close it, and the view is NEVER locked by a run (R1) — the catalogue is server-wide
+// `setToolsView`: the title-row Plugins toggle calls it, harness selection and the Tools
+// toggle close it, and the view is NEVER locked by a run (R1) — the catalogue is server-wide
 // data, the write-anytime contract on `PATCH /plugins/{id}` has no idle window, and
 // every transcript painter already early-returns while a catalogue owns the column.
 //
@@ -9369,7 +10111,7 @@ const setPluginsView = (open: boolean): void => {
     setStatus('idle');
 };
 
-// The topbar icon is a real toggle: a second press closes the pane and returns to the
+// The session-line icon is a real toggle: a second press closes the pane and returns to the
 // selected chat. `paintControls` disables it while a run is pending or before boot, so
 // this handler never races the queue or blanks the startup pane.
 pluginsToggle.addEventListener('click', () => {
@@ -13597,11 +14339,21 @@ const applyDefaults = (defaults: HarnessBootstrap['defaults']): void => {
     if (defaults.base_url.trim().length > 0) settings.baseURL = defaults.base_url;
     if (defaults.model.trim().length > 0) settings.model = defaults.model;
 
-    for (const [key, control] of controls) {
-        control.value = settings[key];
-    }
-
     saveSettings();
+
+    // The defaults are COMMITTED state, and the settings controls show the draft, so the
+    // draft is re-based here rather than written field by field (R4/T4: the fields belong
+    // to the dialog, and they read `endpointDraft`).
+    //
+    // F4: the status pill is enabled BEFORE the bootstrap lands, so the dialog can be open
+    // when these defaults arrive. Re-syncing then rewrites every field out from under the
+    // caret — the reader loses what they typed for nothing, since `saveSettings` above has
+    // already written the server's bytes, not the draft (R4 holds either way). So the re-sync
+    // is skipped while a layer is open: the edits stay, and the next open re-bases from the
+    // saved values exactly as a dismissal does. The one consequence worth naming is that a
+    // reader who opened the dialog before boot and then presses `Apply` commits the pre-boot
+    // draft for the fields they never touched, rather than the defaults that just landed.
+    if (endpointDialog === undefined) syncEndpointDraft();
 };
 
 const showConnecting = (): void => {
@@ -13708,12 +14460,19 @@ const boot = async (): Promise<void> => {
 
         applyDefaults(data.defaults);
 
-        // The defaults may have replaced the model, and the stored settings may
-        // name a model the provider no longer serves. Rendering first and then
-        // fetching keeps the dropdown correct in both cases; the lookup runs in
-        // the background so boot is not gated on the provider being reachable.
+        // The defaults may have replaced the model, and the stored settings may name a model the
+        // provider no longer serves. Rendering first and then fetching keeps the dropdown correct
+        // in both cases; the lookup runs in the background so boot is not gated on the provider
+        // being reachable.
+        //
+        // It is a COMMITTED lookup, and that has to be stated rather than inferred: the dialog can
+        // be open while these defaults land, and `applyDefaults` deliberately leaves the draft
+        // alone then (./main.ts F4), so the draft may still name the pre-boot endpoint. Reading
+        // `settings` is what makes this the answer for the endpoint this load actually dials, and
+        // publishing it is what gives every per-agent model dropdown its provider's ids (./main.ts
+        // `publishModelCatalogue`).
         renderModelOptions();
-        void refreshModels();
+        void refreshModels(committedModelLookup());
 
         presetDescriptors = data.presets as unknown as HarnessDescriptor[];
         // The agent library is server data. An older server has no list, so derive

@@ -6,26 +6,40 @@
 //     classes, ARIA and children, and a bare `<button class="status-button">` wraps it
 //     (a live region cannot also be a button, so the two semantics nest);
 //   - the dialog: title `Endpoint & model`, and inside it the harness server URL group
-//     (field + explanation + refusal line + Apply/Reset) followed by the Base URL / API
-//     key / Model controls, the model status line, the explanatory paragraph and the
-//     API-root line — the same nodes the rail used to host, adopted rather than rebuilt;
-//   - the data path is unchanged by the move: dialog edits still write the exact
-//     `underload-harness-app:settings` payload, still fire ONE debounced catalogue
-//     refresh, and still describe the next session the app creates;
+//     (field + the `role="status"` refusal line + the one-line `In use:` state), the three
+//     provider controls (Base URL / API key / Model), and then ONE footer row carrying the
+//     single `Apply` button as the LAST child of the body. There is no `Reset`, and the
+//     three instructional paragraphs are gone — an expert reader gets a label, a
+//     placeholder and one short state line per concern, nothing else;
+//   - DRAFT-then-APPLY (./main.ts `endpointDraft`): a keystroke and a dropdown change write
+//     the DRAFT and nothing else, so `underload-harness-app:settings` keeps its previous
+//     bytes until the reader presses `Apply`. Dismissal (Escape, the × button, the backdrop,
+//     a second pill press) is therefore a real cancel — which is exactly why the footer
+//     holds one button. The model catalogue is the one thing the draft drives on its own:
+//     typing a base URL posts it to `POST /models` (debounced, 500ms of silence) and
+//     repopulates the dropdown while persisting nothing, and closing drops both the pending
+//     debounce and the in-flight lookup;
+//   - the model control is a `<select>` ONLY: no free-text input and no `Custom model…`
+//     option, because an id the endpoint does not advertise is not something this dialog
+//     invents. A stored model the provider hides stays selectable as `<current> (current)`,
+//     and an empty catalogue shows a disabled `No models` placeholder;
 //   - the harness server URL is a SEPARATE setting (`underload-harness-app:api-root`,
 //     ./api.ts): prefilled from what this browser saved rather than from a one-load
-//     `?apiRoot=`, applied only by its button (validate → persist → strip the override
-//     → reload), refused inline when malformed or when the browser cannot keep the
-//     value, and cleared by Reset. Typing in it never touches the provider payload and
-//     never refreshes the provider catalogue;
+//     `?apiRoot=`, and written by Apply ONLY when the field actually changed — an untouched
+//     field must not turn the automatic root into a stored override. When it changed, the
+//     click validates → persists → strips the override → reloads (the reconnect); when it
+//     did not, Apply is a plain save: settings written, dialog closed, NO reload. A blank
+//     field clears the stored key, which is the job the removed `Reset` used to do. Typing
+//     in it never touches the provider payload and never refreshes the provider catalogue;
 //   - THE ROOT DISPLAYS ARE REPAINTED ON EVERY OPEN: on a GitHub Pages host `API_ROOT`
 //     only moves inside `loadBootstrap` (`ensureApiRoot`, ./api.ts), after `main.ts`
-//     module scope built this dialog, so both the field and the "API root in use" line
-//     must name the gateway the probe LANDED on — and a refusal line from a previous open
-//     must not survive the reopen (./main.ts `paintServerRoot`);
+//     module scope built this dialog, so both the field and the `In use:` line must name
+//     the gateway the probe LANDED on — and a refusal line from a previous open must not
+//     survive the reopen (./main.ts `paintServerRoot`);
 //   - persistence across the dialog lifecycle: closing removes only the overlay, and the
-//     reopen shows the SAME control nodes with the SAME values (no duplicates, no lost
-//     listeners — the dropdown is still populated from the provider answer);
+//     reopen adopts the SAME control nodes (identity, not a copy) with their values
+//     RE-BASED on what is saved — a dismissed edit is gone and an applied one is not, and
+//     neither case rebuilds a field or loses a listener;
 //   - dismissal: Escape, the × button and a backdrop click all close it and hand focus
 //     back to the pill; a second press toggles instead of stacking; the pill is inert
 //     while the tools view owns the centre (the same guard style as the harness title);
@@ -36,10 +50,10 @@
 //   - CSS (jsdom computes no media queries, so the sheet's source text is the contract —
 //     the same convention compact-ui.test.ts and tool-chip-style.test.ts use): the
 //     wrapper is a bare button with no clipping, the dialog body gets its own breathing
-//     room, and the accordion rules (`.endpoint`, `.endpoint-summary`, its `::before`
-//     chevron and its rotation) are gone.
+//     room, the footer row is a right-aligned single action, and the accordion rules
+//     (`.endpoint`, `.endpoint-summary`, its `::before` chevron and its rotation) are gone.
 //
-// Run: npx vitest run --config src/frontend/vitest.config.ts
+// Run: yarn vitest run --config src/frontend/vitest.config.ts src/frontend/endpoint-dialog.test.ts
 
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -64,23 +78,33 @@ const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false 
 // Realistic epoch stamps: the shell formats real server milliseconds.
 const T = 1_700_000_000_000;
 
-// The "which root is live" line the dialog renders. `main.ts` writes it from the SAME
-// live binding (`API_ROOT`) — at module scope and again on every dialog open, because a
-// static-host probe moves that binding after module scope (see the Pages test below) —
-// so the expected text is computed rather than guessed, and a test can name the root a
-// scenario resolved to.
-const apiRootLine = (root: string): string =>
-    `API root in use: ${root.length > 0 ? root : '(origin)'} · every request and the live stream go here. Change it for this browser with the Harness server URL above, or for a single load with ?apiRoot=.`;
+// The "which root is live" line the dialog renders, and the ONLY prose left in the server
+// group: one short state line, no explanation of requests, streams or `?apiRoot=`.
+// `main.ts` writes it from the SAME live binding (`API_ROOT`) — at module scope and again on
+// every dialog open, because a static-host probe moves that binding after module scope (see
+// the Pages test below) — so the expected text is computed rather than guessed, and a test
+// can name the root a scenario resolved to.
+const apiRootLine = (root: string): string => `In use: ${root.length > 0 ? root : '(origin)'}`;
 
 const API_ROOT_HINT = apiRootLine(API_ROOT);
 
-// The two fixed strings of the new server-URL group. Pinning them as constants keeps
-// the DOM-order assertion below readable, and a source change is a deliberate edit.
+// The one string the provider group still states, and the ONLY model state line. Terse by
+// contract: the imperative tails ("Enter a model manually.") are gone with the manual input.
+const MODEL_LOADED = 'Loaded 2 models from http://provider/v1';
+
+// The placeholder an empty catalogue shows. It is disabled, so the reader can never
+// "select" it into the draft.
+const NO_MODELS = 'No models';
+
+// The server-URL placeholder — the one hint the field keeps, because a placeholder teaches
+// the shape without a paragraph.
 const SERVER_URL_PLACEHOLDER = 'http://localhost:8180/v1/harness';
-const SERVER_URL_HINT =
-    'Relative paths resolve against the page that served this UI, so the default /v1/harness means the harness on the same host and port (a UI at http://localhost:8180 dials http://localhost:8180/v1/harness). Blank restores automatic resolution. An absolute URL may name another host: it must accept this page origin at the service Origin gate and CORS, and an https page cannot dial a plain-http host. ?apiRoot= still overrides for a single load.';
-const SETTINGS_HINT =
-    'Sent to the harness server when a session starts. Leave the key blank to use the key configured on the server. Values are saved in this browser only. The model list is fetched by the server from {base URL}/models.';
+
+// The stored payload exactly as `loadSettings`/`saveSettings` serialize it: the whole
+// provider triple, in the record's key order. Every draft assertion below compares against
+// a variant of this byte string, because "the draft was not persisted" is a byte claim.
+const storedSettings = (baseURL: string, apiKey: string, model: string): string =>
+    `{"baseURL":"${baseURL}","apiKey":"${apiKey}","model":"${model}"}`;
 
 const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor =>
     ({
@@ -262,6 +286,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+    // The async-lifecycle cases run on `vi.useFakeTimers()`; leaving the fake clock installed
+    // would hang the next file's real-timer `flush`/`pastDebounce` helpers.
+    vi.useRealTimers();
     vi.unstubAllGlobals();
 });
 
@@ -282,32 +309,57 @@ const closeWithEscape = (): void => {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 };
 
-// `.field-select` is NOT endpoint-specific (the create-harness form wears the same
-// classes), so every settings read is scoped to the dialog. `.model-manual` and
-// `.endpoint-body` ARE unique to the settings, which is what makes the "no duplicate
-// fields" assertions below exact rather than positional.
+// `.field-select` is NOT endpoint-specific (the create-harness form wears the same classes),
+// so every settings read is scoped to the dialog. `.endpoint-body` and `.endpoint-actions`
+// ARE unique to the settings, which is what makes the "no duplicate fields" and "one button"
+// assertions below exact rather than positional.
 const settingsRoot = (): HTMLElement => byClass('.dialog .endpoint-body', 'div');
 
-// The dialog's LAST line: the root this load resolved. Addressed by position because
-// that is what the DOM order pins (see the child-list assertion below).
-const lastBodyHint = (): string | null | undefined => {
-    const children = settingsRoot().children;
+// The `In use:` line — the SECOND child of the body, since the actions row took the last
+// slot. Addressed by position because that is what the DOM-order assertion below pins.
+const serverRootLiveLine = (): string | null | undefined => settingsRoot().children[2]?.textContent;
 
-    return children[children.length - 1]?.textContent;
-};
-
-// The harness server URL control (a `div.field`, so `label.field > input.field-input`
-// below keeps naming the provider pair) and its two action buttons.
+// The harness server URL control (a `div.field`, so `label.field > input.field-input` below
+// keeps naming the provider pair).
 const serverRootInput = (): HTMLInputElement => byClass('.dialog #harness-server-root', 'input');
-const serverRootButtons = (): HTMLButtonElement[] => [
-    ...document.querySelectorAll<HTMLButtonElement>('.dialog .endpoint-actions button')
+
+// The dialog's single action. `.endpoint-actions` is the last child of the body and holds
+// exactly one button, so this is THE Apply of the dialog — there is nothing else in that row
+// to disambiguate.
+const applyButton = (): HTMLButtonElement =>
+    byClass('.dialog .endpoint-actions button', 'button');
+
+// Every button the open layer owns, as `[host, label]` pairs: the × of the head and the
+// footer action. A third entry is a control this dialog is not supposed to have (the exact
+// array IS the "one button, labelled Apply" assertion).
+const dialogButtons = (): [string, string][] => [
+    ...[...document.querySelectorAll<HTMLButtonElement>('.dialog button')].map(
+        (button): [string, string] => [
+            button.closest('.dialog-head') === null ? 'body' : 'head',
+            button.textContent ?? ''
+        ]
+    )
 ];
 
-// The model catalogue's status line. It must be scoped through the model `div.field`:
-// the server-URL group above it owns two `.field-hint` siblings of its own, so the
-// first `.field-hint` inside `.endpoint-body` is no longer the model status.
+// The model catalogue's status line. It must be scoped through the model `div.field`: the
+// server-URL group above it owns two `.field-hint` siblings of its own, so the first
+// `.field-hint` inside `.endpoint-body` is the refusal line, not the model status.
 const modelStatusLine = (): string | null | undefined =>
     settingsRoot().querySelector('.field .field-hint')?.textContent;
+
+// The model `<select>`, the ONLY model control the dialog has.
+const modelSelect = (): HTMLSelectElement => byClass('.dialog .field-select', 'select');
+
+// The dropdown as `[label, value, disabled]` triples — the whole contract of the control in
+// one exact assertion. Spread first: jsdom's `HTMLOptionsCollection` is indexed but has no
+// `map`, so `select.options.map(...)` is not iterable.
+const modelOptions = (): [string | null, string, boolean][] => [
+    ...[...modelSelect().options].map((option) => [
+        option.textContent ?? null,
+        option.value,
+        option.disabled
+    ] as [string | null, string, boolean])
+];
 
 // The server URL's refusal line. `role="status"` is unique to it (the model status line
 // is a plain `.field-hint`), so this selector cannot land on another node.
@@ -392,13 +444,11 @@ it('wraps the status live region in a bare dialog trigger in the top-right clust
     expect(button.getAttribute('aria-pressed')).toBeNull();
     expect(button.getAttribute('aria-expanded')).toBeNull();
 
-    // The topbar cluster still holds the status pill, the tools toggle and (T7/R2) the
-    // plugins toggle, in that order — the two catalogue icons adjacent, plugins last.
-    expect([...byClass('.topbar-right', 'div').children]).toEqual([
-        button,
-        byClass('.tools-toggle', 'button'),
-        byClass('.plugins-toggle', 'button')
-    ]);
+    // The topbar cluster holds the status pill ALONE. The two catalogue toggles that used
+    // to follow it (T7/R2) now live in the `.harness-title-tools` group on the harness
+    // title row, because the panes they open are presented for the session in view while
+    // this pill is app-scoped — the pill's own placement and order are unchanged.
+    expect([...byClass('.topbar-right', 'div').children]).toEqual([button]);
 
     // Nothing is open before the reader presses it.
     expect(document.querySelector('.dialog')).toBeNull();
@@ -429,21 +479,19 @@ it('opens the settings in a dialog titled Endpoint & model with every control', 
     // Exactly one copy of the settings exists: the dialog is the ONLY host.
     expect(document.querySelectorAll('.endpoint-body')).toHaveLength(1);
     expect(document.querySelectorAll('.endpoint-dialog')).toHaveLength(1);
-    expect(document.querySelectorAll('.model-manual')).toHaveLength(1);
 
     // Child order: the harness server URL group FIRST (it decides where the provider
-    // credentials below are sent), then the three provider fields the rail used to
-    // carry, then the two provider hints.
+    // credentials below are sent) with its refusal line and its one `In use:` state line,
+    // then the three provider fields the rail used to carry, then the footer. The three
+    // instructional paragraphs are gone, so the body is 7 children and not 9.
     expect([...body.children].map((child) => child.className)).toEqual([
         'field',
-        'field-hint',
         'field-hint is-warning',
-        'endpoint-actions',
-        'field',
-        'field',
-        'field',
         'field-hint',
-        'field-hint'
+        'field',
+        'field',
+        'field',
+        'endpoint-actions'
     ]);
     expect([...body.querySelectorAll('.field-label')].map((node) => node.textContent)).toEqual([
         'Harness server URL',
@@ -468,6 +516,18 @@ it('opens the settings in a dialog titled Endpoint & model with every control', 
         [false, 'off']
     ]);
 
+    // The whole control inventory of the dialog, exact: three text inputs (server URL,
+    // Base URL, API key) and ONE select. A fourth input would be the free-text model
+    // fallback this dialog no longer offers — the ids come from the endpoint.
+    expect([...body.querySelectorAll<HTMLInputElement>('input')].map((input) => input.type)).toEqual([
+        'text',
+        'text',
+        'password'
+    ]);
+    expect([...body.querySelectorAll('select')].map((node) => node.className)).toEqual([
+        'field-input field-select'
+    ]);
+
     // The harness server URL: the root this load actually uses, an absolute-URL
     // placeholder, and a real accessible name through `label[for]`.
     const serverRoot = serverRootInput();
@@ -480,43 +540,47 @@ it('opens the settings in a dialog titled Endpoint & model with every control', 
     );
     expect(document.querySelector('.dialog label.field > #harness-server-root')).toBeNull();
 
-    // Its two status nodes: the explanation, and the refusal line that starts empty and
-    // hidden (it is the `role="status"` target of a failed Apply).
-    expect(body.children[1].textContent).toBe(SERVER_URL_HINT);
-    const serverStatus = body.children[2] as HTMLElement;
+    // Its two state nodes: the refusal line (empty and hidden until a click is refused),
+    // then the one-line `In use:` state that replaced the paragraph above it.
+    const serverStatus = body.children[1] as HTMLElement;
     expect(serverStatus.getAttribute('role')).toBe('status');
     expect(serverStatus.textContent).toBe('');
     expect(serverStatus.hidden).toBe(true);
+    expect(body.children[2].textContent).toBe(API_ROOT_HINT);
 
-    // Its two actions, primary first in the DOM (CSS right-aligns the row, so the
-    // commit button lands where a reader expects it to be pressed).
-    const [apply, reset] = serverRootButtons();
-    expect(apply.textContent).toBe('Apply & reconnect');
-    expect(apply.className).toBe('button primary');
-    expect(apply.type).toBe('button');
-    expect(reset.textContent).toBe('Reset');
-    expect(reset.className).toBe('button');
-    expect(reset.type).toBe('button');
-
-    // The dropdown is populated from the catalogue boot fetched, plus the manual
-    // fallback entry, and it selects the current model.
-    const select = byClass('.dialog .field-select', 'select');
-    expect([...select.options].map((option) => option.textContent)).toEqual(['m1', 'm2', 'Custom model…']);
-    expect(select.value).toBe('m1');
-    expect(select.disabled).toBe(false);
-    const manual = byClass('.model-manual', 'input');
-    expect(manual.hidden).toBe(true);
-    expect(manual.value).toBe('m1');
-
-    // The text lines, in DOM order: the server explanation, its (empty) refusal line,
-    // the model status, the provider explanation, the API root actually in use.
-    expect([...body.querySelectorAll('.field-hint')].map((node) => node.textContent)).toEqual([
-        SERVER_URL_HINT,
-        '',
-        'Loaded 2 models from http://provider/v1.',
-        SETTINGS_HINT,
-        API_ROOT_HINT
+    // ONE action, labelled exactly `Apply`, and it is the LAST row of the body — the
+    // right-alignment is the stylesheet's (`.endpoint-actions`, pinned by the CSS contract
+    // below), the last-child position is the DOM's. `Reset` is gone with the draft
+    // semantics: walking away from the dialog is how a reader discards an edit.
+    const actions = byClass('.dialog .endpoint-actions', 'div');
+    expect(actions.parentElement).toBe(body);
+    expect(body.lastElementChild).toBe(actions);
+    expect([...actions.querySelectorAll('button')].map((button) => button.textContent)).toEqual(['Apply']);
+    expect(applyButton().className).toBe('button primary');
+    expect(applyButton().type).toBe('button');
+    // The whole layer has two buttons: the × of the head and this one. No `Reset`.
+    expect(dialogButtons()).toEqual([
+        ['head', '×'],
+        ['body', 'Apply']
     ]);
+
+    // The dropdown is the catalogue boot fetched, with the stored model selected. There is
+    // no `Custom model…` entry and no manual input behind it.
+    expect(modelOptions()).toEqual([
+        ['m1', 'm1', false],
+        ['m2', 'm2', false]
+    ]);
+    expect(modelSelect().value).toBe('m1');
+    expect(modelSelect().disabled).toBe(false);
+
+    // The text lines, in DOM order: the (empty) refusal line, the root in use, and the one
+    // model state line. Nothing else in the body says anything.
+    expect([...body.querySelectorAll('.field-hint')].map((node) => node.textContent)).toEqual([
+        '',
+        API_ROOT_HINT,
+        MODEL_LOADED
+    ]);
+    expect(actions.nextElementSibling).toBeNull();
 
     // No disclosure markup survives anywhere in the document.
     expect(document.querySelector('details.endpoint')).toBeNull();
@@ -533,7 +597,6 @@ it('leaves no endpoint markup in the left rail and no fields in the document whi
     expect(rail.querySelector('.endpoint')).toBeNull();
     expect(rail.querySelector('.endpoint-body')).toBeNull();
     expect(rail.querySelector('.endpoint-dialog')).toBeNull();
-    expect(rail.querySelector('.model-manual')).toBeNull();
     expect(rail.querySelector('details')).toBeNull();
 
     // The left panel host is now the rail's LAST child — the disclosure used to follow
@@ -549,17 +612,18 @@ it('leaves no endpoint markup in the left rail and no fields in the document whi
     // While the dialog is closed the settings are DETACHED: they survive as persistent
     // nodes, so the document cannot be holding a second, duplicate copy of a field.
     expect(document.querySelectorAll('.endpoint-body')).toHaveLength(0);
-    expect(document.querySelectorAll('.model-manual')).toHaveLength(0);
-    // The only `<select>`s on the page belong to the create-harness form.
+    // The only `<select>`s on the page belong to the create-harness form: the model
+    // dropdown is a persistent node too, and it is in NONE of them while the dialog is
+    // closed.
     expect([...document.querySelectorAll('select')].map((node) => node.className)).toEqual([
         'field-input field-select create-primary',
         'field-input field-select create-agent-select'
     ]);
 });
 
-// --- the data path is unchanged by the move -----------------------------------
+// --- draft-then-apply: the dialog writes nothing until `Apply` -----------------
 
-it('persists dialog edits to storage and fires one debounced catalogue refresh', async () => {
+it('previews dialog edits through the draft and persists only what Apply commits', async () => {
     const calls = stub();
     await boot();
     const modelsAtBoot = modelCalls(calls).length;
@@ -576,26 +640,24 @@ it('persists dialog edits to storage and fires one debounced catalogue refresh',
     // The debounce is still 500ms of silence: typing must not fan out into one provider
     // request per keystroke, so nothing has fired yet.
     expect(modelCalls(calls)).toHaveLength(modelsAtBoot);
-    // The stored payload is the whole settings object, in `loadSettings`' key order.
-    expect(localStorage.getItem(SETTINGS_KEY)).toBe(
-        '{"baseURL":"http://other/v1","apiKey":"","model":"m1"}'
-    );
+    // And nothing is stored. A keystroke moves the DRAFT; `underload-harness-app:settings`
+    // still holds the byte string boot wrote (./main.ts `endpointDraft`).
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
 
     apiKey.value = 'sk-test';
     apiKey.dispatchEvent(new Event('input', { bubbles: true }));
 
-    const select = byClass('.dialog .field-select', 'select');
-    select.value = 'm2';
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    modelSelect().value = 'm2';
+    modelSelect().dispatchEvent(new Event('change', { bubbles: true }));
 
-    expect(localStorage.getItem(SETTINGS_KEY)).toBe(
-        '{"baseURL":"http://other/v1","apiKey":"sk-test","model":"m2"}'
-    );
+    // Three edits, one of them a model choice, and storage has not moved by a byte.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
 
     await pastDebounce();
 
     // ONE refresh for the whole editing session (each keystroke re-arms the same timer),
-    // and it carries the credentials the dialog is showing.
+    // and it carries the DRAFT credentials — the preview of a pasted base URL is what makes
+    // the list trustworthy, and it persists nothing.
     const refreshes = modelCalls(calls);
     expect(refreshes).toHaveLength(modelsAtBoot + 1);
     expect(refreshes[modelsAtBoot]?.method).toBe('POST');
@@ -607,11 +669,133 @@ it('persists dialog edits to storage and fires one debounced catalogue refresh',
         settings: { base_url: 'http://other/v1', api_key: 'sk-test' }
     });
 
-    // The refreshed catalogue repaints the SAME persistent dropdown and status line:
-    // 'm2' is in the provider list, so the order stays the provider's.
-    expect([...select.options].map((option) => option.textContent)).toEqual(['m1', 'm2', 'Custom model…']);
-    expect(select.value).toBe('m2');
-    expect(modelStatusLine()).toBe('Loaded 2 models from http://other/v1.');
+    // The refreshed catalogue repaints the SAME persistent dropdown and status line: 'm2'
+    // is in the provider list, so the order stays the provider's and the choice holds.
+    expect(modelOptions()).toEqual([
+        ['m1', 'm1', false],
+        ['m2', 'm2', false]
+    ]);
+    expect(modelSelect().value).toBe('m2');
+    expect(modelStatusLine()).toBe('Loaded 2 models from http://other/v1');
+
+    // The stored api root is still absent: the root field was never touched, so the one
+    // action the reader CAN press now must not invent an override out of the automatic
+    // root it was prefilled with.
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+
+    // `Apply` is the writer. The harness server URL did not move, so this is a plain save:
+    // the payload lands in `loadSettings`' key order, the layer closes, and NO reload runs.
+    const navigation = stubNavigation();
+    applyButton().click();
+
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://other/v1', 'sk-test', 'm2'));
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+    expect(navigation.reloads()).toBe(0);
+    expect(document.querySelector('.dialog')).toBeNull();
+});
+
+it('offers a stored model the endpoint no longer advertises as the current choice', async () => {
+    // The select can only offer what the endpoint lists, so a stored model that has been
+    // retired needs its own option in front: the field must not silently rewrite a working
+    // choice to the first entry, and the reader must still be able to move ONCE the
+    // endpoint starts advertising it.
+    localStorage.setItem(SETTINGS_KEY, '{"baseURL":"http://provider/v1","apiKey":"","model":"zeta-model"}');
+    const calls = stub();
+    await boot();
+    openSettings();
+
+    expect(modelSelect().value).toBe('zeta-model');
+    expect(modelOptions()).toEqual([
+        ['zeta-model (current)', 'zeta-model', false],
+        ['m1', 'm1', false],
+        ['m2', 'm2', false]
+    ]);
+
+    modelSelect().value = 'm1';
+    modelSelect().dispatchEvent(new Event('change', { bubbles: true }));
+
+    // Moving onto an advertised id is a DRAFT edit: storage still names the retired model,
+    // and no session was created. (The catalogue read IS a POST, so the assertion names the
+    // route rather than the verb.)
+    expect(modelSelect().value).toBe('m1');
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'zeta-model'));
+    expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
+
+    applyButton().click();
+
+    // `Apply` is the only writer, and a model move needs no reload — the root did not
+    // change, so the new id is simply used by the session created next.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+    expect(document.querySelector('.dialog')).toBeNull();
+});
+
+it('shows a disabled placeholder when the endpoint lists no models at all', async () => {
+    // A well-formed catalogue that comes back empty is a STATE, not an error: the select
+    // has to say so in its own options rather than leave the reader with an empty box or a
+    // fake `Select a model` blank that would commit as an empty model id.
+    // The FIRST `stub()` parameter is the route layer that runs in front of the default
+    // answers, so this overrides the catalogue read and nothing else.
+    stub((url) => (url === '/api/models' ? json({ models: [] }) : undefined));
+    await boot();
+    openSettings();
+
+    expect(modelOptions()).toEqual([['m1 (current)', 'm1', false], ['No models', '', true]]);
+    expect(modelSelect().value).toBe('m1');
+    expect(modelStatusLine()).toBe('No models returned');
+});
+
+it('persists nothing on any dismissal path, and reopens from what is saved', async () => {
+    const calls = stub();
+    await boot();
+
+    // The three ways out `ui/dialog.ts` owns. Each one gets the same full edit — provider
+    // triple AND the server URL field — and each one must leave BOTH storage keys exactly
+    // as they were, which is the whole argument for deleting `Reset`.
+    const dismissals: (() => void)[] = [
+        () => closeWithEscape(),
+        () => byClass('.dialog-close', 'button').click(),
+        () => byClass('.dialog-overlay', 'div').dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    ];
+
+    for (const dismiss of dismissals) {
+        openSettings();
+        const [baseURL, apiKey] = [
+            ...document.querySelectorAll<HTMLInputElement>('.dialog label.field > input.field-input')
+        ];
+
+        baseURL.value = 'http://dismissed/v1';
+        baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+        apiKey.value = 'sk-dismissed';
+        apiKey.dispatchEvent(new Event('input', { bubbles: true }));
+        modelSelect().value = 'm2';
+        modelSelect().dispatchEvent(new Event('change', { bubbles: true }));
+        // The root field is edited too, and editing it is inert on its own: only the
+        // button writes it, and the button was never pressed.
+        serverRootInput().value = 'http://localhost:5000/v1/harness';
+        serverRootInput().dispatchEvent(new Event('input', { bubbles: true }));
+
+        dismiss();
+        expect(document.querySelector('.dialog')).toBeNull();
+
+        // Settings untouched (the boot payload), and no api-root key was created either.
+        expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+        expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
+
+        // The reopen repaints from what is SAVED, so a stale draft can never haunt the
+        // fields the reader is about to commit.
+        openSettings();
+        expect(
+            document.querySelector<HTMLInputElement>('.dialog label.field > input.field-input')?.value
+        ).toBe('http://provider/v1');
+        expect(apiKey.value).toBe('');
+        expect(modelSelect().value).toBe('m1');
+        expect(serverRootInput().value).toBe(API_ROOT);
+        byClass('.dialog-close', 'button').click();
+    }
+
+    // No dismissal leaked a provider request either: dismissing also drops the pending
+    // debounce (./main.ts `cancelModelPreview`), so the only `/models` call is boot's.
+    expect(modelCalls(calls)).toHaveLength(1);
 });
 
 it('sends the dialog values to the session it creates next', async () => {
@@ -650,8 +834,9 @@ it('sends the dialog values to the session it creates next', async () => {
     });
     await boot();
 
-    // The edits happen in the dialog, which is then CLOSED: the values are app state,
-    // not dialog state, so a submit after dismissing the popup still uses them.
+    // The edits happen in the DRAFT and `Apply` commits them: the dialog closes itself as
+    // part of applying, and the values are app state, so a submit after that still uses
+    // them. A root change would reload instead, and this test never touches the root.
     openSettings();
     const [baseURL, apiKey] = [
         ...document.querySelectorAll<HTMLInputElement>('.dialog label.field > input.field-input')
@@ -660,11 +845,16 @@ it('sends the dialog values to the session it creates next', async () => {
     baseURL.dispatchEvent(new Event('input', { bubbles: true }));
     apiKey.value = 'sk-test';
     apiKey.dispatchEvent(new Event('input', { bubbles: true }));
-    const select = byClass('.dialog .field-select', 'select');
+    const select = modelSelect();
     select.value = 'm2';
     select.dispatchEvent(new Event('change', { bubbles: true }));
-    byClass('.dialog-close', 'button').click();
+
+    // The DRAFT is what the select shows; storage is still what boot wrote until Apply.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+
+    applyButton().click();
     expect(document.querySelector('.dialog')).toBeNull();
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://other/v1', 'sk-test', 'm2'));
 
     byClass('.composer-input', 'textarea').value = 'go';
     byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
@@ -711,13 +901,13 @@ it('sends the dialog values to the session it creates next', async () => {
 // --- persistence across close/reopen ------------------------------------------
 
 it('reopens with the same control nodes, values and listeners', async () => {
-    stub();
+    const calls = stub();
     await boot();
 
     openSettings();
     const body = settingsRoot();
     const baseURL = byClass('.dialog label.field > input.field-input', 'input');
-    const select = byClass('.dialog .field-select', 'select');
+    const select = modelSelect();
     const optionValues = [...select.options].map((option) => option.value);
 
     baseURL.value = 'http://typed-once/v1';
@@ -725,11 +915,13 @@ it('reopens with the same control nodes, values and listeners', async () => {
     byClass('.dialog-close', 'button').click();
 
     // Close removes the OVERLAY only. The settings survive detached, so nothing can be
-    // quietly rebuilt behind the reader's back.
+    // quietly rebuilt behind the reader's back. The keystroke's debounced preview died with
+    // the close (`cancelModelPreview`), so the boot read is still the only one.
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.querySelector('.dialog-overlay')).toBeNull();
     expect(baseURL.isConnected).toBe(false);
     expect(body.isConnected).toBe(false);
+    expect(modelCalls(calls)).toHaveLength(1);
 
     openSettings();
 
@@ -739,31 +931,32 @@ it('reopens with the same control nodes, values and listeners', async () => {
     expect(settingsRoot()).toBe(body);
     expect(document.querySelector('.dialog label.field > input.field-input')).toBe(baseURL);
     expect(document.querySelector('.dialog .field-select')).toBe(select);
-    expect(baseURL.value).toBe('http://typed-once/v1');
+    // Re-based, not remembered: the dismissed keystroke is gone.
+    expect(baseURL.value).toBe('http://provider/v1');
     expect(select.value).toBe('m1');
 
-    // The debounced refresh for the last keystroke is DRAINED inside this test: the
-    // app's 500ms timer outlives the module instance, and a request that lands after
-    // `vi.resetModules()` would be recorded by the NEXT test's stub (the same reason
-    // main.test.ts waits past the debounce after touching the endpoint fields).
-    await pastDebounce();
-
-    // The listeners survived the move: a new keystroke still saves, and the value the
-    // closed dialog wrote is the one storage holds.
-    expect(localStorage.getItem(SETTINGS_KEY)).toBe(
-        '{"baseURL":"http://typed-once/v1","apiKey":"","model":"m1"}'
-    );
+    // The listeners survived the move. A keystroke previews instead of persisting — the
+    // value the closed dialog wrote is still what storage holds — and it re-arms the
+    // debounced refresh, drained INSIDE this test: the app's 500ms timer outlives the
+    // module instance, and a request that lands after `vi.resetModules()` would be recorded
+    // by the NEXT test's stub (the same reason main.test.ts waits past the debounce after
+    // touching the endpoint fields).
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
     baseURL.value = 'http://typed-twice/v1';
     baseURL.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(localStorage.getItem(SETTINGS_KEY)).toBe(
-        '{"baseURL":"http://typed-twice/v1","apiKey":"","model":"m1"}'
-    );
-
-    // Still exactly one host for the fields, and the dropdown was not rebuilt empty.
-    expect(document.querySelectorAll('.endpoint-body')).toHaveLength(1);
-    expect([...select.options].map((option) => option.value)).toEqual(optionValues);
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
 
     await pastDebounce();
+    expect(modelCalls(calls)).toHaveLength(2);
+    expect(modelStatusLine()).toBe('Loaded 2 models from http://typed-twice/v1');
+
+    applyButton().click();
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://typed-twice/v1', '', 'm1'));
+
+    // Apply closed the overlay (the host detaches with it), and the dropdown the reader
+    // picked from is the same option list — not a rebuild.
+    expect(document.querySelectorAll('.endpoint-body')).toHaveLength(0);
+    expect([...select.options].map((option) => option.value)).toEqual(optionValues);
 });
 
 it('toggles from the pill instead of stacking a second dialog', async () => {
@@ -834,6 +1027,10 @@ it('stays out of the way while the tools view owns the centre', async () => {
 // --- the live region keeps working while the dialog is open -------------------
 
 it('still paints the same status live region in place while the dialog is open', async () => {
+    // An endpoint-requiring harness whose COMMITTED base URL is blank. The dialog can no
+    // longer half-apply a config, so the refusal has to come from real settings: seed them
+    // BEFORE boot and only open the dialog to prove it does not block the announcement.
+    localStorage.setItem(SETTINGS_KEY, '{"baseURL":"","apiKey":"","model":"m1"}');
     const calls = stub();
     await boot();
 
@@ -842,12 +1039,7 @@ it('still paints the same status live region in place while the dialog is open',
     const stateWord = byClass('.status-text', 'span');
     const detail = byClass('.status-detail', 'span');
 
-    // An endpoint-requiring harness with a blanked base URL: the send is refused, and a
-    // config failure IS app-level state, so the pill owns the announcement.
     openSettings();
-    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
-    baseURL.value = '';
-    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
 
     byClass('.composer-input', 'textarea').value = 'go';
     byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
@@ -868,41 +1060,42 @@ it('still paints the same status live region in place while the dialog is open',
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
 
-    // The debounced refresh for a BLANK url makes no provider request at all: the boot
-    // read is the only one this test can see (every test that types drains its timer, so
-    // no stale request from a previous instance lands here). The persistent status line
-    // says what to do next.
-    await pastDebounce();
-    expect(modelCalls(calls)).toHaveLength(1);
-    expect(modelStatusLine()).toBe('Set a base URL to load models. Enter a model manually until then.');
+    // A blank base URL is a STATE, not a request: nothing is asked of the provider, and
+    // the persistent status line says what is wrong.
+    expect(modelCalls(calls)).toEqual([]);
+    expect(modelStatusLine()).toBe('No base URL set');
 
-    // The pill still closes from an error state, and reopens on the blanked value.
+    // The pill still closes from an error state, and reopens on the same blank value —
+    // with the select parked on the disabled placeholder rather than a manual fallback.
     button.click();
     expect(document.querySelector('.dialog')).toBeNull();
     button.click();
     expect(byClass('.dialog label.field > input.field-input', 'input').value).toBe('');
-    expect(byClass('.model-manual', 'input').hidden).toBe(false);
+    expect(modelStatusLine()).toBe('No base URL set');
+    expect(modelOptions()).toEqual([['m1 (current)', 'm1', false], ['No models', '', true]]);
 });
 
 // --- the harness server URL (the UI-level server setting) -------------------
 //
 // The dialog is where a reader points this UI at a DIFFERENT harness without a
 // rebuild: the field is prefilled from what this browser saved (or from the automatic
-// root), Apply validates and persists it, and both actions strip the one-load
-// `?apiRoot=` override and reload — because every request URL and the socket are built
-// from the root resolved at module load (./api.ts), and the shell has no in-place
-// reset. `location.reload` is stubbed (see `stubNavigation`), so these tests count the
-// reload instead of performing it.
+// root), Apply validates and persists it, then strips the one-load `?apiRoot=` override
+// and reloads — because every request URL and the socket are built from the root
+// resolved at module load (./api.ts), and the shell has no in-place reset. `location
+// .reload` is stubbed (see `stubNavigation`), so these tests count the reload instead of
+// performing it. Leaving the field BLANK is how you ask for automatic resolution: Apply
+// clears the saved key rather than storing an empty string (that is what replaced the old
+// Reset button — one action, one direction).
 //
 // A click fails LOUDLY whenever the write cannot land, and then changes NOTHING: the
 // reason goes on the refusal line, the dialog stays open with the typed value, no key is
 // written and no reload happens. That covers a malformed URL, a root that normalizes
-// away to `''` (`/`), and a typed Apply in a browser that exposes no `localStorage`; a
-// store that can read but refuses the `remove` fails the same way on Reset. Reloading in
-// any of those cases would land on the OLD root and read as an Apply that silently did
-// nothing. The clear in a browser with NO store is the one case that cannot fail (T5):
-// there is nothing to remove and automatic resolution is what such a browser already
-// gets, so Reset succeeds and reloads.
+// away to `''` (`/`), a typed Apply in a browser that exposes no `localStorage`, and a
+// store that can read but refuses the `remove` for a blank field. Reloading in any of
+// those cases would land on the OLD root and read as an Apply that silently did nothing.
+// The clear in a browser with NO store is the one clear that cannot fail: there is
+// nothing to remove and automatic resolution is what such a browser already gets, so it
+// succeeds and reloads.
 
 it('prefills the server URL from the saved setting, not from a one-load override', async () => {
     // A saved cross-origin root is the whole point of the setting: it is trusted
@@ -914,7 +1107,7 @@ it('prefills the server URL from the saved setting, not from a one-load override
     openSettings();
 
     expect(serverRootInput().value).toBe('https://harness.example.test/v1/harness');
-    expect(lastBodyHint()).toBe(apiRootLine('https://harness.example.test/v1/harness'));
+    expect(serverRootLiveLine()).toBe(apiRootLine('https://harness.example.test/v1/harness'));
 
     byClass('.dialog-close', 'button').click();
 
@@ -929,7 +1122,7 @@ it('prefills the server URL from the saved setting, not from a one-load override
     openSettings();
 
     expect(serverRootInput().value).toBe('https://harness.example.test/v1/harness');
-    expect(lastBodyHint()).toBe(apiRootLine('http://localhost:5000/v1/harness'));
+    expect(serverRootLiveLine()).toBe(apiRootLine('http://localhost:5000/v1/harness'));
 });
 
 it('saves a typed server URL normalized, strips the one-load override, and reloads', async () => {
@@ -961,7 +1154,7 @@ it('saves a typed server URL normalized, strips the one-load override, and reloa
         '{"baseURL":"http://provider/v1","apiKey":"","model":"m1"}'
     );
 
-    serverRootButtons()[0].click();
+    applyButton().click();
 
     expect(navigation.reloads()).toBe(1);
     expect(localStorage.getItem(SERVER_URL_KEY)).toBe('https://harness.example.test/v1/harness');
@@ -991,7 +1184,7 @@ it('refuses a malformed server URL inline and keeps the dialog, the storage and 
     // `normalizeApiRoot` rejects (./api.ts:228).
     field.value = '//evil.example/v1/harness';
     field.dispatchEvent(new Event('input', { bubbles: true }));
-    serverRootButtons()[0].click();
+    applyButton().click();
 
     const status = serverRootStatusLine();
     expect(status.hidden).toBe(false);
@@ -1017,7 +1210,7 @@ it('refuses a malformed server URL inline and keeps the dialog, the storage and 
     expect(serverRootStatusLine().hidden).toBe(true);
     expect(serverRootStatusLine().textContent).toBe('');
     expect(serverRootInput().value).toBe(API_ROOT);
-    expect(lastBodyHint()).toBe(API_ROOT_HINT);
+    expect(serverRootLiveLine()).toBe(API_ROOT_HINT);
     expect(navigation.reloads()).toBe(0);
 });
 
@@ -1035,7 +1228,7 @@ it('refuses a bare "/" server URL inline instead of saving a value that silently
 
     field.value = '/';
     field.dispatchEvent(new Event('input', { bubbles: true }));
-    serverRootButtons()[0].click();
+    applyButton().click();
 
     const status = serverRootStatusLine();
     expect(status.hidden).toBe(false);
@@ -1071,7 +1264,7 @@ it('names a browser with no local storage instead of reloading onto the automati
     // `afterEach` (`vi.unstubAllGlobals`) restores it, and this test restores it itself
     // to inspect the store afterwards.
     vi.stubGlobal('localStorage', undefined);
-    serverRootButtons()[0].click();
+    applyButton().click();
 
     const status = serverRootStatusLine();
     expect(status.hidden).toBe(false);
@@ -1089,13 +1282,13 @@ it('names a browser with no local storage instead of reloading onto the automati
     expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
 });
 
-it('resets to the automatic root even in a browser with no local storage', async () => {
-    // The CLEAR half of the same rule (./api.ts `saveApiRootSetting`, T5): the missing
-    // store may only refuse a value that has to be kept. Reset asks for automatic
-    // resolution, and a browser with no store is already there — `storedApiRoot()` reads
-    // it as "no setting" — so there is nothing to remove and the click must behave like
-    // every other successful Reset: write nothing, show no refusal, drop the one-load
-    // override, reload.
+it('clears to the automatic root even in a browser with no local storage', async () => {
+    // The CLEAR half of the no-store rule (./api.ts `saveApiRootSetting`, T5): the missing
+    // store may only refuse a value that has to be kept. A blank field asks for automatic
+    // resolution, and a browser with no store is already there — `storedApiRoot()` reads it
+    // as "no setting" — so there is nothing to remove and the click must behave like every
+    // other successful clear: write nothing, show no refusal, drop the one-load override,
+    // reload.
     stub();
     await boot();
     openSettings();
@@ -1107,8 +1300,10 @@ it('resets to the automatic root even in a browser with no local storage', async
 
     vi.stubGlobal('localStorage', undefined);
 
-    expect(serverRootButtons()[1].textContent).toBe('Reset');
-    serverRootButtons()[1].click();
+    expect(applyButton().textContent).toBe('Apply');
+    serverRootInput().value = '';
+    serverRootInput().dispatchEvent(new Event('input', { bubbles: true }));
+    applyButton().click();
 
     // Success, not a refusal: the reload happened and the status line stayed empty.
     expect(navigation.reloads()).toBe(1);
@@ -1137,7 +1332,7 @@ it('treats a blank field as automatic: Apply clears the saved URL instead of sto
     const field = serverRootInput();
     field.value = '';
     field.dispatchEvent(new Event('input', { bubbles: true }));
-    serverRootButtons()[0].click();
+    applyButton().click();
 
     // An empty string would be a stored value that resolves to nothing; the key is gone,
     // so the next load walks the documented ladder from the top.
@@ -1145,7 +1340,7 @@ it('treats a blank field as automatic: Apply clears the saved URL instead of sto
     expect(navigation.reloads()).toBe(1);
 });
 
-it('resets to the automatic root: clears the saved URL, drops the override, and reloads', async () => {
+it('clears to the automatic root on a blank field: no saved URL, no override, reload', async () => {
     localStorage.setItem(SERVER_URL_KEY, 'https://harness.example.test/v1/harness');
     stub();
     await boot();
@@ -1154,24 +1349,29 @@ it('resets to the automatic root: clears the saved URL, drops the override, and 
     window.history.replaceState(null, '', '/?apiRoot=http%3A%2F%2Flocalhost%3A5000%2Fv1%2Fharness');
     const navigation = stubNavigation();
 
-    // The secondary button of the row (`Reset`, not `Apply & reconnect`).
-    expect(serverRootButtons()[1].textContent).toBe('Reset');
-    serverRootButtons()[1].click();
+    // The one Apply button, and the blank field that stands in for the old Reset: the
+    // label is asserted here so the removal of the second button cannot go unnoticed.
+    expect(applyButton().textContent).toBe('Apply');
+    serverRootInput().value = '';
+    serverRootInput().dispatchEvent(new Event('input', { bubbles: true }));
+    applyButton().click();
 
     expect(navigation.reloads()).toBe(1);
     expect(localStorage.getItem(SERVER_URL_KEY)).toBeNull();
     expect(navigation.location.search).toBe('');
 
-    // A reset with no failure never shows the refusal line.
+    // A clear with no failure never shows the refusal line.
     expect(serverRootStatusLine().hidden).toBe(true);
 });
 
-it('reports a store that refuses the reset instead of reloading onto the same saved root', async () => {
+it('reports a store that refuses the clear instead of reloading onto the same saved root', async () => {
     // The store here CAN read (the boot resolves the saved root and the field is
-    // prefilled from it) but CANNOT remove. Silently accepting that made Reset a no-op
+    // prefilled from it) but CANNOT remove. Silently accepting that made the clear a no-op
     // the reader could never see finish: the reload re-resolved the very host they just
-    // asked to leave.
+    // asked to leave. The provider payload is seeded rather than left to the bootstrap so
+    // the byte string below is a fact of this test, not of the boot's defaulting.
     localStorage.setItem(SERVER_URL_KEY, 'https://harness.example.test/v1/harness');
+    localStorage.setItem(SETTINGS_KEY, storedSettings('http://provider/v1', '', 'm1'));
     stub();
     await boot();
     openSettings();
@@ -1182,8 +1382,14 @@ it('reports a store that refuses the reset instead of reloading onto the same sa
         throw new Error('SecurityError');
     });
 
-    expect(serverRootButtons()[1].textContent).toBe('Reset');
-    serverRootButtons()[1].click();
+    // A provider edit is staged in the draft as well, so "the refusal changed NOTHING" is
+    // observable on both storage keys and on the field itself.
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+    baseURL.value = 'http://not-committed/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+    serverRootInput().value = '';
+    serverRootInput().dispatchEvent(new Event('input', { bubbles: true }));
+    applyButton().click();
 
     const status = serverRootStatusLine();
     expect(status.hidden).toBe(false);
@@ -1194,10 +1400,19 @@ it('reports a store that refuses the reset instead of reloading onto the same sa
     expect(navigation.reloads()).toBe(0);
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
 
+    // The failure is the WHOLE Apply: the root was validated first, so the provider draft
+    // is still uncommitted, still on screen, and neither key moved.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+    expect(baseURL.value).toBe('http://not-committed/v1');
+
     removeItem.mockRestore();
 
     // Why the reload is the wrong answer: the saved root survived the failed clear.
     expect(localStorage.getItem(SERVER_URL_KEY)).toBe('https://harness.example.test/v1/harness');
+
+    // The staged provider edit armed the catalogue debounce, and that timer outlives the
+    // module instance: drain it HERE so the request cannot land in the next test's stub.
+    await pastDebounce();
 });
 
 // --- the static-host probe moves the root AFTER this dialog was built ---------
@@ -1259,7 +1474,789 @@ it('names the gateway the static-host probe landed on, not the candidate resolve
     // candidate the live binding moved to — and it is provably NOT the stale candidate.
     expect(serverRootInput().value).toBe(live);
     expect(serverRootInput().value).not.toBe(dead);
-    expect(lastBodyHint()).toBe(apiRootLine(live));
+    expect(serverRootLiveLine()).toBe(apiRootLine(live));
+});
+
+// --- the model catalogue lifecycle (F1/F2/F3 + the async states) --------------
+//
+// Every remaining surface of the model group is ASYNC, and a synchronous stub cannot pin a
+// single one of them: when each answer arrives immediately, the newest answer is also the only
+// answer, so a `Loading models…` frame, a superseded lookup, and a lookup that outlives the
+// dialog that started it are all invisible. `delayedJson` therefore returns the `Response`
+// synchronously but closes its BODY on a timer, so the client is genuinely waiting on a request
+// the scenario controls, and `scriptedModels` scripts the ANSWER OF EACH CALL IN ORDER (call 0
+// is boot's read).
+//
+// What this section pins, in dependency order:
+//   - SUPERSESSION: two typed endpoints, overlapping lookups, the FIRST answer arriving LAST.
+//     Exactly one catalogue ends up painted, and it is the second endpoint's (./main.ts
+//     `modelTicket` / `modelRequest?.abort()`);
+//   - F1: a preview that is dismissed mid-flight (or superseded) never touches the PUBLISHED
+//     catalogue the per-agent dropdowns read (./main.ts `agentModelSelectOf` → the shared
+//     `catalogue`), and it is read from both sides: the real per-agent `<select>`, and the reopen
+//     of the dialog itself. `Apply` is the one moment a preview MAY publish, and the applied
+//     endpoint then shows up in every per-agent dropdown;
+//   - the CATALOGUE IDENTITY (./main.ts `ModelLookup`): the app-wide list moves only on a lookup
+//     of the COMMITTED pair — boot, the one a dialog open arms when nothing is known, or `Apply` —
+//     and a preview that is dismissed or superseded never moves it. The identity is the (Base URL,
+//     API key) pair, so applying a key the published list was not fetched with re-asks rather than
+//     publishing the wrong credential's answer;
+//   - F2: dismissing a lookup in flight leaves the state line on the initial wording (never a
+//     `Loading models…` with nothing in flight), and reopening either seeds the published list
+//     or arms exactly one fetch when nothing is known for the committed endpoint;
+//   - the failure line `Could not load models: <server message>` — the only error surface the
+//     group has left — and the fact that a failed PREVIEW costs the published catalogue
+//     nothing;
+//   - F3: with a blank stored model the id the dropdown DISPLAYS is the id `Apply` COMMITS, and
+//     no extra option was invented to get there;
+//   - F7: `Enter` in a text field is the same single commit as the button — once, not twice, and
+//     not at all when the keystroke is an IME confirming a candidate;
+//   - F4: a bootstrap that lands while the dialog is open must not rewrite what the reader is
+//     typing, and must not cost the app its catalogue.
+//
+// Timing: the debounce is 500ms (./main.ts `MODEL_REFRESH_DELAY_MS`). The cases that only need to
+// be "past the debounce" use the real clock and `pastDebounce()`; the two that make claims about
+// WHEN an answer lands run on `vi.useFakeTimers()` (the package convention — ./main.test.ts,
+// ./ui/turns.test.ts, ./ui/tools.test.ts) so every assertion names an exact tick with no slack,
+// and each scripted body reports whether it was actually delivered. `wait()` and `flush()` are
+// real-timer helpers and must not be awaited under the fake clock: their `setTimeout` would never
+// fire, so the fake-clock cases advance the clock instead.
+
+const wait = async (ms: number): Promise<void> => {
+    await new Promise((done) => setTimeout(done, ms));
+};
+
+// The fake-clock replacements. `advance` steps the clock and then yields once more so the promise
+// chain an answer starts (body → `response.json()` → the caller) has settled before the test
+// reads the DOM — the microtask equivalent of what `flush()` does on the real clock.
+const advance = async (ms: number): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(ms);
+    await vi.advanceTimersByTimeAsync(0);
+};
+
+// `boot()` on the fake clock. `main.ts` calls `boot()` without awaiting it, so the import settles
+// as soon as the module body has run; advancing 50ms then drains the microtask-only bootstrap and
+// the COMMITTED `/models` read it arms.
+const bootOnFakeClock = async (): Promise<void> => {
+    await import('./main');
+    await advance(50);
+};
+
+// How many scripted `/models` BODIES have actually been written into their stream. A "the late
+// answer changed nothing" assertion is worthless on its own: the same assertions pass when the
+// answer never arrived at all, so the fixture testifies to the delivery and the case asserts it.
+type BodyDelivery = { bodies: number };
+
+// A `/models` answer whose BODY lands on a timer. The fixture never consults the abort signal, so
+// a cancelled lookup really does receive its answer afterwards — and whether that answer is
+// rejected at the socket or dropped by the ticket, it must not paint.
+const delayedJson = (
+    value: unknown,
+    delay: number,
+    status = 200,
+    delivered?: BodyDelivery
+): Response => {
+    if (delay === 0) {
+        if (delivered !== undefined) delivered.bodies += 1;
+        return json(value, status);
+    }
+
+    return new Response(
+        new ReadableStream<Uint8Array>({
+            start(controller) {
+                window.setTimeout(() => {
+                    controller.enqueue(new TextEncoder().encode(JSON.stringify(value)));
+                    controller.close();
+                    if (delivered !== undefined) delivered.bodies += 1;
+                }, delay);
+            }
+        }),
+        { status, headers: { 'Content-Type': 'application/json' } }
+    );
+};
+
+// One scripted `/models` call: the ids it serves, how long the body takes, and (for a failure)
+// the server's own message and status.
+type ModelAnswer = { ids?: readonly string[]; delay?: number; status?: number; message?: string };
+
+// The route handler IN FRONT of the shared stub's default answers (./stub's first parameter),
+// consuming one scripted answer per call in call order. An exhausted queue answers an empty
+// catalogue rather than throwing, so an unexpected extra lookup still shows up as a changed
+// option list instead of an unrelated failure. Pass a `BodyDelivery` to count the bodies that were
+// actually written (see above).
+const scriptedModels =
+    (answers: readonly ModelAnswer[], delivered?: BodyDelivery): ((url: string) => Response | undefined) => {
+        const queue = [...answers];
+
+        return (url: string): Response | undefined => {
+            if (url !== '/api/models') return undefined;
+
+            const answer = queue.shift() ?? {};
+
+            return answer.message === undefined
+                ? delayedJson({ models: answer.ids ?? [] }, answer.delay ?? 0, 200, delivered)
+                : delayedJson(
+                      { error: { message: answer.message } },
+                      answer.delay ?? 0,
+                      answer.status ?? 502,
+                      delivered
+                  );
+        };
+    };
+
+// The model group's two nodes, captured while the layer is OPEN so a test can keep reading them
+// after a close DETACHES the pane. They are the persistent nodes ./main.ts `endpointBody` owns
+// (that is what `openEndpointDialog` adopts), and the state line must be right in BOTH
+// states — the reader sees it while connected, and the reopen contract depends on what it says
+// while detached.
+const captureModelGroup = (): { readonly status: Element; readonly select: HTMLSelectElement } => {
+    const status = settingsRoot().querySelector('.field .field-hint');
+    if (status === null) throw new Error('missing model status line');
+
+    return { status, select: modelSelect() };
+};
+
+// `[label, value, disabled]` triples for ANY `<select>`, including a DETACHED one that
+// `modelOptions()` cannot reach (it queries through `.dialog`, and a closed layer has removed
+// the pane from the document).
+const optionsOf = (select: HTMLSelectElement): [string | null, string, boolean][] =>
+    [...select.options].map(
+        (option) => [option.textContent ?? null, option.value, option.disabled] as [
+            string | null,
+            string,
+            boolean
+        ]
+    );
+
+// The catalogue the APP publishes, read where it is actually consumed: the per-agent model
+// dropdown inside the agent dialog (./main.ts:6800 → ui/agents.ts `createAgentModelSelect`).
+// Option 0 is the no-override choice labelled with the effective default (here the bootstrap
+// default `m1`), so a published `['m1','m2']` is exactly `['', 'm2']` — and a catalogue that a
+// preview leaked into the app would name the preview's ids instead.
+const publishedCatalogue = (): string[] => {
+    byClass('.agent-control-button', 'button').click();
+    const values = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')].map(
+        (select) => [...select.options].map((option) => option.value)
+    );
+    byClass('.dialog-close', 'button').click();
+
+    if (values.length === 0) throw new Error('no per-agent model dropdown was rendered');
+
+    return values[0] ?? [];
+};
+
+it('paints the newest preview only, when two lookups overlap and the first answer lands last', async () => {
+    // The clock is faked because this case is about WHEN each answer lands: every wait below is an
+    // exact tick, and the delivery tally proves both that the stale answer had NOT landed when the
+    // newest one painted and that it DID land before the "nothing changed" assertions ran.
+    vi.useFakeTimers();
+
+    const delivered: BodyDelivery = { bodies: 0 };
+    const calls = stub(
+        scriptedModels(
+            [
+                // 0: boot's committed read for the saved endpoint — the published catalogue.
+                { ids: ['m1', 'm2'] },
+                // 1: the first typed endpoint, answering 1.5s after its own request.
+                { ids: ['x1', 'x2'], delay: 1500 },
+                // 2: the second typed endpoint, answering at once.
+                { ids: ['y1'] }
+            ],
+            delivered
+        )
+    );
+    await bootOnFakeClock();
+    openSettings();
+
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+
+    baseURL.value = 'http://slow/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+    // The debounce fires at exactly t+500ms, so the first lookup is in flight and its body is a
+    // further 1500ms away. A keystroke is a PREVIEW: the loading state is painted, and only boot's
+    // answer has been delivered.
+    await advance(500);
+    expect(modelCalls(calls)).toHaveLength(2);
+    expect(delivered.bodies).toBe(1);
+    expect(modelStatusLine()).toBe('Loading models…');
+
+    baseURL.value = 'http://fast/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+    // Exactly 1000ms in: the second debounce has fired (t+1000ms) and its answer is immediate, so
+    // `y1` is on screen while the FIRST answer is still 1000ms away (t+2000ms). The tally is what
+    // proves that ordering rather than assuming it.
+    await advance(500);
+    expect(modelCalls(calls)).toHaveLength(3);
+    expect(delivered.bodies).toBe(2);
+    // `m1` is the committed model and the fast endpoint does not list it, so it keeps its
+    // `(current)` entry; the catalogue itself is the second endpoint's, alone.
+    expect(modelOptions()).toEqual([
+        ['m1 (current)', 'm1', false],
+        ['y1', 'y1', false]
+    ]);
+    expect(modelSelect().value).toBe('m1');
+    expect(modelSelect().disabled).toBe(false);
+    expect(modelStatusLine()).toBe('Loaded 1 model from http://fast/v1');
+
+    // t+2000ms: the stale answer has now landed (it was issued under a superseded ticket and its
+    // request was aborted when the new lookup started). It may not repaint the option list, the
+    // selection, or the state line — and it may not have published either, since the endpoint it
+    // dialled was never applied. `delivered` is the proof there was an answer to drop.
+    await advance(1000);
+    expect(delivered.bodies).toBe(3);
+    expect(modelOptions()).toEqual([
+        ['m1 (current)', 'm1', false],
+        ['y1', 'y1', false]
+    ]);
+    expect(modelSelect().value).toBe('m1');
+    expect(modelStatusLine()).toBe('Loaded 1 model from http://fast/v1');
+
+    // One lookup per edit — the debounce still coalesces — and a preview persists nothing.
+    expect(modelCalls(calls)).toHaveLength(3);
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+
+    // The published side of the same fact: neither typed endpoint (`slow`, then `fast`) was ever
+    // applied, so the app-wide catalogue the per-agent dropdowns read still holds the provider
+    // the reader applied. The layer closes first because the agent dialog is the second caller
+    // of `openDialog`, and only one layer should be on screen while it is read.
+    byClass('.dialog-close', 'button').click();
+    expect(publishedCatalogue()).toEqual(['', 'm2']);
+});
+
+it('leaves the published catalogue alone when a preview is dismissed mid-flight, and seeds it back on reopen', async () => {
+    // Fake clock for the same reason as the case above, and a harder one: the whole point here is
+    // that an answer arrives in a dialog that no longer exists, which is only an OBSERVATION once
+    // the fixture has reported delivering it. Remove the ticket check in ./main.ts `refreshModels`
+    // and the two post-delivery assertions below fail; make the answer never arrive and the
+    // delivery count fails. Either way the case discriminates.
+    vi.useFakeTimers();
+
+    const delivered: BodyDelivery = { bodies: 0 };
+    const calls = stub(
+        scriptedModels(
+            [
+                { ids: ['m1', 'm2'] },
+                // A foreign endpoint that answers only after the reader has walked away.
+                { ids: ['x1', 'x2'], delay: 1200 }
+            ],
+            delivered
+        )
+    );
+    await bootOnFakeClock();
+
+    // The app-wide starting point: the provider the reader applied.
+    expect(publishedCatalogue()).toEqual(['', 'm2']);
+
+    openSettings();
+    const group = captureModelGroup();
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+
+    baseURL.value = 'http://foreign/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // t+500ms: the debounce has just fired, so the preview is in flight and the control is
+    // disabled and says so (the state this dialog shows while waiting, pinned here because the
+    // dismiss below has to UNDO it). The foreign body is still 1200ms away.
+    await advance(500);
+    expect(modelCalls(calls)).toHaveLength(2);
+    expect(delivered.bodies).toBe(1);
+    expect(modelSelect().disabled).toBe(true);
+    expect(modelOptions()).toEqual([['Loading models…', '', true]]);
+    expect(modelStatusLine()).toBe('Loading models…');
+
+    // Dismiss mid-flight (./main.ts `cancelModelPreview`): the pending work is gone, the state
+    // line goes back to the initial wording, and the dropdown is enabled again — a
+    // `Loading models…` with nothing in flight would be a lie the reader could not escape.
+    closeWithEscape();
+    expect(group.status.isConnected).toBe(false);
+    expect(group.status.textContent).toBe('Model list not loaded yet.');
+    expect(group.select.disabled).toBe(false);
+
+    // t+1700ms: the foreign answer is now written into the socket of a dialog that no longer
+    // exists, and the guard — not the timing — is what keeps it off the screen. The detached
+    // nodes still say exactly what the cancel said, ids included.
+    await advance(1200);
+    expect(delivered.bodies).toBe(2);
+    expect(group.status.textContent).toBe('Model list not loaded yet.');
+    expect(optionsOf(group.select)).toEqual([
+        ['m1 (current)', 'm1', false],
+        ['No models', '', true]
+    ]);
+    expect(publishedCatalogue()).toEqual(['', 'm2']);
+
+    // The reopen is the proof the published catalogue was untouched: it seeds from `modelIds`,
+    // so the provider the reader DID applied is back on screen with its own state line, not
+    // `No models` and not the foreign ids.
+    openSettings();
+    expect(modelOptions()).toEqual([
+        ['m1', 'm1', false],
+        ['m2', 'm2', false]
+    ]);
+    expect(modelSelect().value).toBe('m1');
+    expect(modelStatusLine()).toBe('Loaded 2 models from http://provider/v1');
+
+    // And the dismiss dropped the pending debounce: still exactly two lookups, the second one
+    // answered into the void.
+    expect(modelCalls(calls)).toHaveLength(2);
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+
+    byClass('.dialog-close', 'button').click();
+});
+
+it('reports the server message when the preview lookup fails, and costs the published catalogue nothing', async () => {
+    // The one error surface the model group has left. The body is the contract's error envelope
+    // and the status is the real one the harness server uses for an upstream provider failure
+    // (./server/api.ts:2756 maps a model-list failure to 502 with the upstream message).
+    const message = 'The provider replied 502 Bad Gateway for GET http://broken/v1/models.';
+    const calls = stub(
+        scriptedModels([
+            { ids: ['m1', 'm2'] },
+            { message, status: 502 }
+        ])
+    );
+    await boot();
+    openSettings();
+
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+    baseURL.value = 'http://broken/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+    await pastDebounce();
+
+    // The server's own text, verbatim, on the state line — not a generic failure word and not a
+    // swallowed reason.
+    expect(modelStatusLine()).toBe(`Could not load models: ${message}`);
+    expect(settingsRoot().querySelector('.field .field-hint')?.classList.contains('is-warning')).toBe(true);
+    // A failure is not a catalogue: the empty placeholder is back, and the stored model is still
+    // selectable rather than silently dropped.
+    expect(modelOptions()).toEqual([
+        ['m1 (current)', 'm1', false],
+        ['No models', '', true]
+    ]);
+    expect(modelSelect().disabled).toBe(false);
+
+    // Dismissing an endpoint that failed leaves the app pointing at the provider that was
+    // actually applied — a failed PREVIEW may not clear the published catalogue.
+    byClass('.dialog-close', 'button').click();
+    expect(publishedCatalogue()).toEqual(['', 'm2']);
+
+    openSettings();
+    expect(modelStatusLine()).toBe('Loaded 2 models from http://provider/v1');
+    expect(modelOptions()).toEqual([
+        ['m1', 'm1', false],
+        ['m2', 'm2', false]
+    ]);
+    byClass('.dialog-close', 'button').click();
+
+    expect(modelCalls(calls)).toHaveLength(2);
+});
+
+it('re-arms one lookup when a reopen knows nothing about the committed endpoint', async () => {
+    // Boot's read FAILS (502), so nothing is published and the state line still carries the
+    // server's reason. `No models` beside a Base URL that is set is exactly the dead end F2 is
+    // about: the only controls the reader has are the two text fields they may not want to touch.
+    const calls = stub(
+        scriptedModels([
+            { message: 'The provider is not reachable.', status: 502 },
+            // The reopen's armed lookup: this time the provider answers.
+            { ids: ['m1', 'm2'] }
+        ])
+    );
+    await boot();
+    openSettings();
+
+    // Nothing was known for the committed Base URL, so opening armed exactly one fetch. The
+    // state line is the honest loading line, not the boot failure and not `No models` alone.
+    expect(modelCalls(calls)).toHaveLength(2);
+    expect(modelStatusLine()).toBe('Loading models…');
+    expect(modelSelect().disabled).toBe(true);
+    expect(modelOptions()).toEqual([['Loading models…', '', true]]);
+
+    await pastDebounce();
+    expect(modelStatusLine()).toBe('Loaded 2 models from http://provider/v1');
+    expect(modelOptions()).toEqual([
+        ['m1', 'm1', false],
+        ['m2', 'm2', false]
+    ]);
+
+    const group = captureModelGroup();
+    closeWithEscape();
+
+    // F2/F5(d): the cancel resets the preview to the CLEAN initial line — the state the group
+    // was in before anything was asked.
+    expect(group.status.textContent).toBe('Model list not loaded yet.');
+    expect(group.select.disabled).toBe(false);
+
+    // And the reopen does NOT ask again: a catalogue is now known for exactly that Base URL, so
+    // it seeds from it. Bounded by construction — one fetch per open, no polling, no TTL, and a
+    // provider that serves zero models never earns a request per open either.
+    openSettings();
+    expect(modelCalls(calls)).toHaveLength(2);
+    expect(modelStatusLine()).toBe('Loaded 2 models from http://provider/v1');
+    expect(modelOptions()).toEqual([
+        ['m1', 'm1', false],
+        ['m2', 'm2', false]
+    ]);
+    byClass('.dialog-close', 'button').click();
+});
+
+it('publishes the applied endpoint into every per-agent model dropdown', async () => {
+    // The positive half of F1, which the negative cases above only imply: `Apply` is the moment a
+    // preview is ALLOWED to become the app-wide catalogue, so the endpoint the reader applied has
+    // to show up in the per-agent dropdowns and not only in the dialog they are looking at.
+    const calls = stub(
+        scriptedModels([
+            // boot's committed read for the stored endpoint.
+            { ids: ['m1', 'm2'] },
+            // what the endpoint the reader then TYPES advertises.
+            { ids: ['p1', 'p2'] }
+        ])
+    );
+    await boot();
+    openSettings();
+
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+    baseURL.value = 'http://applied/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+    await pastDebounce();
+
+    // The preview is the typed endpoint's list, and the stored model is still selectable because
+    // the new endpoint does not advertise it.
+    expect(modelOptions()).toEqual([
+        ['m1 (current)', 'm1', false],
+        ['p1', 'p1', false],
+        ['p2', 'p2', false]
+    ]);
+    expect(modelStatusLine()).toBe('Loaded 2 models from http://applied/v1');
+
+    applyButton().click();
+
+    // What the layer was showing answered for exactly the pair that has just been committed, so
+    // `Apply` moves the APP-WIDE catalogue onto it: the per-agent dropdowns now offer the applied
+    // endpoint's ids. Option 0 is still the no-override choice labelled with the effective default
+    // (`m1`), which is why the first value stays empty.
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://applied/v1', '', 'm1'));
+    expect(publishedCatalogue()).toEqual(['', 'p1', 'p2']);
+
+    // And `Apply` armed no second lookup: the published catalogue already answers for the
+    // committed pair (./main.ts `publishedCatalogueAnswers`), so the corrective request is skipped
+    // by construction rather than by a timing accident.
+    expect(modelCalls(calls)).toHaveLength(2);
+});
+
+it('publishes the server-default catalogue on boot even when the dialog is already open', async () => {
+    // M1. The status pill is live before the bootstrap lands, so the dialog can be open when
+    // `applyDefaults` runs — and it deliberately leaves the draft alone then (./main.ts F4), which
+    // means the fields still name the PRE-boot endpoint when the server's defaults arrive. The boot
+    // lookup belongs to the settings that just landed, not to that draft, and its answer is what
+    // the app-wide catalogue must end up holding. Before this, the comparison of a pre-boot draft
+    // against the fresh settings made the answer un-publishable and every per-agent dropdown stayed
+    // without provider ids for the whole load.
+    vi.useFakeTimers();
+
+    const models = scriptedModels([
+        // 0: the open-time seed, dialling the endpoint the dialog was SHOWING.
+        { ids: ['stale1'] },
+        // 1: boot's committed read, dialling the endpoint the bootstrap just named.
+        { ids: ['m1', 'm2'] }
+    ]);
+    const calls = stub((url) => (url === '/api' ? delayedJson(bootstrap(), 500) : models(url)));
+
+    const loaded = import('./main');
+    for (let attempt = 0; attempt < 20 && document.querySelector('.status-button') === null; attempt += 1) {
+        await advance(25);
+    }
+
+    openSettings();
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+
+    // The layer really is inside the bootstrap window: the field still names the module-load
+    // endpoint, so the server defaults have not landed (and have not been re-synced) yet.
+    expect(baseURL.value).toBe('http://localhost:5500/providers/private/v1');
+
+    // The defaults land, the draft is left alone, and boot dials the endpoint it just learned.
+    await advance(500);
+    await loaded;
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+    expect(baseURL.value).toBe('http://localhost:5500/providers/private/v1');
+
+    // Boot's remaining work is a promise chain rather than a timer, so the clock is stepped until
+    // the composer's agent control exists instead of guessing how many hops it needs.
+    for (
+        let attempt = 0;
+        attempt < 20 && document.querySelector('.agent-control-button') === null;
+        attempt += 1
+    ) {
+        await advance(25);
+    }
+
+    // Each lookup dialled the pair its caller owns, and the wire body is the proof: the second
+    // request carries the SERVER's endpoint even though the dialog is still showing the old one.
+    expect(
+        modelCalls(calls).map(
+            (call) => (call.body as { settings: { base_url: string } }).settings.base_url
+        )
+    ).toEqual(['http://localhost:5500/providers/private/v1', 'http://provider/v1']);
+
+    closeWithEscape();
+
+    // The app-wide catalogue is boot's answer for the committed endpoint, not the pre-boot list the
+    // open dialog had seeded — and boot spent exactly one lookup on it.
+    expect(publishedCatalogue()).toEqual(['', 'm2']);
+    expect(modelCalls(calls)).toHaveLength(2);
+});
+
+it('re-asks for the catalogue when only the API key moved before Apply', async () => {
+    // M2. A catalogue answers for a (Base URL, API key) PAIR, not for a URL: a blank key on the
+    // configured origin means the SERVER's key (../shared/harness-api.ts `RunnerSettingsInput`), so
+    // the key-less list boot published is NOT an answer for the credentialed endpoint. Applying a
+    // typed key INSIDE the 500ms debounce window is the case that used to end the load with the
+    // wrong list published and no corrective request, because both halves of the check were
+    // URL-only.
+    localStorage.setItem(SETTINGS_KEY, '{"baseURL":"http://provider/v1","apiKey":"","model":"m1"}');
+    const calls = stub(
+        scriptedModels([
+            // boot's committed read for (http://provider/v1, '').
+            { ids: ['m1', 'm2'] },
+            // the corrective read `Apply` arms for (http://provider/v1, 'sk-test').
+            { ids: ['k1', 'k2'] }
+        ])
+    );
+    await boot();
+
+    // The app-wide starting point: the key-less answer for the stored URL.
+    expect(publishedCatalogue()).toEqual(['', 'm2']);
+
+    openSettings();
+    const [, apiKey] = [
+        ...document.querySelectorAll<HTMLInputElement>('.dialog label.field > input.field-input')
+    ];
+
+    apiKey.value = 'sk-test';
+    apiKey.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // Pressed before the debounce can fire, so the list on screen is still the KEY-LESS answer for
+    // the same URL. The pending preview is dropped by the close, which is what makes the request
+    // count below exact.
+    applyButton().click();
+
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', 'sk-test', 'm1'));
+    expect(document.querySelector('.dialog')).toBeNull();
+
+    // The key-only change moved the identity, so exactly one corrective lookup is armed — and it
+    // carries the credential that was just committed, which is the whole point of tracking it.
+    const refreshes = modelCalls(calls);
+    expect(refreshes).toHaveLength(2);
+    expect(refreshes[1]?.body).toEqual({
+        settings: { base_url: 'http://provider/v1', api_key: 'sk-test' }
+    });
+
+    await pastDebounce();
+
+    // The load ends with the catalogue fetched under the committed credential, published into the
+    // per-agent dropdowns.
+    expect(publishedCatalogue()).toEqual(['', 'k1', 'k2']);
+});
+
+it('commits the model the dropdown displays when the stored model is blank', async () => {
+    // The one way a blank model still exists: a record written by the previous UI's manual input
+    // (./main.ts `loadSettings` passes `""` straight through). The control can no longer produce
+    // it, so the control must not be allowed to keep it by silently APPLYING it.
+    localStorage.setItem(SETTINGS_KEY, '{"baseURL":"http://provider/v1","apiKey":"","model":""}');
+    const calls = stub();
+    await boot();
+    openSettings();
+
+    // No extra option was invented for the blank case — no `Server default`, no blank entry: the
+    // ids come from the endpoint, and the first advertised id is what the control shows.
+    expect(modelOptions()).toEqual([
+        ['m1', 'm1', false],
+        ['m2', 'm2', false]
+    ]);
+    expect(modelSelect().value).toBe('m1');
+    expect(modelSelect().disabled).toBe(false);
+
+    // The draft moved onto the displayed id WITHOUT persisting: `Apply` is still the only writer,
+    // so the stored bytes are exactly what they were before the open.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', ''));
+
+    applyButton().click();
+
+    // AC3: what the control displayed is what the record now holds. Before this, `Apply` wrote
+    // `""` while the dropdown named `m1` — and re-picking `m1` was no `change` event, so the
+    // reader had no way to fix it.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+    expect(document.querySelector('.dialog')).toBeNull();
+
+    // The blank is gone from the record, so a reopen shows the same id and no second write.
+    openSettings();
+    expect(modelSelect().value).toBe('m1');
+    byClass('.dialog-close', 'button').click();
+
+    expect(modelCalls(calls)).toHaveLength(1);
+});
+
+it('commits from Enter in a text field, exactly once', async () => {
+    stub();
+    await boot();
+    openSettings();
+
+    const navigation = stubNavigation();
+
+    // `Enter` in the harness server URL is the same commit as the button: the body is a plain
+    // `div` (no `<form>`), so the browser would otherwise do nothing at all. The reload count is
+    // the exact-once proof — a double fire would reload twice.
+    const root = serverRootInput();
+    root.value = 'https://harness.example.test/v1/harness';
+    root.dispatchEvent(new Event('input', { bubbles: true }));
+
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    root.dispatchEvent(enter);
+
+    expect(enter.defaultPrevented).toBe(true);
+    expect(navigation.reloads()).toBe(1);
+    expect(localStorage.getItem(SERVER_URL_KEY)).toBe('https://harness.example.test/v1/harness');
+
+    await pastDebounce();
+});
+
+it('commits a provider edit from Enter in the Base URL field without reloading', async () => {
+    stub();
+    await boot();
+    openSettings();
+
+    const navigation = stubNavigation();
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+
+    baseURL.value = 'http://entered/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // A keystroke alone persists nothing (the draft), so the byte string below is the proof that
+    // it was the keypress — and only the keypress — that committed.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+    baseURL.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://entered/v1', '', 'm1'));
+    expect(navigation.reloads()).toBe(0);
+    expect(document.querySelector('.dialog')).toBeNull();
+
+    // Every other key is still just typing: the layer is open afterwards and the draft is all the
+    // key moved, so this handler cannot swallow an ordinary character or a caret.
+    openSettings();
+    const second = byClass('.dialog label.field > input.field-input', 'input');
+    second.value = 'http://typed-not-entered/v1';
+    second.dispatchEvent(new Event('input', { bubbles: true }));
+    second.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true }));
+
+    expect(document.querySelector('.dialog')).not.toBeNull();
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://entered/v1', '', 'm1'));
+
+    byClass('.dialog-close', 'button').click();
+    await pastDebounce();
+});
+
+it('ignores the Enter that confirms an input-method candidate', async () => {
+    // M3: `commitFromEnter` carries the same composition guard the composer's Enter-to-send policy
+    // does (./main.ts, and the IME rule documented above that handler). The candidate-confirming
+    // Enter belongs to the input method, so here it must neither commit the draft nor be prevented
+    // — otherwise a keystroke the reader never meant as a commit persists a half-typed value and
+    // closes the layer while the field still holds the unconfirmed composition buffer.
+    stub();
+    await boot();
+    openSettings();
+
+    const navigation = stubNavigation();
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+
+    baseURL.value = 'http://composing/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+
+    const composing = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        isComposing: true,
+        bubbles: true,
+        cancelable: true
+    });
+    baseURL.dispatchEvent(composing);
+
+    // Nothing committed, nothing closed, and the input method still owns the event.
+    expect(composing.defaultPrevented).toBe(false);
+    expect(document.querySelector('.dialog')).not.toBeNull();
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+    expect(navigation.reloads()).toBe(0);
+
+    // Older engines only report the legacy marker (keyCode 229): same outcome.
+    const legacy = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    Object.defineProperty(legacy, 'keyCode', { value: 229 });
+    baseURL.dispatchEvent(legacy);
+
+    expect(legacy.defaultPrevented).toBe(false);
+    expect(document.querySelector('.dialog')).not.toBeNull();
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+    expect(navigation.reloads()).toBe(0);
+
+    // A real Enter is still the commit, so the guard did not swallow the gesture it guards.
+    baseURL.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://composing/v1', '', 'm1'));
+    expect(document.querySelector('.dialog')).toBeNull();
+
+    await pastDebounce();
+});
+
+it('leaves what the reader is typing when the bootstrap lands with the dialog open', async () => {
+    // F4: the status pill is enabled BEFORE the bootstrap resolves, so the dialog can genuinely
+    // be open when `applyDefaults` runs. The `/api` document is delayed so the reader can get a
+    // field typed inside that window; the server default is a DIFFERENT url from what they typed,
+    // which is what makes a re-sync visible.
+    const bootDocument = delayedJson(bootstrap(), 500);
+
+    stub((url) => (url === '/api' ? bootDocument : undefined));
+    const loaded = import('./main');
+
+    // The module body is what builds the shell and starts `boot()`, so wait for the trigger to
+    // exist rather than guessing a duration — and the document is still 0.5s away when it does.
+    for (let attempt = 0; attempt < 60 && document.querySelector('.status-button') === null; attempt += 1) {
+        await wait(25);
+    }
+
+    openSettings();
+
+    const baseURL = byClass('.dialog label.field > input.field-input', 'input');
+
+    // The proof the layer really is INSIDE the bootstrap window: the field still names the
+    // module-load default, i.e. the server defaults have not landed (and not been re-synced) yet.
+    expect(baseURL.value).toBe('http://localhost:5500/providers/private/v1');
+
+    baseURL.value = 'http://typed-during-boot/v1';
+    baseURL.dispatchEvent(new Event('input', { bubbles: true }));
+
+    await loaded;
+
+    // Wait for the delayed document to land and `applyDefaults` to have run — it writes the
+    // server bytes synchronously — instead of guessing how long the bootstrap takes.
+    for (let attempt = 0; attempt < 60 && localStorage.getItem(SETTINGS_KEY) === null; attempt += 1) {
+        await wait(25);
+    }
+    await flush();
+
+    // The layer is still open, the field still holds the typed value, and the caret position is
+    // untouched — before this, `applyDefaults` re-based the draft and rewrote every control,
+    // deleting the edit while naming the SERVER's bytes in storage.
+    expect(byClass('.dialog', 'div')).not.toBeNull();
+    expect(baseURL.value).toBe('http://typed-during-boot/v1');
+
+    // R4 still holds on the other side: the bytes that landed in storage are the SERVER defaults,
+    // not the uncommitted draft. The next open re-bases from them, exactly as a dismissal does.
+    expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
+
+    closeWithEscape();
+
+    // And the reopen does re-base: the typed edit is gone, as it is after any dismissal.
+    openSettings();
+    expect(byClass('.dialog label.field > input.field-input', 'input').value).toBe('http://provider/v1');
+    byClass('.dialog-close', 'button').click();
+
+    await pastDebounce();
 });
 
 // --- the stylesheet contract --------------------------------------------------
@@ -1341,13 +2338,18 @@ it('styles the pill trigger as a bare wrapper and drops the accordion rules', ()
     expect(body).toContain('gap: 9px');
     expect(body).not.toContain('padding');
 
-    // The server-URL action row: a right-aligned pair under the field it commits, with
-    // the sheet's standard action spacing, and no wrapping surprises at the dialog's
-    // `min-width: min(440px, 100%)`.
+    // The action footer: ONE right-aligned button under the fields it commits, with the
+    // sheet's standard action spacing, separated from the form by the same hairline the
+    // agent dialog uses, and no wrapping surprises at the dialog's
+    // `min-width: min(440px, 100%)`. Absolute positioning would need a positioned ancestor
+    // and would overlap the model status line.
     const actions = blockOf('.endpoint-actions {');
     expect(actions).toContain('display: flex');
     expect(actions).toContain('justify-content: flex-end');
     expect(actions).toContain('gap: 8px');
+    expect(actions).toContain('margin-top: 4px');
+    expect(actions).toContain('padding-top: 12px');
+    expect(actions).toContain('border-top: 1px solid var(--border)');
     expect(actions).not.toContain('position:');
 
     // The disclosure vocabulary is gone from every layer of the sheet.

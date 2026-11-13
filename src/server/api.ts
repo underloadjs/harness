@@ -2595,7 +2595,15 @@ export const createHarnessApi = ({
         ...(entry.min === undefined ? {} : { min: entry.min }),
         ...(entry.max === undefined ? {} : { max: entry.max }),
         ...(entry.step === undefined ? {} : { step: entry.step }),
-        ...(entry.description === undefined ? {} : { description: entry.description })
+        ...(entry.description === undefined ? {} : { description: entry.description }),
+        // The 2026-11-13 display fields (group + nesting), same presence rule as every other
+        // optional key: a plugin that declares neither keeps the exact wire key set it had before
+        // they existed, which is what `src/server/plugins-api.test.ts` pins row by row. `group` is
+        // projected field by field rather than passed through, so only the two contract keys can
+        // reach the wire (closed object) and the plugin's own metadata literal is never shared
+        // with a client that might mutate it — the same reason `pluginRowOf` copies `tags`.
+        ...(entry.group === undefined ? {} : { group: { id: entry.group.id, title: entry.group.title } }),
+        ...(entry.parentKey === undefined ? {} : { parentKey: entry.parentKey })
     });
 
     /**
