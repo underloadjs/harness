@@ -3349,6 +3349,21 @@ export type HarnessSnapshot = {
         // Per-query offsets for progressive discovery; empty when no query has a
         // continued tail.
         offsets: HarnessDiscoveryOffsetSnapshot[];
+        // THE CONVERSATION'S SWITCHES: the names its user has switched off for its agents
+        // (../types `Harness.withheldTools` is the live view). OPTIONAL and omitted while
+        // empty, so a file written before the feature — and every existing fixture — restores
+        // exactly as before with NOTHING switched off; that additive-when-absent shape is why
+        // `HARNESS_SNAPSHOT_VERSION` did not move.
+        //
+        // It carries core and pending-only names too, which `enabled` can never represent:
+        // such a name holds no cap slot, so a restart that restored only `enabled` would hand
+        // every one of them back ON. Restore applies this list LENIENTLY — a name the rebuilt
+        // harness does not register is dropped, never thrown, unlike an unknown `enabled` name
+        // (./harness.ts restore, and ../server/restore-enabled-tool-prune.test.ts's header for
+        // what strictness costs here) — and a name that appears in BOTH lists is treated as
+        // switched off, because that is the only reading of a user's decision that survives a
+        // stale `enabled` entry.
+        withheld?: string[];
     };
     // Tools created at runtime (host `createTool` or the model's toolCreate).
     // `source` is retained and RECOMPILED on restore through the existing
@@ -3864,28 +3879,62 @@ export type Harness = {
     // which is what lets a later turn call a tool discovered earlier. Copied on
     // read; `reset()` empties it.
     readonly discoveredTools: string[];
-    // Whether THIS harness's kernel would let a caller switch one name on or off, stated by
-    // the same predicate the enable/disable operations themselves refuse with (the
-    // `occupiesSearchableSlot` rule behind `toolManage enable|disable`): a name is
-    // switchable only while it resolves to a live definition that is NOT `visibility:
-    // 'core'` and NOT pending-only.
+    // THE CONVERSATION'S TOOL SWITCHES — the names the user of THIS session has switched
+    // off for its agents (`HarnessConfiguration`'s tool panel, `toolManage enable|disable`,
+    // the plugin seam, or a restored `snapshot.discovery.withheld`). Sorted and copied on
+    // every read, so a host can render or diff it without owning the live Set.
+    //
+    // WHY THIS IS A SEAM AT ALL: it is the only place the switch of a `visibility: 'core'`
+    // or pending-only name exists. Such a name never holds a cap slot, so `discoveredTools`
+    // cannot mention it and an over-cap snapshot cannot lose it — before this, the ONLY
+    // answer the kernel had for those names was "always in context, cannot be switched".
+    //
+    // WHAT ONE NAME IN THIS LIST MEANS, precisely (and what it does not):
+    //   - the model never SEES it: the declaration boundary skips it, `toolRequest` does not
+    //     list it at all (not as `forbidden` — simply absent, so a search cannot resurrect
+    //     it), and the launch gate refuses it even for a core or pending-only control;
+    //   - it is PER-SESSION and live: the reads are per model turn and per launch, so
+    //     switching a name while a thread is running lands on that thread's NEXT request,
+    //     with no rebuild and no cap change;
+    //   - it does NOT stop the operator's doors. `executeTool` (the REST/manual execution
+    //     routes) and `context.callTool` (a running tool calling another tool) keep reaching
+    //     any registered name, withheld or not — the switch is for the agents and threads of
+    //     this conversation, never for the tool implementation itself.
+    //
+    // Independent of `discoveredTools` by construction: a name appears in both lists only in
+    // a hand-edited snapshot, and `restore` resolves that in favour of the switch. `reset()`
+    // clears it — a new conversation starts with everything on.
+    readonly withheldTools: readonly string[];
+    // Whether THIS harness's kernel would let a caller move one name in or out of the
+    // SEARCHABLE CAP SET — the cap-slot predicate (`occupiesSearchableSlot`) behind
+    // `setActiveTools`, `enableTools`, the snapshot's `discovery.enabled` list, and restore:
+    // a name qualifies only while it resolves to a live definition that is NOT
+    // `visibility: 'core'` and NOT pending-only.
     //
     // WHY THIS IS A HOST SEAM: `discoveredTools` says which names are ON; it cannot say
-    // which names MAY be switched. A host that re-derives that rule from catalogue metadata
+    // which names MAY hold a slot. A host that re-derives that rule from catalogue metadata
     // gets it wrong in both directions — `toolCancel` is demoted to `visibility:
-    // 'searchable'` at registration yet stays pending-only (so it is refused), while a
-    // searchable preset row such as `shell` looks core-adjacent but is genuinely switchable.
-    // Reading the kernel's own answer is the only version that cannot drift, and it is what
-    // lets a UI state the refusal BEFORE the click instead of discovering it afterwards.
+    // 'searchable'` at registration yet stays pending-only (so it has no slot to move), while
+    // a searchable preset row such as `shell` looks core-adjacent but genuinely holds one.
+    // Reading the kernel's own answer is the only version that cannot drift.
     //
-    // `false` covers three distinct cases the kernel refuses identically: an unregistered
-    // name, a core declaration (always in context, never a cap slot), and a pending-only
-    // runtime control (declared only while actionable). Callers that need the reason ask the
-    // operation itself; this seam answers only the yes/no.
+    // WHAT IT NO LONGER CLAIMS: it is NOT "may this name be switched at all", and it was
+    // never the predicate the switch operations refuse with. Since the session switch
+    // (`withheldTools` above), `toolManage enable|disable`, the plugin seam, and the
+    // operator route accept EVERY registered name, and a core/pending-only name's switch
+    // lives only in the withheld set. A host that treats `false` as "not switchable" today
+    // hides the one control the user most wants to switch off; a host that wants "is this
+    // row cap-managed?" (a `protected` row figure) still reads exactly this.
+    //
+    // `false` therefore means "no searchable cap slot for this name": an unregistered name,
+    // a core declaration, and a pending-only runtime control. The switch itself refuses only
+    // a blank name and an unregistered one; it never refuses these three for being core.
     isToolSwitchable: (name: string) => boolean;
     // Re-runs the `enableAllTools` seed pass on a LIVE harness: one `enableTools` pass over
     // every registered name this harness can switch, minus the names the host's global tool
-    // provider denies, capped at `maxEnabledTools` in registration order (the construction seed,
+    // provider denies AND minus the names this conversation has switched off
+    // (`withheldTools` — the seed is an auto-enable path, so it never overwrites a user's
+    // switch), capped at `maxEnabledTools` in registration order (the construction seed,
     // `src/harness.ts` `seedSwitchableTools`, verbatim — same selection, same cap, same order).
     //
     // ONLY FOR A SEEDED HARNESS: the pass belongs to `enableAllTools`, so a handle built WITHOUT
@@ -5163,12 +5212,23 @@ export type HarnessPluginApi = {
         diagnostic: (report: HarnessPluginDiagnosticReport) => void;
     };
 
-    // Progressive-discovery gate. Both REFUSE a core declaration (it is always in
-    // context, so switching it would be a lie), exactly like `toolManage`'s
-    // enable/disable operations do. `enableTool` may evict an over-cap name.
+    // Progressive-discovery gate, and the SAME session switch `toolManage enable|disable`
+    // performs — one kernel, no weaker plugin path. Both refuse only a blank name and an
+    // unregistered one: a `visibility: 'core'` declaration and a pending-only runtime control
+    // are switchable now (they used to be refused, on the reasoning that switching one could
+    // only be a no-op — true while a switch meant "move a cap slot", no longer true now that
+    // the switch is recorded per conversation). For those names the operation touches the
+    // conversation's withheld set and NO cap slot; for a searchable name it additionally moves
+    // the capped set. `enableTool` may therefore still evict an over-cap name.
+    //
+    // What a plugin CANNOT do with this, on purpose: gate the manual/nested doors. A tool it
+    // switches off is hidden from the agents of this conversation, while `harness.executeTool`
+    // and `context.callTool` keep reaching it.
     enableTool: (name: string) => void;
     disableTool: (name: string) => void;
-    // Names searchable RIGHT NOW, newest first (a detached copy).
+    // Names searchable RIGHT NOW, newest first (a detached copy). NOT the whole story about
+    // what a plugin switched off: a core or pending-only name holds no slot, so it appears in
+    // neither this list nor in its absence — ask the harness handle's `withheldTools` for that.
     enabledTools: () => readonly string[];
 
     // Background tool work. `pending` is the wire view of the board; `wake` emits the

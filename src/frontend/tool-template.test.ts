@@ -292,7 +292,8 @@ const toolMounted = async (): Promise<void> => {
 };
 
 const argsFor = async (name: string): Promise<string> => {
-    const button = document.querySelector<HTMLButtonElement>(`.tool-tab-button[data-tool="${name}"]`);
+    // R1 (swap): the runner opens from the row's corner INFO mark; the tile writes enablement.
+    const button = document.querySelector<HTMLButtonElement>(`.tool-tab-info[data-tool="${name}"]`);
     if (button === null) throw new Error(`missing tool tab button for ${name}`);
     button.click();
     await flush();

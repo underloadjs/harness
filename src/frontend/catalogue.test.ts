@@ -13,6 +13,14 @@
 // run of every tool, so this file asserts NO `.tool-tab-group` exists and still reads the
 // group from the runner head's badge, which is where the figure is actually useful.
 //
+// R1 (the swap) moved the two activations apart: the TILE (`.tool-tab-button`) is now the
+// conversation's enable/disable switch and the row's corner MARK (`.tool-tab-info`,
+// `aria-haspopup="dialog"`) is the only way this list opens a runner. `search` is a
+// `visibility: 'core'` name, so its tile is protected — pressed, `data-locked="protected"`, and
+// pressing it costs no PATCH — which is why every selection below presses the mark. The
+// availability figure this file is about is unchanged by all of it: it still rides
+// `data-availability` on the tile and its note in the runner.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -150,6 +158,17 @@ const toolButtons = (): HTMLButtonElement[] => [
     ...document.querySelectorAll<HTMLButtonElement>('.tool-tab-button')
 ];
 
+// The corner INFO control of one row (R1 swap). Since the swap the tile is the enable/disable
+// switch and this mark is the ONLY thing in the list that opens a tool dialog, so every "select
+// the tool" step in this file presses the mark. `main.ts` `toolInfoButtonOf`.
+const toolMark = (name: string): HTMLButtonElement => {
+    const found = document.querySelector<HTMLButtonElement>(`.tool-tab-info[data-tool="${name}"]`);
+
+    if (found === null) throw new Error(`the ${name} row has no corner info control`);
+
+    return found;
+};
+
 const warningNotes = (): HTMLElement[] =>
     Array.from(document.querySelectorAll<HTMLElement>('.tool-card .tool-note.is-warning'));
 
@@ -194,10 +213,24 @@ it('lists an unconfigured search, explains it, and disables the call', async () 
     expect(button.dataset.tool).toBe('search');
     expect(button.dataset.availability).toBe('unconfigured');
     expect(button.querySelector('.tool-tab-kind')?.textContent).toBe('core · unconfigured');
+    // R1 (swap): the tile states the ENABLED figure and never advertises a layer. `search` is a
+    // core name, so the conversation holds it in context (pressed, green edge) while the kernel
+    // refuses any switch of it — the `protected` marker, not the `disabled` attribute, so the
+    // row keeps its focus and its corner mark keeps opening the runner.
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+    expect(button.dataset.locked).toBe('protected');
+    expect(button.getAttribute('aria-haspopup')).toBeNull();
+    expect(button.disabled).toBe(false);
+    expect(toolMark('search').getAttribute('aria-haspopup')).toBe('dialog');
+    expect(toolMark('search').getAttribute('aria-expanded')).toBe('false');
+    expect(toolMark('search').getAttribute('aria-label')).toBe('Details for search');
 
-    // The Tools tab opens the first entry automatically, so the runner is already
-    // showing search; clicking the entry again is the explicit path.
-    button.click();
+    // The Tools tab opens the first entry automatically, so the runner is already showing
+    // search. The explicit path is the row's CORNER MARK, not the tile: the tile is the
+    // enablement switch, and `search` is a `visibility: 'core'` name, so the conversation reports
+    // it protected and pressing its tile would deliberately write nothing (the switch side of the
+    // swap is pinned in ./tools-tab.test.ts). The mark carries `aria-haspopup="dialog"`.
+    toolMark('search').click();
 
     // The tool opens in the centre; the header describes it without badge clutter.
     expect(document.querySelector('.main-title')?.textContent).toBe('search');
@@ -242,8 +275,19 @@ it('enables the same entry when the server reports it configured', async () => {
     expect(button.dataset.tool).toBe('search');
     expect(button.dataset.availability).toBeUndefined();
     expect(button.querySelector('.tool-tab-kind')?.textContent).toBe('core');
+    // R1 (swap): a configured core entry reads exactly like the unconfigured one from the
+    // switch's side — in context, protected, no layer advertised by the tile. Availability is a
+    // different figure and rides `data-availability` (absent here) and the runner's note.
+    expect(button.getAttribute('aria-pressed')).toBe('true');
+    expect(button.dataset.locked).toBe('protected');
+    expect(button.getAttribute('aria-haspopup')).toBeNull();
 
-    button.click();
+    // The corner mark opens the runner here, for the same reason as above.
+    const mark = toolMark('search');
+
+    expect(mark.getAttribute('aria-expanded')).toBe('false');
+    mark.click();
+    expect(mark.getAttribute('aria-expanded')).toBe('true');
 
     expect(document.querySelector('.main-title')?.textContent).toBe('search');
     expect(document.querySelector('.harness-note')?.textContent).toBe(

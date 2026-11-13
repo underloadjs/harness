@@ -741,8 +741,9 @@ it('keeps a manual playground result out of every conversation board (R7)', asyn
     expect(document.querySelector('.tool-card')).toBeNull();
 
     // Activating the entry opens the shared modal; the runner is adopted inside
-    // `.dialog-body > .tool-runner-slot`, which is where the manual call is made.
-    byClass('.tool-tab-button[data-tool="publish"]', 'button').click();
+    // `.dialog-body > .tool-runner-slot`, which is where the manual call is made. R1 (swap):
+    // that activation is the row's corner INFO mark, not the tile (the tile writes enablement).
+    byClass('.tool-tab-info[data-tool="publish"]', 'button').click();
     await flush();
 
     expect(document.querySelector('.dialog-title')?.textContent).toBe('publish');

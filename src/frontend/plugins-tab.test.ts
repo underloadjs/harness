@@ -95,20 +95,50 @@
 //     fallback — the tick-beside-label row built with `:has()` on the markup that already exists,
 //     and `[hidden] { display: none !important }` still the reveal's only authority.
 //
-// R2 (this pass) FLIPPED the enablement half of that memo: there IS one tick box per
-// row, in the row's top-right corner, and this file pins it end to end —
-//   - every row carries an `input[type=checkbox]` beside the dialog trigger (a SIBLING
-//     inside `.plugin-tab-row`: a `<button>` cannot contain a control, and CSS pins the
-//     box to the corner above the tile so its click never opens the dialog), painted
-//     from the TOP-LEVEL `PluginSummary.enabled` and never from `values.enabled` (which
-//     carries declared settings only, so an undeclared plugin would read as off);
-//   - one click sends `PATCH /plugins/{id}` `{ settings: { enabled: <next> } }` (the
-//     framework's reserved key, accepted for every plugin) and repaints that ONE row from
-//     the row the server answered, with no second catalogue read;
-//   - a refusal prints the server's sentence in the pane's own live line and pulls the
-//     tick back to the state the server has (a native checkbox flipped itself on click);
-//   - R1: the pane, its rows and its tick boxes are usable WHILE A RUN IS PENDING, and a
-//     run that settles underneath the open pane neither throws nor tears the pane down.
+// THE SWAP (this pass, R2 + R3) flipped the enablement half of that memo onto the tile, and the
+// Plugins pane now ships the markup the Tools Catalogue got first — one row wrapper, TWO
+// controls, and one job each. This file pins it end to end:
+//   - the row's TILE is the enablement switch: `<button class="plugin-tab-button">` carrying
+//     `aria-pressed` (the ENABLED figure) and `data-enabled` (the green edge), painted from the
+//     TOP-LEVEL `PluginSummary.enabled` and never from `values.enabled` (which carries declared
+//     settings only, so an undeclared plugin would read as off);
+//   - the tile is NEVER the `disabled` attribute — it keeps focus and keeps answering the press,
+//     and an inert switch says WHY with `data-locked` (`writing` = its own PATCH in flight,
+//     `offline` = no server; there is no `protected` and no idle-window twin here) plus
+//     `aria-disabled`. A locked press costs the conversation no request;
+//   - the row's top-right CORNER IS AN INFO BUTTON (`button.plugin-tab-info`, `Details for
+//     <title>`, the shared `ui/info-icon.ts` glyph) and it is the ONLY dialog opener. It is never
+//     locked, never absent, and it is the layer's `returnFocus` target. "Which layer is open" is
+//     its `aria-expanded`/`data-open`, so the open figure and the enabled edge can never collide
+//     on one element (the accent `--accent-soft` fill left the tile with the old
+//     `[aria-pressed]` rule);
+//   - one tile click sends `PATCH /sessions/{id}/plugins/{id}` `{ settings: { enabled: <next> } }`
+//     (the framework's reserved key, accepted for every plugin) and repaints that ONE row from the
+//     row the server answered, with no second catalogue read. Nothing flips optimistically, so a
+//     refusal has nothing to pull back — the figure simply never moved;
+//   - R4 (the reader's screenshot): an ACCEPTED switch prints NO sentence. The green edge IS the
+//     "is now enabled for this conversation" note, and its absence is the off figure, so the
+//     `.plugins-tab-status` line stays in the footer strip empty and hidden and the pane says
+//     nothing. A REFUSED switch marks the ROW: that row's corner button carries
+//     `data-toggle="error"`, swaps its glyph to the warning mark (`ui/info-icon.ts`,
+//     `WARNING_ICON_PATH`), and folds the server's sentence into its accessible name and `title`
+//     (`Details for <title> · switch failed: <server sentence>`). The topbar pill keeps the full
+//     sentence in its `title` and its live-region child. The figure clears when that row's NEXT
+//     attempt starts and when the list is rebuilt, and it never sits on a row that later succeeded;
+//   - R6: the reserved `enabled` key is not part of the card's readout — `pluginValuesOf` and
+//     `pluginSettingLabel` walk `editableSettingsOf` (the same filter the dialog form uses), so the
+//     `key: value` line spells only what the form edits and the `N settings` badge counts the same
+//     set. A plugin whose only declared key is the master switch reads `read-only` / `no settings`
+//     on the card, in the head and in the dialog — one figure, one source;
+//   - the settings DIALOG no longer renders the reserved `enabled` key at all (main.ts
+//     `editableSettingsOf`): that was the duplicated toggle R3 names — Context Trimmer's `Context
+//     trimming` row and Context Compaction's `Compact conversations` row are the two shipped
+//     cases, filtered generically BY KEY, so no plugin that declares it shows the switch twice.
+//     The policy-block dim (`plugin-settings-groups--off`) survives, derived from the row's
+//     top-level figure, and a plugin left with nothing editable takes the existing read-only
+//     presentation;
+//   - R1: the pane, its rows and its switches are usable WHILE A RUN IS PENDING, and a run that
+//     settles underneath the open pane neither throws nor tears the pane down.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts src/frontend/plugins-tab.test.ts
 
@@ -121,6 +151,10 @@ import { sessionToolPage, sessionToolRow } from './session-config-test-support';
 // stream" signal: it drops the adapter's memoized GET answers, which is what makes a
 // Retry/reload actually reach the fixture instead of re-reading the cached answer.
 import { bumpFixtureEpoch, viewAwareFetch } from './view-test-support';
+// The two glyphs a row's corner mark can wear (./ui/info-icon.ts). R4's contract is stated as
+// DATA: the resting mark is the info glyph, the refusal mark is the warning glyph, and the test
+// reads the `d` that is ACTUALLY mounted rather than trusting a class name the sheet alone paints.
+import { INFO_ICON_PATH, WARNING_ICON_PATH } from './ui/info-icon';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
@@ -581,6 +615,11 @@ type Fixture = {
     // Refuse every settings write with this message/status instead of applying it.
     patchMessage?: string;
     patchStatus?: number;
+    // R4: refuse only the FIRST N writes, and apply the rest. `patchMessage` alone refuses
+    // forever, which cannot pin the lifecycle the reader needs: a refusal marks the row, and the
+    // row's NEXT accepted switch has to take that mark back off. With this knob a test states the
+    // sequence instead of arranging two servers.
+    patchFailures?: number;
     // R1: boot with a conversation that is STILL RUNNING, so every assertion in the test
     // is made with the shell's pending lock held — the state the catalogues used to hide
     // themselves in.
@@ -601,7 +640,7 @@ type Fixture = {
 const pluginRoutes = (
     fixture: Fixture,
     calls: Call[],
-    state: { reads: number }
+    state: { reads: number; patches: number }
 ): ((url: string, method: string | undefined, body: unknown) => Response | undefined) => {
     // A MUTABLE store, so a saved value is what the next read answers as well (the server
     // persists overrides; the client normally never re-reads them, but a Retry must see
@@ -643,7 +682,12 @@ const pluginRoutes = (
 
             if (row === undefined) return json({ error: { message: `Unknown plugin ${name}` } }, 404);
 
-            if (fixture.patchMessage !== undefined) {
+            // R4: `patchFailures` bounds the refusal — the first N writes are refused and the rest
+            // are applied, which is the only way one test can pin the whole lifecycle (refusal puts
+            // the warning mark on the row, the next ACCEPTED switch takes it off).
+            if (fixture.patchMessage !== undefined && (fixture.patchFailures === undefined || state.patches < fixture.patchFailures)) {
+                state.patches += 1;
+
                 return json({ error: { message: fixture.patchMessage } }, fixture.patchStatus ?? 400);
             }
 
@@ -674,7 +718,7 @@ const stub = (fixture: Fixture = {}): { calls: Call[]; dialed: string[]; settleR
     const dialed: string[] = [];
     // `settled` is A5's knob: the bounded fallback refresh answers with the terminal
     // record once the test flips it, which is the run completing WHILE the pane is open.
-    const state = { reads: 0, settled: false };
+    const state = { reads: 0, patches: 0, settled: false };
     const plugins = pluginRoutes(fixture, calls, state);
 
     const raw = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response | undefined> => {
@@ -805,10 +849,25 @@ const pluginRow = (name: string): HTMLButtonElement => {
     return found;
 };
 
-// The corner tick box of one plugin row. `input`, not the old `role="switch"` button:
-// the native control carries the state in `checked` and needs no ARIA mirror.
-const pluginBox = (name: string): HTMLInputElement =>
-    byClass(`.plugin-tab-enable[data-plugin="${name}"]`, 'input');
+// The corner INFO button of one plugin row — the ONLY way this list opens a settings dialog
+// since the swap (main.ts `pluginInfoButtonOf`). It is the tile's SIBLING inside
+// `.plugin-tab-row`, never nested in it, and it is the dialog's `returnFocus` target.
+const pluginInfo = (name: string): HTMLButtonElement =>
+    byClass(`.plugin-tab-info[data-plugin="${name}"]`, 'button');
+
+// One corner mark as DATA (R4): the state hook it carries and the glyph it is WEARING. The PAIR is
+// the contract — `data-toggle='error'` with the info path still mounted, or a warning path with no
+// hook, is a mark whose shape and colour disagree, and the sheet paints only the hook.
+const markState = (control: HTMLButtonElement): string =>
+    `${control.dataset.toggle ?? 'idle'}:${control.querySelector('path')?.getAttribute('d') === WARNING_ICON_PATH ? 'warning' : 'info'}`;
+
+// The mark's accessible name and its tooltip, stated together: this UI's standing rule is that a
+// `title` is never the only signal, so the two carry the SAME words — in the failure state, the
+// server's sentence along with them.
+const markNaming = (control: HTMLButtonElement): string[] => [
+    control.getAttribute('aria-label') ?? '',
+    control.title
+];
 
 // The rows the pane is showing, in server order — stated as the rows' own keys rather
 // than as their rendered text.
@@ -1051,6 +1110,17 @@ it('opens the pane from the toggle, reads the catalogue on first open, and lists
     expect(footer.lastElementChild).toBe(refresh);
     expect([...pane.children]).toEqual([head, byClass('.plugin-tab-list', 'div'), footer]);
     expect(pane.lastElementChild).toBe(footer);
+    // R4: the line is still THERE, and it is EMPTY AND HIDDEN. The reader asked for no "X is now
+    // enabled for this conversation." note — the row's green edge is that figure — so main.ts keeps
+    // the element (its `role="status"` + `aria-live` and the sheet's `.plugins-tab-status` /
+    // `.plugins-tab-status-error` contract all survive) and writes nothing into it. The hidden
+    // start is what stops an empty `<p>` from costing the footer a line of height, and it is the
+    // same state a toggle leaves the line in (pinned in the switch tests below).
+    expect(statusLine.textContent).toBe('');
+    expect(statusLine.hidden).toBe(true);
+    expect(statusLine.className).toBe('plugins-tab-status field-hint');
+    expect(statusLine.getAttribute('role')).toBe('status');
+    expect(statusLine.getAttribute('aria-live')).toBe('polite');
 
     // Every shipped plugin is a row, in the page order the server sent.
     expect(pluginNames()).toEqual(['async-ping', 'context-compaction', 'quiet-observer']);
@@ -1064,9 +1134,20 @@ it('opens the pane from the toggle, reads the catalogue on first open, and lists
     expect(compaction.querySelector('.plugin-tab-desc')?.textContent).toBe(compactionRow().description);
     expect(compaction.querySelector('.plugin-tab-meta')?.textContent).toBe('1 hook · 1 setting · built-in');
     expect(compaction.querySelector('.plugin-tab-values')?.textContent).toBe('contextLimit: 100000');
-    expect(compaction.getAttribute('aria-haspopup')).toBe('dialog');
-    expect(compaction.getAttribute('aria-pressed')).toBe('false');
+    // R2 (swap): the tile is a SWITCH, not a popup opener. `aria-haspopup` belongs to the corner
+    // mark (the control that actually opens a layer), and `aria-pressed` on this node is the
+    // row's ENABLED figure — the same figure as its `data-enabled` green edge. Nothing is
+    // `disabled` in this pane: an inert switch says so with `data-locked` + `aria-disabled`, and
+    // the mark beside it always opens.
+    expect(compaction.getAttribute('aria-haspopup')).toBeNull();
+    expect(compaction.getAttribute('aria-pressed')).toBe('true');
+    expect(compaction.dataset.enabled).toBe('true');
     expect(compaction.disabled).toBe(false);
+    expect(compaction.hasAttribute('data-locked')).toBe(false);
+    expect(compaction.hasAttribute('aria-disabled')).toBe(false);
+    expect(compaction.title).toBe(
+        'Enabled for this conversation · click to switch context-compaction off'
+    );
 
     expect(pluginRow('async-ping').querySelector('.plugin-tab-meta')?.textContent).toBe(
         '6 hooks · 1 setting · built-in'
@@ -1078,43 +1159,52 @@ it('opens the pane from the toggle, reads the catalogue on first open, and lists
     );
     expect(pluginRow('quiet-observer').querySelector('.plugin-tab-values')?.textContent).toBe('no settings');
 
-    // R2: every row carries its tick box BESIDE the trigger, in the wrapper's corner (the
-    // row is a `.plugin-tab-row`: a `<button>` cannot contain a control). `enabled` is the
-    // TOP-LEVEL row field, and quiet-observer is the row the server reports as OFF — its
-    // settings map is empty, so a painter that read `values.enabled` would paint this row
-    // on by accident.
+    // R2 (swap): every row carries its INFO mark BESIDE the switch tile, in the wrapper's corner
+    // (the row is a `.plugin-tab-row`: a `<button>` cannot contain a control), and that mark —
+    // not the tile — opens the dialog. `enabled` is the TOP-LEVEL row field the tile paints from,
+    // and quiet-observer is the row the server reports as OFF — its settings map is empty, so a
+    // painter that read `values.enabled` would paint this row on by accident.
+    const info = pluginInfo('context-compaction');
+
     expect(pluginRow('context-compaction').parentElement?.className).toBe('plugin-tab-row');
-    expect(pluginRow('context-compaction').nextElementSibling?.className).toBe('plugin-tab-enable is-on');
+    expect(pluginRow('context-compaction').nextElementSibling).toBe(info);
+    expect(info.previousElementSibling).toBe(pluginRow('context-compaction'));
     expect(pluginRow('context-compaction').dataset.enabled).toBe('true');
 
-    const compactionSwitch = pluginBox('context-compaction');
+    // A real `<button type="button">` (Enter/Space work natively), icon-only, named once: the
+    // <svg> glyph is `aria-hidden`, so `aria-label` is the whole name and `title` says the same
+    // words for the eye. `aria-haspopup` advertises the layer and `aria-expanded` says whether it
+    // is open — false while the catalogue is showing — and no figure of the switch lives here.
+    expect(info.type).toBe('button');
+    expect(info.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+    expect(info.hasAttribute('data-open')).toBe(false);
+    expect(info.getAttribute('aria-label')).toBe('Details for Context Compaction');
+    expect(info.title).toBe('Details for Context Compaction');
+    expect(info.hasAttribute('aria-pressed')).toBe(false);
+    expect(info.disabled).toBe(false);
 
-    // A real checkbox: `checked` is the state (no `role`, no `aria-checked`), the
-    // accessible name is the ACTION, and the box sits OUTSIDE the tile so its click can
-    // never open the dialog.
-    expect(compactionSwitch.type).toBe('checkbox');
-    expect(compactionSwitch.checked).toBe(true);
-    expect(compactionSwitch.dataset.enabled).toBe('true');
-    expect(compactionSwitch.getAttribute('role')).toBeNull();
-    expect(compactionSwitch.getAttribute('aria-checked')).toBeNull();
-    expect(compactionSwitch.getAttribute('aria-label')).toBe('Disable Context Compaction');
-    expect(compactionSwitch.title).toBe(
-        'Enabled for this conversation · click to switch context-compaction off'
-    );
-    expect(compactionSwitch.disabled).toBe(false);
-    expect(compactionSwitch.closest('.plugin-tab-row')?.contains(compactionSwitch)).toBe(true);
-    expect(compactionSwitch.closest('.plugin-tab-button')).toBeNull();
+    // The shared glyph (./ui/info-icon.ts), decorative and the mark's only child.
+    const glyph = info.querySelector('svg');
 
-    // The OFF row states OFF, and no row is ever nested in another control.
-    const quietSwitch = pluginBox('quiet-observer');
+    expect(info.children).toHaveLength(1);
+    expect(glyph?.getAttribute('class')).toBe('info-icon');
+    expect(glyph?.getAttribute('viewBox')).toBe('0 0 24 24');
+    expect(glyph?.getAttribute('aria-hidden')).toBe('true');
 
-    expect(quietSwitch.checked).toBe(false);
-    expect(quietSwitch.className).toBe('plugin-tab-enable is-off');
-    expect(quietSwitch.getAttribute('aria-label')).toBe('Enable Quiet Observer');
-    expect(pluginRow('quiet-observer').dataset.enabled).toBe('false');
+    // The OFF row states OFF on its tile, and its mark is IDENTICAL in kind: a row the reader
+    // cannot switch still has a dialog to open, so the mark is never locked and never absent.
+    const quietSwitch = pluginRow('quiet-observer');
+
+    expect(quietSwitch.dataset.enabled).toBe('false');
+    expect(quietSwitch.getAttribute('aria-pressed')).toBe('false');
+    expect(quietSwitch.title).toBe('Disabled for this conversation · click to switch quiet-observer on');
+    expect(pluginInfo('quiet-observer').getAttribute('aria-expanded')).toBe('false');
+    expect(pluginInfo('quiet-observer').hasAttribute('data-locked')).toBe(false);
     expect(document.querySelector('.plugin-tab-button .plugin-tab-button')).toBeNull();
-    // One box per row, and nothing left of the pill it replaced.
-    expect(document.querySelectorAll('.plugin-tab-enable')).toHaveLength(3);
+    // One mark per row, and nothing left of the checkbox vocabulary it replaced.
+    expect(document.querySelectorAll('.plugin-tab-info')).toHaveLength(3);
+    expect(document.querySelectorAll('.plugin-tab-enable')).toHaveLength(0);
     expect(document.querySelectorAll('.plugin-tab-toggle')).toHaveLength(0);
 
     // The composer and the agent control are hidden while the pane owns the column.
@@ -1186,57 +1276,81 @@ it('keeps the plugins view and the tools view mutually exclusive in both directi
     expect(pluginCountReads(dialed)).toBe(1);
 });
 
-// --- the row tick box (R2) ---------------------------------------------------
+// --- the row switch (R2, flipped onto the tile by the swap) ------------------
 
-it('switches a plugin off and back on with one click, and repaints the row from the server answer', async () => {
+it('switches a plugin off and back on with one tile click, and repaints the row from the server answer', async () => {
     const { calls, dialed } = stub();
     await boot();
     openPlugins();
     await flush();
 
     const row = pluginRow('context-compaction');
-    const control = pluginBox('context-compaction');
+    const info = pluginInfo('context-compaction');
 
-    control.click();
+    row.click();
 
-    // In flight: the native box has flipped itself, the control is locked (one PATCH per
-    // press), and it says so on itself.
-    expect(control.checked).toBe(false);
-    expect(control.disabled).toBe(true);
-    expect(control.getAttribute('aria-busy')).toBe('true');
+    // IN FLIGHT, and the first thing to say is that the FIGURE HAS NOT MOVED. A toggle button
+    // never flips itself the way the old native checkbox did, so `aria-pressed`/`data-enabled`
+    // still state what the server last reported; the cache only moves with a successful answer.
+    // What DOES move is the lock: one PATCH per press, named on the control it belongs to.
+    expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
+    expect(row.getAttribute('aria-busy')).toBe('true');
+    expect(row.dataset.locked).toBe('writing');
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    expect(row.title).toBe('Switching this plugin for this conversation…');
+
+    // THE NEW NO-OP PATH: the tile is never the `disabled` attribute — it has to stay focusable
+    // and its corner mark has to keep opening the dialog — so a locked tile answers the press and
+    // writes NOTHING. The guard lives in the handler (main.ts `buildPluginsTab`), not in the
+    // attribute, and this is the half that proves it.
+    row.click();
+    row.click();
 
     await flush();
     await flush();
 
-    // Exactly one write, and it carries the reserved key as the whole settings map: the
-    // framework accepts `enabled` for every plugin (../shared/harness-api.ts
+    // Exactly one write for THREE presses, and it carries the reserved key as the whole settings
+    // map: the framework accepts `enabled` for every plugin (../shared/harness-api.ts
     // `PluginSettingsUpdate`), and an omitted key is no change.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
         { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
     ]);
     expect(dialed.filter((line) => line === 'PATCH /v1/harness/sessions/s1/plugins/context-compaction')).toHaveLength(1);
 
-    // The answer IS the new state: the SAME nodes are repainted in place (the row stays
-    // the trigger the dialog would hand focus back to), and the box now reads off — box,
-    // `data-enabled` and the tile's green `--ok-line` edge move together, so a tick and a
-    // green-edged row can never disagree.
+    // The answer IS the new state: the SAME nodes are repainted in place (both stay the nodes a
+    // dialog hands focus back to), and the tile's three readings of one figure move together —
+    // `aria-pressed`, `data-enabled` and the green `--ok-line` edge (styles.css).
     expect(pluginRow('context-compaction')).toBe(row);
     expect(row.dataset.enabled).toBe('false');
-    expect(byClass('.plugin-tab-enable[data-plugin="context-compaction"]', 'input')).toBe(control);
-    expect(control.className).toBe('plugin-tab-enable is-off');
-    expect(control.checked).toBe(false);
-    expect(control.dataset.enabled).toBe('false');
-    expect(control.getAttribute('aria-label')).toBe('Enable Context Compaction');
-    expect(control.disabled).toBe(false);
-    expect(control.getAttribute('aria-busy')).toBe('false');
+    expect(row.getAttribute('aria-pressed')).toBe('false');
+    expect(row.getAttribute('aria-label')).toBeNull();
+    expect(row.title).toBe('Disabled for this conversation · click to switch context-compaction on');
+    expect(row.hasAttribute('data-locked')).toBe(false);
+    expect(row.hasAttribute('aria-disabled')).toBe(false);
+    expect(row.getAttribute('aria-busy')).toBe('false');
+    expect(row.disabled).toBe(false);
 
-    // The switch line states the accepted figure, the COUNT line keeps counting, and the
-    // other rows were not touched.
-    expect(byClass('.plugins-tab-status', 'p').textContent).toBe(
-        'Context Compaction is now disabled for this conversation.'
-    );
-    expect(byClass('.plugins-tab-status', 'p').hidden).toBe(false);
+    // The corner mark was NOT touched by an ACCEPTED write: "enabled" and "this row's layer is
+    // open" are two figures with two painters, the mark is never locked, and R4 added a third
+    // figure it owns — the refusal mark — which an accepted switch leaves off entirely.
+    expect(pluginInfo('context-compaction')).toBe(info);
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+    expect(info.hasAttribute('data-open')).toBe(false);
+    expect(info.hasAttribute('data-locked')).toBe(false);
+    expect(info.disabled).toBe(false);
+    expect(markState(info)).toBe('idle:info');
+    expect(markNaming(info)).toEqual(['Details for Context Compaction', 'Details for Context Compaction']);
+    expect(info.children).toHaveLength(1);
+
+    // R4: the accepted switch prints NO sentence. The tile's edge (asserted above) IS the report the
+    // reader asked for, and the footer line stays empty and hidden — the element survives, its
+    // content does not. The pill still returns to `idle`.
+    expect(byClass('.plugins-tab-status', 'p').textContent).toBe('');
+    expect(byClass('.plugins-tab-status', 'p').hidden).toBe(true);
     expect(byClass('.plugins-tab-status', 'p').className).toBe('plugins-tab-status field-hint');
+    expect(document.body.textContent).not.toContain('is now disabled for this conversation');
+    expect(document.body.textContent).not.toContain('is now enabled for this conversation');
     // The count sentence survives ONLY in the view head subtitle now (the pane's own copy is
     // deleted), and an enablement write does not repaint the switch line away: the two
     // channels stay independent, exactly as they were when the pane carried its own line.
@@ -1246,17 +1360,25 @@ it('switches a plugin off and back on with one click, and repaints the row from 
     expect(pluginRow('async-ping').dataset.enabled).toBe('true');
     expect(byClass('.status-text', 'span').textContent).toBe('idle');
 
-    // The cache took the answer, so a reopen shows the server's state and the visit still
-    // costs exactly ONE catalogue read.
-    row.click();
+    // The mark still opens the layer over the switched-off row, and dismissal lands the reader
+    // back on the MARK they pressed (main.ts passes it as `returnFocus`) — the control that is
+    // never inert, which is the whole reason the opener moved off the switchable tile.
+    info.click();
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
+    expect(info.getAttribute('aria-expanded')).toBe('true');
+    expect(info.dataset.open).toBe('true');
     byClass('.dialog-close', 'button').click();
     await flush();
+
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+    expect(info.hasAttribute('data-open')).toBe(false);
+    expect(document.activeElement).toBe(info);
+    // The cache took the answer, so the visit still costs exactly ONE catalogue read.
     expect(pluginCountReads(dialed)).toBe(1);
 
     // A second press inverts what the SERVER last reported, not what this list frame was
     // built from: the round trip goes back on.
-    control.click();
+    row.click();
     await flush();
     await flush();
 
@@ -1266,14 +1388,15 @@ it('switches a plugin off and back on with one click, and repaints the row from 
         method: 'PATCH',
         body: { settings: { enabled: true } }
     });
-    expect(control.checked).toBe(true);
-    expect(control.className).toBe('plugin-tab-enable is-on');
     expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
 });
 
-it('states a refused switch with the server sentence and leaves the row exactly as the server has it', async () => {
+it('marks a refused switch on that row\u2019s corner mark and leaves the row exactly as the server has it', async () => {
     // The shipped row is enabled, and this refusal is the settings save's own shape: the
-    // server's sentence verbatim, nothing reset, and the control re-armed.
+    // server's sentence verbatim, nothing reset, and the control re-armed. R4 moved WHERE that
+    // sentence is told: the row's own mark (red warning glyph) and the topbar pill, not a line
+    // under the pane title.
     const message = 'context-compaction cannot be switched off while a run is held.';
     const { calls, dialed } = stub({ patchMessage: message, patchStatus: 403 });
 
@@ -1282,12 +1405,18 @@ it('states a refused switch with the server sentence and leaves the row exactly 
     await flush();
 
     const row = pluginRow('context-compaction');
-    const control = pluginBox('context-compaction');
+    const info = pluginInfo('context-compaction');
 
-    control.click();
-    // The native box flipped itself on the click. A refusal wrote nothing, so this is the
-    // tick the repaint has to pull back.
-    expect(control.checked).toBe(false);
+    row.click();
+    // The figure NEVER moved optimistically, so a refusal has nothing to pull back: this is the
+    // difference between a toggle button and the native checkbox this replaced, which flipped
+    // itself on the click and had to be dragged back to the server's figure.
+    expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
+    expect(row.dataset.locked).toBe('writing');
+    // While the write is out the mark is still the resting one: a refusal has not happened yet,
+    // and an in-flight row must not already look failed.
+    expect(markState(info)).toBe('idle:info');
 
     await flush();
     await flush();
@@ -1296,45 +1425,179 @@ it('states a refused switch with the server sentence and leaves the row exactly 
         { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
     ]);
 
-    // Nothing moved: the row and its box still state the figure the server has, and the
-    // refusal is on the switch line, classed as a failure as well as coloured.
-    expect(byClass('.plugins-tab-status', 'p').textContent).toBe(message);
-    expect(byClass('.plugins-tab-status', 'p').className).toBe('plugins-tab-status plugins-tab-status-error');
-    expect(control.checked).toBe(true);
-    expect(control.className).toBe('plugin-tab-enable is-on');
-    expect(control.dataset.enabled).toBe('true');
-    expect(control.getAttribute('aria-label')).toBe('Disable Context Compaction');
-    expect(control.disabled).toBe(false);
+    // THE FAILURE FIGURE (R4): this row's mark wears the warning glyph and carries `data-toggle=
+    // 'error'`, the hook the sheet paints red (`--danger` edge + glyph, styles.css
+    // `.plugin-tab-info[data-toggle='error']`). Shape AND hook move together, and the reason is in
+    // the control's name and its tooltip — a `title` is never the only signal here.
+    expect(markState(info)).toBe('error:warning');
+    expect(info.querySelector('path')?.getAttribute('d')).toBe(WARNING_ICON_PATH);
+    expect(info.children).toHaveLength(1);
+    expect(markNaming(info)).toEqual([
+        `Details for Context Compaction · switch failed: ${message}`,
+        `Details for Context Compaction · switch failed: ${message}`
+    ]);
+    // Everything the mark has ALWAYS stated is untouched by it: it still only opens the settings
+    // dialog, it is still not locked, and the row's own figures are where they were.
+    expect(info.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+    expect(info.hasAttribute('data-open')).toBe(false);
+    expect(info.disabled).toBe(false);
+
+    // Nothing moved on the tile: it still states the figure the server has, and its lock is OFF
+    // again because the write is no longer in flight.
     expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
+    expect(row.title).toBe('Enabled for this conversation · click to switch context-compaction off');
+    expect(row.hasAttribute('data-locked')).toBe(false);
+    expect(row.hasAttribute('aria-disabled')).toBe(false);
+    expect(row.getAttribute('aria-busy')).toBe('false');
+    expect(row.disabled).toBe(false);
+
+    // The refusal prints NOTHING in the pane (R4 — the line the screenshot showed is gone), and it
+    // is not merely overwritten: the element stays empty AND hidden, so a sentence from an earlier
+    // attempt can never linger under a row that has since switched clean.
+    expect(byClass('.plugins-tab-status', 'p').textContent).toBe('');
+    expect(byClass('.plugins-tab-status', 'p').hidden).toBe(true);
+    expect(byClass('.plugins-tab-status', 'p').className).toBe('plugins-tab-status field-hint');
+    // The sentence is not printed ANYWHERE in the pane — the mark names it, the pill carries it.
+    expect(byClass('.plugins-pane', 'div').textContent).not.toContain(message);
+    // The other rows never borrow a refusal that is not theirs.
+    expect(markState(pluginInfo('async-ping'))).toBe('idle:info');
+    expect(markState(pluginInfo('quiet-observer'))).toBe('idle:info');
     // The cache was not touched, so the head subtitle still describes the same three rows
     // (it is the only place that sentence renders since the pane's own copy was deleted).
     expect(byClass('.harness-note', 'p').textContent).toBe(
         '3 plugins · auto-scanned · settings save for this conversation'
     );
+    // The pill is NOT weakened by the mark: it states the word, and its `title` plus its hidden
+    // live-region child carry the server's sentence in full, verbatim.
     expect(byClass('.status-text', 'span').textContent).toBe('error');
+    expect(byClass('.status-detail', 'span').textContent).toBe(`plugin enablement: ${message}`);
+    expect(byClass('.status', 'span').title).toBe(`plugin enablement: ${message}`);
 
-    // And the failed write is not memoized: the next press dials again.
-    control.click();
+    // And the failed write is not memoized: the next press dials again — and it CLEARS the mark the
+    // moment the attempt starts, so a row never wears a warning for a write it has already redone.
+    row.click();
+    expect(markState(info)).toBe('idle:info');
+    expect(markNaming(info)).toEqual(['Details for Context Compaction', 'Details for Context Compaction']);
+
     await flush();
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(2);
     expect(pluginCountReads(dialed)).toBe(1);
+    // Refused again, so the figure is back on — it is a figure of the LAST attempt, not of the
+    // first one.
+    expect(markState(info)).toBe('error:warning');
+    expect(markNaming(info)).toEqual([
+        `Details for Context Compaction · switch failed: ${message}`,
+        `Details for Context Compaction · switch failed: ${message}`
+    ]);
 });
 
-// R2's click separation: the corner box and the tile are two controls in one row, and
+it('takes the refusal mark off a row whose next switch is accepted, and leaves the others alone', async () => {
+    // The half the reader experiences: press, get refused, press again, and this time it lands. The
+    // warning must never stick to a row that later succeeded — R4's clear-attempt-plus-success
+    // rule, pinned end to end with ONE server that refuses only the first write.
+    const message = 'context-compaction is held by another turn.';
+    const { calls } = stub({ patchMessage: message, patchStatus: 403, patchFailures: 1 });
+
+    await boot();
+    openPlugins();
+    await flush();
+
+    const row = pluginRow('context-compaction');
+    const info = pluginInfo('context-compaction');
+
+    row.click();
+    await flush();
+    await flush();
+
+    expect(markState(info)).toBe('error:warning');
+    expect(row.dataset.enabled).toBe('true');
+
+    // The retry is ACCEPTED (the fixture refuses one write only), so the row ends switched ON and
+    // clean: green edge, pressed toggle, plain info mark, no sentence anywhere.
+    row.click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(2);
+    expect(row.dataset.enabled).toBe('false');
+    expect(row.getAttribute('aria-pressed')).toBe('false');
+    expect(markState(info)).toBe('idle:info');
+    expect(info.querySelector('path')?.getAttribute('d')).toBe(INFO_ICON_PATH);
+    expect(markNaming(info)).toEqual(['Details for Context Compaction', 'Details for Context Compaction']);
+    expect(byClass('.plugins-tab-status', 'p').hidden).toBe(true);
+    expect(byClass('.plugins-tab-status', 'p').textContent).toBe('');
+    expect(byClass('.status-text', 'span').textContent).toBe('idle');
+    // The refusal the row carried is gone from every surface the pane owns — and the mark is back to
+    // opening the dialog with its resting name.
+    expect(document.body.textContent).not.toContain(message);
+
+    info.click();
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
+    byClass('.dialog-close', 'button').click();
+    await flush();
+});
+
+it('keeps the refusal mark off the other rows, and rebuilds the list clean', async () => {
+    // Two figures that must not spread: a refusal belongs to ONE row, and a rebuilt list starts
+    // clean (main.ts clears `pluginToggleFailures` with the nodes it paints, so a sentence can
+    // never resurface on a row built later for the same name).
+    const message = 'context-compaction refuses to move.';
+    const { dialed } = stub({ patchMessage: message, patchStatus: 403 });
+
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginRow('context-compaction').click();
+    await flush();
+    await flush();
+
+    expect(markState(pluginInfo('context-compaction'))).toBe('error:warning');
+
+    // `Reload plugins` re-reads the catalogue and REBUILDS every row (`buildPluginsTab`), which is
+    // the pane re-render the figure clears on. The refusal it just painted is not a server figure —
+    // nothing wrote — and a fresh row is a fresh slate.
+    byClass('.plugins-refresh', 'button').click();
+    await flush();
+
+    expect(pluginCountReads(dialed)).toBe(2);
+    expect(markState(pluginInfo('context-compaction'))).toBe('idle:info');
+    expect(markNaming(pluginInfo('context-compaction'))).toEqual([
+        'Details for Context Compaction',
+        'Details for Context Compaction'
+    ]);
+    // Every mark in the rebuilt list is the resting one.
+    expect([...document.querySelectorAll<HTMLButtonElement>('.plugin-tab-info')].map(markState)).toEqual([
+        'idle:info',
+        'idle:info',
+        'idle:info'
+    ]);
+});
+
+// The swap's click separation: the tile and the corner mark are two controls in one row, and
 // each owns exactly one action.
-it('writes enablement from the corner box without opening the dialog, and the tile click still opens it', async () => {
+it('writes enablement from the tile without opening the dialog, and the corner mark still opens it', async () => {
     const { calls, dialed } = stub();
     await boot();
     openPlugins();
     await flush();
 
-    // The box is the tile's SIBLING, absolutely positioned over its corner (styles.css
-    // `.plugin-tab-enable`), so a click on the box cannot reach the trigger's handler.
-    expect(pluginBox('context-compaction').closest('button')).toBeNull();
+    // The mark is the tile's SIBLING, absolutely positioned over its corner (styles.css
+    // `.plugin-tab-info`), so a click on the mark cannot reach the tile's handler — and neither
+    // is nested, because a `<button>` cannot contain another (jsdom would report that as a parse
+    // error, and the tile's accessible name would swallow the mark's own).
+    const info = pluginInfo('context-compaction');
+    const tile = pluginRow('context-compaction');
+    expect(info.parentElement).toBe(tile.parentElement);
+    expect(info.parentElement?.classList.contains('plugin-tab-row')).toBe(true);
+    expect(tile.contains(info)).toBe(false);
+    expect(info.closest('.plugin-tab-button')).toBeNull();
 
-    pluginBox('context-compaction').click();
+    pluginRow('context-compaction').click();
     await flush();
     await flush();
 
@@ -1343,14 +1606,19 @@ it('writes enablement from the corner box without opening the dialog, and the ti
         { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { enabled: false } } }
     ]);
     expect(document.querySelector('.dialog')).toBeNull();
-    expect(pluginBox('context-compaction').checked).toBe(false);
     expect(pluginRow('context-compaction').getAttribute('aria-pressed')).toBe('false');
+    expect(pluginInfo('context-compaction').getAttribute('aria-expanded')).toBe('false');
 
-    // The tile click is the other action: it opens the dialog and writes nothing.
-    pluginRow('context-compaction').click();
+    // The mark's click is the other action: it opens the dialog and writes nothing.
+    pluginInfo('context-compaction').click();
 
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
     expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(1);
+    // And the row whose layer is open says so on the MARK — not on the tile, whose `aria-pressed`
+    // stays the (now false) enabled figure.
+    expect(pluginInfo('context-compaction').getAttribute('aria-expanded')).toBe('true');
+    expect(pluginInfo('context-compaction').dataset.open).toBe('true');
+    expect(pluginRow('context-compaction').getAttribute('aria-pressed')).toBe('false');
 
     byClass('.dialog-close', 'button').click();
     await flush();
@@ -1358,7 +1626,7 @@ it('writes enablement from the corner box without opening the dialog, and the ti
     // The list came back with the server's figure on both readings, and the whole visit
     // still cost exactly one catalogue read.
     expect(document.querySelector('.dialog')).toBeNull();
-    expect(pluginBox('context-compaction').checked).toBe(false);
+    expect(pluginInfo('context-compaction').getAttribute('aria-expanded')).toBe('false');
     expect(pluginRow('context-compaction').dataset.enabled).toBe('false');
     expect(pluginCountReads(dialed)).toBe(1);
 });
@@ -1390,29 +1658,39 @@ it('keeps the plugins and tools pages, their rows and their switches usable whil
     // The pane took the centre column mid-run, with its rows and switches live.
     expect(byClass('.stage', 'div').querySelector('.plugins-pane')).not.toBeNull();
     expect(pluginNames()).toEqual(['async-ping', 'context-compaction', 'quiet-observer']);
-    expect(pluginRow('context-compaction').disabled).toBe(false);
-    expect(pluginBox('context-compaction').disabled).toBe(false);
+    // Neither control is inert mid-run, and neither one ever takes the `disabled` attribute:
+    // the tile states an inert switch as `data-locked` + `aria-disabled`, and a working
+    // conversation puts NEITHER on a plugin tile (the session plugin PATCH has no idle window —
+    // the asymmetry with the tool tile below is the server's, not a client rule).
+    const compactionSwitch = pluginRow('context-compaction');
 
-    // A row is clickable mid-run: its detail dialog opens over the list.
-    pluginRow('context-compaction').click();
+    expect(compactionSwitch.disabled).toBe(false);
+    expect(compactionSwitch.hasAttribute('data-locked')).toBe(false);
+    expect(compactionSwitch.hasAttribute('aria-disabled')).toBe(false);
+    expect(pluginInfo('context-compaction').disabled).toBe(false);
+
+    // A row is clickable mid-run: its detail dialog opens over the list — from the mark.
+    pluginInfo('context-compaction').click();
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
     byClass('.dialog-close', 'button').click();
     await flush();
     expect(byClass('.stage', 'div').querySelector('.plugins-pane')?.isConnected).toBe(true);
 
-    // And the global tick box WRITES mid-run — the server's route has no idle window, and
+    // And the switch tile WRITES mid-run — the server's route has no idle window, and
     // the answer repaints the row.
-    pluginBox('context-compaction').click();
+    compactionSwitch.click();
     await flush();
     await flush();
 
     expect(
         dialed.filter((line) => line === 'PATCH /v1/harness/sessions/s1/plugins/context-compaction')
     ).toHaveLength(1);
-    expect(pluginBox('context-compaction').checked).toBe(false);
+    expect(compactionSwitch.dataset.enabled).toBe('false');
+    expect(compactionSwitch.getAttribute('aria-pressed')).toBe('false');
 
     // The other catalogue is reachable from here too: Tools closes Plugins (the exclusive
-    // centre column survives R1), its rows are clickable and its tick box is live.
+    // centre column survives R1), its rows are clickable and its switch still reports the
+    // conversation's figure.
     openTools();
     await flush();
 
@@ -1421,20 +1699,26 @@ it('keeps the plugins and tools pages, their rows and their switches usable whil
     expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').disabled).toBe(false);
 
-    const toolSwitch = byClass('.tool-tab-enable[data-tool="read"]', 'input');
+    // R1 (the swap): the tools switch IS the row's tile. It never takes the `disabled`
+    // attribute — the row keeps its focus and its corner mark keeps opening the dialog — so the
+    // locked state is the `aria-disabled` + `data-locked='running'` pair.
+    const toolSwitch = byClass('.tool-tab-button[data-tool="read"]', 'button');
 
     // T4: that row is THIS conversation's toolbox, and the server answers 409 for any session tool
     // write outside an idle window (src/server/api-session-tool-writes.ts), so EVERY tool switch is
     // locked while the conversation works — the opposite of the plugin tick boxes above it, whose
     // route has no idle gate and which stay live. The figure is still painted from the row, and the
-    // row itself still opens its runner (execution stayed deployment-scoped).
-    expect(toolSwitch.disabled).toBe(true);
+    // row still opens its runner (execution stayed deployment-scoped).
+    expect(toolSwitch.getAttribute('aria-disabled')).toBe('true');
+    expect(toolSwitch.dataset.locked).toBe('running');
     expect(toolSwitch.title).toBe('This conversation is working · the switch unlocks when its run ends');
-    expect(toolSwitch.checked).toBe(true);
+    expect(toolSwitch.getAttribute('aria-pressed')).toBe('true');
 
-    // A tool row opens its runner mid-run as well.
-    byClass('.tool-tab-button[data-tool="read"]', 'button').click();
+    // A tool row opens its runner mid-run as well — from the corner mark, which a run never
+    // locks, while the locked tile costs no PATCH.
+    byClass('.tool-tab-info[data-tool="read"]', 'button').click();
     expect(byClass('.dialog-title', 'h2').textContent).toBe('read');
+    expect(dialed.filter((line) => line.startsWith('PATCH /v1/harness/sessions/s1/tools/'))).toEqual([]);
     byClass('.dialog-close', 'button').click();
     await flush();
 });
@@ -1517,14 +1801,23 @@ it('opens the Context Compaction dialog with the declared hooks and a numeric li
     await flush();
 
     const row = pluginRow('context-compaction');
+    const info = pluginInfo('context-compaction');
 
-    row.click();
+    info.click();
 
     // The shared modal, named after the plugin's own title.
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
     expect(byClass('.dialog', 'div').getAttribute('role')).toBe('dialog');
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
+    // R2 (swap): "this row's layer is open" is the MARK's figure, and the tile's `aria-pressed`
+    // is untouched by the layer — it still answers "is this plugin enabled", which for this row
+    // happens to be true as well. The other rows' marks all say they are closed.
+    expect(info.getAttribute('aria-expanded')).toBe('true');
+    expect(info.dataset.open).toBe('true');
     expect(row.getAttribute('aria-pressed')).toBe('true');
+    expect(row.dataset.enabled).toBe('true');
+    expect(pluginInfo('async-ping').getAttribute('aria-expanded')).toBe('false');
+    expect(pluginInfo('quiet-observer').getAttribute('aria-expanded')).toBe('false');
 
     // Identity facts plus the declared hooks: existing metadata only.
     expect(byClass('.plugin-detail-description', 'p').textContent).toBe(compactionRow().description);
@@ -1596,15 +1889,19 @@ it('opens the Context Compaction dialog with the declared hooks and a numeric li
     expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('');
 
-    // Escape dismisses the layer, resets the row, re-describes the catalogue, and hands
-    // focus back to the row that opened it.
+    // Escape dismisses the layer, resets the row's open marker, re-describes the catalogue, and
+    // hands focus back to the MARK that opened it (never the switch tile, whose figure must not
+    // move just because a layer closed).
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 
     expect(document.querySelector('.dialog')).toBeNull();
-    expect(row.getAttribute('aria-pressed')).toBe('false');
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+    expect(info.hasAttribute('data-open')).toBe(false);
+    expect(row.getAttribute('aria-pressed')).toBe('true');
+    expect(row.dataset.enabled).toBe('true');
     expect(byClass('.main-title', 'h1').textContent).toBe('Plugins');
     expect(byClass('.harness-id', 'span').textContent).toBe('built-ins');
-    expect(document.activeElement).toBe(row);
+    expect(document.activeElement).toBe(info);
     // The list stayed on the stage the whole time: one modal over one list.
     expect(byClass('.stage', 'div').querySelector('.plugins-pane')?.isConnected).toBe(true);
 });
@@ -1617,7 +1914,8 @@ it('saves only the changed key, repaints from the server row, and reopens with t
 
     const row = pluginRow('context-compaction');
 
-    row.click();
+    // The layer opens from the corner mark; `row` stays the node the save repaints in place.
+    pluginInfo('context-compaction').click();
 
     const input = byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input');
 
@@ -1665,7 +1963,7 @@ it('saves only the changed key, repaints from the server row, and reopens with t
     // Close and reopen: the merged cache row is what the form shows, so a reopen answers
     // 150000 with NO extra traffic.
     byClass('.dialog-close', 'button').click();
-    pluginRow('context-compaction').click();
+    pluginInfo('context-compaction').click();
 
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
     expect(byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input').value).toBe('150000');
@@ -1685,7 +1983,7 @@ it('keeps Save pressable and sends nothing when no setting changed', async () =>
     openPlugins();
     await flush();
 
-    pluginRow('context-compaction').click();
+    pluginInfo('context-compaction').click();
 
     const save = byClass('.plugin-setting-save', 'button');
 
@@ -1728,7 +2026,7 @@ it('keeps the typed value editable and states the server refusal verbatim', asyn
     openPlugins();
     await flush();
 
-    pluginRow('context-compaction').click();
+    pluginInfo('context-compaction').click();
 
     const input = byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input');
 
@@ -1770,10 +2068,11 @@ it('renders a plugin with no declared settings read-only, with no write control'
     await flush();
 
     const row = pluginRow('quiet-observer');
+    const info = pluginInfo('quiet-observer');
 
     expect(row.querySelector('.plugin-tab-values')?.textContent).toBe('no settings');
 
-    row.click();
+    info.click();
 
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Quiet Observer');
     // No control and no Save: an action that could only ever send an empty patch.
@@ -1797,7 +2096,12 @@ it('renders a plugin with no declared settings read-only, with no write control'
 
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
     expect(document.querySelector('.dialog')).toBeNull();
-    expect(document.activeElement).toBe(row);
+    // Focus returns to the mark, and the switch figure of an OFF row never moved while its layer
+    // was open or after it closed.
+    expect(document.activeElement).toBe(info);
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+    expect(row.dataset.enabled).toBe('false');
+    expect(row.getAttribute('aria-pressed')).toBe('false');
 });
 
 it('renders no System prompt section for a row whose declared prompt is empty', async () => {
@@ -1813,7 +2117,7 @@ it('renders no System prompt section for a row whose declared prompt is empty', 
     openPlugins();
     await flush();
 
-    pluginRow('context-compaction').click();
+    pluginInfo('context-compaction').click();
 
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Context Compaction');
     // The two sections of a row that never prompts — nothing empty-shaped between them.
@@ -1834,7 +2138,7 @@ it('renders each declared setting as its own control and sends only the changed 
     await flush();
 
     expect(pluginNames()).toEqual(['extras']);
-    pluginRow('extras').click();
+    pluginInfo('extras').click();
 
     const verbose = byClass('.plugin-setting-input[data-setting="verbose"]', 'input');
     const prefix = byClass('.plugin-setting-input[data-setting="prefix"]', 'input');
@@ -1870,8 +2174,8 @@ it('replaces the open detail when another row is activated instead of stacking a
     openPlugins();
     await flush();
 
-    const compaction = pluginRow('context-compaction');
-    const ping = pluginRow('async-ping');
+    const compaction = pluginInfo('context-compaction');
+    const ping = pluginInfo('async-ping');
 
     compaction.click();
     ping.click();
@@ -1890,8 +2194,16 @@ it('replaces the open detail when another row is activated instead of stacking a
     expect(document.querySelector('.dialog .plugin-detail-prompt-section')).toBeNull();
     expect(document.querySelector('.dialog .plugin-detail-prompt')).toBeNull();
 
-    expect(compaction.getAttribute('aria-pressed')).toBe('false');
-    expect(ping.getAttribute('aria-pressed')).toBe('true');
+    // R2 (swap): EXACTLY one row's MARK says "open" — the one pressed last — and the replacement
+    // took the marker off the first. The tiles keep their OWN enabled figures through it, which
+    // is the point of the split: both rows are enabled, so both tiles stay pressed while a layer
+    // moves between them.
+    expect(compaction.getAttribute('aria-expanded')).toBe('false');
+    expect(compaction.hasAttribute('data-open')).toBe(false);
+    expect(ping.getAttribute('aria-expanded')).toBe('true');
+    expect(ping.dataset.open).toBe('true');
+    expect(pluginRow('context-compaction').getAttribute('aria-pressed')).toBe('true');
+    expect(pluginRow('async-ping').getAttribute('aria-pressed')).toBe('true');
     expect(byClass('.main-title', 'h1').textContent).toBe('Background Ping');
     expect(byClass('.harness-note', 'p').textContent).toBe('v1.0.0 · 6 hooks · 1 setting · built-in');
 
@@ -1901,7 +2213,7 @@ it('replaces the open detail when another row is activated instead of stacking a
     await flush();
 
     expect(document.querySelector('.dialog')).toBeNull();
-    expect(ping.getAttribute('aria-pressed')).toBe('false');
+    expect(ping.getAttribute('aria-expanded')).toBe('false');
     expect(byClass('.main-title', 'h1').textContent).toBe('Plugins');
     expect(byClass('.harness-id', 'span').textContent).toBe('built-ins');
     expect(document.activeElement).toBe(ping);
@@ -2017,7 +2329,7 @@ it('re-reads the catalogue from the pane control instead of trusting the cache',
     expect(calls.filter((call) => call.url === '/api/sessions/s1/plugins?limit=25')).toHaveLength(2);
     expect(pluginNames()).toHaveLength(3);
 
-    pluginRow('context-compaction').click();
+    pluginInfo('context-compaction').click();
     expect(byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input').value).toBe('100000');
 });
 
@@ -2029,7 +2341,7 @@ it('draws each declared group as a titled block with its gated settings nested u
     openPlugins();
     await flush();
 
-    pluginRow('context-trimmer').click();
+    pluginInfo('context-trimmer').click();
 
     // The manifest order the renderer must NOT reorder at the top level, and the one case
     // it must reorder inside a block: `truncateTurns` is declared BEFORE the switch that
@@ -2045,12 +2357,25 @@ it('draws each declared group as a titled block with its gated settings nested u
         'truncateToolRequests'
     ]);
 
-    // The whole form, as one exact structure. Read it as the operator does: one ungrouped
-    // row (`enabled`) at the root, then three blocks, each a caption plus its rows, with
-    // every dependent setting inside that parent's own indented host.
+    // R3: the master row is GONE from the form — this plugin declares the reserved `enabled`
+    // key (label `Automatic trimming`), and the row's TILE is that switch. Everything else keeps
+    // its declared place, so the filter is a removal, not a re-layout.
+    expect(document.querySelector('.dialog .plugin-setting-input[data-setting="enabled"]')).toBeNull();
+    expect(texts('.dialog .plugin-setting-label')).toEqual([
+        'Automatic trim invalid tools',
+        'Trim after (tool turns)',
+        'Outcomes that count as invalid',
+        'Trim recorded thinking',
+        'Trim after (thought entries)',
+        'Truncate tool requests',
+        'Truncate after (tool turns)'
+    ]);
+
+    // The whole form, as one exact structure. Read it as the operator does: no flat row at the
+    // root any more, then three blocks, each a caption plus its rows, with every dependent
+    // setting inside that parent's own indented host.
     expect(settingsFormTree()).toEqual([
         'plugin-settings-form-label',
-        'enabled',
         [
             ['Invalid tool calls', 'trimInvalidTools', ['children:trimInvalidTools', 'invalidToolTurns', 'invalidOutcomes']],
             ['Recorded thinking', 'trimThoughts', ['children:trimThoughts', 'thoughtTurns']],
@@ -2101,8 +2426,15 @@ it('draws each declared group as a titled block with its gated settings nested u
 
     // Seeded visibility, taken from the VALUES on the row and not from a click: the ON
     // parent shows both of its children (a number AND a string), the OFF parent hides its
-    // one child, and the flat master row is never hidden.
+    // one child, and no block is hidden. There is no fourth case for the master row: it left
+    // this form with R3, and the dim it used to drive is derived from the row's `enabled` at
+    // build time — a dedicated test pins that.
     expect(hiddenSettingKeys()).toEqual(['thoughtTurns']);
+    expect([...document.querySelectorAll<HTMLElement>('.dialog .plugin-settings-group')].map((block) => block.hidden)).toEqual([
+        false,
+        false,
+        false
+    ]);
 });
 
 it('reveals a gated setting the same turn its parent tick is pressed, and hides it again', async () => {
@@ -2111,7 +2443,7 @@ it('reveals a gated setting the same turn its parent tick is pressed, and hides 
     openPlugins();
     await flush();
 
-    pluginRow('context-trimmer').click();
+    pluginInfo('context-trimmer').click();
 
     // `trimThoughts` is OFF on the row the server sent, so its horizon starts gone.
     expect(settingRow('thoughtTurns').hidden).toBe(true);
@@ -2153,7 +2485,7 @@ it('keeps a hidden setting registered and savable, and re-takes the reveal from 
     openPlugins();
     await flush();
 
-    pluginRow('context-trimmer').click();
+    pluginInfo('context-trimmer').click();
 
     // The row is hidden by its OFF parent, and the value on it is still editable.
     expect(settingRow('thoughtTurns').hidden).toBe(true);
@@ -2195,7 +2527,7 @@ it('hides the indent host itself once every row inside it is hidden, leaving no 
     openPlugins();
     await flush();
 
-    pluginRow('context-trimmer').click();
+    pluginInfo('context-trimmer').click();
 
     // Seeded state, from the VALUES on the server's row: two parents are ON, so their hosts are
     // shown, and `trimThoughts` is OFF with its one child hidden — so that host hides itself.
@@ -2236,16 +2568,10 @@ it('hides the indent host itself once every row inside it is hidden, leaving no 
         ['truncateToolRequests', false]
     ]);
 
-    // The master switch is a DIM and never a hide: switching the plugin off marks the ONE wrapper
-    // element and takes nothing out of the tree — no row, no host, no block.
-    tickOf('enabled');
-
-    expect(byClass('.plugin-settings-groups', 'div').classList.contains('plugin-settings-groups--off')).toBe(true);
-    expect(hostState()).toEqual([
-        ['trimInvalidTools', false],
-        ['trimThoughts', false],
-        ['truncateToolRequests', false]
-    ]);
+    // The master switch is a DIM and never a hide, and since R3 it is not even part of this form:
+    // the class is derived from the ROW's top-level `enabled`, so no checkbox toggle inside the
+    // dialog can move it. A dedicated test pins that derivation; what stays pinned here is the
+    // other half of the old guarantee — the tree never changes shape.
     expect([...document.querySelectorAll<HTMLElement>('.dialog .plugin-settings-group')].map((block) => block.hidden)).toEqual([
         false,
         false,
@@ -2259,7 +2585,7 @@ it('keeps a nested reveal inside its own block when a gated setting is itself a 
     openPlugins();
     await flush();
 
-    pluginRow('nested-gates').click();
+    pluginInfo('nested-gates').click();
 
     // The whole form, exactly. The load-bearing entry is `['children:middle','innerTurns']`
     // INSIDE `['children:outer', …]`: the grandchild sits immediately after its own parent row, in
@@ -2335,7 +2661,7 @@ it('shows a child gated by a non-boolean setting exactly like one gated by nothi
     openPlugins();
     await flush();
 
-    pluginRow('wrong-gate').click();
+    pluginInfo('wrong-gate').click();
 
     // Both children are SHOWN. `underLimit`'s `parentKey` names a NUMBER setting, and a number box
     // has no `checked`: reading `undefined !== true` used to decide that gate, so the row hid
@@ -2380,7 +2706,7 @@ it('reveals and focuses the hidden row whose value Save refuses, and still sends
     openPlugins();
     await flush();
 
-    pluginRow('context-trimmer').click();
+    pluginInfo('context-trimmer').click();
 
     // The refusal case D4 is about: the row is off screen because its own tick is OFF, and the
     // number box inside it is emptied.
@@ -2421,39 +2747,241 @@ it('reveals and focuses the hidden row whose value Save refuses, and still sends
     ]);
 });
 
-it('dims the declared blocks while the plugin switch is off without hiding anything', async () => {
+it('dims the declared blocks from the row’s own switch figure without hiding anything', async () => {
+    // TWO copies of the grouped manifest in one page, differing ONLY in the top-level `enabled`
+    // figure. The modal cannot toggle the row's tile, so the dim is derived once per OPEN; the
+    // only way to pin both states in one run is to open two rows. The second row deliberately
+    // keeps `values.enabled: true` — the settings map reports DECLARED values, and the pane must
+    // read the ROW field, never that map (main.ts `paintPluginRowEnablement`).
+    const offRow = (): Row => ({
+        ...trimmerRow(),
+        name: 'context-trimmer-off',
+        title: 'Context Trimmer Off',
+        enabled: false,
+        values: { ...trimmerRow().values }
+    });
+
+    stub({ rows: () => [trimmerRow(), offRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    expect(pluginRow('context-trimmer').dataset.enabled).toBe('true');
+    expect(pluginRow('context-trimmer-off').dataset.enabled).toBe('false');
+
+    // The switched-ON plugin: blocks marked nothing, and NO master row anywhere in the form.
+    pluginInfo('context-trimmer').click();
+
+    const groups = byClass('.plugin-settings-groups', 'div');
+
+    expect(groups.className).toBe('plugin-settings-groups');
+    expect(document.querySelector('.dialog .plugin-setting-input[data-setting="enabled"]')).toBeNull();
+    // Captured to compare against the switched-OFF open below: the dim must not add, drop or
+    // reorder a single row.
+    const onLabels = texts('.dialog .plugin-setting-label');
+
+    expect(onLabels).toHaveLength(7);
+
+    // NOTHING is hidden by the switch being off: every block, every caption and every control is
+    // still on screen, so an operator can set the policy up and switch the plugin back on without
+    // reopening anything. The only hidden row is still the one its own tick hides.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.dialog .plugin-settings-group')].map((block) => block.hidden)
+    ).toEqual([false, false, false]);
+    expect(texts('.dialog .plugin-setting-group-title')).toEqual(['Invalid tool calls', 'Recorded thinking', 'Truncate requests']);
+    // SEVEN controls, not the eight the manifest declares: the master key is the tile's.
+    expect(document.querySelectorAll('.dialog .plugin-setting-input')).toHaveLength(7);
+    expect(hiddenSettingKeys()).toEqual(['thoughtTurns']);
+
+    // The switched-OFF plugin, opened over it (the catalogue's replacement rule): the SAME form,
+    // and the ONE wrapper marked from the row figure at open — the dim, never a hide.
+    pluginInfo('context-trimmer-off').click();
+
+    expect(byClass('.plugin-settings-groups', 'div').className).toBe('plugin-settings-groups plugin-settings-groups--off');
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.dialog .plugin-settings-group')].map((block) => block.hidden)
+    ).toEqual([false, false, false]);
+    expect(texts('.dialog .plugin-setting-group-title')).toEqual(['Invalid tool calls', 'Recorded thinking', 'Truncate requests']);
+    expect(document.querySelectorAll('.dialog .plugin-setting-input')).toHaveLength(7);
+    expect(texts('.dialog .plugin-setting-label')).toEqual(onLabels);
+    expect(hiddenSettingKeys()).toEqual(['thoughtTurns']);
+    // The dim lands on the rows' OWN labels and hints (styles.css), so the controls themselves are
+    // untouched and every one of them is still focusable.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.dialog .plugin-setting-input')].every((input) => !input.disabled)
+    ).toBe(true);
+
+    byClass('.dialog-close', 'button').click();
+    await flush();
+
+    // Back on the list, the two figures are still the tiles' and neither was touched by a layer.
+    expect(pluginRow('context-trimmer').dataset.enabled).toBe('true');
+    expect(pluginRow('context-trimmer-off').dataset.enabled).toBe('false');
+});
+
+it('keeps the master switch on the row tile: the dialog renders no `enabled` row, and the tile still writes the key', async () => {
+    // The duplication R3 pointed at: the shipped Context Trimmer declares the framework's
+    // RESERVED `enabled` key (label `Automatic trimming`), so the pane showed the same switch
+    // twice — the tile's edge and a checkbox inside the layer. The filter is by KEY, so it catches
+    // every plugin that declares it, and nothing else moves.
+    const { calls } = stub({ rows: () => [trimmerRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    pluginInfo('context-trimmer').click();
+
+    // The manifest DOES declare the key (the fixture mirrors the shipped descriptor), and the
+    // form still holds no control for it.
+    expect(trimmerRow().settings.some((setting) => setting.key === 'enabled')).toBe(true);
+    expect(document.querySelector('.dialog .plugin-setting-input[data-setting="enabled"]')).toBeNull();
+    expect(texts('.dialog .plugin-setting-label')).not.toContain('Automatic trimming');
+    expect(document.querySelectorAll('.dialog .plugin-setting-input')).toHaveLength(7);
+
+    // A policy save can no longer send the key either: it is not a registered field, so the patch
+    // carries ONLY what the reader changed (an omitted key is "no change").
+    tickOf('trimThoughts');
+    byClass('.plugin-setting-save', 'button').click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/sessions/s1/plugins/context-trimmer', method: 'PATCH', body: { settings: { trimThoughts: true } } }
+    ]);
+    expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
+
+    // And the row's TILE is the switch: one press, the reserved key, and no layer opened.
+    byClass('.dialog-close', 'button').click();
+    await flush();
+
+    const row = pluginRow('context-trimmer');
+
+    row.click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')[1]).toEqual({
+        url: '/api/sessions/s1/plugins/context-trimmer',
+        method: 'PATCH',
+        body: { settings: { enabled: false } }
+    });
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(row.dataset.enabled).toBe('false');
+    expect(row.getAttribute('aria-pressed')).toBe('false');
+
+    // Reopening takes the NEW figure from the cache: still no master row, and the policy blocks
+    // are dimmed because the ROW says off.
+    pluginInfo('context-trimmer').click();
+
+    expect(document.querySelector('.dialog .plugin-setting-input[data-setting="enabled"]')).toBeNull();
+    expect(document.querySelectorAll('.dialog .plugin-setting-input')).toHaveLength(7);
+    expect(byClass('.plugin-settings-groups', 'div').className).toBe('plugin-settings-groups plugin-settings-groups--off');
+});
+
+it('renders the read-only presentation when the master key is the only declared setting', async () => {
+    // The edge the filter creates: a plugin that declares NOTHING BUT the reserved key has no
+    // editable setting left, so its dialog must take the same empty/read-only shape a
+    // settings-free plugin already takes — not an empty form with a Save that could only ever
+    // send an empty patch (the server refuses one, ../server/plugins.ts).
+    const masterOnlyRow = (): Row => ({
+        name: 'master-only',
+        title: 'Master Only',
+        description: 'A plugin that declares nothing but the reserved switch.',
+        version: '1.0.0',
+        tags: ['edge'],
+        hooks: ['turn.after'],
+        builtin: false,
+        enabled: true,
+        settings: [{ key: 'enabled', label: 'Run this plugin', type: 'boolean', default: true }],
+        values: { enabled: true }
+    });
+
+    const { calls } = stub({ rows: () => [masterOnlyRow()] });
+    await boot();
+    openPlugins();
+    await flush();
+
+    // R6: the LIST no longer counts or prints the reserved key either. `enabled` is this row's
+    // SWITCH — the tile's green edge, its `aria-pressed`, its tooltip — so a third copy of it in the
+    // readout is the duplication the reader pointed at. The card now says what its own dialog has
+    // always said: nothing editable.
+    expect(pluginRow('master-only').querySelector('.plugin-tab-meta')?.textContent).toBe('1 hook · read-only · custom');
+    expect(pluginRow('master-only').querySelector('.plugin-tab-values')?.textContent).toBe('no settings');
+    expect(pluginRow('master-only').dataset.enabled).toBe('true');
+
+    pluginInfo('master-only').click();
+
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Master Only');
+    // The existing read-only branch: no form, no control, no Save, and the same words the
+    // settings-free row shows.
+    expect(document.querySelector('.dialog .plugin-settings-form')).toBeNull();
+    expect(document.querySelectorAll('.dialog .plugin-setting-input')).toHaveLength(0);
+    expect(document.querySelector('.dialog .plugin-setting-save')).toBeNull();
+    expect(texts('.dialog .plugin-detail-empty')).toEqual(['This plugin declares no settings · read-only.']);
+    expect(texts('.dialog .plugin-detail-section-title')).toEqual(['Hooks', 'Settings']);
+    // R6: the head counts the SAME list the card and the form render, so all three now say
+    // read-only for a plugin whose only declared key is the master switch. Before this pass the
+    // head said "1 setting" beside a dialog that said "declares no settings" — the pair this change
+    // makes impossible, because all three read `editableSettingsOf`.
+    expect(byClass('.harness-note', 'p').textContent).toBe('v1.0.0 · 1 hook · read-only · custom');
+
+    byClass('.dialog-close', 'button').click();
+    await flush();
+
+    // The switch is still writable — just from the tile, which is the only place it is offered.
+    pluginRow('master-only').click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/sessions/s1/plugins/master-only', method: 'PATCH', body: { settings: { enabled: false } } }
+    ]);
+    expect(pluginRow('master-only').dataset.enabled).toBe('false');
+    // The REPAINT path (main.ts `paintPluginRow`) is the second writer of the same line, and R6
+    // routes it through the same helper the builder uses: an accepted switch repaints the row
+    // without resurrecting `enabled: true` and without leaving the line EMPTY — a plugin with
+    // nothing editable keeps the explicit word, on the paint that follows its own write.
+    expect(pluginRow('master-only').querySelector('.plugin-tab-values')?.textContent).toBe('no settings');
+    expect(pluginRow('master-only').querySelector('.plugin-tab-meta')?.textContent).toBe('1 hook · read-only · custom');
+    // R4: and the accepted switch says nothing in the footer, on a row whose readout is silent too.
+    expect(byClass('.plugins-tab-status', 'p').hidden).toBe(true);
+    expect(byClass('.plugins-tab-status', 'p').textContent).toBe('');
+});
+
+it('keeps the reserved master key out of a grouped plugin\u2019s readout, and counts only what is editable', async () => {
+    // R6, pinned on the shipped shape rather than on the edge row: Context Trimmer DECLARES the
+    // reserved `enabled` key (./plugins-tab fixtures mirror src/plugins/context-trimmer.plugin.ts),
+    // so its card used to print `enabled: true` inside the `key: value` line and count it as one of
+    // its settings — the switch stated a third time, beside the tile that already wears it as a
+    // green edge. The card now spells the seven EDITABLE settings and counts seven.
     stub({ rows: () => [trimmerRow()] });
     await boot();
     openPlugins();
     await flush();
 
-    pluginRow('context-trimmer').click();
+    const row = pluginRow('context-trimmer');
 
-    const groups = byClass('.plugin-settings-groups', 'div');
+    expect(row.querySelector('.plugin-tab-meta')?.textContent).toBe('1 hook · 7 settings · built-in');
+    // Declared order, master key dropped, effective values from the server's `values` map.
+    expect(row.querySelector('.plugin-tab-values')?.textContent).toBe(
+        'trimInvalidTools: true · invalidToolTurns: 2 · invalidOutcomes: failed,rejected · ' +
+            'trimThoughts: false · thoughtTurns: 2 · truncateTurns: 2 · truncateToolRequests: true'
+    );
+    expect(row.querySelector('.plugin-tab-values')?.textContent).not.toContain('enabled');
+    // The row is still ON — the figure simply lives on the tile, which is where it was already
+    // stated, in the one place a press can change it.
+    expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
 
-    expect(groups.className).toBe('plugin-settings-groups');
+    // And the dialog head counts the same seven, so the card, the head and the form's seven inputs
+    // can never disagree about what counts as a setting.
+    pluginInfo('context-trimmer').click();
 
-    // The plugin's own `enabled` row is a setting like any other, so the dialog can read the
-    // master state off it. Switching it off marks the ONE wrapper element.
-    tickOf('enabled');
+    expect(byClass('.harness-note', 'p').textContent).toBe('v0.4.0 · 1 hook · 7 settings · built-in');
+    expect(document.querySelectorAll('.dialog .plugin-setting-input')).toHaveLength(7);
 
-    expect(groups.className).toBe('plugin-settings-groups plugin-settings-groups--off');
-
-    // NOTHING is hidden by the master switch: every block, every caption and every control is
-    // still on screen, so an operator can set the policy up and switch the plugin back on
-    // without reopening anything. The only hidden row is still the one its own tick hides.
-    expect([...document.querySelectorAll<HTMLElement>('.dialog .plugin-settings-group')].map((block) => block.hidden)).toEqual([
-        false,
-        false,
-        false
-    ]);
-    expect(texts('.dialog .plugin-setting-group-title')).toEqual(['Invalid tool calls', 'Recorded thinking', 'Truncate requests']);
-    expect(document.querySelectorAll('.dialog .plugin-setting-input')).toHaveLength(8);
-    expect(hiddenSettingKeys()).toEqual(['thoughtTurns']);
-
-    tickOf('enabled');
-
-    expect(groups.className).toBe('plugin-settings-groups');
+    byClass('.dialog-close', 'button').click();
+    await flush();
 });
 
 it('keeps a plugin that declares no grouping byte-for-byte flat, with no group chrome at all', async () => {
@@ -2464,7 +2992,7 @@ it('keeps a plugin that declares no grouping byte-for-byte flat, with no group c
     openPlugins();
     await flush();
 
-    pluginRow('context-compaction').click();
+    pluginInfo('context-compaction').click();
 
     // The pre-contract DOM exactly: the sr-only form name, then one row per setting, direct
     // children of the form, in the declared order.
@@ -2488,7 +3016,7 @@ it('keeps a plugin that declares no grouping byte-for-byte flat, with no group c
     await flush();
 
     // The two-setting mixed row: two rows, still in declared order, still no chrome.
-    pluginRow('extras').click();
+    pluginInfo('extras').click();
 
     expect([...byClass('.plugin-settings-form', 'div').children].map((node) => node.className)).toEqual([
         'plugin-settings-form-label',

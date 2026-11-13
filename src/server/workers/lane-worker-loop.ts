@@ -63,7 +63,7 @@ import type { HarnessPluginSettingsRecord } from '../persistence';
 import type { HarnessPreset } from '../harnesses/types';
 import { presetFromRecord } from '../harnesses';
 import type { LaneAuthorityRequest } from './lane-authority';
-import type { LaneBlueprint, LaneCommand, LaneRegistryChange, LaneReply, LaneRequestReplyValue } from './protocol';
+import type { LaneBlueprint, LaneCommand, LaneRegistryChange, LaneReply, LaneRequestReplyValue, LaneToolStateSync } from './protocol';
 import {
     LANE_EVENT_WINDOW,
     LANE_MAX_FRAME_BYTES,
@@ -193,6 +193,17 @@ export type LaneWorkerState = {
     // mirrors the id the lane actually archived, or the UI joins a turn to a result that does
     // not exist.
     turnInvocationId?: string;
+    // R5b: a `sync.tools` frame that arrived while this lane had NO replica yet. The window is
+    // real but narrow: the coordinator posts the frame as soon as the route writes a toggle, and
+    // `handle` is not awaited by the message listener, so a frame can be dispatched while
+    // `sayHello` is still awaiting its imports and its `restore()`.
+    //
+    // It is STASHED rather than dropped, and applied as the LAST replica-shaping step of hello.
+    // Ordering is safe in the only direction that matters: the frame was posted AFTER the host
+    // read the blueprint's canonical snapshot, so its state is the newer one, and applying it on
+    // top of the restore lands the replica where the coordinator stands. A silent drop here would
+    // strand the toggle until the user clicked again, which is the report R5b is about.
+    pendingToolSync?: LaneToolStateSync;
 };
 
 const state: LaneWorkerState = {
@@ -294,10 +305,12 @@ const identityOf = (source: unknown, extra?: { threadId?: string }): { agent?: s
  */
 // The replica's OWN implementations of the two methods used for mirror writes, captured in
 // `installAuthorityRuntime` before the routed replacements are installed.
-let localRuntime: {
+type LocalToolRuntime = {
     requestTools: (caller: unknown, parameters: unknown) => unknown;
     manageTool: (caller: unknown, parameters: unknown) => unknown;
-} = {
+};
+
+let localRuntime: LocalToolRuntime = {
     // Until a replica exists, a mirror write is a no-op rather than a crash: the only callers
     // are frame handlers that cannot run before hello built the replica.
     requestTools: () => undefined,
@@ -590,6 +603,27 @@ const applySync = (sync: LaneRequestReplyValue['sync']): void => {
         const installed = replica.tools as Record<string, unknown>;
         const granted = sync.enabled.filter((name) => installed[name] !== undefined);
 
+        // R5b: the SWITCH half of the replay. Canonical's `enabled` list can never contain a
+        // withheld name - `applyToolSwitch(false)` removes the cap slot in the SAME breath it
+        // withholds (src/harness.ts:1957) and `restore` re-applies the same rule
+        // (src/harness.ts:11914) - so a name the authority reports as enabled is, canonically, a
+        // name its user has switched ON. A replica can still hold a stale local flag for it, in
+        // exactly one way: step 4 of `applyToolStateSync` below, the only seam that frees a cap
+        // slot also sets the flag. CLEARING THE FLAG HERE IS NOT OPTIONAL, and the failure mode
+        // is silent: `requestToolsFor` filters withheld names out of its OWN catalogue
+        // (src/harness.ts:3439), so the grant under this line would match nothing, report
+        // `matched: 0`, and the lane would keep omitting a tool the canonical harness had just
+        // enabled - until the next reconcile frame arrived.
+        //
+        // `enable` on a name that is neither withheld nor already capped re-takes a slot
+        // newest-first, which is the same insertion a canonical grant performs, so the cap stays
+        // capped and no arithmetic changes.
+        for (const name of granted) {
+            if (replica.withheldTools.includes(name)) {
+                localRuntime.manageTool(undefined, { operation: 'enable', name });
+            }
+        }
+
         if (granted.length > 0) {
             // LOCAL replay: `requestTools` is the core's only enabled-set writer and is
             // idempotent for names already enabled.
@@ -623,6 +657,171 @@ const applySync = (sync: LaneRequestReplyValue['sync']): void => {
 // Raise this replica's minting counters to the leased high-water marks.
 const reserve = (identities: Partial<Record<IdSpace, number>>): HarnessIdentityReservation | undefined =>
     state.replica?.reserveIdentity(reservationOf(identities));
+
+// ---------------------------------------------------------------------------
+// R5b — THE WHOLESALE TOOL-STATE RECONCILE (the `sync.tools` applier)
+// ---------------------------------------------------------------------------
+
+// What one reconcile actually did, as data. Exported so a test can assert the EXACT outcome of
+// a frame - including what it dropped and why - without reaching into harness internals, and so
+// the warm-lane tests can state the difference between "installed" and "silently ignored".
+export type LaneToolStateReconcile = {
+    // The names this replica now holds, in each of the two canonical lists, pruned to what this
+    // replica can honour. Equal to the frame's lists minus `dropped`.
+    enabled: string[];
+    withheld: string[];
+    // Names the frame carried that THIS replica could not install, each with its reason. A
+    // reconcile never throws on one of these: a lane replica is rebuilt from a RECORD, so a name
+    // the coordinator holds may genuinely not exist here (the `testFlaky` case in
+    // ./lane-tool-settings.test.ts, and every nested-run tool `refuseNestedRuns` deletes).
+    dropped: { name: string; list: 'enabled' | 'withheld'; reason: 'not-registered' | 'not-switchable' }[];
+};
+
+/**
+ * Set the replica's copy of the session's tool switches to the canonical state - WHOLESALE.
+ *
+ * WHY IT IS A RECONCILE AND NOT A PATCH
+ * -------------------------------------
+ * The frame is one-way (no id, no receipt, no ordering guarantee beyond the port), the switch is
+ * per-SESSION while lanes are per-conversation and appear and disappear, and a lane may have
+ * been rebuilt from a fresh snapshot between two frames. Setting both lists from the payload
+ * makes every frame independently sufficient: a duplicate lands the same state, a late one lands
+ * the newer state, and a lost one is covered by the next click. A delta would need all three to
+ * be true at once.
+ *
+ * WHY IT USES THE KERNEL SEAMS INSTEAD OF A NEW ONE
+ * -------------------------------------------------
+ * The replica's two sets are closure state inside src/harness.ts (`activeTools`,
+ * `withheldTools`); the ONLY writable doors the kernel offers are `runtime.manageTool
+ * enable|disable` (one name, both sets, `applyToolSwitch`) and `runtime.requestTools
+ * {names}` (the capped set, additive). `restore()` would be the true wholesale primitive but it
+ * rebuilds tools and thread agents and zeroes the run generation (./protocol.ts:110-113) - on a
+ * WARM lane that is exactly the "abort the running thread" outcome R5b forbids. So this function
+ * composes the seams, in the order that makes each step's side effect the next step's input, and
+ * documents the one residue that composition leaves (step 4).
+ *
+ * THE FOUR STEPS
+ * --------------
+ *  1. WITHHOLD what the frame withholds. `disable` records the flag for EVERY registered name
+ *     (a core or pending-only name's switch lives only there) and frees the cap slot when the
+ *     name holds one. Idempotent, so a repeat frame costs nothing.
+ *  2. UN-WITHHOLD what the replica withheld and the frame does not. `enable` clears the flag and,
+ *     for a searchable name, re-takes a slot newest-first.
+ *  3. ENABLE the canonical capped names this replica lacks (a rebuild may have pruned one, or a
+ *     grant may have arrived on a frame the replica has not seen yet).
+ *  4. WITHDRAW the capped names the replica holds and the frame does not - the direction the
+ *     protocol has NEVER had before, and what makes a disable reach a warm lane.
+ *
+ * THE RESIDUE, stated rather than hidden (step 4): the only seam that frees a cap slot is
+ * `disable`, which also sets the switch flag, so a name canonical merely EVICTED (cap pressure,
+ * not a user action) ends up flagged on the replica as well as off its list. That is the
+ * redundant-but-safe direction: a flagged-and-uncapped name is undeclared and refused at the
+ * gate, which is exactly canonical's behaviour for it, and the flag is self-clearing - the next
+ * frame's step 2 removes it, and a canonical grant for that name is replayed with the flag
+ * cleared in `applySync` above. The flag can never make the lane MORE permissive than canonical,
+ * which is the only invariant a reconcile has to keep.
+ *
+ * `target` defaults to the live lane's replica and its captured LOCAL runtime; a test passes a
+ * plain harness and its own runtime so the reconcile can be pinned without spawning a thread
+ * (calling the routed runtime here would ask the authority to change itself instead).
+ */
+export const applyToolStateSync = (
+    sync: LaneToolStateSync,
+    target?: { replica: Harness; runtime: LocalToolRuntime }
+): LaneToolStateReconcile | undefined => {
+    const replica = target?.replica ?? state.replica;
+
+    // No replica yet. The frame handler stashes it for the end of hello, so this is a "not now",
+    // never a "no": returning undefined is how the caller tells the two apart.
+    if (replica === undefined) return undefined;
+
+    const runtime = target?.runtime ?? localRuntime;
+    const installed = replica.tools as Record<string, unknown>;
+    const dropped: LaneToolStateReconcile['dropped'] = [];
+
+    // TOLERANCE FIRST. A name the replica does not register is dropped, and a name it registers
+    // but cannot hold in a CAP slot is dropped from the enabled list only - both are the same
+    // decision the hello prune already makes two functions below, restated here so a toggle for
+    // a tool this build does not have is a no-op instead of a `toolManage ... is not registered`
+    // throw that would fault the frame and, with it, the lane's live turn.
+    const prune = (names: readonly string[], list: 'enabled' | 'withheld'): string[] => {
+        const unique: string[] = [];
+        const seen = new Set<string>();
+
+        for (const name of names) {
+            // A non-string or blank member is wire junk, not a name. It is SKIPPED rather than
+            // reported: the kernel throws on a blank name (`toolManage requires a non-empty tool
+            // name`), and there is no name to name in the result.
+            if (typeof name !== 'string' || name.length === 0 || seen.has(name)) continue;
+
+            seen.add(name);
+
+            if (installed[name] === undefined) {
+                dropped.push({ name, list, reason: 'not-registered' });
+                continue;
+            }
+
+            // `enabled` is the CAPPED SEARCHABLE set (`discoveredTools`), so a name the kernel
+            // says holds no slot cannot be installed into it here either - the same
+            // `isToolSwitchable` rule as the hello prune. `withheld` has no such bound: it is
+            // precisely where a core or pending-only name's switch lives.
+            if (list === 'enabled' && !replica.isToolSwitchable(name)) {
+                dropped.push({ name, list, reason: 'not-switchable' });
+                continue;
+            }
+
+            unique.push(name);
+        }
+
+        return unique;
+    };
+
+    const targetEnabled = prune(Array.isArray(sync?.enabled) ? sync.enabled : [], 'enabled');
+    const targetWithheld = prune(Array.isArray(sync?.withheld) ? sync.withheld : [], 'withheld');
+    const wantWithheld = new Set(targetWithheld);
+    const wantEnabled = new Set(targetEnabled);
+
+    // Step 1: install the switches the user made. Read BEFORE step 2 mutates anything, so the set
+    // membership the loops compare against is one consistent snapshot of this replica.
+    for (const name of targetWithheld) {
+        if (!replica.withheldTools.includes(name)) {
+            runtime.manageTool(undefined, { operation: 'disable', name });
+        }
+    }
+
+    // Step 2: clear the switches the user undid. A name whose registration left the harness
+    // mid-flight is gone from `withheldTools` already (src/harness.ts:3071), so every member of
+    // this read is still resolvable; the guard against a throw is the same registry check the
+    // prune above uses.
+    const heldWithheld = new Set(replica.withheldTools);
+
+    for (const name of heldWithheld) {
+        if (!wantWithheld.has(name) && installed[name] !== undefined) {
+            runtime.manageTool(undefined, { operation: 'enable', name });
+        }
+    }
+
+    // Step 3: take the capped slots canonical holds and this replica does not. AFTER step 2, on
+    // purpose - `requestToolsFor` selects out of a catalogue that excludes withheld names, so
+    // enabling before clearing a stale flag would match nothing and the name would stay undeclared.
+    const heldEnabled = new Set(replica.discoveredTools);
+    const missing = targetEnabled.filter((name) => !heldEnabled.has(name));
+
+    if (missing.length > 0) {
+        runtime.requestTools(undefined, { names: missing });
+    }
+
+    // Step 4: free the capped slots this replica holds and canonical does not, and that are not
+    // already accounted for by step 1 (a name the frame withholds left the list in step 1).
+    const stillEnabled = new Set(replica.discoveredTools);
+    const stale = [...stillEnabled].filter((name) => !wantEnabled.has(name) && !wantWithheld.has(name));
+
+    for (const name of stale) {
+        runtime.manageTool(undefined, { operation: 'disable', name });
+    }
+
+    return { enabled: targetEnabled, withheld: targetWithheld, dropped };
+};
 
 // Install a registry change the authority already applied, so this replica runs the same
 // revision the canonical harness runs (T3 finding F9: no stale definition behind a replace).
@@ -1420,6 +1619,33 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
     // `fault` frame: the handshake is rejected, and the coordinator never falls back to inline.
     const refusedNestedRuns = refuseNestedRuns(replica);
 
+    // R5b: install the SESSION SWITCH state, and then any reconcile that arrived mid-handshake.
+    //
+    // THIS position is the whole design: after `installAuthorityRuntime` (so `localRuntime` is the
+    // replica's own kernel seams, not the routed ones) and AFTER `refuseNestedRuns` (which deletes
+    // names from this registry, so a canonical switch for one of them must be pruned, not
+    // installed against a tool that no longer resolves here). It is the same applier the
+    // `sync.tools` frame runs, so hello and a live toggle cannot drift: hello is simply the first
+    // reconcile of the session's tool state.
+    //
+    // `withheldTools` is optional on the blueprint, and the snapshot ALREADY carries the same set
+    // under `discovery.withheld` (src/harness.ts:11679, restored at :11919) - the fallback below
+    // is what makes the two spellings agree instead of fighting, and what keeps a coordinator that
+    // ships only the snapshot at exactly the state it always reached.
+    const blueprintWithheld = blueprint.withheldTools ?? (discovery as { withheld?: readonly string[] } | undefined)?.withheld ?? [];
+
+    applyToolStateSync({ enabled: [...enabledNames], withheld: [...blueprintWithheld] });
+
+    // A frame that landed while this replica did not exist yet (see LaneWorkerState
+    // `.pendingToolSync`): the coordinator has ALREADY posted the newer state, so applying it on
+    // top of the blueprint's is what makes "toggle a tool while the lane is starting" land rather
+    // than vanish. Cleared here so a later hello on a rebuilt replica cannot re-apply a stale one.
+    const earlySync = state.pendingToolSync;
+
+    state.pendingToolSync = undefined;
+
+    if (earlySync !== undefined) applyToolStateSync(earlySync);
+
     const report = capabilityReport(replica, preset, refusedNestedRuns);
 
     send({ kind: 'hello', laneEpoch: frame.laneEpoch, version: LANE_PROTOCOL_VERSION, capabilities: report });
@@ -1708,6 +1934,26 @@ const handle = async (frame: LaneCommand): Promise<void> => {
                 await syncTranscript();
             }).catch(() => undefined);
 
+            return;
+        }
+
+        // R5b: the session's tool switches moved. SYNCHRONOUS and NOT serialised behind the
+        // commit chain, on purpose - the applier touches only this replica's two discovery sets
+        // (kernel seams, no await), and the effect the requirement cares about is the NEXT model
+        // request of THIS lane, which `declared()` rebuilds from exactly those sets. Nothing here
+        // aborts, interrupts or re-bases a run: a tool call already scheduled when the frame
+        // lands keeps executing, because the switch is read at LAUNCH (src/harness.ts:8040) and
+        // the launch already happened.
+        case 'sync.tools': {
+            if (state.replica === undefined) {
+                // Mid-handshake. Stashed and applied at the end of hello (see LaneWorkerState
+                // `.pendingToolSync`); a fault here would fail the handshake over a settings
+                // frame, which is the wrong size of answer.
+                state.pendingToolSync = frame.tools;
+                return;
+            }
+
+            applyToolStateSync(frame.tools);
             return;
         }
 

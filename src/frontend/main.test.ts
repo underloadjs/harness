@@ -943,8 +943,9 @@ it('shows the tools badge only in the tools view and keeps it hidden in the chat
     expect(badge.textContent).toBe('');
     expect(badge.hidden).toBe(true);
 
-    // Selected tool: the head names the tool and its GROUP in the badge.
-    byClass('.tool-tab-button', 'button').click();
+    // Selected tool: the head names the tool and its GROUP in the badge. R1 (swap): the dialog
+    // opens from the row's corner INFO mark; the tile is the enablement switch now.
+    byClass('.tool-tab-info', 'button').click();
     await flush();
     expect(document.querySelector('.main-title')?.textContent).toBe('read');
     expect(badge.textContent).toBe('Files');

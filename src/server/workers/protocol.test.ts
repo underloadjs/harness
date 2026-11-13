@@ -13,6 +13,10 @@
 
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_RUNTIME_CONFIGURATION, MAX_LANE_WORKERS_LIMIT, WORKER_HANDSHAKE_MS_MIN } from '../config';
+// The command UNION, imported as a type so the `satisfies LaneCommand` pin below is checked by
+// the compiler: the frame's payload field names ARE the wire contract, and a union member nobody
+// constructs cannot drift silently.
+import type { LaneCommand } from './protocol';
 import {
     LANE_EVENT_WINDOW,
     LANE_HANDSHAKE_MS,
@@ -73,6 +77,14 @@ describe('frame vocabulary', () => {
             // T10 finding M4: "canonical moved in the conversation you own - come and get the
             // messages you are missing". A pointer, not a state document.
             'sync.transcript',
+            // R5b: "the session's tool switches moved - set your copy to these two lists".
+            // The one WHOLESALE frame in the protocol, and the only one that exists because a
+            // replica cannot derive the value itself: the switch lives on the coordinator's
+            // harness, a closure cannot cross `worker_threads`, and until this frame nothing in
+            // the vocabulary could TAKE a name away from a warm lane (the `sync.enabled` replay
+            // in ./lane-worker-loop.ts is additive). ./protocol.ts:272-300 states why the
+            // payload is two lists and why there is no receipt.
+            'sync.tools',
             'dispose'
         ]) {
             expect(isLaneCommandKind(kind)).toBe(true);
@@ -104,6 +116,41 @@ describe('frame vocabulary', () => {
         // the live turn at the host, and guidance that arrived at an unsteerable moment must
         // not destroy the run that is still executing.
         expect(isLaneReplyKind('steer.result')).toBe(true);
+    });
+});
+
+describe('sync.tools — the R5b tool-state reconcile frame', () => {
+    it('is a one-way command carrying exactly the two canonical lists', () => {
+        // The frame AS THE HOST POSTS IT (./lane-host.ts `broadcastTools`, fed by
+        // ./lane-authority.ts `toolStateNow`). `satisfies LaneCommand` is the load-bearing part
+        // of this assertion: the payload field names are the wire contract, and a rename on
+        // either side stops compiling here rather than arriving as a silently empty reconcile.
+        const frame = {
+            kind: 'sync.tools',
+            laneEpoch: 7,
+            tools: { enabled: ['timeNow'], withheld: ['glob'] }
+        } satisfies LaneCommand;
+
+        expect(isLaneEnvelope(frame)).toBe(true);
+        expect(isLaneCommandKind(frame.kind)).toBe(true);
+        // Coordinator -> worker ONLY. A worker that answered this frame would be a second
+        // writer of the enabled set, which is the invariant ./lane-commit.ts protects.
+        expect(isLaneReplyKind(frame.kind)).toBe(false);
+        // ONE-WAY by construction: no `callId`, no `seq`, no `streamSeq` - there is no reply to
+        // correlate and no receipt to advance a committed base. The envelope carries the epoch
+        // and the state, and the state is complete, which is what makes a duplicate or a late
+        // frame land the same set instead of corrupting it.
+        expect(Object.keys(frame)).toEqual(['kind', 'laneEpoch', 'tools']);
+        expect(Object.keys(frame.tools)).toEqual(['enabled', 'withheld']);
+        // Both lists are plain string arrays: nothing in this frame can fail `postMessage`.
+        expect(isTransferableFrame(frame)).toBe(true);
+        // A frame for a lane that no longer exists is still a VALID envelope - the host and the
+        // worker's own epoch guard decide what to do with it, the vocabulary does not.
+        expect(isLaneEnvelope({ ...frame, laneEpoch: 0 })).toBe(true);
+        expect(isLaneEnvelope({ ...frame, laneEpoch: -1 })).toBe(false);
+        // An EMPTY reconcile is a real answer ("nothing enabled, nothing switched off"), not an
+        // absent frame, so it must stay accepted: the applier prunes and withdraws accordingly.
+        expect(isLaneEnvelope({ kind: 'sync.tools', laneEpoch: 1, tools: { enabled: [], withheld: [] } })).toBe(true);
     });
 });
 

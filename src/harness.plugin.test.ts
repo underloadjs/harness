@@ -679,13 +679,19 @@ describe('plugin harness control', () => {
                         api.disableTool('now');
                         expect(api.enabledTools()).not.toContain('now');
 
-                        // A core declaration is always in context, so switching it would
-                        // be a lie the plugin would believe.
-                        expect(() => api.enableTool('toolRequest')).toThrow(
-                            'Tool "toolRequest" is a core declaration; it is always in context and cannot be enabled or disabled.'
-                        );
+                        // THE SESSION SWITCH: a core declaration is switchable from here on,
+                        // so `enableTool`/`disableTool` no longer throw for one. What they
+                        // move is the conversation's withheld set, NOT a cap slot — which is
+                        // why `enabledTools()` (the capped view) stays exactly as it was in
+                        // both directions. The unregistered name is still the refusal.
+                        expect(() => api.disableTool('toolRequest')).not.toThrow();
+                        expect(api.enabledTools()).not.toContain('toolRequest');
+                        expect(() => api.enableTool('toolRequest')).not.toThrow();
                         expect(() => api.disableTool('missing')).toThrow(
                             'Tool "missing" is not registered in this harness.'
+                        );
+                        expect(() => api.enableTool('   ')).toThrow(
+                            'A tool switch requires a non-empty tool name.'
                         );
                     }
                 }

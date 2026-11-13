@@ -138,13 +138,13 @@ export const metadata = {
             scope: {
                 type: 'object',
                 description:
-                    'Restrict what the child may do. `tools` is an allowlist of wire names: the child neither sees nor can call anything outside it, so a planning or review delegation can be read-only by construction instead of by instruction. One door is never restricted: toolRequest stays available to a scoped child so it can report what it is missing instead of looping. Omit for the historical unrestricted child.',
+                    'Restrict what the child may do. `tools` is an allowlist of wire names: the child neither sees nor can call anything outside it, so a planning or review delegation can be read-only by construction instead of by instruction. One door is never restricted BY THE SCOPE: toolRequest stays available to a scoped child so it can report what it is missing instead of looping - unless the user of this conversation has switched toolRequest off, which is a session switch and applies to every child. Omit for the historical unrestricted child.',
                 properties: {
                     tools: {
                         type: 'array',
                         items: { type: 'string' },
                         description:
-                            'Wire names the child may use (e.g. ["read", "glob", "grep"] for a read-only review). An empty array declares no tools at all; toolRequest is still available to it as the discovery door.'
+                            'Wire names the child may use (e.g. ["read", "glob", "grep"] for a read-only review). An empty array declares no tools at all; toolRequest is still available to it as the discovery door, unless the user of this conversation has switched toolRequest off.'
                     }
                 },
                 additionalProperties: false

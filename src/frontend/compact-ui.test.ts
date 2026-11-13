@@ -277,14 +277,23 @@ it('opens and closes the global tools view from the session-line icon only', asy
     expect(agentSlot.hidden).toBe(true);
     expect(composer.hidden).toBe(true);
 
-    // Activating the entry opens its runner in the shared modal. The button names
-    // the popup kind and reports the current selection.
-    const toolButton = byClass('.tool-tab-button', 'button');
-    expect(toolButton.dataset.tool).toBe('read');
-    expect(toolButton.getAttribute('aria-haspopup')).toBe('dialog');
-    expect(toolButton.getAttribute('aria-pressed')).toBe('false');
+    // R1 (the swap): the row's two activations are two nodes. The TILE is the conversation's
+    // enable/disable switch — `read` is a switchable name the session reports enabled, so its
+    // tile is pressed and carries no lock. The corner MARK is what opens a runner, and it names
+    // the popup kind and reports whether ITS dialog is open.
+    const toolTile = byClass('.tool-tab-button', 'button');
+    const toolMark = byClass('.tool-tab-info', 'button');
 
-    toolButton.click();
+    expect(toolTile.dataset.tool).toBe('read');
+    expect(toolTile.getAttribute('aria-pressed')).toBe('true');
+    expect(toolTile.getAttribute('aria-haspopup')).toBeNull();
+    expect(toolTile.dataset.locked).toBeUndefined();
+    expect(toolMark.dataset.tool).toBe('read');
+    expect(toolMark.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(toolMark.getAttribute('aria-expanded')).toBe('false');
+    expect(toolMark.getAttribute('aria-label')).toBe('Details for read');
+
+    toolMark.click();
     await flush();
 
     const dialog = byClass('.dialog', 'div');
@@ -298,9 +307,13 @@ it('opens and closes the global tools view from the session-line icon only', asy
     // (main.ts:3867-3868) even though the chat header keeps it hidden.
     expect(badge.hidden).toBe(false);
     expect(head.querySelector('.harness-note')?.textContent).toBe('searchable · tags: files, read');
-    expect(toolButton.getAttribute('aria-pressed')).toBe('true');
+    // The OPEN figure belongs to the mark; the tile's `aria-pressed` is the enabled figure and
+    // opening a dialog says nothing about it (the two figures stay independent by design).
+    expect(toolMark.getAttribute('aria-expanded')).toBe('true');
+    expect(toolMark.dataset.open).toBe('true');
+    expect(toolTile.getAttribute('aria-pressed')).toBe('true');
     // Opening moves focus onto the modal panel, so the close-time focus restore
-    // below is a real move back to the entry rather than a no-op.
+    // below is a real move back to the mark rather than a no-op.
     expect(document.activeElement).toBe(dialog);
     // The persistent runner pane is adopted inside the dialog body: slot > pane >
     // the real tool card (schema + arguments + result), not a copy.
@@ -316,16 +329,17 @@ it('opens and closes the global tools view from the session-line icon only', asy
     expect(agentSlot.hidden).toBe(true);
     expect(composer.hidden).toBe(true);
 
-    // Closing the dialog drops the layer, resets the pressed state, re-describes
-    // the catalogue in the head and returns focus to the entry that opened it.
+    // Closing the dialog drops the layer, resets the mark's expanded state, re-describes the
+    // catalogue in the head, and returns focus to the MARK that opened it (`returnFocus`).
     byClass('.dialog-close', 'button').click();
     await flush();
 
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.querySelector('.tool-runner-slot')).toBeNull();
     expect(document.querySelector('.tool-card')).toBeNull();
-    expect(toolButton.getAttribute('aria-pressed')).toBe('false');
-    expect(toolButton.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(toolMark.getAttribute('aria-expanded')).toBe('false');
+    expect(toolMark.dataset.open).toBeUndefined();
+    expect(toolTile.getAttribute('aria-pressed')).toBe('true');
     expect(head.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
     expect(head.querySelector('.harness-id')?.textContent).toBe('');
     // Dialog close repaints the catalogue head (`paintToolsHead`), which keeps the shared
@@ -334,7 +348,7 @@ it('opens and closes the global tools view from the session-line icon only', asy
     // T4: closing a runner repaints the SAME conversation's tally — the rows are still the ones
     // this conversation's read returned, and nothing re-dials the toolbox on a dialog close.
     expect(head.querySelector('.harness-note')?.textContent).toBe('1 tool · the toolbox of this conversation');
-    expect(document.activeElement).toBe(toolButton);
+    expect(document.activeElement).toBe(toolMark);
     expect(stage.querySelector('.tools-pane')).not.toBeNull();
     expect(agentSlot.hidden).toBe(true);
     expect(composer.hidden).toBe(true);
@@ -541,7 +555,9 @@ it('opens harness details from the clickable title and keeps the dashboard reach
 
     // Selecting a tool retitles the head but not the affordance: the heading names the
     // tool, the runner is the front layer, and no harness details leak in.
-    byClass('.tool-tab-button', 'button').click();
+    // R1 (swap): the tool dialog opens from the row's CORNER MARK, not from the tile —
+    // the tile's press writes enablement. Same head/affordance contract either way.
+    byClass('.tool-tab-info', 'button').click();
     await flush();
     expect(title.textContent).toBe('read');
     expect(button.disabled).toBe(false);
@@ -797,19 +813,19 @@ it('has no tab strip rules left and styles the global icon toggle', () => {
     expect(rules).not.toContain('.plugins-toggle, .tools-toggle');
 });
 
-// R1/R2: each catalogue row now carries its own enablement TICK BOX in the tile's
-// top-right corner, and a row is a WRAPPER (`.tool-tab-row` / `.plugin-tab-row`) holding
-// the dialog trigger and the box as siblings — a `<button>` cannot contain a control.
-// These rules are the layout that wrapper needs. The TICK vocabulary is the same in both
-// panes, and since the second pass on the Plugins pane so is the tile VOCABULARY: each says
-// "enabled" on the BORDER, so the background stays free for the SELECTION figure. What stays
-// per pane is the SELECTOR — the two catalogues are deliberately never merged into one
-// selector list, so restyling one row can never move the other.
-it('lays out each catalogue row as a trigger plus its own corner enablement box', () => {
-    // The wrapper is a flex line AND the positioning context the corner box anchors to;
-    // the trigger takes the remaining width and can shrink (a long tool name still clamps
-    // instead of pushing the layout), and it reserves the corner so text never runs under
-    // the box.
+// R1 (THE SWAP): each catalogue row now carries its own enable/disable SWITCH in the tile itself
+// and a corner INFO BUTTON in the tile's top-right corner. A row is still a WRAPPER
+// (`.tool-tab-row` / `.plugin-tab-row`) holding its two controls as siblings — a `<button>` cannot
+// contain a control. The plugins pane moved the same way (R2/R3): its native tick box is gone and
+// the corner mark is now a button the sheet has to paint. The tile says "enabled" on the BORDER,
+// and since the swap the SELECTION figure lives on the corner control rather than on the tile, so
+// the two figures cannot collide in one cascade at all. What stays per pane is the SELECTOR — the
+// two catalogues are deliberately never merged into one selector list, so restyling one row can
+// never move the other.
+it('lays out each catalogue row as a switch tile plus its own corner info control', () => {
+    // The wrapper is a flex line AND the positioning context the corner control anchors to;
+    // the tile takes the remaining width and can shrink (a long tool name still clamps instead of
+    // pushing the layout), and it reserves the corner so text never runs under the mark.
     expect(blockOf('.tool-tab-row {')).toContain('display: flex');
     expect(blockOf('.tool-tab-row {')).toContain('position: relative');
     expect(blockOf('.tool-tab-row .tool-tab-button {')).toContain('flex: 1 1 auto');
@@ -821,49 +837,96 @@ it('lays out each catalogue row as a trigger plus its own corner enablement box'
     expect(blockOf('.plugin-tab-row .plugin-tab-button {')).toContain('min-width: 0');
     expect(blockOf('.plugin-tab-row .plugin-tab-button {')).toContain('padding-right: 34px');
 
-    // The box is a native checkbox absolutely positioned in the corner and LIFTED above the
-    // tile by `z-index` — that pairing is what makes a click on the box land on the box
-    // and never open the runner/dialog. Both panes use the same 17px box and the same
-    // green tick, as two separate blocks.
-    for (const selector of ['.tool-tab-enable', '.plugin-tab-enable']) {
+    // Both corner controls are absolutely positioned in the wrapper and LIFTED above the tile by
+    // `z-index` — that pairing is what makes a press on the corner land on the corner and never
+    // reach the tile's handler. Both are now the SAME kind of control: a bordered 20px square the
+    // sheet paints, sized around the shared 13px glyph.
+    for (const selector of ['.tool-tab-info', '.plugin-tab-info']) {
         expect(blockOf(`${selector} {`)).toContain('position: absolute');
         expect(blockOf(`${selector} {`)).toContain('z-index: 1');
-        expect(blockOf(`${selector} {`)).toContain('width: 17px');
-        expect(blockOf(`${selector} {`)).toContain('accent-color: var(--ok)');
         expect(blockOf(`${selector} {`)).toContain('cursor: pointer');
-        expect(blockOf(`${selector}.is-off {`)).toContain('accent-color: var(--muted)');
+        expect(blockOf(`${selector} {`)).toContain('width: 20px');
+        expect(blockOf(`${selector} {`)).toContain('height: 20px');
+        expect(blockOf(`${selector} {`)).toContain('border: 1px solid var(--border-strong)');
+        expect(blockOf(`${selector} {`)).toContain('background: var(--bg-elevated)');
+        expect(blockOf(`${selector} {`)).toContain('color: var(--muted)');
+        expect(blockOf(`${selector}:hover {`)).toContain('border-color: var(--accent)');
         expect(blockOf(`${selector}:focus-visible {`)).toContain('outline: 2px solid var(--accent)');
-        // R1: the ONLY disabled state is the control's own in-flight write.
-        expect(blockOf(`${selector}:disabled {`)).toContain('cursor: progress');
     }
+
+    // Each pane owns its corner INSET — the two catalogues have different tile padding, and the
+    // mark is centred on the card's title line in each. This is the pair of numbers that keeps a
+    // clamped title or description from running under the mark (see the `padding-right` above).
+    expect(blockOf('.tool-tab-info {')).toContain('top: 8px');
+    expect(blockOf('.tool-tab-info {')).toContain('right: 9px');
+    expect(blockOf('.plugin-tab-info {')).toContain('top: 11px');
+    expect(blockOf('.plugin-tab-info {')).toContain('right: 12px');
+
+    // The native checkbox and its rules are gone from this pane, in both spellings: a tick box
+    // cannot be locked-but-not-disabled, and its state was a FILL (`accent-color`), which is the
+    // one channel this contract keeps free for the selection figure.
+    expect(rules).not.toContain('.plugin-tab-enable');
+    expect(rules).not.toContain('accent-color: var(--ok)');
+
+    // The glyph itself is ONE rule for every copy in the frontend (./ui/info-icon.ts is data
+    // only — `fill="none"` rides the element). `stroke: currentColor` is what lets the control's
+    // own `color` state carry the mark, and it is why the open state needs no second glyph rule.
+    const glyph = blockOf('.info-icon {');
+
+    expect(glyph).toContain('fill: none');
+    expect(glyph).toContain('stroke: currentColor');
+    expect(glyph).toContain('stroke-width: 1.7');
+    expect(glyph).toContain('width: 13px');
+    expect(glyph).toContain('height: 13px');
+
+    // THE selection figure of the tools pane: the mark of the row whose runner is open. This is
+    // the accent pair the tile used to carry, and it is the ONLY place that pair appears in this
+    // pane — so "enabled" (the tile's green edge) and "open" (the mark's accent) stay two
+    // readable, non-competing states.
+    const toolInfoOpen = blockOf(".tool-tab-info[aria-expanded='true'] {");
+
+    expect(toolInfoOpen).toContain('border-color: var(--accent)');
+    expect(toolInfoOpen).toContain('background: var(--accent-soft)');
+    expect(toolInfoOpen).toContain('color: var(--text)');
 
     // R1: the TOOLS tile carries "enabled" on its EDGE only — `--ok-line` border over the
     // tile's normal `--bg-elevated` surface. The green wash is gone from this pane because
-    // the BACKGROUND is the SELECTION channel: the tile whose runner is open fills with
-    // `--accent-soft` (pinned below), so the two figures can never collide. The rule must
+    // the BACKGROUND is the SELECTION channel: the mark of the open row fills with
+    // `--accent-soft` (pinned above), so the two figures can never collide. The rule must
     // not declare a background at all — the elevated surface is inherited from the base
     // `.tool-tab-button {` rule, and any enabled background here would sit on the selection
     // channel and make "enabled" and "selected" unreadable on the same tile.
     const toolEnabled = blockOf(".tool-tab-button[data-enabled='true'] {");
+
     expect(toolEnabled).toContain('border-color: var(--ok-line)');
     expect(toolEnabled).not.toContain('var(--ok-wash)');
     expect(toolEnabled).not.toContain('background');
 
-    // Hover strengthens the SAME edge (never adds a tint), and selection keeps its own
-    // two-channel treatment: accent border plus the `--accent-soft` fill.
+    // Hover strengthens the SAME edge (never adds a tint).
     expect(blockOf(".tool-tab-button[data-enabled='true']:hover:not(:disabled) {")).toContain(
         'border-color: var(--ok)'
     );
     expect(blockOf('.tool-tab-button {')).toContain('border: 1px solid transparent');
     expect(blockOf('.tool-tab-button {')).toContain('background: var(--bg-elevated)');
-    const toolPressed = blockOf(".tool-tab-button[aria-pressed='true'] {");
-    expect(toolPressed).toContain('border-color: var(--accent)');
-    expect(toolPressed).toContain('background: var(--accent-soft)');
+
+    // Since the swap the tile's `aria-pressed` IS the enabled figure, so the accent "selected"
+    // rule that used to sit on it is GONE — an accent border there would repaint the green edge
+    // on every enabled row. The tick box's own rules left with its markup too, in BOTH panes.
+    expect(rules).not.toContain(".tool-tab-button[aria-pressed='true']");
+    expect(rules).not.toContain(".plugin-tab-button[aria-pressed='true']");
+    expect(rules).not.toContain('.tool-tab-enable');
+
+    // A locked switch is inert but never `disabled`, so the cursor is the only thing that can
+    // say it: `data-locked` names the reason (protected / running / writing / offline for tools,
+    // writing / offline for plugins) and `writing` keeps the progress cursor the busy tick box
+    // used to carry.
+    expect(blockOf('.tool-tab-button[data-locked] {')).toContain('cursor: default');
+    expect(blockOf(".tool-tab-button[data-locked='writing'] {")).toContain('cursor: progress');
 
     // The PLUGINS twin now MATCHES the tools twin: a ticked plugin row carries the green on
     // its EDGE only, over the elevated surface the base rule already gives it. The wash left
     // this pane for the same reason it left tools — the background there is the SELECTION
-    // channel (`.plugin-tab-button[aria-pressed='true']` fills with `--accent-soft`, pinned
+    // channel (`.plugin-tab-info[aria-expanded='true']` fills with `--accent-soft`, pinned
     // below), so a green fill and an accent fill would collide on the row whose dialog is
     // open. The rule declares NO background at all; the old `background-color:
     // var(--bg-elevated)` companion existed only as the layer UNDER the wash gradient and has
@@ -879,19 +942,29 @@ it('lays out each catalogue row as a trigger plus its own corner enablement box'
     expect(blockOf('.plugin-tab-button {')).toContain('border: 1px solid transparent');
     expect(blockOf('.plugin-tab-button {')).toContain('background: var(--bg-elevated)');
 
-    const pluginPressed = blockOf(".plugin-tab-button[aria-pressed='true'] {");
+    // THE selection figure of the plugins pane, exactly as in tools: the mark of the row whose
+    // settings layer is open. `blockOf` takes the FIRST rule for a selector, and there is no
+    // second one here — the forced-colours twin below is inside a `@media`, so it cannot be
+    // mistaken for a base rule that overrides this one.
+    const pluginInfoOpen = blockOf(".plugin-tab-info[aria-expanded='true'] {");
 
-    expect(pluginPressed).toContain('border-color: var(--accent)');
-    expect(pluginPressed).toContain('background: var(--accent-soft)');
+    expect(pluginInfoOpen).toContain('border-color: var(--accent)');
+    expect(pluginInfoOpen).toContain('background: var(--accent-soft)');
+    expect(pluginInfoOpen).toContain('color: var(--text)');
+    expect(blockOf('.plugin-tab-info:hover {')).toContain('border-color: var(--accent)');
 
-    // The tile whose runner/dialog is open still reads as the selected one: `[data-enabled]`
-    // is declared BEFORE the accent rule at equal specificity, so `[aria-pressed]` wins the
-    // border in both panes.
-    for (const button of ['.tool-tab-button', '.plugin-tab-button']) {
-        expect(rules.indexOf(`${button}[data-enabled='true'] {`)).toBeLessThan(
-            rules.indexOf(`${button}[aria-pressed='true'] {`)
-        );
-    }
+    // Neither pane has a border contest any more: "enabled" and "open" sit on two different
+    // controls, one on the tile's edge and one on the mark's edge, so the ORDER of the two rules
+    // cannot change what a row looks like. The old
+    // `[data-enabled]`-before-`[aria-pressed]` pin is gone because the pair it ordered is gone;
+    // the two `not.toContain` greps above are what keep it gone.
+
+    // A locked plugin switch is inert but never `disabled` — the tools rule above, with only the
+    // plugin's real reasons. The `@supports` pair is the progressive layer for engines without
+    // `not-allowed`; both spellings must survive the strip, or the fallback silently becomes the
+    // only cursor this UI has.
+    expect(blockOf('.plugin-tab-button[data-locked] {')).toContain('cursor: default');
+    expect(blockOf(".plugin-tab-button[data-locked='writing'] {")).toContain('cursor: progress');
 
     // The token pair is still two tokens, not alphas repeated per pane, and `--ok-wash` is
     // still DEFINED and still CONSUMED — by the records/tasks completed rows
@@ -906,12 +979,30 @@ it('lays out each catalogue row as a trigger plus its own corner enablement box'
     // its state on the edge has to pin that edge to a SYSTEM colour: the sheet's own doctrine
     // is that a state must survive on borders and text, and an enabled tile and a plain one
     // would both collapse onto the forced `CanvasText` border and stop differing at all.
-    // `Highlight` is the salient-one system colour the block already uses elsewhere. (The
-    // plugin tile now rides the same edge; its forced-colours twin is the one piece of the
-    // parity this pass did NOT add, so it is not pinned here.)
+    // `Highlight` is the salient-one system colour the block already uses elsewhere. BOTH
+    // catalogue tiles ride that edge now, so both pin it.
     const forcedToolEnabled = blockOfLast(".tool-tab-button[data-enabled='true'] {");
 
     expect(forcedToolEnabled.replace(/\s+/g, ' ').trim()).toBe('border-color: Highlight;');
+
+    const forcedPluginEnabled = blockOfLast(".plugin-tab-button[data-enabled='true'] {");
+
+    expect(forcedPluginEnabled.replace(/\s+/g, ' ').trim()).toBe('border-color: Highlight;');
+
+    // The swap moved the SELECTION figure onto the corner mark, and that figure is an accent
+    // border plus an accent TINT — the tint is exactly what forced colours throws away. So the
+    // mark states its open edge in a system colour too, and follows it with `color` because the
+    // glyph rides `stroke: currentColor`: without the second declaration the open row's mark
+    // would collapse to a plain outline and the pane would have no "which runner is open" cue.
+    const forcedToolInfo = blockOfLast(".tool-tab-info[aria-expanded='true'] {");
+
+    expect(forcedToolInfo.replace(/\s+/g, ' ').trim()).toBe('border-color: Highlight; color: Highlight;');
+
+    // The plugins mark is the same figure with the same dependency, and it is a SEPARATE rule
+    // (the two panes are never merged into one selector list).
+    const forcedPluginInfo = blockOfLast(".plugin-tab-info[aria-expanded='true'] {");
+
+    expect(forcedPluginInfo.replace(/\s+/g, ' ').trim()).toBe('border-color: Highlight; color: Highlight;');
 
     // A DISABLED tile is the PLAIN one: the old `[data-enabled='false']` opacity dim is
     // gone, so "off" is the default appearance and no catalogue row is faded. The only dim
@@ -941,9 +1032,12 @@ it('lays out each catalogue row as a trigger plus its own corner enablement box'
     expect(rules).not.toContain('.plugins-tab-note');
     expect(blockOf('.plugins-tab-status-error {')).toContain('color: var(--danger)');
 
-    // The two panes still own their own rules (no shared selector list was introduced).
-    expect(rules).not.toContain('.tool-tab-enable, .plugin-tab-enable');
+    // The two panes still own their own rules (no shared selector list was introduced). The
+    // tools corner control has no plugins twin to merge with at all now that the tick boxes are
+    // different controls, and the pane's dead enablement vocabulary may not survive anywhere.
+    expect(rules).not.toContain('.tool-tab-info, .plugin-tab-info');
     expect(rules).not.toContain('.plugin-tab-enable, .tool-tab-enable');
+    expect(rules).not.toContain('.tool-tab-enable');
 });
 
 // The Plugins pane FOOTER (2026-11-13): `Reload plugins` moved out of `.plugins-tab-head`,
@@ -1005,6 +1099,83 @@ it('leaves the create-harness close baseline alone (F2 cascade guard)', () => {
 
     // And the toggle does not wear that class at all.
     expect(rules).not.toContain('.icon-button.tools-toggle');
+});
+
+// R4 (2026-11-13): both catalogues stopped PRINTING a sentence about a switch — the tile's green
+// edge is the accepted figure — and a refused switch moved onto the row itself, as the corner mark
+// turning into a red warning glyph. jsdom runs no cascade, so what gets pinned here is the
+// declarations, the ORDER that makes them win, and the shape of the contract: one state hook per
+// pane (never a shared selector list), painted from the sheet's own danger token, and NO rule for
+// the failure glyph beyond the shared `.info-icon` one — the mark rides `stroke: currentColor`, so
+// the control's colour IS the glyph's colour.
+it('paints a refused switch red on both catalogues’ corner marks', () => {
+    for (const pane of ['tool', 'plugin'] as const) {
+        const error = blockOf(`.${pane}-tab-info[data-toggle='error'] {`);
+
+        // Edge AND glyph. The glyph needs its own declaration because it is stroked with
+        // `currentColor`: without `color`, a refused row would wear a red border and a grey mark.
+        expect(error).toContain('border-color: var(--danger)');
+        expect(error).toContain('color: var(--danger)');
+        // The token, never a literal, so one palette edit moves both catalogues and the pill.
+        expect(error).not.toMatch(/#[0-9a-fA-F]{3,6}|rgba?\(/);
+        // The failure state adds NO background: the accent fill is the pane's "this row's layer is
+        // open" figure (`.tool-tab-info[aria-expanded='true']` / its plugin twin), and a third
+        // channel on the same 20px box would be read as a third state of the ROW.
+        expect(error).not.toContain('background');
+        // Not a size change either — the two glyphs share `.info-icon`'s box, so a swap cannot
+        // move the control's footprint or the row's text padding.
+        expect(error).not.toContain('width');
+        expect(error).not.toContain('height');
+
+        // ORDER is load-bearing: `:hover`, the open rule and this one all have the same specificity
+        // (one class + one compound), so the LAST writer wins. Being written after both keeps a
+        // refused row red under the pointer and while its own dialog is open — otherwise the hover
+        // accent would silently repaint the failure the moment the reader aimed at it.
+        expect(rules.indexOf(`.${pane}-tab-info:hover {`)).toBeLessThan(rules.indexOf(`.${pane}-tab-info[data-toggle='error'] {`));
+        expect(
+            rules.indexOf(`.${pane}-tab-info[aria-expanded='true'] {`)
+        ).toBeLessThan(rules.indexOf(`.${pane}-tab-info[data-toggle='error'] {`));
+
+        // ONE rule per pane, and no forced-colours twin: the selectors appear EXACTLY once in the
+        // stripped sheet. The enabled edge needs a `Highlight` rescue in that mode because it is a
+        // colour with no shape and no words; this state changes the glyph's SHAPE and puts the
+        // reason in the control's accessible name and tooltip, which forced colours never touches —
+        // and there is no system colour for "error" to rescue it to anyway.
+        expect(rules.match(new RegExp(`\\.${pane}-tab-info\\[data-toggle='error'\\]`, 'g'))).toHaveLength(1);
+    }
+
+    // The two catalogues are never merged into a selector list — the standing rule that restyling
+    // one pane cannot move the other (the same reason their base, hover and open rules are pairs).
+    expect(rules).not.toContain(".tool-tab-info[data-toggle='error'],");
+    expect(rules).not.toContain(".plugin-tab-info[data-toggle='error'],");
+    expect(rules).not.toContain('.tool-tab-info, .plugin-tab-info');
+
+    // The warning glyph borrows the SHARED paint rule rather than inventing a class of its own, so
+    // the resting mark and the failure mark cannot drift in size, stroke or joins. A `.warning-icon`
+    // rule appearing here would be the drift this pin exists to catch.
+    const glyph = blockOf('.info-icon {');
+
+    expect(glyph).toContain('stroke: currentColor');
+    expect(glyph).toContain('fill: none');
+    expect(rules).not.toContain('.warning-icon');
+    expect(rules).not.toContain('.info-icon-warning');
+
+    // The danger token is still defined ONCE, and both new rules consume that definition.
+    expect(blockOf(':root {')).toContain('--danger: #f87171');
+    expect(rules.match(/--danger: /g)).toHaveLength(1);
+
+    // The plugin pane's footer line KEEPS both of its rules even though R4 silenced the element:
+    // main.ts still builds the `<p>` (the footer strip stays `[statusLine, refresh]`), the
+    // `role="status"` live region survives for any sentence the pane is given again, and a dead
+    // selector grep must not clear the failure spelling this element's contract is written in.
+    expect(blockOf('.plugins-tab-status {')).toContain('margin: 0');
+    expect(blockOf('.plugins-tab-status-error {')).toContain('color: var(--danger)');
+    expect(blockOf('.plugins-tab-status-error {')).toContain('font-weight: 600');
+    // The sentence's own surface never grew a colour contest: one line, one danger spelling.
+    expect(rules).not.toContain('.plugins-tab-status-error,');
+    // And neither catalogue grew a replacement sentence: the tools pane's line is gone, and the
+    // plugins pane's line is now written by nobody.
+    expect(rules).not.toContain('.tools-tab-note');
 });
 
 it('lets the topbar cluster shrink so the status pill never scrolls the bar (F1)', () => {

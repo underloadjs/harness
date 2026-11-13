@@ -1553,6 +1553,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const globalDisableDiscoveryReason = (name: string): string =>
         `${globalDisableReason(name)} Requesting it again will not change this answer — adapt to the available tools or report the limitation.`;
 
+    // THE SESSION-SCOPED REFUSAL SENTENCE (see the withheld set beside `activeTools`).
+    //
+    // Deliberately NOT `globalDisableDiscoveryReason`: that one names the OPERATOR of the
+    // server and is permanent for every session, while this one names the user of THIS
+    // conversation and is reversible by them. A model told "the server disabled it" learns
+    // nothing it can act on; a model told "the user switched this off for this
+    // conversation" knows to stop asking and to report the limitation. The sentence
+    // carries the same loop-breaker clause (`asking again will not change this answer`)
+    // because it does the same job: `toolRequest` cannot find a withheld name, so a
+    // second search is not a second chance.
+    //
+    // Reads `withheldTools` at CALL time. The set is declared later in this closure, which
+    // is safe (a const binding is only in TDZ until its initializer runs, and nothing here
+    // is called during construction) and keeps the two refusal sentences in one place.
+    const sessionDisableReason = (name: string): string =>
+        `Tool "${name}" is switched off for this conversation by its user. Calling ${TOOL_REQUEST} will not find it and asking again will not change this answer.`;
+
     // ------------------------------------------------------------------
     // R3 plugin api: the plugin-agnostic half, built ONCE per harness
     // ------------------------------------------------------------------
@@ -1792,6 +1809,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // here. Core tools never enter this set and never occupy a cap slot.
     const activeTools = new Set<string>();
 
+    // THE SESSION SWITCH (withheld set) — a completely different fact from `activeTools`.
+    //
+    // `activeTools` answers "does this name hold one of the `maxEnabledTools` slots?".
+    // `withheldTools` answers "has the operator of THIS conversation switched this name
+    // off for the agents?". The two sets are independent by design:
+    //
+    //   - A withheld name occupies NO slot and never affects cap arithmetic
+    //     (`occupiesSearchableSlot`, `enableTools`, `currentEnabledNames`,
+    //     `setActiveTools` are all untouched). Core and pending-only names never had a
+    //     slot to begin with, so switching one is only a membership change here.
+    //   - Written ONLY by deliberate switch operations (`toolManage enable|disable`,
+    //     the plugin seam, restore). Cap EVICTION never writes it — being pushed out of
+    //     a full toolbox is not a user decision, and an evicted name must stay one
+    //     `toolRequest` away.
+    //   - Read live by every model-facing consumer (declarations, the launch gate,
+    //     `toolRequest`'s catalogue, the details projection). Because those are all
+    //     per-turn / per-launch reads, a switch takes effect on the NEXT request of a
+    //     thread that is already running, with no rebuild and no cap change.
+    //
+    // WHAT IT DOES NOT GATE: the manual and nested doors. `executeToolInternal` (a host
+    // or REST execution) and `invokeRegisteredTool` (`context.callTool`, a tool calling a
+    // tool) keep bypassing discovery, exactly like an evicted or never-discovered name
+    // does — the switch is for agents/threads of this conversation, not for its operator.
+    const withheldTools = new Set<string>();
+
+    // The single read accessor, so the projection below and every refusal site agree.
+    const isToolWithheld = (name: string): boolean => withheldTools.has(name);
+
     // A name may occupy a searchable cap slot only while it resolves to a live,
     // non-core, non-pending-only definition. This one predicate is shared by
     // enablement, declarations, authorization, snapshot, and restore so those
@@ -1883,18 +1928,88 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     // ------------------------------------------------------------------
+    // THE SESSION SWITCH — one mutation kernel behind EVERY switch path
+    // ------------------------------------------------------------------
+    //
+    // `toolManage enable|disable` (the model-facing operation the operator route also
+    // calls) and the plugin seam (`enableToolFor`/`disableToolFor`) both land HERE, so
+    // those three callers cannot drift apart. Two sets can move, and only the ones the
+    // name actually belongs to change:
+    //
+    //   1. `withheldTools` — always. This is the record that "the user of THIS
+    //      conversation switched the name off for the agents", and for a core or
+    //      pending-only name it is the ONLY record, because such a name never had a slot.
+    //   2. `activeTools` — only for a name that occupies a searchable cap slot
+    //      (`occupiesSearchableSlot`). Disable drops it and keeps every survivor's
+    //      relative position; enable re-inserts it newest-first through the SAME
+    //      `enableTools` path a `toolRequest` match uses, so it can evict whatever no
+    //      longer fits `maxEnabledTools` and reports that eviction verbatim.
+    //
+    // A core/pending-only switch therefore costs and frees no cap slot: the capped set,
+    // `maxEnabledTools` arithmetic, and the creation budget are all untouched, and the
+    // name is back in the model's very next request the moment the switch is undone.
+    //
+    // `changed` is deliberately "did EITHER set move", not "did the capped set move": a
+    // caller that bumps its revision (or persists) only when the cap moved would silently
+    // drop a core-name switch, and re-disabling an already-off-cap searchable name is a
+    // real change the operator has to see.
+    const applyToolSwitch = (name: string, enable: boolean): { changed: boolean; evicted: string[] } => {
+        const withheld = withheldTools.has(name);
+        const enabledNow = currentEnabledSet().has(name);
+        const searchable = occupiesSearchableSlot(name);
+
+        if (enable) {
+            // Already on: not switched off, and (for a searchable name) already holding a
+            // slot. Anything else has work to do.
+            if (!withheld && (!searchable || enabledNow)) return { changed: false, evicted: [] };
+
+            withheldTools.delete(name);
+
+            // A name with no slot (core/pending-only), or one that still holds its slot,
+            // needs no cap mutation — the un-withhold alone completed the switch.
+            if (!searchable || enabledNow) return { changed: true, evicted: [] };
+
+            // Newest-first insertion with the documented eviction, exactly like a
+            // `toolRequest` match or the pre-existing `toolManage enable`.
+            const outcome = enableTools([name, ...currentEnabledNames()]);
+
+            return { changed: true, evicted: outcome.evicted };
+        }
+
+        // Already off: switched off and holding no slot. This is the idempotence the
+        // route relies on to skip a revision bump on a repeat click.
+        if (withheld && !enabledNow) return { changed: false, evicted: [] };
+
+        withheldTools.add(name);
+
+        if (enabledNow) {
+            // The registration stays: discovery gates the MODEL, so a switched-off tool
+            // is still callable by its host and costs no budget to switch back on.
+            setActiveTools(currentEnabledNames().filter((entry) => entry !== name));
+        }
+
+        return { changed: true, evicted: [] };
+    };
+
+    // ------------------------------------------------------------------
     // R3 plugin-facing tool switching
     // ------------------------------------------------------------------
     //
     // A plugin must not get a second, weaker set of rules than the model-facing
-    // `toolManage` or the operator route: the same three refusals apply (unknown name,
-    // core declaration, blank name) and the mutation goes through the same helpers.
-    // Both operations are IDEMPOTENT, like the `enable`/`disable` operations are, so a
-    // plugin that re-enables a tool it already enabled costs nothing.
+    // `toolManage` or the operator route: the same refusals apply (unknown name, blank
+    // name) and the mutation goes through the same kernel (`applyToolSwitch`). Both
+    // operations are IDEMPOTENT, like the `enable`/`disable` operations are, so a plugin
+    // that re-enables a tool it already enabled costs nothing.
     //
     // `enableTool` intentionally uses the SAME newest-first selection as a `toolRequest`
     // match, which means it can evict whatever no longer fits `maxEnabledTools` — the
     // cap is not bypassed for a plugin, only for the operator's manual EXECUTION path.
+    //
+    // WHAT CHANGED WITH THE SESSION SWITCH: a `visibility: 'core'` declaration and the
+    // pending-only runtime controls are switchable now (the refusal that used to cover
+    // them assumed switching meant "move a cap slot", which is the only thing a core name
+    // has no part in). Registered is the bar; only a blank name and an unregistered one
+    // are still refusals.
     const requireSwitchableTool = (name: string): string => {
         if (typeof name !== 'string' || name.trim().length === 0) {
             throw new HarnessError('A tool switch requires a non-empty tool name.');
@@ -1904,46 +2019,45 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             throw new HarnessError(`Tool "${name}" is not registered in this harness.`);
         }
 
-        // A core declaration is always in context and never occupies a cap slot, so
-        // switching it would be a no-op the caller believes took effect.
-        if (!occupiesSearchableSlot(name)) {
-            throw new HarnessError(
-                `Tool "${name}" is a core declaration; it is always in context and cannot be enabled or disabled.`
-            );
-        }
-
         return name;
     };
 
     const enableToolFor = (name: string): void => {
         const switchable = requireSwitchableTool(name);
-        if (currentEnabledSet().has(switchable)) return;
+        if (!applyToolSwitch(switchable, true).changed) return;
 
-        enableTools([switchable, ...currentEnabledNames()]);
         notifyStateChange('tool_create', { tool: switchable });
     };
 
     const disableToolFor = (name: string): void => {
         const switchable = requireSwitchableTool(name);
-        if (!currentEnabledSet().has(switchable)) return;
+        if (!applyToolSwitch(switchable, false).changed) return;
 
-        // The registration stays: discovery gates the MODEL, so a disabled tool is
-        // still callable by a host and costs no budget to re-enable.
-        setActiveTools(currentEnabledNames().filter((entry) => entry !== switchable));
         notifyStateChange('tool_create', { tool: switchable });
     };
 
     // The core tools a given agent may actually see: every 'core' definition, minus
-    // the primary-only ones for every other agent. ONE rule, shared by the request
-    // declaration below and by toolRequest's `alreadyAvailable` report, so a tool
-    // cannot be declared to a subagent and omitted from discovery (or advertised
-    // to an agent that never receives it).
+    // the primary-only ones for every other agent, minus every name THIS conversation
+    // has switched off. ONE rule, shared by the request declaration below and by
+    // toolRequest's `alreadyAvailable` report, so a tool cannot be declared to a
+    // subagent and omitted from discovery (or advertised to an agent that never receives
+    // it, or hidden from one that does).
+    //
+    // THE SESSION SWITCH (withheld set). "Core" used to mean "cannot be turned off", and
+    // that is no longer true: the user of a conversation switches a core name off by
+    // withholding it, not by moving a cap slot, so the read belongs HERE — at the
+    // declaration boundary — rather than in the capped set, where a core name never
+    // appears. This is a per-request read, which is what makes a switch mid-run land on
+    // the NEXT model turn of the same live thread with no rebuild.
     const visibleCoreTools = (brain: Agent): Tool[] => {
         const core: Tool[] = [];
         const role = roleOf(brain);
 
         for (const definition of Object.values(tools)) {
             if (definition.visibility !== 'core') continue;
+            // A name the conversation switched off is not declared at all: the model
+            // never sees it, so it has nothing to try.
+            if (isToolWithheld(definition.name)) continue;
             // Runtime controls (toolCancel) are declared separately and only while
             // actionable; they are still ordinary replaceable registry entries.
             if (pendingOnlyDefinitions.has(definition)) continue;
@@ -1969,6 +2083,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         if (
             pendingCancel !== undefined &&
+            // A conversation that switched `toolCancel` off loses it from BOTH views: the
+            // declaration (offerDeclarations) and this report. Reporting a control as
+            // "callable right now" while the launch gate refuses it is the exact lie T28
+            // exists to prevent.
+            !isToolWithheld(pendingCancel.name) &&
             pendingOnlyDefinitions.has(pendingCancel) &&
             // Exclude the CALLING tool call: `toolRequest` itself is pending while it
             // runs, so counting it would make `toolCancel` look actionable on every
@@ -2270,8 +2389,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // A newly registered/replaced searchable tool is immediately usable by
             // the registering agent. Disk-backed mutations are calls too, so they
             // follow the same newest-first capped switch as toolRequest.
+            //
+            // SESSION SWITCH: a re-registration must NOT undo a switch the user already
+            // made. `toolCreate update` / `toolRegistry` / a folder re-scan all land here,
+            // and without this guard editing the source of a name the conversation
+            // switched off would silently hand it back (and spend a cap slot on it). The
+            // withheld membership is the user's decision about the NAME, and it survives
+            // every definition revision until they switch it back on.
             if (prepared.tool.visibility === 'core') {
                 // Core tools are always declared and never occupy a cap slot.
+                activeTools.delete(name);
+            } else if (isToolWithheld(name)) {
+                // Still a searchable registration, so it must not sit in the capped set
+                // while switched off: eviction on the way in is the same trim a switch
+                // does, and it keeps `discoveredTools` honest about what the model can use.
                 activeTools.delete(name);
             } else {
                 enableTools([name]);
@@ -2391,9 +2522,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             description: definition.description,
             tags: [...definition.tags],
             visibility: definition.visibility,
+            // THE ROW'S TRUTH (the server's tool pane reads this). `enabled` means "the
+            // agents of this conversation can use it right now", which is two independent
+            // facts: the conversation has not switched it off (the withheld set — the only
+            // place a core or pending-only name's switch exists), AND it is either always
+            // in context (core) or holds a cap slot. A searchable name that is merely
+            // evicted, and a name the conversation switched off, both read `false`; the
+            // difference between those two states is the host's `protected`/switch view
+            // (`harness.withheldTools`), not a re-derivation of this rule.
             enabled:
-                definition.visibility === 'core' ||
-                currentEnabledSet().has(definition.name),
+                !isToolWithheld(definition.name) &&
+                (definition.visibility === 'core' ||
+                    currentEnabledSet().has(definition.name)),
             hasSource: record !== undefined,
             ...(parameters === undefined ? {} : { parameters }),
             ...(record?.sourcePath === undefined ? {} : { sourcePath: record.sourcePath }),
@@ -2854,49 +2994,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     throw new HarnessError(`Tool "${switchable}" is not registered in this harness.`);
                 }
 
-                // A core declaration is always in the model's context and never occupies a
-                // cap slot, so switching it on or off would be a no-op the client believes
-                // took effect. That is a refusal, not a silent success.
-                if (!occupiesSearchableSlot(switchable)) {
-                    throw new HarnessError(
-                        `Tool "${switchable}" is a core declaration; it is always in context and cannot be enabled or disabled.`
-                    );
+                // THE SESSION SWITCH. Registered is the bar; the old core/pending-only
+                // refusal is gone, because a switch is no longer only "move a cap slot":
+                // `applyToolSwitch` records the conversation's decision in `withheldTools`
+                // for EVERY name, and additionally moves the capped set for the names that
+                // have one. The capped path itself (idempotence, newest-first insertion,
+                // `evicted`) is byte-identical to what this operation did before.
+                //
+                // `remove` deliberately keeps its core refusal below: unregistering a
+                // harness-owned control is a different privilege from switching it off.
+                const outcome = applyToolSwitch(switchable, operation === 'enable');
+
+                if (!outcome.changed) {
+                    // Nothing moved: no notification, and no revision bump for the route.
+                    // This is the idempotent answer the operator pane depends on.
+                    return {
+                        name: switchable,
+                        operation,
+                        enabled: operation === 'enable',
+                        changed: false
+                    };
                 }
-
-                const enabledNow = currentEnabledSet();
-
-                if (operation === 'disable') {
-                    // Idempotent: disabling a tool that is already off changes nothing and
-                    // says so (`changed: false`), which is what lets the route skip the
-                    // revision bump instead of claiming a mutation that did not happen.
-                    if (!enabledNow.has(switchable)) {
-                        return { name: switchable, operation, enabled: false, changed: false };
-                    }
-
-                    // Every survivor keeps its relative position; the disabled name leaves
-                    // the capped set. The registration itself stays, so re-enabling costs no
-                    // budget and a manual/host `executeTool` still reaches the implementation
-                    // (discovery gates the MODEL, not its operator).
-                    setActiveTools(currentEnabledNames().filter((entry) => entry !== switchable));
-                    notifyStateChange('tool_create', { tool: switchable });
-
-                    return { name: switchable, operation, enabled: false, changed: true };
-                }
-
-                if (enabledNow.has(switchable)) {
-                    return { name: switchable, operation, enabled: true, changed: false };
-                }
-
-                // Newest-first insertion with the documented eviction of whatever falls off
-                // the cap, so an explicit enable behaves exactly like a `toolRequest` match.
-                const outcome = enableTools([switchable, ...currentEnabledNames()]);
 
                 notifyStateChange('tool_create', { tool: switchable });
 
                 return {
                     name: switchable,
                     operation,
-                    enabled: true,
+                    enabled: operation === 'enable',
                     changed: true,
                     ...(outcome.evicted.length === 0 ? {} : { evicted: outcome.evicted })
                 };
@@ -2936,6 +3061,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 toolSourceRecords.delete(removed);
                 toolOwningPaths.delete(removed);
                 setActiveTools(currentEnabledNames().filter((entry) => entry !== removed));
+                // The switch goes with the registration: `remove` is an un-publish, and a
+                // dangling withheld name would (a) be written into every snapshot this
+                // harness still writes and (b) make a later CREATE of the same name look
+                // like it inherited a switch nobody made in this conversation. A name that
+                // is registered again is a new registration; the user switches it off again
+                // if they want it off. (An update of a name that was never removed keeps its
+                // withheld membership — see `acceptTool`.)
+                withheldTools.delete(removed);
 
                 // A created tool that leaves the harness also leaves the durable created-tool
                 // set, and the lifetime counter pair moves with it (exactly as a disk-backed
@@ -3288,8 +3421,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // Pending-only runtime controls are never discoverable: they are declared
         // only while actionable and have no catalogue identity to hand out.
+        //
+        // THE SESSION SWITCH — a name the conversation switched off is not in the
+        // catalogue either. The user's rule is that a switched-off tool is "simply not
+        // listed", so the filter is applied to the SOURCE of every field below rather
+        // than patched into each answer:
+        //   - `matched`/`tools`/`enabled`/`omitted` all derive from `selection`, which
+        //     selects out of this catalogue, so a withheld name cannot appear in any of
+        //     them (and cannot spend a cap slot by being "enabled" back into the set);
+        //   - `availableTags` is the vocabulary of this same catalogue, so a tag only a
+        //     withheld tool carries stops being offered as a retry hint;
+        //   - `unmatchedTags` probes this same catalogue per tag, so such a tag is
+        //     honestly reported as unmatched instead of promising a tool nobody can get;
+        //   - `alreadyAvailable` comes from `declaredForDiscovery`, which applies the same
+        //     rule to the core view (core names have no catalogue entry to filter).
+        //
+        // What this deliberately does NOT do is report a withheld name under `forbidden`.
+        // That field stays scope + deployment-deny only — a denial the model can be TOLD
+        // about because the answer is stable for the whole deployment — whereas a
+        // switched-off name is invisible, exactly like a name that was never registered.
+        // A model that cannot see it cannot loop on it.
         const catalogue = Object.values(tools).filter(
-            (definition) => !pendingOnlyDefinitions.has(definition)
+            (definition) =>
+                !pendingOnlyDefinitions.has(definition) && !isToolWithheld(definition.name)
         );
         // T28: the ALREADY-DECLARED set includes a pending-only control while it is
         // actually actionable. `toolCancel` is appended to the declaration list only
@@ -4623,10 +4777,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // toolCancel is declared only while this actor has work in flight. It is a
         // normal registered definition; the pending-only marker belongs to the
         // baseline object, so a replacement is declared by its own visibility.
+        //
+        // SESSION SWITCH: a withheld name is not declared, even a pending-only runtime
+        // control. This is a per-request read, so switching `toolCancel` off mid-run
+        // removes it from the next turn's declaration list without touching the cap.
         const pendingCancel = tools[TOOL_CANCEL];
 
         if (
             pendingCancel !== undefined &&
+            !isToolWithheld(pendingCancel.name) &&
             pendingOnlyDefinitions.has(pendingCancel) &&
             scheduler.pending(run.actorKey).length > 0
         ) {
@@ -7813,9 +7972,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // Unknown tool: answer the call so the transcript stays valid for strict
             // providers, and point the model at discovery.
             const available = declared(brain, run.toolScope).map((tool) => tool.name).join(', ') || 'none';
-            await fail(
-                `Tool "${call.name}" is not registered. Available tools: ${available}. Call ${TOOL_REQUEST} with capability tags to search the catalogue.`
-            );
+            // THE HINT HAS TO BE TRUE. `toolRequest` is a registered name the user of this
+            // conversation can now switch off, and a sentence telling the model to call a
+            // tool that is not in its declaration list is the one thing that turns a clean
+            // "no such tool" into a discovery loop. Nothing else about the answer changes.
+            const hint = isToolWithheld(TOOL_REQUEST)
+                ? ''
+                : ` Call ${TOOL_REQUEST} with capability tags to search the catalogue.`;
+
+            await fail(`Tool "${call.name}" is not registered. Available tools: ${available}.${hint}`);
             return;
         }
 
@@ -7851,6 +8016,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // discovered.
         if (isToolGloballyDisabled(call.name)) {
             await fail(globalDisableReason(call.name));
+            return;
+        }
+
+        // SESSION SWITCH GATE — the same defence-in-depth position one level lower in the
+        // stack of "who is allowed to run this": the deployment's operator (above), then
+        // the conversation's user (here), then the capped discovery set (below).
+        //
+        // It sits HERE, before the branch-control dispatches further down, on purpose.
+        // `threadFork` and `actionRequest` leave this function through their own handlers
+        // and `toolCancel` answers from its own acknowledgement branch, so a check placed
+        // only in the discovery gate below would make disabling those controls a silent
+        // no-op: a withheld name that is core or pending-only is never even a member of
+        // the capped set, so the discovery gate would wave it through.
+        //
+        // A per-launch read again (like the global one): a switch made while a thread is
+        // running lands on the next call that thread launches, and the state that matters
+        // is the one in force when the call would actually run. The manual and nested
+        // doors (`harness.executeTool` / the REST execution routes, and
+        // `context.callTool`) do NOT go through this function's gate, so an operator can
+        // still run a name the agents of this conversation have switched off, and a tool
+        // that is running can still call one.
+        if (isToolWithheld(call.name)) {
+            await fail(sessionDisableReason(call.name));
             return;
         }
 
@@ -11474,7 +11662,27 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 offsets: [...discoveryOffsets.entries()].map(([query, offset]) => ({
                     query,
                     offset
-                }))
+                })),
+                // THE CONVERSATION'S SWITCHES (sorted, so the document is stable and a
+                // byte-comparison of two writes of the same state is meaningful).
+                //
+                // OMITTED while the set is empty, exactly like `agentResults`/`threads`:
+                // every snapshot this build has already written — and every fixture — keeps
+                // its exact prior shape, absence means "nothing is switched off", and the
+                // reader defaults to empty. That is why `HARNESS_SNAPSHOT_VERSION` stays 2:
+                // the change is a purely additive optional key, not a shape break.
+                //
+                // Why this is persisted at all: the switch is conversation state, so a
+                // restart that restored only `enabled` would hand back every core name the
+                // user switched off (they were never in `enabled`) and re-open any searchable
+                // name a later `toolRequest` happened to match.
+                ...(withheldTools.size === 0
+                    ? {}
+                    : {
+                          withheld: [...withheldTools].sort((left, right) =>
+                              left.localeCompare(right)
+                          )
+                      })
             },
             // Creation order is registry insertion order, which decides
             // declaration order after a restore.
@@ -11616,6 +11824,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
         }
 
+        // THE CONVERSATION'S SWITCHES (`discovery.withheld`) — validated the OTHER way
+        // round, on purpose, and the asymmetry is the point.
+        //
+        // An ENABLED name the rebuilt harness cannot register is a real contradiction: the
+        // file claims the model may call a tool that does not exist, so the kernel throws
+        // (./server/restore-enabled-tool-prune.test.ts:1-41 documents what that strictness
+        // used to cost, and why the STORE now prunes those names before calling restore).
+        //
+        // A WITHHELD name that is not registered asserts nothing dangerous — "do not show
+        // the agents a tool we do not have" is simply a no-op — so it is DROPPED silently
+        // here rather than thrown. If it threw, every ordinary removal (a web-search key
+        // taken away, a plugin unregistered, an app tool edited out of a harness card)
+        // would turn into a per-session restore failure and delete whole conversations,
+        // because the store's pruner only knows about `enabled`. Names that DO resolve
+        // (including core and pending-only ones, which is the whole reason this list
+        // exists) are kept, so a switch survives a restart.
+        const restoredWithheld = (next.discovery.withheld ?? []).filter((name) =>
+            available.has(name)
+        );
+
         // Phase 3b (R2): build the backing Agent for every persisted host thread
         // BEFORE mutating live state. The owner agents are already validated
         // above; a factory failure aborts the restore with nothing replaced.
@@ -11673,7 +11901,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Restore enforces the CURRENT maxEnabledTools even when an older/edited
         // snapshot names more tools. Snapshot order is newest-first for snapshots
         // this harness wrote, so the first `maxEnabledTools` are retained.
-        setActiveTools(next.discovery.enabled);
+        //
+        // SESSION SWITCH: the two discovery lists are independent facts, but a file this
+        // harness wrote never names a tool in BOTH (a disable removes the capped entry as
+        // well as withholding the name). An edited or merged file CAN, and the only
+        // coherent reading of "switched off" is that it wins — otherwise a stale
+        // `enabled` entry would declare a tool its user has hidden, and re-introduce the
+        // exact "I switched it off and it came back" bug on restart. The drop is local to
+        // this pass: nothing about the capped set's own arithmetic changes.
+        const withheldFromSnapshot = new Set(restoredWithheld);
+
+        setActiveTools(next.discovery.enabled.filter((name) => !withheldFromSnapshot.has(name)));
+
+        // Replace the live switch set with the snapshot's, in sorted-write order. Absent
+        // key (every v2 file written before this feature) means an empty set, which is why
+        // the schema version did not move.
+        withheldTools.clear();
+        for (const name of restoredWithheld) withheldTools.add(name);
 
         discoveryOffsets.clear();
         for (const entry of next.discovery.offsets) {
@@ -12061,7 +12305,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // names while this pass keeps the FIRST N — a re-seed would then land a different set than
     // the construction seed it is supposed to reproduce.
     function seedSwitchableTools(): { enabled: string[]; omitted: string[]; evicted: string[]; retained: string[] } {
-        return enableTools(Object.keys(tools).filter((name) => !isToolGloballyDisabled(name)));
+        // Two exclusions, and they are NOT the same kind of one:
+        //   - `isToolGloballyDisabled` — this deployment's deny list, because a name the
+        //     server refuses to run would otherwise burn a cap slot the model cannot use;
+        //   - `isToolWithheld` — THIS conversation's switches. The seed is an auto-enable
+        //     path, and an auto-enable that ignored the withheld set would quietly undo
+        //     every switch the user made the moment a host re-seeded (a reset re-run, a
+        //     restore, a plugin calling `enableAllSwitchableTools`). A user decision is not
+        //     overwritten by a capacity pass; only the user switching a name back on is.
+        return enableTools(
+            Object.keys(tools).filter(
+                (name) => !isToolGloballyDisabled(name) && !isToolWithheld(name)
+            )
+        );
     }
 
     // The host/server-facing execution path (R8): run one REGISTERED tool by name
@@ -12609,14 +12865,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // every nested runAgent call: only the root prompt may carry media.
         runAgent(primary, input, options?.signal, undefined, undefined, undefined, options?.attachments);
 
-    // Every Harness field except `name`, `commands`, and `discoveredTools` is
-    // assigned here. Those three are defineProperty'd below: `name` is a built-in
-    // function property that cannot be assigned, and `commands`/`discoveredTools`
-    // must be GETTERS so a caller can never mutate the live registry or the
-    // enabled set through the handle. The `unknown`-mediated cast is therefore
-    // describing exactly that: a complete handle assembled from two sources. Keep
-    // this list in step with the Harness type — an omitted accessor typechecks as
-    // `never` here and the cast would silently hide it.
+    // Every Harness field except `name`, `commands`, `discoveredTools`, and
+    // `withheldTools` is assigned here. Those four are defineProperty'd below: `name` is a
+    // built-in function property that cannot be assigned, and `commands`/
+    // `discoveredTools`/`withheldTools` must be GETTERS so a caller can never mutate the
+    // live registry, the enabled set, or the session's switch set through the handle (and
+    // so a literal getter would not be flattened into one value by `Object.assign`). The
+    // `unknown`-mediated cast is therefore describing exactly that: a complete handle
+    // assembled from two sources. Keep this list in step with the Harness type — an omitted
+    // accessor typechecks as `never` here and the cast would silently hide it.
     let handle!: Harness;
     handle = Object.assign(run, {
         agent: primary,
@@ -12633,12 +12890,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         toolSource,
         toolSources,
         // THE KERNEL'S OWN SWITCHABILITY ANSWER (src/types/index.ts `Harness.isToolSwitchable`).
-        // A bare forward onto `occupiesSearchableSlot` — the ONE predicate `toolManage
-        // enable|disable`, `enableToolFor`/`disableToolFor`, the snapshot, and restore already
-        // share — so a host can state which names a conversation may switch at all without
-        // re-implementing the rule (and getting `toolCancel` and the searchable preset rows
-        // wrong in opposite directions). Read at call time: a tool registered after
-        // construction is switchable the moment it exists, and a removed one is not.
+        // A bare forward onto `occupiesSearchableSlot` — the ONE predicate that decides
+        // which names hold a searchable CAP SLOT, and therefore the one `setActiveTools`,
+        // `enableTools`, the snapshot's `enabled` list, and restore already share — so a
+        // host can state which names a conversation may move in and out of the capped set
+        // without re-implementing the rule (and getting `toolCancel` and the searchable
+        // preset rows wrong in opposite directions). Read at call time: a tool registered
+        // after construction is slot-switchable the moment it exists, and a removed one is
+        // not.
+        //
+        // WHAT IT IS NOT ANY MORE: it is NOT "may this name be switched at all". Since the
+        // session switch (the withheld set), `toolManage enable|disable`, the plugin seam,
+        // and the operator route accept EVERY registered name, and a core or pending-only
+        // name's switch lives only in `withheldTools`. This predicate stayed exactly as it
+        // was because its job is cap arithmetic — a host that needs the list of names the
+        // conversation has currently switched off reads `withheldTools` below, and a host
+        // that needs "is this row a cap-managed one?" reads this.
         isToolSwitchable: (name: string) => occupiesSearchableSlot(name),
         // THE FULL-TOOLBOX RE-SEED (`src/types/index.ts` `Harness.enableAllSwitchableTools`).
         // `reset()` empties the enabled set and the construction seed is NOT snapshot state, so
@@ -12660,6 +12927,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // so a persistence observer has to see it exactly like a `toolManage enable` does. A
         // no-op re-seed (an already-full toolbox, or a harness that never asked for the seed)
         // reports nothing.
+        //
+        // IT DOES NOT UN-SWITCH ANYTHING: the pass filters the conversation's withheld names
+        // (see `seedSwitchableTools`), so re-seeding fills the toolbox with everything the user
+        // of THIS conversation has left on. A name they switched off stays off, and stays out of
+        // the cap; only they can put it back. That is also why `reset()` clears the switch set —
+        // a reset is the user asking for a new conversation, a re-seed is not.
         enableAllSwitchableTools: (): void => {
             if (configuration.enableAllTools !== true) return;
 
@@ -12821,6 +13094,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             for (const brain of Object.values(agents)) brain.reset();
             activeTools.clear();
+            // SESSION SWITCH: a reset starts a NEW conversation, and a new conversation
+            // has no switches in it. Clearing this set beside `activeTools` is what keeps
+            // `reset()` + `enableAllSwitchableTools()` identical to a freshly created
+            // session (that seam re-runs the seed, which SKIPS withheld names — leaving a
+            // reset harness holding an old switch would make the two postures differ in
+            // the one place the seam exists to make them match).
+            withheldTools.clear();
             discoveryOffsets.clear();
             recordEngine.reset();
             invocationRecords.clear();
@@ -12867,6 +13147,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // reload still knows which capabilities were discovered.
     Object.defineProperty(handle, 'discoveredTools', {
         get: () => currentEnabledNames(),
+        enumerable: true,
+        configurable: true
+    });
+
+    // THE CONVERSATION'S SWITCHES (`Harness.withheldTools`) — the other half of the
+    // discovery state, and the only place the switch of a CORE or pending-only name is
+    // recorded at all (such a name never holds a cap slot, so `discoveredTools` cannot
+    // say anything about it).
+    //
+    // THE PUBLIC SEAM T6/T7/T8 BUILD ON: the server's tool pane and the lane replica read
+    // exactly this list — a row is "off for the agents" when its name is here, and the
+    // REST/manual execution doors do not consult it. Sorted and copied on every read (a
+    // getter, for the same reason as `discoveredTools`: `Object.assign` would flatten a
+    // literal getter into one snapshot value), so a caller can neither see an intermediate
+    // order nor mutate the live Set through the handle.
+    Object.defineProperty(handle, 'withheldTools', {
+        get: () => [...withheldTools].sort((left, right) => left.localeCompare(right)),
         enumerable: true,
         configurable: true
     });

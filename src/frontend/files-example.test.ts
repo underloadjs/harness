@@ -203,7 +203,9 @@ it('offers the ops array as the example and sends it unwrapped', async () => {
     openTools();
     await flush();
 
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="files"]')?.click();
+    // R1 (swap): the runner opens from the row's corner INFO mark; the tile is the enablement
+    // switch, so pressing it here would cost a PATCH instead of opening the dialog.
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="files"]')?.click();
     await flush();
 
     // The example is the OPERATIONS array itself:

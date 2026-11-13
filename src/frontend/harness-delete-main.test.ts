@@ -488,7 +488,9 @@ it('survives an empty roster and releases the playground session bound to the de
     // session (R7), on the same harness that is about to disappear.
     document.querySelector<HTMLButtonElement>('.tools-toggle')?.click();
     await flush();
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="toolRequest"]')?.click();
+    // R1 (swap): the playground's runner opens from the row's corner INFO mark — the tile writes
+    // enablement now, and a playground call must not touch the conversation's toolbox.
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="toolRequest"]')?.click();
     await flush();
     document.querySelector<HTMLTextAreaElement>('.tool-args')!.value = '{"tags":["web"]}';
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();

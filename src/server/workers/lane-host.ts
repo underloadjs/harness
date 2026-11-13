@@ -56,7 +56,7 @@ import { packagePath } from '../package-root';
 import type { LaneAuthority, LaneAuthorityRequest } from './lane-authority';
 import type { IdSpace } from './lane-identity';
 import type { IdentityLease } from './lane-identity';
-import type { LaneBlueprint, LaneCommand, LaneRegistryChange, LaneReply } from './protocol';
+import type { LaneBlueprint, LaneCommand, LaneRegistryChange, LaneReply, LaneToolStateSync } from './protocol';
 import { LANE_PROTOCOL_VERSION, createSequence, describeEnvelope, isLaneEnvelope, isLaneReplyKind } from './protocol';
 import { laneWorkerEnvironment } from './capability';
 import { openHarnessWorkerSession, type HarnessWorkerSession } from './worker-runner';
@@ -90,9 +90,19 @@ export type LaneTarget = { kind: 'thread'; threadId: string } | { kind: 'root'; 
 // (./lane-worker-loop.ts `laneToolSettingsProvider` / `lanePluginSettingsProvider`). They are
 // therefore LANE-CREATION snapshots, not live reads - the documented lane semantics for every
 // value that crosses here (../harness.swagger.yaml, the plugin-settings PATCH).
+//
+// `withheldTools` (R5b) joins the same list with ONE difference worth naming, because it is the
+// field that proves the difference is not a rule of the mechanism: the deployment deny list and
+// the plugin overrides are snapshots whose value only a NEW lane can learn, while the session's
+// own switch set is ALSO re-pushed to a warm lane the moment it moves, through the
+// `sync.tools` frame below (`broadcastTools`). The blueprint entry stays necessary all the same
+// - it is the canonical figure at creation, and the frame carries the same two lists in the
+// same shape, so hello and a reconcile install ONE state by ONE code path
+// (./lane-worker-loop.ts `applyToolStateSync`). The snapshot-vs-live distinction belongs to the
+// OTHER two fields, not to this one.
 export type LaneBlueprintSource = Pick<
     LaneBlueprint,
-    'record' | 'settings' | 'apiKey' | 'memoryKeys' | 'disabledTools' | 'pluginSettings'
+    'record' | 'settings' | 'apiKey' | 'memoryKeys' | 'disabledTools' | 'withheldTools' | 'pluginSettings'
 >;
 
 export type LaneTurnRequest = {
@@ -150,6 +160,11 @@ export type LaneHost = {
     steer(sessionKey: string, target: LaneTarget, input: string): Promise<LaneSteerReceipt | undefined>;
     interrupt(sessionKey: string, target: LaneTarget, reason?: string): boolean;
     broadcastRegistry(sessionKey: string, change: RegistryChange): void;
+    // R5b: push the session's canonical tool-switch state ({enabled, withheld}) to EVERY live
+    // lane of `sessionKey` — a wholesale reconcile, one-way, no receipt. Call it after a switch
+    // lands on the canonical harness; read the payload from the authority's `toolStateNow()`
+    // (./lane-authority.ts) rather than assembling it in the caller.
+    broadcastTools(sessionKey: string, tools: LaneToolStateSync): void;
     closeLane(sessionKey: string, target: LaneTarget, reason?: string): void;
     closeSession(sessionKey: string, reason?: string): void;
     // Store shutdown: every worker terminated.
@@ -1040,6 +1055,35 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         }
     };
 
+    // R5b — the session's TOOL SWITCHES, pushed to EVERY live lane of that session.
+    //
+    // The entry point the server calls after a switch lands on the canonical harness: the
+    // operator route (`PATCH /sessions/:id/tools/:tool_id {enabled}`, and the same gate inside
+    // a content PATCH), a `toolManage enable|disable` from the model, or the plugin seam. The
+    // payload is the authority's own read of canonical state (./lane-authority.ts
+    // `toolStateNow()`), never a caller's guess, so a lane cannot be told something the
+    // authority does not believe.
+    //
+    // EVERY lane of the session, exactly like the registry broadcast above and for the same
+    // reason: the switch is a per-SESSION fact (src/harness.ts keeps one withheld set per
+    // harness, shared by every thread and by the root/operator lanes), so a toggle has to reach
+    // threads that are running RIGHT NOW, not only the one that made the request. That is what
+    // "the panel toggle is global session level, affecting all threads" means on the wire.
+    //
+    // FIRE-AND-FORGET, deliberately: the frame has no `callId` and the worker sends no receipt
+    // (./protocol.ts `sync.tools`), so the route that toggles a tool never waits on a lane, a
+    // lane that has not handshaked yet is not a failure, and a lane that is gone simply does not
+    // receive it. A lane created after this call learns the same state from its blueprint
+    // (`withheldTools` + the snapshot's `discovery.withheld`), which is why no replay buffer is
+    // needed here.
+    const broadcastTools = (sessionKey: string, tools: LaneToolStateSync): void => {
+        for (const lane of [...lanes.values()]) {
+            if (lane.closed || !lane.key.startsWith(`${sessionKey}::`)) continue;
+
+            post(lane, { kind: 'sync.tools', laneEpoch: lane.epoch, tools });
+        }
+    };
+
     const closeLane = (sessionKey: string, target: LaneTarget, reason?: string): void => {
         const lane = lanes.get(laneKeyOf(sessionKey, target));
 
@@ -1075,6 +1119,7 @@ export const createLaneHost = (runtime: ServerRuntimeConfiguration): LaneHost =>
         steer,
         interrupt,
         broadcastRegistry,
+        broadcastTools,
         closeLane,
         closeSession,
         close,

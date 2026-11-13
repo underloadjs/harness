@@ -51,8 +51,15 @@
 //   - ../harness.ts     — the declaration boundary this text assumes
 
 // Tools outside the declaration list are searchable, not missing.
+//
+// CONDITIONAL ON PURPOSE (`when toolRequest is in it`): the user of a conversation can now
+// switch ANY registered name off for its agents (../harness.ts `withheldTools`), and a
+// switched-off `toolRequest` is not declared at all — so an unconditional "call
+// toolRequest" line would send that model hunting for a tool it was never given, which is
+// the failure this line exists to prevent. Same reasoning as ./guidelines.ts's web line:
+// a prompt may only name a tool the declaration boundary actually hands over.
 export const DISCOVERY_GUIDELINE =
-    'Your declared tool list is not the whole catalogue: call toolRequest (exact names, a regex, or capability tags) to enable a searchable tool before concluding a capability is missing.';
+    'Your declared tool list is not the whole catalogue: when toolRequest is in it, call it (exact names, a regex, or capability tags) to enable a searchable tool before concluding a capability is missing.';
 
 // Web access is asymmetric, and only the prompt can say so honestly:
 //   - `search` is `visibility: 'core'` but its ACTIVATION is `websearch`, so a
@@ -110,5 +117,9 @@ export const READ_ONLY_GUIDELINE =
 // The self-extending escape hatch, one line rather than a tool manual. `toolCreate`
 // is itself searchable (src/core/tool-manifest.ts), so the line states the order:
 // discover it through toolRequest first, then author the missing capability.
+//
+// THE SAME CONDITIONAL AS THE DISCOVERY LINE ABOVE: `toolRequest` is a registered name the
+// user of this conversation can switch off, and a switched-off name is not declared, so the
+// route "enable it with toolRequest" only exists while toolRequest is in the list.
 export const TOOL_CREATE_GUIDELINE =
-    'toolCreate is searchable, not declared: enable it with toolRequest before using it to add a small missing capability to this session.';
+    'toolCreate is searchable, not declared: while toolRequest is declared, enable it there before using it to add a small missing capability to this session.';

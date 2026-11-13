@@ -484,9 +484,10 @@ const boot = async (subagents: readonly string[] = ['research', 'workspace']): P
 const method_is_get = (url: string, init?: RequestInit): boolean =>
     url !== '/api/sessions' && (init?.method === undefined || init.method === 'GET');
 
-// Open one tool's runner and return its preset buttons, in document order.
+// Open one tool's runner and return its preset buttons, in document order. R1 (swap): the runner
+// opens from the row's corner INFO mark — the tile writes enablement now.
 const presetsFor = async (name: string): Promise<HTMLButtonElement[]> => {
-    const entry = document.querySelector<HTMLButtonElement>(`.tool-tab-button[data-tool="${name}"]`);
+    const entry = document.querySelector<HTMLButtonElement>(`.tool-tab-info[data-tool="${name}"]`);
     if (entry === null) throw new Error(`missing tool entry ${name}`);
     entry.click();
     await flush();

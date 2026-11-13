@@ -26,12 +26,14 @@
     --accent: #7aa2ff;
     --accent-soft: rgba(122, 162, 255, 0.12);
     --ok: #4ade80;
-    /* The enabled pair for the catalogue corner tick box. The tick itself is the native
-       mark painted with `--ok`; BOTH catalogue tiles it belongs to — TOOLS and PLUGINS —
-       carry the SAME green on their EDGE only (`--ok-line` border) and keep their normal
-       `--bg-elevated` surface, because in those panes BACKGROUND is the SELECTION channel:
-       the tile whose runner or plugin dialog is open fills with `--accent-soft`, so an
-       enabled wash there would compete with it.
+    /* The enabled pair for the two catalogue panes. BOTH catalogue tiles — TOOLS and PLUGINS —
+       carry the SAME green on their EDGE only (`--ok-line` border, `--ok` on hover) and keep
+       their normal `--bg-elevated` surface,
+       because in those panes the tile's BACKGROUND must stay free: "enabled" and "this row's
+       dialog is open" are two independent figures and must never share one surface. Since the
+       Tools Catalogue swap BOTH panes state "open" on the row's corner control instead
+       (`.tool-tab-info[aria-expanded='true']` / `.plugin-tab-info[aria-expanded='true']`), so
+       an enabled wash would compete with either of them.
        `--ok-wash` is still very much alive: the records feed's completed row and the
        ok-toned fact chip fill themselves with it. Both are edge/background values, never
        text colours, so an enabled row keeps exactly the foreground contrast of a disabled
@@ -1044,20 +1046,20 @@ body.is-resizing-rail {
     border-color: var(--border-strong);
 }
 
-/* R1: a TICKED row is enabled and the TILE says so on its EDGE — `--ok-line` border over
-   the tile's own elevated surface. The green WASH is deliberately NOT used here: in this
-   pane the background is the SELECTION channel (`.tool-tab-button[aria-pressed='true']`
-   below fills with `--accent-soft`), so "enabled" rides the border and "selected" rides the
-   background and the two figures can never collide or be mistaken for one another. The
-   corner tick box (`accent-color: var(--ok)`) is the authoritative mark and shares the same
-   green edge. An unticked row keeps the base rules above EXACTLY as they are: the
-   `[data-enabled='false']` dim is gone, because "off" is now the plain look rather than a
-   de-emphasised one. The base rule already declares `border: 1px solid transparent`, so
-   only the colour changes — the tile geometry is identical enabled or not.
-   `paintToolRowEnablement` moves this attribute and the tick together.
-   Placement matters: this sits BEFORE the `[aria-pressed='true']` rule below, at equal
-   specificity, so the accent border of the row whose runner is open still wins —
-   "selected" and "enabled" stay two readable, separate figures. */
+/* R1 (Tools Catalogue swap): an ENABLED row says so on the TILE'S EDGE — `--ok-line` border
+   over the tile's own elevated surface. The green WASH is deliberately NOT used here, and the
+   reason is the same one the pane has always had: the tile's background must stay free, because
+   a second colour on the same tile would be read as the other state of the row. "This row's
+   dialog is open" used to ride that background (`.tool-tab-button[aria-pressed='true']`, now
+   GONE); since the swap the tile's `aria-pressed` IS the enabled figure — the very thing the
+   green edge paints — so the accent "selected" channel moved to the corner control that states
+   it (`.tool-tab-info[aria-expanded='true']` below). "Enabled" and "open" stay two readable,
+   separate figures and can never be mistaken for one another on the same row.
+   An "off" row keeps the base rules above EXACTLY as they are: the old `[data-enabled='false']`
+   dim is gone, because "off" is the plain look rather than a de-emphasised one. The base rule
+   already declares `border: 1px solid transparent`, so only the colour changes — the tile
+   geometry is identical enabled or not. `paintToolRowEnablement` moves this attribute and the
+   toggle's `aria-pressed` together, in one pass. */
 .tool-tab-button[data-enabled='true'] {
     border-color: var(--ok-line);
 }
@@ -1066,9 +1068,21 @@ body.is-resizing-rail {
     border-color: var(--ok);
 }
 
-.tool-tab-button[aria-pressed='true'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
+/* The tile's toggle is INERT only while THIS BROWSER cannot write — `data-locked` names WHICH
+   reason (`writing` this row's own PATCH, `offline` no transport, `no-enablement` the server
+   reports no figure at all; main.ts `paintToolRowEnablement`). There is no `protected` and no
+   `running` twin: the session tool PATCH is write-anytime and switches every registered name, so
+   a harness-owned row and a working conversation look exactly like every other row here (R5).
+   The tile is never the `disabled` attribute: it has to stay focusable, and its corner info
+   control has to keep opening the dialog, so the state is the `aria-disabled` + `data-locked`
+   PAIR and the cursor says it out loud instead. `writing` keeps the progress cursor the busy
+   tick box used to carry. */
+.tool-tab-button[data-locked] {
+    cursor: default;
+}
+
+.tool-tab-button[data-locked='writing'] {
+    cursor: progress;
 }
 
 .tool-tab-button:disabled {
@@ -1091,13 +1105,14 @@ body.is-resizing-rail {
     font-size: 10.5px;
 }
 
-/* --- R1: the row and its corner enablement tick box ------------------------
+/* --- R1 (Tools Catalogue swap): the row and its corner info button ---------
    `.tool-tab-list` used to place the `<button>` itself; a button cannot contain a
-   control, so the row is a wrapper with two SIBLINGS — the listing button (which opens
-   the runner) and the tick box (which writes `PATCH /tools/{tool_id}`). The box is
-   absolutely positioned in the wrapper's top-right corner, which is why the wrapper is
-   the positioning context. The wrapper is still the grid item, so the card grid is
-   unchanged; the button keeps every rule above by simply filling the whole width.   */
+   control, so the row is a wrapper with two SIBLINGS — the toggle tile (which writes
+   `PATCH /sessions/{id}/tools/{tool_id}`) and the info button (which opens the runner
+   dialog). The info button is absolutely positioned in the wrapper's top-right corner,
+   which is why the wrapper is the positioning context. The wrapper is still the grid item,
+   so the card grid is unchanged; the tile keeps every rule above by simply filling the
+   whole width.                                                                */
 .tool-tab-row {
     display: flex;
     align-items: stretch;
@@ -1108,65 +1123,110 @@ body.is-resizing-rail {
 .tool-tab-row .tool-tab-button {
     flex: 1 1 auto;
     min-width: 0;
-    /* Reserve the corner the tick box sits in, so a long tool name never runs under it. */
+    /* Reserve the corner the info button sits in, so a long tool name never runs under it
+       (20px control + 9px inset + a 3px gap the text never enters). */
     padding-right: 32px;
 }
 
-/* The corner tick box: a real `input[type=checkbox]`, so `checked` IS the state for
-   assistive tech and the native mark needs no invented glyph. It is the button's
-   SIBLING, lifted above the tile by `z-index`, so a click lands on the box and the
-   tile's own handler (open the runner) never sees it. `accent-color` paints the tick
-   with `--ok`, the same green as the tile's enabled BORDER, so "ticked" and "green-edged
-   tile" are one figure rather than two signals that could drift. The box keeps its NATIVE
-   painting —
-   `color-scheme: dark` on `:root` already gives it a dark-theme surface, and overriding
-   `background`/`border` here would fight `accent-color` in some engines for no gain.
-   Styled per pane (no selector list with `.plugin-tab-enable`) for the same reason the
-   two catalogue toggles keep separate rules: restyling one catalogue must never move the
-   other. */
-.tool-tab-enable {
+/* The shared glyph rule (./ui/info-icon.ts) — and since R4 it paints TWO glyphs, the "info"
+   mark and the "warning" mark a corner control wears while a refused switch is outstanding on its
+   row. Both carry this class on purpose: size, stroke and joins are the same figure for both, and
+   only the PATH differs, so the sheet cannot drift between a resting state and a failure state.
+   `stroke: currentColor` is what lets the control's own `color` state (muted / text / accent /
+   `--danger`) carry the mark without a second declaration, and each pane sizes its own instance
+   from its own control. The stroke vocabulary mirrors `.dialog-copy-icon` (./ui/dialog.css:143-152),
+   which is the same trick with three glyphs. */
+.info-icon {
+    display: block;
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+/* The corner info button: the tick box's exact footprint, and now the ONLY way this list
+   opens a dialog. It is the tile's SIBLING, lifted above it by `z-index`, so a press on the
+   mark lands on the mark and the tile's toggle handler never sees it. Unlike the checkbox it
+   replaces, it is a control the sheet has to paint — a native tick came free, a glyph does
+   not — so it borrows the icon-button vocabulary the rest of this UI uses: bordered surface,
+   centred mark, `color` for the glyph, and the accent pair for its open state.
+   Styled per pane (no selector list with `.plugin-tab-info`) for the same reason the two
+   catalogue toggles keep separate rules: restyling one catalogue must never move the other. */
+.tool-tab-info {
     position: absolute;
-    top: 9px;
-    right: 10px;
+    top: 8px;
+    right: 9px;
     z-index: 1;
-    width: 17px;
-    height: 17px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
     margin: 0;
-    border-radius: 4px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--muted);
     cursor: pointer;
-    accent-color: var(--ok);
 }
 
-/* An unticked box reads muted; a ticked one takes the ok green from the rule above. The
-   checked state also moves the tile (`[data-enabled='true']`), so the two are painted by
-   the same pass and cannot disagree about which rows are live. */
-.tool-tab-enable.is-off {
-    accent-color: var(--muted);
+.tool-tab-info:hover {
+    border-color: var(--accent);
+    color: var(--text);
 }
 
-.tool-tab-enable:hover:not(:disabled) {
-    outline: 1px solid var(--accent);
-    outline-offset: 1px;
+/* THE selection figure of this pane: the row whose runner dialog is open is the row whose
+   mark is expanded. This is the accent treatment the tile used to carry
+   (`.tool-tab-button[aria-pressed='true']`, deleted with the swap) — on the tile it would now
+   sit on top of the enabled green edge, because `aria-pressed` on a tile means ENABLED. */
+.tool-tab-info[aria-expanded='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
 }
 
-.tool-tab-enable:focus-visible {
+/* R4: THE refusal figure of this pane. When a row's enablement PATCH is refused, main.ts swaps
+   this button's only child to the warning glyph (./ui/info-icon.ts `createWarningIcon`) and sets
+   `data-toggle='error'` on it; this rule is the COLOUR half of that same state — edge and glyph,
+   the glyph following the button's `color` through `.info-icon`'s `stroke: currentColor`.
+   Why the mark rather than a sentence: the reader asked for no "X is now enabled" line under the
+   catalogue title at all (the tile's green edge says on, its absence says off), and a refusal
+   belongs on the row that was refused, not three rows above it.
+   ORDER is load-bearing: `:hover`, `[aria-expanded='true']` and this rule have the SAME
+   specificity, so the last one wins — being written last keeps a refused row red while the
+   pointer is over it and while its own runner is open. The accent FILL survives from the open
+   rule, so "this row's layer is open" and "this row's switch was refused" stay two figures on one
+   control instead of overwriting each other.
+   No forced-colours twin is needed, unlike the enabled edge above: that state has no shape and no
+   words, so it must be pinned to a system colour, while this one changes the GLYPH'S SHAPE and
+   puts the reason in the control's accessible name and tooltip (`Details for <tool> · switch
+   failed: <server sentence>`, main.ts `setToolToggleFailure`) — both of which forced colours
+   never touches. There is no system colour for "error" to pin it to anyway. */
+.tool-tab-info[data-toggle='error'] {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.tool-tab-info:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
 
-/* A tick box that is waiting for its own PATCH. R1 removed every OTHER disabled state
-   from this control, so this is the only dimming the list ever shows for a control. */
-.tool-tab-enable:disabled {
-    opacity: 0.55;
-    cursor: progress;
-}
-
 /* The tools pane owns no enablement line of its own any more (main.ts dropped it with the
-   markup), so a refused switch reports itself on the topbar pill and the row's own edge. */
+   markup), and R4 took the last sentence out of the PLUGINS pane for the same reason. A refused
+   switch now reports itself in two places, in BOTH catalogues: the row's own corner mark
+   (`.tool-tab-info[data-toggle='error']` above, `.plugin-tab-info[data-toggle='error']` below)
+   and the topbar pill, whose `title` and hidden live-region child carry the server's sentence in
+   full. */
 
 /* ---------------------------------------------------------------------------
    T7 (R2/R3): the PLUGINS view — the auto-scanned catalogue and the row dialog
-   that edits a plugin's declared settings.
+   that edits a plugin's declared settings (the master `enabled` switch belongs to the row's
+   tile since the swap, so the dialog leaves that key out).
 
    The layout mirrors `.tools-pane` above on purpose: the two catalogues are the two
    non-chat owners of the centre column, so they read and scroll identically. Every
@@ -1252,23 +1312,23 @@ body.is-resizing-rail {
     border-color: var(--border-strong);
 }
 
-/* R2: a TICKED plugin row is enabled and this pane says it on its EDGE — `--ok-line` border
-   over the row's own elevated surface. The green WASH is deliberately NOT used here: in this
-   pane the background is the SELECTION channel (`.plugin-tab-button[aria-pressed='true']`
-   below fills with `--accent-soft`), so "enabled" rides the border and "selected" rides the
-   background and the two figures can never collide or be mistaken for one another — the exact
-   recipe the TOOLS tile already uses (`.tool-tab-button[data-enabled='true']`, above), so the
-   two catalogues now read alike. The corner tick box (`accent-color: var(--ok)`) is the
-   authoritative mark and shares the same green edge. An unticked row keeps the base rules
-   above EXACTLY as they are: the `[data-enabled='false']` dim is gone, because "off" is now
-   the plain look rather than a de-emphasised one. The base rule already declares
-   `border: 1px solid transparent`, so only the colour changes — the row geometry is identical
-   enabled or not. The two catalogues stay styled PER PANE (no selector list with the tools
-   rule), so restyling one can never move the other.
-   `paintPluginToggle` moves this attribute and the tick together.
-   Placement matters: this sits BEFORE the `[aria-pressed='true']` rule below, at equal
-   specificity, so the accent border of the row whose dialog is open still wins —
-   "selected" and "enabled" stay two readable, separate figures. */
+/* R2 (swap): an ENABLED plugin row says so on the TILE'S EDGE — `--ok-line` border over the
+   row's own elevated surface. The green WASH is deliberately NOT used here, for the tools
+   pane's reason: the tile's background must stay free, because a second colour on the same tile
+   would be read as the other state of the row. "This row's dialog is open" used to ride that
+   background (`.plugin-tab-button[aria-pressed='true']`, GONE with the swap); since the swap the
+   tile's `aria-pressed` IS the enabled figure — the very thing the green edge paints — so the
+   accent "selected" channel moved to the corner control that states it
+   (`.plugin-tab-info[aria-expanded='true']` below). "Enabled" and "open" stay two readable,
+   separate figures and can never be mistaken for one another on the same row, and the two
+   catalogues now wear identical state vocabulary on their tiles.
+   An "off" row keeps the base rules above EXACTLY as they are: the old `[data-enabled='false']`
+   dim is gone, because "off" is the plain look rather than a de-emphasised one. The base rule
+   already declares `border: 1px solid transparent`, so only the colour changes — the tile
+   geometry is identical enabled or not. The two panes stay styled PER PANE (no selector list
+   with the tools rule), so restyling one can never move the other.
+   `paintPluginRowEnablement` moves this attribute and the toggle's `aria-pressed` together, in
+   one pass. */
 .plugin-tab-button[data-enabled='true'] {
     border-color: var(--ok-line);
 }
@@ -1277,11 +1337,29 @@ body.is-resizing-rail {
     border-color: var(--ok);
 }
 
-.plugin-tab-button[aria-pressed='true'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
+/* The tile's toggle is INERT only while THIS BROWSER cannot write — `data-locked` names WHICH
+   reason (`writing` this row's own PATCH, `offline` no transport). R5 made this the SAME two
+   reasons the Tools pane has: the session plugin route always accepted the reserved `enabled` key
+   for EVERY plugin with no idle window, and the session tool route dropped its 403/409 refusals,
+   so neither catalogue locks a switch on a name or on a run (main.ts `pluginSwitchLockOf` and
+   `toolSwitchLockOf`). The `no-enablement` marker has no plugin twin either — `PluginSummary.enabled`
+   is a required row field, so every plugin row states a figure to invert.
+   The tile is never the `disabled` attribute: it has to stay focusable, and its corner info
+   control has to keep opening the dialog, so the state is the `aria-disabled` + `data-locked`
+   PAIR (main.ts `paintPluginRowEnablement`) and the cursor says it out loud instead. `writing`
+   keeps the progress cursor the busy tick box used to carry. */
+.plugin-tab-button[data-locked] {
+    cursor: default;
 }
 
+.plugin-tab-button[data-locked='writing'] {
+    cursor: progress;
+}
+
+/* Kept as the twin of the tools rule, and deliberately NOT reachable today: no plugin state
+   maps onto the real attribute (there is no `unconfigured` plugin), which is exactly the point of
+   the `aria-disabled` + `data-locked` pair above. If a future plugin row does become
+   non-interactable, this is the rule that says so. */
 .plugin-tab-button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
@@ -1323,13 +1401,15 @@ body.is-resizing-rail {
     color: var(--text);
 }
 
-/* --- R2: the row and its corner enablement tick box ------------------------
-   A `<button>` cannot contain a control, so the row is a wrapper with two SIBLINGS: the
-   listing button (the dialog trigger, everything above styles it) and the tick box that
-   writes `PATCH /plugins/{id} { settings: { enabled } }`. The wrapper owns the grid slot
-   AND the positioning context, the button takes the whole width, and the box is
-   absolutely positioned over the row's top-right corner — where a reader finds a
-   control, and where it cannot be mistaken for part of the label.                    */
+/* --- R2 (swap): the row and its corner info button -------------------------
+   A `<button>` cannot contain a control, so the row is a wrapper with two SIBLINGS: the TILE
+   that writes enablement (`PATCH /sessions/{id}/plugins/{id}` with the reserved `enabled` key —
+   everything above styles it) and the INFO BUTTON that opens the settings dialog in the
+   listing's old footprint. The wrapper owns the grid slot AND the positioning context, the tile
+   takes the whole width, and the mark is absolutely positioned over the row's top-right corner
+   — where a reader finds a control, and where it cannot be mistaken for part of the label. The
+   tools pane grew the identical wrapper in its own swap; these are the plugin rules, kept
+   separate so restyling one catalogue can never move the other.                    */
 .plugin-tab-row {
     display: flex;
     align-items: stretch;
@@ -1340,58 +1420,84 @@ body.is-resizing-rail {
 .plugin-tab-row .plugin-tab-button {
     flex: 1 1 auto;
     min-width: 0;
-    /* Reserve the corner the tick box sits in, so the clamped description never runs
-       under the control. */
+    /* Reserve the corner the info button sits in (a 20px mark + a 12px inset + a 2px gap the
+       text never enters), so the clamped description never runs under the control. */
     padding-right: 34px;
 }
 
-/* A real checkbox: `checked` is the state for assistive tech, `accent-color` paints the
-   native mark with `--ok`, and `z-index` lifts it above the tile so a click on the box
-   never opens the plugin dialog. `paintPluginToggle` moves `checked`, `data-enabled` and
-   the tile's green `--ok-line` edge together — the three readings of one figure (main.ts). */
-.plugin-tab-enable {
+/* The corner info button: the tick box's exact corner, and now the ONLY way this list opens a
+   dialog. It is the tile's SIBLING, lifted above it by `z-index`, so a press on the mark lands
+   on the mark and the tile's toggle handler never sees it. Unlike the native checkbox it
+   replaces, it is a control the sheet has to paint — a tick came free, a glyph does not — so it
+   borrows the icon-button vocabulary the rest of this UI uses (and the tools mark above):
+   bordered elevated surface, centred mark, and `color` as the glyph's paint channel. The glyph
+   itself is the shared `.info-icon` rule (./ui/info-icon.ts), stroked with `currentColor`.
+   It is NEVER locked and never absent — a row whose switch is inert still has a dialog — so it
+   is also the layer's `returnFocus` target (main.ts `pluginInfoButtonOf`). */
+.plugin-tab-info {
     position: absolute;
     top: 11px;
     right: 12px;
     z-index: 1;
-    width: 17px;
-    height: 17px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
     margin: 0;
+    padding: 0;
     border: 1px solid var(--border-strong);
-    border-radius: 4px;
-    background: var(--bg-input);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--muted);
     cursor: pointer;
-    accent-color: var(--ok);
 }
 
-/* The unticked box is muted; the ticked one keeps the base rule's `--ok`. Same state
-   vocabulary as the tools pane, written as its OWN block so restyling the plugin rows
-   cannot move the tool rows. */
-.plugin-tab-enable.is-off {
-    accent-color: var(--muted);
-}
-
-.plugin-tab-enable:hover:not(:disabled) {
+.plugin-tab-info:hover {
     border-color: var(--accent);
+    color: var(--text);
 }
 
-.plugin-tab-enable:focus-visible {
+/* THE selection figure of this pane: the row whose settings layer is open is the row whose mark
+   is expanded. This is the accent pair the tile used to carry
+   (`.plugin-tab-button[aria-pressed='true']`, deleted with the swap) — on the tile it would now
+   sit on top of the enabled green edge, because `aria-pressed` on a tile means ENABLED. */
+.plugin-tab-info[aria-expanded='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+/* R4: the PLUGINS twin of the tools rule above, and a SEPARATE rule for the standing reason (the
+   two catalogues are never merged into one selector list, so restyling one cannot move the other).
+   Same state, same spelling: `setPluginToggleFailure` (main.ts) sets `data-toggle='error'` on this
+   button and swaps its glyph to the warning mark when the row's
+   `PATCH /sessions/{id}/plugins/{id}` is refused, and this rule paints the edge and the glyph with
+   `--danger`. It also sits after `:hover` and after the open rule on purpose — equal specificity,
+   so the later rule wins and a refused row stays red under the pointer and while its settings
+   layer is open.
+   This pane needs the rule most: R4 took its enablement SENTENCE away as well (the reader's
+   screenshot complaint — "Context Trimmer is now enabled for this conversation." beside `Reload
+   plugins`), so without a figure on the row a refused switch would live only in the topbar pill.
+   See the tools note above for why no forced-colours twin is required: shape and words carry it. */
+.plugin-tab-info[data-toggle='error'] {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.plugin-tab-info:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
 
-/* R1: the ONLY disabled state this control has is its own in-flight PATCH. A run in
-   flight never dims a plugin row, so this rule is the whole lock. */
-.plugin-tab-enable:disabled {
-    opacity: 0.55;
-    cursor: progress;
-}
-
-/* The enablement outcome line (main.ts `pluginsTabStatus`) — feedback, so it survived the
-   copy removal that took the pane's hint and count lines. Separate from the view head's count
-   subtitle on purpose: that one is the catalogue count and the READ failure, and a refused
-   switch must never be read as one. main.ts appends this line into `.plugins-tab-footer`, in
-   front of `Reload plugins`, since the pane head is now the bare `h2`. */
+/* The enablement outcome line (main.ts `pluginsTabStatus`) — the element FEEDBACK used to live
+   in. R4 silenced it: the pane writes no sentence about a switch any more, because the tile's
+   green edge is the accepted figure and the refusal is the row's corner mark above. The `<p>`
+   stays in the DOM and in the footer strip (main.ts keeps the `[statusLine, refresh]` pair, and
+   its `role="status"` + `aria-live="polite"` stay for any sentence this pane is given again), so
+   both rules stay as the sheet's contract for that element — and `.plugins-tab-status-error`
+   remains the spelling of a failure line here, marked by CLASS as well as colour, which is why a
+   grep for dead selectors may not clear it. */
 .plugins-tab-status {
     margin: 0;
     font-size: 11.5px;
@@ -1654,7 +1760,9 @@ body.is-resizing-rail {
     display: none;
 }
 
-/* The plugin's own master tick (`enabled`, the reserved framework key) is off. The policy
+/* The plugin itself is switched off — the framework's reserved `enabled` key, which since the
+   swap only the row's TILE writes (main.ts `buildPluginsTab`; the dialog no longer renders a
+   checkbox for it, because it duplicated that switch). The policy
    blocks stay FULLY VISIBLE and addressable — hiding them would strand exactly the operator
    who switched the plugin off and now wants to change its policy before switching it back —
    while their TEXT reads as not in force.
@@ -1673,8 +1781,10 @@ body.is-resizing-rail {
    stated here because jsdom runs no cascade — `plugins-tab.test.ts` pins the SELECTORS and the
    STEP, and cannot pin the rendering.
 
-   The state is never carried by opacity alone: the `enabled` row and its own hint say it in
-   words, the block CAPTIONS keep full contrast and keep naming each block, and nothing here
+   The state is never carried by opacity alone: the LIST says it in words and in an attribute —
+   the row's tile is a toggle button (`aria-pressed`, main.ts) with a green edge and a tooltip
+   that names the figure, and the row's settings line still prints `enabled: <value>` — the
+   block CAPTIONS keep full contrast and keep naming each block, and nothing here
    hides, moves or clips a single thing. */
 .plugin-settings-groups--off .plugin-setting > .plugin-setting-label,
 .plugin-settings-groups--off .plugin-setting > .plugin-setting-hint {
@@ -1684,8 +1794,9 @@ body.is-resizing-rail {
 /* Forced colours (D8): this mode repaints text from the system palette, so a translucent
    step is a cue the platform is not obliged to preserve. The insensitive-text system colour
    carries "declared, not in force" in a palette the mode does own — the same role `CanvasText`
-   and `Highlight` outlines play for the five forced-colours fallbacks above — and the words in
-   the `enabled` row still state the state regardless. */
+   and `Highlight` outlines play for the five forced-colours fallbacks above — and the words the
+   LIST still prints about the switch state (`enabled: <value>` on the row, and its tile's
+   tooltip) are stated regardless. */
 @media (forced-colors: active) {
     .plugin-settings-groups--off .plugin-setting > .plugin-setting-label,
     .plugin-settings-groups--off .plugin-setting > .plugin-setting-hint {
@@ -9392,14 +9503,40 @@ body.is-resizing-rail {
     }
 
     /* Tools catalogue tile: "enabled" is ALREADY an edge in that pane — the green wash was
-       dropped from it so the background could stay the SELECTION channel — so forced
-       colours has no tint to take away. The tile only needs the green edge pinned to a
-       system colour, because otherwise an enabled tile and a plain one both collapse to the
-       forced `CanvasText` border and stop differing at all. `Highlight` is the same
-       "the salient one" system colour this block already uses for active/completed rows,
-       and the corner box keeps its native `checked` rendering (forced colours paints that
-       itself), so the state is never carried by colour alone. */
+       dropped from it so the background could stay free — so forced colours has no tint to
+       take away. The tile only needs the green edge pinned to a system colour, because
+       otherwise an enabled tile and a plain one both collapse to the forced `CanvasText`
+       border and stop differing at all. `Highlight` is the same "the salient one" system
+       colour this block already uses for active/completed rows, and the corner info button
+       below states its own open state, so the two figures are never carried by colour alone. */
     .tool-tab-button[data-enabled='true'] {
         border-color: Highlight;
+    }
+
+    /* The corner info button is the pane's SELECTION figure since the swap (accent border +
+       `--accent-soft` fill), and forced colours drops exactly that fill. Pinning the open
+       mark's edge and glyph to `Highlight` keeps "this row's runner is open" legible without
+       a tint, and the glyph follows through `stroke: currentColor` — so it needs its own
+       declaration here, not just the button's. */
+    .tool-tab-info[aria-expanded='true'] {
+        border-color: Highlight;
+        color: Highlight;
+    }
+
+    /* PLUGINS catalogue — the same two figures, pinned the same way, as the pane's own rules
+       (never a selector list with the tools twins). Before the swap this pane needed nothing
+       here: its enabled mark was a native checkbox, which forced colours paints itself, and its
+       selection figure was a tile the mode already re-borders. Now the plugin tile carries the
+       green EDGE and the corner mark carries the accent tint, exactly like the tools row, so
+       both need the system-colour twin or the two catalogues collapse differently. */
+    .plugin-tab-button[data-enabled='true'] {
+        border-color: Highlight;
+    }
+
+    /* The mark, its edge AND the glyph, for the reason the tools note above gives: the tint is
+       what the mode throws away, and the glyph rides `stroke: currentColor`. */
+    .plugin-tab-info[aria-expanded='true'] {
+        border-color: Highlight;
+        color: Highlight;
     }
 }

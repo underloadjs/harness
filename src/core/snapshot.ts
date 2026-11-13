@@ -15,9 +15,12 @@
 //   - no silent loss: unknown fields, missing fields, wrong types, duplicate ids,
 //     and mismatched counters are errors. A file that this version cannot
 //     represent in full is refused, not partially accepted.
-//   - backward compatibility: the terminal agent-result archive is an OPTIONAL
-//     `agentResults` field on the existing version 1. Snapshots written before
-//     the feature (no field) still restore, with an empty result registry.
+//   - backward compatibility: additive state joins the EXISTING version as an OPTIONAL
+//     key rather than bumping it. Two fields work that way: the terminal agent-result
+//     archive (`agentResults`) and the conversation's tool switches
+//     (`discovery.withheld`, see ./harness.ts `withheldTools`). Both are written only when
+//     non-empty and read as "nothing recorded" when absent, so every pre-feature v2 file
+//     (and every fixture) still validates and restores with its exact prior meaning.
 //
 // Cross-references:
 //   - ../types            — HarnessSnapshot and its parts
@@ -846,8 +849,17 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
 
     // Discovery: enabled names keep their order, and each progressive-discovery
     // key is unique so replaying it after a restart is deterministic.
+    //
+    // `withheld` is the conversation's switch set (names its user has switched off for
+    // the agents) and is OPTIONAL: a v2 file written before the feature has no key and
+    // restores as "nothing switched off", which is why the version number did not move.
     const discoveryRecord = readSnapshotRecord(root.discovery, 'snapshot.discovery');
-    readSnapshotKeys(discoveryRecord, ['enabled', 'offsets'], 'snapshot.discovery');
+    readSnapshotKeys(
+        discoveryRecord,
+        ['enabled', 'offsets', 'withheld'],
+        'snapshot.discovery',
+        ['withheld']
+    );
 
     const enabled = readSnapshotArray(discoveryRecord.enabled, 'snapshot.discovery.enabled').map(
         (entry, index) =>
@@ -865,6 +877,26 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
 
         seenEnabled.add(name);
     }
+
+    // The conversation's switches, validated LENIENTLY by SHAPE (a non-empty string list)
+    // and deduplicated. Unlike `enabled`, an unknown or duplicated name here costs nothing
+    // — ../harness.ts `restore` drops what the rebuilt harness cannot register instead of
+    // throwing, because a whole conversation must not be lost over a switch that refers to
+    // a tool this build no longer has. A list of switches is a SET, so a duplicate is
+    // collapsed rather than refused.
+    const withheld: string[] =
+        discoveryRecord.withheld === undefined
+            ? []
+            : [
+                  ...new Set(
+                      readSnapshotArray(discoveryRecord.withheld, 'snapshot.discovery.withheld').map(
+                          (entry, index) =>
+                              readSnapshotString(entry, `snapshot.discovery.withheld[${index}]`, {
+                                  min: 1
+                              })
+                      )
+                  )
+              ];
 
     const offsets: HarnessDiscoveryOffsetSnapshot[] = readSnapshotArray(
         discoveryRecord.offsets,
@@ -975,7 +1007,15 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
     return {
         version: HARNESS_SNAPSHOT_VERSION,
         agents,
-        discovery: { enabled, offsets },
+        discovery: {
+            enabled,
+            offsets,
+            // Mirrors the writer in ../harness.ts `snapshot()`: the key is present only
+            // while something is actually switched off, so a read of a pre-feature file
+            // produces the exact document that file held (and a read-modify-write cycle
+            // never invents an empty list a byte-diff would have to explain).
+            ...(withheld.length === 0 ? {} : { withheld })
+        },
         createdTools,
         createdToolCount,
         ...(agentResults === undefined || agentResults.length === 0 ? {} : { agentResults }),

@@ -125,7 +125,9 @@ const boot = async (): Promise<Call[]> => {
 };
 
 const openRunner = async (): Promise<void> => {
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="read"]')?.click();
+    // R1 (swap): the runner opens from the row's corner INFO mark; the tile is the enablement
+    // switch now, and pressing it here would cost a PATCH instead of opening the dialog.
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="read"]')?.click();
     await flush();
 };
 

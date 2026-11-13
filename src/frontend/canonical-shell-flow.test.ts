@@ -386,7 +386,9 @@ it('boots, runs a core tool through its identified read, then submits and settle
     byClass('.tools-toggle', 'button').click();
     await flush();
 
-    byClass('.tool-tab-button[data-tool="tasks"]', 'button').click();
+    // R1 (swap): the runner opens from the row's corner INFO mark; the tile is the enablement
+    // switch and would write a PATCH instead.
+    byClass('.tool-tab-info[data-tool="tasks"]', 'button').click();
     await flush(2);
 
     // One identified read for the opened tool, and its schema is on screen: the catalogue row
@@ -417,11 +419,11 @@ it('boots, runs a core tool through its identified read, then submits and settle
         duration_ms: 4
     });
 
-    // Re-opening the same tool costs NO second schema read (the memo lives until the catalogue
-    // page is replaced).
+    // Re-opening the same tool from its mark costs NO second schema read (the memo lives until
+    // the catalogue page is replaced).
     byClass('.dialog-close', 'button').click();
     await flush();
-    byClass('.tool-tab-button[data-tool="tasks"]', 'button').click();
+    byClass('.tool-tab-info[data-tool="tasks"]', 'button').click();
     await flush(2);
     expect(dialed('GET', `${ROOT}/tools/tasks`)).toBe(1);
 

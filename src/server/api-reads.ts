@@ -111,12 +111,14 @@ export const THREAD_PREVIEW_CHARS = 160;
 export const TURN_PROMPT_PREVIEW_CHARS = 320;
 
 // The shipped harness-owned control tools (`toolRequest`, `tasks`, ...). This is the ONLY
-// remaining use of that list on the read side, and it is a SESSION fact, not a global one:
-// it decides which live registry entries a conversation can neither un-register nor switch
-// off (./api.ts `setSessionToolEnabled` / `deleteSessionTool` read the row's `protected`
-// field), and which entries have no standalone implementation (the execution gate below).
-// The GLOBAL deployment switch (./tool-settings.ts) no longer consults it: every listed
-// name is switchable there.
+// remaining use of that list on the read side, and after T6 it feeds exactly ONE figure:
+// which entries have no standalone implementation, i.e. the `session_required` value of the
+// EXECUTION gate below. It no longer decides what a conversation may SWITCH: every registered
+// name is switchable there (../harness.ts `applyToolSwitch`, the withheld set), and the row's
+// `protected` flag moved to the UNREGISTER axis (`visibility === 'core'`, the kernel's own
+// `toolManage remove` rule), which is a property of the entry, not of this list. The GLOBAL
+// deployment switch (./tool-settings.ts) never consulted it either: every listed name is
+// switchable there.
 
 // ---------------------------------------------------------------------------
 // Context
@@ -982,27 +984,63 @@ export const toolEntryOf = (name: string, context: ReadContext): CatalogueEntry 
  *   - `declared`  - the frozen definition's `coreTools` carries the name, i.e. it is in
  *                   context on every request (NOT `definition.tools`, which is the larger set
  *                   this card REGISTERS and most of which still has to be discovered);
- *   - `enabled`   - the live enabled set (`harness.discoveredTools`);
+ *   - `enabled`   - THE CALL AXIS, T6's redefinition: "may an agent in THIS conversation call
+ *                   it right now", which is TWO kernel states, not one:
+ *                     `!withheldTools.has(name) && (isToolSwitchable(name) ? discoveredTools.has(name) : true)`
+ *                   The first half is the conversation's own switch (../harness.ts
+ *                   `withheldTools`, ../types/index.ts `Harness.withheldTools`) and it applies to
+ *                   EVERY registered name, core ones included — that is the only way a row for
+ *                   `write` can say "off". The second half is cap arithmetic
+ *                   (`isToolSwitchable` means "holds one of the `maxEnabledTools` slots",
+ *                   ../types/index.ts:3908-3933): a name with a slot is on exactly while the
+ *                   capped set holds it, and a name with NO slot (a core declaration, or the
+ *                   pending-only `toolCancel`) is in context through the declaration list, so it
+ *                   is on unless this conversation switched it off.
+ *                   THE TWO FALSES ARE NOT THE SAME FACT and a client must not merge them: a
+ *                   WITHHELD name is one the operator turned off and `toolRequest` cannot even
+ *                   list; an OFF-SLOT name is one `maxEnabledTools` evicted (or a name the
+ *                   conversation has not discovered yet), which is not the user's decision and
+ *                   stays discoverable — one `toolRequest` round puts it back. Neither half
+ *                   states the DEPLOYMENT's switch, which outranks both and is only ever on the
+ *                   global row (./tool-settings.ts, `GET /tools`); a ticked row is therefore a
+ *                   statement about this conversation, not a capability promise
+ *                   (./session-tools-deployment-deny.test.ts pins both directions);
  *   - `origin`    - `created` when a source revision is installed, `discovered` when the
- *                   enabled set contains a non-declared name, `catalogue` otherwise;
- *   - `protected` - the ONE figure this projection does not decide for itself: it is the
- *                   NEGATION of the kernel's own switchability predicate
- *                   (`harness.isToolSwitchable`, ../harness.ts `occupiesSearchableSlot`), the
- *                   same code path the enable/disable operations refuse with. A catalogue row
- *                   cannot state it and a server-side guess from `visibility` cannot either
- *                   (`toolCancel` is demoted to `visibility: 'searchable'` at registration yet
- *                   stays pending-only, so it is NOT switchable). Stating the kernel's answer
- *                   BEFORE the click is what lets the pane grey the row out instead of
- *                   answering a click with a refusal: the write routes' 403 and this field are
- *                   now the same fact, so no clickable row can be refused.
- *                   This is a per-conversation fact; the global Tools rows carry no such
- *                   field, because the deployment-wide switch applies to every name;
+ *                   enabled set contains a non-declared name, `catalogue` otherwise. It stays
+ *                   keyed on the CAPPED SET (`discoveredTools`), NOT on the `enabled` figure
+ *                   above: `discovered` means "this conversation holds a slot for a name it did
+ *                   not declare", and a core declaration has no slot to hold, so `enabled: true`
+ *                   on `write` must not relabel it `discovered`;
+ *   - `protected` - the UNREGISTER axis, and after T6 nothing else: "this name cannot be
+ *                   unregistered". It is the kernel's own `toolManage remove` rule read from the
+ *                   live registry map (../harness.ts:3045 tests
+ *                   `tools[removed].visibility === 'core'`, and this row tests the same map the
+ *                   same way), so DELETE's 403 and this flag are one fact stated twice — even
+ *                   for a created tool whose REGISTERED visibility differs from the catalogue
+ *                   entry's. What it used to claim is gone: it was
+ *                   `!harness.isToolSwitchable(name)`, the cap-slot predicate, and since every
+ *                   registered name became switchable that predicate stopped being the
+ *                   switchability story — reading it here hid the switch the user most wants
+ *                   (a core name) while calling `toolCancel` un-registerable, which the kernel
+ *                   disagrees with (`toolCancel` registers at `visibility: 'searchable'`, so
+ *                   `remove` accepts it). It is NOT a claim about the PATCH: an `enabled`-only
+ *                   patch answers 200 for every row, protected ones included. It is also not a
+ *                   claim that DELETE succeeds: an INHERITED name with no session-local
+ *                   registration answers 400 whatever this flag says (./api.ts
+ *                   `deleteSessionTool`);
  *   - `source_*`  - the installed source revision, which is what makes the source route
  *                   worth calling.
  */
 export const sessionToolRowsOf = (record: SessionRecord, context: ReadContext): SessionToolSummary[] => {
     const declared = new Set<string>(record.definition.coreTools ?? []);
     const enabled = new Set<string>(record.harness.discoveredTools ?? []);
+    // THE CONVERSATION'S SWITCHES. Read once per projection (the handle's getter copies and
+    // sorts the live Set), so every row in this page is stated against one moment. `?? []`
+    // rather than a bare read: `withheldTools` is required on the `Harness` type, and a store
+    // built over a hand-rolled handle (the read-context fusions in ./api.test.ts) may predate
+    // the field — an absent list means "nothing switched off", which is the pre-T6 state and a
+    // valid one, not a crash.
+    const withheld = new Set<string>(record.harness.withheldTools ?? []);
     const sources = new Map(record.harness.toolSources().map((source) => [source.name, source]));
     // One rule decides `origin` and the budget, so a row and the page's budget can never
     // disagree about which revisions belong to this session.
@@ -1014,17 +1052,30 @@ export const sessionToolRowsOf = (record: SessionRecord, context: ReadContext): 
         const source = sources.get(name);
         const isDeclared = declared.has(name);
         const isEnabled = enabled.has(name);
+        // THE KERNEL'S CAP-SLOT ANSWER, not a guess from `visibility`: `true` means this name
+        // competes for one of the `maxEnabledTools` slots and is therefore in context ONLY while
+        // the capped set holds it; `false` means a core declaration or a pending-only control,
+        // which is in context through the declaration list and has no slot to lose.
+        const holdsSlot = record.harness.isToolSwitchable(name);
 
         return {
             ...toolSummaryOf(entry, name, liveToolDescription(record, name)),
             session_id: record.id,
             declared: isDeclared,
-            enabled: isEnabled,
+            // The call axis: off if this conversation switched it off (any name), or if it holds
+            // a slot that is currently not held. A slotless name that nobody switched off is in
+            // context on every request, so `false` there would be a lie about a live tool.
+            enabled: !withheld.has(name) && (!holdsSlot || isEnabled),
             // `created` is what this session registered; `discovered` is an enabled name this
             // session did not declare (a `toolRequest` match, or the host's new-session toolbox
             // seed — same slot in the same capped set); `catalogue` is everything else.
             origin: created.has(name) ? 'created' : !isDeclared && isEnabled ? 'discovered' : 'catalogue',
-            protected: !record.harness.isToolSwitchable(name),
+            // The unregister axis, read from the SAME live map the kernel's `remove` refuses
+            // with (`src/harness.ts:3045` tests `tools[removed].visibility === 'core'`), so
+            // DELETE's 403 and this flag are one fact stated twice — for a name whose REGISTERED
+            // visibility differs from the catalogue's (a created tool declared `core`) the live
+            // definition is the one that answers, and a stale catalogue guess would be the lie.
+            protected: record.harness.tools[name]?.visibility === 'core',
             source_available: source !== undefined,
             ...(source === undefined ? {} : { source_revision: source.revision })
         };
@@ -1058,11 +1109,12 @@ export const sessionToolDetailOf = (
     // A name the live registry does not hold cannot be addressed by this route: every caller
     // answers 404 from the row list first (`./api.ts` `getSessionTool`, `patchSessionTool`,
     // `deleteSessionTool`), so the row below is a type-complete fallback, not a claim a client
-    // ever sees. What it states must still be TRUE for the name, which is why `protected` is
-    // the kernel's own answer rather than a literal: an unregistered name is by definition not
-    // switchable (`../harness.ts` `occupiesSearchableSlot` reads the live registry), so a
-    // fallback that said `protected: false` would contradict the row rule it stands in for
-    // (`sessionToolRowsOf` above sets `protected = !isToolSwitchable(name)`).
+    // ever sees. What it states must still be TRUE for the name, which is why both figures are
+    // the kernel's own answers rather than literals: `enabled: false` because an unregistered
+    // name can be called by nobody, and `protected` from the SAME live-map expression
+    // `sessionToolRowsOf` uses (../harness.ts `toolManage remove` refuses a name that is not
+    // registered at all, so it is not the harness-owned core case this flag names). A fallback
+    // that said `protected: true` would claim an un-registerable entry that does not exist.
     if (row === undefined) {
         return {
             ...toolSummaryOf(toolEntryOf(name, context), name),
@@ -1070,7 +1122,7 @@ export const sessionToolDetailOf = (
             declared: false,
             enabled: false,
             origin: 'catalogue',
-            protected: !record.harness.isToolSwitchable(name),
+            protected: record.harness.tools[name]?.visibility === 'core',
             source_available: false,
             execution: toolExecutionScopeOf(name)
         };
@@ -1107,17 +1159,23 @@ const toolDetailsOf = (
 /** How one entry may be called over HTTP, stated rather than inferred by the client. */
 export const toolExecutionScopeOf = (name: string): ToolExecutionScope => ({
     // THIS IS THE EXECUTION AXIS, and it is a DIFFERENT predicate from the row's `protected`
-    // flag on the switch axis. `session_required` names the control-plane entries the runtime
+    // flag and from `enabled`. `session_required` names the control-plane entries the runtime
     // ships that have NO standalone implementation (`CORE_TOOL_NAMES` = `toolRequest` and
     // `tasks`, ./harnesses/toolbox.ts:194-196), because only a live conversation can run them.
-    // `protected` answers whether THIS conversation may switch the name at all, which is the
-    // kernel's switchability rule and covers a far wider set — `read`, `write`, `edit`, `glob`,
-    // `grep`, `delegate` and `toolCancel` are all protected (../harness.ts
-    // `occupiesSearchableSlot`) while remaining callable through the session route, so they
-    // stay `session_only` here. The two figures disagree ON PURPOSE; neither one may be derived
-    // from the other (see the `isCoreToolName` note above and `sessionToolRowsOf`).
+    // `protected` now answers the UNREGISTER question (`visibility: 'core'` — can this name be
+    // removed at all), and `enabled` answers the CALL question (may an agent here call it); a
+    // name can be all three at once. Concretely after T6: `read`, `write`, `edit`, `glob`,
+    // `grep` and `fetch` are `protected: true` (harness-owned, so DELETE 403s) AND
+    // `enabled: true` until this conversation switches them off, AND `session_only` here —
+    // while `toolRequest`/`tasks` are `session_required` because no global route can run them.
+    // `toolCancel` is `protected: false` (its registered visibility is `searchable`), which is
+    // yet another combination. The three figures disagree ON PURPOSE; none may be derived from
+    // another (see the `isCoreToolName` note above and `sessionToolRowsOf`).
     scope: isCoreToolName(name) ? 'session_required' : 'session_only',
-    // Manual execution is the documented session surface for every live entry.
+    // Manual execution is the documented session surface for every live entry. T6's session
+    // switch does NOT reach this: `store.callTool` -> `harness.executeTool` bypasses discovery by
+    // design, so a row the operator switched off is still executable over REST (and still callable
+    // by a nested `context.callTool` from inside another tool).
     manual: true
 });
 

@@ -747,4 +747,809 @@ describe("harness.isToolSwitchable — the kernel's own answer to \"may this be 
         // A created tool is enabled by the same kernel, and stays switchable afterwards.
         expect(writer.discoveredTools).toContain('late');
     });
+
+    // THE SESSION SWITCH REDRAWS THIS SEAM'S MEANING, and the pin below is the proof that
+    // it did not move: `isToolSwitchable` is the CAP-SLOT predicate, and it is still false
+    // for every name that cannot hold one. What changed is that it is no longer the bar for
+    // switching — the enable/disable operations accept any registered name now, and a core
+    // or pending-only name's switch lives in `withheldTools`, which this predicate says
+    // nothing about. A host that reads `false` as "the user cannot switch this off" is the
+    // mistake this comment exists to prevent (the server's `protected` row figure is T6's).
+    it('stays the cap-slot predicate while the session switch widens: core and pending-only names switch, slots do not move', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(2),
+            presets: false,
+            enableAllTools: true
+        });
+
+        // The predicate itself: byte-identical to the pre-switch kernel.
+        expect(writer.isToolSwitchable('file-00')).toBe(true);
+        expect(writer.isToolSwitchable('toolRequest')).toBe(false);
+        expect(writer.isToolSwitchable('tasks')).toBe(false);
+        expect(writer.isToolSwitchable('toolCancel')).toBe(false);
+
+        const capBefore = writer.discoveredTools;
+
+        // Three names with no cap slot, each a DIFFERENT shape, all switchable now: an
+        // always-declared core control, a core record tool, and the pending-only runtime
+        // control that reports `visibility: 'searchable'` but is never seedable.
+        for (const name of ['toolRequest', 'tasks', 'toolCancel']) {
+            expect(writer.runtime.manageTool(undefined, { operation: 'disable', name })).toEqual({
+                name,
+                operation: 'disable',
+                enabled: false,
+                changed: true
+            });
+        }
+
+        // The switch is recorded where a slot cannot be — and the capped set did not move
+        // by one name, in either list or order.
+        expect(writer.withheldTools).toEqual(['tasks', 'toolCancel', 'toolRequest']);
+        expect(writer.discoveredTools).toEqual(capBefore);
+
+        for (const name of ['toolRequest', 'tasks', 'toolCancel']) {
+            expect(writer.runtime.manageTool(undefined, { operation: 'enable', name })).toEqual({
+                name,
+                operation: 'enable',
+                enabled: true,
+                changed: true
+            });
+        }
+
+        expect(writer.withheldTools).toEqual([]);
+        expect(writer.discoveredTools).toEqual(capBefore);
+
+        // An UNREGISTERED name is still refused, and a blank name still throws: the switch
+        // has a bar, it is just registration rather than cap membership.
+        expect(() => writer.runtime.manageTool(undefined, { operation: 'disable', name: 'delegate' })).toThrow(
+            'Tool "delegate" is not registered in this harness.'
+        );
+        expect(() => writer.runtime.manageTool(undefined, { operation: 'enable', name: '   ' })).toThrow(
+            'Tool "   " is not registered in this harness.'
+        );
+
+        // `remove` is the OTHER privilege and keeps its core refusal: switching a harness
+        // control off is not the same as unregistering it.
+        expect(() => writer.runtime.manageTool(undefined, { operation: 'remove', name: 'toolRequest' })).toThrow(
+            'Tool "toolRequest" is a core harness tool and cannot be unregistered.'
+        );
+    });
 });
+
+// ---------------------------------------------------------------------------
+// THE SESSION SWITCH — the withheld set (`harness.withheldTools`).
+//
+// The requirement this block exists for: "all tools can be toggled off... toggling is
+// purely for agents/threads of that session, and it can be in real time (when the agent's
+// thread is still running)... tools can execute any tools regardless whether they are
+// disabled or not... this does not stop the user from triggering those tools through the
+// REST API" and "a disabled tool shouldn't even appear in toolRequest — they are simply
+// not listed", "the same for when a thread spawns a delegate or another thread", "tool
+// control via the tool panel is global session level, affecting all threads".
+//
+// The kernel's shape, and the four properties that fall out of it:
+//   - a SEPARATE set beside `activeTools`, so a switch never spends or frees a cap slot and
+//     applies to names that never had one (core, pending-only);
+//   - read at the model boundaries — per model turn (declarations) and per launch (the gate),
+//     which is what makes it real-time for a running thread, with no rebuild;
+//   - consulted by EVERY agent and thread of the session through those shared boundaries
+//     (`visibleCoreTools`/`declared` are what a subagent, a fork, and a thread all build
+//     their request from), and by the discovery catalogue, which stops `toolRequest`
+//     resurrecting a name its user just switched off;
+//   - NOT consulted by the execution doors (`executeTool`/`callTool`), which is the REST and
+//     nested-tool-call guarantee, unchanged from the discovery contract they already had.
+// ---------------------------------------------------------------------------
+
+// The refusal sentence a model gets for a name the conversation switched off. It is the
+// kernel's `sessionDisableReason`, pinned here as ONE literal so a wording change is a
+// deliberate diff: the sentence has to break the loop ("toolRequest will not find it")
+// because the alternative answer — "call toolRequest" — is a promise the kernel no longer
+// keeps for this name.
+const SWITCHED_OFF = (name: string): string =>
+    `Tool "${name}" is switched off for this conversation by its user. Calling toolRequest will not find it and asking again will not change this answer.`;
+
+describe('the conversation tool switch (the withheld set)', () => {
+    it('switches a core declaration off and back on mid-conversation, and the NEXT request follows', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const writer = harness({
+            // `ping` is a host-registered CORE tool: always declared, never a cap slot. It
+            // is the case the old kernel could not switch at all.
+            agents: { writer: brain(scripted([answer('one'), answer('two'), answer('three')], seen)) },
+            tools: {
+                ...fixtures(1),
+                ping: tool({
+                    name: 'ping',
+                    description: 'Ping.',
+                    tags: ['ping'],
+                    visibility: 'core',
+                    execute: () => 'pong'
+                })
+            },
+            presets: false
+        });
+
+        await writer('go');
+        expect((seen[0].tools ?? []).map((entry) => entry.name)).toEqual(['toolRequest', 'tasks', 'ping']);
+
+        const capBefore = writer.discoveredTools;
+        expect(writer.runtime.manageTool(undefined, { operation: 'disable', name: 'ping' })).toEqual({
+            name: 'ping',
+            operation: 'disable',
+            enabled: false,
+            changed: true
+        });
+
+        // LIVE, not staged: the next model turn of the SAME running conversation is built
+        // from the new state. No re-registration, no rebuild, no cap movement.
+        await writer('again');
+        expect((seen[1].tools ?? []).map((entry) => entry.name)).toEqual(['toolRequest', 'tasks']);
+        expect(writer.withheldTools).toEqual(['ping']);
+        expect(writer.discoveredTools).toEqual(capBefore);
+
+        // And the switch is reversible by the same operation, with the same zero cap effect.
+        expect(writer.runtime.manageTool(undefined, { operation: 'enable', name: 'ping' })).toEqual({
+            name: 'ping',
+            operation: 'enable',
+            enabled: true,
+            changed: true
+        });
+        await writer('third');
+        expect((seen[2].tools ?? []).map((entry) => entry.name)).toEqual(['toolRequest', 'tasks', 'ping']);
+        expect(writer.withheldTools).toEqual([]);
+        expect(writer.discoveredTools).toEqual(capBefore);
+    });
+
+    it('reports a repeat switch as changed:false, and never claims a mutation that did not happen', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(1),
+            presets: false,
+            enableAllTools: true
+        });
+
+        const capBefore = writer.discoveredTools;
+
+        expect(writer.runtime.manageTool(undefined, { operation: 'disable', name: 'tasks' })).toEqual({
+            name: 'tasks',
+            operation: 'disable',
+            enabled: false,
+            changed: true
+        });
+        expect(writer.runtime.manageTool(undefined, { operation: 'disable', name: 'tasks' })).toEqual({
+            name: 'tasks',
+            operation: 'disable',
+            enabled: false,
+            changed: false
+        });
+        expect(writer.runtime.manageTool(undefined, { operation: 'enable', name: 'tasks' })).toEqual({
+            name: 'tasks',
+            operation: 'enable',
+            enabled: true,
+            changed: true
+        });
+        expect(writer.runtime.manageTool(undefined, { operation: 'enable', name: 'tasks' })).toEqual({
+            name: 'tasks',
+            operation: 'enable',
+            enabled: true,
+            changed: false
+        });
+
+        // The same idempotence for a name that DOES hold a slot, on the capped path.
+        expect(writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-00' })).toEqual({
+            name: 'file-00',
+            operation: 'disable',
+            enabled: false,
+            changed: true
+        });
+        expect(writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-00' })).toEqual({
+            name: 'file-00',
+            operation: 'disable',
+            enabled: false,
+            changed: false
+        });
+        expect(writer.withheldTools).toEqual(['file-00']);
+        expect(writer.discoveredTools).toEqual(capBefore.filter((entry) => entry !== 'file-00'));
+    });
+
+    it('refuses a withheld name at launch — core, searchable, and each pre-gate runtime control', async () => {
+        // A core host tool the model still tries to call after it disappeared from the
+        // declaration list.
+        let coreRan = false;
+        const core = harness({
+            agents: {
+                writer: brain(scripted([callTool('c1', 'ping', '{}'), answer('recovered')]))
+            },
+            tools: {
+                ping: tool({
+                    name: 'ping',
+                    description: 'Ping.',
+                    tags: ['ping'],
+                    visibility: 'core',
+                    execute: () => {
+                        coreRan = true;
+                        return 'pong';
+                    }
+                })
+            },
+            presets: false
+        });
+        core.runtime.manageTool(undefined, { operation: 'disable', name: 'ping' });
+
+        expect((await core('go')).content).toBe('recovered');
+        expect(coreRan).toBe(false);
+        expect((core.agent.messages[2] as { content: string }).content).toBe(SWITCHED_OFF('ping'));
+
+        // A SEARCHABLE name that also lost its slot: the switch sentence, not the old
+        // "not enabled yet. Call toolRequest" one, because toolRequest cannot find it.
+        const searchable = harness({
+            agents: { writer: brain(scripted([callTool('c1', 'file-00', '{}'), answer('recovered')])) },
+            tools: fixtures(1),
+            presets: false,
+            enableAllTools: true
+        });
+        searchable.runtime.manageTool(undefined, { operation: 'disable', name: 'file-00' });
+        await searchable('go');
+        expect((searchable.agent.messages[2] as { content: string }).content).toBe(SWITCHED_OFF('file-00'));
+
+        // THE PRE-GATE BRANCHES. `threadFork` and `actionRequest` leave the launcher through
+        // their own handlers BEFORE the discovery gate, and `toolCancel` answers from its own
+        // acknowledgement branch, so a gate placed only at the discovery check would leave
+        // all three switches no-ops. Each is asserted against a control that proves the branch
+        // WOULD have run.
+        const forkOff = harness({
+            agents: { writer: brain(scripted([callTool('c1', 'threadFork', '{"input":"x"}'), answer('recovered')])) },
+            tools: fixtures(1),
+            presets: false,
+            enableAllTools: true
+        });
+        forkOff.runtime.manageTool(undefined, { operation: 'disable', name: 'threadFork' });
+        await forkOff('go');
+        expect((forkOff.agent.messages[2] as { content: string }).content).toBe(SWITCHED_OFF('threadFork'));
+        // No branch was minted: the refusal replaced the fork.
+        expect(forkOff.threads().map((entry) => entry.id)).toEqual(['agent:writer']);
+
+        const forkOn = harness({
+            agents: { writer: brain(scripted([callTool('c1', 'threadFork', '{"input":"x"}'), answer('recovered')])) },
+            tools: fixtures(1),
+            presets: false,
+            enableAllTools: true
+        });
+        await forkOn('go');
+        expect(JSON.parse((forkOn.agent.messages[2] as { content: string }).content)).toEqual({
+            branchId: 'branch-1',
+            threadId: 'branch-1',
+            content: 'recovered'
+        });
+
+        const actionOff = harness({
+            agents: {
+                writer: brain(
+                    scripted([
+                        callTool('c1', 'actionRequest', '{"kind":"confirm","question":"go?"}'),
+                        answer('recovered')
+                    ])
+                )
+            },
+            tools: fixtures(1),
+            presets: false,
+            enableAllTools: true,
+            interaction: {}
+        });
+        actionOff.runtime.manageTool(undefined, { operation: 'disable', name: 'actionRequest' });
+        await actionOff('go');
+        expect((actionOff.agent.messages[2] as { content: string }).content).toBe(SWITCHED_OFF('actionRequest'));
+
+        // `toolCancel` is the pending-only control: withheld, it is neither declared nor
+        // runnable even while a sibling call is genuinely in flight.
+        const cancelOff = harness({
+            agents: {
+                writer: brain(
+                    scripted([
+                        [
+                            {
+                                type: 'done',
+                                stopReason: 'tool_calls',
+                                toolCalls: [
+                                    { id: 'c1', name: 'file-00', arguments: '{}' },
+                                    { id: 'c2', name: 'toolCancel', arguments: '"c1"' }
+                                ]
+                            }
+                        ],
+                        answer('recovered')
+                    ])
+                )
+            },
+            tools: {
+                'file-00': tool({
+                    name: 'file-00',
+                    description: 'file-00 fixture.',
+                    tags: ['widgets'],
+                    mode: 'async',
+                    execute: async () => 'done'
+                })
+            },
+            presets: false,
+            enableAllTools: true
+        });
+        cancelOff.runtime.manageTool(undefined, { operation: 'disable', name: 'toolCancel' });
+        await cancelOff('go');
+
+        const cancelResults = cancelOff.agent.messages
+            .filter((entry) => entry.role === 'tool')
+            .map((entry) => (entry as { content: string }).content);
+        expect(cancelResults).toEqual(['done', SWITCHED_OFF('toolCancel')]);
+    });
+
+    it('keeps a withheld name out of every toolRequest field — it is simply not listed', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(4),
+            presets: false
+        });
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-01' });
+
+        // A tag union: the withheld name is absent from `tools`/`enabled`, and `matched`
+        // counts only what the catalogue still offers. Not `forbidden`, not `omitted`, not a
+        // row with a reason — absent.
+        expect(writer.runtime.requestTools(undefined, { tags: ['widgets'] })).toEqual({
+            enabled: ['file-00', 'file-02', 'file-03'],
+            tools: [matchOf('file-00'), matchOf('file-02'), matchOf('file-03')],
+            matched: 3,
+            omitted: 0
+        });
+
+        // An exact name the user switched off answers like a name that does not exist.
+        expect(
+            (writer.runtime.requestTools(undefined, { names: ['file-01'] }) as Record<string, unknown>).matched
+        ).toBe(0);
+
+        // A regex whose only hit is the withheld name: same answer, and the name never
+        // reaches the capped set.
+        const regexed = writer.runtime.requestTools(undefined, { regex: '^file-01$' });
+        expect((regexed as Record<string, unknown>).enabled).toEqual([]);
+        expect(writer.withheldTools).toEqual(['file-01']);
+
+        // A scoped run keeps its own denial channel, and a withheld name does NOT borrow it:
+        // `forbidden` stays the scope + deployment-deny field it always was.
+        const scoped = writer.runtime.requestTools(
+            undefined,
+            { names: ['file-01', 'file-02'] },
+            undefined,
+            ['file-01', 'file-02']
+        ) as Record<string, unknown>;
+        expect(scoped).toEqual({
+            enabled: ['file-02'],
+            tools: [matchOf('file-02')],
+            matched: 1,
+            omitted: 0
+        });
+    });
+
+    it('moves a tag that only a withheld tool carries out of availableTags and into unmatchedTags', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: {
+                ...fixtures(1),
+                solo: tool({ name: 'solo', description: 'Solo.', tags: ['sopranos'], execute: () => 'x' })
+            },
+            presets: false
+        });
+
+        // Before the switch: `sopranos` is offered as the retry vocabulary, and a query for
+        // it matches.
+        const before = writer.runtime.requestTools(undefined, { tags: ['nothing-matching'] }) as Record<
+            string,
+            unknown
+        >;
+        expect((before.availableTags as string[])).toContain('sopranos');
+        expect((writer.runtime.requestTools(undefined, { tags: ['sopranos'] }) as Record<string, unknown>).matched).toBe(1);
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'solo' });
+
+        // After it: the vocabulary no longer dangles a tool nobody can enable, and the tag
+        // itself is honestly reported as unmatched — the two fields that keep a model from
+        // searching in circles.
+        const after = writer.runtime.requestTools(undefined, { tags: ['nothing-matching'] }) as Record<
+            string,
+            unknown
+        >;
+        expect((after.availableTags as string[])).not.toContain('sopranos');
+
+        expect(writer.runtime.requestTools(undefined, { tags: ['sopranos'] })).toEqual({
+            enabled: [],
+            tools: [],
+            matched: 0,
+            omitted: 0,
+            unmatchedTags: ['sopranos'],
+            availableTags: (after.availableTags as string[])
+        });
+    });
+
+    it('never lets toolRequest resurrect a withheld name, by any selector', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(3),
+            presets: false,
+            enableAllTools: true
+        });
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-01' });
+        // The switch took `file-01` out of the capped set as well, so the seed order is the
+        // runtime rows plus the two names still on.
+        expect(writer.discoveredTools).toEqual([
+            'toolRegistry',
+            'toolList',
+            'toolManage',
+            'toolCreate',
+            'records',
+            'profiles',
+            'chapters',
+            'locations',
+            'agentManage',
+            'agentResult',
+            'threadFork',
+            'file-00',
+            'file-02'
+        ]);
+
+        // ONE call, all THREE selectors, and the withheld name is reachable by none of them:
+        // the exact name misses, the regex contributes only `file-02`, and the tag union
+        // contributes `file-02` and `file-00`.
+        expect(
+            writer.runtime.requestTools(undefined, {
+                names: ['file-01'],
+                regex: '^file-0[12]$',
+                tags: ['widgets']
+            })
+        ).toEqual({
+            enabled: ['file-02', 'file-00'],
+            tools: [matchOf('file-02'), matchOf('file-00')],
+            matched: 2,
+            omitted: 0
+        });
+
+        // Newest-first, exactly like any other selection — and `file-01` stayed switched off
+        // through a turn in which three of its selectors fired.
+        expect(writer.discoveredTools).toEqual([
+            'file-02',
+            'file-00',
+            'toolRegistry',
+            'toolList',
+            'toolManage',
+            'toolCreate',
+            'records',
+            'profiles',
+            'chapters',
+            'locations',
+            'agentManage',
+            'agentResult',
+            'threadFork'
+        ]);
+        expect(writer.withheldTools).toEqual(['file-01']);
+    });
+
+    it('treats cap eviction as capacity, not as a switch, so an evicted name stays discoverable', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(4),
+            presets: false,
+            maxEnabledTools: 2
+        });
+
+        expect(writer.runtime.requestTools(undefined, { names: ['file-00', 'file-01'] })).toEqual({
+            enabled: ['file-00', 'file-01'],
+            tools: [matchOf('file-00'), matchOf('file-01')],
+            matched: 2,
+            omitted: 0
+        });
+
+        // One more name than the bound: `file-01` is pushed out.
+        expect(writer.runtime.requestTools(undefined, { names: ['file-02'] })).toEqual({
+            enabled: ['file-02'],
+            tools: [matchOf('file-02')],
+            matched: 1,
+            omitted: 0,
+            evicted: ['file-01']
+        });
+
+        // THE PIN: eviction wrote the capped set and NOTHING else. The user never decided
+        // anything about `file-01`, so it is still listed, still findable, and one query away.
+        expect(writer.withheldTools).toEqual([]);
+        expect(writer.runtime.requestTools(undefined, { names: ['file-01'] })).toEqual({
+            enabled: ['file-01'],
+            tools: [matchOf('file-01')],
+            matched: 1,
+            omitted: 0,
+            evicted: ['file-00']
+        });
+    });
+
+    it('survives the seed pass and a re-registration, and is forgotten only by reset or an explicit enable', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(3),
+            presets: false,
+            enableAllTools: true
+        });
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-00' });
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'tasks' });
+        const capAfterSwitch = writer.discoveredTools;
+        expect(capAfterSwitch).not.toContain('file-00');
+
+        // AUTO-ENABLE PATH #1 — the full-toolbox re-seed. It fills the cap with everything
+        // the user left on and does not touch a single switch.
+        writer.enableAllSwitchableTools();
+        expect(writer.discoveredTools).toEqual(capAfterSwitch);
+        expect(writer.withheldTools).toEqual(['file-00', 'tasks']);
+
+        // AUTO-ENABLE PATH #2 — a re-registration of the same name (an update, a folder
+        // re-scan, a plugin publishing its row again). Editing a tool's source is not the
+        // user taking it back, and the immediate-enable a creation normally performs must
+        // not fire for it.
+        await writer.createTool({
+            name: 'file-00',
+            description: 'file-00 replaced.',
+            tags: ['widgets'],
+            source: 'return 1;'
+        });
+
+        expect(writer.withheldTools).toEqual(['file-00', 'tasks']);
+        expect(writer.discoveredTools).toEqual(capAfterSwitch);
+        expect(
+            (writer.runtime.manageTool(undefined, { operation: 'details', name: 'file-00' }) as Record<
+                string,
+                unknown
+            >).enabled
+        ).toBe(false);
+
+        // A NEW conversation: a reset starts with everything on, which is also what makes the
+        // reset + re-seed pair equal a freshly created session.
+        writer.reset();
+        expect(writer.withheldTools).toEqual([]);
+        expect(writer.discoveredTools).toEqual([]);
+
+        writer.enableAllSwitchableTools();
+        expect(writer.withheldTools).toEqual([]);
+        expect(writer.discoveredTools).toEqual([
+            'toolRegistry',
+            'toolList',
+            'toolManage',
+            'toolCreate',
+            'records',
+            'profiles',
+            'chapters',
+            'locations',
+            'agentManage',
+            'agentResult',
+            'threadFork',
+            'file-00',
+            'file-01',
+            'file-02'
+        ]);
+    });
+
+    it('un-registers the switch with the name, so a later create is not shadowed by an old decision', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(1),
+            presets: false,
+            enableAllTools: true
+        });
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-00' });
+        expect(writer.withheldTools).toEqual(['file-00']);
+
+        expect(
+            (writer.runtime.manageTool(undefined, { operation: 'remove', name: 'file-00' }) as Record<
+                string,
+                unknown
+            >).removed
+        ).toBe(true);
+
+        // The registry, the capped set, and the SWITCH all moved together: the snapshot the
+        // observer is about to write names the removed tool nowhere.
+        expect(writer.withheldTools).toEqual([]);
+        expect(writer.snapshot().discovery).toEqual({
+            enabled: [
+                'toolRegistry',
+                'toolList',
+                'toolManage',
+                'toolCreate',
+                'records',
+                'profiles',
+                'chapters',
+                'locations',
+                'agentManage',
+                'agentResult',
+                'threadFork'
+            ],
+            offsets: []
+        });
+    });
+
+    it('answers the handle as a sorted, detached view — a caller cannot switch a tool through it', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(2),
+            presets: false
+        });
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-00' });
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'toolRequest' });
+
+        const view = writer.withheldTools as string[];
+        view.push('zzz');
+        view.reverse();
+
+        expect(writer.withheldTools).toEqual(['file-00', 'toolRequest']);
+        expect(writer.withheldTools).toEqual(writer.withheldTools);
+    });
+
+    it('stops telling a model to call a toolRequest this conversation has switched off', async () => {
+        const on = harness({
+            agents: { writer: brain(scripted([callTool('c1', 'nope', '{}'), answer('recovered')])) },
+            tools: fixtures(1),
+            presets: false
+        });
+        await on('go');
+        expect((on.agent.messages[2] as { content: string }).content).toBe(
+            'Tool "nope" is not registered. Available tools: toolRequest, tasks. Call toolRequest with capability tags to search the catalogue.'
+        );
+
+        const off = harness({
+            agents: { writer: brain(scripted([callTool('c1', 'nope', '{}'), answer('recovered')])) },
+            tools: fixtures(1),
+            presets: false
+        });
+        off.runtime.manageTool(undefined, { operation: 'disable', name: 'toolRequest' });
+        await off('go');
+
+        // Same answer, minus the instruction that would send the model after an undeclared
+        // tool. The declared-tool list in the sentence is already filtered, so `toolRequest`
+        // is gone from both halves at once.
+        expect((off.agent.messages[2] as { content: string }).content).toBe(
+            'Tool "nope" is not registered. Available tools: tasks.'
+        );
+    });
+
+    it('keeps the manual and nested doors open, which is what the REST and tool-to-tool guarantees mean', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: {
+                ...fixtures(1),
+                ping: tool({
+                    name: 'ping',
+                    description: 'Ping.',
+                    tags: ['ping'],
+                    visibility: 'core',
+                    execute: () => 'pong'
+                })
+            },
+            presets: false
+        });
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'ping' });
+
+        // The operator's door (what `POST /tools/:name` calls).
+        expect(await writer.executeTool('ping', {})).toBe('pong');
+        // The programmatic door (what `context.callTool` reaches from a running tool).
+        expect(await writer.callTool('ping', {})).toBe('pong');
+        expect(writer.withheldTools).toEqual(['ping']);
+
+        // A withheld searchable name is still callable by a host too: the switch is a
+        // declaration rule, not an execution rule.
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-00' });
+        expect(await writer.executeTool('file-00', {})).toBe('file-00');
+    });
+
+    it('projects the switch on the details view, which is the row a tool pane renders', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(1),
+            presets: false,
+            enableAllTools: true
+        });
+
+        const details = (name: string): Record<string, unknown> =>
+            writer.runtime.manageTool(undefined, { operation: 'details', name }) as Record<string, unknown>;
+
+        // Before: a core name reads enabled (it is in context) and the seeded searchable one
+        // reads enabled (it holds a slot).
+        expect(details('toolRequest')).toMatchObject({ visibility: 'core', enabled: true });
+        expect(details('file-00')).toMatchObject({ visibility: 'searchable', enabled: true });
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'toolRequest' });
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'file-00' });
+
+        // After: both read off, by the SAME field — and the registration and the source
+        // record are untouched, which is what tells a pane "off", not "gone".
+        expect(details('toolRequest')).toMatchObject({ visibility: 'core', enabled: false, hasSource: true });
+        expect(details('file-00')).toMatchObject({ visibility: 'searchable', enabled: false, hasSource: false });
+
+        // An evicted-but-not-switched name reads off as well, and the two states are
+        // distinguished by `harness.withheldTools`, which is why that seam exists.
+        const capped = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            tools: fixtures(3),
+            presets: false,
+            maxEnabledTools: 1
+        });
+        capped.runtime.requestTools(undefined, { names: ['file-00'] });
+        capped.runtime.requestTools(undefined, { names: ['file-01'] });
+        // The EVICTED name reads off on this field exactly like a switched-off one — the
+        // eviction itself is invisible here (`file-01` took the only slot). `withheldTools`
+        // is the seam that separates the two states, which is why it exists.
+        expect(
+            (capped.runtime.manageTool(undefined, { operation: 'details', name: 'file-01' }) as Record<
+                string,
+                unknown
+            >).enabled
+        ).toBe(true);
+        expect(
+            (capped.runtime.manageTool(undefined, { operation: 'details', name: 'file-00' }) as Record<
+                string,
+                unknown
+            >).enabled
+        ).toBe(false);
+        expect(capped.withheldTools).toEqual([]);
+    });
+
+    it('applies to every actor of the session at once — a delegated child and a thread see the same switch', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const writer = harness({
+            agents: {
+                writer: brain(
+                    scripted(
+                        [callTool('c1', 'delegate', '{"agent":"researcher","input":"check"}'), answer('done')],
+                        seen
+                    )
+                ),
+                // The child's requests land in the SAME `seen` list, which is the point: the
+                // switch has to be visible from both sides of the delegation.
+                researcher: brain(scripted([answer('checked')], seen))
+            },
+            subagents: ['researcher'],
+            tools: {
+                ...fixtures(1),
+                ping: tool({
+                    name: 'ping',
+                    description: 'Ping.',
+                    tags: ['ping'],
+                    visibility: 'core',
+                    execute: () => 'pong'
+                })
+            },
+            presets: false
+        });
+
+        await writer('go');
+
+        // Request 1 is the primary, 2 is the DELEGATED child (no `delegate`: a subagent
+        // cannot delegate further), 3 is the primary's follow-up. `ping` is declared to all
+        // three — one session-level rule, not a per-actor list.
+        expect(seen.map((request) => (request.tools ?? []).map((entry) => entry.name))).toEqual([
+            ['toolRequest', 'tasks', 'delegate', 'ping'],
+            ['toolRequest', 'tasks', 'ping'],
+            ['toolRequest', 'tasks', 'delegate', 'ping']
+        ]);
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'ping' });
+
+        // A turn asked of the CHILD's own conversation, after the switch. The user of the
+        // session switched one name off; every thread of that session loses it, which is what
+        // "tool control via the tool panel is global session level, affecting all threads"
+        // means at the kernel.
+        expect((await writer.sendThreadInput('agent:researcher', 'again')).content).toBe('checked');
+        expect(seen[3].tools?.map((entry) => entry.name)).toEqual(['toolRequest', 'tasks']);
+        expect(writer.withheldTools).toEqual(['ping']);
+
+        // The switch is conversation state, so a NEW conversation of the same harness starts
+        // without it (and the child's history is untouched by that decision).
+        writer.reset();
+        expect(writer.withheldTools).toEqual([]);
+    });
+});
+

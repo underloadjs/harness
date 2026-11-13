@@ -217,7 +217,9 @@ const openTool = async (name: string): Promise<void> => {
     if (toolsToggle().getAttribute('aria-pressed') !== 'true') toolsToggle().click();
     await flush();
 
-    const button = document.querySelector<HTMLButtonElement>(`.tool-tab-button[data-tool="${name}"]`);
+    // R1 (swap): the runner opens from the row's corner INFO mark; the tile is the enablement
+    // switch, so the playground helper must not press it.
+    const button = document.querySelector<HTMLButtonElement>(`.tool-tab-info[data-tool="${name}"]`);
     if (button === null) throw new Error(`missing tool entry ${name}`);
     button.click();
     await flush();

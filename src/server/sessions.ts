@@ -2626,6 +2626,18 @@ export class SessionStore {
     // sides of the thread boundary. Empty means "this session has changed nothing", and the
     // worker then installs no provider at all.
     //
+    // T6 (the SESSION tool switch): `withheldTools` is the third read of that group, and it is
+    // the one figure in this object that is PER-CONVERSATION rather than per-deployment — the
+    // names this session's user has switched off for its agents
+    // (`harness.withheldTools`, ../types/index.ts:3882-3907). `disabledTools` above is the
+    // operator's deployment-wide deny and can never carry it: a global deny applies to every
+    // session, so a value that lives in ONE harness's withheld Set has no process store to be
+    // read from. It joins the blueprint for the same reason as the other two: the Set is behind
+    // a getter on a live handle, and a closure cannot cross `worker_threads`, so a replica that
+    // never receives it declares and launches tools this conversation has already switched off
+    // (the inline coordinator reads the Set per turn, so it does not have that gap). The frame
+    // handling is ./workers/lane-host.ts + ./workers/lane-worker-loop.ts.
+    //
     // The scope is the point: reading `this.plugins.snapshot()` here (the pre-R4 process
     // store) would give a lane the template's answer while the inline session it mirrors runs
     // with its own, so the same turn would compact in a worker and not inline. `disabledTools`
@@ -2638,6 +2650,11 @@ export class SessionStore {
             apiKey: session.settings.apiKey,
             memoryKeys: this.memoryKeysFor(session),
             disabledTools: this.tools.disabled(),
+            // THE CONVERSATION'S SWITCHES, sorted and copied by the handle's getter
+            // (../harness.ts:13165). Lane-creation snapshot like every other field here: a lane
+            // that is already running keeps the set it was built with, and the CURRENT set
+            // reaches the next lane its conversation creates.
+            withheldTools: session.harness.withheldTools,
             pluginSettings: session.plugins.snapshot()
         };
     }
@@ -3634,9 +3651,9 @@ export class SessionStore {
         session.invalidThreads = restored;
     }
 
-    // TOLERATED prune of stale ENABLED names, run on the snapshot immediately before
-    // `harness.restore` (R1 consequence; the lane replica does the identical thing for its
-    // rebuilt copy at ./workers/lane-worker-loop.ts:1391).
+    // TOLERATED prune of stale ENABLED TOOL NAMES (and, since T6, of stale WITHHELD ones), run on
+    // the snapshot immediately before `harness.restore` (R1 consequence; the lane replica does the
+    // identical thing for its rebuilt copy at ./workers/lane-worker-loop.ts:1391).
     //
     // WHY THIS EXISTS NOW: `create` seeds a brand-new session's enabled set with EVERY
     // switchable name (../types/index.ts `HarnessConfiguration.enableAllTools`), so a
@@ -3674,26 +3691,66 @@ export class SessionStore {
         harness: Harness,
         sessionId: string
     ): HarnessSnapshot {
-        // Defensive `??`s: `discovery`/`createdTools` are required by the snapshot TYPE, but
-        // a hand-edited `state.json` reaches here after only the document-level shape check
+        // Defensive `??`s: `discovery`/`createdTools` are required by the snapshot TYPE, and
+        // `discovery.withheld` is OPTIONAL by design (../types/index.ts:3352-3366), but a
+        // hand-edited `state.json` reaches here after only the document-level shape check
         // (./persistence.ts `readHarnessSnapshot`), and an absent list means "nothing was
-        // enabled", which is a valid state rather than a corruption to report.
+        // enabled" / "nothing was switched off", which is a valid state rather than a corruption
+        // to report.
         const enabled = core.discovery?.enabled ?? [];
+        const withheld = core.discovery?.withheld ?? [];
 
-        if (enabled.length === 0) return core;
+        if (enabled.length === 0 && withheld.length === 0) return core;
 
         const recreated = new Set((core.createdTools ?? []).map((created) => created.name));
         const dropped = new Set(
             enabled.filter((name) => !recreated.has(name) && !harness.isToolSwitchable(name))
         );
+        // THE WITHHELD PRUNE (T6), the same tolerance one level down: a name the conversation
+        // switched off that THIS build no longer registers is dropped silently. It is not worth a
+        // diagnostic because it asserts nothing dangerous — "do not show the agents a tool we do
+        // not have" is a no-op — and the kernel already filters the list the same way on restore
+        // (../harness.ts:11843-11845). What this copy guarantees is the STORE's half: the pruned
+        // list is what gets restored AND what the next save writes, so a vanished name cannot
+        // ride in every later snapshot. Kept names are exactly the ones the rebuilt harness can
+        // hold, and the bar is REGISTRATION, not `isToolSwitchable`: a core declaration (`write`)
+        // and the pending-only `toolCancel` have no cap slot, yet their switch is the whole
+        // reason `discovery.withheld` exists, so pruning by the cap predicate would throw a core
+        // disable away on every restart (./session-reset-toolbox.test.ts pins the consequence
+        // through the rows). A name the snapshot re-registers itself (`createdTools`) is kept for
+        // the same reason the enabled list keeps it — it is not in the registry yet when this
+        // decision runs, and `restore()` puts it there.
+        const droppedWithheld = new Set(
+            withheld.filter(
+                (name) =>
+                    !recreated.has(name) &&
+                    (harness.tools as Record<string, unknown>)[name] === undefined
+            )
+        );
 
-        if (dropped.size === 0) return core;
+        if (dropped.size === 0 && droppedWithheld.size === 0) return core;
 
         const kept = enabled.filter((name) => !dropped.has(name));
 
-        this.noteToleratedRestore(sessionId, kept.length, [...dropped]);
+        // Only the ENABLED prune reports: that one is the case where a committed file claimed a
+        // capability this build lost, and `restoreErrors` keeps its "what went wrong" meaning (the
+        // pins in ./restore-enabled-tool-prune.test.ts state this line verbatim). A dropped switch
+        // is a silent no-op, per the paragraph above.
+        if (dropped.size > 0) this.noteToleratedRestore(sessionId, kept.length, [...dropped]);
 
-        return { ...core, discovery: { ...core.discovery, enabled: kept } };
+        return {
+            ...core,
+            discovery: {
+                ...core.discovery,
+                enabled: kept,
+                // Field-preserving: a document that carried `withheld` keeps carrying it (minus
+                // the names this build cannot hold), and one that never did is left exactly as it
+                // parsed, so the byte shape of every pre-T6 record is untouched.
+                ...(withheld.length === 0
+                    ? {}
+                    : { withheld: withheld.filter((name) => !droppedWithheld.has(name)) })
+            }
+        };
     }
 
     // Observability for the prune above, on the channel that already reports what a saved

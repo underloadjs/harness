@@ -198,6 +198,43 @@ describe('toolRequest already-available core tools', () => {
         expect(writer.discoveredTools).toEqual(AGENT_QUERY_ENABLED);
     });
 
+    // THE SESSION SWITCH (../harness.ts `withheldTools`). `alreadyAvailable` is a report
+    // about what the caller can call RIGHT NOW, so a name the conversation switched off has
+    // to leave it — the alternative is the worst discovery answer there is: "you already
+    // have it", about a tool the launcher then refuses. `delegate` is the sharpest case
+    // because it is a CORE declaration: it never had a cap entry to remove, so this report
+    // and the declaration list are the only two places it exists, and both must agree.
+    it('drops a switched-off core declaration from alreadyAvailable and from the declaration list', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const entry = brain(
+            scripted([callTool('c1', 'toolRequest', '{"tags":["delegate"]}'), answer('done')], seen)
+        );
+        const writer = harness({
+            agents: { writer: entry, researcher: brain(scripted([answer('found')])) },
+            presets: false
+        });
+
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'delegate' });
+        await writer('delegate?');
+
+        // Not `forbidden` (that field stays scope + deployment-deny), not `matched`, not
+        // `alreadyAvailable` — the capability is simply not listed, and the tag is honestly
+        // reported as unmatched because nothing in THIS conversation answers to it any more.
+        expect(JSON.parse(content(entry.messages[2]))).toEqual({
+            enabled: [],
+            tools: [],
+            matched: 0,
+            omitted: 0,
+            unmatchedTags: ['delegate'],
+            availableTags: SEARCHABLE_TAGS
+        });
+
+        // The SAME switch removed the tool from the request the model is answering from, so
+        // the "not listed" answer and the declaration cannot contradict each other.
+        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'tasks']);
+        expect(writer.withheldTools).toEqual(['delegate']);
+    });
+
     it('does not advertise delegate to a one-agent harness that lacks it', async () => {
         const entry = brain(
             scripted([
@@ -446,5 +483,91 @@ describe('toolCancel discovery (T28)', () => {
         );
         expect(idleNames).not.toContain('toolCancel');
         expect(idleAnswer.enabled).not.toContain('toolCancel');
+    });
+
+    // THE SESSION SWITCH, on the one report that exists for a control with no catalogue
+    // identity. `toolCancel` is never in the discovery catalogue (pending-only) and never in
+    // `discovery.enabled` (it holds no slot), so `alreadyAvailable` and the declaration list
+    // are the only two places it is ever named — and a conversation that switched it off has
+    // to lose it in BOTH, or the report promises a control the launcher refuses.
+    it('does not report or declare a switched-off toolCancel even while a call is pending', async () => {
+        let release!: () => void;
+        const hang = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+
+        const seen: HarnessStreamRequest[] = [];
+        // State-based, like the test above: the run takes a turn per completion, so the
+        // second request is whatever the model sees WHILE `hang` is still on the board.
+        let turn = 0;
+        const stateful: HarnessStream = async function* stream(request) {
+            seen.push(request);
+            turn += 1;
+
+            if (turn === 1) {
+                yield* callTool('h1', 'hang', '{}');
+                return;
+            }
+
+            const queried = request.messages.some(
+                (message) => message.role === 'tool' && message.toolCallId === 'q1'
+            );
+
+            if (!queried) {
+                yield* callTool('q1', 'toolRequest', '{"tags":["cancel"]}');
+                return;
+            }
+
+            yield* answer('done');
+        };
+
+        const writer = harness({
+            agents: { writer: agent({ model: 'merge/ds4-flash', stream: stateful }) },
+            tools: {
+                hang: tool({
+                    description: 'Hang until released.',
+                    tags: ['test'],
+                    visibility: 'core',
+                    mode: 'async',
+                    execute: () => hang.then(() => 'released')
+                })
+            },
+            presets: false
+        });
+
+        // Pin the cap state BEFORE the switch, so the switch's effect on it is measurable:
+        // `toolCancel` holds no slot, and switching it off must not move one.
+        const seedBeforeSwitch = [...writer.discoveredTools];
+        writer.runtime.manageTool(undefined, { operation: 'disable', name: 'toolCancel' });
+        expect(writer.discoveredTools).toEqual(seedBeforeSwitch);
+        expect(writer.withheldTools).toEqual(['toolCancel']);
+
+        const running = writer('go');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+
+        // The control is genuinely actionable here — a call IS pending — and it is still
+        // neither declared nor reported, because the user of this conversation switched it
+        // off. The honest answer is the same one an idle agent gets: no match.
+        expect(declaredNames(seen[1])).not.toContain('toolCancel');
+
+        const queryAnswer = JSON.parse(
+            String(
+                writer.agent.messages.find(
+                    (candidate) => candidate.role === 'tool' && candidate.toolCallId === 'q1'
+                )?.content
+            )
+        );
+
+        expect(queryAnswer.alreadyAvailable).toBeUndefined();
+        // 'cancel' is still a tag some searchable row carries, so the tag is not reported as
+        // unmatched — only the switched-off control disappears from the core report.
+        expect(queryAnswer.unmatchedTags).toBeUndefined();
+        // The control was never enabled by the query either: it is not in the cap set at all,
+        // which is exactly why the withheld set is the switch's only record.
+        expect(writer.discoveredTools).not.toContain('toolCancel');
+        expect(writer.withheldTools).toEqual(['toolCancel']);
+
+        release();
+        await running;
     });
 });

@@ -155,18 +155,26 @@ const CONTRACT = {
 // (`yarn vite-node Temp/opencode/prompt-size.ts` prints this table). Exact equality (not a range):
 // growth has to be intentional, so adding a bullet to a shared guideline line is a visible
 // diff here. The seven real roles get their own, higher ceiling below.
+//
+// +18 on every profile that composes DISCOVERY_GUIDELINE (and +38 on the debugger, which
+// composes TOOL_CREATE_GUIDELINE as well): both shared lines are now CONDITIONAL on
+// `toolRequest` being declared, because the user of a conversation can switch that name off
+// and a prompt that orders the model to call an undeclared tool is the exact loop these
+// lines were written to prevent. `workspace` and `summarizer` are unmoved — the first names
+// its own searchable tools instead of the shared line, the second composes none.
 const PROMPT_LENGTHS = [
-    // 1227: grew from 1168 because the "works alone" bullet now names BOTH ways a lone agent
+    // 1245: 1227 + the conditional `toolRequest` clause (see the block above); before that
+    // it grew from 1168 because the "works alone" bullet now names BOTH ways a lone agent
     // could still offload a step (`threadFork` and `threadSend`) instead of only the fork.
-    { name: 'general', length: 1227 },
-    { name: 'instruct', length: 1516 },
-    { name: 'research', length: 1587 },
+    { name: 'general', length: 1245 },
+    { name: 'instruct', length: 1534 },
+    { name: 'research', length: 1605 },
     { name: 'workspace', length: 1521 },
-    { name: 'reviewer', length: 1475 },
+    { name: 'reviewer', length: 1493 },
     { name: 'planner', length: 1634 },
-    // 1690: the widest prompt on the roster, because the debugger composes every shared line
+    // 1728: the widest prompt on the roster, because the debugger composes every shared line
     // (web + delegation + discovery + toolCreate + permissions) on top of its own five bullets.
-    { name: 'debugger', length: 1690 },
+    { name: 'debugger', length: 1728 },
     { name: 'summarizer', length: 141 }
 ];
 
@@ -491,6 +499,27 @@ describe('profile guidance stays policy, not a tool inventory', () => {
 
         expect(description).toContain('maxEnabledTools');
         expect(description).toContain('newest request takes precedence');
+    });
+
+    // THE SESSION SWITCH makes `toolRequest` itself switchable, and a switched-off name is
+    // not declared at all. Both shared lines used to promise the discovery door uncondition-
+    // ally, which for those two profiles is now a promise the kernel may not keep — so each
+    // states its own condition, and the toolRequest description says what a switched-off
+    // capability looks like from the inside (absent from every list).
+    it('states the discovery door as the conditional it now is', () => {
+        expect(DISCOVERY_GUIDELINE).toContain('when toolRequest is in it');
+        expect(TOOL_CREATE_GUIDELINE).toContain('while toolRequest is declared');
+
+        const description = descriptorOf('toolRequest')?.metadata.description ?? '';
+
+        expect(description).toContain(
+            'A tool the user of THIS conversation has switched off is not listed here at all'
+        );
+        // The bound sentence is untouched: core tools still neither count against
+        // `maxEnabledTools` nor get evicted — the switch is a separate set, not a slot.
+        expect(description).toContain(
+            'while core tools neither count against the bound nor get evicted'
+        );
     });
 
     // The rewritten web line is only correct while it matches src/core/tool-manifest.ts:

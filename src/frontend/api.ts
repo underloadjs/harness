@@ -1681,8 +1681,9 @@ export const descriptorOf = (card: HarnessCard | HarnessDefinition): HarnessCard
 // A catalogue row as the tools view renders it. `session_bound` is the contract's
 // spelling of "this entry only runs inside a conversation".
 //
-// R3 (the global enablement switch): `enabled` is NOT dropped — it is the figure the
-// Tools pane paints its corner tick box from, and it rides every `GET /tools` row and
+// R3 (the global enablement switch): `enabled` is NOT dropped — it is the figure the Tools pane
+// paints its row toggle from (`aria-pressed` plus the green `data-enabled` edge on the tile;
+// ./main.ts `paintToolRowEnablement`), and it rides every `GET /tools` row and
 // the identified read (../shared/harness-api.ts `ToolSummary`). The row no longer
 // carries a pinned-set flag: every catalogue entry is switchable now (the
 // harness-owned core set included), so the frontend has no pinned-on branch to paint and

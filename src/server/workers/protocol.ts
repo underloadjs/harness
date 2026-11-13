@@ -43,6 +43,11 @@
 //     conversation's canonical transcript (`sync.transcript` -> a `transcript:sync` request
 //     answered with the messages it has not adopted). `hello` is still the ONLY place a full
 //     snapshot is shipped, because that is the one moment a rebuild is legitimate.
+//     ONE exception exists, R5b's `sync.tools`: the tool SWITCH state is two small name lists
+//     (not a state document), it has no CAS, no receipt and no reply, and a replica cannot
+//     derive it locally because the switch lives on the coordinator's harness. It is therefore
+//     pushed WHOLESALE - the whole set every time - which is what makes a lost or duplicated
+//     frame harmless instead of ordering-sensitive. Everything else still rebuilds.
 //   - No leniency for unknown frames: `describeEnvelope` names the offender, since a
 //     silently ignored frame shows up later as a mysteriously stuck turn.
 //
@@ -74,6 +79,13 @@ import type { GroupOutcome, MutationGroup, MutationReceipt, SharedMutation } fro
 // broadcast carries the installed revision in its own format (`moduleText`) instead of
 // pretending every tool is a legacy function body. A v2 worker cannot answer for any of
 // that, so it must fail here rather than run a turn whose frames it half-understands.
+//
+// R5b's `sync.tools` frame and `LaneBlueprint.withheldTools` did NOT bump this. Both are
+// strictly additive, and a mixed pair cannot reach either one: the coordinator resolves the
+// worker entry from THIS checkout (./lane-host.ts `resolveEntry`), and a bundle that predates
+// the frame fails the hello version check above before a frame of any kind is posted. An old
+// coordinator talking to a new worker simply never posts it, and the lane keeps the
+// creation-time behaviour it has always had.
 export const LANE_PROTOCOL_VERSION = 3;
 
 // Un-acked `event` frames a worker may have in flight. Small on purpose: one model
@@ -148,6 +160,21 @@ export type LaneBlueprint = {
     // ignores it, and a v3 coordinator talking to an older bundle gets the older behaviour.
     // Neither side can mis-parse a frame, which is what the version bump exists to catch.
     disabledTools?: string[];
+    // T6 (the SESSION tool switch): the names THIS conversation's user has switched off for its
+    // agents — `harness.withheldTools` (../types `Harness.withheldTools`), the per-conversation
+    // counterpart of `disabledTools` above.
+    //
+    // WHY IT CANNOT RID ON `disabledTools`: that list is the DEPLOYMENT's deny, identical for
+    // every session, read from a process-wide store; this one is a Set inside ONE harness. A
+    // replica that never receives it keeps declaring and launching tools the operator has already
+    // switched off, because the deny provider has no idea the switch exists.
+    //
+    // A SNAPSHOT at lane creation, with the same documented consequence as `disabledTools`: an
+    // already-running lane keeps the set it was built with and picks the current one up the next
+    // time its lane is created. Populated by ./sessions.ts `blueprintFor`; the frame handling
+    // (merge into the `hello` blueprint, install it on the replica) is
+    // ./lane-host.ts + ./lane-worker-loop.ts.
+    withheldTools: string[];
     // R3 (the PLUGIN switches): the operator's per-plugin setting OVERRIDES as of lane
     // creation, in the SAME shape `state.json` stores them (`HarnessPluginSettingsRecord`,
     // plugin name -> key -> JSON scalar; ../persistence.ts). It joins the blueprint for the
@@ -232,6 +259,35 @@ export type LaneRegistryChange = {
     removed: boolean;
 };
 
+// R5b — the payload of `sync.tools`: the WHOLE tool-switch state of one session, as the
+// canonical harness states it at the moment the frame is posted.
+//
+// TWO LISTS because they are two different facts about two different kernel sets, and one
+// name can be in neither, either, or (transitionally) both:
+//
+//   - `enabled`  — the capped, searchable set the model may enable (`Harness.discoveredTools`,
+//     src/harness.ts:13149). A name outside it is not declared and is refused by the discovery
+//     gate. Canonical invariant, guaranteed by `applyToolSwitch` (src/harness.ts:1957) and by
+//     `restore` (src/harness.ts:11914): NO name appears in both lists — disabling a name
+//     removes its cap slot as well as withholding the flag.
+//   - `withheld` — the names the USER of this conversation has switched off (`Harness.
+//     withheldTools`, src/harness.ts:13165). This is the only record for a `visibility: 'core'`
+//     or pending-only name, which never had a cap slot to lose.
+//
+// WHOLESALE, not a delta: the applier sets both to what the frame says, so a frame that
+// arrives twice, out of order relative to another, or after a lane rebuilt from a fresh
+// snapshot, lands the same state. That is why there is no `seq`, no CAS digest, and no reply.
+//
+// TOLERANT BY CONTRACT: the replica is rebuilt from a RECORD and may genuinely lack a name the
+// coordinator has (a `tool()` object a preset passed cannot cross a thread — the exact case
+// ./lane-tool-settings.test.ts pins for `testFlaky`), and `refuseNestedRuns` deletes
+// `delegate` from every replica. A name the replica does not register is therefore DROPPED from
+// the list, never an error, mirroring the hello prune and `restore`'s withheld filter.
+export type LaneToolStateSync = {
+    enabled: string[];
+    withheld: string[];
+};
+
 // ---------------------------------------------------------------------------
 // Coordinator -> worker
 // ---------------------------------------------------------------------------
@@ -308,6 +364,32 @@ export type LaneCommand =
     // which is the safe point. This push is the responsiveness half; the boundary retry is the
     // correctness half.
     | { kind: 'sync.transcript'; laneEpoch: number; threadId: string }
+    // R5b: THE SESSION'S TOOL SWITCHES MOVED - the user clicked a row in the tool panel
+    // (`PATCH /sessions/:id/tools/:tool_id {enabled}`, or a `toolManage enable|disable` from
+    // anywhere), and the canonical harness's two discovery sets are now different from the one
+    // this replica was built with.
+    //
+    // WHY A FRAME AT ALL: a lane replica decides what to DECLARE and what to LAUNCH from its
+    // OWN copy of those sets, and both reads are live inside the worker process - a closure over
+    // the coordinator's harness cannot cross `worker_threads`, which is the one cause behind
+    // every blueprint field above. Without this frame the copy only ever moves in ONE
+    // direction: `applySync` replays the authority's `sync.enabled` ADDITIVELY (a grant), and
+    // nothing in the protocol could ever take a name away. So a disable reached a new lane (the
+    // blueprint) but never a warm one, and "the toggle is real time" was false on exactly the
+    // threads still running.
+    //
+    // WHY A RECONCILE AND NOT A DELTA: the switch is per-SESSION, not per-conversation (one
+    // click moves EVERY lane of that session, and lanes join and leave at any moment), so a
+    // delta would need per-lane sequencing to be correct. Carrying the whole set makes every
+    // lane idempotently converge on the canonical answer from whichever frame it happens to
+    // receive - hello, a duplicate, or a late one after a reclaim.
+    //
+    // ONE-WAY, like `broadcast.registry`: no `callId`, no receipt, no reply. The next model
+    // request of that lane IS the acknowledgement, because `declared()` is rebuilt per request
+    // and the launch gate is read per launch (src/harness.ts:8017 / :8040) - which is also why
+    // a call already SCHEDULED when the frame lands keeps running: the gate is at launch, and
+    // an in-flight turn is never aborted by this frame.
+    | { kind: 'sync.tools'; laneEpoch: number; tools: LaneToolStateSync }
     // Final frame.
     | { kind: 'dispose'; laneEpoch: number; reason?: string };
 
@@ -392,6 +474,8 @@ const COMMAND_KINDS = new Set([
     'broadcast.registry',
     'sync.memory',
     'sync.transcript',
+    // R5b: the session's tool switches, pushed wholesale to every live lane of that session.
+    'sync.tools',
     'dispose'
 ]);
 

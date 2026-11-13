@@ -105,17 +105,23 @@ info:
     true` on the session-tool POST is refused with 403 (the route is create-or-409, not an atomic
     replace), and a metadata-only PATCH over a tool with no captured source revision - a built-in
     registered from an already-constructed definition - is refused with 403 because there is no
-    revision to re-publish. `protected: true` marks an entry this session's own kernel refuses to switch:
-    a core declaration (always in context, never an enabled slot) or a pending-only runtime control
-    (declared only while actionable). The figure is not a server-side inference from catalogue metadata - it
-    is the negation of the harness's own switchability predicate, the same code path the enable/disable
-    operation refuses with, so the row a client reads and the status a click receives are one fact stated
-    twice and a 409 is never the answer to a row that looked clickable. A protected entry refuses the
-    enable/disable PATCH and refuses DELETE with
-    403, not 409, because removing it would break that session's own control surface; a registration
-    that merely takes the same NAME is not refused, and replaces the live entry like any other
-    same-name write. Every write rejects unknown properties outright instead of ignoring them, so a
-    client is never left believing it changed something.
+    revision to re-publish. `protected: true` marks an entry this conversation may not UNREGISTER:
+    a harness-owned name whose REGISTERED visibility is `core`, which is the kernel's own
+    `toolManage remove` rule, so deleting it would detach the control surface the session runs on
+    and DELETE answers 403 for it. The flag says NOTHING about switching, and switching is a
+    different privilege: EVERY name this session's harness registers is switchable, the core
+    declarations (`toolRequest`, `tasks`, `delegate`, `read`, `write`, `edit`, `glob`, `grep`,
+    `fetch`) and the pending-only runtime controls (`toolCancel`) included, and an `enabled`-only
+    PATCH answers 200 for all of them, while the session is running. One sentence for the whole
+    feature: switching a tool off restricts the AGENTS AND THREADS of THIS CONVERSATION only, in
+    real time (the write is accepted mid-run and lands on that thread's next model request, with
+    no rebuild), it changes no other session and no deployment setting, and it does not stop the
+    user from triggering that tool manually - a nested call made from inside another tool and a
+    manual REST execution through `POST .../tools/{tool_id}/executions` both still run a switched-off
+    name, because the switch gates what the model is OFFERED, not what the implementation can do.
+    A registration that merely takes the same NAME is not refused, and replaces the live entry like
+    any other same-name write. Every write rejects unknown properties outright instead of ignoring
+    them, so a client is never left believing it changed something.
 
 
     LIMITS (the same numbers travel to a client in `GET /v1/harness`, so they are contract, not
@@ -1511,11 +1517,15 @@ paths:
       operationId: resetSession
       summary: Discard a session's conversation state
       description: >-
-        Clears the recorded turns, transcripts, and created-tool state, and RE-RUNS the new-session
-        toolbox seed over `discovery`: the enabled set a RESET conversation starts with is the set a
-        freshly CREATED one starts with (every switchable name, the deployment's deny list filtered
-        out first, capped at the harness's bound), because a reset is a new conversation rather than
-        a restart - a restored session is the case that keeps the enabled set it committed. A session
+        Clears the recorded turns, transcripts, and created-tool state, RE-RUNS the new-session
+        toolbox seed over `discovery`, and CLEARS this conversation's tool switches: the enabled set AND
+        the withheld set a RESET conversation starts with are the ones a freshly CREATED one starts with
+        (every slot-holding name on, the deployment's deny list filtered
+        out first, capped at the harness's bound; nothing switched off), because a reset is a new
+        conversation rather than
+        a restart - a restored session is the case that keeps the enabled set AND the switches it
+        committed, which is why a tool the user switched off stays off across a restart until they
+        switch it back or reset. A session
         that is running or has queued work is refused with 409 - cancel it first - so a reset can
         never destroy work that has not been stopped. The receipt reports what was discarded and the
         new session revision; it does not echo the emptied aggregate.
@@ -1942,16 +1952,20 @@ paths:
         Every entry this session's live registry holds: what the frozen definition declares, what
         `toolRequest` has enabled (in registry order), and what this session created at runtime - which is a
         wider set than what the model can call right now, and the row says which is which. A session this
-        server created NEW starts with every switchable name this deployment has not denied already in that
-        enabled set: the toolbox is seeded at harness construction with the operator's deny list filtered out
-        of that pass rather than left empty, so a first conversation does not have to spend a discovery round
-        trip to reach its own tools. A name that is NOT switchable - a core declaration, or
-        a pending-only runtime control - reports `enabled: false` and `protected: true`, because it never
-        occupied a slot to begin with. Each row is the
+        server created NEW starts with every name that can hold a cap slot already switched on, the
+        operator's deployment-wide deny list filtered out of that pass rather than the toolbox left empty,
+        so a first conversation does not have to spend a discovery round trip to reach its own tools.
+        A core declaration and a pending-only runtime control hold NO cap slot and are therefore on
+        through their declaration list: they report `enabled: true` like any other row, and they report
+        `false` only after THIS conversation switches one off (`PATCH {enabled}` - accepted for every
+        registered name). A name the cap evicted and a name the conversation switched off both read
+        `enabled: false`; both stay listed here, because this list is the OPERATOR's view of the toolbox
+        and the whole point of the switch is that the user can see what they hid from the model. Each row is the
         catalogue projection plus the
         live session facts the catalogue cannot state: `declared` (the frozen definition declares it in its
         `core_tools` list, the names in context on every request), `enabled`
-        (callable here), `origin` (`catalogue`, `discovered`, or `created`), `protected`, whether an
+        (may an agent of this conversation call it), `origin` (`catalogue`, `discovered`, or `created`),
+        `protected` (may this conversation un-register it), whether an
         editable source revision exists, and the created-tool budget. Rows omit the argument JSON Schema
         and the source text; the identified read adds the schema, the source route adds the code. The `enabled`
         and `origin` filters narrow the page, never the row shape, and the page carries the collection's
@@ -2086,19 +2100,27 @@ paths:
         same code; a name with NO captured source revision at all - a tool registered from an already-built
         definition, which is every built-in - has nothing to re-publish and is refused with 403 instead of
         silently doing nothing. `enabled`
-        is the discovery gate: `false` withdraws the tool from this session's callable set without losing
-        anything, and `true` switches that same live slot back on - it does not restore an inherited binding,
-        because a removal in this API never hands back a superseded revision. Concurrency is per verb, not per
-        route: the `enabled` gate and an unregister mutate the LIVE harness and so require an IDLE session
-        (409 naming the lanes that are running, since in worker mode a replica would disagree with what a run
-        in flight executes), while a source or metadata registration is accepted while the session runs. A patch
-        that names BOTH is checked in that order, after the source has already been published, so such a 409
-        can arrive with the new revision installed and the gate unchanged. A `protected` entry splits the same
-        way: an `enabled`-only patch is 403 - disabling the tools a session runs on is not a user-level edit -
-        while a source patch is accepted, because replacing an implementation is a different privilege from
-        switching the control plane off. That 403 is decided BEFORE the idle check and before the runtime is
-        asked: the name is not switchable at any moment, so a running session gets the refusal that matches the
-        row rather than a 409 telling the client to retry later. Writes are
+        is THIS CONVERSATION'S switch: `false` withdraws the tool from what its agents are offered
+        without losing the registration, the captured source revision, or the row itself, and `true`
+        puts it back. It is a real write to one live harness and it is a REAL-TIME one: the route has
+        NO idle gate, so a toggle made while a thread is running answers 200 and lands on that
+        thread's very next model request (the kernel reads the switch per turn and per launch, with no
+        rebuild and no cap change), and it restricts the agents and threads of THIS conversation only -
+        a nested call made by another tool and a manual REST execution through the executions route
+        still run the name, and switching off is never an un-register. Concurrency is per verb, not per
+        route: an unregister, and a patch that names BOTH the declaration and this switch, mutate what
+        a run in flight is executing and so require an IDLE session (409 naming the lanes that are
+        running, since in worker mode a replica would otherwise disagree with that run), while a source
+        or metadata registration is accepted while the session runs. A patch that names BOTH is checked
+        in that order, after the source has already been published, so such a 409 can arrive with the
+        new revision installed and the gate unchanged. A `protected` entry no longer splits this route
+        at all: after the session switch EVERY registered name is switchable, core declarations and
+        pending-only runtime controls included, so an `enabled`-only patch answers 200 for all of them
+        and `protected` belongs to DELETE, where it still means "this name cannot be unregistered" and
+        answers 403. The 403s that remain on THIS route are the ones it always had for a declaration
+        write: `replace` is ignored here, and a metadata-only patch over a tool with no captured source
+        revision is refused because there is nothing to re-publish. A 404 is the answer for a name the
+        session does not register. Writes are
         session-local and never change the global catalogue.
       requestBody:
         required: true
@@ -2146,15 +2168,23 @@ paths:
         identity but never keeps its bytes - so after an override there is no second copy to hand back, and a
         deletion states that instead of letting a client infer a restore that did not happen. Two refusals stay
         distinct because they mean different things: a `protected` entry is 403 - the control plane is not
-        deletable, and `protected` is the kernel's own answer, the negation of the same switchability predicate
-        the `enabled` PATCH refuses with (a core declaration or a pending-only runtime control), NOT a guess
-        from the frozen definition's declaration list - while an inherited name with NO session-local
+        deletable, and `protected` is the kernel's OWN remove rule read from the live registry (a name whose
+        registered `visibility` is `core`: `toolRequest`, `tasks`, `delegate`, `read`, `write`, `edit`, `glob`,
+        `grep`, the environment-backed `fetch`, the thread controls where they exist), NOT a guess from the
+        frozen definition's declaration list - while an inherited name with NO session-local
         registration and an origin that is not `discovered` is 400, because there is nothing here to remove.
-        The consequence of the seed is stated plainly: a brand-new session's ordinary toolbox rows ARE
+        Note that this route is now the ONLY tool write the `protected` flag predicts: the same name that
+        answers 403 here answers 200 on the `enabled` PATCH, because switching a tool off is a decision about
+        what this conversation's agents may call and detaching a harness-owned entry is a different privilege
+        - which is also why the pending-only `toolCancel` (`visibility: 'searchable'`, so `protected: false`)
+        is deletable here while a switch of it was previously refused. The consequence of the seed is stated plainly: a brand-new session's ordinary toolbox rows ARE
         `discovered`, so they are removable (200), and the row simply disappears - the shared catalogue entry
-        stays untouched, but this session no longer holds it. Like the gate, an unregister mutates the live
-        harness and so requires an IDLE session: 409 while a run or a conversation lane is active, checked after
-        the 403 and 400 guards. Nothing global is touched either way.
+        stays untouched, but this session no longer holds it. Like a declaration write, an unregister mutates
+        what a run in flight executes and so requires an IDLE session: 409 while a run or a conversation lane is
+        active, checked after the 403 and 400 guards. An `enabled` switch does NOT carry that requirement (see
+        the PATCH operation): only this verb and a source write do. Nothing global is touched either way, and
+        removing a name a switch had withheld also clears the switch, because the registration it belonged to
+        is gone.
       responses:
         '200':
           description: Removal receipt.
@@ -3865,10 +3895,13 @@ components:
       description: >-
         The request is well formed and this server refuses it as a matter of policy. The complete set of
         403s this build answers is short and enumerable: `replace: true` on a session-tool POST; a
-        metadata-only PATCH over a tool with no captured source revision; the enable/disable PATCH or a
-        DELETE over a PROTECTED session tool (one of the harness core names, or any name the session's
-        frozen harness definition declares - a PATCH that installs NEW source over such a name is
-        accepted, because replacing an implementation is not the same act as detaching it); a global
+        metadata-only PATCH over a tool with no captured source revision; a DELETE over a PROTECTED
+        session tool (a harness-owned name whose registered visibility is `core` - the kernel's own
+        remove rule, and the figure `protected` states on the row), which is the ONLY tool write this
+        status can come from: after the session switch no tool route refuses an `enabled` PATCH at all,
+        so a name this conversation may not delete may still switch it off and gets 200 (a PATCH that
+        installs NEW source over a protected name is likewise accepted, because replacing an
+        implementation is not the same act as detaching it); a global
         execution of a `session_bound` catalogue entry, which has no standalone implementation;
         `GET /stream` on a deployment that advertises `capabilities.websocket_stream: false`; and the
         host's browser-Origin gate, which refuses a cross-origin request or a cross-origin stream
@@ -3887,7 +3920,7 @@ components:
             protected-tool:
               value:
                 error:
-                  message: 'Tool "task" is harness-owned in session "01JD4K3R8M"; a protected entry cannot be unregistered.'
+                  message: 'Tool "write" is harness-owned in session "01JD4K3R8M"; a protected entry cannot be unregistered.'
             replace-on-create:
               value:
                 error:
@@ -6231,31 +6264,46 @@ components:
             enabled:
               type: boolean
               description: >-
-                Membership in THIS SESSION's live enabled set - the capped set the running harness
-                currently keeps switched on (`harness.discoveredTools`, read in `./api-reads.ts`
-                `sessionToolRowsOf`). It is NOT "is this name in the model's context": a core declaration is
-                in context on every request without ever occupying an enabled slot, so it answers `false` here
-                and `declared` plus `protected` are the fields that state its real position. A session this
-                server created NEW answers `true` for every row that is switchable at all AND that this
-                deployment has not switched off: the enabled set is seeded from the kernel's own switchable
-                names when the harness is built, and the operator's deny list is filtered out of that pass
-                first (`./tool-settings.ts` - the same provider the GLOBAL Tools row's `enabled` states). A
-                session the server RESETS answers the same way, because a reset starts a new conversation and
-                re-runs that one pass (`./sessions.ts` `reset`). Only a `protected` name is left `false` -
-                because a name that was never in the set cannot be switched off. THE SCOPE OF THAT PROMISE,
-                stated plainly: this figure is one conversation's own membership, and the deployment-wide
-                switch OUTRANKS it. A name the operator has denied is hidden from a model's declarations,
-                refused at the launch gate, and answered `forbidden` by `toolRequest` whatever this row says,
-                so a ticked row on a denied name is a true statement about this conversation and no promise of
-                capability. Both authority directions hold, deliberately: a session CAN hold a denied name
-                enabled - a session-scoped `PATCH` of it answers 200 and persists across a restart - and a
-                denial that lands mid-life rewrites none of this session's rows. A client that needs the
-                deployment's answer asks the global read (`GET /v1/harness/tools`), which states it per name;
-                no session row field carries it. `PATCH` toggles membership in the set. `false` withdraws
-                the name without losing its registration or its captured source revision, and `true` switches
-                that same live slot back on: it does NOT restore an inherited binding, because a removal or an
-                override here never keeps a superseded copy to hand back. Toggling requires an idle session
-                (409) and is refused with 403 on a protected entry.
+                THE CALL AXIS: "may an agent of THIS conversation call this name right now". It is
+                the answer to that question, not a dump of one internal set, and it is composed from
+                two kernel states (`./api-reads.ts` `sessionToolRowsOf`): the conversation's own
+                switch (`harness.withheldTools` - the names its user has switched off, which is the
+                ONLY record for a core or pending-only name because such a name has no cap slot),
+                and the capped set (`harness.discoveredTools` - which names currently hold one of
+                the `maxEnabledTools` slots). A name that holds a slot is on exactly while the
+                capped set holds it; a name with NO slot - a core declaration, or the pending-only
+                `toolCancel` - is in context through the declaration list, so it answers `true`
+                unless this conversation switched it off. THE TWO FALSES ARE DIFFERENT FACTS and a
+                client must not merge them: a WITHHELD name is one the operator turned off, and
+                `toolRequest` cannot even list it any more (not as `forbidden` - simply absent),
+                while an OFF-SLOT name is one the cap evicted or this conversation has not
+                discovered yet, which is not the user's decision, keeps showing up in this list, and
+                is one `toolRequest` round away from being callable again. A session this server
+                created NEW answers `true` for every row the deployment has not denied: the toolbox
+                is seeded from the kernel's own switchable names when the harness is built, and the
+                operator's deny list is filtered out of that pass first (`./tool-settings.ts` - the
+                same provider the GLOBAL Tools row's `enabled` states); a session the server RESETS
+                answers the same way, because a reset starts a new conversation, re-runs that one
+                pass, and clears every switch this conversation had made. THE SCOPE OF THAT PROMISE,
+                stated plainly: this figure is one conversation's own state, and the deployment-wide
+                switch OUTRANKS it. A name the operator has denied is hidden from a model's
+                declarations, refused at the launch gate, and answered `forbidden` by `toolRequest`
+                whatever this row says, so a ticked row on a denied name is a true statement about
+                this conversation and no promise of capability. Both authority directions hold,
+                deliberately: a session CAN hold a denied name enabled - a session-scoped `PATCH` of
+                it answers 200 and persists across a restart - and a denial that lands mid-life
+                rewrites none of this session's rows. A client that needs the deployment's answer
+                asks the global read (`GET /v1/harness/tools`), which states it per name; no session
+                row field carries it. What this figure does NOT gate, in either direction: the
+                operator's own doors. `PATCH` writes this switch, and switching a tool off
+                restricts the agents and threads of THIS conversation only - it is accepted while a
+                thread is RUNNING (no idle gate, and no 403 for a harness-owned name: every
+                registered row answers 200), it lands on that thread's very next model request, and
+                it never un-registers anything. A nested call made by another tool
+                (`context.callTool`) and a manual REST execution
+                (`POST /v1/harness/sessions/{session_id}/tools/{tool_id}/executions`) still run the
+                switched-off name, and a name this row reports `false` for stays listed here,
+                because the operator needs to see the tool they just hid from the model.
             origin:
               type: string
               enum: [catalogue, discovered, created]
@@ -6269,18 +6317,27 @@ components:
             protected:
               type: boolean
               description: >-
-                True for an entry this session's kernel refuses to switch at all: a core declaration (always in
-                context, never an enabled slot - `toolRequest`, `tasks`, `delegate`, the core file set, the
-                thread controls when they exist) or a pending-only runtime control such as `toolCancel`, which
-                is declared only while it is actionable. It is the NEGATION of the harness's own switchability
-                predicate, computed by the same code path the enable/disable operation refuses with - not a
-                server-side guess from catalogue `visibility`, which is why a row that is searchable in the
-                manifest (`syntax`, `files`, `shell`) is honestly switchable here and a row whose manifest
-                visibility was demoted is not. Consequences, stated exactly: a
-                protected entry refuses an `enabled`-only PATCH and refuses DELETE with 403, and it accepts a
-                source PATCH (replacing an implementation is a different privilege from switching the control
-                plane off). A CREATE that collides with a protected name is NOT refused: the POST answers 201
-                with `replaced: true` even here, so a client must not expect 403 from a collision.
+                THE UNREGISTER AXIS, and nothing else: true for a name this conversation may not
+                DELETE, because it is harness-owned - the figure is the kernel's own `toolManage
+                remove` rule (`src/harness.ts` refuses a name whose REGISTERED
+                `visibility` is `core`), read from the same live registry map the delete route
+                asks. Consequences, stated exactly: a protected entry refuses DELETE with 403 and
+                accepts a source PATCH (replacing an implementation is a different privilege from
+                detaching the control plane). It does NOT refuse the switch: `PATCH` with only
+                `enabled` answers 200 for every row in this list, protected ones included, while
+                the session runs. `protected: false` is not a promise that DELETE succeeds either -
+                an inherited name with no session-local registration answers 400 whatever this flag
+                says. What the flag used to mean is gone, and it is the reason a pane must not
+                re-derive anything from it: it used to be the negation of the harness's cap-slot
+                predicate (`isToolSwitchable`), which after the session switch stopped being the
+                switchability story AND got the unregister story wrong in one direction -
+                `toolCancel` registers at `visibility: 'searchable'`, so the kernel happily
+                un-registers it and this flag now says `false`, even though it is still a
+                pending-only control with no cap slot (a pane that greyed a row out from
+                `visibility` alone, or from this flag's OLD meaning, would offer a switch and a
+                delete that both work). A CREATE that collides with a protected name is NOT refused:
+                the POST answers 201 with `replaced: true` even here, so a client must not expect
+                403 from a collision.
             source_available:
               type: boolean
               description: >-
@@ -6328,10 +6385,14 @@ components:
             other live entry this session holds - created, discovered, replaced, or inherited with no local
             registration. It is a statement about the name, not about where the entry came from, so a
             replaced catalogue tool still reads `session_only`. This is the EXECUTION axis and it is NOT the
-            same predicate as the row's `protected` flag, which is the SWITCH axis decided by the kernel's
-            own switchability rule: `read`, `write`, `edit`, `glob`, `grep`, `delegate` and `toolCancel` are
-            `protected: true` and STILL `session_only`, because a conversation may not switch them off yet a
-            manual session-scoped call still runs them. `global` is not answered by this route at all: it
+            same predicate as either of the row's other two flags: `protected` is the UNREGISTER axis (the
+            kernel's remove rule) and `enabled` is the CALL axis (may an agent of this conversation call
+            it). All three can hold at once - `read`, `write`, `edit`, `glob`, `grep` and `fetch` are
+            `protected: true`, `enabled: true`, and STILL `session_only`, because a conversation may switch
+            them off but a global route cannot run them - and `toolCancel` is the fourth combination
+            (`protected: false`, pending-only, `session_only`). Most importantly, a manual session-scoped
+            call runs a name whatever `enabled` says: switching a tool off restricts the agents and
+            threads of this conversation, never this route. `global` is not answered by this route at all: it
             appears only on the catalogue detail read (`GET /tools/{tool_id}`), where an entry with a
             standalone implementation is callable without a session. Treat the three values as two different
             projections of one gate rather than a ladder.
@@ -6460,7 +6521,9 @@ components:
             Refusal, not a modifier: this route has no atomic replace-on-create, so `true` is answered 403
             naming the operation and the missing capability, and `false` is accepted and ignored. A collision
             without the field is not a conflict either - the registration publishes over the name this session
-            already resolves and answers 201 with `created: false, replaced: true`, protected names included.
+            already resolves and answers 201 with `created: false, replaced: true`, harness-owned
+            (`protected`) names included, and a switch of one included too: only DELETE is what `protected`
+            predicts.
     UpdateSessionToolRequest:
       type: object
       description: >-
@@ -6489,11 +6552,18 @@ components:
         enabled:
           type: boolean
           description: >-
-            The discovery gate, and it is a real runtime write. `false` withdraws the tool from this session's
-            callable set without losing its registration or its captured revision; `true` switches that same
-            live slot back on - it does NOT restore an inherited binding, and no superseded revision comes back.
-            A patch naming ONLY this field is refused 403 on a protected entry and 409 unless the session is
-            idle, and its receipt reports `created: false, replaced: false` because the code did not change.
+            THIS CONVERSATION'S switch, and it is a real runtime write. `false` withdraws the tool from
+            what this conversation's agents and threads are offered without losing its registration or its
+            captured revision; `true` puts it back. It is not an un-register and it is not the
+            deployment-wide switch (`PATCH /v1/harness/tools/{tool_id}`, which is every session at once).
+            A patch naming ONLY this field answers 200 for EVERY registered row - harness-owned core
+            declarations and pending-only runtime controls included - with no 403, and it carries NO idle
+            gate: a toggle made while a thread is running is accepted and lands on that thread's next
+            model request, because the kernel reads the switch per turn rather than per harness. A nested
+            call made by another tool and a manual REST execution still run a name this switched off.
+            A patch naming this field ALONGSIDE a declaration keeps the idle requirement (the source write
+            is what needs it), and its receipt reports `created: false, replaced: false` because the code
+            did not change.
         source:
           type: string
           maxLength: 20000

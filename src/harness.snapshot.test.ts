@@ -2134,3 +2134,137 @@ describe('snapshot persistence of the display lane', () => {
         expect(again.thread(ownerId)?.contextLane).toBe(3);
     });
 });
+
+// ---------------------------------------------------------------------------
+// THE CONVERSATION'S TOOL SWITCHES (`discovery.withheld`).
+//
+// The session switch (../harness.ts `withheldTools`) is conversation state, and for the
+// names that matter most it is the ONLY place that state exists: a `visibility: 'core'`
+// declaration and the pending-only runtime controls never appear in `discovery.enabled`,
+// so a restart that restored only `enabled` would hand back every control the user
+// switched off. Pinned here:
+//   - the key is OMITTED while empty, so every document this build wrote before the
+//     feature — and every fixture above — keeps its exact shape, and `version` stays 2
+//     (an additive optional key is a schema extension, not a break);
+//   - restore validates it LENIENTLY: an unknown name is dropped, never thrown. The
+//     `enabled` list above it stays strict on purpose (./server/restore-enabled-tool-prune
+//     .test.ts documents what strictness costs a session), and a switch that refers to a
+//     tool this build no longer registers asserts nothing dangerous, so it must not be
+//     the reason a whole conversation fails to load.
+// ---------------------------------------------------------------------------
+
+describe('snapshot persistence of the conversation tool switches', () => {
+    it('omits the key while nothing is switched off, and pins the schema version at 2', async () => {
+        const writer = buildSession();
+
+        // Absence, not an empty list: the document shape a v2 file always had.
+        expect(writer.snapshot().discovery).toEqual({ enabled: [], offsets: [] });
+        expect(Object.hasOwn(writer.snapshot().discovery, 'withheld')).toBe(false);
+        expect(HARNESS_SNAPSHOT_VERSION).toBe(2);
+    });
+
+    it('round-trips a core switch and a searchable switch through JSON, and the next request obeys both', async () => {
+        const source = buildSession();
+
+        // Two shapes: `tasks` is a core declaration (no cap slot, so `enabled` says nothing
+        // about it) and `bulk01` is a seeded searchable row that DOES hold one.
+        await source.executeTool('toolRequest', { tags: ['bulk'] });
+        const capBefore = source.discoveredTools;
+        source.runtime.manageTool(undefined, { operation: 'disable', name: 'tasks' });
+        source.runtime.manageTool(undefined, { operation: 'disable', name: 'bulk01' });
+
+        // Sorted, so two writes of one state are byte-comparable, and the searchable name
+        // left the capped set on the way out.
+        expect(source.snapshot().discovery).toEqual({
+            enabled: capBefore.filter((entry) => entry !== 'bulk01'),
+            offsets: [],
+            withheld: ['bulk01', 'tasks']
+        });
+
+        const seen: HarnessStreamRequest[] = [];
+        const target = buildSession({ seen });
+        target.restore(JSON.parse(JSON.stringify(source.snapshot())));
+
+        expect(target.withheldTools).toEqual(['bulk01', 'tasks']);
+        expect(target.discoveredTools).toEqual(capBefore.filter((entry) => entry !== 'bulk01'));
+
+        // The restored conversation BEHAVES like the one that saved it: the core control the
+        // user switched off is not declared, and the searchable name is neither declared nor
+        // findable through discovery.
+        await target('go');
+        const declared = (seen[0].tools ?? []).map((entry) => entry.name);
+        expect(declared).not.toContain('tasks');
+        expect(declared).not.toContain('bulk01');
+        expect((target.runtime.requestTools(undefined, { tags: ['bulk'] }) as Record<string, unknown>).enabled).not.toContain('bulk01');
+
+        // Idempotent: restoring the same document again writes the same document back.
+        const saved = source.snapshot();
+        target.restore(saved);
+        expect(target.snapshot().discovery).toEqual(saved.discovery);
+    });
+
+    it('drops a withheld name this harness does not register, and restores the rest of the document', async () => {
+        const source = buildSession();
+        source.runtime.manageTool(undefined, { operation: 'disable', name: 'tasks' });
+        const saved = clone(source.snapshot());
+
+        // The ordinary operational event this tolerance exists for: the tool was removed
+        // from the harness between the save and the load (a key taken away, a plugin
+        // unregistered, an app tool edited out of a card).
+        const edited = clone(saved) as unknown as Record<string, any>;
+        edited.discovery.withheld = ['ghost', 'tasks'];
+
+        const target = buildSession();
+        expect(() => target.restore(edited)).not.toThrow();
+        expect(target.withheldTools).toEqual(['tasks']);
+
+        // THE CONTRAST that keeps the asymmetry honest: the same unknown name in `enabled`
+        // is still a contradiction and still throws, because that list CLAIMS a tool the
+        // conversation can call.
+        const strict = clone(saved) as unknown as Record<string, any>;
+        strict.discovery.enabled = ['ghost'];
+        expect(() => buildSession().restore(strict)).toThrow(
+            'Snapshot discovery names "ghost", which is not registered in this harness.'
+        );
+
+        // A pre-feature document (no key at all) restores with NOTHING switched off.
+        const legacy = clone(saved) as unknown as Record<string, any>;
+        delete legacy.discovery.withheld;
+        const reopened = buildSession();
+        reopened.restore(legacy);
+        expect(reopened.withheldTools).toEqual([]);
+        expect(reopened.snapshot().discovery).toEqual({ enabled: [], offsets: [] });
+    });
+
+    it('resolves a name listed in BOTH discovery arrays as switched off, and refuses a malformed switch list', async () => {
+        const source = buildSession();
+        const saved = clone(source.snapshot());
+
+        // A hand-edited or merged document can claim `bulk01` is enabled AND switched off.
+        // The only coherent reading is the user's decision, and it has to survive the
+        // restore — otherwise a stale `enabled` entry re-opens a switch on restart.
+        const both = clone(saved) as unknown as Record<string, any>;
+        both.discovery.enabled = ['bulk01'];
+        both.discovery.withheld = ['bulk01'];
+
+        const target = buildSession();
+        target.restore(both);
+        expect(target.discoveredTools).toEqual([]);
+        expect(target.withheldTools).toEqual(['bulk01']);
+
+        const rejects = (mutate: (discovery: Record<string, any>) => void, message: string): void => {
+            const bad = clone(saved) as unknown as Record<string, any>;
+            mutate(bad.discovery);
+            expect(() => buildSession().restore(bad)).toThrow(message);
+        };
+
+        // SHAPE stays strict (only the registration check is lenient), and the closed key
+        // list around it is unchanged: `withheld` joined it, nothing else may.
+        rejects((discovery) => (discovery.withheld = 'tasks'), 'snapshot.discovery.withheld must be an array.');
+        rejects((discovery) => (discovery.withheld = ['']), 'snapshot.discovery.withheld[0] must be at least 1 characters.');
+        rejects(
+            (discovery) => (discovery.switches = ['tasks']),
+            'snapshot.discovery has an unknown field "switches".'
+        );
+    });
+});

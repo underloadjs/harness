@@ -2494,15 +2494,16 @@ export const createHarnessApi = ({
 
     // `PATCH /tools/{tool_id}` — R3's GLOBAL tool switch, one boolean, for every session.
     //
-    // WRITE-ANYTIME (R1): no `assertIdleForToolMutation` here, unlike the session-scoped
-    // switch (./api.ts `setSessionToolEnabled`), and the difference is real rather than
-    // convenient. That route mutates ONE live harness (an entry leaves a cap slot or a
-    // declaration a run was promised), so it needs its session quiet; this one changes a
-    // deployment-wide ANSWER that the runtime re-reads when it builds the NEXT request's
-    // tool list (../harness.ts `declared`, the launch gate, and `toolRequest`'s forbidden
-    // report). Nothing is un-registered, no schema disappears mid-turn, and a run in flight
-    // keeps exactly the declarations it was given — so there is no disagreement to 409
-    // about, and the Tools page stays reachable while a thread is running.
+    // WRITE-ANYTIME (R1): no `assertIdleForToolMutation` here. T6 made the SESSION-scoped switch
+    // (`setSessionToolEnabled`) write-anytime as well — the user's requirement is that a tool can
+    // be switched off while the agent's thread is still running — so the two routes differ in
+    // SCOPE, not in concurrency: this one changes a deployment-wide ANSWER that every harness
+    // re-reads when it builds the NEXT request's tool list (../harness.ts `declared`, the launch
+    // gate, and `toolRequest`'s forbidden report), and that one changes ONE conversation's
+    // withheld set the same per-request way. Nothing is un-registered and no schema disappears
+    // mid-turn, so there is no disagreement to 409 about; the idle gate stays where a write
+    // replaces or removes what a run is executing (a source registration's combined patch, and
+    // DELETE), and the Tools page stays reachable while a thread is running.
     //
     // DURABLE BEFORE THE ANSWER (the plugins precedent): the commit runs inside
     // `store.updateToolEnabled` and a failed write is a 500 whose in-process value stays
@@ -4054,9 +4055,16 @@ export const createHarnessApi = ({
 
     // T19: session-tool configuration is a mutation of the LIVE harness, so it obeys the
     // idle rule. In worker mode every lane runs against its own replica of the session's
-    // harness, and an enabled switch or unregister applied to the coordinator's handle
-    // would silently disagree with what a run in flight still executes. A 409 naming the
-    // lane work is therefore the legitimate answer, not a missing capability.
+    // harness, and an unregister (or the combined source+gate patch below) applied to the
+    // coordinator's handle would silently disagree with what a run in flight still executes.
+    // A 409 naming the lane work is therefore the legitimate answer, not a missing capability.
+    //
+    // T6 EXEMPTS ONE ROUTE: the `enabled`-only PATCH (`setSessionToolEnabled` below) does NOT
+    // call this. The user's requirement is that a tool can be switched off IN REAL TIME, while
+    // the agent's thread is still running, and the kernel reads the withheld set per model turn
+    // and per launch (../types/index.ts `Harness.withheldTools`), so an inline switch lands on
+    // the running conversation's NEXT request with no rebuild. A registration still needs the
+    // gate because it replaces the implementation a run is executing.
     const assertIdleForToolMutation = (record: SessionRecord, route: string): void => {
         const activeLanes = [...record.lanes.values()].filter(
             (lane) => (lane as ThreadLaneInfo).active !== undefined
@@ -4070,41 +4078,38 @@ export const createHarnessApi = ({
         }
     };
 
-    // One enabled switch, answered in the SAME registration envelope a source update uses
-    // (the contract has one response shape for PATCH). A gate change never mints a source
-    // revision, so `source_revision` restates the installed one and `created`/`replaced`
-    // are both false - the honest statement that the code did not change.
+    // One switch of THIS conversation's tool gate, answered in the SAME registration envelope a
+    // source update uses (the contract has one response shape for PATCH). A gate change never
+    // mints a source revision, so `source_revision` restates the installed one and
+    // `created`/`replaced` are both false - the honest statement that the code did not change.
     const setSessionToolEnabled = async (
         record: SessionRecord,
         name: string,
-        enabled: boolean,
-        ctx: Ctx
+        enabled: boolean
     ): Promise<HarnessApiResult> => {
         const row = sessionToolRowsOf(record, context).find((candidate) => candidate.name === name);
 
         if (row === undefined) throw missing('tool', name, record.id);
 
-        // A `protected` entry is one this session's kernel refuses to switch at all: a core
-        // declaration (always in context, never a cap slot) or a pending-only runtime control
-        // such as `toolCancel`. The figure is the KERNEL's answer, not this dispatcher's guess:
-        // ./api-reads.ts `sessionToolRowsOf` sets `protected = !harness.isToolSwitchable(name)`,
-        // which is the same predicate the `toolManage enable|disable` switch below refuses with
-        // (../harness.ts `occupiesSearchableSlot`). That identity is the whole point — the row
-        // a client rendered and the status this route answers are one fact stated twice, so no
-        // row that LOOKS clickable can come back refused, and a refusal is stated before the
-        // click (403 here, per the published contract) instead of after it.
+        // T6: there is NO 403 here any more, and no idle gate. The route's whole subject is the
+        // conversation's own switch, and the kernel now accepts EVERY registered name
+        // (../harness.ts `applyToolSwitch` / `toolManage enable|disable`): a `visibility: 'core'`
+        // declaration and the pending-only runtime controls move through the withheld set instead
+        // of a cap slot, so switching `write` off is a reversible, per-conversation act — not the
+        // "user is detaching the control plane" act the old refusal protected. The row list is the
+        // live registry, so an unregistered name is already the 404 above, which is the only
+        // remaining refusal this route can produce (400s come from the PATCH body validation).
         //
-        // The scope note still holds: this is the SESSION-scoped route. The GLOBAL route above
-        // has no such exception — every listed tool is switchable there (R5).
-        if (row.protected) {
-            throw new HttpError(
-                403,
-                `Tool "${name}" is harness-owned in session "${record.id}"; a protected entry cannot be enabled or disabled.`
-            );
-        }
-
-        assertIdleForToolMutation(record, `PATCH ${ctx.mount}/sessions/${record.id}/tools/${name}`);
-
+        // The row's `protected` flag is deliberately NOT consulted here: since T6 it means
+        // "cannot be UNREGISTERED" (the kernel's `remove` rule, ../harness.ts:3045), which is a
+        // different privilege from switching a name off, and DELETE below is the route that owns
+        // it. Reading it here is what made a core row look unclickable.
+        //
+        // NO IDLE GATE EITHER, on purpose: the withheld set is read per model turn and per launch,
+        // so this write lands on a RUNNING thread's next request (../types/index.ts
+        // `Harness.withheldTools`), which is the user's real-time requirement. A lane replica is
+        // told about it through the blueprint (`./sessions.ts` `blueprintFor` ->
+        // `LaneBlueprint.withheldTools`); the wire frame itself is T7's.
         try {
             record.harness.runtime.manageTool(undefined, {
                 operation: enabled ? 'enable' : 'disable',
@@ -4113,18 +4118,27 @@ export const createHarnessApi = ({
         } catch (error) {
             if (isInstanceOf(error, SessionError)) throw error;
 
-            // The runtime owns the rules this route cannot restate up front (an idle check
-            // race, a name that stopped being registered between the row and the write), so its
-            // message becomes the 409/400 boundary. The core-declaration sentence is NOT
-            // reachable from a pane that reads its rows: a name the kernel will not switch is
-            // `protected` and stopped at the 403 above, which is exactly the contract
-            // ./harness.swagger.yaml publishes for this route (403, never 409, for a row the
-            // session cannot switch).
+            // What CAN still reach here: a name that stopped being registered between the row read
+            // and this write (a concurrent DELETE or an unregister in another request), which the
+            // kernel answers `Tool "X" is not registered in this harness.`, and the blank-name
+            // guard. Those stay the 409 boundary, because the runtime owns a race this dispatcher
+            // cannot restate up front.
+            //
+            // What used to be documented here - "the core-declaration sentence is unreachable from
+            // a pane that reads its rows, because a name the kernel will not switch is `protected`
+            // and stopped at the 403 above" - is obsolete in BOTH directions after T6: this route
+            // has no 403 at all, and the kernel no longer refuses a core name on a switch. The
+            // sentence that DID belong to a core name ("is a core harness tool and cannot be
+            // unregistered") now belongs to DELETE alone, where `protected` is the row figure that
+            // predicts it.
             throw new HttpError(409, boundErrorMessage(error));
         }
 
-        // The durable session document is written from the harness snapshot, whose enabled
-        // set just changed; the same commit boundary a registration uses runs here.
+        // The durable session document is written from the harness snapshot, whose discovery
+        // state just changed (`discovery.enabled` for a name that holds a cap slot,
+        // `discovery.withheld` for every name including the core and pending-only ones); the same
+        // commit boundary a registration uses runs here, which is what makes a switch of `write`
+        // survive a restart.
         await store.persistRegistry();
 
         const revision = events.bumpRevision('session_tools', record.id);
@@ -4357,14 +4371,15 @@ export const createHarnessApi = ({
             throw new HttpError(400, '"enabled" must be a boolean.');
         }
 
-        // `enabled` is the reversible discovery gate; everything else is the registration
-        // kernel's declaration. A patch that names ONLY the gate is now a real runtime write
-        // (T19: `toolManage enable|disable`), so the capability refusal it used to answer is
-        // gone rather than kept as a placeholder.
+        // `enabled` is this conversation's own switch; everything else is the registration
+        // kernel's declaration. T6: this is a REAL-TIME write — no idle gate and no `protected`
+        // refusal — because the kernel reads the withheld set per model turn, so a thread that is
+        // already running loses the tool on its next request. The capability refusal this route
+        // used to answer for a core name is gone rather than kept as a placeholder.
         const contentOnly = Object.keys(body).filter((key) => key !== 'enabled');
 
         if (contentOnly.length === 0) {
-            return await setSessionToolEnabled(record, ctx.params.tool_id, body.enabled === true, ctx);
+            return await setSessionToolEnabled(record, ctx.params.tool_id, body.enabled === true);
         }
 
         const result = await registerSessionTool(record, body, ctx, 'update');
@@ -4373,6 +4388,11 @@ export const createHarnessApi = ({
         // registration, because a source update enables the name at once and the caller's
         // `enabled: false` is the later, more specific instruction. The registration envelope
         // stays the answer (the contract has one response shape for this route).
+        //
+        // T6 keeps the IDLE GATE on THIS path only: a source update replaces the implementation a
+        // run in flight is executing, which is the state the 409 exists to protect, and the gate
+        // is checked once for the whole request. The consequence is published, not hidden: such a
+        // 409 can arrive with the new revision installed and the gate unchanged.
         if (typeof body.enabled === 'boolean') {
             const name = ctx.params.tool_id;
 
@@ -4408,14 +4428,25 @@ export const createHarnessApi = ({
         if (row === undefined) throw missing('tool', name, record.id);
 
         // Two different refusals, kept distinct because they mean different things to a
-        // client: a `protected` entry — the same kernel-stated figure the `enabled` PATCH above
-        // refuses with, i.e. a core declaration or a pending-only runtime control — is not a
-        // user-level edit at all -> 403. A name this session merely INHERITS from the catalogue
-        // with no session-local registration and no enabled slot has nothing to remove -> 400.
-        // Note what that identity means for an ORDINARY toolbox row (`syntax`, `files`, a
-        // created tool): it is switchable, therefore not protected, therefore removable — the
-        // runtime `remove` operation is the one that decides, and it never disagrees with the
-        // row the client clicked.
+        // client: a `protected` entry is one this conversation may not UNREGISTER — the row
+        // figure is the kernel's own `remove` rule (`harness.tools[name].visibility === 'core'`,
+        // ../harness.ts:3045), i.e. a harness-owned core declaration such as `write`, `tasks`,
+        // `delegate` or the always-mounted `fetch` — so removing it would break the session's own
+        // control surface -> 403. A name this session merely INHERITS from the catalogue with no
+        // session-local registration and no enabled slot has nothing to remove -> 400.
+        //
+        // T6 MOVED THE OTHER DIRECTION OF THIS IDENTITY: `protected` used to be
+        // `!harness.isToolSwitchable(name)`, which also swept in the pending-only `toolCancel`.
+        // `toolCancel` registers at `visibility: 'searchable'`, the kernel's `remove` never
+        // refused it, and the row now says so (`protected: false`); clicking DELETE on it still
+        // answers the 400 above, because this session never registered it either. Switching the
+        // SAME name off is a 200 (see `setSessionToolEnabled`): unregister and switch are two
+        // different privileges, and only the first one is what this flag predicts.
+        //
+        // What an ORDINARY toolbox row (`syntax`, `files`, a created tool) means is unchanged: it
+        // is not core, therefore not protected, therefore removable — the runtime `remove`
+        // operation is the one that decides, and it never disagrees with the row the client
+        // clicked.
         if (row.protected) {
             throw new HttpError(
                 403,

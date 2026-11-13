@@ -26,12 +26,12 @@
 //
 // Dialog rework (main.ts `selectTool`/`openToolDialog`/`setToolsView`): opening the
 // tools view shows ONLY the catalogue list (head title "Tools Catalogue" with the shared
-// `.harness-id` badge HIDDEN, plus the count note) and activating a `.tool-tab-button`
-// opens the runner inside the shared
+// `.harness-id` badge HIDDEN, plus the count note) and the corner `.tool-tab-info` control
+// of one entry opens the runner inside the shared
 // `.dialog` (`.dialog-title` = tool name, `.tool-runner-slot > .pane > .log-wrap >
 // .log > .tool-card`).
-// The runner therefore does not exist in the document until an entry is clicked —
-// every test that reads `.tool-args` must click its `.tool-tab-button` first.
+// The runner therefore does not exist in the document until a row's info mark is clicked —
+// every test that reads `.tool-args` clicks `.tool-tab-info` first.
 //
 // Tools Catalogue pass (this pass), pinned below:
 //   - R1: the pane's long "Every tool the server lists…" paragraph is GONE (no
@@ -47,12 +47,56 @@
 // R1 + R3 (that pass) — the page is ALWAYS reachable and every row states its switch:
 //   - no run gate on the rows or the identified-detail read (`setToolsView`/`selectTool`
 //     dropped their `running` guards, and `paintControls` gates the controls on `booted`);
-//   - each row carries a corner `input[type=checkbox]` (a `<button>` cannot contain a
-//     control, hence the `.tool-tab-row` wrapper and the absolutely positioned box);
-//   - EVERY row gets one, the harness-owned core entries included, so there is no
-//     affordance-less row shape left.
+//   - each row is a `.tool-tab-row` WRAPPER holding two SIBLINGS — the tile button and the
+//     corner control — because a `<button>` cannot contain a control, and CSS positions the
+//     corner control absolutely in the wrapper's top-right corner (`z-index` lifts it above
+//     the tile, which is what keeps the two activations apart);
+//   - EVERY row gets a corner control, the harness-owned core entries included, so there is
+//     no affordance-less row shape left.
 //
-// T4 (this pass) — the pane describes ONE CONVERSATION, not the deployment:
+// R1 (this pass — the SWAP) — the two activations changed places:
+//   - the TILE (`.tool-tab-button`) is the enable/disable switch: its `aria-pressed` IS the
+//     enabled figure (the same figure as the row's green `data-enabled` edge), its click
+//     writes `PATCH /sessions/{id}/tools/{tool_id}` `{ enabled }`, and it carries no
+//     `aria-haspopup` any more;
+//   - the corner control (`.tool-tab-info`) is an INFO BUTTON that opens the tool dialog —
+//     the mark where the tick box used to be. It carries `aria-haspopup="dialog"`, the
+//     accessible name `Details for <tool>`, and `aria-expanded`/`data-open` while its dialog
+//     is open, and it is the dialog's `returnFocus` target;
+//   - R4 (the reader's "green border is enough"): the pane prints NO sentence about a switch. An
+//     accepted write is stated by the tile's green edge alone, and a REFUSED one by the row's own
+//     corner mark: `data-toggle="error"` plus the warning glyph from `ui/info-icon.ts`, with the
+//     server's sentence folded into that control's accessible name and `title`
+//     (`Details for <tool> · switch failed: <server sentence>`) and kept verbatim on the topbar
+//     pill. The figure clears when that row's NEXT attempt starts and when the list is rebuilt, and
+//     it never sits on a row that later succeeded. The PLUGINS pane wears the identical figure
+//     (`./plugins-tab.test.ts`), and its old footer sentence is cleared rather than written;
+//   - the tick box (`input.tool-tab-enable`) is GONE: no `checked`, no `is-on`/`is-off`
+//     class, no `Enable <tool>`/`Disable <tool>` label. A row that is not switchable keeps
+//     its explanation on the TILE as an `aria-disabled` + `data-locked="<reason>"` pair plus
+//     the existing `title` — never the `disabled` attribute, because the tile stays focusable
+//     and the info mark must still open the dialog;
+//   - a row whose server states NO enablement (`enabled === undefined`) falls back: the tile
+//     opens the dialog like it always did, and the row still gets its info mark. A DIRECT
+//     listing (no conversation bound, so `setToolEnabled` has nowhere to write) falls back the
+//     same way — the tile is never a click that silently does nothing.
+//
+// R5 (this pass) — EVERY registered tool is switchable for this conversation:
+//   - the `protected` lock reason and the `running` lock reason are GONE from the pane's
+//     vocabulary. `data-locked` now names only `writing` (this tile's own PATCH), `offline` (no
+//     transport) and `no-enablement` (a server that reported no figure), and the same sentence
+//     pair is pinned in ./compact-ui.test.ts;
+//   - a `visibility: 'core'` name (`write`) and the pending-only `toolCancel` toggle exactly like
+//     any other row: the tile is not `aria-disabled`, the press sends the PATCH, and the shared
+//     double answers it 200 — `protected` is the wire's UNREGISTER axis now, not a refusal;
+//   - a conversation with work queued does NOT lock a switch: the `enabled` route is write-anytime
+//     and the figure lands on the agents' next turn (pinned by the run-pending test below, which
+//     now writes instead of swallowing the press);
+//   - the tooltip states what the switch actually does — this conversation's agents and threads,
+//     from their next turn, without stopping another tool calling it or a direct REST call running
+//     it — and no row says it "cannot be switched here" unless its server really stated no figure.
+//
+// T4 (that pass) — the pane describes ONE CONVERSATION, not the deployment:
 //   - it lists `GET /sessions/{id}/tools` for the conversation the card points at
 //     (`src/frontend/main.ts` `configScope`/`loadSessionTools`), read on the pane's FIRST open
 //     and dropped on every conversation change, so the rows can never be the previous
@@ -61,10 +105,10 @@
 //     only, never `PATCH /tools/{tool_id}` — and repaints from the session re-read that follows
 //     the accepted write (`main.ts` `setToolEnabled`/`applySessionToolRows`), which is why every
 //     switch assertion below pins a PATCH and the re-read that follows it;
-//   - a row the conversation cannot switch (`protected`: the harness declares that control
-//     itself — `visibility: 'core'`, or a pending-only runtime control — never merely "declared by
-//     the frozen definition"; ../shared/harness-api.ts:1885) renders a LOCKED box, and a run
-//     in flight locks every box, because that PATCH answers 403 and 409 respectively;
+//   - R5: the row's `protected` figure is the wire's UNREGISTER axis ("this name cannot be removed
+//     from the registry"), NOT a reason the pane can refuse its own press. It never locks a tile,
+//     and the PATCH answers 200 for it. The route has no idle window either, so a run never locks a
+//     switch (main.ts `toolSwitchLockOf`);
 //   - with NO conversation bound both header toggles are `hidden` (`main.ts` `syncConfigScope`,
 //     `styles.css` `.tools-toggle[hidden]`), so these fixtures boot with one session in the
 //     roster (`bootstrap` below) — the playground runner's own temporary session is a separate
@@ -76,6 +120,10 @@ import type { SessionToolRowSeed } from './session-config-test-support';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { sessionConfigDouble, sessionToolPage, sessionToolRow } from './session-config-test-support';
 import { viewAwareFetch } from './view-test-support';
+// The two glyphs a row's corner mark can wear (./ui/info-icon.ts). R4 states the failure figure as
+// DATA — the warning path mounted under a `data-toggle='error'` hook — rather than as a colour no
+// jsdom run can compute.
+import { INFO_ICON_PATH, WARNING_ICON_PATH } from './ui/info-icon';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
@@ -98,13 +146,16 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
 // R3: the enablement figure every catalogue row carries (../shared/harness-api.ts
 // `ToolSummary`, mapped through by ./api.ts `toolRowOf`). `ToolDescriptor`
 // (../server/protocol.ts:414) predates it, so the fixtures state the row the way the
-// WIRE does — a `ToolRowEntry` in main.ts's spelling — and a row without it would render
-// no tick box at all. There is NO pinned-set field: every entry, core tools included,
-// is switchable, and the frontend reads no such figure.
+// WIRE does — a `ToolRowEntry` in main.ts's spelling — and a row without it renders no
+// enabled figure at all (and its tile falls back to opening the dialog; see the
+// `enabled === undefined` case pinned below). There is NO pinned-set field: every entry,
+// core tools included, is switchable, and the frontend reads no such figure.
 type WireTool = ToolDescriptor & { enabled: boolean };
 
-// A harness-owned core entry. It ships enabled and it carries a tick box like every
-// other row — the server answers a PATCH for it too.
+// A harness-owned core entry. R5: `visibility: 'core'` is the UNREGISTER axis — it says the name
+// cannot be removed from this conversation's registry, and nothing else. The row ships enabled like
+// every other row, its tile is pressable, and the PATCH for it answers 200 (see the `write` test
+// below, the regression this pass exists to pin: `write` used to render LOCKED).
 const coreTool = (name: string, parameters: Record<string, unknown>): WireTool => ({
     name,
     group: 'Core tools',
@@ -153,25 +204,28 @@ const toolRequestTool = coreTool('toolRequest', {
     }
 });
 
-// T4: the pane's rows are this CONVERSATION's toolbox, in the spelling `GET /sessions/{id}/tools`
-// serves (`SessionToolSummary`, ../shared/harness-api.ts:1852-1900). The three facts a catalogue
-// row never carried follow the SERVER's rule (`sessionToolRowsOf`, src/server/api-reads.ts:1003-1032):
-// `protected` is the kernel's switchability answer, so a `visibility: 'core'` name is protected and
-// every other name here is switchable — `declared` plays no part in it (these fixtures declare
-// nothing). The ordinary tools got in through `toolRequest`, so they are `declared: false` +
-// `origin: 'discovered'` — the only shape whose PATCH the server accepts, which is what makes the
-// switch tests below legal. A core row states `enabled: false` (a core tool never enters the
-// enabled set) and is still in context, which is exactly what `toolRowInContext` in main.ts reads.
-const sessionRow = (tool: WireTool, overrides: Partial<Omit<SessionToolSummary, 'name'>> = {}): SessionToolRowSeed => ({
+// T4 (that pass): the pane's rows are this CONVERSATION's toolbox, in the spelling
+// `GET /sessions/{id}/tools` serves (`SessionToolSummary`, ../shared/harness-api.ts). The three
+// facts a catalogue row never carried follow the SERVER's rule (`sessionToolRowsOf`,
+// src/server/api-reads.ts):
+//   - `enabled` IS the gate's figure and comes straight from the wire row above. R5 removed the
+//     old `visibility === 'core' ? false : …` translation: a core name is reported ON by a fresh
+//     conversation exactly like any other, and a row reads off only because it was withheld or has
+//     no free slot;
+//   - `protected` is the UNREGISTER axis — `visibility: 'core'` here — and no longer makes a tile
+//     locked or refused;
+//   - `origin` is left to `sessionToolRow` to derive, because `discovered` is simply "enabled and
+//     not declared" — which is now true of the core names in these fixtures too.
+// These fixtures declare nothing, and `declared` was never a switch reason either.
+const sessionRow = (tool: WireTool, overrides: Partial<Omit<SessionToolRowSeed, 'name'>> = {}): SessionToolRowSeed => ({
     name: tool.name,
     group: tool.group,
     description: tool.description,
     tags: [...tool.tags],
     visibility: tool.visibility,
     session_bound: tool.sessionBound ?? false,
-    enabled: tool.visibility === 'core' ? false : tool.enabled,
+    enabled: tool.enabled,
     declared: false,
-    origin: tool.visibility === 'core' ? 'catalogue' : 'discovered',
     protected: tool.visibility === 'core',
     source_available: false,
     ...overrides
@@ -179,6 +233,19 @@ const sessionRow = (tool: WireTool, overrides: Partial<Omit<SessionToolSummary, 
 
 // The toolbox a fixture's boot tools add up to, in server order (the pane sorts for display).
 const sessionRows = (tools: readonly WireTool[]): SessionToolRowSeed[] => tools.map((tool) => sessionRow(tool));
+
+// The two tooltip sentences a live tile carries, written out VERBATIM rather than imported: R5 is a
+// copy change, and a test that imports the constant it pins can never disagree with it. They are
+// main.ts's `TOOL_ENABLED_TITLE` and `TOOL_DISABLED_TITLE`, and between them they state the three
+// facts the switch actually has — the scope (this conversation's agents and threads), the timing
+// (their NEXT turn, running or idle), and the limit (another tool calling it internally, or a direct
+// REST call, still runs it). Nothing here says a name "cannot be switched": only a server that
+// reports no figure at all earns that (`no-enablement`, pinned on its own test below).
+const ENABLED_TITLE =
+    'Enabled for this conversation · click to switch it off · the switch covers this conversation’s agents and threads, applies from their next turn whether a thread is running or idle, and does not stop another tool calling it or a direct REST call running it';
+
+const DISABLED_TITLE =
+    'Disabled for this conversation · click to switch it on · the switch covers this conversation’s agents and threads, applies from their next turn whether a thread is running or idle, and does not stop another tool calling it or a direct REST call running it · a name can be off because this conversation switched it off or because its toolbox has no free slot';
 
 const snapshot = (overrides: Partial<SessionSnapshot> = {}): SessionSnapshot =>
     ({
@@ -507,9 +574,9 @@ it('lists core tools in the global tools view, calls with the captured session a
         '2 tools · the toolbox of this conversation'
     );
 
-    // Activating the core entry adopts the persistent runner into the shared modal.
-    // A core tool reports its session context before anything is created.
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="toolRequest"]')?.click();
+    // Activating the core entry's corner mark adopts the persistent runner into the shared
+    // modal. A core tool reports its session context before anything is created.
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="toolRequest"]')?.click();
 
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
     expect(byClass('.dialog-title', 'h2').textContent).toBe('toolRequest');
@@ -589,8 +656,9 @@ it('lists core tools in the global tools view, calls with the captured session a
         'tools-tab-title'
     ]);
 
-    // An ordinary tool is unchanged: no sessionId key, no extra session traffic.
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="read"]')?.click();
+    // An ordinary tool is unchanged: no sessionId key, no extra session traffic. The runner
+    // is opened by the row's info mark, never by the tile (that press would write).
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="read"]')?.click();
     expect(document.querySelector('.tool-session')?.hidden).toBe(true);
 
     byClass('.tool-args', 'textarea').value = '["package.json"]';
@@ -614,13 +682,16 @@ it('lists core tools in the global tools view, calls with the captured session a
 
 // Dialog rework: the manual runner is a MODAL, not an inline panel under the list.
 // This test pins the modal contract itself — the list-only head, the dialog title,
-// one-at-a-time replacement, and the close reset (head back to the catalogue,
-// `aria-pressed` false, focus back on the entry that opened it).
-it('opens the tool runner in the shared dialog and restores the list on close', async () => {
+// one-at-a-time replacement, and the close reset (head back to the catalogue, the open
+// figure cleared on the corner mark, focus back on the mark that opened it) — plus the
+// R1 swap's two markup halves: the mark advertises the popup, the tile does not.
+it('opens the tool runner from a row mark in the shared dialog and restores the list on close', async () => {
     // T4: the pane lists the bound conversation's toolbox, which the shared stub serves (its own
     // routes are exactly the boot document, the session record the view double composes from, and
     // the toolbox page) — so this test's bespoke "boot + models only" stub is replaced by it.
-    stubFetch();
+    // The calls are kept because the dialog path must cost this conversation NO write: after
+    // the swap, opening a runner is never a PATCH, whatever the fixture answers.
+    const calls = stubFetch();
 
     await boot();
 
@@ -639,46 +710,69 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
         '2 tools · the toolbox of this conversation'
     );
 
-    const toolRequestButton = byClass('.tool-tab-button[data-tool="toolRequest"]', 'button');
-    const fileReadButton = byClass('.tool-tab-button[data-tool="read"]', 'button');
-    // Every entry advertises the popup it opens and starts unpressed.
+    const readTile = toolTile('read');
+    const requestTile = toolTile('toolRequest');
+    const toolRequestButton = toolInfo('toolRequest');
+    const fileReadButton = toolInfo('read');
+
+    // R1 (swap): every row advertises the popup on its CORNER MARK and starts collapsed. The
+    // mark is a real `<button>` with a real accessible name (an icon-only control is never
+    // unnamed in this UI), and its glyph is decorative.
+    expect(toolRequestButton.type).toBe('button');
     expect(toolRequestButton.getAttribute('aria-haspopup')).toBe('dialog');
-    expect(toolRequestButton.getAttribute('aria-pressed')).toBe('false');
-    expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
+    expect(toolRequestButton.getAttribute('aria-expanded')).toBe('false');
+    expect(toolRequestButton.dataset.open).toBeUndefined();
+    expect(toolRequestButton.getAttribute('aria-label')).toBe('Details for toolRequest');
+    expect(toolRequestButton.title).toBe('Details for toolRequest');
+    expect(toolRequestButton.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
+    // The tile no longer advertises the layer at all, and its `aria-pressed` is the ENABLED
+    // figure — both rows of this fixture are enabled, so both start pressed.
+    expect(readTile.getAttribute('aria-haspopup')).toBeNull();
+    expect(readTile.getAttribute('aria-pressed')).toBe('true');
+    expect(requestTile.getAttribute('aria-pressed')).toBe('true');
 
     toolRequestButton.click();
 
-    // Exactly one dialog, named after the tool, with the runner adopted inside it.
+    // Exactly one dialog, named after the tool, with the runner adopted inside it. The mark
+    // that opened it is the control that reports it — on the tile, opening a dialog says
+    // nothing about enablement, so its `aria-pressed` cannot move.
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
     expect(byClass('.dialog-title', 'h2').textContent).toBe('toolRequest');
     expect(
         document.querySelector('.dialog .tool-runner-slot > .pane > .log-wrap > .log > .tool-card')
     ).not.toBeNull();
-    expect(toolRequestButton.getAttribute('aria-pressed')).toBe('true');
-    expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
+    expect(toolRequestButton.getAttribute('aria-expanded')).toBe('true');
+    expect(toolRequestButton.dataset.open).toBe('true');
+    expect(fileReadButton.getAttribute('aria-expanded')).toBe('false');
+    expect(requestTile.getAttribute('aria-pressed')).toBe('true');
+    expect(readTile.getAttribute('aria-pressed')).toBe('true');
     expect(document.querySelector('.main-title')?.textContent).toBe('toolRequest');
     expect(document.querySelector('.harness-id')?.textContent).toBe('Core tools');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'core · tags: core, harness · session-bound'
     );
 
-    // A second selection REPLACES the layer instead of stacking a second one.
+    // A second selection REPLACES the layer instead of stacking a second one, and the single
+    // "open" figure moves with it.
     fileReadButton.click();
 
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
     expect(byClass('.dialog-title', 'h2').textContent).toBe('read');
-    expect(toolRequestButton.getAttribute('aria-pressed')).toBe('false');
-    expect(fileReadButton.getAttribute('aria-pressed')).toBe('true');
+    expect(toolRequestButton.getAttribute('aria-expanded')).toBe('false');
+    expect(toolRequestButton.dataset.open).toBeUndefined();
+    expect(fileReadButton.getAttribute('aria-expanded')).toBe('true');
+    expect(fileReadButton.dataset.open).toBe('true');
     expect(document.querySelector('.main-title')?.textContent).toBe('read');
     expect(document.querySelector('.harness-id')?.textContent).toBe('Files');
     expect(document.querySelector('.harness-note')?.textContent).toBe('searchable · tags: files, read');
 
-    // `.dialog-close` removes the layer, resets the pressed state, repaints the
-    // catalogue head and hands focus back to the entry that opened it.
+    // `.dialog-close` removes the layer, resets the open figure, repaints the
+    // catalogue head and hands focus back to the mark that opened it.
     byClass('.dialog-close', 'button').click();
 
     expect(document.querySelector('.dialog')).toBeNull();
-    expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
+    expect(fileReadButton.getAttribute('aria-expanded')).toBe('false');
+    expect(fileReadButton.dataset.open).toBeUndefined();
     // R2: the catalogue head says "Tools Catalogue" and keeps the shared badge hidden.
     expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
     expect(byClass('.harness-id', 'span').hidden).toBe(true);
@@ -688,14 +782,18 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
     );
     expect(document.activeElement).toBe(fileReadButton);
 
-    // Escape is the other dismissal path and converges on the same reset.
+    // Escape is the other dismissal path and converges on the same reset: the mark collapses,
+    // the tile keeps the enabled figure it never lost, and focus is back on the mark.
     fileReadButton.click();
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 
     expect(document.querySelector('.dialog')).toBeNull();
-    expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
+    expect(fileReadButton.getAttribute('aria-expanded')).toBe('false');
+    expect(fileReadButton.dataset.open).toBeUndefined();
+    expect(readTile.getAttribute('aria-pressed')).toBe('true');
+    expect(readTile.dataset.enabled).toBe('true');
     // R2: the catalogue head says "Tools Catalogue" and keeps the shared badge hidden.
     expect(document.querySelector('.main-title')?.textContent).toBe('Tools Catalogue');
     expect(byClass('.harness-id', 'span').hidden).toBe(true);
@@ -708,6 +806,9 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
     // The list itself never left the stage: the dialog sits over it, not instead.
     expect(document.querySelector('.stage .tools-pane')?.isConnected).toBe(true);
     expect(document.querySelector('.dialog-overlay')).toBeNull();
+    // And the whole dialog round trip cost this conversation NO write: five opens/closes of
+    // two runners, and not one PATCH (the tile is the only control that writes).
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
 });
 
 it('shows a server request failure for a core call instead of pretending it ran', async () => {
@@ -730,8 +831,8 @@ it('shows a server request failure for a core call instead of pretending it ran'
     openTools();
     await flush();
 
-    // The runner only exists inside the modal now, so the entry must be opened first.
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="toolRequest"]')?.click();
+    // The runner only exists inside the modal now, so the entry's info mark must be pressed first.
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="toolRequest"]')?.click();
 
     byClass('.tool-args', 'textarea').value = '{"tags":["web"]}';
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();
@@ -794,7 +895,7 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
 
     openTools();
     await flush();
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="delegate"]')?.click();
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="delegate"]')?.click();
 
     // The first configured subagent is the example target, and the brief says what a
     // self-contained brief must contain.
@@ -840,7 +941,7 @@ it('reports delegation as unavailable when the playground harness has no subagen
 
     // Delegation is blocked rather than offered with a target this team lacks.
     // The runner is inside the modal now, so open the entry before reading it.
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="delegate"]')?.click();
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="delegate"]')?.click();
 
     expect(byClass('.tool-args', 'textarea').value).toBe('{}');
     // R8: no target means no preset to offer.
@@ -891,10 +992,30 @@ const toolRowAnswer = (name: string, enabled: boolean): Record<string, unknown> 
     execution: { scope: name === 'toolRequest' ? 'session_required' : 'global', manual: true }
 });
 
-// The corner tick box of one row. `input`, not a `role="switch"` button: the native
-// control carries the state in `checked` and needs no ARIA mirror.
-const toolBox = (name: string): HTMLInputElement =>
-    byClass(`.tool-tab-enable[data-tool="${name}"]`, 'input');
+// The corner INFO button of one row (R1 swap): a `<button>` whose one action is opening
+// that tool's runner dialog. The tile — `toolTile` below — is the enable/disable switch now.
+const toolInfo = (name: string): HTMLButtonElement =>
+    byClass(`.tool-tab-info[data-tool="${name}"]`, 'button');
+
+// One corner mark as DATA (R4): the state hook it carries and the glyph it is WEARING. The PAIR is
+// the contract — the sheet paints only `data-toggle`, so a warning path with no hook (or a hook
+// with the resting path) is a mark whose shape and colour disagree. The plugin pane's test file
+// pins the same pair for its own marks (./plugins-tab.test.ts `markState`).
+const markState = (control: HTMLButtonElement): string =>
+    `${control.dataset.toggle ?? 'idle'}:${control.querySelector('path')?.getAttribute('d') === WARNING_ICON_PATH ? 'warning' : 'info'}`;
+
+// The mark's accessible name and its tooltip, stated together: this UI's rule is that a `title` is
+// never the only signal, so the two carry the SAME words — in the failure state, the server's
+// sentence along with them.
+const markNaming = (control: HTMLButtonElement): string[] => [
+    control.getAttribute('aria-label') ?? '',
+    control.title
+];
+
+// The tile of one row: the control that carries the enabled figure (`aria-pressed` +
+// `data-enabled`) and performs the conversation's `PATCH` when it is pressed.
+const toolTile = (name: string): HTMLButtonElement =>
+    byClass(`.tool-tab-button[data-tool="${name}"]`, 'button');
 
 // T4: every read and write the tools pane makes lives under one path — the bound conversation's
 // toolbox — and a paged read carries `?limit=25` (./api.ts `pageParams`). This filter collects
@@ -972,77 +1093,94 @@ it('moves to a new conversation without ever painting the previous one’s toolb
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
 });
 
-it('paints one corner tick box on EVERY row, the harness-owned core row included', async () => {
+it('paints one corner info button on EVERY row, the harness-owned core row included', async () => {
     const calls = stubFetch();
     await boot();
 
     openTools();
     await flush();
 
-    // Every row is a wrapper holding the tile and its box as SIBLINGS — a `<button>`
-    // cannot contain a control — and the rows run A–Z by tool name (R5: one flat list, no
-    // group headings; the server's core-first order is not what the reader sees).
+    // Every row is a wrapper holding the toggle tile and its info mark as SIBLINGS — a
+    // `<button>` cannot contain a control — and the rows run A–Z by tool name (R5: one flat
+    // list, no group headings; the server's core-first order is not what the reader sees).
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) =>
             [...node.children].map((child) => `${child.tagName.toLowerCase()}.${child.className}`)
         )
     ).toEqual([
-        ['button.tool-tab-button', 'input.tool-tab-enable is-on'],
-        ['button.tool-tab-button', 'input.tool-tab-enable is-on']
+        ['button.tool-tab-button', 'button.tool-tab-info'],
+        ['button.tool-tab-button', 'button.tool-tab-info']
     ]);
 
-    const readRow = byClass('.tool-tab-button[data-tool="read"]', 'button');
-    const readSwitch = toolBox('read');
+    const readRow = toolTile('read');
+    const readMark = toolInfo('read');
 
-    // A real checkbox: `checked` IS the state (so no `role`, no `aria-checked` to keep
-    // honest), the accessible name is the ACTION, and the title states the SCOPE — T4 moved that
-    // scope from the deployment to this conversation (main.ts `toolSwitchTitleOf`).
-    expect(readSwitch.type).toBe('checkbox');
-    expect(readSwitch.checked).toBe(true);
-    expect(readSwitch.dataset.enabled).toBe('true');
-    expect(readSwitch.getAttribute('role')).toBeNull();
-    expect(readSwitch.getAttribute('aria-checked')).toBeNull();
-    expect(readSwitch.getAttribute('aria-label')).toBe('Disable read');
-    expect(readSwitch.title).toBe(
-        'Enabled for this conversation · click to switch this tool off'
-    );
-    // A control that is neither waiting on its own write nor locked by the conversation, and not
-    // yet disabled by the transport.
-    expect(readSwitch.disabled).toBe(false);
+    // The mark: a real button that advertises the popup it opens, with a real accessible name
+    // (an icon-only control is never unnamed here) and a purely decorative glyph.
+    expect(readMark.type).toBe('button');
+    expect(readMark.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(readMark.getAttribute('aria-expanded')).toBe('false');
+    expect(readMark.getAttribute('aria-label')).toBe('Details for read');
+    expect(readMark.title).toBe('Details for read');
+    expect(readMark.disabled).toBe(false);
+    expect(readMark.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
+    expect(readMark.querySelector('svg')?.getAttribute('focusable')).toBe('false');
+    expect(readMark.querySelector('svg')?.getAttribute('viewBox')).toBe('0 0 24 24');
+    expect(readMark.querySelector('path')?.getAttribute('fill')).toBe('none');
+    // R4: the RESTING figure — no failure hook, and the info glyph mounted as the mark's only
+    // child. `data-toggle='error'` and the warning path appear together, and only while a refused
+    // enablement PATCH is outstanding on THIS row (see the switch tests below).
+    expect(markState(readMark)).toBe('idle:info');
+    expect(readMark.querySelector('path')?.getAttribute('d')).toBe(INFO_ICON_PATH);
+    expect(readMark.children).toHaveLength(1);
 
-    // The box is NOT inside the tile, and the tile carries the SAME figure — which is what
-    // styles the enabled state: an `--ok-line` BORDER on the tile and no green wash behind it
-    // (styles.css:1042-1058 `.tool-tab-button[data-enabled='true']`; an unticked row keeps the
-    // plain surface).
-    expect(readRow.parentElement?.className).toBe('tool-tab-row');
-    expect(readRow.contains(readSwitch)).toBe(false);
-    expect(readSwitch.parentElement?.className).toBe('tool-tab-row');
-    expect(readSwitch.closest('.tool-tab-button')).toBeNull();
+    // The TILE is the switch (R1 swap): `aria-pressed` IS the enabled figure for assistive
+    // tech, and it is the SAME figure the green edge paints (`data-enabled`, styles.css
+    // `.tool-tab-button[data-enabled='true']`), because `paintToolRowEnablement` moves them in
+    // one pass. The tooltip the tick box used to carry now sits on the control that performs
+    // the write, and says what a press here does.
+    expect(readRow.getAttribute('aria-pressed')).toBe('true');
     expect(readRow.dataset.enabled).toBe('true');
+    expect(readRow.getAttribute('aria-disabled')).toBeNull();
+    expect(readRow.dataset.locked).toBeUndefined();
+    expect(readRow.getAttribute('aria-haspopup')).toBeNull();
+    expect(readRow.title).toBe(ENABLED_TITLE);
 
-    // T4: the harness-owned core row still gets a box — every row that states an enablement does —
-    // but the box is LOCKED. `protected` is the server's figure (src/server/api-reads.ts:1003-1032:
-    // the negation of `harness.isToolSwitchable`, so a `visibility: 'core'` control name) and its
-    // PATCH answers 403, so main.ts states that refusal on the control before the click instead of
-    // after it.
-    const coreRow = byClass('.tool-tab-button[data-tool="toolRequest"]', 'button');
-    const coreSwitch = toolBox('toolRequest');
+    // The mark is the tile's SIBLING, never its child.
+    expect(readRow.parentElement?.className).toBe('tool-tab-row');
+    expect(readRow.contains(readMark)).toBe(false);
+    expect(readMark.parentElement?.className).toBe('tool-tab-row');
+    expect(readMark.closest('.tool-tab-button')).toBeNull();
 
-    // A core row reads `enabled: false` on the session route and is STILL in context, which is
-    // what `toolRowInContext` (main.ts:8752) decides from `protected` — so the tick is on.
+    // R5: the harness-owned core row gets a mark like every row, and its TILE IS A SWITCH LIKE
+    // EVERY OTHER ONE. `toolRequest` is `visibility: 'core'`, so the route states `protected: true`
+    // — the UNREGISTER axis ("this name cannot be removed from the registry"), which is no longer a
+    // reason to refuse a toggle — and the row reads `enabled: true`, the gate's own figure with no
+    // `protected` escape hatch behind it. So the tile is pressed, NOT `aria-disabled`, carries no
+    // `data-locked`, and its press sends the PATCH (pinned end to end in the `write` test below).
+    const coreRow = toolTile('toolRequest');
+    const coreMark = toolInfo('toolRequest');
+
     expect(coreRow.dataset.enabled).toBe('true');
-    expect(coreSwitch.checked).toBe(true);
-    expect(coreSwitch.disabled).toBe(true);
-    expect(coreSwitch.getAttribute('aria-label')).toBe('Disable toolRequest');
-    expect(coreSwitch.title).toBe(
-        'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
-    );
+    expect(coreRow.getAttribute('aria-pressed')).toBe('true');
+    expect(coreRow.getAttribute('aria-disabled')).toBeNull();
+    expect(coreRow.dataset.locked).toBeUndefined();
+    expect(coreRow.disabled).toBe(false);
+    expect(coreRow.title).toBe(ENABLED_TITLE);
+    // The dialog is reachable from the mark either way.
+    expect(coreMark.getAttribute('aria-expanded')).toBe('false');
+    expect(coreMark.title).toBe('Details for toolRequest');
 
-    // Nothing is left of the old pill or the pin, in the document or in the markup.
+    // Nothing is left of the old pill, the pin, a `role="switch"`, or the tick box and its
+    // input element.
     expect(document.querySelectorAll('.tool-tab-toggle')).toHaveLength(0);
     expect(document.querySelectorAll('.tool-tab-pin')).toHaveLength(0);
     expect(document.querySelectorAll('[role="switch"]')).toHaveLength(0);
-    expect(document.querySelectorAll('.tool-tab-enable')).toHaveLength(2);
+    expect(document.querySelectorAll('.tool-tab-enable')).toHaveLength(0);
+    expect(byClass('.tools-pane', 'div').querySelectorAll('input')).toHaveLength(0);
+    expect(document.querySelectorAll('.tool-tab-info')).toHaveLength(2);
+    // The swap writes nothing on its own: rendering the pane is a read, never a PATCH.
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
 
     // R1 (Tools Catalogue): the paragraph that used to explain the switch from above the list
     // is gone, and the pane adds nothing about the switch of its own: the switch's `title`
@@ -1065,9 +1203,10 @@ it('paints one corner tick box on EVERY row, the harness-owned core row included
     expect(byClass('.tools-tab-title', 'h2').textContent).toBe('Tools Catalogue');
 });
 
-// The guard main.ts documents: a row that never stated an enablement states NO state,
-// rather than inventing a tick the server never reported.
-it('renders no tick box and no enablement attribute for a row whose server never stated one', async () => {
+// The guard main.ts documents: a row that never stated an enablement states NO figure,
+// rather than inventing one the server never reported — and its tile keeps the one behaviour
+// that is still true of it (open the runner), while the row still gets its info mark.
+it('renders a mark and no enablement figure for a row whose server never stated one', async () => {
     const legacyRow: Record<string, unknown> = { ...fileReadTool };
     delete legacyRow.enabled;
 
@@ -1077,7 +1216,7 @@ it('renders no tick box and no enablement attribute for a row whose server never
     // `JSON.stringify`, which is exactly the payload an older server would send.
     const statedRow = { ...sessionToolRow(sessionRow(fileReadTool)), enabled: undefined } as unknown as SessionToolSummary;
 
-    stubFetch((url, method) =>
+    const calls = stubFetch((url, method) =>
         url === '/api'
             ? json(bootstrap({ tools: [legacyRow] }))
             : url === '/api/sessions/s1/tools' && method === undefined
@@ -1089,16 +1228,48 @@ it('renders no tick box and no enablement attribute for a row whose server never
     openTools();
     await flush();
 
-    const row = byClass('.tool-tab-button[data-tool="read"]', 'button');
+    const row = toolTile('read');
+    const mark = toolInfo('read');
 
+    // NEITHER figure: no green edge, no pressed toggle. The lock marker says WHY, in the same
+    // `aria-disabled` + `data-locked` pair the conversation locks use, and it is a marker, not
+    // the `disabled` attribute — the tile is still focusable and still presses.
     expect(row.dataset.enabled).toBeUndefined();
+    expect(row.getAttribute('aria-pressed')).toBeNull();
+    expect(row.dataset.locked).toBe('no-enablement');
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    expect(row.disabled).toBe(false);
+    expect(row.title).toBe('This server reports no enablement for this tool · it cannot be switched here');
+
+    // The row keeps its corner mark: a tool with no switchable figure still has a runner.
     expect(document.querySelectorAll('.tool-tab-enable')).toHaveLength(0);
     expect(document.querySelector('.tool-tab-pin')).toBeNull();
-    // The tile still opens its runner: only the enablement affordance is withheld.
-    expect(row.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(document.querySelectorAll('.tool-tab-info')).toHaveLength(1);
+    expect(mark.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(mark.getAttribute('aria-label')).toBe('Details for read');
+    expect(mark.getAttribute('aria-expanded')).toBe('false');
+
+    // The fallback: with nothing to toggle, the tile keeps the behaviour it always had and
+    // opens the runner — and it still writes NOTHING, which is the half the reader would
+    // otherwise experience as a silent 400 on a route the row never justified.
+    row.click();
+
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('read');
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+    // The open figure lands on the mark either way, so one control can never look open while
+    // the layer was raised by the other.
+    expect(mark.getAttribute('aria-expanded')).toBe('true');
+    expect(mark.dataset.open).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBeNull();
+
+    byClass('.dialog-close', 'button').click();
+    await flush();
+
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(mark.getAttribute('aria-expanded')).toBe('false');
 });
 
-it('switches a tool off and back on with one click, and repaints the row from the conversation re-read', async () => {
+it('switches a tool off and back on with one tile click, and repaints the row from the conversation re-read', async () => {
     // T4: the switch is this conversation's, and the shared double's store APPLIES the accepted
     // write (./session-config-test-support.ts), so the figure the row repaints below can only come
     // from the `GET /sessions/s1/tools` re-read main.ts performs after the PATCH (`setToolEnabled`
@@ -1112,17 +1283,28 @@ it('switches a tool off and back on with one click, and repaints the row from th
     openTools();
     await flush();
 
-    const row = byClass('.tool-tab-button[data-tool="read"]', 'button');
-    const control = toolBox('read');
+    const row = toolTile('read');
+    const mark = toolInfo('read');
 
-    control.click();
+    row.click();
 
-    // In flight: the native box has already flipped itself, only THIS row's control is
-    // locked (its own write), and the app pill says what is being saved — the same
+    // In flight: NOTHING about the enabled figure has moved — a `<button>` never flips its own
+    // `aria-pressed` (the old native checkbox did, and had to be pulled back), so the only new
+    // facts are the busy flag and the `writing` lock that makes the tile inert. Only THIS row's
+    // tile is locked, by its own write, and the app pill says what is being saved — the same
     // reporting the plugin settings save uses.
-    expect(control.checked).toBe(false);
-    expect(control.disabled).toBe(true);
-    expect(control.getAttribute('aria-busy')).toBe('true');
+    expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
+    expect(row.getAttribute('aria-busy')).toBe('true');
+    expect(row.dataset.locked).toBe('writing');
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    expect(row.title).toBe('Switching this tool for this conversation…');
+    // A press while the write is out costs nothing (the single-flight guard), and the row's mark
+    // is untouched by any of it: the dialog stays reachable during a write, and an in-flight row
+    // is not yet a refused one (R4 — the warning figure only arrives with a refusal).
+    expect(mark.getAttribute('aria-expanded')).toBe('false');
+    expect(markState(mark)).toBe('idle:info');
+    expect(document.querySelector('.dialog')).toBeNull();
 
     await flush();
     await flush();
@@ -1139,41 +1321,49 @@ it('switches a tool off and back on with one click, and repaints the row from th
     expect(calls.filter((call) => call.url === '/api/tools/read' && call.method === 'PATCH')).toEqual([]);
 
 
-    // The SAME nodes repaint from the answer: no list rebuild, so the row stays the node
-    // the runner dialog would hand focus back to. The box, its `data-enabled` and the
-    // tile's enabled EDGE move together, so the tick and the green border can never disagree.
+    // The SAME node repaints from the answer: no list rebuild, so the row stays the node the
+    // runner dialog would hand focus back to. `data-enabled` (the green edge) and `aria-pressed`
+    // (the toggle) move together, so the border and the state can never disagree, and the busy
+    // lock is cleared with the write.
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button')).toBe(row);
-    expect(byClass('.tool-tab-enable[data-tool="read"]', 'input')).toBe(control);
     expect(row.dataset.enabled).toBe('false');
-    expect(control.className).toBe('tool-tab-enable is-off');
-    expect(control.checked).toBe(false);
-    expect(control.dataset.enabled).toBe('false');
-    expect(control.getAttribute('aria-label')).toBe('Enable read');
-    expect(control.disabled).toBe(false);
+    expect(row.getAttribute('aria-pressed')).toBe('false');
+    expect(row.dataset.locked).toBeUndefined();
+    expect(row.getAttribute('aria-disabled')).toBeNull();
+    expect(row.getAttribute('aria-busy')).toBe('false');
+    expect(row.title).toBe(DISABLED_TITLE);
 
     // The pane says NOTHING about the accepted switch: its live line is gone with the
-    // markup, so the box/row figure asserted above IS the report, and the pill returns to idle.
+    // markup, so the tile figure asserted above IS the report, and the pill returns to idle.
     expect(document.querySelector('.tools-tab-note')).toBeNull();
     expect(byClass('.status-text', 'span').textContent).toBe('idle');
+    // R4: and the accepted switch leaves the corner mark exactly as it found it — the resting
+    // glyph, the resting name, no `data-toggle`. A green edge with a red mark beside it would
+    // claim the same row both succeeded and failed.
+    expect(markState(mark)).toBe('idle:info');
+    expect(mark.querySelector('path')?.getAttribute('d')).toBe(INFO_ICON_PATH);
+    expect(markNaming(mark)).toEqual(['Details for read', 'Details for read']);
 
     // A second press inverts what the SERVER reported (the cache moved with the re-read), and the
     // traffic of the second switch is the same write-then-read pair — the pane never paints a
     // figure it did not get back from the conversation's own route.
-    control.click();
+    row.click();
     await flush();
     await flush();
 
     expect(calls.filter((call) => call.url === '/api/sessions/s1/tools/read' && call.method === 'PATCH')).toHaveLength(2);
     expect(traffic()).toHaveLength(5);
-    expect(control.checked).toBe(true);
-    expect(control.className).toBe('tool-tab-enable is-on');
     expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
+    expect(row.dataset.locked).toBeUndefined();
+    expect(row.title).toBe(ENABLED_TITLE);
 });
 
-it('pulls a refused switch back to the server figure and keeps the server sentence on the pill', async () => {
+it('marks a refused switch on that row\u2019s corner mark and keeps the server sentence on the pill', async () => {
     // The conversation's own route refuses the write (409 while it is working, 403 for a protected
-    // name — ../shared/harness-api.ts:1885). The sentence is the server's, and it is the ONLY new
-    // figure the refusal leaves anywhere: nothing was written, and no re-read follows a failure.
+    // name — ../shared/harness-api.ts:1885). The sentence is the server's, and R4 leaves it in
+    // exactly two places: this row's corner mark (its `title` and accessible name) and the pill.
+    // Nothing was written, and no re-read follows a failure.
     const message = 'read cannot be switched off while this conversation is working.';
     const calls = stubFetch((url, method) => {
         if (url === '/api/sessions/s1/tools/read' && method === 'PATCH') return json({ error: { message } }, 409);
@@ -1185,14 +1375,20 @@ it('pulls a refused switch back to the server figure and keeps the server senten
     openTools();
     await flush();
 
-    const row = byClass('.tool-tab-button[data-tool="read"]', 'button');
-    const control = toolBox('read');
+    const row = toolTile('read');
+    const mark = toolInfo('read');
     const trafficBefore = toolboxTraffic(calls).length;
 
-    control.click();
-    // A native checkbox flipped itself on the click — this is exactly the state a refusal
-    // has to undo, and why the busy pass repaints from the cache when it unlocks.
-    expect(control.checked).toBe(false);
+    row.click();
+    // During the flight the tile is locked by its own write, and that is the ONLY thing that
+    // moves: an `<button>` cannot flip its own `aria-pressed`, so unlike the old checkbox there
+    // is nothing for the refusal to undo.
+    expect(row.getAttribute('aria-busy')).toBe('true');
+    expect(row.dataset.locked).toBe('writing');
+    expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
+    // …and the row is not wearing a refusal it has not received yet.
+    expect(markState(mark)).toBe('idle:info');
 
     await flush();
     await flush();
@@ -1206,32 +1402,153 @@ it('pulls a refused switch back to the server figure and keeps the server senten
     expect(document.querySelector('.tools-tab-retry')).toBeNull();
 
     // The refusal leaves nothing in the pane that could lie: there is no line to contradict
-    // the server (the live element is gone), and the row still states the figure the server
-    // holds, because nothing was written and the unlock pass repaints from that cache.
+    // the server (the live element is gone), and the tile still states the figure the server
+    // holds, because nothing was written and the unlock pass repaints from that cache. The
+    // busy flag and the `writing` lock are both cleared, so the reader can press again.
     expect(document.querySelector('.tools-tab-note')).toBeNull();
-    expect(control.checked).toBe(true);
-    expect(control.className).toBe('tool-tab-enable is-on');
-    expect(control.dataset.enabled).toBe('true');
-    expect(control.getAttribute('aria-label')).toBe('Disable read');
-    expect(control.disabled).toBe(false);
     expect(row.dataset.enabled).toBe('true');
+    expect(row.getAttribute('aria-pressed')).toBe('true');
+    expect(row.getAttribute('aria-busy')).toBe('false');
+    expect(row.dataset.locked).toBeUndefined();
+    expect(row.getAttribute('aria-disabled')).toBeNull();
+    expect(row.title).toBe(ENABLED_TITLE);
+
+    // R4: THE row figure. `data-toggle='error'` (the hook styles.css paints with `--danger`,
+    // `.tool-tab-info[data-toggle='error']`) and the warning glyph move together, and the reason
+    // is in the control's accessible name and its tooltip — the shape and the words, never colour
+    // alone. The mark still only opens the dialog: a refused row is not an inert row.
+    expect(markState(mark)).toBe('error:warning');
+    expect(mark.querySelector('path')?.getAttribute('d')).toBe(WARNING_ICON_PATH);
+    expect(mark.children).toHaveLength(1);
+    expect(markNaming(mark)).toEqual([
+        `Details for read · switch failed: ${message}`,
+        `Details for read · switch failed: ${message}`
+    ]);
+    expect(mark.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(mark.getAttribute('aria-expanded')).toBe('false');
+    expect(mark.disabled).toBe(false);
+    // The refusal belongs to ONE row: the other row's mark is untouched.
+    expect(markState(toolInfo('toolRequest'))).toBe('idle:info');
+
     // The server's own sentence is NOT dropped with the pane line: the pill reports the state
     // word, its `title` carries the diagnostic for pointer readers, and the hidden live-region
     // child announces it — so a refused switch still fails out loud, just not in the pane.
     expect(byClass('.status-text', 'span').textContent).toBe('error');
     expect(byClass('.status-detail', 'span').textContent).toBe(`tool enablement: ${message}`);
+
+    // The next press clears the mark the MOMENT the attempt starts (a row never wears a warning for
+    // a write it has already redone), and the refusal lands it back on, because the figure describes
+    // the LAST attempt.
+    row.click();
+    expect(markState(mark)).toBe('idle:info');
+
+    await flush();
+    await flush();
+
+    expect(markState(mark)).toBe('error:warning');
+    expect(markNaming(mark)).toEqual([
+        `Details for read · switch failed: ${message}`,
+        `Details for read · switch failed: ${message}`
+    ]);
+});
+
+it('takes the refusal mark off a tool row whose next switch is accepted', async () => {
+    // The lifecycle the reader actually walks: press, be refused, press again, land. R4's promise is
+    // that a warning never sticks to a row that later succeeded — and the tools pane has no sentence
+    // to overwrite, so the mark is the ONLY thing that could get this wrong.
+    const message = 'read cannot be switched off while this conversation is working.';
+    let refused = 0;
+    const calls = stubFetch((url, method) => {
+        // ONE refusal, then the double's own store applies the write.
+        if (url === '/api/sessions/s1/tools/read' && method === 'PATCH' && refused++ === 0)
+            return json({ error: { message } }, 409);
+
+        return undefined;
+    });
+
+    await boot();
+    openTools();
+    await flush();
+
+    const row = toolTile('read');
+    const mark = toolInfo('read');
+
+    row.click();
+    await flush();
+    await flush();
+
+    expect(markState(mark)).toBe('error:warning');
+    expect(row.dataset.enabled).toBe('true');
+
+    row.click();
+    await flush();
+    await flush();
+    await flush();
+
+    // Accepted: the write, the re-read that repaints the row, and a CLEAN mark — the resting glyph
+    // and the resting name — because the attempt cleared it and nothing put it back.
+    expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(2);
+    expect(row.dataset.enabled).toBe('false');
+    expect(row.getAttribute('aria-pressed')).toBe('false');
+    expect(markState(mark)).toBe('idle:info');
+    expect(mark.querySelector('path')?.getAttribute('d')).toBe(INFO_ICON_PATH);
+    expect(markNaming(mark)).toEqual(['Details for read', 'Details for read']);
+    expect(byClass('.status-text', 'span').textContent).toBe('idle');
+});
+
+it('rebuilds the tools list clean after a refused switch', async () => {
+    // The other clear condition R4 states: a pane RE-RENDER. Closing and re-opening the catalogue
+    // repaints it from the cached page (`loadSessionTools` → `buildToolsTab`), and a rebuilt row is
+    // a new node — the refusal figure belongs to the node it was painted on, so the map that drives
+    // it is emptied with the nodes it describes rather than resurrected onto them.
+    const message = 'read cannot be switched off while this conversation is working.';
+    const calls = stubFetch((url, method) => {
+        if (url === '/api/sessions/s1/tools/read' && method === 'PATCH') return json({ error: { message } }, 409);
+
+        return undefined;
+    });
+
+    await boot();
+    openTools();
+    await flush();
+
+    toolTile('read').click();
+    await flush();
+    await flush();
+
+    expect(markState(toolInfo('read'))).toBe('error:warning');
+
+    // Close the pane, then re-open it — the traffic of the second open is the cached re-read path,
+    // and the list the pane paints is brand new.
+    toolsToggle().click();
+    await flush();
+    openTools();
+    await flush();
+    await flush();
+
+    expect(markState(toolInfo('read'))).toBe('idle:info');
+    expect(markNaming(toolInfo('read'))).toEqual(['Details for read', 'Details for read']);
+    expect([...document.querySelectorAll<HTMLButtonElement>('.tool-tab-info')].map(markState)).toEqual([
+        'idle:info',
+        'idle:info'
+    ]);
+    // The refusal is not a server figure either — nothing was written — so the rebuilt row states
+    // the figure the conversation holds, unchanged.
+    expect(toolTile('read').dataset.enabled).toBe('true');
+    expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(1);
 });
 
 // ---------------------------------------------------------------------------
 // The two row shapes the reader met on a BRAND-NEW conversation (the upgrade regression: a
-// checkbox that answered with the top-right `error` pill).
+// checkbox that answered with the top-right `error` pill), restated for R5 — the same two rows are
+// now the two shapes that PROVE a harness-owned name switches.
 //
 // Both fixtures state ONLY the kernel facts a row is derived from — `visibility`, `pendingOnly`,
 // `declared` — and let `sessionToolRow` compute `protected` / `enabled` / `origin` the way
-// `sessionToolRowsOf` (src/server/api-reads.ts:1003-1032) does. That is deliberate: a fixture that
-// hand-states `protected: true` pins its own opinion and cannot catch the rule drifting, while
-// these two pin the derivation itself (the first `expect` of each test is the exact row the double
-// projects, before the pane ever sees it).
+// `sessionToolRowsOf` (src/server/api-reads.ts) does. That is deliberate: a fixture that hand-states
+// `protected: true` pins its own opinion and cannot catch the rule drifting, while these two pin the
+// derivation itself (the first `expect` of each test is the exact row the double projects, before
+// the pane ever sees it).
 // ---------------------------------------------------------------------------
 
 // The shared double wired into a fixture's OWN handler, so its routes win over `stubFetch`'s
@@ -1245,10 +1562,11 @@ const seededFetch = (seeds: readonly SessionToolRowSeed[]) => {
     return { calls, config };
 };
 
-it('renders a harness-owned row checked and locked, and its press cannot ask the server for a switch', async () => {
-    // `delegate` as the live kernel reports it (measured on a real session): harness-owned, NOT
-    // declared by the frozen definition, `session_bound: true`, and therefore `protected: true`
-    // with `enabled: false`.
+it('switches a harness-owned core row and a pending-only control, because `protected` is the unregister axis', async () => {
+    // `delegate` as the live kernel reports it: harness-owned (`visibility: 'core'`), NOT declared
+    // by the frozen definition, `session_bound: true`. R5: that makes it UNREGISTERABLE, not
+    // unswitchable — the gate states `enabled: true` for it on a fresh conversation exactly like it
+    // does for a searchable name.
     const delegateSeed: SessionToolRowSeed = {
         name: 'delegate',
         group: 'Core tools',
@@ -1259,9 +1577,9 @@ it('renders a harness-owned row checked and locked, and its press cannot ask the
         declared: false
     };
     // The other direction of the same rule: `toolCancel` is protected WITHOUT being declared,
-    // because its registration is pending-only — its manifest visibility is demoted to
-    // `searchable`, which is precisely the case a server-side guess from `visibility` used to get
-    // wrong (and the case that made the pane offer a switch the route answers 403 to).
+    // because its registration is pending-only — its manifest visibility reads `searchable`, which
+    // is precisely the case a server-side guess from `visibility` used to get wrong. It is the row
+    // whose tile used to be locked and whose press used to answer the reader with an `error` pill.
     const cancelSeed: SessionToolRowSeed = {
         name: 'toolCancel',
         group: 'Core tools',
@@ -1275,10 +1593,10 @@ it('renders a harness-owned row checked and locked, and its press cannot ask the
     const { calls, config } = seededFetch([delegateSeed, cancelSeed]);
 
     // The exact rows the double serves — the derivation, not an opinion. `protected` is the
-    // negation of switchability in BOTH names (`delegate` by `visibility: 'core'`, `toolCancel` by
-    // its pending-only registration), `enabled` is false because a protected name never enters the
-    // capped set, and `origin` is `catalogue` for both — `discovered` is an ENABLED name this
-    // session did not declare, and neither of these holds a slot.
+    // unregister figure in BOTH names (`delegate` by `visibility: 'core'`, `toolCancel` by its
+    // pending-only registration), `enabled` is TRUE for both because a registered name is ON until
+    // somebody withholds it or the toolbox runs out of slots, and `origin` is therefore
+    // `discovered` for both — `discovered` is simply an ENABLED name this session did not declare.
     expect(config.toolRows()).toEqual([
         {
             name: 'delegate',
@@ -1287,10 +1605,10 @@ it('renders a harness-owned row checked and locked, and its press cannot ask the
             tags: ['core', 'harness'],
             visibility: 'core',
             session_bound: true,
-            enabled: false,
+            enabled: true,
             session_id: 's1',
             declared: false,
-            origin: 'catalogue',
+            origin: 'discovered',
             protected: true,
             source_available: false
         },
@@ -1301,10 +1619,10 @@ it('renders a harness-owned row checked and locked, and its press cannot ask the
             tags: ['core', 'harness'],
             visibility: 'searchable',
             session_bound: true,
-            enabled: false,
+            enabled: true,
             session_id: 's1',
             declared: false,
-            origin: 'catalogue',
+            origin: 'discovered',
             protected: true,
             source_available: false
         }
@@ -1314,73 +1632,99 @@ it('renders a harness-owned row checked and locked, and its press cannot ask the
     openTools();
     await flush();
 
-    // `name:checked:disabled` for every row: both are ticked ON (`main.ts` `toolRowInContext` reads
-    // `protected`, so a harness-owned name shows as in context whatever `enabled` says) and both
-    // are LOCKED. Nothing here is clickable-but-off.
+    // `name:pressed:aria-disabled:locked` for every row. Both tiles are PRESSED and NEITHER is
+    // locked: the `protected` figure paints nothing, and `data-locked` has no value that applies
+    // here (its whole vocabulary is `writing` / `offline` / `no-enablement`).
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) => {
-            const box = node.querySelector<HTMLInputElement>('.tool-tab-enable');
+            const tile = node.querySelector<HTMLButtonElement>('.tool-tab-button')!;
 
-            return `${node.querySelector('.tool-tab-button')?.dataset.tool}:${String(box?.checked)}:${String(box?.disabled)}`;
+            return `${tile.dataset.tool}:${String(tile.getAttribute('aria-pressed'))}:${tile.getAttribute('aria-disabled') ?? 'null'}:${tile.dataset.locked}`;
         })
-    ).toEqual(['delegate:true:true', 'toolCancel:true:true']);
+    ).toEqual(['delegate:true:null:undefined', 'toolCancel:true:null:undefined']);
 
-    // The lock says WHY, in the reader's terms — and the reason is the harness, not the team that
-    // wrote this conversation's definition.
-    const delegate = toolBox('delegate');
+    // The tooltip is the LIVE one, not a sentence about the harness holding the name.
+    const delegate = toolTile('delegate');
 
-    expect(delegate.className).toBe('tool-tab-enable is-on');
     expect(delegate.dataset.enabled).toBe('true');
-    expect(delegate.getAttribute('aria-label')).toBe('Disable delegate');
-    expect(delegate.title).toBe(
-        'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
-    );
+    expect(delegate.getAttribute('aria-pressed')).toBe('true');
+    expect(delegate.disabled).toBe(false);
+    expect(delegate.title).toBe(ENABLED_TITLE);
+    expect(toolTile('toolCancel').title).toBe(ENABLED_TITLE);
 
-    // Two presses, in the two ways a press can arrive.
+    // Both presses go through, in the two ways a press can arrive.
     //
-    // The NATIVE one first: a disabled control swallows the click (real hit-testing, and jsdom's
-    // `HTMLElement.click()` implements the same rule), so the row cannot move at all.
+    // The native one first: `delegate` is harness-owned and writes.
     delegate.click();
-    toolBox('toolCancel').click();
-    await flush();
-
-    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
-    expect(toolBox('delegate').checked).toBe(true);
-    expect(toolBox('toolCancel').checked).toBe(true);
-
-    // A DISPATCHED click gets past the disabled control — the path a scripted reader, or a frame
-    // that painted the box before its lock did, takes — so this is main.ts's own guard under test
-    // (`if (row.protected === true) return`, main.ts:8722): no write leaves the pane. The native
-    // checkbox still flips its own `checked` on a synthesized click and the guard returns before
-    // any repaint, so the DOM figure is re-based by the next paint pass rather than by this click;
-    // what may never change is the traffic and the pill, and those are what the reader's complaint
-    // is about.
-    delegate.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    toolBox('toolCancel').dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await flush();
     await flush();
 
-    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
-    expect(config.toolWrites).toEqual([]);
-    // The pill is the ONLY place a refusal could appear, and there is no refusal: the state is
-    // still the idle one boot left, with no diagnostic under it. The pane itself keeps its
-    // deliberate shape — no inline error line, no retry control, head = title only — which is the
-    // layout the reader asked for (main.ts `setToolEnabled`'s catch reports on the pill alone).
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
+        { url: '/api/sessions/s1/tools/delegate', method: 'PATCH', body: { enabled: false } }
+    ]);
+    // The double accepted it — no 403 — and the re-read says so, which is what moved the tile.
+    expect(config.toolWrites).toEqual([{ name: 'delegate', body: { enabled: false } }]);
+    expect(toolTile('delegate').getAttribute('aria-pressed')).toBe('false');
+    expect(toolTile('delegate').dataset.enabled).toBe('false');
+    expect(toolTile('delegate').title).toBe(DISABLED_TITLE);
+    expect(toolTile('delegate').dataset.locked).toBeUndefined();
+
+    // A DISPATCHED click on the pending-only control takes the SAME path: the guard in
+    // `buildToolsTab` only refuses `writing` and a dead transport, so a `protected` name is a
+    // normal write. This is the state that used to answer the reader with an `error` pill.
+    toolTile('toolCancel').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(2);
+    expect(config.toolWrites).toEqual([
+        { name: 'delegate', body: { enabled: false } },
+        { name: 'toolCancel', body: { enabled: false } }
+    ]);
+    expect(toolTile('toolCancel').dataset.enabled).toBe('false');
+    expect(toolTile('toolCancel').getAttribute('aria-pressed')).toBe('false');
+    expect(toolTile('toolCancel').getAttribute('aria-disabled')).toBeNull();
+    // Withheld names stop reporting `origin: 'discovered'`, the way the server re-derives them:
+    // `discovered` is an ENABLED name this session did not declare.
+    expect(config.toolRows().map((row) => [row.name, row.enabled, row.protected, row.origin])).toEqual([
+        ['delegate', false, true, 'catalogue'],
+        ['toolCancel', false, true, 'catalogue']
+    ]);
+    // A switch never costs the row its dialog: the mark beside the tile opens the runner for both
+    // names, which is the whole point of keeping the tile focusable and clickable.
+    for (const name of ['delegate', 'toolCancel']) {
+        toolInfo(name).click();
+        expect(byClass('.dialog-title', 'h2').textContent).toBe(name);
+        expect(toolInfo(name).getAttribute('aria-expanded')).toBe('true');
+        byClass('.dialog-close', 'button').click();
+        await flush();
+        expect(document.querySelector('.dialog')).toBeNull();
+        expect(toolInfo(name).getAttribute('aria-expanded')).toBe('false');
+    }
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(2);
+    // Both writes were ACCEPTED, so there is no refusal anywhere: the pill is back to the idle
+    // figure boot left, with no diagnostic under it, and neither row wears the warning glyph. The
+    // pane itself keeps its deliberate shape — no inline error line, no retry control, head = title
+    // only — which is the layout the reader asked for (main.ts `setToolEnabled`'s catch reports on
+    // the pill alone).
     expect(byClass('.status-text', 'span').textContent).toBe('idle');
     expect(byClass('.status-detail', 'span').textContent).toBe('');
+    expect(markState(toolInfo('delegate'))).toBe('idle:info');
+    expect(markState(toolInfo('toolCancel'))).toBe('idle:info');
     expect(document.querySelector('.tools-tab-note')).toBeNull();
     expect(document.querySelector('.tools-tab-hint')).toBeNull();
     expect(document.querySelector('.tools-tab-retry')).toBeNull();
     expect([...byClass('.tools-tab-head', 'div').children].map((node) => node.className)).toEqual(['tools-tab-title']);
 });
 
-it('renders a brand-new session with every switchable box on, and switches one of them with one accepted write', async () => {
-    // The seed a brand-new conversation ships with: `enableAllTools` (src/harness.ts:12046-12048,
-    // set by `src/server/sessions.ts:2204` for a CREATE and for a RESTORE (`:3843`), and re-run by
-    // `:10204` for a RESET) puts
-    // every globally-enabled
-    // SWITCHABLE registration in the capped set, so each row below must arrive
-    // `enabled: true` / `protected: false` without a fixture saying so.
+it('renders a brand-new session with every tile on, and switches one of them with one accepted write', async () => {
+    // The seed a brand-new conversation ships with: `enableAllTools` (src/harness.ts, run by
+    // src/server/sessions.ts for a CREATE, a RESTORE and a RESET) seeds the conversation's gate
+    // with EVERY globally-enabled registration, so each row below must arrive `enabled: true`
+    // without a fixture saying so. R5 removed the "switchable only" half of that rule, and these
+    // three names are searchable anyway — the protected-name version of the same figure is pinned
+    // by the test above.
     const seededFetchRows: readonly SessionToolRowSeed[] = [
         { name: 'glob', group: 'Files', description: 'List files by pattern.', tags: ['files'], visibility: 'searchable', declared: false },
         { name: 'read', group: 'Files', description: 'Read one or more files.', tags: ['files', 'read'], visibility: 'searchable', declared: false },
@@ -1402,18 +1746,20 @@ it('renders a brand-new session with every switchable box on, and switches one o
     openTools();
     await flush();
 
-    // R1: every box is ON and every box is togglable — no row on a fresh conversation can produce
-    // the refusal the reader hit.
+    // R1 (swap): every TILE is pressed and none of them is locked — no row on a fresh
+    // conversation can produce the refusal the reader hit. The triple is
+    // `name:aria-pressed:aria-disabled`, and `aria-disabled` is absent ('false' here) exactly
+    // when the tile may write.
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) => {
-            const box = node.querySelector<HTMLInputElement>('.tool-tab-enable');
+            const tile = node.querySelector<HTMLButtonElement>('.tool-tab-button');
 
-            return `${node.querySelector('.tool-tab-button')?.dataset.tool}:${String(box?.checked)}:${String(box?.disabled)}`;
+            return `${tile?.dataset.tool}:${String(tile?.getAttribute('aria-pressed'))}:${tile?.getAttribute('aria-disabled') ?? 'false'}`;
         })
     ).toEqual(['glob:true:false', 'read:true:false', 'syntax:true:false']);
-    expect(toolBox('read').title).toBe('Enabled for this conversation · click to switch this tool off');
+    expect(toolTile('read').title).toBe(ENABLED_TITLE);
 
-    toolBox('read').click();
+    toolTile('read').click();
     await flush();
     await flush();
 
@@ -1425,18 +1771,26 @@ it('renders a brand-new session with every switchable box on, and switches one o
     expect(config.toolWrites).toEqual([{ name: 'read', body: { enabled: false } }]);
 
     // The row moves to the figure the next read states, and the read re-derives `origin` with it
-    // (a name that is no longer enabled is not `discovered`). The other boxes are untouched.
+    // (a name that is no longer enabled is not `discovered`). The other tiles are untouched.
     expect(config.toolRows().map((row) => [row.name, row.enabled, row.protected, row.origin])).toEqual([
         ['glob', true, false, 'discovered'],
         ['read', false, false, 'catalogue'],
         ['syntax', true, false, 'catalogue']
     ]);
-    expect(toolBox('read').checked).toBe(false);
-    expect(toolBox('read').className).toBe('tool-tab-enable is-off');
-    expect(toolBox('read').dataset.enabled).toBe('false');
-    expect(toolBox('read').getAttribute('aria-label')).toBe('Enable read');
-    expect(toolBox('glob').checked).toBe(true);
-    expect(toolBox('syntax').checked).toBe(true);
+    // THE FIGURE, on the toggle itself: `aria-pressed` and the green `data-enabled` edge move
+    // together, and the tile keeps no state class of its own (the swap removed `is-on`/`is-off`).
+    expect(toolTile('read').getAttribute('aria-pressed')).toBe('false');
+    expect(toolTile('read').dataset.enabled).toBe('false');
+    expect(toolTile('read').className).toBe('tool-tab-button');
+    // The tile is a toggle, not a labelled checkbox: its accessible name is the row's own text
+    // (the tool name and its kind), so a press is announced as "read core pressed/unpressed".
+    expect(toolTile('read').getAttribute('aria-label')).toBeNull();
+    expect(toolTile('glob').getAttribute('aria-pressed')).toBe('true');
+    expect(toolTile('syntax').getAttribute('aria-pressed')).toBe('true');
+    // And the switch cost the reader NO layer: the tile press never opens the runner, and the
+    // corner mark it did not touch still says "closed".
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(toolInfo('read').getAttribute('aria-expanded')).toBe('false');
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').dataset.enabled).toBe('false');
     // An accepted switch says so on the pill the way every other accepted write does: `idle`, with
     // no diagnostic line — the error pill stays reserved for a refusal.
@@ -1456,11 +1810,12 @@ it('renders a brand-new session with every switchable box on, and switches one o
 // `toolCancel`, searchable-and-undeclared for the rest) and the shared double derives the wire
 // row, so the payload this test paints is the payload the route answers, field for field.
 //
-// What is pinned is the pane's own two figures, NOT a translation of them: every box TICKED
+// What is pinned is the pane's own two figures, NOT a translation of them: every tile PRESSED
 // (`main.ts` `toolRowInContext` — a protected name is in context because the harness holds it, and
-// the reader's complaint was a page that looked empty) and EXACTLY the ten protected boxes LOCKED
-// (`toolSwitchLockOf` — the box that 403s is disabled before the click, which is the other half of
-// the complaint: pressing `delegate` used to produce a refusal).
+// the reader's complaint was a page that looked empty) and EXACTLY the ten protected tiles LOCKED
+// (`toolSwitchLockOf` — the tile whose PATCH would 403 carries the `aria-disabled` +
+// `data-locked='protected'` pair before the click, which is the other half of the complaint:
+// pressing `delegate` used to produce a refusal).
 const hostRow = (name: string, over: Partial<SessionToolRowSeed> = {}): SessionToolRowSeed => ({
     name,
     group: 'Preset tools',
@@ -1513,7 +1868,7 @@ const MEASURED_SEEDS: readonly SessionToolRowSeed[] = [
 // The ten rows the harness owns itself — the exact set the probe reported as `protected: true`.
 const PROTECTED_HOST_NAMES = ['delegate', 'edit', 'fetch', 'glob', 'grep', 'read', 'tasks', 'toolCancel', 'toolRequest', 'write'];
 
-it('paints the measured 32-row new-session payload with every box ticked and exactly the ten protected boxes locked', async () => {
+it('paints the measured 32-row new-session payload with every tile pressed and exactly the ten protected tiles locked', async () => {
     const { config } = seededFetch(MEASURED_SEEDS);
 
     // The payload first: the 32 rows the pane is about to paint, in server order, exactly as the
@@ -1560,27 +1915,51 @@ it('paints the measured 32-row new-session payload with every box ticked and exa
 
     // Every row reaches the pane: the page read is `?limit=25`, so this also proves the cursor
     // walk (`main.ts` `readSessionToolRows`) followed the page instead of stopping at 25 rows.
+    // The figure read is the TILE's: `aria-pressed` for the state, `data-locked` for the reason
+    // a press cannot write, and `title` for the sentence the reader hears.
     const painted = [...document.querySelectorAll<HTMLElement>('.tool-tab-row')].map((node) => {
-        const box = node.querySelector<HTMLInputElement>('.tool-tab-enable')!;
+        const tile = node.querySelector<HTMLButtonElement>('.tool-tab-button')!;
 
-        return { name: box.dataset.tool ?? '', checked: box.checked, disabled: box.disabled, title: box.title };
+        return {
+            name: tile.dataset.tool ?? '',
+            pressed: tile.getAttribute('aria-pressed'),
+            locked: tile.dataset.locked,
+            title: tile.title
+        };
     });
 
     expect(painted).toHaveLength(32);
-    // The complaint in one figure: on a brand-new conversation NO row is off.
-    expect(painted.filter((row) => !row.checked).map((row) => row.name)).toEqual([]);
+    // The complaint in one figure: on a brand-new conversation NO tile reads as off.
+    expect(painted.filter((row) => row.pressed !== 'true').map((row) => row.name)).toEqual([]);
     // ...and the complaint that `delegate` errors when pressed: exactly the ten names the route
-    // 403s are the ten boxes that cannot be pressed.
-    expect(painted.filter((row) => row.disabled).map((row) => row.name).sort()).toEqual(PROTECTED_HOST_NAMES);
+    // 403s are the ten tiles that cannot write — each one stating WHY, and none of them using the
+    // `disabled` attribute, because every row keeps its info control.
+    expect(painted.filter((row) => row.locked !== undefined)).toEqual(
+        PROTECTED_HOST_NAMES.map((name) => ({
+            name,
+            pressed: 'true',
+            locked: 'protected',
+            title: 'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
+        }))
+    );
+    expect(painted.filter((row) => row.locked === undefined).map((row) => row.name)).toEqual(
+        MEASURED_SEEDS.map((seed) => seed.name)
+            .filter((name) => !PROTECTED_HOST_NAMES.includes(name))
+            .sort((left, right) => left.localeCompare(right))
+    );
+    // Every row of the payload has its own corner mark, locked rows included — the dialog is
+    // reachable from all 32 rows even though ten of them cannot be switched.
+    expect(document.querySelectorAll('.tool-tab-info')).toHaveLength(32);
+    expect(document.querySelectorAll('.tool-tab-enable')).toHaveLength(0);
 
-    // The two tooltip sentences, stated per row rather than counted: a locked box says WHY the
-    // harness holds it, a live box says it can be switched off. A protected row that read as
-    // "disabled, click to switch it on" is the lie this pass exists to remove.
+    // The two tooltip sentences, stated per row rather than counted: a locked tile says WHY the
+    // harness holds it, a live tile says it can be switched off. A protected row that read as
+    // "off, click to switch it on" is the lie this pass exists to remove.
     for (const row of painted) {
         expect(row.title).toBe(
             PROTECTED_HOST_NAMES.includes(row.name)
                 ? 'Always in context for this conversation · the harness itself declares it, so it cannot be switched here'
-                : 'Enabled for this conversation · click to switch this tool off'
+                : ENABLED_TITLE
         );
     }
 
@@ -1591,11 +1970,11 @@ it('paints the measured 32-row new-session payload with every box ticked and exa
     expect(byClass('.harness-note', 'p').textContent).toBe('32 tools · the toolbox of this conversation');
 });
 
-// R1's click separation: the box and the tile are two controls in one row, and each owns
-// exactly one of the two actions.
-it('writes enablement from the corner box without opening the runner, and the tile click still opens it', async () => {
-    // T4: the corner box writes the conversation (`PATCH /sessions/s1/tools/read`, answered by the
-    // shared double), while the TILE still pays the deployment's identified detail read for the
+// R1 (swap)'s click separation: the tile and the corner mark are two controls in one row, and
+// each owns exactly one of the two actions.
+it('writes enablement from the tile without opening the runner, and the corner mark still opens it', async () => {
+    // The TILE writes the conversation (`PATCH /sessions/s1/tools/read`, answered by the shared
+    // double), while the corner MARK still pays the deployment's identified detail read for the
     // runner's schema — that read is execution, and T4 left it global.
     const calls = stubFetch((url, method) => {
         if (url === '/api/tools/read' && method === undefined) return json({ tool: toolRowAnswer('read', false) });
@@ -1607,11 +1986,16 @@ it('writes enablement from the corner box without opening the runner, and the ti
     openTools();
     await flush();
 
-    // The box is the button's SIBLING, so its click cannot bubble into the tile's handler
-    // (CSS positions it over the tile's corner and lifts it above the button).
-    expect(toolBox('read').closest('button')).toBeNull();
+    // The mark is the tile's SIBLING inside the row wrapper, never its descendant: a `<button>`
+    // cannot contain a control, and nesting them would merge the two actions into one.
+    const info = toolInfo('read');
 
-    toolBox('read').click();
+    expect(info.closest('.tool-tab-button')).toBeNull();
+    expect(info.parentElement).toBe(toolTile('read').parentElement);
+    expect(info.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+
+    toolTile('read').click();
     await flush();
     await flush();
 
@@ -1621,21 +2005,26 @@ it('writes enablement from the corner box without opening the runner, and the ti
     ]);
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.querySelector('.tool-args')).toBeNull();
-    expect(toolBox('read').checked).toBe(false);
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+    expect(toolTile('read').getAttribute('aria-pressed')).toBe('false');
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').getAttribute('aria-pressed')).toBe('false');
 
-    // The tile click is the other action: it opens the runner and writes nothing.
-    byClass('.tool-tab-button[data-tool="read"]', 'button').click();
+    // The mark's press is the other action: it opens the runner and writes nothing.
+    info.click();
 
     expect(byClass('.dialog-title', 'h2').textContent).toBe('read');
     expect(calls.filter((call) => call.method === 'PATCH')).toHaveLength(1);
+    // The open state is the mark's, and it is the node the dialog hands focus back to.
+    expect(info.getAttribute('aria-expanded')).toBe('true');
+    expect(info.dataset.open).toBe('true');
 
     byClass('.dialog-close', 'button').click();
     await flush();
 
     expect(document.querySelector('.dialog')).toBeNull();
     // The list came back with the server's figure still painted on both readings.
-    expect(toolBox('read').checked).toBe(false);
+    expect(toolTile('read').getAttribute('aria-pressed')).toBe('false');
+    expect(info.getAttribute('aria-expanded')).toBe('false');
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').dataset.enabled).toBe('false');
 });
 
@@ -1683,27 +2072,31 @@ it('keeps the tools page and its rows usable while a run is pending, and locks e
     await flush();
 
     expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
+    // The row is still a real, focusable button mid-run — the tile never takes the `disabled`
+    // attribute, because its corner mark has to keep opening the dialog.
     expect(byClass('.tool-tab-button[data-tool="read"]', 'button').disabled).toBe(false);
 
     // T4: the SWITCH is a different story. `PATCH /sessions/{id}/tools/{id}` answers 409 unless the
     // session is idle (../shared/harness-api.ts:1873, `assertIdleForToolMutation` in
     // src/server/api.ts), so main.ts states that rule on the control BEFORE the click
     // (`toolSwitchLockOf` → 'running') instead of taking the refusal on the chin afterwards.
-    const runningSwitch = byClass('.tool-tab-enable[data-tool="read"]', 'input');
+    const runningTile = toolTile('read');
 
-    expect(runningSwitch.disabled).toBe(true);
-    expect(runningSwitch.title).toBe('This conversation is working · the switch unlocks when its run ends');
+    expect(runningTile.getAttribute('aria-disabled')).toBe('true');
+    expect(runningTile.dataset.locked).toBe('running');
+    expect(runningTile.title).toBe('This conversation is working · the switch unlocks when its run ends');
 
-    // A row is clickable mid-run: its runner opens over the list, schema read and all.
-    byClass('.tool-tab-button[data-tool="toolRequest"]', 'button').click();
+    // A row is clickable mid-run: its runner opens over the list, schema read and all — from the
+    // corner mark, which a pending run never locks.
+    toolInfo('toolRequest').click();
     expect(byClass('.dialog-title', 'h2').textContent).toBe('toolRequest');
     byClass('.dialog-close', 'button').click();
     await flush();
     expect(byClass('.stage', 'div').querySelector('.tools-pane')?.isConnected).toBe(true);
 
-    // A locked native control swallows the press, so the run costs the conversation no write and
-    // no 409: the toolbox traffic of this fixture is the single read that opened the pane.
-    runningSwitch.click();
+    // A locked tile swallows the press in its handler, so the run costs the conversation no write
+    // and no 409: the toolbox traffic of this fixture is the single read that opened the pane.
+    runningTile.click();
     await flush();
     await flush();
 
@@ -1711,7 +2104,9 @@ it('keeps the tools page and its rows usable while a run is pending, and locks e
     // The whole toolbox traffic of this fixture is the ONE read that opened the pane: the locked
     // control costs the conversation no write and no 409 round-trip.
     expect(toolboxTraffic(calls)).toEqual([{ url: TOOLBOX_PAGE_URL, method: undefined, body: undefined }]);
-    expect(byClass('.tool-tab-enable[data-tool="read"]', 'input').checked).toBe(true);
+    // And the figure is exactly what it was before the press: nothing moved, optimistically or
+    // otherwise.
+    expect(toolTile('read').getAttribute('aria-pressed')).toBe('true');
 });
 
 // ---------------------------------------------------------------------------

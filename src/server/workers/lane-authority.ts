@@ -80,6 +80,10 @@ import { ID_SPACES, createIdentityLedger, seedFromCounter } from './lane-identit
 import type { IdSpace, IdentityLease } from './lane-identity';
 import { ABSENT_DIGEST, applyMemoryWrite, assessMemoryAccess, captureMemoryWindow, digestMemoryValue } from './lane-memory';
 import type { MemoryWindow } from './lane-memory';
+// R5b: the payload shape `sync.tools` carries and the shape `toolStateNow()` returns. TYPE-ONLY
+// on purpose: ./protocol.ts imports this module's request union, so a VALUE import here would be
+// a runtime cycle (the same rule protocol.ts:62-64 states for the other direction).
+import type { LaneToolStateSync } from './protocol';
 // T10 findings M5/S2: the created-tool revision is scanned with the SAME lens the hello
 // report uses, before the canonical harness installs it, so a lane never runs a body whose
 // shared reach the plan could not bound.
@@ -237,6 +241,19 @@ export type LaneAuthority = {
     blueprintIdentities: () => Partial<Record<IdSpace, number>>;
     blueprintSnapshot: () => HarnessSnapshot;
     memoryWindow: (laneEpoch: number, keys?: string[]) => MemoryWindow;
+    // R5b: the WHOLE tool-switch state of this session, in the shape `sync.tools` carries
+    // (./protocol.ts `LaneToolStateSync`). Both lists are read from the canonical harness at
+    // call time, never cached: `discoveredTools` is the capped searchable set
+    // (src/harness.ts:13149) and `withheldTools` is the conversation's switch set
+    // (src/harness.ts:13165), and the figure the lane must land on is the one in force the
+    // moment the switch was written - which is the whole requirement ("real time, while the
+    // agent's thread is still running").
+    //
+    // This is the ONLY spelling of "what should I push to the lanes" the server is meant to
+    // use: the caller hands the value straight to `host.broadcastTools(sessionId, …)
+    // (./lane-host.ts) without knowing either kernel field, so the two halves of the reconcile
+    // cannot drift from what the authority itself replays into `sync.enabled`.
+    toolStateNow: () => LaneToolStateSync;
     // Everything the authority does on behalf of one lane.
     answer: (laneEpoch: number, request: LaneAuthorityRequest) => Promise<LaneAuthorityAnswer>;
     commit: (laneEpoch: number, group: MutationGroup) => GroupOutcome;
@@ -537,6 +554,15 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
     // The enabled tool set the replica must declare on its next model request. Read after a
     // discovery or registry change so the lane and the authority agree without a re-hello.
     const enabledNow = (): string[] => [...((harness as unknown as { discoveredTools?: string[] }).discoveredTools ?? [])];
+
+    // R5b: the canonical SWITCH set - the names the user of this conversation has turned off.
+    // `enabledNow()` cannot answer this: a `visibility: 'core'` or pending-only name never holds
+    // a cap slot, so it never appears in `discoveredTools` at all (src/harness.ts:13149), and a
+    // replica reconciled from `enabled` alone would go on declaring a core tool its user has
+    // already hidden. The read is defensive for exactly the reason `enabledNow` above is: a
+    // harness build without the seam (src/harness.ts:13165) reports nothing switched off, which
+    // is that build's real state rather than a crash in the push.
+    const withheldNow = (): string[] => [...((harness as unknown as { withheldTools?: readonly string[] }).withheldTools ?? [])];
 
     // The canonical transcript of one conversation, in canonical order. `threadMessages`
     // resolves BOTH ids a lane uses - a host thread AND an agent's default conversation
@@ -1176,6 +1202,12 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
         blueprintIdentities: () => ledger.published(),
         blueprintSnapshot: () => harness.snapshot(),
         memoryWindow: (laneEpoch, keys) => captureMemoryWindow(memory, keys ?? [...declared], laneEpoch),
+        // R5b: the one canonical read the server feeds to `host.broadcastTools`. BOTH lists come
+        // from the same harness at the same instant, so a reconcile can never carry a name in one
+        // list that the other list contradicts a moment later (the invariant `applyToolSwitch`
+        // keeps, src/harness.ts:1957). Copied, never the live arrays: the frame is structured-
+        // cloned on the way out, and a caller that sorts or filters must not move the harness.
+        toolStateNow: (): LaneToolStateSync => ({ enabled: enabledNow(), withheld: withheldNow() }),
         answer,
         commit,
         canonicalLengthOf,
