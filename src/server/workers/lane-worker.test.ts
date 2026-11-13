@@ -53,6 +53,10 @@ import { installAuthorityRuntime, nestedRunHandshakeLimitations, refuseNestedRun
 // view (`ReplicaReadView`) precisely so a test can hand it one.
 import { committedDigestOf, deriveOperations } from './lane-worker-loop';
 import type { LaneWorkerState, ReplicaReadView } from './lane-worker-loop';
+// The projection BOTH sides of the archive seam digest. The cases below gate a derived op on it, so
+// the expectation names the writer's own rule (./lane-commit.ts) instead of trusting the receipt.
+import { archiveDigestOf } from './lane-commit';
+import type { HarnessAgentResultSnapshot } from '../../types';
 import { digestMemoryValue } from './lane-memory';
 import type { LaneAuthority } from './lane-authority';
 import { HarnessPersistence } from '../persistence';
@@ -1391,6 +1395,143 @@ describe('worker mode: an IN-PLACE change to the committed prefix is an operatio
         // conversation has nothing yet" is a state both sides can compare, while "this key never
         // existed" is a memory-axis fact with a different meaning (./lane-memory.ts).
         expect(committedDigestOf(replicaView([]), { targetId: 'thread-1', committedLength: 0 })).toBe(digestMemoryValue([]));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Review finding #5 / issues 0020 + 0033 (2026-11-14) — the archive op the WORKER derives.
+//
+// A stopped lane run has always known what it said: `finishInvocation` writes
+// `partialContent`/`cancelledAtMessage` on the terminal transition (src/harness.ts:3886-3898) and
+// the worker's own snapshot projection carries both. The archive PAYLOAD named neither, so a
+// lane-archived cancellation landed as `content: ''` with no partial — issue 0020's "significant
+// cancelled child reports no partial content", with no restart involved. These cases pin the writer
+// end of that seam on the structural read view (no thread, no provider): the op names the pair, the
+// digest skip only skips a row that already holds THAT pair, and a completed record sends neither
+// field. The end-to-end version, on a real worker thread and a real session, is in
+// ./lane-worker-correctness.test.ts.
+// ---------------------------------------------------------------------------
+describe('worker mode: the derived archive op carries the forensic pair of a stopped run (review #5)', () => {
+    // The terminal row a cancelled lane turn leaves on its own replica.
+    const cancelledRow = {
+        invocationId: '513',
+        sequence: 3,
+        completedOrder: 1,
+        agent: 'research',
+        role: 'subagent',
+        kind: 'delegation',
+        status: 'cancelled',
+        content: '',
+        error: 'The run was cancelled.',
+        partialContent: 'thinking0 I will read the file',
+        cancelledAtMessage: 2,
+        threadId: 'thread-1'
+    } satisfies HarnessAgentResultSnapshot;
+
+    // The row the SAME lane archived BEFORE the pair crossed the seam: same identity, same status,
+    // and no forensics at all. Held separately rather than derived by `delete`, so the two digests
+    // below are both written out and a field added to one shape cannot silently appear in the other.
+    const archivedEmptyRow = {
+        invocationId: '513',
+        sequence: 3,
+        completedOrder: 1,
+        agent: 'research',
+        role: 'subagent',
+        kind: 'delegation',
+        status: 'cancelled',
+        content: '',
+        error: 'The run was cancelled.',
+        threadId: 'thread-1'
+    } satisfies HarnessAgentResultSnapshot;
+
+    // The op that row must produce, in full. `threadId` is stated by the lane from its own target
+    // (issue 0033/0024's owner rule) and `completedOrder` travels as the replica's local counter,
+    // which the authority then re-mints.
+    const stoppedOp = {
+        kind: 'result:archive',
+        invocationId: '513',
+        sequence: 3,
+        completedOrder: 1,
+        agent: 'research',
+        role: 'subagent',
+        runKind: 'delegation',
+        status: 'cancelled',
+        content: '',
+        error: 'The run was cancelled.',
+        partialContent: 'thinking0 I will read the file',
+        cancelledAtMessage: 2,
+        threadId: 'thread-1'
+    };
+
+    const viewWith = (results: HarnessAgentResultSnapshot[]): ReplicaReadView => ({
+        threadMessages: () => [],
+        memory: { has: () => false, get: () => undefined },
+        snapshot: () => ({ agentResults: results })
+    });
+
+    // A lane whose transcript base is already adopted (an empty conversation at an empty digest), so
+    // the ONLY operation it can owe is the archive, and `archived` is the only state that decides.
+    const laneWithArchived = (archived: Array<[string, string]>): LaneWorkerState =>
+        ({
+            epoch: 7,
+            targetId: 'thread-1',
+            committedLength: 0,
+            committedDigest: digestMemoryValue([]),
+            readDigests: {},
+            declaredKeys: [],
+            archived: new Map(archived),
+            identities: {}
+        }) as unknown as LaneWorkerState;
+
+    it('names the pair on the op, so canonical state learns what the stopped run said', () => {
+        expect(deriveOperations(laneWithArchived([]), viewWith([cancelledRow]))).toEqual([stoppedOp]);
+    });
+
+    it('skips a row whose canonical digest already covers that pair, and owes one that does not', () => {
+        // The op landed and the receipt digest was adopted: the next boundary owes nothing, which is
+        // the idempotence the digest exists to provide.
+        expect(deriveOperations(laneWithArchived([['513', archiveDigestOf(cancelledRow)]]), viewWith([cancelledRow]))).toEqual([]);
+
+        // THE REGRESSION THIS FINDING IS ABOUT. While the pair was outside `archiveDigestOf`, the
+        // digest of the empty row EQUALLED the digest of the row with the pair, so a lane whose
+        // earlier boundary archived `content: ''` skipped the only op that could have carried the
+        // forensics — the writer's own skip test suppressed the fix, and no amount of re-deriving
+        // would have sent it. A digest that cannot SEE a field cannot gate the write of that field.
+        expect(archiveDigestOf(archivedEmptyRow)).not.toBe(archiveDigestOf(cancelledRow));
+        expect(deriveOperations(laneWithArchived([['513', archiveDigestOf(archivedEmptyRow)]]), viewWith([cancelledRow]))).toEqual([
+            stoppedOp
+        ]);
+    });
+
+    it('sends neither field for a completed record, which is what keeps the row reloadable', () => {
+        // The ordinary path: `finishInvocation` drops the pair on a completed transition, so nothing
+        // extra travels, and the archived row stays one ../core/snapshot.ts can read back.
+        const completedRow = {
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'research',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'the finished answer',
+            threadId: 'thread-1'
+        } satisfies HarnessAgentResultSnapshot;
+
+        expect(deriveOperations(laneWithArchived([]), viewWith([completedRow]))).toEqual([
+            {
+                kind: 'result:archive',
+                invocationId: '513',
+                sequence: 3,
+                completedOrder: 1,
+                agent: 'research',
+                role: 'subagent',
+                runKind: 'delegation',
+                status: 'completed',
+                content: 'the finished answer',
+                threadId: 'thread-1'
+            }
+        ]);
     });
 });
 

@@ -82,15 +82,27 @@ export const WEB_SEARCH_GUIDELINE =
 // (src/harness.ts:2962-2976). What no schema can say is the three policies below, so this
 // line now carries ONLY those:
 //   1. a brief must be SELF-CONTAINED, because the child starts with no knowledge of the
-//      parent conversation (src/core/thread.ts — the agent thread accumulates per target);
+//      parent conversation, and (since 0028) no knowledge of the previous child either —
+//      a delegation from a conversation mints its own transcript (src/harness.ts, the
+//      delegation thread header);
 //   2. the caller OWNS the verification — a child's "done" is a claim (see
 //      ./planner.ts, which turns this into a per-step review);
-//   3. a FOLLOW-UP delegation continues the same child conversation, so a vague first
-//      brief is not fatal — asking again is cheaper than guessing.
+//   3. a FOLLOW-UP goes through the handle, not through a second delegation
+//      (0028, corrected 2026-11-14). The old text promised that "a later delegation
+//      continues that subagent's conversation", and the runtime does not do that for a
+//      conversation parent: EVERY delegation from a thread mints its own child
+//      conversation (src/harness.ts, `createThreadState(brain.name, { ownerThreadId })`),
+//      so the second brief arrives in a transcript that has never seen the first. Only a
+//      delegation from the HOST reuses the subagent's default conversation. The real
+//      continuation door is `threadSend` into the `threadId` the envelope reported, so
+//      this line names that handle instead of a continuity that is not there.
 // It reads correctly for a primary (it has the tool), a subagent (it never does), and a
-// lone agent (`subagents: []` means the row is not even registered, src/harness.ts:1101-1103).
+// lone agent (`subagents: []` means the row is not even registered — the `activeDescriptors`
+// filter's `case 'subagents'` arm returns `subagentNames.length > 0`, src/harness.ts:1227-1229,
+// over the allowlist resolved at :1118-1123, whose own comment states "A one-agent harness
+// therefore has no subagents and gets no delegate tool at all").
 export const DELEGATION_GUIDELINE =
-    'When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation, verify its answer before relying on it, and follow up with the same target instead of guessing: a later delegation continues that subagent\'s conversation.';
+    'When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation and every delegation starts a NEW one, verify its answer before relying on it, and continue a child you already used with threadSend on the threadId it returned rather than assuming it remembers the last brief.';
 
 // No sandbox: side effects land on the machine running the harness.
 export const PERMISSIONS_GUIDELINE =

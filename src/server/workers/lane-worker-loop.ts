@@ -453,7 +453,7 @@ export const installAuthorityRuntime = (replica: Harness): void => {
     // memory keys and identity watermarks. Transcript mirrors move through `transcript:sync` /
     // `adoptCommittedBase`, and a cascade target is never the lane's own conversation (that one
     // read stays local), so a later read of a released id is ROUTED and answers the canonical
-    // harness's own "no record in this session" error instead of a stale local copy.
+    // harness's own "is not available in this harness" error instead of a stale local copy.
     route('threadDelete', (callerThreadId, threadId) => ({
         threadId: threadId as string,
         identity: identityOf(undefined, { threadId: callerThreadId as string | undefined })
@@ -1095,7 +1095,35 @@ export const deriveOperations = (lane: LaneWorkerState, replica: ReplicaReadView
             runKind: record.kind,
             status: record.status,
             content: record.content,
-            ...(record.error === undefined ? {} : { error: record.error })
+            ...(record.error === undefined ? {} : { error: record.error }),
+            // Review finding #5 / issues 0020 + 0033 (2026-11-14): the FORENSIC PAIR of a run that
+            // did not finish. This replica produced both — `finishInvocation` writes them on the
+            // terminal transition and the snapshot projection carries them — and until now this
+            // payload named neither, so a lane-archived cancellation reached canonical state as
+            // `content: ''` with no partial at all: a significant cancelled child reporting nothing,
+            // with no restart involved.
+            //
+            // Spread only when present, exactly like `error` one line up. An absent partial means the
+            // run said NOTHING substantive, and `''` would be a different claim: the core refuses a
+            // present empty value (../core/snapshot.ts's `min: 1` bound), so emitting one for a run
+            // that never streamed anything would make the row impossible to archive. A `completed`
+            // record carries neither field (the terminal writer drops the pair there), so nothing
+            // extra travels on the ordinary path.
+            ...(record.partialContent === undefined ? {} : { partialContent: record.partialContent }),
+            ...(record.cancelledAtMessage === undefined ? {} : { cancelledAtMessage: record.cancelledAtMessage }),
+            // Stress report #6 (2026-11-14): the conversation this result belongs to. The
+            // canonical record's `threadId` is what `purgeThread` matches when a conversation
+            // is DELETED, and the lane states it from the one fact it knows: this replica runs
+            // exactly one conversation, and it is `targetId`. Omitting it is what made a
+            // lane-archived result escape the delete cascade while an inline one was removed.
+            //
+            // Review #5 correction (2026-11-14): the clause this comment used to carry — that the
+            // snapshot projection `HarnessAgentResultSnapshot` does not expose `threadId` — stopped
+            // being true when issue 0033/0024 taught the projection to write the owner WITH the row
+            // (src/harness.ts, the `agentResults` map in `snapshot()`). The reason to state the owner
+            // is unchanged and never needed that claim, and `archiveDigestOf` still excludes
+            // `threadId` because the authority assigns it rather than the writer.
+            threadId: lane.targetId as string
         });
     }
 

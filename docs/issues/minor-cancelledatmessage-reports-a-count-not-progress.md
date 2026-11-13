@@ -99,3 +99,40 @@ what the fields mean: committed messages, tool calls completed, and elapsed time
   Proposal (report tool calls completed and the current round index) is the half 0020 does not
   cover.
 - Severity unchanged: **Minor**.
+
+## Update (2026-11-14) — the wording half closed; the progress half delegated
+
+- **The counter is untouched, which is what AC2 asked for.** `run.messagesProduced =
+  Math.max(0, brain.messages.length - commitIndex)` is still captured before the splice
+  (`src/harness.ts:11458`) and still recorded as `cancelledAtMessage` by `finishInvocation`
+  (`src/harness.ts:3784`, next to the record's other forensic fields). Both surfaces emit it only
+  when it exists (`:4177-4179` in `agentResult`, `:4301-4303` in the `delegate` envelope).
+- **AC3 — met, in both descriptions and in the generated catalogue.** The sentence that advertised
+  progress now says what the number is: "`cancelledAtMessage`, which counts committed messages
+  rather than measuring progress" (`src/tools/runtime/delegate.tool.ts:99`) and "…`cancelledAtMessage`,
+  which counts the messages that run had committed and is not a measure of progress" (`:213`), both
+  regenerated into `src/core/metadata.ts:249` and `src/core/tool-manifest.ts:1193`. The neighbouring
+  conflation the review did not name is gone too: `maxTurns` is now documented as a cap on model
+  REQUESTS with "N allows at most N-1 tool rounds" (`src/tools/runtime/delegate.tool.ts:142`, the
+  same rule stated in the entry's turn-gate comment at `:66-70` and as stress-report item #7), which
+  is what made a "rounds" reading of `cancelledAtMessage` look plausible in the first place.
+- **AC1 — not met, and the field it wanted is now filed elsewhere.** The proposal asked for the
+  number of tool calls completed and, inside a model round, the round's index, so two children of
+  different depth are tellable without comparing `durationMs`. Nothing like that shipped: the
+  unfinished-run envelope is still `status` + `error` + `partialContent` + `cancelledAtMessage`
+  (`src/types/index.ts:1399-1407`), so a child stopped at 62 ms and one stopped at 9,962 ms after a
+  dozen tool rounds remain indistinguishable on the message count. The 2026-11-14 pass put that
+  need into its own entry — `docs/issues/minor-cancelled-childs-tool-activity-leaves-no-addressable-record.md`
+  (0032) proposes a bounded `toolActivity` tally captured at the same point — so AC1 of this entry
+  and 0032's field are the SAME work. The owner should fix one and close the other by reference
+  rather than adding two counters.
+- **Tests, and why the pin this entry asked for is still missing.** There is no test in
+  `src/harness.delegation.test.ts` comparing the reported progress of a first-turn cancellation
+  against a multi-round one, and **no pin that the description's wording of the forensic fields
+  matches the emitted fields** — the closest are a presence assertion
+  (`src/harness.metadata.test.ts:710`, the description must contain `partialContent`) and the
+  schema/prose pins for `timeoutMs` and `maxTurns`
+  (`src/core/metadata.ownership.test.ts:477-492`, `:495-557`), none of which covers the forensic
+  sentences. Since 2026-11-14 those sentences are the ONLY place the true meanings are written for a
+  model, an unguarded drift here re-creates the issue.
+- Status stays **Open** (AC1 outstanding, delegated to 0032), severity **Minor**.

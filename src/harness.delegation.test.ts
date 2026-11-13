@@ -136,6 +136,11 @@ const advance = async (ms: number): Promise<void> => {
     await flush();
 };
 
+// Real-time settle (20 ms): the same helper the cancel describe defines locally at
+// :1138. The 0019/0020 cases below need real timers because cancellation and the
+// re-drive cross actor boundaries, and a fake clock cannot interleave them honestly.
+const realSettle = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
+
 const deferred = <T>() => {
     let settle!: (value: T) => void;
     const promise = new Promise<T>((resolve) => {
@@ -180,6 +185,513 @@ const parkedTool = (name: string, gate: Promise<string>, mode?: 'async') =>
         ...(mode === undefined ? {} : { mode }),
         execute: () => gate
     });
+
+// ---------------------------------------------------------------------------
+// issue 0020 (AC1) fixtures — a child that STREAMS and then parks
+// ---------------------------------------------------------------------------
+//
+// `scripted([...answer(t)])` yields the text and then `done` in the same tick, so
+// the assistant message is committed before the run can be interrupted. The state
+// this issue is about — "interrupted with an answer in hand" where the answer was
+// never committed — needs a stream that emits its text and then never finishes.
+// `marker` lets a test observe the exact instant the child is parked mid-request:
+// the delta has left the transport, the harness has buffered it, and the model
+// request is still open.
+const parkedBeforeFirstDelta = (gate: Promise<unknown>): HarnessStream =>
+    async function* stream() {
+        await gate;
+        yield { type: 'text', delta: 'never reached' };
+        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+    };
+
+const streamedThenParked = (
+    text: string,
+    gate: Promise<unknown>,
+    marker?: { resolve: () => void }
+): HarnessStream =>
+    async function* stream() {
+        yield { type: 'text', delta: text };
+        marker?.resolve();
+        await gate;
+        // Only reached if the test releases the gate; the cancel tests never do.
+        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+    };
+
+// Counts the transcript entries that account for a child's outcome. `marker` is a
+// phrase only the child's OWN answer contains, so it appears once per account and
+// never as a side effect of surrounding runtime text. A delegation is "reported"
+// when this is exactly 1 — 0 means the outcome was discarded, 2 means the next turn
+// re-reported an outcome the transcript already carried.
+const accountsFor = (messages: readonly unknown[], marker: string): number =>
+    messages.filter((message) => JSON.stringify(message).includes(marker)).length;
+
+// ---------------------------------------------------------------------------
+// issues 0019 + 0020 (docs/issues/*.md) — every terminal child is reported, and a
+// cancelled child reports what it actually said
+// ---------------------------------------------------------------------------
+//
+// 0019: a `delegate` call can be discarded with no transcript account. The four
+// exits are: the parent terminates after launching the call, the launching request
+// is discarded, the call is parked when the parent's terminal lands, and the queue
+// abandons the carrier scope. What must hold across ALL of them is one invariant:
+// a conversation that has drained carries EXACTLY ONE account of a settled child,
+// and that account agrees with what the thread ledger says.
+//
+// 0020 (AC1): a child cancelled or turn-exhausted mid-sentence must report the text
+// it streamed. `HarnessAgentRunResult.partialContent` is the contract field
+// (src/types/index.ts:2254); until this issue it was only ever set by the
+// maxTurns-exhaustion throw, so an interrupted child that had streamed prose and
+// committed nothing reported nothing.
+// The released read surfaces these tests use. `threads()` is how a test OBSERVES a
+// child's invocation id (the runtime's rule: ids are never invented), and
+// `agentResult` is the durable terminal record for that id.
+const childOf = (
+    instance: any,
+    agentName = 'researcher'
+): { invocationId: string; agent: string; status: string } => {
+    const threads = instance.threads() as {
+        invocationId?: string;
+        agent: string;
+        status: string;
+    }[];
+    const child = threads.find((entry) => entry.agent === agentName);
+
+    if (child?.invocationId === undefined) throw new Error(`no thread for ${agentName}`);
+
+    return { ...child, invocationId: child.invocationId };
+};
+
+const recordOf = async (instance: any, invocationId: string): Promise<Record<string, any>> =>
+    (await instance.executeTool('agentResult', { agent: 'researcher', invocationId })) as Record<string, any>;
+
+// The `delegate` envelope the parent's transcript carries for a given call id.
+const envelopeOfCall = (messages: readonly unknown[], callId: string): Record<string, any> => {
+    const message = messages.find(
+        (entry) =>
+            (entry as { role?: string; toolCallId?: string }).role === 'tool' &&
+            (entry as { toolCallId?: string }).toolCallId === callId
+    );
+
+    if (message === undefined) throw new Error(`no tool result for ${callId}`);
+
+    return JSON.parse((message as { content: string }).content) as Record<string, any>;
+};
+
+describe('a settled delegation is never silently stranded (issue 0019)', () => {
+    // A structurally valid transcript: every tool result answers a call the
+    // transcript actually contains. An orphan result is how "we had to report it
+    // somewhere" silently becomes "the provider rejected the next request".
+    const orphanToolResults = (messages: readonly unknown[]): string[] => {
+        const called = new Set<string>();
+
+        for (const message of messages) {
+            const entry = message as { role?: string; toolCalls?: { id: string }[] };
+
+            if (entry.role === 'assistant') {
+                for (const call of entry.toolCalls ?? []) called.add(call.id);
+            }
+        }
+
+        return messages
+            .filter((message) => (message as { role?: string }).role === 'tool')
+            .map((message) => (message as { toolCallId: string }).toolCallId)
+            .filter((id) => !called.has(id));
+    };
+
+    it('accounts for a child that settled after its parent was cut off by its turn budget', async () => {
+        const gate = deferred<void>();
+        const researcher = brain(streamedThenParked('late: the module is fine', gate.promise));
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                answer('noted')
+            ])
+        );
+
+        // One model turn: the delegate call is launched and the budget is gone, so the
+        // run terminates with its tool call parked (issue 0019's first exit, through
+        // the turn-budget door).
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            presets: false,
+            maxIterations: 1
+        });
+
+        await expect(writer('go')).rejects.toThrow(
+            /requested tools on its single model turn without answering/
+        );
+
+        // An exhausted run ROLLS BACK its turns, so the transcript does not even hold
+        // the `delegate` call any more: an account CANNOT be a tool result for `c1`,
+        // and the runtime must not invent one there.
+        expect(withoutIds(writerAgent.messages)).toEqual([]);
+
+        gate.resolve();
+        await realSettle();
+
+        // The child is terminal — cancelled, because terminating the parent released
+        // its context — and its record says so. What the conversation says is the
+        // finding: it must carry an account of that outcome.
+        const child = childOf(writer);
+        const record = await recordOf(writer, child.invocationId);
+        expect(record.status).toBe('cancelled');
+
+        await writer('go2');
+
+        // EXACTLY ONE account of the child's outcome in the parent's conversation, and
+        // it must be addressable by a provider: no tool result for a call the
+        // transcript never carried.
+        expect(accountsFor(writerAgent.messages, 'late: the module is fine')).toBe(1);
+        expect(orphanToolResults(writerAgent.messages)).toEqual([]);
+
+        // A third turn does not re-report what the transcript already said.
+        await writer('go3');
+        expect(accountsFor(writerAgent.messages, 'late: the module is fine')).toBe(1);
+        expect(orphanToolResults(writerAgent.messages)).toEqual([]);
+
+        // AC2's drain invariant, stated over BOTH channels: the queue is empty (a settled
+        // record is never reported twice, and nothing is left queued behind the answer), and
+        // the LEDGER half still holds the same outcome — the account is not the only copy, so
+        // a caller that wants the record can still read it by id after the register has
+        // finished with it.
+        const drained = await recordOf(writer, child.invocationId);
+
+        expect(drained).toMatchObject({
+            invocationId: child.invocationId,
+            status: 'cancelled',
+            partialContent: 'late: the module is fine'
+        });
+    });
+
+    it('accounts for a child that settled after its parent was aborted with the call in flight', async () => {
+        const gate = deferred<void>();
+        const controller = new AbortController();
+        const researcher = brain(streamedThenParked('late: the module is fine', gate.promise));
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                answer('noted')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+
+        // The parent parks INSIDE the `delegate` tool; aborting lands its terminal
+        // while the child's launch is in flight and cancels the child.
+        const running = writer('go', { signal: controller.signal });
+        await realSettle();
+        controller.abort();
+
+        await expect(running).rejects.toThrow();
+        gate.resolve();
+        await realSettle();
+
+        const child = childOf(writer);
+        const record = await recordOf(writer, child.invocationId);
+        expect(record.status).toBe('cancelled');
+
+        await writer('go2');
+
+        expect(accountsFor(writerAgent.messages, 'late: the module is fine')).toBe(1);
+        expect(orphanToolResults(writerAgent.messages)).toEqual([]);
+
+        // The abort door does not report twice either. `abandonScope` cleared the task's
+        // `_notify`, so the child's late settlement is data on a dead task: the register saw
+        // the debt once (at the abandonment), paid it on `go2`, and has nothing left to pay.
+        await writer('go3');
+        expect(accountsFor(writerAgent.messages, 'late: the module is fine')).toBe(1);
+        expect(orphanToolResults(writerAgent.messages)).toEqual([]);
+    });
+
+    it('keeps the ONE account a still-open conversation already carries (no duplicate on the next turn)', async () => {
+        // The shape the runtime already handles: the child settles while the parent's
+        // conversation is still open. This pins that a re-drive does not re-report on
+        // the next turn what the transcript has already said.
+        const gate = deferred<void>();
+        const researcher = brain(streamedThenParked('the module is fine', gate.promise));
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                answer('noted')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        const running = writer('go');
+        await realSettle();
+        gate.resolve();
+
+        await running;
+        expect(accountsFor(writerAgent.messages, 'the module is fine')).toBe(1);
+
+        await writer('go2');
+        expect(accountsFor(writerAgent.messages, 'the module is fine')).toBe(1);
+        expect(orphanToolResults(writerAgent.messages)).toEqual([]);
+    });
+
+    it('drops an UNPAID account when a restore replaces the runtime state that owed it', async () => {
+        // The register is RUNTIME state, exactly like the mailbox FIFOs beside it: `snapshot()`
+        // and `restore()` model the PERSISTED contract, and AC5 accepts the window in which the
+        // process dies with an unpaid debt. A restore is that window made explicit — the debt is
+        // owned by a conversation the incoming document may not even contain — so `restore()`
+        // clears the register instead of replaying an account into a session that did not earn
+        // it. The counterfactual is the first test above: the SAME exhausted run, with no
+        // restore in the way, prints exactly one account on its next turn. What survives here is
+        // the durable half — the ledger still answers the id.
+        const gate = deferred<void>();
+        const researcher = brain(streamedThenParked('late: the module is fine', gate.promise));
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                answer('noted')
+            ])
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            presets: false,
+            maxIterations: 1
+        });
+
+        await expect(writer('go')).rejects.toThrow(
+            /requested tools on its single model turn without answering/
+        );
+
+        gate.resolve();
+        await realSettle();
+
+        const child = childOf(writer);
+        const snapshot = writer.snapshot();
+
+        writer.restore(snapshot);
+
+        // The debt was runtime state, so it is gone with the state it belonged to.
+        await writer('go2');
+        expect(accountsFor(writerAgent.messages, 'late: the module is fine')).toBe(0);
+        expect(orphanToolResults(writerAgent.messages)).toEqual([]);
+
+        // The durable half of the same window: the terminal record travelled with the snapshot,
+        // so the id the account would have named is still readable after the reload.
+        expect(await recordOf(writer, child.invocationId)).toMatchObject({
+            status: 'cancelled',
+            partialContent: 'late: the module is fine'
+        });
+    });
+});
+
+describe('a cancelled child reports the answer it was streaming (issue 0020 AC1)', () => {
+    // A child streams an answer, parks INSIDE the request (nothing is committed), and
+    // is cancelled while its parent is parked on the `delegate` call. `abort` chooses
+    // how the parent is cut off; it returns once the child is terminal, so every
+    // assertion below runs against a settled ledger with no wall-clock dependence.
+    const cancelledMidSentence = async (options: {
+        turns: (yield: (event: HarnessStreamEvent) => void) => Promise<void>;
+        abort: (writer: any, controller: AbortController, running: Promise<unknown>) => Promise<void>;
+        stream: HarnessStream;
+    }) => {
+        const researcher = brain(options.stream);
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                answer('noted')
+            ])
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            tools: options.turns === undefined ? {} : {
+                read: tool({
+                    description: 'Read.',
+                    tags: ['files'],
+                    visibility: 'core',
+                    execute: () => 'a long tool body full of facts'
+                })
+            },
+            presets: false
+        });
+
+        const controller = new AbortController();
+        const running = writer('go', { signal: controller.signal });
+        await realSettle();
+
+        await options.abort(writer, controller, running);
+
+        return { writer, writerAgent };
+    };
+
+    it('reports the in-flight streamed text as partialContent when the child is cancelled', async () => {
+        const childGate = deferred<void>();
+        const researcher = brain(streamedThenParked('nine seconds of prose', childGate.promise));
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                answer('noted')
+            ])
+        );
+
+        const controller = new AbortController();
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+
+        const running = writer('go', { signal: controller.signal });
+        await realSettle();
+
+        // The parent terminates while the child is mid-request; releasing the context
+        // cancels the child, and the gate release is what lets its parked transport
+        // unwind so the cancellation can be recorded.
+        controller.abort();
+        await expect(running).rejects.toThrow();
+        childGate.resolve();
+        await realSettle();
+
+        const child = childOf(writer);
+        const record = await recordOf(writer, child.invocationId);
+
+        // AC1: the prose it had streamed is reported, on the released door, with the
+        // identity fields the cancellation contract already carries.
+        expect(record.status).toBe('cancelled');
+        expect(record.error).toBe('This operation was aborted');
+        expect(record.content).toBe('nine seconds of prose');
+        expect(record.partialContent).toBe('nine seconds of prose');
+        expect(record.contentLength).toBe('nine seconds of prose'.length);
+    });
+
+    it('reports only the prose of the request that was in flight, not earlier transcript text', async () => {
+        // The leak guard. A child that answered one turn, took a tool result, and is
+        // then cut off mid-sentence reports ONLY the in-flight sentence: tool OUTPUT,
+        // the child's instructions and the injected delegation input all live in that
+        // same conversation, and an unbounded scan of it would pull them in.
+        const childGate = deferred<void>();
+        let researcherTurn = 0;
+
+        const researcher = brain(async function* stream() {
+            researcherTurn += 1;
+
+            if (researcherTurn === 1) {
+                yield { type: 'text', delta: 'earlier paragraph. ' };
+                yield {
+                    type: 'done',
+                    stopReason: 'tool_calls',
+                    toolCalls: [{ id: 'r1', name: 'read', arguments: '{"path":"src/a.ts"}' }]
+                };
+                return;
+            }
+
+            yield { type: 'text', delta: 'mid-sentence' };
+            await childGate.promise;
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        });
+
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                answer('noted')
+            ])
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            tools: {
+                read: tool({
+                    description: 'Read.',
+                    tags: ['files'],
+                    visibility: 'core',
+                    execute: () => 'a long tool body full of facts'
+                })
+            },
+            presets: false
+        });
+
+        const controller = new AbortController();
+        const running = writer('go', { signal: controller.signal });
+        await realSettle();
+        controller.abort();
+        await expect(running).rejects.toThrow();
+        childGate.resolve();
+        await realSettle();
+
+        // The parent's run was aborted, so its own turn is rolled back and the
+        // envelope may not survive in the transcript — the durable record is the
+        // surface AC1 names, and it must carry the in-flight sentence alone.
+        const child = childOf(writer);
+        const record = await recordOf(writer, child.invocationId);
+        expect(record.status).toBe('cancelled');
+        expect(record.partialContent).toBe('mid-sentence');
+        expect(record.content).toBe('mid-sentence');
+    });
+
+    it('reports the in-flight partial through the model-facing delegation timeout as well', async () => {
+        // The other cancellation door the finding names: `timeoutMs`. The cut lands
+        // while the transport is still parked, so this also pins that the parent's
+        // abandoned-child record does not lose the partial the child was streaming.
+        const childGate = deferred<void>();
+        const researcher = brain(streamedThenParked('nine seconds of prose', childGate.promise));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"review src/a.ts","timeoutMs":30}'
+                ),
+                answer('noted')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        const running = writer('go');
+
+        // Real timers: the bound is a wall-clock one, and the test moves PAST it before
+        // releasing the transport, so the cancellation is unambiguously first.
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        childGate.resolve();
+        await running;
+
+        const envelope = envelopeOfCall(writerAgent.messages, 'c1');
+        expect(envelope.status).toBe('cancelled');
+        expect(envelope.error).toBe(
+            'Delegation to "researcher" exceeded its 30ms timeout and was stopped.'
+        );
+        expect(envelope.content).toBe('nine seconds of prose');
+        expect(envelope.partialContent).toBe('nine seconds of prose');
+
+        const record = await recordOf(writer, envelope.invocationId);
+        expect(record.status).toBe('cancelled');
+        expect(record.partialContent).toBe('nine seconds of prose');
+        expect(record.content).toBe('nine seconds of prose');
+    });
+
+    it('reports no partialContent for a child cancelled before it streamed anything', async () => {
+        const childGate = deferred<void>();
+        // The child is mid-REQUEST with nothing streamed: the in-flight buffer is empty
+        // and the transcript holds only the delegation input.
+        const researcher = brain(parkedBeforeFirstDelta(childGate.promise));
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                answer('noted')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        const controller = new AbortController();
+        const running = writer('go', { signal: controller.signal });
+        // Let the child's request open, then cut the parent: the child is cancelled
+        // inside its first request, having streamed nothing.
+        await realSettle();
+        controller.abort();
+        await expect(running).rejects.toThrow();
+        childGate.resolve();
+        await realSettle();
+
+        // Absent, not empty: the child never said anything. `min: 1` in the snapshot
+        // reader (src/core/snapshot.ts) is what makes that distinction durable across a
+        // restart, and a present value always means text the child really produced.
+        const child = childOf(writer);
+        const record = await recordOf(writer, child.invocationId);
+        expect(record.status).toBe('cancelled');
+        expect('partialContent' in record).toBe(false);
+        expect(record.content).toBe('');
+    });
+});
 
 describe('primary and subagents', () => {
     it('selects the primary explicitly and defaults the allowlist to the rest', () => {
@@ -639,6 +1151,121 @@ describe('delegation result contract (T28)', () => {
         expect(answerOf(writerAgent.messages[2])).toEqual({ agent: 'researcher', content: 'done' });
     });
 
+    // ------------------------------------------------------------------
+    // Issue 0025 (2026-11-14) — the brief gate reads SUBSTANCE, not a magic phrase.
+    //
+    // Three directions, each pinned separately because the old single word list failed in both
+    // directions at once and the original pass only tested one of them:
+    //   * an explicit output shape or COUNT is a criterion (AC1) — the brief below names a file,
+    //     an operation, a shape and a count, and used to be refused;
+    //   * a brief that names no target is still refused BEFORE the child runs, and the refusal
+    //     still names exactly the part that is missing (AC2);
+    //   * a causal or incidental word is no longer an acceptance signal (the review's
+    //     over-acceptance finding), so the gate did not just get looser.
+    // ------------------------------------------------------------------
+
+    it('accepts a brief whose done-ness is an explicit output shape rather than a modal verb', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('summarised')], seen));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"Summarize the file README.md in three bullets.","requireClarification":true}'
+                ),
+                answer('final')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        // Accepted: the child ran, so the caller paid no round trip for a `done when` clause
+        // that would have added nothing the child could not already do.
+        expect(seen).toHaveLength(1);
+        expect(answerOf(writerAgent.messages[2])).toEqual({ agent: 'researcher', content: 'summarised' });
+    });
+
+    it('refuses an acceptance-worded brief that names no target, and names only the target', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('should not run')], seen));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"Make the module such that it must pass the tests.","requireClarification":true}'
+                ),
+                answer('recovered')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        const refusal = content(writerAgent.messages[2]);
+
+        expect(refusal).toContain('is under-specified');
+        expect(refusal).toContain('concrete target');
+        // The criterion IS stated (`must pass`), so the refusal must not claim otherwise — a
+        // caller that reads one half of the list should not go and restate the other half.
+        expect(refusal).not.toContain('acceptance criterion');
+        expect(seen).toHaveLength(0);
+    });
+
+    it('refuses a brief whose only acceptance signal is a causal word', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('should not run')], seen));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"Refactor `src/parse.ts` because it is long.","requireClarification":true}'
+                ),
+                answer('recovered')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        const refusal = content(writerAgent.messages[2]);
+
+        expect(refusal).toContain('is under-specified');
+        expect(refusal).toContain('acceptance criterion');
+        // The target is named (a quoted path), so it is not reported as missing.
+        expect(refusal).not.toContain('concrete target');
+        expect(seen).toHaveLength(0);
+    });
+
+    it('names both missing parts for a brief that states neither a target nor a criterion', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('should not run')], seen));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"Make it better.","requireClarification":true}'
+                ),
+                answer('recovered')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        const refusal = content(writerAgent.messages[2]);
+
+        expect(refusal).toContain('concrete target');
+        expect(refusal).toContain('acceptance criterion');
+        // AC3: the remedy no longer insists on a `done when` clause specifically.
+        expect(refusal).not.toContain('done when');
+        expect(seen).toHaveLength(0);
+    });
+
     it('reports a cancelled child as a structured result instead of an empty record', async () => {
         // A child that commits a substantive turn and then hangs inside a tool: the run
         // is cancelled mid-flight, which is exactly the case the transcript rollback
@@ -708,6 +1335,576 @@ describe('delegation result contract (T28)', () => {
         expect(stored.content).toBe('half an answer');
         expect(stored.cancelledAtMessage).toBeGreaterThan(0);
         expect(stored.error).toContain('operator stop');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 0028 AC3 — WHICH conversation a delegated child runs in, pinned in BOTH
+// directions by behaviour rather than by description text
+// ---------------------------------------------------------------------------
+//
+// The `delegate` descriptions promise a fresh conversation per delegation, and the runtime
+// really does branch on the PARENT's conversation kind (`src/harness.ts:12350-12368`):
+//   - a parent that is itself an independent host conversation (`createThread`, record
+//     origin 'host') MINTS a new child thread per delegation — `createThreadState` at
+//     `:12360`, linked to the caller with `ownerThreadId` — so siblings never share a
+//     transcript even when they target the same agent;
+//   - a parent with no thread of its own (a host-driven session: the primary invoked
+//     directly, which binds it to its DEFAULT conversation, origin 'agent') falls through to
+//     `defaultThreadOf` at `:12367`, so EVERY delegation to one subagent re-enters that
+//     subagent's standing `agent:<name>` conversation and a second child really does see
+//     what it answered the first time.
+// Only the single-delegation case was pinned (`:1038`, `:1577`), so either direction could
+// be inverted with the suite green — which is how the prose drifted into promising
+// unconditional freshness. "Remembers" is not hidden state here: it is observable as the
+// message list the NEXT model request carries, so both tests assert that list end to end.
+// Every expected value below was measured from these exact scenarios, not inferred.
+describe('delegation conversation continuity, both directions (issue 0028 AC3)', () => {
+    // The envelope a call ended with, minus the one field no assertion here owns. The file's
+    // `envelopeOfCall` (:268) returns the whole JSON; `durationMs` is measured, so it is
+    // checked for type only and dropped, exactly as the 0029 block does at :1368.
+    const envelopeWithoutClock = (messages: readonly unknown[], callId: string): Record<string, unknown> => {
+        const { durationMs, ...rest } = envelopeOfCall(messages, callId);
+
+        expect(durationMs).toEqual(expect.any(Number));
+
+        return rest;
+    };
+
+    // The transcript as the CHILD model receives it: role plus text, messageIds stripped
+    // (`withoutIds`, :53) because an id is an address, not content.
+    const requestsOf = (requests: readonly HarnessStreamRequest[]) =>
+        requests.map((request) =>
+            request.messages.map((message) => ({ role: message.role, content: message.content }))
+        );
+
+    it('re-enters the same child conversation when a host-driven session delegates twice', async () => {
+        const childRequests: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('facts one'), answer('facts two')], childRequests), {
+            instruction: 'You are a researcher.'
+        });
+        // Two delegate turns, then the answer: each turn is a separate model REQUEST of the
+        // parent, so the first child has fully finished before the second one starts.
+        const writerAgent = brain(
+            scripted([
+                callTool('d1', 'delegate', JSON.stringify({ agent: 'researcher', input: 'brief one' })),
+                callTool('d2', 'delegate', JSON.stringify({ agent: 'researcher', input: 'brief two' })),
+                answer('final')
+            ]),
+            { instruction: 'You are a writer.' }
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+
+        await writer('go');
+
+        // SAME conversation id, DIFFERENT run ids: the second delegation was another turn of
+        // `agent:researcher`, not a new conversation.
+        expect(envelopeWithoutClock(writerAgent.messages, 'd1')).toEqual({
+            agent: 'researcher',
+            content: 'facts one',
+            contentLength: 9,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'agent:researcher',
+            status: 'completed'
+        });
+        expect(envelopeWithoutClock(writerAgent.messages, 'd2')).toEqual({
+            agent: 'researcher',
+            content: 'facts two',
+            contentLength: 9,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '3',
+            threadId: 'agent:researcher',
+            status: 'completed'
+        });
+
+        // No child thread was minted at all: delegating twice from the host still leaves only
+        // the two default conversations in the session.
+        expect(writer.threads().map((record) => [record.id, record.origin])).toEqual([
+            ['agent:writer', 'agent'],
+            ['agent:researcher', 'agent']
+        ]);
+
+        // The standing conversation accumulated BOTH exchanges, in order.
+        expect(withoutIds(researcher.messages)).toEqual([
+            { role: 'system', content: 'You are a researcher.' },
+            { role: 'user', content: 'brief one' },
+            { role: 'assistant', content: 'facts one' },
+            { role: 'user', content: 'brief two' },
+            { role: 'assistant', content: 'facts two' }
+        ]);
+
+        // THE PIN: the second request carried the first brief and the first answer, so the
+        // child of the second delegation really does remember the first one.
+        expect(requestsOf(childRequests)).toEqual([
+            [
+                { role: 'system', content: 'You are a researcher.' },
+                { role: 'user', content: 'brief one' }
+            ],
+            [
+                { role: 'system', content: 'You are a researcher.' },
+                { role: 'user', content: 'brief one' },
+                { role: 'assistant', content: 'facts one' },
+                { role: 'user', content: 'brief two' }
+            ]
+        ]);
+
+        await writer.dispose();
+    });
+
+    it('mints two independent child conversations for a threaded parent, neither of which remembers the other', async () => {
+        const childRequests: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('facts one'), answer('facts two')], childRequests), {
+            instruction: 'You are a researcher.'
+        });
+        // Two host sends of the SAME thread, each delegating once. `scripted` counts REQUESTS,
+        // so one send consumes two entries (the tool call, then the answer) and the second
+        // send continues the same parent conversation with entries 3 and 4.
+        const writerAgent = brain(
+            scripted([
+                callTool('d1', 'delegate', JSON.stringify({ agent: 'researcher', input: 'brief one' })),
+                answer('first done'),
+                callTool('d2', 'delegate', JSON.stringify({ agent: 'researcher', input: 'brief two' })),
+                answer('second done')
+            ]),
+            { instruction: 'You are a writer.' }
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        const parent = writer.createThread('writer');
+
+        await writer.sendThreadInput(parent.id, 'first task');
+        await writer.sendThreadInput(parent.id, 'second task');
+
+        const parentMessages = writer.threadMessages(parent.id);
+
+        // Two DIFFERENT minted conversations, addressed by two different ids.
+        expect(envelopeWithoutClock(parentMessages, 'd1')).toEqual({
+            agent: 'researcher',
+            content: 'facts one',
+            contentLength: 9,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'thread-2',
+            status: 'completed'
+        });
+        expect(envelopeWithoutClock(parentMessages, 'd2')).toEqual({
+            agent: 'researcher',
+            content: 'facts two',
+            contentLength: 9,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '4',
+            threadId: 'thread-3',
+            status: 'completed'
+        });
+
+        // The roster is the proof of minting, not the envelope: `thread-2` and `thread-3` are
+        // separate host conversations owned by `thread-1`, and the invocation ids pair each
+        // child with its own run.
+        expect(
+            writer.threads().map((record) => [record.id, record.origin, record.ownerThreadId, record.invocationId])
+        ).toEqual([
+            ['agent:writer', 'agent', undefined, undefined],
+            ['agent:researcher', 'agent', undefined, undefined],
+            ['thread-1', 'host', undefined, '3'],
+            ['thread-2', 'host', 'thread-1', '2'],
+            ['thread-3', 'host', 'thread-1', '4']
+        ]);
+
+        // Each child holds exactly its OWN exchange …
+        expect(withoutIds(writer.threadMessages('thread-2'))).toEqual([
+            { role: 'system', content: 'You are a researcher.' },
+            { role: 'user', content: 'brief one' },
+            { role: 'assistant', content: 'facts one' }
+        ]);
+        expect(withoutIds(writer.threadMessages('thread-3'))).toEqual([
+            { role: 'system', content: 'You are a researcher.' },
+            { role: 'user', content: 'brief two' },
+            { role: 'assistant', content: 'facts two' }
+        ]);
+
+        // … and neither request carried the other's brief: isolation, asserted as what the
+        // child was actually shown.
+        expect(requestsOf(childRequests)).toEqual([
+            [
+                { role: 'system', content: 'You are a researcher.' },
+                { role: 'user', content: 'brief one' }
+            ],
+            [
+                { role: 'system', content: 'You are a researcher.' },
+                { role: 'user', content: 'brief two' }
+            ]
+        ]);
+
+        // The asymmetry with the host case, stated as data: a threaded parent never touches the
+        // subagent's standing conversation, which stays at its seeded system prompt.
+        expect(withoutIds(writer.threadMessages('agent:researcher'))).toEqual([
+            { role: 'system', content: 'You are a researcher.' }
+        ]);
+
+        await writer.dispose();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Issues 0029 and 0021 — the identity an envelope reports belongs to the child THIS
+// call started, and a delegation released by `toolCancel` still delivers its result
+// ---------------------------------------------------------------------------
+//
+// Both defects are one problem: a `delegate` result is computed by a run the CALLER does
+// not hold.
+//
+//   D1 (0029) — the identity used to be REDISCOVERED after the child resolved: "the record
+//   whose `parentCallId` equals my call id", else "the newest record for that agent I had
+//   not seen at dispatch". A tool-call id is unique only WITHIN one run, and a second run of
+//   the same agent genuinely overlaps a delegation (a host thread queues on its own actor,
+//   not on the agent's default conversation), so either rule can name a run this call never
+//   started — and the caller reports another run's `invocationId`, `threadId` AND `status`.
+//   The child run now CARRIES its identity out through `context.run(..., { identity })`, so
+//   the ledger entry is ADDRESSED by that id and only verified afterwards.
+//
+//   D2 (0021) — `toolCancel` releases the call synchronously (JavaScript cannot be
+//   preempted) and the scheduler treats the child's late resolution as data on a dead task.
+//   The envelope this call computed was therefore produced and DISCARDED: the caller read
+//   "no result is available" and had to spend a second call on forensics that already
+//   existed in the child's terminal record.
+describe('delegation identity by value and cancel delivery (0029, 0021)', () => {
+    // The envelope with its ONE measured number pulled out (no assertion here owns elapsed
+    // time — the T28 contract test above pins it with `expect.any`). Accepts either the value
+    // a manual `executeTool('delegate')` hands back, or a transcript message whose `content`
+    // is the delivered JSON.
+    const envelopeOf = (value: unknown): Record<string, unknown> => {
+        const candidate =
+            (value as { role?: unknown } | undefined)?.role === undefined ? value : content(value);
+        const parsed = (typeof candidate === 'string'
+            ? JSON.parse(candidate)
+            : candidate) as Record<string, unknown>;
+        const { durationMs, ...rest } = parsed;
+
+        expect(durationMs).toEqual(expect.any(Number));
+
+        return rest;
+    };
+
+    // The message a tool call ended up with, so an assertion names the CALL rather than a
+    // transcript index that moves when the turn shape changes.
+    const toolMessageOf = (brain: Agent, callId: string): Record<string, any> =>
+        brain.messages.find(
+            (message) => (message as Record<string, any>).role === 'tool' && (message as Record<string, any>).toolCallId === callId
+        ) as Record<string, any>;
+
+    // This file's `scripted` helper counts TURNS in one closure, so two concurrent runs of
+    // the SAME Agent consume each other's turns. Every stream below answers from the REQUEST
+    // instead: that is what makes the interleaving below deterministic.
+    const answersFromRequest = (textFor: (input: string) => string): HarnessStream =>
+        (async function* stream(request: HarnessStreamRequest) {
+            const answered = request.messages.some((message) => (message as Record<string, any>).role === 'tool');
+            const input = String(
+                request.messages.find((message) => (message as Record<string, any>).role === 'user')?.content ?? ''
+            );
+            const text = textFor(input);
+
+            if (!answered) {
+                yield { type: 'text', delta: `half of ${text}` };
+                yield {
+                    type: 'done',
+                    stopReason: 'tool_calls',
+                    toolCalls: [{ id: 'hold-1', name: 'hold', arguments: '{}' }]
+                };
+                return;
+            }
+
+            yield { type: 'text', delta: text };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        } as unknown) as HarnessStream;
+
+    const holdTool = (gate: Promise<void>) =>
+        tool({
+            description: 'Hold until the test releases it.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: () => gate.then(() => 'released')
+        });
+
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+    it('names the child THIS call started while a host thread of the same agent runs alongside', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([answer('final')])),
+                researcher: brain(
+                    answersFromRequest((input) => (input === 'thread task' ? 'the thread answer' : 'the delegated answer'))
+                )
+            },
+            tools: { hold: holdTool(gate) },
+            presets: false
+        });
+
+        // The MANUAL `executeTool` door: it carries no `callId` and no `runScope`, so before
+        // the carrier existed this call had exactly one rule left — "the newest record for
+        // that agent that did not exist when I dispatched".
+        const delegated = writer.executeTool('delegate', { agent: 'researcher', input: 'find facts' });
+
+        // A second run of the SAME agent, started while the first is still inside its tool.
+        // A host thread owns its own actor, so it really does overlap the delegated
+        // conversation — and it registers its ledger entry in the same window.
+        const thread = writer.createThread('researcher');
+        const sibling = writer.sendThreadInput(thread.id, 'thread task');
+
+        await settle();
+        release();
+
+        expect(envelopeOf(await delegated)).toEqual({
+            agent: 'researcher',
+            content: 'the delegated answer',
+            contentLength: 20,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            // THE POINT OF THE TEST. `'1'` is the delegated child (its conversation is the
+            // agent's DEFAULT thread); `'2'` is the host thread's run. Measured on the
+            // pre-carrier code, this same scenario reported the sibling instead —
+            // `invocationId: '2'`, `threadId: 'thread-1'` — an identity, a conversation and a
+            // status this call never had.
+            invocationId: '1',
+            threadId: 'agent:researcher',
+            status: 'completed'
+        });
+
+        expect((await sibling).content).toBe('the thread answer');
+
+        // The sibling's record still exists and is still its OWN — the fix stopped
+        // misreporting it, it did not merge or drop it. `agentManage` is the caller's view of
+        // the same ledger, asserted whole.
+        expect(await writer.executeTool('agentManage', {})).toEqual({
+            agents: [
+                { name: 'writer', role: 'primary', model: 'merge/ds4-flash', invocationCount: 0, results: [] },
+                {
+                    name: 'researcher',
+                    role: 'subagent',
+                    model: 'merge/ds4-flash',
+                    invocationCount: 2,
+                    results: [
+                        {
+                            invocationId: '2',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 17,
+                            preview: 'the thread answer',
+                            truncated: false
+                        },
+                        {
+                            invocationId: '1',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 20,
+                            preview: 'the delegated answer',
+                            truncated: false
+                        }
+                    ]
+                }
+            ],
+            totalResults: 2,
+            activeResults: 0,
+            truncated: false
+        });
+
+        await writer.dispose();
+    });
+
+    it('keeps two parents that share a tool-call id pointed at different children', async () => {
+        const writerAgent = brain(
+            (async function* stream(request: HarnessStreamRequest) {
+                const answered = request.messages.some((message) => (message as Record<string, any>).role === 'tool');
+
+                if (!answered) {
+                    // BOTH conversations of this one Agent write the SAME call id (`c1`) —
+                    // legal, because a call id is scoped to its run — and delegate to a
+                    // different subagent each time.
+                    const input = String(
+                        request.messages.find((message) => (message as Record<string, any>).role === 'user')?.content ?? ''
+                    );
+
+                    yield {
+                        type: 'done',
+                        stopReason: 'tool_calls',
+                        toolCalls: [
+                            {
+                                id: 'c1',
+                                name: 'delegate',
+                                arguments: JSON.stringify({
+                                    agent: input === 'route A' ? 'researcher' : 'critic',
+                                    input: `review ${input}`
+                                })
+                            }
+                        ]
+                    };
+                    return;
+                }
+
+                const result = String(
+                    request.messages.filter((message) => (message as Record<string, any>).role === 'tool').pop()?.content ?? ''
+                );
+
+                yield { type: 'text', delta: `done: ${(JSON.parse(result) as { content: string }).content}` };
+                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+            } as unknown) as HarnessStream
+        );
+
+        const writer = harness({
+            agents: {
+                writer: writerAgent,
+                researcher: brain(scripted([answer('the facts')])),
+                critic: brain(scripted([answer('the verdict')]))
+            },
+            presets: false
+        });
+
+        const first = writer('route A');
+        const thread = writer.createThread('writer');
+        const second = writer.sendThreadInput(thread.id, 'route B');
+
+        await first;
+        expect((await second).content).toBe('done: the verdict');
+
+        // Each parent names ITS OWN child: the ids, conversations and answers are paired, and
+        // neither envelope can be the other's (the pre-carrier pair match keyed on
+        // `parentCallId` alone was one missing `parentScope` check away from getting this
+        // backwards for a parent that has no scope).
+        expect(envelopeOf(toolMessageOf(writerAgent, 'c1'))).toEqual({
+            agent: 'researcher',
+            content: 'the facts',
+            contentLength: 9,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '3',
+            threadId: 'agent:researcher',
+            status: 'completed'
+        });
+
+        const threadToolMessage = (writer.threadMessages(thread.id) as Record<string, any>[]).find(
+            (message) => message.role === 'tool' && message.toolCallId === 'c1'
+        );
+
+        expect(envelopeOf(threadToolMessage)).toEqual({
+            agent: 'critic',
+            content: 'the verdict',
+            contentLength: 11,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '4',
+            threadId: 'thread-2',
+            status: 'completed'
+        });
+
+        await writer.dispose();
+    });
+
+    it('delivers the child forensics when toolCancel releases the delegation', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+
+        const researcher = brain(
+            scripted([
+                [
+                    { type: 'text', delta: 'half an answer' },
+                    { type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'r1', name: 'hold', arguments: '{}' }] }
+                ],
+                answer('never reached')
+            ])
+        );
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
+                callTool('c2', 'toolCancel', '{"callId":"c1"}'),
+                answer('final')
+            ])
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            tools: { hold: holdTool(gate) },
+            presets: false
+        });
+
+        const running = writer('go');
+        await settle();
+        await running;
+        release();
+        await settle();
+
+        // ONE tool message for `c1`, classified as the control outcome it was, and it carries
+        // the child's terminal record instead of the "no result is available" sentence: the
+        // answer the child managed to finish (here, none — its text was rolled back with the
+        // run), the partial text it had said, how far it got, and the identity of the exact
+        // invocation that produced them.
+        expect(envelopeOf(toolMessageOf(writerAgent, 'c1'))).toEqual({
+            agent: 'researcher',
+            content: 'half an answer',
+            contentLength: 14,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'agent:researcher',
+            status: 'cancelled',
+            // A harness-raised reason naming the agent and the cause. The child's OWN record
+            // keeps its raw abort string (asserted below) — 0021 AC1 asks for the classifiable
+            // wording on the door the CALLER used, and `agentResult` stays the child's account.
+            error: 'Delegation to "researcher" was cancelled by the caller before the call returned.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            callCancelled: true
+        });
+
+        expect(toolMessageOf(writerAgent, 'c1').outcome).toBe('cancelled');
+
+        // The `toolCancel` control is untouched: same acknowledgement, byte for byte, and the
+        // released call still keeps exactly one result (0021 AC3).
+        expect(content(toolMessageOf(writerAgent, 'c2'))).toBe(
+            '{"cancelled":true,"callId":"c1","name":"delegate"}'
+        );
+        expect(writerAgent.messages.filter((message) => (message as Record<string, any>).role === 'tool').length).toBe(2);
+
+        // The delivered bytes and the ledger agree: the same invocation reads the same status,
+        // the same partial answer and the same progress marker through `agentResult` (0019 AC3).
+        const stored = (await writer.executeTool('agentResult', {
+            agent: 'researcher',
+            invocationId: '2'
+        })) as Record<string, any>;
+
+        expect({
+            status: stored.status,
+            content: stored.content,
+            partialContent: stored.partialContent,
+            cancelledAtMessage: stored.cancelledAtMessage
+        }).toEqual({
+            status: 'cancelled',
+            content: 'half an answer',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2
+        });
+
+        // The child's own wording is still what the record holds — the raw abort primitive
+        // 0021 also names. Replacing it is the record's business, not this door's, so it is
+        // pinned here to make that boundary explicit.
+        expect(stored.error).toBe('This operation was aborted');
+
+        await writer.dispose();
     });
 });
 
@@ -1527,7 +2724,7 @@ describe('pending delegation placeholder (delegate-stress T1.3/T1.4)', () => {
 
     it('advertises toolCancel beside the callId while the child is still running', async () => {
         const seenParent: HarnessStreamRequest[] = [];
-        const { writer, gate } = hangingChild({
+        const { writer, writerAgent, gate } = hangingChild({
             arguments: '{"agent":"researcher","input":"find facts"}',
             ping: false,
             seenParent
@@ -1555,10 +2752,18 @@ describe('pending delegation placeholder (delegate-stress T1.3/T1.4)', () => {
         // because its wording is not the published shape (see the alignment note in
         // src/harness.inclusion.test.ts) — what this finding pins is that the text
         // NAMES the control and the id it belongs to.
-        const { note, ...payload } = JSON.parse(placeholder.content) as {
+        //
+        // Issue 0024 (2026-11-14) edited this pin deliberately: the two identity fields are
+        // now part of the contract, so they are destructured OUT of the generic payload (which
+        // stays exactly the four keys it always was) and asserted against the terminal envelope
+        // below rather than against a hard-coded number — the finding is that the placeholder
+        // names the SAME child, and an invocation id is a runtime value, not a fixture.
+        const { note, invocationId, threadId, ...payload } = JSON.parse(placeholder.content) as {
             status: string;
             callId: string;
             name: string;
+            invocationId: string;
+            threadId: string;
             elapsedMs: number;
             note: string;
         };
@@ -1570,6 +2775,133 @@ describe('pending delegation placeholder (delegate-stress T1.3/T1.4)', () => {
         gate.resolve('released');
         await flush();
         expect(state.status).toBe('resolved');
+
+        // 0024 AC1 — the pending placeholder and the delivered envelope describe ONE child.
+        // Before this fix the caller held only `c1` at exactly the moment it might want to
+        // inspect the running child, and recovering the ids meant `agentManage`.
+        const terminal = delegationOf(writerAgent.messages[2]);
+
+        expect({ invocationId, threadId }).toEqual({
+            invocationId: terminal.invocationId,
+            threadId: terminal.threadId
+        });
+    });
+
+    it('gives each of three siblings in flight its own child identity (AC3)', async () => {
+        // 0024 AC3 extends the sibling-attribution guarantee (0029) to the PENDING state. Three
+        // delegations to ONE agent would serialize behind each other (one model stream per
+        // agent), so the interesting shape is three DIFFERENT subagents running at once: each
+        // pending placeholder used to carry only its callId, which cannot say which child it
+        // describes.
+        const gates = [deferred<string>(), deferred<string>(), deferred<string>()];
+        const names = ['alpha', 'beta', 'gamma'];
+
+        const children = names.map((name, index) =>
+            brain(
+                scripted([
+                    [
+                        { type: 'text', delta: 'working' },
+                        {
+                            type: 'done',
+                            stopReason: 'tool_calls',
+                            toolCalls: [{ id: `h${index}`, name: `hang${index}`, arguments: '{}' }]
+                        }
+                    ],
+                    answer(`${name} finished`)
+                ])
+            )
+        );
+
+        const seenParent: HarnessStreamRequest[] = [];
+
+        const writerAgent = brain(
+            scripted(
+                [
+                    [
+                        {
+                            type: 'done',
+                            stopReason: 'tool_calls',
+                            toolCalls: names.map((name, index) => ({
+                                id: `c${index}`,
+                                name: 'delegate',
+                                arguments: `{"agent":"${name}","input":"find facts"}`
+                            }))
+                        }
+                    ],
+                    answer('waiting'),
+                    answer('final')
+                ],
+                seenParent
+            )
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, ...Object.fromEntries(names.map((name, index) => [name, children[index]!])) },
+            tools: Object.fromEntries(
+                names.map((_, index) => [
+                    `hang${index}`,
+                    tool({
+                        description: 'Park until released.',
+                        tags: ['test'],
+                        visibility: 'core',
+                        execute: () => gates[index]!.promise
+                    })
+                ])
+            ),
+            presets: false,
+            plugins: [{ name: 'async-ping', setup: () => undefined }]
+        });
+
+        const running = writer('go');
+        await flush();
+
+        // The second request carries one placeholder per delegated call, and each names its OWN
+        // child: three distinct invocation ids, each pointing at its own conversation.
+        const placeholders = names.map((_, index) => {
+            const message = (seenParent[1]?.messages ?? []).find(
+                (entry) => entry.role === 'tool' && entry.toolCallId === `c${index}`
+            ) as Extract<HarnessMessage, { role: 'tool' }>;
+
+            expect(message).toBeDefined();
+
+            return JSON.parse(message.content) as {
+                status: string;
+                callId: string;
+                invocationId?: string;
+                threadId?: string;
+            };
+        });
+
+        expect(placeholders.map((entry) => entry.status)).toEqual(['pending', 'pending', 'pending']);
+        expect(new Set(placeholders.map((entry) => entry.invocationId)).size).toBe(3);
+        expect(placeholders.map((entry) => entry.threadId)).toEqual([
+            'agent:alpha',
+            'agent:beta',
+            'agent:gamma'
+        ]);
+
+        for (const gate of gates) gate.resolve('released');
+        await flush();
+        await running;
+
+        // And each placeholder's id is the id the SAME call is later answered with — the
+        // attribution cannot drift between the pending state and the terminal envelope.
+        const delivered = names.map((_, index) =>
+            delegationOf(
+                writerAgent.messages.find(
+                    (message) => message.role === 'tool' && message.toolCallId === `c${index}`
+                )
+            )
+        );
+
+        expect(delivered.map((envelope) => envelope.invocationId)).toEqual(
+            placeholders.map((placeholder) => placeholder.invocationId)
+        );
+        expect(delivered.map((envelope) => envelope.content)).toEqual([
+            'alpha finished',
+            'beta finished',
+            'gamma finished'
+        ]);
     });
 });
 
@@ -1808,7 +3140,7 @@ describe('per-delegation turn cap (I5)', () => {
             threadId: 'agent:researcher',
             status: 'failed',
             error:
-                'Agent "researcher" requested tools more than 2 times without answering, the 2 turns this run was given.',
+                'Agent "researcher" requested tools on all 2 model turns without answering, the maxTurns this run was given.',
             partialContent: 'pass 2',
             cancelledAtMessage: 5
         });
@@ -1839,7 +3171,7 @@ describe('per-delegation turn cap (I5)', () => {
             invocationId: '2',
             threadId: 'agent:researcher',
             status: 'failed',
-            error: 'Agent "researcher" requested tools more than 3 times without answering.',
+            error: 'Agent "researcher" requested tools on all 3 model turns without answering.',
             partialContent: 'pass 3',
             cancelledAtMessage: 7
         });
@@ -1864,7 +3196,7 @@ describe('per-delegation turn cap (I5)', () => {
             invocationId: '2',
             threadId: 'agent:researcher',
             status: 'failed',
-            error: 'Agent "researcher" requested tools more than 2 times without answering.',
+            error: 'Agent "researcher" requested tools on all 2 model turns without answering.',
             partialContent: 'pass 2',
             cancelledAtMessage: 5
         });
@@ -1914,7 +3246,7 @@ describe('per-delegation turn cap (I5)', () => {
             threadId: 'agent:researcher',
             status: 'failed',
             error:
-                'Agent "researcher" requested tools more than 1 times without answering, the 1 turns this run was given.',
+                'Agent "researcher" requested tools on its single model turn without answering, the maxTurns this run was given.',
             partialContent: 'pass 1',
             cancelledAtMessage: 3
         });
@@ -1931,7 +3263,7 @@ describe('per-delegation turn cap (I5)', () => {
             minimum: 1,
             maximum: 64,
             description:
-                'Optional cap on how many model turns (tool rounds) the child run may take, 1-64. OMIT IT to use the harness-wide limit for this session, which is what normally applies; set it to keep a quick lookup cheap or to bound a long research run. A child that runs out of turns has not answered, so its result is reported like any other unfinished run - its status plus the partialContent it had produced - instead of a final answer it never gave.'
+                'Optional cap on how many model REQUESTS the child run may make, 1-64. The cap counts model requests, not tool rounds: the child\'s answer has to land inside it, so N allows at most N-1 tool rounds and 1 only suits a child that answers with no tool call at all. OMIT IT to use the harness-wide limit for this session, which is what normally applies; set it to keep a quick lookup cheap or to bound a long research run. A child that runs out of turns has not answered, so its result is reported like any other unfinished run - its status plus the partialContent it had produced - instead of a final answer it never gave.'
         };
 
         // The catalogue form (no subagents) and the live session declaration are the

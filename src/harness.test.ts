@@ -1012,7 +1012,7 @@ describe('harness', () => {
         });
         const writer = harness({ agents: { writer: brain(loop) }, tools: { again }, maxIterations: 16 });
 
-        await expect(writer('go')).rejects.toThrow('requested tools more than 16 times');
+        await expect(writer('go')).rejects.toThrow('requested tools on all 16 model turns');
         // The failed run leaves no partial history behind.
         expect(writer.agent.messages).toEqual([]);
     });
@@ -1105,7 +1105,7 @@ describe('harness', () => {
             maxIterations: 2
         });
 
-        await expect(writer('go')).rejects.toThrow('requested tools more than 2 times');
+        await expect(writer('go')).rejects.toThrow('requested tools on all 2 model turns');
         expect(writer.agent.messages).toEqual([]);
     });
 

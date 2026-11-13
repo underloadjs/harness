@@ -50,6 +50,17 @@ export const readSnapshotArray = (value: unknown, label: string): unknown[] => {
     return value;
 };
 
+// Count/noun agreement for the length messages in `readSnapshotString` (report
+// #17, same fix as ./schema-validation.ts `countNoun`): "at least 1 character" vs
+// "at least 3 characters". Kept file-local for the same reason — the package has
+// no shared plural helper to reuse. Call sites pass `min: 1` (ids and labels in
+// ../core/snapshot.ts and ../core/records.ts), a larger bound, or no bound at all
+// (`min` defaults to 0, which can never fire because a length is never negative),
+// so only real counts reach the message; the surrounding text and labels are
+// untouched.
+const countNoun = (count: number, noun: string): string =>
+    `${count} ${noun}${count === 1 ? '' : 's'}`;
+
 export const readSnapshotString = (
     value: unknown,
     label: string,
@@ -63,11 +74,11 @@ export const readSnapshotString = (
     const max = options.max ?? Number.POSITIVE_INFINITY;
 
     if (value.length < min) {
-        throw new HarnessError(`${label} must be at least ${min} characters.`);
+        throw new HarnessError(`${label} must be at least ${countNoun(min, 'character')}.`);
     }
 
     if (value.length > max) {
-        throw new HarnessError(`${label} must be at most ${max} characters.`);
+        throw new HarnessError(`${label} must be at most ${countNoun(max, 'character')}.`);
     }
 
     return value;

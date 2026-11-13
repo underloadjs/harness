@@ -1701,8 +1701,42 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
 
         // A branch is not a thread SLOT, so the host's release keeps refusing it: its records
         // leave with its owner conversation (the M2 cascade), never on their own.
-        expect(() => writer.deleteThread(branchId)).toThrow(
-            `Thread "${branchId}" is not available in this harness; it was never created, or it was deleted.`
+        //
+        // WHAT CHANGED (stress report #4, 2026-11-14) is the SENTENCE. The refusal used to come
+        // from `threadStateOf` and claim the id "was never created, or it was deleted" — the one
+        // answer that is false two lines above, where `threadRead branch-N` served five messages
+        // and `agentResult` served the record. The delete seam now resolves the branch ledger
+        // first (`branchRecordOf`, ahead of `threadStateOf` in `deleteThread`) and states the
+        // actual rule.
+        const branchRefusal =
+            `Thread "${branchId}" is a fork record, not a conversation: it holds no thread slot, so there is ` +
+            `nothing to release — it goes when the conversation that forked it ("${home.id}") is deleted. ` +
+            'The branch ledger keeps only its newest 64 records.';
+
+        expect(() => writer.deleteThread(branchId)).toThrow(branchRefusal);
+
+        // THE MODEL DOOR ANSWERS THE SAME WAY FOR A BRANCH IT OWNS, and the refusal is still a
+        // refusal — no branch has become deletable.
+        expect(() => writer.runtime.threadDelete(home.id, branchId)).toThrow(branchRefusal);
+
+        // THE DESCENDANT GATE IS NOT LAUNDERED BY THE BRANCH LEDGER. `sibling` never forked
+        // this branch, so it gets the lineage refusal (`threadDeleteFor`), not the owner-facing
+        // one: a scoped caller cannot probe which subtree a branch belongs to by guessing its id.
+        expect(() => writer.runtime.threadDelete(sibling.id, branchId)).toThrow(
+            `Thread "${branchId}" is not one of the conversations "${sibling.id}" created; ` +
+                'threadDelete releases your own descendants (see threadList) — never your current thread, ' +
+                "an ancestor, a sibling, or another agent's conversation."
+        );
+
+        // AND AN ID THAT RESOLVES FOR NOBODY STILL GETS THE CANONICAL NOT-FOUND, on the delete
+        // door exactly as on the two read seams above. `branch-999999` is not in the ledger, so
+        // the new branch clause does not fire and "gone" stays indistinguishable from "never
+        // existed" — which is what makes a reaping retry safe.
+        expect(() => writer.deleteThread('branch-999999')).toThrow(
+            'Thread "branch-999999" is not available in this harness; it was never created, or it was deleted.'
+        );
+        expect(() => writer.runtime.threadDelete(home.id, 'branch-999999')).toThrow(
+            'Thread "branch-999999" is not available in this harness; it was never created, or it was deleted.'
         );
     });
 

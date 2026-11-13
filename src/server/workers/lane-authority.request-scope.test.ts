@@ -394,11 +394,18 @@ describe('routed conversation read and delete: the caller travels with the reque
 
         // The receipt is the harness's own `HarnessThreadDeleteResult`, stated whole: `deleted`
         // is the id the caller named, `removedThreadIds` everything that actually went, the
-        // cascade included (the named owner first, then descendants in creation order). It must
-        // arrive as an OBJECT with `deleted` in it, because src/tools/runtime/threadDelete.tool.ts
-        // unwraps on `('deleted' in result)` and would otherwise coerce a primitive into
+        // cascade included (the named owner first, then descendants in creation order), and the
+        // two purge sets (2026-11-14) name the invocation and branch lookups that left with them
+        // — empty here, because neither conversation ever ran a turn. It must arrive as an
+        // OBJECT with `deleted` in it, because src/tools/runtime/threadDelete.tool.ts unwraps on
+        // `('deleted' in result)` and would otherwise coerce a primitive into
         // `{ deleted: <primitive> }` — the bug the live tool test pins from the other side.
-        expect(released.value).toEqual({ deleted: child.id, removedThreadIds: [child.id, grandchild.id] });
+        expect(released.value).toEqual({
+            deleted: child.id,
+            removedThreadIds: [child.id, grandchild.id],
+            removedInvocationIds: [],
+            removedBranchIds: []
+        });
 
         // Canonical state agrees: both conversations are gone and the caller survives.
         expect(core.threads().map((thread) => thread.id)).toEqual([`agent:primary`, caller.id]);

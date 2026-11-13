@@ -167,14 +167,22 @@ const PROMPT_LENGTHS = [
     // it grew from 1168 because the "works alone" bullet now names BOTH ways a lone agent
     // could still offload a step (`threadFork` and `threadSend`) instead of only the fork.
     { name: 'general', length: 1245 },
-    { name: 'instruct', length: 1534 },
-    { name: 'research', length: 1605 },
-    { name: 'workspace', length: 1521 },
-    { name: 'reviewer', length: 1493 },
-    { name: 'planner', length: 1634 },
-    // 1728: the widest prompt on the roster, because the debugger composes every shared line
+    // +55 each (0028, 2026-11-14): `DELEGATION_GUIDELINE` no longer promises that "a later
+    // delegation continues that subagent's conversation" — a delegation from a conversation
+    // mints its OWN child transcript, so the line now says each delegation starts a NEW one
+    // and names the handle that makes continuation real (`threadSend` on the returned
+    // `threadId`). Every role that composes the delegation line grows by exactly that delta;
+    // `general` and `summarizer` do not compose it and are unmoved.
+    { name: 'instruct', length: 1589 },
+    { name: 'research', length: 1660 },
+    { name: 'workspace', length: 1576 },
+    { name: 'reviewer', length: 1548 },
+    { name: 'planner', length: 1689 },
+    // 1783: the widest prompt on the roster, because the debugger composes every shared line
     // (web + delegation + discovery + toolCreate + permissions) on top of its own five bullets.
-    { name: 'debugger', length: 1728 },
+    // Still under the 1800 budget below, by 17 characters — the delegation line was reworded
+    // to fit under that ceiling rather than raising the ceiling.
+    { name: 'debugger', length: 1783 },
     { name: 'summarizer', length: 141 }
 ];
 

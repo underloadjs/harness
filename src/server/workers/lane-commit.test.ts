@@ -6,6 +6,12 @@
 // transcript that cannot lose a concurrent append, and a base that cannot advance on
 // a mutation nobody accepted.
 //
+// And, since review finding #5 (issues 0020 + 0033, 2026-11-14): that a `result:archive` op
+// carries the FORENSIC PAIR of a run that did not finish, that a malformed value is refused with
+// `invalid-mutation` before the view moves, that a completed row carries neither field, that a
+// replay of the same op is idempotent, and that `archiveDigestOf` covers the pair — because the
+// writer's skip test IS that digest, and a digest blind to a field suppresses the write of it.
+//
 // Cross-references:
 //   - ./lane-commit.ts   - applySharedMutation / applyMutationGroup / the journal
 //   - ./lane-identity.ts - the id leases the fold consumes
@@ -899,6 +905,154 @@ describe('thread creation and result archiving: identity comes from the authorit
         expect(view.resultOwners[String(idA.lease.start)]).toBe(EPOCH_A);
     });
 
+    // Review finding #5 / issues 0020 + 0033 (2026-11-14): the archive payload is the seam that
+    // lost a stopped lane run's answer. These pins hold the four rules the fold now shares with the
+    // core's own `archiveInvocation` (src/harness.ts): the pair is carried, a completed row carries
+    // neither field, a malformed value is REFUSED before the view moves, and a replay of the same op
+    // produces the same row and the same digest.
+    it('carries the forensic pair of a stopped run and refuses a malformed one without touching canonical state', () => {
+        const view = emptyCanonicalView();
+        const identity = createIdentityLedger({ invocation: 1 });
+        const leases = createWriterLeaseLedger();
+
+        const stopped = {
+            kind: 'result:archive',
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'instruct',
+            role: 'subagent',
+            runKind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'thinking0 I will read the file',
+            cancelledAtMessage: 2,
+            threadId: 'thread-9'
+        } as SharedMutation;
+
+        const applied = applySharedMutation(view, stopped, { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 1 });
+
+        expect(applied.status).toBe('applied');
+        // The whole row, key for key: the pair is ON the canonical record, not only in the payload.
+        const stoppedRow = {
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'instruct',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'thinking0 I will read the file',
+            cancelledAtMessage: 2,
+            threadId: 'thread-9'
+        };
+
+        expect(view.results['513']).toEqual(stoppedRow);
+        // The receipt digest is the digest the WRITER computed from the payload it sent: an
+        // asymmetry here is a lane that re-archives the same row on every boundary.
+        expect(applied.effect?.digest).toBe(archiveDigestOf(view.results['513']));
+
+        // Folding the same op again (a restart replaying the journal, or a lane re-deriving after a
+        // partial group) is idempotent: same row, same digest, one slot.
+        const replay = applySharedMutation(view, stopped, { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 2 });
+
+        expect(replay.status).toBe('applied');
+        expect(replay.effect?.digest).toBe(applied.effect?.digest);
+        expect(view.results['513']).toEqual(stoppedRow);
+        expect(Object.keys(view.results)).toHaveLength(1);
+
+        const row = view.results['513'];
+        const owners = view.resultOwners['513'];
+        // A blank-but-present partial is malformed, not empty: "present" is the claim that the run
+        // said something, so the fold refuses it exactly as the core does.
+        const blank = applySharedMutation(
+            view,
+            { ...stopped, partialContent: '   ' } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 3 }
+        );
+
+        expect(blank.status).toBe('rejected');
+        expect(blank.rejection).toEqual({
+            code: 'invalid-mutation',
+            message:
+                'Archived invocation "513" carries a malformed forensic pair: Invocation "513".partialContent cannot be blank; a run that said nothing archives no partial at all.'
+        });
+
+        // A negative message index is refused with the snapshot reader's own bound, so a payload
+        // legal to archive is never illegal to reload.
+        const negative = applySharedMutation(
+            view,
+            { ...stopped, cancelledAtMessage: -1 } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 4 }
+        );
+
+        expect(negative.rejection).toEqual({
+            code: 'invalid-mutation',
+            message:
+                'Archived invocation "513" carries a malformed forensic pair: Invocation "513".cancelledAtMessage must be between 0 and Infinity.'
+        });
+
+        // A value of the wrong type is refused, never coerced (issue 0020 lists coercion as a
+        // defect — a repaired forensic field is no longer evidence of what happened).
+        const wrongType = applySharedMutation(
+            view,
+            { ...stopped, partialContent: 7 } as unknown as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 5 }
+        );
+
+        expect(wrongType.rejection).toEqual({
+            code: 'invalid-mutation',
+            message: 'Archived invocation "513" carries a malformed forensic pair: Invocation "513".partialContent must be a string.'
+        });
+
+        // ALL THREE refusals left canonical state exactly where it was: the row still holds the
+        // pair (a half-applied forensic write is worse than a refused one), the slot count is
+        // unchanged, and the ownership that lets this lane update its own conversation next turn is
+        // intact.
+        expect(view.results['513']).toEqual(stoppedRow);
+        expect(Object.keys(view.results)).toHaveLength(1);
+        expect(view.resultOwners['513']).toBe(EPOCH_A);
+        expect(row).toBe(view.results['513']);
+        expect(owners).toBe(EPOCH_A);
+
+        // A completed archive carries NEITHER field, and drops a stale pair off the row it replaces:
+        // ../core/snapshot.ts refuses to READ a completed row that carries one, so a fold that kept
+        // it would write a canonical view — and a next snapshot — that cannot be reloaded. This is
+        // the ordinary case, not a corner: a cancelled lane child that later finishes.
+        const completed = applySharedMutation(
+            view,
+            {
+                ...stopped,
+                status: 'completed',
+                content: 'the finished answer',
+                error: undefined,
+                partialContent: 'thinking0 I will read the file',
+                cancelledAtMessage: 2
+            } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 6 }
+        );
+
+        expect(completed.status).toBe('applied');
+        expect(view.results['513']).toEqual({
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'instruct',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'the finished answer',
+            threadId: 'thread-9'
+        });
+        // A completed row digests identically with and without the pair on the PAYLOAD, which is
+        // what keeps the writer's own digest (computed from its record, where the core also dropped
+        // the pair) equal to this slot's.
+        expect(completed.effect?.digest).toBe(archiveDigestOf(view.results['513']));
+    });
+
     it('holds the core retention bound by evicting the oldest completed result', () => {
         const view = emptyCanonicalView();
         const identity = createIdentityLedger({ invocation: 1 });
@@ -1253,6 +1407,24 @@ describe('group rollback, canonical re-base, and the declared window (T10 M2/M3/
         expect(archiveDigestOf(record)).toBe(archiveDigestOf({ ...record, completedOrder: 99 }));
         expect(archiveDigestOf(record)).not.toBe(archiveDigestOf({ ...record, content: 'answer two' }));
         expect(archiveDigestOf(record)).not.toBe(archiveDigestOf({ ...record, sequence: 9 }));
+
+        // Review finding #5 / issues 0020 + 0033: the FORENSIC PAIR is part of the projection,
+        // because it is a field the WRITER owns (its replica produced both values) and the authority
+        // stores verbatim. The test that makes this load-bearing: `deriveOperations` emits an archive
+        // op only when its `archived` digest disagrees with `archiveDigestOf(record)`, so a payload
+        // change the digest cannot see is a write the lane would skip.
+        const stopped = { ...record, status: 'cancelled', content: '', partialContent: 'half an answer', cancelledAtMessage: 2 };
+
+        expect(archiveDigestOf(record)).not.toBe(archiveDigestOf(stopped));
+        // ABSENT and EMPTY are different claims, and the digest has to tell them apart: an absent
+        // partial says the run never said anything, `''` is a value the core refuses to archive.
+        expect(archiveDigestOf(stopped)).not.toBe(archiveDigestOf({ ...stopped, partialContent: '' }));
+        expect(archiveDigestOf(stopped)).not.toBe(archiveDigestOf({ ...stopped, cancelledAtMessage: 3 }));
+        // `completedOrder` stays excluded WITH the pair present — the asymmetry is per field, not per
+        // record: an authority-reassigned field can never be in a writer's digest.
+        expect(archiveDigestOf(stopped)).toBe(archiveDigestOf({ ...stopped, completedOrder: 99 }));
+        // A field the authority assigns stays out of it too (issue 0033/0024's owner).
+        expect(archiveDigestOf(stopped)).toBe(archiveDigestOf({ ...stopped, threadId: 'thread-9' }));
     });
 
     it('refuses a memory write the lane was never given a window for (S6)', () => {

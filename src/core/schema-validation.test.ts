@@ -8,7 +8,8 @@
 //   - a manual call may also pass the wrapper; both resolve to the same value;
 //   - wrong types, missing required properties, unknown properties (when
 //     additionalProperties is false), enums, oneOf, and numeric/string/array
-//     limits are rejected with an exact, path-carrying message;
+//     limits are rejected with an exact, path-carrying message; the count in that
+//     message and its noun agree ("1 character", "3 characters");
 //   - a created schema is depth/size gated before it can become a request
 //     payload.
 
@@ -129,11 +130,53 @@ describe('validateSchemaValue', () => {
 
         expect(validateSchemaValue({ type: 'array', minItems: 1 }, [])).toEqual({
             valid: false,
-            message: '$ must contain at least 1 items.'
+            message: '$ must contain at least 1 item.'
         });
         expect(validateSchemaValue({ type: 'array', maxItems: 2 }, [1, 2, 3])).toEqual({
             valid: false,
             message: '$ must contain at most 2 items.'
+        });
+    });
+
+    // Report #17: the count-bearing limit messages must agree in number with the
+    // bound they quote. The stress report surfaced `$.message must be at least 1
+    // characters.`; the fix is in ./schema-validation.ts `countNoun`, and the
+    // trigger conditions, severity, paths and error class are unchanged — only the
+    // trailing "s" moves.
+    it('uses the singular noun when the bound is exactly 1', () => {
+        // The exact report shape: a `threadSend`-style `message` string bounded at 1.
+        expect(validateSchemaValue({ type: 'string', minLength: 1 }, '', '$.message')).toEqual({
+            valid: false,
+            message: '$.message must be at least 1 character.'
+        });
+        expect(validateSchemaValue({ type: 'string', maxLength: 1 }, 'ab')).toEqual({
+            valid: false,
+            message: '$ must be at most 1 character.'
+        });
+        expect(validateSchemaValue({ type: 'array', minItems: 1 }, [])).toEqual({
+            valid: false,
+            message: '$ must contain at least 1 item.'
+        });
+        expect(validateSchemaValue({ type: 'array', maxItems: 1 }, [1, 2])).toEqual({
+            valid: false,
+            message: '$ must contain at most 1 item.'
+        });
+    });
+
+    it('keeps the plural noun for every other bound', () => {
+        expect(validateSchemaValue({ type: 'string', minLength: 3 }, 'ab')).toEqual({
+            valid: false,
+            message: '$ must be at least 3 characters.'
+        });
+        expect(validateSchemaValue({ type: 'array', minItems: 3 }, [1])).toEqual({
+            valid: false,
+            message: '$ must contain at least 3 items.'
+        });
+        // A non-integer bound is not 1, so it reads plural; the count itself is
+        // interpolated exactly as before.
+        expect(validateSchemaValue({ type: 'string', minLength: 1.5 }, 'a')).toEqual({
+            valid: false,
+            message: '$ must be at least 1.5 characters.'
         });
     });
 

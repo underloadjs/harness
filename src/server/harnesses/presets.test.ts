@@ -243,7 +243,7 @@ const card = (name: string, team: readonly string[]) => ({
 // policies no schema can say. It is pinned as a literal so a rewording in the source is a
 // visible diff here instead of a silent pass.
 const DELEGATION_LINE =
-    'When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation, verify its answer before relying on it, and follow up with the same target instead of guessing: a later delegation continues that subagent\'s conversation.';
+    'When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation and every delegation starts a NEW one, verify its answer before relying on it, and continue a child you already used with threadSend on the threadId it returned rather than assuming it remembers the last brief.';
 
 // The default card's replacement for that line (../../agents/general.ts): alone by
 // contract, with BOTH loopholes a lone agent could still use to hand a step away closed

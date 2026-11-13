@@ -13,6 +13,15 @@
 //   M9  `maxLaneWorkers` is enforced, not advertised;
 //   S9  these assertions run against the SOURCE worker, never a stale `dist/` bundle.
 //
+//   #6  (stress report, 2026-11-14) A LANE-ARCHIVED RESULT BELONGS TO ITS CONVERSATION: the
+//       `result:archive` operation names the conversation the lane writes, so deleting that
+//       conversation purges every turn it archived — the rule the inline path always had, and
+//       the last case below is the end-to-end proof of the chain.
+//   #5  (review, 2026-11-14) A STOPPED LANE RUN KEEPS ITS PARTIAL: the same operation carries the
+//       forensic pair `partialContent`/`cancelledAtMessage`, so a child cancelled mid-answer
+//       reports what it was streaming on the canonical side too — inline already did, and the seam
+//       was the only door left that lost it without a restart.
+//
 // Cross-references:
 //   - ./lane-host.ts            - spawn/reclaim/bound/shutdown (M1 M8 M9)
 //   - ./lane-worker-loop.ts     - the delta sync and the per-receipt re-base (M3 M4)
@@ -143,12 +152,31 @@ const lastAssistant = (store: SessionStore, sessionId: string, threadId: string)
 // range (`513`, `514`, ...), i.e. one NEW id per turn - NOT the thread id. What must hold in
 // both modes is that every turn's result is centrally addressable, the newest answer wins, and
 // the roster names an invocation that exists.
-const archivedRecords = (store: SessionStore, sessionId: string): { invocationId: string; content: string }[] => {
+// One archived row, read WHOLE. The shape is `HarnessAgentResultSnapshot` (../../types/index.ts
+// :3331): the pair `partialContent`/`cancelledAtMessage` is optional and ABSENT unless the run was
+// stopped with something to show, which is exactly the distinction issues 0020/0033 turn on — so
+// the reader keeps the optional keys instead of projecting the row down to `content`.
+type ArchivedRow = {
+    invocationId: string;
+    sequence: number;
+    completedOrder: number;
+    agent: string;
+    role: string;
+    kind: string;
+    status: string;
+    content: string;
+    error?: string;
+    partialContent?: string;
+    cancelledAtMessage?: number;
+    threadId?: string;
+};
+
+const archivedRecords = (store: SessionStore, sessionId: string): ArchivedRow[] => {
     const authority = (store as unknown as { authorities?: Map<string, LaneAuthority> }).authorities?.get(sessionId);
 
     if (authority === undefined) throw new Error(`No lane authority exists for session ${sessionId}.`);
 
-    return (authority.harness.snapshot() as unknown as { agentResults?: { invocationId: string; content: string }[] }).agentResults ?? [];
+    return (authority.harness.snapshot() as unknown as { agentResults?: ArchivedRow[] }).agentResults ?? [];
 };
 
 // The roster's own view of the conversation, read on the coordinator.
@@ -401,5 +429,158 @@ describe('worker mode: the lane worker bound and shutdown (T10 M8/M9)', () => {
         expect(settled.status).not.toBe('running');
         expect(['done', 'error', 'cancelled']).toContain(settled.status);
         expect(host.lanes()).toHaveLength(0);
+    }, 300_000);
+});
+
+// STRESS REPORT #6, WORKER MODE (2026-11-14) — ONE PURGE RULE, BOTH EXECUTION MODES.
+//
+// Inline, `purgeThread` (../../harness.ts) drops a conversation's agent-result records by
+// matching `record.threadId`. In worker mode the canonical record is written by the AUTHORITY
+// from a `result:archive` operation, and that operation carried no conversation at all — so the
+// identical delete released an inline conversation's results and kept a lane conversation's,
+// and `agentResult` / `agentManage` went on answering for a conversation that had left the
+// roster. The lane now names the conversation it writes (./lane-worker-loop.ts
+// `deriveOperations`), and this is the end-to-end proof of the whole chain: the worker sends the
+// field, the authority stores the join, and deleting the conversation takes EVERY turn of it —
+// not just whatever the roster's single invocation slot happens to name.
+describe('worker mode: a deleted conversation purges its lane-archived results (stress report #6)', () => {
+    it('purges every lane turn of the conversation, exactly as the inline path does', async () => {
+        const store = storeOf();
+        const session = await store.create('general');
+
+        const first = await store.dispatch(session.id, 'lane purge one');
+
+        expect((await settle(store, session.id, first.turn.id)).status).toBe('done');
+
+        const threadId = first.turn.threadId as string;
+        const second = await store.dispatch(session.id, 'lane purge two', undefined, undefined, threadId);
+
+        expect((await settle(store, session.id, second.turn.id)).status).toBe('done');
+
+        // Two lane turns, two centrally-archived results. A lane-minted identity per turn (one
+        // NEW id each turn, NOT the thread id — see the M1/M3 case above), which is exactly why
+        // the roster's single invocation slot could never be the purge join on its own.
+        const archived = archivedRecords(store, session.id);
+
+        expect(archived).toHaveLength(2);
+        expect(archived.map((record) => record.invocationId)).not.toContain(threadId);
+
+        await store.deleteThread(session.id, threadId);
+
+        // The conversation is gone, and its results went WITH it: the registry the inline path
+        // would have produced after the same delete.
+        expect(store.get(session.id).threads).toBeUndefined();
+        expect(archivedRecords(store, session.id)).toEqual([]);
+    }, 300_000);
+});
+
+// REVIEW FINDING #5 (High) / ISSUES 0020 + 0033 — THE WORKER-MODE LEG.
+//
+// Inline, a run stopped mid-answer reports the text it was STREAMING: `runAgentCore`'s
+// cancellation catch prefers `run.streamedText` over the last committed assistant text
+// (../../harness.ts:11927-11938, issue 0020 AC1), `finishInvocation` records the pair on the
+// terminal transition (`:3886-3893`), the snapshot projection writes it (`:12810-12813`) and
+// `restore()` re-attaches it (`:13175-13180`) — pinned by `src/harness.delegation.test.ts:482`
+// and `src/harness.snapshot.test.ts`.
+//
+// In worker mode the run happens on a lane, and the ONLY way its terminal record reaches the
+// canonical harness is the `result:archive` operation (./lane-worker-loop.ts `deriveOperations`).
+// That payload carried `content` and `error`, so `archiveInvocation` (../../harness.ts:7288-7299)
+// forced `content: ''` for a non-completed status and never learned the partial existed: the
+// caller of a cancelled lane child was told the answer was empty — WITH NO RESTART INVOLVED AT
+// ALL, because the loss is in the seam, not in the persistence layer.
+//
+// Both directions are pinned here because they are one rule with two halves: the pair must TRAVEL
+// for a stopped run, and it must stay ABSENT beside a completed answer (mutual exclusion —
+// `../../core/snapshot.ts:291-298` refuses a completed row that carries it, so a lane that archived
+// a stale partial next to a finished answer would archive a row the session cannot reload).
+describe('worker mode: a stopped lane run archives its forensic pair (review #5, issues 0020/0033)', () => {
+    it('carries partialContent and cancelledAtMessage for a run cancelled mid-stream, and neither for one that completed', async () => {
+        const store = storeOf();
+        const session = await store.create('general');
+
+        // HALF ONE — the completed turn, measured first so the cancelled row below is the only
+        // unfinished one in the archive and the `status` filter cannot match two rows.
+        const finished = await store.dispatch(session.id, 'lane turn that completes');
+
+        expect((await settle(store, session.id, finished.turn.id)).status).toBe('done');
+
+        const threadId = finished.turn.threadId as string;
+        const completed = archivedRecords(store, session.id);
+
+        expect(completed).toHaveLength(1);
+        expect(completed[0].status).toBe('completed');
+        // The WHOLE key set, exactly: the answer rides in `content`, and neither forensic key is
+        // present. A lane that archived `partialContent` beside a completed answer would produce
+        // a row `readAgentResults` refuses to load (../core/snapshot.ts:291-298).
+        expect(Object.keys(completed[0]).sort()).toEqual([
+            'agent',
+            'completedOrder',
+            'content',
+            'invocationId',
+            'kind',
+            'role',
+            'sequence',
+            'status',
+            'threadId'
+        ]);
+
+        // HALF TWO — a second turn of the SAME conversation, stopped while its answer is streaming.
+        const running = await store.dispatch(session.id, 'lane turn that gets stopped', undefined, undefined, threadId);
+
+        // The precondition, not a guess: the stub streams one `text` delta per 40ms, and the
+        // harness buffers a delta into `run.streamedText` BEFORE emitting it
+        // (../../harness.ts:11404-11411). So the first `text` event the coordinator has recorded
+        // proves the worker is holding non-blank in-flight text at the moment the stop lands —
+        // which is the state that must survive the archive seam.
+        let streamed = '';
+
+        for (let attempt = 0; attempt < 600 && streamed.length === 0; attempt += 1) {
+            const turn = turnOf(store.get(session.id), running.turn.id);
+
+            streamed = turn?.events
+                .filter((event) => event.type === 'text')
+                .map((event) => (event.type === 'text' ? event.delta : ''))
+                .join('') ?? '';
+
+            if (streamed.length === 0) await sleep(20);
+        }
+
+        expect(streamed.startsWith('thinking0 ')).toBe(true);
+
+        // The operator's Stop door: `cancel()` aborts this lane's controller
+        // (../sessions.ts:8823-8831), and the host turns that abort into the `interrupt` frame
+        // (./lane-host.ts:915-923) that stops the run inside the worker.
+        expect(await store.cancel(session.id)).toBe(true);
+
+        const stopped = await settle(store, session.id, running.turn.id, 60_000);
+
+        expect(stopped.status).toBe('cancelled');
+
+        const rows = archivedRecords(store, session.id);
+        const cancelled = rows.filter((record) => record.status === 'cancelled');
+
+        // One stopped row, and it is the newest turn of this conversation.
+        expect(cancelled).toHaveLength(1);
+        expect(rows).toHaveLength(2);
+
+        const row = cancelled[0];
+
+        // Mutual exclusion, the other direction: a stopped run keeps `content` EMPTY and carries
+        // its text in `partialContent`, exactly as the inline record does.
+        expect(row.content).toBe('');
+        expect(row.error).toBeTypeOf('string');
+        // The partial the caller was already shown before the seam: the words the stub streamed
+        // (the first delta is `thinking0 `, then `thinking1 `, ...). Its exact length depends on
+        // when the abort lands, so the pin is the deterministic prefix and the absence of anything
+        // that is not answer text — the 0020 leak boundary, unchanged.
+        expect(row.partialContent?.startsWith('thinking0 ')).toBe(true);
+        expect(row.partialContent).not.toContain('the tool returned');
+        // The pair travels together: `cancelledAtMessage` counts COMMITTED messages (issue 0022),
+        // so for a run stopped inside its first request it is an integer — the exact count is a
+        // scheduling fact, its PRESENCE is the contract.
+        expect(Number.isInteger(row.cancelledAtMessage)).toBe(true);
+        // And the row is still the delete-cascade carrier (stress report #6, above).
+        expect(row.threadId).toBe(threadId);
     }, 300_000);
 });

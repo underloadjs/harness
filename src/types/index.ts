@@ -1190,16 +1190,29 @@ export type HarnessMemory = {
 // kernel/harness state operations (discovery, guarded creation, per-session record
 // stores), not a restricted capability facade: every tool still receives the
 // unrestricted `context.harness` reference above.
-// What one `threadDelete` released (B5, 2026-11-13).
+// What one `threadDelete` released (B5, 2026-11-13; extended 2026-11-14 for the stress
+// report's #6).
 //
 // `deleted` is the id the CALLER named — a refusal throws, so reaching a receipt at all
 // means the conversation went. `removedThreadIds` is every conversation that actually
 // went, the cascade included: deletion owns the descendants of the thread it deletes, and
 // a caller that just released a fan-out child needs to see the settled grandchildren leave
 // with it rather than infer the state change from a roster that got shorter.
+//
+// `removedInvocationIds` and `removedBranchIds` are the other half of the same fact, added
+// because deleting a conversation silently SHRINKS the agent-result registry: `agentManage`
+// drops an invocation and `agentResult(id)` starts throwing with no indication why. The
+// purge already knew exactly which records and branch lookups it was dropping — it simply
+// threw those sets away — so the receipt now reports them. Both are ALWAYS present and
+// empty when nothing went: "purged nothing" and "did not say" are different answers, and a
+// caller that is auditing a reaping loop must be able to tell them apart. This is a report,
+// not a durability change: nothing is moved out of the registry, and a released
+// conversation's results stay released.
 export type HarnessThreadDeleteResult = {
     deleted: string;
     removedThreadIds: string[];
+    removedInvocationIds: string[];
+    removedBranchIds: string[];
 };
 
 export type HarnessToolRuntime = {
@@ -1388,10 +1401,33 @@ export type HarnessDelegationResult = {
     // What the child had already produced when it was cancelled or failed, so a
     // post-mortem does not require the (rolled-back) transcript. Present only for a
     // non-completed run that had said something substantive.
+    //
+    // "Already produced" INCLUDES the answer that was still STREAMING (issue 0020,
+    // AC1): a run buffers the text deltas of the model request it has open, so a child
+    // cut off between "the model has begun answering" and "the answer is committed"
+    // reports that sentence rather than nothing. The buffer is owned by the request in
+    // flight — it is reset for every new request and for a `retry`, whose failed
+    // attempt the agent discards — so this field never mixes in an earlier turn's
+    // prose, a tool's output, or the delegation input. When nothing was in flight the
+    // last COMMITTED assistant text is reported, which is what this field always meant.
+    //
+    // DURABILITY (issue 0033): this text is stored state, not a live projection — the
+    // terminal record keeps it and `snapshot()` writes it, so the same invocation is
+    // still readable with the same partial after `restore()` and across a server
+    // restart. What NEVER survived a restart, before or after that fix, is the rest of
+    // the run: its transcript (rolled back) and its tool calls and tool bodies (never
+    // retained) are gone for good — 0020's leak boundary and 0032.
     partialContent?: string;
     // How many messages the child had appended when it was cancelled/failed. This is
     // the "how far did it get" number the transcript rollback used to erase.
     cancelledAtMessage?: number;
+    // D2 (2026-11-14, issues 0021/0019) — the CALL was released by `toolCancel` while the
+    // child's terminal record was still readable. Present (true) on exactly one door: the
+    // delivered tool message of a cancelled delegation. It separates "the caller let go of the
+    // call" from "the child did not finish", which `status` alone cannot say — a child that
+    // answered a moment after the release reports `status: 'completed'` next to this marker.
+    // Every other door omits it, so its absence never means "not cancelled".
+    callCancelled?: boolean;
 };
 
 // Terminal (or in-flight) state of one agent invocation. The same vocabulary
@@ -2213,6 +2249,41 @@ export type TaskResult = Omit<RecordsResult, 'entries' | 'counts' | 'removed'> &
 // limitation entries).
 export type NestedRunPolicy = 'allow' | 'refuse';
 
+// D1 (2026-11-14, docs/issues/minor-success-envelope-can-fabricate-identity-and-status.md)
+// -----------------------------------------------------------------------------------------
+// An OUT-carrier the caller of `context.run` hands down with the call and the runtime fills
+// IN from the child run itself: the invocation identity, and the terminal status, of exactly
+// the run this call started.
+//
+// WHY IT EXISTS. A `delegate` envelope reports `invocationId`, `threadId` and `status`, and
+// the runtime used to REDISCOVER them after the child resolved by searching the ledger for
+// "the record for that agent that matches my spawning call id", falling back to "the newest
+// record that did not exist when I dispatched". A tool-call id is unique only WITHIN one run,
+// and a second run of the same agent can start concurrently (a host thread queues behind
+// itself, not behind the agent's default conversation), so both rules can name ANOTHER run:
+// the caller then reports an identity it did not run and a status it never observed. The
+// child run is the only component that knows its own identity by VALUE, so it writes it here
+// and the caller reads it back — the lookup becomes a verification step, and an identity that
+// cannot be verified against the ledger is omitted rather than invented (the rule
+// src/harness.agent-results.test.ts pins).
+//
+// Written by the runtime only, never by a tool: a host that omits the field keeps the
+// historical behaviour untouched, and a tool that passes an object gets it filled before the
+// child's first provider request (`invocationId`/`threadId`) and again on the terminal commit
+// (`status`). Keys stay ABSENT until they are known — an empty string here would read like an
+// address, which is precisely the fabrication this removes.
+export type HarnessRunIdentity = {
+    // The child's own invocation id — the same value `agentResult`/`agentManage` report, i.e.
+    // `RunState.thread.id` when the run is addressable by conversation, else its run sequence.
+    invocationId?: string;
+    // The persistent conversation the child runs in. Absent for a parentless/nested manual
+    // child (which binds no thread) and for an ephemeral branch.
+    threadId?: string;
+    // Terminal status the run itself reached: written when the run commits its terminal ledger
+    // entry, so a caller that sees it knows the record was settled (not merely awaited).
+    status?: HarnessInvocationStatus;
+};
+
 export type ToolContext<TParameters = any> = {
     // The parameter value. For a schema with several properties this is the
     // parsed arguments object; for a schema with exactly one property it is that
@@ -2238,10 +2309,22 @@ export type ToolContext<TParameters = any> = {
     // means "no restriction" (the historical behaviour). `toolRequest` is exempt from
     // the allowlist (the scope escape hatch, delegate-stress finding 2), so a scoped
     // child can always name the capability it is missing.
+    // `identity` (D1, 2026-11-14) is an OUT-carrier, not an input: `delegate` passes an empty
+    // object and the runtime fills it in with the identity of THE RUN THIS CALL STARTED —
+    // `invocationId`/`threadId` before the child's first request, `status` on its terminal
+    // commit. That is what lets a delegation report its child's identity BY VALUE instead of
+    // re-discovering it from the invocation ledger, where a concurrent run of the same agent
+    // can be mistaken for it (see HarnessRunIdentity). Omitted, the run behaves exactly as
+    // before and nothing is written.
     run?: (
         agentName: string,
         input: string,
-        options?: { signal?: AbortSignal; tools?: readonly string[]; maxTurns?: number }
+        options?: {
+            signal?: AbortSignal;
+            tools?: readonly string[];
+            maxTurns?: number;
+            identity?: HarnessRunIdentity;
+        }
     ) => Promise<HarnessAssistantMessage>;
     // The id of the tool call being executed (T28). Present for a model tool call
     // (the id the model wrote) and absent for a manual `executeTool` call, which has
@@ -2945,6 +3028,13 @@ export type HarnessThreadMessageResult = {
     //
     // It appears only for a default-conversation target that has a running thread of the
     // same agent, and it never changes where the message went.
+    //
+    // T5/#2 (2026-11-14, stress report): the thread it names must be one the CALLER can
+    // address. The scan runs across the whole session, so a bare "newest running sibling"
+    // could point a scoped caller at a thread outside its family — and the send/read doors
+    // refuse everything outside the family, which made the advice a promise the next call
+    // would break. Candidates are filtered through the caller's family, so no addressable
+    // conversation in flight means no `note` at all. The wording is unchanged.
     note?: string;
 };
 
@@ -3251,11 +3341,68 @@ export type HarnessAgentResultSnapshot = {
     role: 'primary' | 'subagent';
     kind: 'root' | 'delegation' | 'fork' | 'autoanswer';
     status: 'completed' | 'failed' | 'cancelled';
-    // Completed answer text; empty for failed/cancelled.
+    // Completed answer text; empty for failed/cancelled. An unfinished run's text is
+    // NOT stored here — it is `partialContent` below, so this field and that one carry
+    // one answer string between them, never two (issue 0033).
     content: string;
     // Failure/cancellation message. Required for a non-completed result, never
     // present on a completed one.
     error?: string;
+    // Issue 0033 (2026-11-14): the run's FORENSIC PARTIAL — the last assistant TEXT it
+    // had committed when it was cancelled or failed. The live envelope for an
+    // unfinished run has always reported this text (the `agentResult` reader pages it
+    // into `content` and emits it whole as `partialContent`, src/harness.ts:4144 and
+    // :4171-4173; `delegateFor` does the same at :4282-4303), but the field was
+    // RUNTIME-ONLY: the snapshot projection wrote `content` (empty for a non-completed
+    // run) and `restore()` rebuilt without the partial, so after a restart the durable
+    // ledger answered the very same invocationId with `content: ""` and no
+    // `partialContent` key at all. The caller had been shown an answer that a restart
+    // then took back. This is the durability half of that envelope.
+    //
+    // SIZE — no new bound, and here is why that is safe rather than careless: the pair
+    // is mutually exclusive by construction. `finishInvocation` (src/harness.ts:3866-3890)
+    // writes `content` for a COMPLETED run and `partialContent` for every other terminal
+    // state, never both, and `archiveInvocation` (:7194) keeps the same rule. So the
+    // archive's answer-text footprint is unchanged — AT MOST ONE answer string per
+    // record — while the record count stays bounded by AGENT_RESULT_RETENTION (64,
+    // src/core/agent-limits.ts:25, enforced on both the runtime ledger and this array by
+    // `readAgentResults`). `content` is already stored in full and paged on READ
+    // (AGENT_RESULT_PAGE_CHARS), never truncated on write, and this field follows that
+    // precedent rather than inventing one.
+    //
+    // Present only for a non-completed run that had said something substantive; ABSENT
+    // (never empty) otherwise, exactly like both emission sites. "Said something"
+    // covers the answer the run was still STREAMING when it was cut off, not only text
+    // it had committed (issue 0020, AC1) — the capture point is `runAgentCore`'s
+    // cancellation catch, which reads the per-request buffer first and the committed
+    // transcript second, so the fresher evidence wins. Never widened to tool calls or
+    // tool bodies: a rolled-back run's tool activity is deliberately not retained
+    // (0020's leak boundary, 0032).
+    partialContent?: string;
+    // How many messages that run had committed when it stopped. Optional for the same
+    // reason as `partialContent`, and absent on a completed record: an envelope that
+    // reports a partial but not the position it was reached at is only half an answer,
+    // so the pair travels together (issue 0033). Counts committed messages; it is NOT a
+    // measure of progress (0022).
+    cancelledAtMessage?: number;
+    // Issue 0033 / 0024 (2026-11-14): the PERSISTENT conversation this invocation ran in, when
+    // one owns it. The field has always existed on the in-memory record (harness.ts
+    // `AgentInvocationRecord.threadId`), on the lane archive payload, and on
+    // `HarnessInvocationArchiveInput`, and `purgeThread`'s delete cascade is a predicate on
+    // exactly it — but the SNAPSHOT never carried it, so the owner was the one fact a restart
+    // could not survive: a conversation deleted after a reload lost its archived results to the
+    // cascade while the same delete before the reload removed them. This closes the
+    // type/validator disagreement the issue records: `readAgentResults` now accepts and validates
+    // the key (src/core/snapshot.ts) instead of refusing a row that carries it.
+    //
+    // Optional because a run CAN resolve no conversation at all: `runThreadId` (src/harness.ts
+    // :12277) leaves the field off for an ephemeral branch whose parent had none and for a brain
+    // outside the registry. It is NOT off for an ordinary root run — that one belongs to the
+    // agent's default conversation, so the row names `agent:<name>` and the cascade still matches
+    // it after a reload. ABSENT means "no owner", never "unknown owner", and an empty string is
+    // rejected at the load boundary. Legal on a completed result, unlike the forensic pair: a
+    // finished turn still belongs to its thread.
+    threadId?: string;
 };
 
 // T5 lane-worker seam: ONE terminal invocation the coordinator archives on behalf of a
@@ -3281,6 +3428,27 @@ export type HarnessInvocationArchiveInput = {
     completedOrder?: number;
     // The persistent conversation this invocation ran in, when one owns it.
     threadId?: string;
+    // Review finding #5 / issues 0020 + 0033 (2026-11-14): the FORENSIC PARTIAL of a run that did
+    // not finish, and how far it got. The lane replica already holds both — `finishInvocation`
+    // records them on the terminal transition (src/harness.ts:3886-3893, the streamed-text capture
+    // at :11927-11938) and the snapshot projection writes them (:12810-12813) — but until now the
+    // archive seam named neither, so `archiveInvocation` forced `content: ''` and the canonical
+    // reader was told a cancelled lane child said nothing. WITHOUT any restart involved: the loss
+    // is in this payload, not in persistence.
+    //
+    // Same rules as the persisted row (../core/snapshot.ts:242-298), because the record written
+    // here IS the row the next snapshot writes:
+    //   * ABSENT (never empty) unless the run said something substantive — a present
+    //     `partialContent` always means "it did say something", which is what keeps the reader's
+    //     `min: 1` bound meaningful;
+    //   * a malformed value is REFUSED, not coerced (src/harness.ts validates it before anything
+    //     moves, so a bad send cannot corrupt live canonical state);
+    //   * DROPPED on a `completed` status, exactly like `error` — mutual exclusion with `content`,
+    //     so a completed row never carries the pair and stays reloadable.
+    partialContent?: string;
+    // How many messages that run had COMMITTED when it stopped (an integer >= 0; NOT a measure of
+    // progress — issue 0022). Travels with `partialContent`.
+    cancelledAtMessage?: number;
 };
 
 // T5 lane-worker seam: reserve identity high-water marks in one harness (see
@@ -3380,6 +3548,12 @@ export type HarnessSnapshot = {
     // them with an empty registry, and a snapshot with no terminal results omits
     // the field so older fixtures/tests keep their exact shape. Running
     // invocations are omitted (never written as a partial/cancelled answer).
+    //
+    // Additive and OPTIONAL the same way are the two forensic fields of an unfinished
+    // run (`partialContent`, `cancelledAtMessage` — see HarnessAgentResultSnapshot):
+    // written only when the record actually holds them, read as "nothing recorded"
+    // when absent, so every pre-0033 file restores with its exact prior meaning and
+    // the schema version did not move.
     agentResults?: HarnessAgentResultSnapshot[];
     // R2 persistent threads. OPTIONAL and OMITTED while this harness has only its
     // implicit per-agent default conversations, so pre-thread snapshots and every

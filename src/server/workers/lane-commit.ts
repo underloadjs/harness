@@ -58,6 +58,11 @@
 //   - ../../core/creation.ts - DEFAULT_CREATED_TOOLS_LIMIT (32)
 
 import { AGENT_RESULT_RETENTION, DEFAULT_CREATED_TOOLS_LIMIT, MAX_THREAD_RECORDS } from '../../core';
+// The snapshot readers' value bounds (../../core/snapshot-validation.ts), reused verbatim by
+// `readArchiveForensicPair` below so the lane archive fold and the core's canonical write refuse the
+// same malformed FORENSIC PAIR (review finding #5 / issues 0020 + 0033). Direct module import, the
+// same convention src/harness.ts uses for these two helpers: the core barrel does not re-export them.
+import { readSnapshotInteger, readSnapshotString } from '../../core/snapshot-validation';
 import type { HarnessAgentResultSnapshot, HarnessMessage } from '../../types';
 import type { IdentityLedger } from './lane-identity';
 import { idOf } from './lane-identity';
@@ -109,6 +114,31 @@ export type CanonicalTool = { name: string; source: string; revision: string; re
 // applies an archive (ordering is decided where the ordering counter lives), so a lane
 // comparing its own record against a canonical digest would never match and would
 // re-archive forever. Both sides therefore digest the SAME projection.
+//
+// Review finding #5 / issues 0020 + 0033 (2026-11-14): the FORENSIC PAIR is now part of that
+// projection, and the reason it has to be is the skip test the digest is guarding. A lane whose
+// archive op is rejected with a digest that DIFFERS from its own re-derives the archive and tries
+// again, which is what keeps a lost write recoverable; a lane whose digest MATCHES treats the row as
+// already archived and skips — `./lane-worker-loop.ts` `deriveOperations` emits an archive op only
+// when `lane.archived` disagrees with `archiveDigestOf(record)`. Before this, a cancelled lane child
+// carried no pair across the seam on either side, so the digests agreed while canonical held
+// `partialContent` absent — and for a worker-mode cancellation that had ALREADY archived an empty
+// row, the writer skipped the very op that would have carried the pair: the digest was suppressing an
+// op whose payload mattered. Once the pair is in the payload, leaving it out of the digest would keep
+// that trap: canonical state moving from no-pair to pair would be invisible to the equality test that
+// decides whether to send it.
+//
+// The asymmetry with the two EXCLUDED fields is deliberate and stays. `completedOrder` is excluded
+// because the authority RE-MINTS it (a writer cannot know it in advance, so including it would break
+// the very agreement above and cause endless re-archiving). `threadId` is excluded because it is
+// conversation metadata the authority stores, not part of the answer the writer produced — and the
+// field was added to the op after the fact, so an archive op from an older send (which names no
+// conversation, `SharedMutation`'s own comment above) must still digest equal to a canonical row that
+// carries one, or every such lane re-archives its whole history forever. The pair is the opposite
+// case on both counts: the lane's replica PRODUCES both values (its `finishInvocation` wrote them),
+// they are the answer's content, and the authority stores them verbatim — src/harness.ts drops them
+// on `completed` and the fold in this file drops them the same way, so both sides project the same
+// keys and the digests stay equal.
 export const archiveDigestOf = (record: {
     invocationId: string;
     sequence: number;
@@ -118,6 +148,8 @@ export const archiveDigestOf = (record: {
     status: string;
     content?: string;
     error?: string;
+    partialContent?: string;
+    cancelledAtMessage?: number;
 }): string =>
     digestMemoryValue({
         invocationId: record.invocationId,
@@ -127,8 +159,76 @@ export const archiveDigestOf = (record: {
         kind: record.kind,
         status: record.status,
         content: record.content ?? '',
-        ...(record.error === undefined ? {} : { error: record.error })
+        ...(record.error === undefined ? {} : { error: record.error }),
+        // Absent-vs-present is load-bearing, so the projection mirrors the record instead of
+        // defaulting: a record whose partial was dropped (completed) must digest exactly like the
+        // record the authority stored, key for key.
+        ...(record.partialContent === undefined ? {} : { partialContent: record.partialContent }),
+        ...(record.cancelledAtMessage === undefined ? {} : { cancelledAtMessage: record.cancelledAtMessage })
     });
+
+// The FORENSIC PAIR of an archive payload: validated, and projected onto what a row may store
+// (review finding #5 / issues 0020 + 0033, 2026-11-14).
+//
+// Why this is a shared helper rather than two inline reads: the rule runs on BOTH seams — this fold
+// (./lane-authority.ts replays the same group through it) and the live canonical write
+// (src/harness.ts `archiveInvocation`) — and the two must accept EXACTLY the same payloads. A value
+// this fold rejects while the core accepts is a receipt that says `invalid-mutation` about state that
+// landed; a value the fold accepts while the core rejects rolls the whole group back after the fold
+// already moved the view. Both sides therefore call the same bounds, and the bounds are
+// `../../core/snapshot-validation.ts` — the module ../core/snapshot.ts itself uses to read these two
+// fields back off disk — reused rather than re-derived, so a payload can never be legal to archive
+// and illegal to reload.
+//
+// The rules, in one place:
+//   * an ABSENT field stays absent: a lane built against the previous payload archives the row it
+//     always archived, and a `completed` row carries neither field;
+//   * a PRESENT value must be well-formed — a string of at least one character, a safe integer >= 0.
+//     Nothing is coerced: issue 0020 lists coercion as a defect, because silently repairing a
+//     forensic field is how it stops being evidence of what actually happened;
+//   * a present-but-blank partial is refused for the same reason: "present" is the signal that the
+//     run said something, and whitespace says nothing;
+//   * a `completed` status DROPS both fields. That is not leniency, it is loadability —
+//     ../core/snapshot.ts:280-300 refuses to read a completed row that carries the pair, so a fold
+//     that kept it would write a canonical view (and a next snapshot) that cannot be reloaded.
+//     A cancelled row that later COMPLETES is the ordinary case: the replacement payload has no pair
+//     of its own, and the drop is what stops the earlier cancellation's evidence outliving it.
+//
+// A throw here is a PERMANENT refusal, so callers map it to `invalid-mutation` (not the op kind's
+// usual conflict): a malformed payload re-derived forever would never converge.
+const readArchiveForensicPair = (mutation: {
+    invocationId: string;
+    status: string;
+    partialContent?: string;
+    cancelledAtMessage?: number;
+}): { partialContent?: string; cancelledAtMessage?: number } => {
+    const partialContent =
+        mutation.partialContent === undefined
+            ? undefined
+            : readSnapshotString(mutation.partialContent, `Invocation "${mutation.invocationId}".partialContent`, {
+                  min: 1,
+              });
+
+    if (partialContent !== undefined && partialContent.trim().length === 0) {
+        throw new Error(
+            `Invocation "${mutation.invocationId}".partialContent cannot be blank; a run that said nothing archives no partial at all.`
+        );
+    }
+
+    const cancelledAtMessage =
+        mutation.cancelledAtMessage === undefined
+            ? undefined
+            : readSnapshotInteger(mutation.cancelledAtMessage, `Invocation "${mutation.invocationId}".cancelledAtMessage`, {
+                  min: 0,
+              });
+
+    if (mutation.status === 'completed') return {};
+
+    return {
+        ...(partialContent === undefined ? {} : { partialContent }),
+        ...(cancelledAtMessage === undefined ? {} : { cancelledAtMessage })
+    };
+};
 
 export type CanonicalView = {
     threads: Record<string, CanonicalThread>;
@@ -264,6 +364,36 @@ export type SharedMutation =
           status: HarnessAgentResultSnapshot['status'];
           content: string;
           error?: string;
+          // The PERSISTENT conversation this invocation ran in (stress report #6,
+          // 2026-11-14). Optional so an older send stays valid, and the fold ignores it —
+          // `archiveDigestOf` projects only the fields a writer owns, and the conversation
+          // is not one of them. The AUTHORITY needs it: `harness.archiveInvocation` writes
+          // `threadId` onto the record, and `purgeThread`'s delete-cascade predicate is
+          // `record.threadId`. Without it a lane-archived result has no owner at all, so the
+          // same `threadDelete` removed an inline result and kept a lane one.
+          //
+          // The lane sets it to its own target conversation: a lane replica refuses every
+          // nested-run door in worker mode (src/server/workers/capability.ts
+          // NESTED_RUN_TOOL_NAMES — `delegate` and `threadFork` are refused before they
+          // execute), so the only invocation it can produce IS the conversation it writes.
+          // A result that merely came back in the rebuilt snapshot is skipped by digest
+          // before an op is ever built (./lane-worker-loop.ts, T10 finding M3), so an op
+          // never re-parents somebody else's record.
+          threadId?: string;
+          // Review finding #5 / issues 0020 + 0033 (2026-11-14): the FORENSIC PAIR of a run that
+          // did not finish — what the stopped run actually said, and how many messages it had
+          // committed when it stopped. Optional so an older send stays valid (a lane built against
+          // the previous payload archives the same row it always did, just without the forensics).
+          //
+          // Both fields are writer-owned: the lane's replica produced them in its own
+          // `finishInvocation`, the authority stores them verbatim, and `archiveDigestOf` covers
+          // them, so a canonical row moving from no-pair to pair is an op the writer must send (and
+          // one it must not skip). A malformed value is refused, never coerced — see
+          // `readArchiveForensicPair` below, which applies the snapshot reader's own bounds so a bad
+          // payload cannot persist into the view, and src/harness.ts's `archiveInvocation` applies
+          // the identical rule on the live side.
+          partialContent?: string;
+          cancelledAtMessage?: number;
       }
     | { kind: 'tool:create'; name: string; source: string; revision: string }
     | { kind: 'tool:replace'; name: string; source: string; revision: string; expects: string }
@@ -874,6 +1004,25 @@ export const applySharedMutation = (
         }
 
         case 'result:archive': {
+            // Review finding #5 / issues 0020 + 0033: the payload's forensic pair is checked HERE,
+            // first, before a single line below touches `view`. This fold has already applied the
+            // earlier ops of the group to the view it was handed, so a row that carried a malformed
+            // partial (a number, a blank string, a negative message index) would otherwise persist
+            // into the canonical view — and into the next snapshot — while the lane was told nothing
+            // worse than `applied`. Refusing here keeps the rule honest: a malformed pair never
+            // becomes canonical state on either seam.
+            let pair: { partialContent?: string; cancelledAtMessage?: number };
+
+            try {
+                pair = readArchiveForensicPair(mutation);
+            } catch (error) {
+                return reject(
+                    base,
+                    'invalid-mutation',
+                    `Archived invocation "${mutation.invocationId}" carries a malformed forensic pair: ${error instanceof Error ? error.message : String(error)}`
+                );
+            }
+
             const existing = view.results[mutation.invocationId];
 
             if (existing !== undefined) {
@@ -906,6 +1055,13 @@ export const applySharedMutation = (
                 // replaces the slot (`archiveInvocation` returns `replaced: true`). The
                 // retired behaviour here refused the repeat, so the canonical archive kept
                 // the FIRST answer for the whole life of the conversation.
+                //
+                // #6/0033: `threadId` is carried into the canonical record here as well as
+                // into the core's own archive. The canonical view is what this authority
+                // persists and rebuilds from, so a slot that dropped the owner left the
+                // delete-cascade predicate with nothing to match after a reload - the same
+                // lane/inline divergence, one layer down. `archiveDigestOf` ignores the key,
+                // so this cannot disturb the writer's idempotency test.
                 const replacedRecord: HarnessAgentResultSnapshot = {
                     invocationId: mutation.invocationId,
                     sequence: mutation.sequence,
@@ -915,7 +1071,17 @@ export const applySharedMutation = (
                     kind: mutation.runKind,
                     status: mutation.status,
                     content: mutation.content,
-                    ...(mutation.error === undefined ? {} : { error: mutation.error })
+                    ...(mutation.error === undefined ? {} : { error: mutation.error }),
+                    // #5/0020+0033: the pair, validated above and projected by the core's own rule
+                    // (`readArchiveForensicPair`) — a `completed` status yields `{}`, so a row that is
+                    // being replaced by a completed archive cannot keep a partial that outlived the
+                    // cancellation it described. This is the SECOND place the rule must hold: the live
+                    // write in src/harness.ts applies the identical drop, and the digest of this slot
+                    // is compared against the digest of that record. Drop on one side only and the two
+                    // digests disagree permanently, which is the lane re-archiving the same row on
+                    // every boundary.
+                    ...pair,
+                    ...(mutation.threadId === undefined ? {} : { threadId: mutation.threadId })
                 };
 
                 view.results[replacedRecord.invocationId] = replacedRecord;
@@ -945,7 +1111,16 @@ export const applySharedMutation = (
                 kind: mutation.runKind,
                 status: mutation.status,
                 content: mutation.content,
-                ...(mutation.error === undefined ? {} : { error: mutation.error })
+                ...(mutation.error === undefined ? {} : { error: mutation.error }),
+                // #6/0033: the owner is part of the canonical row, not only of the core's own
+                // archive — see the `replacedRecord` above for why dropping it here is what let
+                // a lane conversation's results survive a `threadDelete` after a reload.
+                ...(mutation.threadId === undefined ? {} : { threadId: mutation.threadId }),
+                // #5/0020+0033: the forensic pair of a run that did not finish, with the same
+                // validation and the same completed-drop as the replacement branch above. A first
+                // archive is the case the pair exists for: a cancelled lane child's canonical row gets
+                // what it SAID, not just the fact that it stopped.
+                ...pair
             };
 
             view.results[record.invocationId] = record;

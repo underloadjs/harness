@@ -10,6 +10,11 @@
 //     64 KiB result cap never silently truncates a full result;
 //   - subagent and fork results are available without reading the owner's
 //     transcript;
+//   - `archiveInvocation` — the door a LANE result comes through — carries the forensic
+//     pair of a stopped run (`partialContent` / `cancelledAtMessage`), refuses a malformed
+//     value before it mints an order or writes a row, drops the pair on a completed
+//     status, and returns what it stored, which is the record the lane seam digests
+//     (review finding #5, issues 0020 + 0033);
 //   - no system prompt, transcript message, tool argument, or tool body is ever
 //     exposed: only the completed assistant answer value is recorded.
 
@@ -844,6 +849,11 @@ describe('snapshot durability (R3)', () => {
         const snapshot = source.snapshot();
 
         // Only terminal records, ordered by run sequence (root, helper, fork).
+        //
+        // Every row names its OWNER (`threadId`) — the persistent conversation `purgeThread`'s
+        // delete cascade matches on. A default-thread run is owned by `agent:<name>`, and a
+        // branch by the conversation that spawned it (0033/0024: the owner is state, so it has to
+        // survive the round trip or a conversation deleted after a reload keeps its results).
         expect(snapshot.agentResults).toEqual([
             {
                 invocationId: '1',
@@ -853,7 +863,8 @@ describe('snapshot durability (R3)', () => {
                 role: 'primary',
                 kind: 'root',
                 status: 'completed',
-                content: 'root final'
+                content: 'root final',
+                threadId: 'agent:lead'
             },
             {
                 invocationId: '2',
@@ -863,7 +874,8 @@ describe('snapshot durability (R3)', () => {
                 role: 'subagent',
                 kind: 'delegation',
                 status: 'completed',
-                content: 'helper answer'
+                content: 'helper answer',
+                threadId: 'agent:helper'
             },
             {
                 invocationId: branchId,
@@ -873,7 +885,8 @@ describe('snapshot durability (R3)', () => {
                 role: 'primary',
                 kind: 'fork',
                 status: 'completed',
-                content: 'fork answer'
+                content: 'fork answer',
+                threadId: 'agent:lead'
             }
         ]);
 
@@ -969,7 +982,15 @@ describe('snapshot durability (R3)', () => {
                 kind: 'root',
                 status: 'failed',
                 content: '',
-                error: 'transport exploded'
+                error: 'transport exploded',
+                // Issue 0033: the position the run reached is stored with the row, and it
+                // travels on its own — this run failed on its first request, so it has a
+                // message count and NO `partialContent` key. That asymmetry is the runtime's
+                // own (0020's open case), and the reader keeps it rather than pairing the two.
+                cancelledAtMessage: 1,
+                // The callable root belongs to the agent's DEFAULT conversation, so the row names
+                // that owner (`agent:writer`) rather than leaving it out (0033/0024).
+                threadId: 'agent:writer'
             }
         ]);
 
@@ -989,7 +1010,8 @@ describe('snapshot durability (R3)', () => {
             offset: 0,
             limit: 4000,
             hasMore: false,
-            error: 'transport exploded'
+            error: 'transport exploded',
+            cancelledAtMessage: 1
         });
     });
 
@@ -1032,7 +1054,10 @@ describe('snapshot durability (R3)', () => {
                 role: 'primary',
                 kind: 'root',
                 status: 'completed',
-                content: 'late answer'
+                content: 'late answer',
+                // A completed row may name its owner too — unlike the forensic pair, a finished
+                // turn still belongs to the conversation that ran it (0033/0024).
+                threadId: 'agent:writer'
             }
         ]);
     });
@@ -1382,7 +1407,11 @@ describe('terminal commit is atomic for a finished run (B2)', () => {
         // by the same op once its run is genuinely over.
         expect(writer.deleteThread(thread.id)).toEqual({
             deleted: thread.id,
-            removedThreadIds: [thread.id]
+            removedThreadIds: [thread.id],
+            // The turn that had just finished is the lookup the release takes with it — named
+            // on the receipt, since `agentResult` for it starts throwing on the next call.
+            removedInvocationIds: ['1'],
+            removedBranchIds: []
         });
     });
 
@@ -1639,5 +1668,756 @@ describe('terminal commit is atomic for a finished run (B2)', () => {
         // `durationMs` keeps its honest fallback: the child's own measurement when the
         // record exists, otherwise the span this call actually spent.
         expect(source).toContain('durationMs: record?.durationMs ?? Math.max(0, Date.now() - startedAt)');
+    });
+});
+
+
+// ---------------------------------------------------------------------------
+// ISSUE 0033 (2026-11-14) — the forensic partial of an UNFINISHED run survives
+// persistence
+// ---------------------------------------------------------------------------
+//
+// `partialContent` and `cancelledAtMessage` are the ONLY surviving account of a
+// cancelled or failed run: the transcript rollback in `runAgentCore`'s catch
+// (`src/harness.ts:11486`) splices the run's own messages out, so a post-mortem has
+// exactly these two fields plus `error`. They were also RUNTIME-ONLY. The snapshot
+// projection wrote `content` alone — empty for a non-completed run — and `restore()`
+// rebuilt the record without the pair, so the restart took back an answer the caller
+// had already been shown. `Temp/t12-verify/probes/t12-snapshot-partial.test.ts`
+// measured it on the pre-fix tree (invocationId `2`, the abort door):
+//
+//   live      content:"half an answer", contentLength:14, partialContent present, cancelledAtMessage:2
+//   snapshot  content:"" and NO `partialContent` key
+//   restored  content:"", contentLength:0, and NO `partialContent` key
+//
+// That is the stress report's #5 harm class — "the answer I already relied on is
+// gone" — one door further down. The fixtures below reproduce the same two shapes the
+// probe used (a committed text turn, then a parked tool for the cancel; a committed
+// text turn, then a transport error for the failure) and pin the whole chain with
+// exact values: live door, snapshot row, restored door, and re-projection.
+//
+// The pair also bounds itself, which is why persisting it costs nothing: a terminal
+// record holds its answer in exactly ONE of `content` (completed) or `partialContent`
+// (unfinished) — `finishInvocation` (`src/harness.ts:3866-3890`) never writes both and
+// `archiveInvocation` (`:7194-7196`) keeps the same rule — so the archive's answer-text
+// footprint is unchanged and the row count is still capped by AGENT_RESULT_RETENTION
+// (64, `src/core/agent-limits.ts:25`). No new size cap was introduced; `content` was
+// already stored in full and paged on READ, and this field follows that precedent.
+//
+// What still does NOT survive, and deliberately: the run's transcript (rolled back),
+// its tool calls and tool bodies (0020's leak boundary, 0032), and `durationMs` — a
+// wall-clock measurement of the run this process made, not part of 0033's gap, so the
+// restored envelopes below assert its ABSENCE rather than inventing a value.
+describe('the forensic partial survives persistence (issue 0033)', () => {
+    const deferred = <T,>(): { promise: Promise<T>; resolve: (value: T) => void } => {
+        let resolve!: (value: T) => void;
+        const promise = new Promise<T>((accept) => {
+            resolve = accept;
+        });
+        return { promise, resolve };
+    };
+
+    // Real timers, state-driven pump — same convention as the B2 block above.
+    const pump = async (predicate: () => boolean, passes = 120): Promise<void> => {
+        for (let index = 0; index < passes && !predicate(); index++) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        expect(predicate()).toBe(true);
+    };
+
+    const settle = async (passes = 20): Promise<void> => {
+        for (let index = 0; index < passes; index++) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+    };
+
+    const rowOf = (snapshot: unknown, invocationId: string) =>
+        ((snapshot as { agentResults?: Record<string, unknown>[] }).agentResults ?? []).find(
+            (record) => record.invocationId === invocationId
+        ) ?? null;
+
+    // The cancelled fixture: ONE committed assistant text turn, then a park inside a
+    // hanging sync tool. The abort door is the run's OWN signal — a host `stopThread`
+    // reaches the same catch but leaves nothing committed (see the pin at :1571, where a
+    // stopped run reports `cancelledAtMessage: 1` with NO partial), so only the signal
+    // exercises the pair.
+    const cancelledRun = async (): Promise<{
+        source: ReturnType<typeof harness>;
+        invocationId: string;
+        // The host thread this run belongs to — the owner the persisted row has to name, so the
+        // assertions below can address it without hardcoding the minted id.
+        threadId: string;
+        release: () => void;
+    }> => {
+        const gate = deferred<string>();
+
+        const source = harness({
+            agents: {
+                writer: brain(
+                    routed((request) =>
+                        request.messages.some((message) => message.role === 'tool')
+                            ? answer('never reached')
+                            : [
+                                  { type: 'text', delta: 'half an answer' },
+                                  ...callTool('h1', 'hold', '{}')
+                              ]
+                    )
+                )
+            },
+            tools: {
+                hold: tool({
+                    description: 'Hold until the test releases it.',
+                    tags: ['test'],
+                    visibility: 'core',
+                    execute: () => gate.promise
+                })
+            },
+            presets: false
+        });
+
+        const thread = source.createThread('writer');
+        const controller = new AbortController();
+        const run = source
+            .sendThreadInput(thread.id, 'go', { signal: controller.signal })
+            .catch((error: Error) => error);
+
+        await pump(() =>
+            source.threadMessages(thread.id).some((message) => message.role === 'assistant')
+        );
+
+        controller.abort(new Error('operator stop'));
+        await run;
+
+        gate.resolve('released');
+        await settle();
+
+        return {
+            source,
+            threadId: thread.id,
+            invocationId: String(source.thread(thread.id)?.invocationId ?? ''),
+            release: () => undefined
+        };
+    };
+
+    it('carries a cancelled run partial and its message position through snapshot -> restore', async () => {
+        const { source, threadId, invocationId } = await cancelledRun();
+
+        // SURFACE 1 — the live door, the shape the caller was promised.
+        expect(await source.executeTool('agentResult', { agent: 'writer', invocationId })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'cancelled',
+            content: 'half an answer',
+            contentLength: 14,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'operator stop',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            durationMs: expect.any(Number)
+        });
+
+        // SURFACE 2 — the persisted row. `content` stays EMPTY (it is the completed
+        // answer, and this run never gave one); the partial and its position travel
+        // beside the error instead. `threadId` names the conversation that ran it — the
+        // same fact `purgeThread`'s cascade matches on, and the one a restart used to
+        // lose (0033/0024).
+        const snapshot = source.snapshot();
+
+        expect(rowOf(snapshot, invocationId)).toEqual({
+            invocationId: '1',
+            sequence: 1,
+            completedOrder: 1,
+            agent: 'writer',
+            role: 'primary',
+            kind: 'root',
+            status: 'cancelled',
+            content: '',
+            error: 'operator stop',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            threadId
+        });
+
+        // SURFACE 3 — the restart. JSON on purpose: this is the bytes a server writes
+        // under DATABASE_ROOT, so the round trip is proven through the serialiser and the
+        // reader, not only through two in-process objects.
+        const target = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+        target.restore(JSON.parse(JSON.stringify(snapshot)) as never);
+
+        expect(await target.executeTool('agentResult', { agent: 'writer', invocationId })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'cancelled',
+            content: 'half an answer',
+            contentLength: 14,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'operator stop',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2
+        });
+
+        // The restored record re-projects byte-for-byte, so a restart cannot start
+        // drifting the archive a second time.
+        expect(rowOf(target.snapshot(), invocationId)).toEqual(rowOf(snapshot, invocationId));
+
+        // SURFACE 4 — the owner is the point of persisting it: deleting the conversation AFTER
+        // the reload has to take the archived result with it, exactly as the same delete does
+        // BEFORE the reload. Before 0033/0024 the restored record had no `threadId`, so
+        // `purgeThread`'s predicate (`record.threadId === threadId`) missed it and the row
+        // outlived its conversation. Both doors are asserted, in the same run, so the parity is
+        // the finding rather than an assumption.
+        expect(source.deleteThread(threadId)).toEqual({
+            deleted: threadId,
+            removedThreadIds: [threadId],
+            removedInvocationIds: [invocationId],
+            removedBranchIds: []
+        });
+        expect(target.deleteThread(threadId)).toEqual({
+            deleted: threadId,
+            removedThreadIds: [threadId],
+            removedInvocationIds: [invocationId],
+            removedBranchIds: []
+        });
+
+        // Neither side keeps a row whose owner is gone, and the reloaded harness reads the id
+        // as archived-and-deleted, not as still addressable.
+        expect(rowOf(source.snapshot(), invocationId)).toBeNull();
+        expect(rowOf(target.snapshot(), invocationId)).toBeNull();
+        expect(target.thread(threadId)).toBeUndefined();
+    });
+
+    it('carries a failed run partial through snapshot -> restore', async () => {
+        // A FAILED terminal state with something committed: the assistant text turn
+        // lands, the tool it called throws, and the NEXT request dies on the transport
+        // with `retry: false` so the failure is one record, not a retry sequence.
+        const source = harness({
+            agents: {
+                writer: brain(
+                    routed((request) =>
+                        request.messages.some((message) => message.role === 'tool')
+                            ? [{ type: 'error', message: 'transport died mid-run' }]
+                            : [
+                                  { type: 'text', delta: 'a partial before the crash' },
+                                  ...callTool('b1', 'boom', '{}')
+                              ]
+                    ),
+                    { retry: false }
+                )
+            },
+            tools: {
+                boom: tool({
+                    description: 'Fail loudly.',
+                    tags: ['test'],
+                    visibility: 'core',
+                    execute: () => {
+                        throw new Error('tool exploded');
+                    }
+                })
+            },
+            presets: false
+        });
+
+        const thread = source.createThread('writer');
+
+        await expect(source.sendThreadInput(thread.id, 'go')).rejects.toThrow('transport died mid-run');
+
+        const invocationId = String(source.thread(thread.id)?.invocationId ?? '');
+
+        expect(await source.executeTool('agentResult', { agent: 'writer', invocationId })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'failed',
+            content: 'a partial before the crash',
+            contentLength: 26,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'transport died mid-run',
+            partialContent: 'a partial before the crash',
+            cancelledAtMessage: 3,
+            durationMs: expect.any(Number)
+        });
+
+        const snapshot = source.snapshot();
+
+        expect(rowOf(snapshot, invocationId)).toEqual({
+            invocationId: '1',
+            sequence: 1,
+            completedOrder: 1,
+            agent: 'writer',
+            role: 'primary',
+            kind: 'root',
+            status: 'failed',
+            content: '',
+            error: 'transport died mid-run',
+            partialContent: 'a partial before the crash',
+            cancelledAtMessage: 3,
+            // The owner travels on a failed row exactly as it does on a cancelled one.
+            threadId: thread.id
+        });
+
+        const target = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+        target.restore(JSON.parse(JSON.stringify(snapshot)) as never);
+
+        expect(await target.executeTool('agentResult', { agent: 'writer', invocationId })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'failed',
+            content: 'a partial before the crash',
+            contentLength: 26,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'transport died mid-run',
+            partialContent: 'a partial before the crash',
+            cancelledAtMessage: 3
+        });
+    });
+
+    it('restores an OLD-GENERATION agent-result row that never carried the forensic keys', async () => {
+        // Compatibility is asserted against DATA, not against this build's own writer:
+        // the array below is a literal, typed only as JSON, exactly the row shape every
+        // file written before 0033 holds (`error` present, no forensic keys). Both
+        // halves of the rule matter: the old row must still VALIDATE, and the reader must
+        // not INVENT the keys on the way back out.
+        const base = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+        const document = base.snapshot() as Record<string, unknown>;
+
+        document.agentResults = [
+            {
+                invocationId: '1',
+                sequence: 1,
+                completedOrder: 1,
+                agent: 'writer',
+                role: 'primary',
+                kind: 'root',
+                status: 'cancelled',
+                content: '',
+                error: 'operator stop'
+            },
+            {
+                invocationId: '2',
+                sequence: 2,
+                completedOrder: 2,
+                agent: 'writer',
+                role: 'primary',
+                kind: 'root',
+                status: 'completed',
+                content: 'a finished answer'
+            }
+        ];
+
+        const target = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+        target.restore(JSON.parse(JSON.stringify(document)) as never);
+
+        // The old file answers exactly what it always did: the cancelled run reports its
+        // error and an empty page, with NO forensic key rather than an empty-string one.
+        expect(await target.executeTool('agentResult', { agent: 'writer', invocationId: '1' })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'cancelled',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'operator stop'
+        });
+        expect(await target.executeTool('agentResult', { agent: 'writer', invocationId: '2' })).toEqual({
+            agent: 'writer',
+            invocationId: '2',
+            kind: 'root',
+            status: 'completed',
+            content: 'a finished answer',
+            contentLength: 17,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // Round-tripping old data does not quietly upgrade it: the keys stay absent, so a
+        // file this build reads is also a file the previous build could read back.
+        expect(target.snapshot().agentResults).toEqual(document.agentResults);
+
+        // A MIXED-generation array — one row with the pair, one without — validates and
+        // restores per row, which is what a store with files from both eras needs.
+        const mixed = JSON.parse(JSON.stringify(document)) as {
+            agentResults: Array<Record<string, unknown>>;
+        };
+        mixed.agentResults[0].partialContent = 'half an answer';
+        mixed.agentResults[0].cancelledAtMessage = 2;
+
+        const both = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+        both.restore(mixed as never);
+
+        expect(await both.executeTool('agentResult', { agent: 'writer', invocationId: '1' })).toMatchObject({
+            status: 'cancelled',
+            content: 'half an answer',
+            contentLength: 14,
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2
+        });
+        expect(await both.executeTool('agentResult', { agent: 'writer', invocationId: '2' })).toMatchObject({
+            status: 'completed',
+            content: 'a finished answer'
+        });
+        expect(rowOf(both.snapshot(), '2')).not.toHaveProperty('partialContent');
+    });
+
+    it('refuses a forensic value the runtime can never write, without touching live state', async () => {
+        const base = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+        const rowOfStatus = (status: string): Record<string, unknown> => ({
+            invocationId: '1',
+            sequence: 1,
+            completedOrder: 1,
+            agent: 'writer',
+            role: 'primary',
+            kind: 'root',
+            status,
+            content: '',
+            ...(status === 'completed' ? {} : { error: 'operator stop' })
+        });
+
+        const restoreWith = (patch: Record<string, unknown>): (() => void) => () => {
+            const document = JSON.parse(JSON.stringify(base.snapshot())) as {
+                agentResults: Record<string, unknown>[];
+            };
+            document.agentResults = [patch];
+
+            harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false }).restore(
+                document as never
+            );
+        };
+
+        // A writer that stored a blank partial is hand-edited data, not a fact this build
+        // produces (`finishInvocation` guards on a non-blank trim, src/harness.ts:3887-3889),
+        // and restoring it would answer `partialContent: ""` where the runtime says ABSENT.
+        expect(restoreWith({ ...rowOfStatus('cancelled'), partialContent: '' })).toThrow(
+            'snapshot.agentResults[0].partialContent must be at least 1 character.'
+        );
+
+        expect(restoreWith({ ...rowOfStatus('cancelled'), partialContent: 7 })).toThrow(
+            'snapshot.agentResults[0].partialContent must be a string.'
+        );
+
+        // `cancelledAtMessage` may be 0 — a run stopped before it appended anything
+        // reports zero — but not negative and not fractional.
+        expect(restoreWith({ ...rowOfStatus('cancelled'), cancelledAtMessage: 0 })).not.toThrow();
+        expect(restoreWith({ ...rowOfStatus('cancelled'), cancelledAtMessage: -1 })).toThrow(
+            'snapshot.agentResults[0].cancelledAtMessage must be between 0 and Infinity.'
+        );
+        expect(restoreWith({ ...rowOfStatus('cancelled'), cancelledAtMessage: 1.5 })).toThrow(
+            'snapshot.agentResults[0].cancelledAtMessage must be a safe integer.'
+        );
+
+        // The same completed-row rule `error` already enforces: a completed answer has no
+        // partial, and a row claiming one is a contradiction, not a redundant field.
+        expect(restoreWith({ ...rowOfStatus('completed'), content: 'done', partialContent: 'draft' })).toThrow(
+            'snapshot.agentResults[0].partialContent and .cancelledAtMessage must be absent on a completed result.'
+        );
+        expect(restoreWith({ ...rowOfStatus('completed'), content: 'done', cancelledAtMessage: 4 })).toThrow(
+            'snapshot.agentResults[0].partialContent and .cancelledAtMessage must be absent on a completed result.'
+        );
+
+        // Nothing above is a PARTIAL accept either: a refused row leaves the harness's own
+        // registry exactly as it was (the reader runs before any live state is touched).
+        const target = harness({ agents: { writer: brain(scripted([answer('keep')])) }, presets: false });
+        await target('go');
+
+        const refused = JSON.parse(JSON.stringify(target.snapshot())) as {
+            agentResults: Record<string, unknown>[];
+        };
+        refused.agentResults[0].partialContent = 'a draft that never was';
+
+        expect(() => target.restore(refused as never)).toThrow(
+            'snapshot.agentResults[0].partialContent and .cancelledAtMessage must be absent on a completed result.'
+        );
+        expect(await target.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'keep',
+            contentLength: 4,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // THE OWNER KEY (0033/0024) is read under the same rules: optional on the row, NEVER
+        // blank on a row that carries one — both writers (the snapshot projection and
+        // `archiveInvocation`) spread it only when the invocation has a conversation, so a
+        // `threadId: ""` on disk is a hand edit, and restoring one would hand `purgeThread`'s
+        // cascade predicate an owner that matches no conversation.
+        expect(restoreWith({ ...rowOfStatus('cancelled'), threadId: '' })).toThrow(
+            'snapshot.agentResults[0].threadId must be at least 1 character.'
+        );
+        expect(restoreWith({ ...rowOfStatus('cancelled'), threadId: 7 })).toThrow(
+            'snapshot.agentResults[0].threadId must be a string.'
+        );
+
+        // And, unlike the forensic pair, it is LEGAL on a completed row — a finished turn of a
+        // host thread still belongs to that thread — and it survives the restore intact, which is
+        // the whole point: the cascade still matches after the reload.
+        const ownerKept = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+
+        ownerKept.restore({
+            ...(JSON.parse(JSON.stringify(base.snapshot())) as Record<string, unknown>),
+            agentResults: [{ ...rowOfStatus('completed'), content: 'done', threadId: 'thread-9' }]
+        } as never);
+
+        expect(rowOf(ownerKept.snapshot(), '1')).toEqual({
+            ...rowOfStatus('completed'),
+            content: 'done',
+            threadId: 'thread-9'
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// REVIEW FINDING #5 / issues 0020 + 0033 (2026-11-14) — THE ARCHIVE SEAM ITSELF.
+//
+// Everything above this block establishes that a STOPPED RUN holds the pair (live reader, persisted
+// row, restored row). What it could not say is that an ARCHIVE — the door a lane result comes
+// through, and the door `restore()`-then-re-archive pushes through — carries it. Until this change
+// `HarnessInvocationArchiveInput` named neither field, so `archiveInvocation` stored `content: ''`
+// and nothing else: issue 0020's "significant cancelled child reports no partial content" with NO
+// restart involved, because the loss was in this payload.
+//
+// The rules pinned here are the snapshot reader's own (../core/snapshot.ts:242-298), reused through
+// `core/snapshot-validation.ts` rather than re-derived, so an archive can never mint a live record
+// the next snapshot cannot reload:
+//   * PRESENT means it said something — a value must be a non-blank string, and an integer >= 0;
+//   * a malformed value is REFUSED, not coerced, and refused BEFORE anything moves: no record
+//     written, no completion order burned (the lane seam turns this throw into a permanent
+//     `invalid-mutation`, so a canonical state corrupted on the way would never be repaired);
+//   * a `completed` status carries NEITHER field, exactly like `error` — and on a REPLACE it drops
+//     the pair the earlier cancellation left behind, because the reader refuses a completed row
+//     that holds one;
+//   * the RETURNED record carries what was stored, because the lane digests the return value
+//     (`lane-authority.ts` → `archiveDigestOf(archived.record)`) and a field the digest covers that
+//     the return omits is a lane that re-archives the same row forever.
+// ---------------------------------------------------------------------------
+describe('the archive seam carries the forensic pair of a stopped run (review #5, 0020 + 0033)', () => {
+    // An archive never runs a model, so one scripted turn is the whole fixture.
+    const coreOf = () => harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+
+    const rowOf = (snapshot: unknown, invocationId: string) =>
+        ((snapshot as { agentResults?: Record<string, unknown>[] }).agentResults ?? []).find(
+            (record) => record.invocationId === invocationId
+        ) ?? null;
+
+    const cancelledArchive = {
+        invocationId: '513',
+        sequence: 3,
+        agent: 'writer',
+        role: 'subagent',
+        kind: 'delegation',
+        status: 'cancelled',
+        content: '',
+        error: 'The run was cancelled.',
+        partialContent: 'half an answer',
+        cancelledAtMessage: 2,
+        threadId: 'thread-9'
+    } as const;
+
+    it('stores the pair on the canonical row AND returns it, which is the record the lane digests', () => {
+        const source = coreOf();
+        const archived = source.archiveInvocation(cancelledArchive);
+
+        expect(archived.replaced).toBe(false);
+        // The whole returned record, key for key. `lane-authority.ts` digests THIS object as the
+        // receipt the lane compares against its own derivation, so the pair has to be on it.
+        expect(archived.record).toEqual({
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'writer',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2
+        });
+
+        // And the row the session reads, `/results` serves, and the next snapshot writes.
+        expect(rowOf(source.snapshot(), '513')).toEqual({
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'writer',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            threadId: 'thread-9'
+        });
+
+        // Reloadable in the strictest sense: the persisted form parses and restores unchanged, which
+        // is the guarantee the pair has to keep (the reader's `min: 1` / `>= 0` bounds are why the
+        // writer refuses anything else rather than tidying it up).
+        const reloaded = coreOf();
+
+        reloaded.restore(JSON.parse(JSON.stringify(source.snapshot())) as never);
+        expect(rowOf(reloaded.snapshot(), '513')).toEqual(rowOf(source.snapshot(), '513'));
+    });
+
+    it('drops the pair on a completed archive, and off the row a completed archive replaces', () => {
+        const source = coreOf();
+
+        // A caller that sends `completed` WITH a partial is not refused — the pair simply has no
+        // meaning there, exactly as `error` is ignored on a completed status. Storing it would write
+        // a row ../core/snapshot.ts refuses to read back, so the whole snapshot would stop loading.
+        const completed = source.archiveInvocation({
+            ...cancelledArchive,
+            status: 'completed',
+            content: 'the finished answer',
+            error: undefined
+        });
+
+        expect(completed.record).toEqual({
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'writer',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'the finished answer'
+        });
+        expect(rowOf(source.snapshot(), '513')).toEqual({
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'writer',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'the finished answer',
+            threadId: 'thread-9'
+        });
+
+        // THE CASE THAT MATTERS: a lane child that is cancelled and then finishes. The first archive
+        // stores the pair; the completed one replaces the row, and a spread merge would quietly
+        // resurrect the stale partial beside a completed status.
+        const staged = coreOf();
+
+        staged.archiveInvocation(cancelledArchive);
+        expect(rowOf(staged.snapshot(), '513')?.partialContent).toBe('half an answer');
+
+        staged.archiveInvocation({ ...cancelledArchive, status: 'completed', content: 'the finished answer', error: undefined });
+
+        expect(rowOf(staged.snapshot(), '513')).toEqual({
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 2,
+            agent: 'writer',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'the finished answer',
+            threadId: 'thread-9'
+        });
+        // Still one row, and the persisted form is one the reader accepts.
+        expect((staged.snapshot() as { agentResults?: unknown[] }).agentResults).toHaveLength(1);
+
+        const restored = coreOf();
+
+        restored.restore(JSON.parse(JSON.stringify(staged.snapshot())) as never);
+        expect(rowOf(restored.snapshot(), '513')).toEqual(rowOf(staged.snapshot(), '513'));
+    });
+
+    it('refuses a malformed pair before anything moves — no row, no burned completion order', () => {
+        const source = coreOf();
+
+        // The four malformed shapes, each refused with the snapshot reader's own sentence (so a
+        // value that is legal to archive is never illegal to reload).
+        expect(() => source.archiveInvocation({ ...cancelledArchive, partialContent: '' })).toThrow(
+            'Invocation "513".partialContent must be at least 1 character.'
+        );
+        expect(() => source.archiveInvocation({ ...cancelledArchive, partialContent: '   ' })).toThrow(
+            'Invocation "513".partialContent cannot be blank; a run that said nothing archives no partial at all.'
+        );
+        expect(() => source.archiveInvocation({ ...cancelledArchive, partialContent: 7 as unknown as string })).toThrow(
+            'Invocation "513".partialContent must be a string.'
+        );
+        expect(() => source.archiveInvocation({ ...cancelledArchive, cancelledAtMessage: -1 })).toThrow(
+            'Invocation "513".cancelledAtMessage must be between 0 and Infinity.'
+        );
+        // A count is a count, not a string.
+        expect(() => source.archiveInvocation({ ...cancelledArchive, cancelledAtMessage: '2' as unknown as number })).toThrow(
+            'Invocation "513".cancelledAtMessage must be a safe integer.'
+        );
+
+        // NONE of the five touched live canonical state: not a record, not a slot, not the ordering
+        // counter. `completedOrder` is minted by incrementing harness-owned state, which is why the
+        // validation runs above it — a refusal that burned an order would leave `/results` with a
+        // gap nobody can explain, and the lane seam retries the same op against the same payload.
+        expect(rowOf(source.snapshot(), '513')).toBeNull();
+        expect((source.snapshot() as { agentResults?: unknown[] }).agentResults ?? []).toEqual([]);
+
+        const landed = source.archiveInvocation({ ...cancelledArchive, invocationId: '514', sequence: 4 });
+
+        expect(landed.record.completedOrder).toBe(1);
+        expect(rowOf(source.snapshot(), '514')).toEqual({
+            invocationId: '514',
+            sequence: 4,
+            completedOrder: 1,
+            agent: 'writer',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            threadId: 'thread-9'
+        });
+
+        // An absent pair stays absent — the pre-change payload is still a legal archive, and `''` is
+        // a DIFFERENT claim that the reader would refuse. This is what lets an older lane keep
+        // archiving while the field crosses the seam.
+        const bare = source.archiveInvocation({
+            invocationId: '515',
+            sequence: 5,
+            agent: 'writer',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            threadId: 'thread-9'
+        });
+
+        expect(bare.record.completedOrder).toBe(2);
+        expect(rowOf(source.snapshot(), '515')).toEqual({
+            invocationId: '515',
+            sequence: 5,
+            completedOrder: 2,
+            agent: 'writer',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            threadId: 'thread-9'
+        });
     });
 });

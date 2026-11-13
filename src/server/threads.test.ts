@@ -23,8 +23,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
-import type { HarnessMessage, HarnessPluginApi, HarnessStreamEvent } from '../harness';
+import { agent, harness, tool } from '../harness';
+import type {
+    HarnessMessage,
+    HarnessPluginApi,
+    HarnessStreamEvent,
+    HarnessStreamRequest
+} from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';
@@ -3024,6 +3029,372 @@ describe('delegated child threads', () => {
         expect(
             await reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: '1' })
         ).toMatchObject({ agent: 'lead', invocationId: '1', status: 'completed' });
+
+        reloaded.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    // ISSUE 0033 — THE DURABILITY HALF, AT THE SERVER DOOR.
+    //
+    // A child that commits ONE assistant text turn and then parks inside a hanging tool is
+    // the state a timeout or a `toolCancel` actually produces: the run has said something
+    // substantive, and cancelling it is what ends it. The live `agentResult` envelope has
+    // always reported that partial; what issue 0033 found is that the SNAPSHOT PROJECTION
+    // dropped it, so the durable ledger — the file a server writes under DATABASE_ROOT —
+    // answered the same invocationId with `content: ""` and no `partialContent` key at all
+    // after a restart. The caller had been shown an answer that a restart took back.
+    //
+    // Everything below runs the server's own path, not a harness stand-in: SessionStore ->
+    // HarnessPersistence -> the bytes on disk -> a SECOND store built from that file -> the
+    // tool the model calls. The three surfaces are pinned apart (live, on disk, restored)
+    // because the defect lived exactly in the gap between them.
+    it('carries the forensic partial of a cancelled child through the file a server writes (issue 0033)', async () => {
+        // `entered` fires when the child's tool call BEGINS, which is the moment the
+        // assistant text above it has been committed. Cancelling from there means the test
+        // never races a wall clock for "is there a partial yet".
+        const childPreset = (hang: Promise<string>, entered: () => void): HarnessPreset => {
+            let leadRequests = 0;
+
+            return {
+            name: 'lead',
+            title: 'lead',
+            description: 'lead + a child that stops mid-answer',
+            requiresEndpoint: false,
+            primary: 'lead',
+            subagents: ['helper'],
+            agents: ['lead', 'helper'],
+            tools: [],
+            builtin: true,
+            editable: true,
+            create: (settings, progress) =>
+                harness({
+                    agents: {
+                        lead: agent({
+                            model: settings.model,
+                            instruction: 'lead',
+                            stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
+                                // A fresh generator per request, so the delegate call is emitted
+                                // exactly ONCE — re-emitting its id is the reuse guard's business
+                                // (see src/harness.ts:11281), and `delegationPreset` above counts
+                                // requests for the same reason.
+                                if (leadRequests++ === 0) {
+                                    yield {
+                                        type: 'done',
+                                        stopReason: 'tool_calls',
+                                        toolCalls: [
+                                            {
+                                                id: 'delegate-1',
+                                                name: 'delegate',
+                                                arguments: JSON.stringify({ agent: 'helper', input: 'child work' })
+                                            }
+                                        ]
+                                    };
+                                    return;
+                                }
+
+                                // The lead is still ANSWERING after the child is cancelled — the
+                                // delegation reports the stop rather than stranding the turn.
+                                yield { type: 'text', delta: 'lead answer' };
+                                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                            }
+                        }),
+                        helper: agent({
+                            model: settings.model,
+                            instruction: 'helper',
+                            stream: async function* (
+                                request: HarnessStreamRequest
+                            ): AsyncGenerator<HarnessStreamEvent> {
+                                // Reached only if the hold were released; the abort ends the run
+                                // first, and the cancelled record below is what proves that.
+                                if (request.messages.some((message) => message.role === 'tool')) {
+                                    yield { type: 'text', delta: 'never reached' };
+                                    yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                                    return;
+                                }
+
+                                yield { type: 'text', delta: 'half an answer' };
+                                yield {
+                                    type: 'done',
+                                    stopReason: 'tool_calls',
+                                    toolCalls: [{ id: 'h1', name: 'hold', arguments: '{}' }]
+                                };
+                            }
+                        })
+                    },
+                    tools: {
+                        hold: tool({
+                            description: 'Hold until the run is cancelled.',
+                            tags: ['test'],
+                            visibility: 'core',
+                            execute: () => {
+                                entered();
+                                return hang;
+                            }
+                        })
+                    },
+                    primary: 'lead',
+                    subagents: ['helper'],
+                    presets: false,
+                    report: { progress }
+                })
+            };
+        };
+
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
+        const persistence = new HarnessPersistence(root);
+        const entered = deferred();
+        const hang = new Promise<string>(() => undefined);
+        const store = createStore([childPreset(hang, entered.resolve)], persistence);
+        const created = await store.create('lead');
+
+        const task = await store.enqueue(created.id, 'delegate please');
+        await entered.promise;
+
+        expect((await store.cancelThread(created.id, 'thread-2', 'operator stop')).cancelled).toBe(true);
+
+        // The lead's turn runs to completion after the child is stopped, and the store refuses
+        // a tool call while a task is in flight — so every door below is read on an idle
+        // session. The cancelled record is durable by then; what changes is only WHO answers it.
+        await task.settled;
+        await store.waitForIdle(created.id);
+
+        // SURFACE 1 — the live door, before a byte is written.
+        const live = await store.callTool(created.id, 'agentResult', { agent: 'helper', invocationId: '2' });
+
+        expect(live).toEqual({
+            agent: 'helper',
+            cancelledAtMessage: 2,
+            content: 'half an answer',
+            contentLength: 14,
+            durationMs: expect.any(Number),
+            error: 'operator stop',
+            hasMore: false,
+            invocationId: '2',
+            kind: 'delegation',
+            limit: 4000,
+            offset: 0,
+            partialContent: 'half an answer',
+            status: 'cancelled'
+        });
+
+        // SURFACE 2 — the bytes the server wrote. `content` stays EMPTY, because that field
+        // is the COMPLETED answer and this child never gave one; the partial and its position
+        // travel beside the error instead. Before the fix this row carried neither key, which
+        // is why the restart could not answer what the live door had shown.
+        const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+            sessions: { core: { agentResults?: Record<string, unknown>[] } }[];
+        };
+        const onDisk = (document.sessions[0].core.agentResults ?? []).find((record) => record.invocationId === '2');
+
+        expect(onDisk).toEqual({
+            agent: 'helper',
+            cancelledAtMessage: 2,
+            completedOrder: 1,
+            content: '',
+            error: 'operator stop',
+            invocationId: '2',
+            kind: 'delegation',
+            partialContent: 'half an answer',
+            role: 'subagent',
+            sequence: 2,
+            status: 'cancelled',
+            // The OWNER is on the row too (0033/0024): the child's one-shot conversation is
+            // `thread-2`, and `purgeThread`'s cascade matches `record.threadId` — so deleting
+            // that conversation after a reload still takes this result with it.
+            threadId: 'thread-2'
+        });
+
+        // The COMPLETED row in the same document carries the other half of the rule: neither
+        // forensic key appears on a finished run, so one record never holds two answer strings
+        // — the reason adding `partialContent` does not grow the archive (issue 0033).
+        const leadRow = (document.sessions[0].core.agentResults ?? []).find((record) => record.invocationId === '1');
+
+        expect(leadRow).toEqual({
+            agent: 'lead',
+            completedOrder: 2,
+            content: 'lead answer',
+            invocationId: '1',
+            kind: 'root',
+            role: 'primary',
+            sequence: 1,
+            status: 'completed',
+            // The completed row keeps its owner as well — a finished turn still belongs to the
+            // conversation that ran it, and unlike the forensic pair this key is legal here.
+            threadId: 'thread-1'
+        });
+
+        store.dispose();
+
+        // SURFACE 3 — the restart, through a store built from that file. This is the answer
+        // the caller did NOT get before the fix: same id, same door, and the text gone.
+        const reloaded = createStore([childPreset(hang, () => undefined)], persistence, persistence.load());
+
+        expect(await reloaded.callTool(created.id, 'agentResult', { agent: 'helper', invocationId: '2' })).toEqual({
+            agent: 'helper',
+            cancelledAtMessage: 2,
+            content: 'half an answer',
+            contentLength: 14,
+            error: 'operator stop',
+            hasMore: false,
+            invocationId: '2',
+            kind: 'delegation',
+            limit: 4000,
+            offset: 0,
+            partialContent: 'half an answer',
+            status: 'cancelled'
+        });
+
+        // The reloaded store re-projects the row it was given, byte for byte — the round trip
+        // is a fixed point, so a second restart cannot drift the archive further.
+        reloaded.dispose();
+        const rewritten = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+            sessions: { core: { agentResults?: Record<string, unknown>[] } }[];
+        };
+
+        expect((rewritten.sessions[0].core.agentResults ?? []).find((record) => record.invocationId === '2')).toEqual(onDisk);
+
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    // A lead whose FIRST request forks. threadFork is a core tool (registered by
+    // default), so the preset needs no fork configuration; the branch is a copy of
+    // 'lead', and routing on the last user message keeps the branch actor ANSWERING
+    // instead of forking again.
+    const forkPreset = (): HarnessPreset => ({
+        name: 'lead',
+        title: 'lead',
+        description: 'lead + branch',
+        requiresEndpoint: false,
+        primary: 'lead',
+        subagents: [],
+        agents: ['lead'],
+        tools: [],
+        builtin: true,
+        editable: true,
+        create: (settings, progress) =>
+            harness({
+                agents: {
+                    lead: agent({
+                        model: settings.model,
+                        instruction: 'lead',
+                        stream: async function* (
+                            request: HarnessStreamRequest
+                        ): AsyncGenerator<HarnessStreamEvent> {
+                            const users = request.messages.filter(
+                                (message) => message.role === 'user'
+                            ) as HarnessMessage[];
+                            const last = users[users.length - 1];
+
+                            // The branch actor's turn: answer, so branch-1 completes.
+                            if (last?.content === 'branch work') {
+                                yield { type: 'text', delta: 'branch facts' };
+                                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+
+                                return;
+                            }
+
+                            // The root's first request forks; its second, driven by the
+                            // branch completion, answers.
+                            if (!request.messages.some((message) => message.role === 'assistant')) {
+                                yield {
+                                    type: 'done',
+                                    stopReason: 'tool_calls',
+                                    toolCalls: [
+                                        {
+                                            id: 'fork-1',
+                                            name: 'threadFork',
+                                            arguments: JSON.stringify({ input: 'branch work' })
+                                        }
+                                    ]
+                                };
+
+                                return;
+                            }
+
+                            yield { type: 'text', delta: 'lead answer' };
+                            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                        }
+                    })
+                },
+                primary: 'lead',
+                subagents: [],
+                presets: false,
+                report: { progress }
+            })
+    });
+
+    // AC5 (#3, the cross-process half): the durable registry the server writes must agree
+    // with what the runtime purge does for a FORK record. threadFork mints branch-N as
+    // detached audit state — NO thread slot, NO queued run — but its child frames ARE
+    // durable results, recorded under invocationId === branchId. The turn-event scan in
+    // `doomedInvocationIds` used to skip `kind: 'fork'` events outright, so deleting the
+    // conversation that forked left that entry on disk with an address nothing resolves
+    // any more, and a restart rehydrated it. This test pins both halves: the branch id is
+    // still a refusal on its own, and the branch frame goes with its source conversation.
+    it('prunes the durable branch child frame with the conversation that forked it (AC5)', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
+        const persistence = new HarnessPersistence(root);
+        const store = createStore([forkPreset()], persistence);
+        const created = await store.create('lead');
+
+        const task = await store.enqueue(created.id, 'fork please');
+        await task.settled;
+        await store.waitForIdle(created.id);
+
+        const persistedIds = (): string[] => {
+            const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+                sessions: { core: { agentResults?: { invocationId: string }[] } }[];
+            };
+
+            return (document.sessions[0].core.agentResults ?? []).map(
+                (result) => result.invocationId
+            );
+        };
+
+        // Root answer '1' plus the branch child frame, recorded under the BRANCH id.
+        expect(persistedIds()).toEqual(['1', 'branch-1']);
+
+        // Deleting the FORK id itself stays a refusal through this door too, and a refusal
+        // disturbs nothing: the registry still holds both results.
+        await expect(store.deleteThread(created.id, 'branch-1')).rejects.toThrow(
+            'Could not delete thread "branch-1": Thread "branch-1" is a fork record, not a conversation:'
+        );
+        expect(persistedIds()).toEqual(['1', 'branch-1']);
+
+        // What makes this more than an outcome check: the TRANSACTIONAL write must already
+        // be correct. `persistOrThrow` runs first, and the F6 consistency guard afterwards
+        // re-saves the runtime's snapshot whenever the two disagree — so a stale projection
+        // still ends on the right file, one silent best-effort write later. Pinning the save
+        // calls separates the two: exactly one write, with both results already gone.
+        const save = vi.spyOn(persistence, 'save');
+
+        const deleted = await store.deleteThread(created.id, 'thread-1');
+
+        const savedAgentResults = save.mock.calls.map(
+            ([database]) =>
+                ((database as { sessions: { core: { agentResults?: { invocationId: string }[] } }[] })
+                    .sessions[0]?.core.agentResults ?? []).map((result) => result.invocationId)
+        );
+
+        save.mockRestore();
+
+        expect(savedAgentResults).toEqual([[]]);
+        expect([deleted.turns, deleted.threads]).toEqual([[], undefined]);
+        expect(persistedIds()).toEqual([]);
+        expect(store.get(created.id).threads).toBeUndefined();
+
+        store.dispose();
+
+        // Restart: neither the root answer nor the branch frame is addressable, so the
+        // document no longer hands out an id whose conversation is gone.
+        const reloaded = createStore([forkPreset()], persistence, persistence.load());
+
+        await expect(
+            reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: '1' })
+        ).rejects.toThrow('No result "1" is available for agent "lead".');
+        await expect(
+            reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: 'branch-1' })
+        ).rejects.toThrow('No result "branch-1" is available for agent "lead".');
 
         reloaded.dispose();
         fs.rmSync(root, { recursive: true, force: true });

@@ -407,6 +407,12 @@ import { assignMessageId } from './core/message-id';
 // `isError`. Direct module import, same convention as the two helpers above — the runtime
 // needs these two rules, not the whole core barrel.
 import { isErrorOutcome, storedOutcomeEntry } from './core/tool-outcome';
+// The snapshot readers' value bounds (core/snapshot-validation.ts), reused verbatim by
+// `archiveInvocation` for the FORENSIC PAIR of a stopped run. Direct module import, same
+// convention as the helpers above. The point is a single discipline: `core/snapshot.ts:242-298`
+// is what reads `partialContent`/`cancelledAtMessage` back off disk, and an archive that accepted
+// a looser value would mint a live record the next snapshot cannot persist and reload.
+import { readSnapshotInteger, readSnapshotString } from './core/snapshot-validation';
 import { validateAttachments } from './shared/attachments';
 import type {
     Agent,
@@ -459,6 +465,7 @@ import type {
     HarnessMessage,
     HarnessPendingTool,
     HarnessProgress,
+    HarnessRunIdentity,
     HarnessRunOptions,
     HarnessSnapshot,
     HarnessStateChangeReason,
@@ -3796,7 +3803,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         parentScope?: string;
         // R2: the persistent thread that owns this invocation. Internal only; it
         // exists so `deleteThread` can purge every lookup scoped to the removed
-        // conversation (the persisted agent-result schema is unchanged).
+        // conversation. Issue 0033/0024: the persisted agent-result schema NOW carries
+        // it (`HarnessAgentResultSnapshot.threadId`, written by the snapshot projection
+        // and read back by `readAgentResults`), because a purge after a reload used to
+        // match nothing and silently keep the deleted conversation's archived results.
         threadId?: string;
     };
 
@@ -3936,6 +3946,42 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // or an id) AND an acceptance signal (what "done" means). Deliberately coarse: the
     // gate exists to stop `"Fix the bug."` from reaching a write-capable agent, not to
     // grade prose. An empty list means the brief passed.
+    // Issue 0025 (2026-11-14) — the ACCEPTANCE SIGNALS a brief can state its "done" with,
+    // split out so each direction the old single word list was wrong in is visible and pinned.
+    //
+    // It OVER-ACCEPTED: `because`, `without`, `test` and `tests` sit in ordinary prose, so
+    // "Refactor `src/parse.ts` because it is long" cleared the gate while stating no criterion
+    // at all (the issue's independent review: the only direction the original pass had tested).
+    // Those words are gone. A causal clause is a REASON, not a condition the result has to meet.
+    //
+    // It UNDER-ACCEPTED: a brief that fixes its own done-ness by SHAPE instead of by a modal
+    // verb — "in three bullets", "as a table with columns name and age", "under 100 words",
+    // "exactly one line" — states something the child can be checked against, and refusing it
+    // costs a round trip to add a clause that adds nothing (the incident in the issue:
+    // "Summarize the file README.md in three bullets." was refused for naming a file, an
+    // operation, a shape and a count).
+    //
+    // Still DELIBERATELY COARSE, and it stays a regex: the gate exists to stop `"Fix the bug."`
+    // reaching a write-capable agent, not to grade prose, and a gate that saves a child run must
+    // not itself spend one.
+    const BRIEF_ARTIFACTS =
+        'bullets?|points?|lines?|words?|characters?|chars?|paragraphs?|sentences?|items?|entries?|columns?|rows?|sections?|fields?|steps?|tables?|lists?|arrays?|objects?|examples?|files?|pages?|turns?';
+    const BRIEF_COUNT = '\\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|hundred|thousand';
+
+    // A quantity the result has to hit, attached to the artifact it counts.
+    const BRIEF_COUNTED_SHAPE = new RegExp(
+        `\\b(?:in|as|of|using|with|within|under|over|at\\s+most|at\\s+least|no\\s+more\\s+than|no\\s+fewer\\s+than|fewer\\s+than|more\\s+than|exactly|about|roughly|max(?:imum)?|min(?:imum)?)\\s+(?:exactly\\s+)?(?:${BRIEF_COUNT})\\s+(?:${BRIEF_ARTIFACTS})\\b`,
+        'i'
+    );
+
+    // A named output format ("as a table", "as JSON", "in a bulleted list"): done is a shape,
+    // not a count, and it is still checkable.
+    const BRIEF_NAMED_FORMAT =
+        /\b(?:as|in|into|using)\s+(?:a|an|the)?\s*(?:table|json|csv|yaml|xml|markdown|checklist|bulleted|numbered|plain[- ]?text|list|array|object|schema)\b/i;
+
+    // A bare numeric bound with the noun implied ("no more than 12", "exactly 3").
+    const BRIEF_BOUND = /\b(?:exactly|no more than|at most|at least|fewer than|more than|under|over|within|up to)\s+\d+\b/i;
+
     const missingBriefParts = (brief: string): string[] => {
         const missing: string[] = [];
 
@@ -3949,10 +3995,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (!hasTarget) missing.push('concrete target (file, symbol, URL, or id)');
 
         // An acceptance signal: the brief says how the result will be judged.
-        const hasAcceptance =
-            /\b(acceptance|criteria|expect|expected|should|must|verify|verified|pass|passes|test|tests|repro|reproduce|done when|so that|because|instead of|without)\b/i.test(
+        //
+        // The word list is the ORIGINAL list minus 0025's incidental words, plus the singular
+        // `criterion` (the plural was already here). The shape tests above are what a brief that
+        // never says "must" or "done when" can still pass on.
+        const statesCondition =
+            /\b(acceptance|criteria|criterion|expect|expects|expected|should|must|verify|verified|pass|passes|passed|repro|reproduce|done when|so that|instead of)\b/i.test(
                 brief
             );
+
+        const hasAcceptance =
+            statesCondition ||
+            BRIEF_COUNTED_SHAPE.test(brief) ||
+            BRIEF_NAMED_FORMAT.test(brief) ||
+            BRIEF_BOUND.test(brief);
 
         if (!hasAcceptance) missing.push('acceptance criterion (what "done" means)');
 
@@ -4231,6 +4287,235 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return controller.signal;
     };
 
+    // -----------------------------------------------------------------------
+    // The delegation envelope pieces shared by `delegateFor` AND the delivery layer
+    // -----------------------------------------------------------------------
+    //
+    // THREE doors produce the result a caller reads for a child that did not answer:
+    //   1. `delegateFor` itself, when the child rejects and the CALLING call is still
+    //      live (a timeout, a stopped child thread, an exhausted turn cap);
+    //   2. `deliverTask`'s cancelled branch, for the one door where the scheduler has
+    //      ALREADY released the call — `toolCancel` (docs/issues/minor-toolcancel-
+    //      acknowledges-rather-than-reporting-the-envelope.md, 0021, and the delivery
+    //      half of docs/issues/significant-delegation-result-can-be-stranded-without-
+    //      delivery.md, 0019). That door used to answer "no result is available" while
+    //      the child's terminal record — status, error, partialContent,
+    //      cancelledAtMessage, identity — sat in the ledger one call away; and
+    //   3. the owed-account register (`owedAccountOf`), which reprints the SAME envelope
+    //      on the caller's next turn for a delivery a cancellation or a dead run dropped
+    //      before it could be inserted — 0019's other doors. It was added after this
+    //      heading said "TWO", and it builds the object through this helper too.
+    //
+    // All three build the SAME object, so the shape is defined ONCE here, in
+    // `unfinishedDelegateEnvelopeOf`: two hand-copied literals are how the doors drifted
+    // apart in the first place, and the delivered bytes must agree with what `agentResult`
+    // reports for the same invocation. WHAT is single-sourced is the SHAPE, not the
+    // WORDING — the review pass of 2026-11-14 checked that and found three sites that
+    // still raise a "did not finish" sentence in their own words:
+    //   - `releasedDelegateResultOf` raises the harness's own cancel line (the
+    //     `record.status === 'completed' ? undefined : ...` argument below it), because the
+    //     raw abort string on the child's record cannot be classified (0021 AC1);
+    //   - `unfinishedDelegateEnvelopeOf`'s callers supply the `error` they mean: the
+    //     delegation's timeout sentence, or the child's OWN `record.error`, in the
+    //     `delegateFor` catch and again in the reprinted account (`owedAccountOf`); and
+    //   - when the child left NO record, `deliverTask`'s cancelled branch falls back to the
+    //     generic line for the released task, with the fork variant beside it — the door
+    //     that keeps 0029 AC4 honest by inventing nothing.
+    // So "every cancellation answer" is a three-place grep, not one; the invariant this
+    // section owns is the envelope's shape, never one shared sentence.
+
+    // The page size a delegation asked for, normalised exactly the way `delegateFor`
+    // normalises it (`maxChars` clamped into the agentResult page range; omitted means
+    // one whole page). The delivery side reads the call's OWN arguments, so `limit`,
+    // `content` and `nextOffset` cannot disagree between the two doors.
+    const delegatePageLimitOf = (parameters: unknown): number => {
+        const maxChars = (parameters as { maxChars?: unknown } | undefined)?.maxChars;
+
+        return typeof maxChars === 'number'
+            ? Math.min(Math.max(1, Math.floor(maxChars)), AGENT_RESULT_PAGE_MAX_CHARS)
+            : AGENT_RESULT_PAGE_MAX_CHARS;
+    };
+
+    // The unfinished-child envelope, from the child's own terminal record. `error` is
+    // passed in because only the CALLER knows which reason to name: the delegation's own
+    // timeout sentence, the record's error, or the failure a released call carried.
+    //
+    // `answer` is the text to page into `content`. The `delegateFor` catch path omits it and
+    // gets the record's PARTIAL answer — that door's child never finished, so partial content is
+    // the whole story. The released-call door passes the child's final answer when it has one,
+    // because a release races the child and the child may still have answered (0021).
+    const unfinishedDelegateEnvelopeOf = (
+        record: AgentInvocationRecord,
+        agent: string,
+        limit: number,
+        startedAt: number,
+        // Issue 0019 (2026-11-14) made this OPTIONAL, and only for the door that reports a
+        // COMPLETED child: the owed-account reprint reuses this builder, and a completed record
+        // has no error to name. `HarnessDelegationResult.error` is itself optional and documented
+        // as "present only when status is not 'completed'" (src/types/index.ts), so writing the
+        // key only when a caller supplies it is the declared contract — the two existing callers
+        // always pass a string, so their bytes are unchanged.
+        error?: string,
+        answer?: string
+    ): HarnessDelegationResult => {
+        const partial = answer ?? record.partialContent ?? '';
+        const page = resultPageOf(partial, 0, limit);
+
+        return {
+            agent,
+            content: page.content,
+            contentLength: partial.length,
+            offset: page.offset,
+            limit,
+            truncated: page.hasMore,
+            ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+            invocationId: record.invocationId,
+            ...(record.threadId === undefined ? {} : { threadId: record.threadId }),
+            status: record.status,
+            durationMs: record.durationMs ?? Math.max(0, Date.now() - startedAt),
+            ...(error === undefined ? {} : { error }),
+            ...(record.partialContent === undefined
+                ? {}
+                : { partialContent: record.partialContent }),
+            ...(record.cancelledAtMessage === undefined
+                ? {}
+                : { cancelledAtMessage: record.cancelledAtMessage })
+        };
+    };
+
+    // D2 (2026-11-14, issues 0021/0019) — WHAT A LIVE `delegate` CALL LEAVES FOR THE DELIVERY
+    // LAYER.
+    //
+    // `toolCancel` releases the call synchronously (arbitrary JavaScript cannot be preempted),
+    // and the scheduler then treats the child's late resolution as data on a dead task — so the
+    // envelope `delegateFor` computed IS produced and then DISCARDED, and the caller is handed
+    // "no result is available" while the child's terminal record sits in the ledger one call
+    // away. The delivery layer cannot recover that envelope from the task, and after the tool
+    // body has returned it no longer holds the target agent, the page size or the start time
+    // either. So the live call publishes them here, together with the identity carrier the child
+    // itself fills in.
+    //
+    // Keyed `${scope}\0${callId}` — the SAME pair the ledger records as
+    // (`parentScope`, `parentCallId`) — so the entry can only ever describe this one call's
+    // child. It lives exactly as long as the call: `delegateFor` sets it before dispatching and
+    // clears it in its own `finally`, which is why a completed delegation leaves nothing behind
+    // for a later cancel of an unrelated call to mistake for its own.
+    type DelegateCallTrace = {
+        // The calling run's scheduler scope and this call's id — the pair the child records as
+        // (`parentScope`, `parentCallId`), kept so the record can still be addressed exactly when
+        // a host-supplied `run` closure ignores the options and never writes the carrier.
+        scope: string;
+        callId: string;
+        // The carrier handed to the child run; it writes `invocationId`/`threadId` at
+        // registration and `status` at the terminal commit.
+        identity: HarnessRunIdentity;
+        // The agent this call delegated to, and the page size and start time the envelope needs.
+        agent: string;
+        limit: number;
+        startedAt: number;
+    };
+
+    const delegateCallTraces = new Map<string, DelegateCallTrace>();
+
+    // One key format for "this call", shared with the fork marker above (`branchCallIds`) so
+    // both per-call side tables address work the same way.
+    const callTraceKey = (scope: string, callId: string): string => `${scope}\u0000${callId}`;
+
+    // D2 — the terminal envelope a released `delegate` call still owes its caller, or
+    // `undefined` when there is nothing honest to say.
+    //
+    // The record is ADDRESSED by the id the child wrote into the carrier (the same value-first
+    // rule `delegateFor` uses), never searched for, so two delegations to one agent and a host
+    // thread of that agent running alongside them cannot cross-report. `undefined` means the
+    // child registered no record (it was refused before it started) or lost it (a thread purge,
+    // a ledger eviction): the caller then gets the historical cancel sentence, which is what
+    // "no invented identity" requires (docs/issues/minor-success-envelope-can-fabricate-identity-
+    // and-status.md, 0029).
+    //
+    // `content` prefers the child's FINAL answer: the release races the child, and a child that
+    // answered anyway is the case the 0021 review calls "the result was still useful". Falling
+    // back to `partialContent` is what makes a mid-sentence cancel report how far it got.
+    // `error` is a harness-raised sentence rather than `record.error` on purpose — the record
+    // holds the raw `"This operation was aborted"`, which cannot be classified (0021 AC1); the
+    // child's own wording stays available through `agentResult` for that invocation. The ONE
+    // exception is a child that ANSWERED anyway: its status is 'completed', and a completed
+    // envelope carries no error at all (P2, see the call below) — `callCancelled` is the field
+    // that records the release.
+    const releasedDelegateResultOf = (
+        trace: DelegateCallTrace
+    ): HarnessDelegationResult | undefined => {
+        const invocationId = trace.identity.invocationId;
+        // `invocationRecords` is keyed by EXACTLY the value the child wrote into the carrier
+        // (`registerInvocation` uses the same `invocationIdOf(run)`), so an entry found here IS
+        // this call's child and cannot be a foreign run. The pair-addressed fallback covers a
+        // host-supplied `run` closure that ignored the carrier; it matches only the
+        // (`parentScope`, `parentCallId`) the child stamped itself.
+        const record =
+            (invocationId === undefined ? undefined : invocationRecords.get(invocationId)) ??
+            delegatedRecordOf(trace.scope, trace.callId);
+
+        if (record === undefined) return undefined;
+
+        const answer =
+            typeof record.content === 'string' && record.content.length > 0
+                ? record.content
+                : (record.partialContent ?? '');
+        const envelope = unfinishedDelegateEnvelopeOf(
+            record,
+            trace.agent,
+            trace.limit,
+            trace.startedAt,
+            // P2 (the envelope contract behind 0021/0029): `error` is documented as present ONLY
+            // when `status` is not 'completed' (src/types/index.ts, HarnessDelegationResult). A
+            // release RACES the child, and a child that answered a moment after the release
+            // reports `status: 'completed'` — this door used to print the cancel sentence next to
+            // it, so the envelope contradicted its own type and a caller that branches on
+            // `error !== undefined` filed an answered child under "did not finish".
+            // `callCancelled: true` below is what says "the caller released this call"; it needs
+            // no error to say it, and the child's own reason stays on its record for `agentResult`.
+            record.status === 'completed'
+                ? undefined
+                : `Delegation to "${trace.agent}" was cancelled by the caller before the call returned.`,
+            answer
+        );
+
+        return { ...envelope, callCancelled: true };
+    };
+
+    // D1/D2 — the record a delegation's OWN child wrote, ADDRESSED BY VALUE.
+    //
+    // A child run stamps `parentScope` + `parentCallId` from the tool call that spawned it
+    // (`runAgent`'s `callId` parameter and its parent's scheduler scope), and a scheduler
+    // scope is unique per run (`String(++runSequence)`), so this pair names ONE invocation
+    // and nothing else. That is the opposite of the two heuristics this replaced for the
+    // released-call door: "newest record for that agent" and "the newest record that did not
+    // exist at dispatch" both pick up a CONCURRENT run of the same agent — a host thread of
+    // that agent queues behind itself, not behind the agent's default conversation, so it
+    // really can run in parallel — and hand the caller somebody else's identity.
+    //
+    // Returns `undefined` when the child registered no record (it never started) or lost it
+    // (a thread purge, the bounded ledger evicting a terminal entry). Callers must then
+    // report NOTHING rather than an invented identity — the rule pinned by
+    // src/harness.agent-results.test.ts ("invents no invocation identity …").
+    const delegatedRecordOf = (
+        parentScope: string,
+        parentCallId: string
+    ): AgentInvocationRecord | undefined => {
+        let owned: AgentInvocationRecord | undefined;
+
+        for (const record of invocationRecords.values()) {
+            if (record.parentCallId !== parentCallId || record.parentScope !== parentScope) continue;
+
+            // A caller that starts two children from one call (an ordinary `ctx.run` tool
+            // sharing the call id) gets the one that finished LAST; for a `delegate` call
+            // there is exactly one child, so the guard is only about never picking a stale
+            // match when a newer one exists.
+            if (owned === undefined || record.sequence > owned.sequence) owned = record;
+        }
+
+        return owned;
+    };
+
     // Bounded delegation (R4). Registered only when there is somewhere to
     // delegate: a tool that can only fail would cost context on every request.
     // Subagents never receive it (see declared()), and launchToolCall rejects a
@@ -4258,10 +4543,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             maxChars?: number;
             requireClarification?: boolean;
             timeoutMs?: number;
-            // I5 (2026-11-13): OPTIONAL per-delegation turn bound for THIS child. The
-            // number of model turns (tool rounds) the child may take before it has to
-            // answer. It can only LOWER the harness-wide `maxIterations` bound, never
-            // raise it; omitted means "inherit whatever the host configured". The
+            // I5 (2026-11-13): OPTIONAL per-delegation turn bound for THIS child. The number
+            // of model REQUESTS the child may make before it has to answer — stress report
+            // #7 (2026-11-14) retired the old "model turns (tool rounds)" gloss: the gate is
+            // `run.iteration >= turnLimit` checked BEFORE the increment (the `turnLimit`
+            // computation in `runAgentCore`), so `maxTurns: N` permits exactly N requests and
+            // at most N-1 tool rounds. It can only LOWER the harness-wide `maxIterations`
+            // bound, never raise it; omitted means "inherit whatever the host configured". The
             // `delegate` entry advertises 1..DELEGATE_MAX_TURNS_MAX (64) for a MODEL;
             // this host path is not schema-validated, so any finite count is honoured.
             maxTurns?: number;
@@ -4323,8 +4611,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             if (missing.length > 0) {
                 throw new HarnessError(
+                    // STRESS REPORT #18 (2026-11-14): the second sentence used to RESTATE
+                    // the parts the enumeration above has already named in full ("concrete
+                    // target (file, symbol, URL, or id)" / "acceptance criterion (what
+                    // "done" means)"), and it added "any constraint", which this gate does
+                    // not check at all. One enumeration, one remedy. The `is under-specified`
+                    // substring stays.
+                    //
+                    // Correction (review #5, 2026-11-14): the sentence this site carried — "the
+                    // GATE IS UNCHANGED, 0025's semantic proposals are separate work" — described
+                    // #18's edit in isolation and went stale the moment issue 0025 shipped. Only
+                    // the MESSAGE was untouched by #18; 0025 changed what this gate accepts, by
+                    // widening the acceptance signal inside `missingBriefParts` (the over-accepted
+                    // causal words are gone and `BRIEF_COUNTED_SHAPE` / `BRIEF_NAMED_FORMAT` /
+                    // `BRIEF_BOUND` let a brief that fixes done-ness by SHAPE through). A reader
+                    // who took the old wording as "the acceptance rule is still the original word
+                    // list" would grade a brief this gate no longer refuses.
                     `The brief for "${target}" is under-specified: it names no ${missing.join(', no ')}. ` +
-                        'Restate it with the concrete target (file, symbol, or URL), what "done" means, and any constraint, then delegate again.'
+                        'Add those parts to the brief and delegate again.'
                 );
             }
         }
@@ -4333,13 +4637,37 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             throw new HarnessError('Delegation requires a harness run context.');
         }
 
-        const limit =
-            typeof parameters?.maxChars === 'number'
-                ? Math.min(Math.max(1, Math.floor(parameters.maxChars)), AGENT_RESULT_PAGE_MAX_CHARS)
-                : AGENT_RESULT_PAGE_MAX_CHARS;
+        const limit = delegatePageLimitOf(parameters);
 
         const startedAt = Date.now();
         let message: HarnessAssistantMessage;
+
+        // D1 (issue 0029) — THE IDENTITY CARRIER. Handed down through `context.run` and
+        // written by the CHILD RUN ITSELF (see `runAgent`: `invocationId`/`threadId` right
+        // after `registerInvocation`, `status` right after the terminal commit). This is the
+        // only way the identity can be exact: after an `await`, the calling code holds no
+        // RunState, and the ledger is a SHARED store that a concurrent run of the same agent
+        // writes into.
+        const carried: HarnessRunIdentity = {};
+
+        // D2 (issues 0021/0019): publish this CALL's trace while the child runs, so the delivery
+        // layer can report the child's outcome on the `toolCancel` door — the one door where the
+        // scheduler has already released the call and the value returned here is discarded. Only
+        // a call that HAS a scope and an id can be addressed later, so a host `runtime.delegate`
+        // with neither registers no trace and keeps today's behaviour.
+        const trace =
+            selfScope === undefined || selfCallId === undefined
+                ? undefined
+                : {
+                      scope: selfScope,
+                      callId: selfCallId,
+                      identity: carried,
+                      agent: target,
+                      limit,
+                      startedAt
+                  };
+
+        if (trace !== undefined) delegateCallTraces.set(callTraceKey(trace.scope, trace.callId), trace);
 
         // T28: the invocation ids that already exist for this agent. A delegation's own
         // record is the one that is NOT in this set afterwards. Matching by "newest
@@ -4350,17 +4678,45 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             recordsForAgent(target).map((record) => record.invocationId)
         );
 
-        // The child this delegation started: matched by the spawning call id when the
-        // runtime recorded one (the model path always does), otherwise by "new since
-        // dispatch" (the manual executeTool path has no call id).
+        // The child this delegation started.
+        //
+        // D1 (issue 0029): this is now VERIFICATION, not discovery. The child told us its
+        // own invocation id through `carried`, so the ledger entry is ADDRESSED
+        // (`invocationRecords.get`) rather than guessed, and the two checks below only
+        // confirm the entry is still the one that run wrote. A record that cannot be
+        // confirmed is reported as ABSENT — the same rule the pre-D1 code applied when it
+        // found nothing, and the rule src/harness.agent-results.test.ts pins: an identity
+        // the runtime did not observe is never invented.
+        //
+        // The legacy heuristics survive ONLY for a run that never reached
+        // `registerInvocation` (so it wrote no carrier): a child refused before it owned
+        // its actor, or a host that calls `runtime.delegate` with its own `run` closure
+        // that ignores the options. They are kept in that order because both are
+        // fallible; a carrier always wins.
         const newInvocationOf = (): AgentInvocationRecord | undefined => {
+            if (carried.invocationId !== undefined) {
+                const record = invocationRecords.get(carried.invocationId);
+
+                // Verification: the entry must still carry the id the run wrote, and must
+                // belong to the agent this delegation started. An entry under a stale id
+                // (a purge that freed the slot) therefore reports nothing rather than
+                // somebody else's run.
+                if (record === undefined || record.invocationId !== carried.invocationId) return undefined;
+                if (record.agent !== target) return undefined;
+
+                return record;
+            }
+
             const records = recordsForAgent(target);
 
             if (selfCallId !== undefined) {
+                // Tightened with the value path in place: the pair is compared EXACTLY, so
+                // a caller without a `runScope` can no longer match a record that belongs to
+                // a different run's call of the same id (a tool-call id is unique only
+                // within one run — see AgentInvocationRecord.parentScope).
                 const owned = records.find(
                     (record) =>
-                        record.parentCallId === selfCallId &&
-                        (selfScope === undefined || record.parentScope === selfScope)
+                        record.parentCallId === selfCallId && record.parentScope === selfScope
                 );
                 if (owned !== undefined) return owned;
             }
@@ -4428,6 +4784,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // I5: carried to `runAgentCore` through the run options and the RunState,
                 // so the bound belongs to the child run, not to the tool call.
                 maxTurns,
+                // D1 (issue 0029): the identity OUT-carrier. `context.run` forwards it to
+                // `runAgent` as run internals, and the child writes its OWN invocation id,
+                // thread id and terminal status into it — the values this envelope reports.
+                identity: carried,
                 // T28: an explicit tool allowlist for the child. A planning or review
                 // delegation can therefore be read-only by construction instead of by
                 // instruction, so it cannot leave artifacts in the user's checkout.
@@ -4439,11 +4799,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // A cancellation of the CALLING run is a rollback: the parent transcript
             // is about to be truncated, so a structured result would be inserted into
             // a dead transcript. Propagate it unchanged.
+            //
+            // D2 (issue 0021) — the `toolCancel` door travels through this same line, and
+            // it is NOT a rollback: the scheduler released only THIS call, the run keeps
+            // going, and its transcript still holds the call. The envelope this call
+            // computed is therefore still owed to the caller, and `deliverTask`'s cancelled
+            // branch picks it up from the child's settled record (see
+            // `releasedDelegateResultOf`) — the propagation here stays byte-identical so a
+            // run rollback keeps rejecting with its own reason.
             if (callerSignal?.aborted === true) throw error;
 
-            // Otherwise the CHILD ended without an answer (cancelled by toolCancel, a
-            // timeout, or a failure). Report it as a result carrying the child's own
-            // forensic record, so the caller can see what it had produced and how far
+            // Otherwise the CHILD ended without an answer (cancelled by a stopped child
+            // thread, a timeout, or a failure). Report it as a result carrying the child's
+            // own forensic record, so the caller can see what it had produced and how far
             // it got instead of receiving a bare error.
             //
             // A child that never STARTED (a stopped thread, a cycle, a depth refusal)
@@ -4454,36 +4822,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             if (record === undefined) throw error;
 
-            const partial = record.partialContent ?? '';
-            const page = resultPageOf(partial, 0, limit);
             const timedOut = timeoutController.signal.aborted;
 
-            return {
-                agent: target,
-                content: page.content,
-                contentLength: partial.length,
-                offset: page.offset,
+            return unfinishedDelegateEnvelopeOf(
+                record,
+                target,
                 limit,
-                truncated: page.hasMore,
-                ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
-                invocationId: record.invocationId,
-                ...(record.threadId === undefined ? {} : { threadId: record.threadId }),
-                status: record.status,
-                durationMs: record.durationMs ?? Math.max(0, Date.now() - startedAt),
-                error: timedOut
+                startedAt,
+                timedOut
                     ? `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
-                    : (record.error ?? toErrorInfo(error).message),
-                ...(record.partialContent === undefined
-                    ? {}
-                    : { partialContent: record.partialContent }),
-                ...(record.cancelledAtMessage === undefined
-                    ? {}
-                    : { cancelledAtMessage: record.cancelledAtMessage })
-            };
+                    : (record.error ?? toErrorInfo(error).message)
+            );
         } finally {
             // No timer means nothing was armed; the disarm closure is a no-op for the
             // unbounded path (and `vi.getTimerCount()` stays 0 for it).
             disarmWallClock();
+            // D2: the trace lives exactly as long as the call. `deliverTask` read it in the
+            // release's own stack, so clearing it here cannot race the delivery, and a completed
+            // delegation leaves nothing behind for a later, unrelated call id to match.
+            if (trace !== undefined) delegateCallTraces.delete(callTraceKey(trace.scope, trace.callId));
         }
 
         // Only the answer crosses back: the subagent keeps its own transcript and
@@ -4510,6 +4867,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // `status: 'completed'`. A caller then had an address it could not address and
             // a status no record supported. Absent means "this run produced no ledger entry
             // to point at"; the content and paging fields stay exact either way.
+            //
+            // D1 (2026-11-14, issue 0029) keeps that rule and fixes HOW the record is found:
+            // the child run carried its own invocation identity out through `carried`, so the
+            // entry is ADDRESSED by that id and then verified, instead of matched by
+            // `(parentCallId, parentScope)` or by "new since dispatch". Both heuristics could
+            // name a CONCURRENT run of the same agent (a host thread of that agent queues
+            // behind itself, not behind the delegated conversation), which is how a completed
+            // child used to be reported under somebody else's identity.
             ...(record === undefined ? {} : { invocationId: record.invocationId }),
             ...(record?.threadId === undefined ? {} : { threadId: record.threadId }),
             ...(record === undefined ? {} : { status: record.status }),
@@ -4871,6 +5236,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // to the invocation record (delete-thread purge). Distinct from
         // `thread.id`, which is the per-RUN invocation id.
         threadId?: string;
+        // T5/#1 (2026-11-14, delegate stress report) — THE REPLY TARGET.
+        //
+        // The id of the conversation that STARTED this run by posting into a DEFAULT
+        // conversation, so the started turn can answer the party that spoke to it. It is
+        // per-RUN and transient by construction: it is never written to the thread record,
+        // never persisted, and it disappears with the run — which is why the first-wins
+        // `ownerThreadId` link was NOT reused for it. That link is permanent and survives
+        // no restart, so adopting the sender there would weld one caller's family onto
+        // another agent's STANDING transcript and then silently drop it.
+        //
+        // `threadFamilyOf` folds this id in as ONE extra family member while the run is
+        // attached, which is what keeps the roster, the `threadSend` gate, and the read
+        // visibility (`isAddressVisible`) in agreement: they all resolve the family through
+        // `familyOfCaller` → the live thread state → this field.
+        replyThreadId?: string;
         signal?: AbortSignal;
         lineage: readonly Agent[];
         parent?: RunState;
@@ -4964,6 +5344,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // a frozen agent can be post-mortemed instead of vanishing.
         messagesProduced?: number;
         partialContent?: string;
+        // issue 0020 (AC1): the answer this run is STREAMING right now, for the model
+        // request that is currently in flight. `partialContent` above could only ever
+        // report text the run had already COMMITTED, so a child cut off between "the
+        // model has begun answering" and "the answer is committed" — exactly
+        // mid-sentence — reported nothing. The buffer is reset at the start of every
+        // request (and on a `retry`, whose failed attempt the agent itself discards),
+        // so it can never carry an earlier turn's prose, a tool's output, or anything
+        // outside the request it belongs to.
+        streamedText: string;
         // Epoch milliseconds at run start, for the reported duration.
         startedAt: number;
         // T28: the parent tool call that spawned this run (delegate/ctx.run pass their
@@ -4994,12 +5383,61 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // owner read. A branch run is owned/cancellable by its requester but does
         // not consume a delegation depth level.
         branch?: { metadata: AgentBranchMetadata; autoAnswer: boolean };
+        // D1 (2026-11-14, issue 0029): the OUT-carrier a delegation handed down through
+        // `context.run(..., { identity })`. Written by THIS run, from its own state:
+        // `invocationId`/`threadId` right after `registerInvocation`, `status` right after
+        // the terminal commit. The caller of `delegate` uses it to ADDRESS the ledger entry
+        // it is reporting instead of guessing which entry is its own.
+        identity?: HarnessRunIdentity;
+        // T5/#1 (2026-11-14, stress report): the conversation that started THIS run by
+        // posting into a DEFAULT conversation, so that turn can answer its sender. Set
+        // only by `postThreadMessage`'s dormant-start branch, and it travels on the RUN
+        // (never on the thread record), which is what makes the reply route transient —
+        // see `RunState.replyThreadId` and `threadFamilyOf` step 5.
+        replyThreadId?: string;
     };
 
     // The delegate answer policy (T2/R1). One shared instance so the model path
     // (launchToolCall) and the manual path (executeTool) opt into identical
     // semantics.
     const DELEGATE_ANSWER: RunInternals = { delegateAnswer: true };
+
+    // The internals a DELEGATE dispatch runs with, resolved from the definition MARKER
+    // (never the wire name, so a replacement under `delegate` inherits neither the answer
+    // policy nor the carrier). A call that supplied a D1 identity carrier needs its own
+    // internals object — the carrier is per call, so the shared DELEGATE_ANSWER instance
+    // cannot carry it — and every other delegate call keeps that one instance, exactly as
+    // before.
+    const delegateInternalsFor = (
+        definition: Tool,
+        identity?: HarnessRunIdentity
+    ): RunInternals | undefined => {
+        if (delegateAnswerDefinitions.has(definition)) {
+            return identity === undefined ? DELEGATE_ANSWER : { delegateAnswer: true, identity };
+        }
+
+        // A non-delegate `ctx.run` dispatch that supplied a carrier still gets its identity
+        // written: the carrier is the only by-value channel out of a child run, nothing else
+        // reads these internals (`runAgentCore` keys off `internals.delegateAnswer`, and branch
+        // internals travel in their own parameter), and the public contract of
+        // `ToolContext.run(..., { identity })` in ./types/index.ts promises it for any call.
+        // Without a carrier and without the delegate marker there are no internals at all,
+        // exactly as before.
+        return identity === undefined ? undefined : { identity };
+    };
+
+    // The option surface of `ToolContext.run`, declared ONCE so every door that builds a
+    // tool context — the model's `launchToolCall`, a nested `context.callTool`, and a manual
+    // `harness.executeTool` — advertises and forwards the same fields. That matters for the
+    // D1 carrier in particular: a delegation started through any of those doors must be able
+    // to report its own identity, so the carrier may not be accepted by one door and dropped
+    // by another. The mirror of this shape is `ToolContext.run` in ./types/index.ts.
+    type ToolRunOptions = {
+        signal?: AbortSignal;
+        tools?: readonly string[];
+        maxTurns?: number;
+        identity?: HarnessRunIdentity;
+    };
 
     // -----------------------------------------------------------------------
     // R2 persistent threads
@@ -5067,6 +5505,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // scheduling/ownership state through the handle.
     const threadRecordCopy = (record: HarnessThreadRecord): HarnessThreadRecord => ({ ...record });
 
+    // A missing thread record is ONE fact and gets ONE sentence (issue 0034). This is it:
+    // the routed read (`src/server/workers/lane-authority.ts`, the `thread:read` case) and
+    // `threadRead`'s own record tail (`src/tools/runtime/threadRead.tool.ts`) quote it
+    // byte-for-byte, so an id that does not exist reads the same inline, on a lane, and
+    // through the tool. Keep the three in step — the divergence this fixed was exactly a
+    // second head appearing for the same condition.
     const threadStateOf = (threadId: string): ThreadState => {
         const state = threadStates.get(threadId);
 
@@ -5298,7 +5742,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             throw new HarnessError(
                 `Thread "${targetThreadId}" is not one thread "${sender.threadId}" can address: threadSend reaches ` +
                     'your own thread, an ancestor, one of your descendants, or a default conversation (agent:<name>) ' +
-                    'your roster lists (see threadList). The id exists — it is simply outside your lineage.'
+                    'your roster lists (see threadList). The id exists — it is simply outside your lineage.' +
+                    // #5 (2026-11-14): the same actionable clause the READ door adds. A default
+                    // conversation the caller used to be able to write is the one out-of-family
+                    // address a `delegate` puts back, and this door is where a caller finds out it
+                    // lost it. Non-default targets keep the sentence byte for byte.
+                    (defaultFamilyClauseOf(targetThreadId) ?? '')
             );
         }
 
@@ -5333,11 +5782,28 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const liveSiblingNoteFor = (): string | undefined => {
             if (target.record.origin !== 'agent') return undefined;
 
+            // T5/#2 (2026-11-14, stress report) — NEVER NAME AN ID THE CALLER CANNOT USE.
+            //
+            // The scan above walks the WHOLE session, so before this line the note could
+            // point a caller at a thread outside its family — and `threadSend`/`threadRead`
+            // refuse everything outside the family, so the advice "address that id to reach
+            // the turn in flight" led to a refusal the receipt had just promised was
+            // unnecessary. Only the `ownerThreadId === sender` candidate was ever guaranteed
+            // addressable (a descendant is a family member); the "newest running sibling"
+            // fallback usually was not, because a sibling is EXCLUDED from the family by
+            // design (0027). So candidates are now filtered through the same set the send
+            // gate and the roster use, and a note is emitted only when something addressable
+            // is genuinely in flight. The wording itself is unchanged byte for byte.
+            const family = familyOfCaller(sender.threadId);
+
             const candidates = [...threadStates.values()].filter(
                 (entry) =>
                     entry.record.id !== target.record.id &&
                     entry.record.agent === target.record.agent &&
-                    entry.record.status === 'running'
+                    entry.record.status === 'running' &&
+                    // A threadless caller is unscoped (the host view) and may address any
+                    // conversation, so it keeps every candidate.
+                    (family === undefined || family.has(entry.record.id))
             );
             if (candidates.length === 0) return undefined;
 
@@ -5452,13 +5918,35 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // it for `agentResult`, and the thread returns to `idle` in the finally
         // block. The `catch` exists only so a fire-and-forget rejection is never an
         // unhandled rejection in the host process.
+        // T5/#1 (2026-11-14, stress report) — THE REPLY TARGET.
+        //
+        // A `threadSend` that STARTS a default conversation fires the run with NO parent
+        // (a parent would put the sender's brain in the lineage and turn two threads of one
+        // agent into a "delegation cycle"), so the first-wins `ownerThreadId` link is never
+        // written for it and `threadFamilyOf` computes a SINGLETON family: the started turn
+        // reads a roster of exactly one conversation and its reply to the party that woke it
+        // is refused "outside your lineage". The sender id therefore travels on the RUN,
+        // through `RunInternals.replyThreadId`, and step 5 of the family rule folds it in
+        // while that run is attached.
+        //
+        // Scope, deliberately narrow:
+        //   - a DEFAULT conversation only (`origin === 'agent'`). A dormant HOST thread the
+        //     caller starts is already in that caller's subtree, so its family reaches back
+        //     through the owner chain and needs no extra door;
+        //   - a sender WITH a thread id. A threadless caller is the host, and the host is
+        //     addressable by definition (an unscoped caller sees everything).
+        const replyTarget =
+            target.record.origin === 'agent' && sender.threadId !== undefined
+                ? { replyThreadId: sender.threadId }
+                : undefined;
+
         void runAgent(
             target.agent,
             content,
             undefined,
             undefined,
             undefined,
-            undefined,
+            replyTarget,
             undefined,
             undefined,
             target
@@ -5610,7 +6098,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //   4. the DEFAULT conversations (`agent:<name>`) of the agents in that family, plus
     //      a default whose first-wins `ownerThreadId` is in the family — the default is an
     //      agent's standing conversation, and the family is defined by AGENTS as well as
-    //      by threads (that is how a child talks to the conversation its agent shares).
+    //      by threads (that is how a child talks to the conversation its agent shares);
+    //   5. the one address a DEFAULT conversation gains only WHILE a run is attached to it:
+    //      that run's REPLY TARGET (T5/#1, 2026-11-14 stress report — see
+    //      `RunState.replyThreadId`). A `threadSend` that STARTS a dormant default
+    //      conversation fires the run with no parent, so nothing ever writes `ownerThreadId`
+    //      for it and steps 2-4 compute a SINGLETON family: the started turn can see nothing
+    //      but itself, and its reply to the party that woke it is refused "outside your
+    //      lineage". Folding the sender in as one member, read off the LIVE run, is what
+    //      gives that turn a reply route — and it is transient by construction: when the run
+    //      is released (`state.run` cleared) the family reverts, so no caller's id is welded
+    //      onto another agent's standing transcript.
     //
     // A SIBLING is deliberately NOT in the set: it shares an ancestor but was not created
     // by this caller, and 0027's complaint was precisely that a caller was shown — and
@@ -5668,8 +6166,43 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             if (owner !== undefined && family.has(owner)) family.add(candidate.record.id);
         }
 
+        // (5) The TRANSIENT REPLY TARGET of the run currently attached to this
+        // conversation (documented in the family rule above). Read off `state.run`, so it
+        // is exactly as long-lived as that run: `runAgent` clears `threadState.run` at the
+        // terminal commit and in its `finally`, and the family reverts on its own.
+        //
+        // Deliberately the SENDER'S ID ONLY, applied AFTER step 4: folding it in earlier
+        // would let a caller's one-off message pull the sender's whole subtree (and its
+        // agent's standing transcript) into a conversation it never spoke to, which is the
+        // leak issue 0027 closed. The started turn gets a route back to the party that woke
+        // it, nothing more.
+        const replyThreadId = state.run?.replyThreadId;
+        if (replyThreadId !== undefined) family.add(replyThreadId);
+
         return family;
     };
+
+    // #4 (2026-11-14, stress report) — the DELETE door's answer for a branch address.
+    //
+    // This is the sentence that replaces `threadStateOf`'s canonical not-found error for an
+    // id like `branch-1`, which is NOT unknown: it is a fork record, and the read seams
+    // (`threadMessages`, `thread`) already answer it. Saying "it was never created, or it
+    // was deleted" while `threadRead branch-1` returns five messages is the one thing this
+    // refusal may not be, so it states the actual rule instead: a branch is not a
+    // conversation, there is nothing to release, and here is when it does leave.
+    //
+    // `maxBranchRecords` is the bound in force for THIS harness (the configured override,
+    // defaulting to core/branch.ts `MAX_BRANCH_RECORDS`), so the caller is pointed at the
+    // real ledger length rather than a constant it may not share.
+    const branchDeleteRefusal = (branch: HarnessBranchRecord): HarnessError =>
+        new HarnessError(
+            `Thread "${branch.branchId}" is a fork record, not a conversation: it holds no thread slot, so there is ` +
+                'nothing to release' +
+                (branch.threadId === undefined
+                    ? '. '
+                    : ` — it goes when the conversation that forked it ("${branch.threadId}") is deleted. `) +
+                `The branch ledger keeps only its newest ${forks.maxBranchRecords} records.`
+        );
 
     // The family of a CALLER IDENTIFIER, or `undefined` when the caller has no thread at
     // all (unscoped). A caller id that no longer resolves (deleted mid-run, or a stale
@@ -5705,8 +6238,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //   - `status` — 'running' while the branch task is live, otherwise 'idle'. A terminal
     //     branch is done working, and a READ reports exactly that. It is NOT a delete door:
     //     a branch is detached audit state owned by its requester conversation (there is no
-    //     thread state to release), so `deleteThread("branch-N")` keeps the canonical
-    //     unknown-id refusal and the record goes when its OWNER is deleted (the M2 cascade);
+    //     thread state to release), so `deleteThread("branch-N")` refuses with the
+    //     branch-specific sentence below (`branchDeleteRefusal`) and the record goes when its
+    //     OWNER is deleted (the M2 cascade);
     //   - `sequence` — the branch's position in the retained ledger plus one. The ledger is
     //     kept in creation order, so this is stable for a given session state and is never
     //     a fabricated timestamp;
@@ -5751,6 +6285,47 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return branch.threadId === undefined || family.has(branch.threadId);
     };
 
+    // #5 (2026-11-14, stress report) — the one out-of-family address the caller can FIX, and
+    // the only thing the sentence below adds for it.
+    //
+    // A DEFAULT conversation (`agent:<name>`) is in a family through the conversations of
+    // that agent it spans (see `threadFamilyOf` step 4), so deleting the caller's last
+    // conversation running `X` drops `agent:X` out of the family with no visible cause. The
+    // base sentence is then technically true and useless: "the id exists — it is simply
+    // outside your lineage" names no cause and no way back, and the caller has no idea that
+    // one `delegate` call re-admits the address. A non-default target has no such remedy (an
+    // ancestor, a sibling, and another family's thread stay permanently out of reach), so it
+    // keeps the base sentence BYTE FOR BYTE and this clause is not appended at all.
+    //
+    // The FAMILY RULE AND THE VERDICT ARE UNCHANGED: this is a message. Widening the family
+    // to every configured agent was reviewed and rejected — a default conversation is the
+    // agent's standing transcript, and admitting it by agent name alone would leak other
+    // callers' content across families, which is exactly what issue 0027 removed.
+    //
+    // C2 (2026-11-14, independent review) — THE CAUSE IS HEDGED, THE REMEDY IS NOT. The first
+    // draft asserted the deletion as fact ("it left your lineage when the last of your
+    // conversations running X was deleted"), but this clause fires for ANY out-of-family
+    // `agent:<name>` address, and a caller that never delegated to that agent never had its
+    // default in its lineage in the first place — so the sentence blamed the caller for a
+    // delete it did not perform (the same over-claim C5 corrects in issue 0029's doc). Both
+    // causes are now offered: never-in-the-lineage, or left when the last conversation running
+    // that agent was deleted. The remedy is unchanged and unconditional, because re-delegating
+    // admits the address under either cause.
+    const defaultFamilyClauseOf = (threadId: string): string | undefined => {
+        const target = threadStates.get(threadId);
+
+        if (target === undefined || target.record.origin !== 'agent') return undefined;
+
+        const agent = target.record.agent;
+
+        return (
+            ` The cause is specific: "${threadId}" is agent "${agent}"'s default conversation, so either it was ` +
+            `never in your lineage or it left when the last of your conversations running "${agent}" was ` +
+            `deleted. Delegate to "${agent}" again — the conversation it mints re-admits this address, and ` +
+            'threadRead/threadSend reach it from then on.'
+        );
+    };
+
     // Separate sentence from the not-found error, for the same reason `threadSend`'s
     // refusal is: an id that exists outside your lineage is a roster problem, and an id
     // nobody has is a typo or a released conversation.
@@ -5766,7 +6341,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         new HarnessError(
             `Thread "${threadId}" is not visible to thread "${callerThreadId}": a read reaches your own thread, an ` +
                 'ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists (see ' +
-                'threadList). The id exists — it is simply outside your lineage.'
+                'threadList). The id exists — it is simply outside your lineage.' +
+                // #5: the actionable cause and remedy, for a default conversation only. The
+                // sentence above stays byte-for-byte for every other address.
+                (defaultFamilyClauseOf(threadId) ?? '')
         );
 
     // Mark one thread stopped and abort its run, if any. Returns whether a live run
@@ -5835,12 +6413,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return aborted;
     };
 
+    // What one purge released, beyond the conversation itself: the invocation ids whose
+    // agent-result records went with the conversation, and the branch ids whose ledger
+    // entries went with it. `deleteThread` folds these into the `threadDelete` receipt
+    // (stress report #6, 2026-11-14) so "agentManage got shorter" is a reportable fact
+    // instead of a silent side effect.
+    type ThreadPurgeOutcome = {
+        removedInvocationIds: string[];
+        removedBranchIds: string[];
+    };
+
     // Drop one thread state and every LOOKUP that pointed at it. Shared by
     // deleteThread (invocation/branch purge) and restore (replacing the persisted
     // set), so both paths cannot drift. It never touches an agent transcript the
     // thread shares with anyone else: the caller's content purge is the thread's
     // own Agent, which becomes unreachable here.
-    const purgeThread = (state: ThreadState): void => {
+    //
+    // Returns what it removed (a caller that wants the sets; `restore` ignores them).
+    const purgeThread = (state: ThreadState): ThreadPurgeOutcome => {
         const threadId = state.record.id;
         threadStates.delete(threadId);
 
@@ -5872,6 +6462,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 (record.sourceThreadId !== undefined && ownedInvocations.has(record.sourceThreadId))
         );
 
+        const removedBranchIds: string[] = [];
+
         if (removed.length > 0) {
             const removedIds = new Set(removed.map((record) => record.branchId));
             branchRecords = branchRecords.filter((record) => !removedIds.has(record.branchId));
@@ -5880,8 +6472,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             for (const branchId of removedIds) {
                 activeBranches.delete(branchId);
                 branchScopes.delete(branchId);
+                removedBranchIds.push(branchId);
             }
         }
+
+        // Ledger (creation) order, not map-iteration order: `branchRecords` is kept in
+        // creation order, so the receipt states a cascade in the order it was minted.
+        return { removedInvocationIds: [...ownedInvocations], removedBranchIds };
     };
 
     // Remove a terminal host thread and every lookup scoped to it. Content that
@@ -5889,6 +6486,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // chat message) is NOT recalled: deletion is a purge of THIS conversation, not
     // a promise of forgetting what other histories learned from it.
     const deleteThread = (threadId: string): HarnessThreadDeleteResult => {
+        // #4 (2026-11-14, stress report) — resolve a BRANCH address before the thread
+        // table. `threadStateOf` below throws the canonical not-found sentence, and for a
+        // fork that sentence is the ONE answer that is false: `threadRead branch-N` answers
+        // with the branch's transcript and `agentResult` answers with its record, so the id
+        // demonstrably exists. The read seam was given the truthful answer for exactly this
+        // reason (see `threadRecordOfBranch`); the delete seam is given it here.
+        //
+        // The answer is still a REFUSAL, not a delete. A branch holds no thread slot and has
+        // no ThreadState to release, so there is nothing here to free — and starting to
+        // delete branches on their own would strip the requester's fork audit trail. Its
+        // record goes when the conversation that forked it is deleted (the M2 cascade in
+        // `purgeThread`), and the ledger keeps only its newest `maxBranchRecords` entries
+        // (core/branch.ts `MAX_BRANCH_RECORDS`, pruned in `finishBranch`).
+        const branch = branchRecordOf(threadId);
+
+        if (branch !== undefined) throw branchDeleteRefusal(branch);
+
         const state = threadStateOf(threadId);
 
         if (state.record.origin === 'agent') {
@@ -5945,8 +6559,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
               }))
             : undefined;
 
-        purgeThread(state);
-        for (const child of descendants) purgeThread(child);
+        // #6 (2026-11-14, stress report): the purge already computed exactly which invocation
+        // records and which branch lookups leave with the conversation, and threw those sets
+        // away. The receipt now carries them, because the observable symptom of the old shape
+        // was silent: `agentManage`'s count dropped and `agentResult(id)` began throwing with
+        // no indication why. Owner first, then cascade children in creation order — the same
+        // order `removedThreadIds` states — and an EMPTY array means "nothing else went", not
+        // "this build does not say".
+        const removedInvocationIds = new Set<string>();
+        const removedBranchIds = new Set<string>();
+
+        for (const entry of purged) {
+            const outcome = purgeThread(entry);
+
+            for (const invocationId of outcome.removedInvocationIds) removedInvocationIds.add(invocationId);
+            for (const branchId of outcome.removedBranchIds) removedBranchIds.add(branchId);
+        }
+
         notifyStateChange('thread');
 
         // R2 plugin hook: one event per purged conversation, cascade children last
@@ -5958,7 +6587,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // B5 (2026-11-13): the receipt is the state the caller caused. `deleted` is the id
         // it named (a refusal throws, so a return is always a removal); `removedThreadIds`
         // is every conversation that actually went, the cascade included.
-        return { deleted: threadId, removedThreadIds };
+        return {
+            deleted: threadId,
+            removedThreadIds,
+            removedInvocationIds: [...removedInvocationIds],
+            removedBranchIds: [...removedBranchIds]
+        };
     };
 
     // B5 (2026-11-13) — the model-facing release, scoped to the caller's OWN descendants.
@@ -5980,11 +6614,61 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //
     // The cascade, the running refusal, and the `agent:<name>` refusal are unchanged —
     // they live in `deleteThread`, so both doors refuse identically.
+    // Every persistent ancestor of `fromOwnerId`, tested against `callerId`. Extracted from
+    // `threadDeleteFor` (2026-11-14) because a BRANCH address needs the same test with a
+    // different starting point: a branch has no thread record, so its persistent owner
+    // (`HarnessBranchSummary.threadId`, the field the M2 purge cascades on) is the first link
+    // of the chain. A corrupt/cyclic owner link (only reachable from a hand-edited snapshot)
+    // terminates on the `seen` set rather than looping.
+    const ownerChainReaches = (callerId: string, fromOwnerId: string | undefined): boolean => {
+        // Empty seed on purpose: the first link IS `fromOwnerId`, and seeding it with
+        // `callerId` would reject the direct-parent case before the loop ever looked at it.
+        // The set is only a cycle guard, so it accumulates each visited id.
+        const seen = new Set<string>();
+        let current = fromOwnerId;
+
+        while (current !== undefined && !seen.has(current)) {
+            seen.add(current);
+            if (current === callerId) return true;
+            current = threadStates.get(current)?.record.ownerThreadId;
+        }
+
+        return false;
+    };
+
+    // The refusal both doors give a caller that named an address it does not own. Kept as one
+    // helper so a live thread and a branch can never drift into two different sentences.
+    const threadNotOwnedError = (threadId: string, callerId: string): HarnessError =>
+        new HarnessError(
+            `Thread "${threadId}" is not one of the conversations "${callerId}" created; ` +
+                'threadDelete releases your own descendants (see threadList) — never your current thread, ' +
+                'an ancestor, a sibling, or another agent\'s conversation.'
+        );
+
     const threadDeleteFor = (
         callerThreadId: string | undefined,
         threadId: string
     ): HarnessThreadDeleteResult => {
         if (callerThreadId === undefined) return deleteThread(threadId);
+
+        // #4 (2026-11-14) — the branch check comes BEFORE `threadStateOf(threadId)`, because
+        // that is the call producing the false "never created, or it was deleted" answer for
+        // an id `threadRead` serves fine. The door still refuses; what changes is which
+        // truthful sentence it refuses with, and the descendant gate is NOT laundered away by
+        // the branch ledger: a caller that does not own the conversation that forked still
+        // gets the lineage refusal, so a scoped caller cannot probe a sibling subtree by
+        // guessing a branch id.
+        const branch = branchRecordOf(threadId);
+
+        if (branch !== undefined) {
+            const caller = threadStateOf(callerThreadId);
+
+            if (!ownerChainReaches(caller.record.id, branch.threadId)) {
+                throw threadNotOwnedError(threadId, caller.record.id);
+            }
+
+            throw branchDeleteRefusal(branch);
+        }
 
         const target = threadStateOf(threadId);
         const caller = threadStateOf(callerThreadId);
@@ -5992,25 +6676,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Walk the persistent owner chain up from the target. `ownerThreadId` is the
         // first-wins link set when a conversation is minted (see the run-start site), so a
         // thread this caller created — directly or several levels down — terminates here.
-        let owned = false;
-        let current: string | undefined = target.record.ownerThreadId;
-        const seen = new Set<string>([target.record.id]);
-
-        while (current !== undefined && !seen.has(current)) {
-            seen.add(current);
-            if (current === caller.record.id) {
-                owned = true;
-                break;
-            }
-            current = threadStates.get(current)?.record.ownerThreadId;
-        }
-
-        if (!owned) {
-            throw new HarnessError(
-                `Thread "${threadId}" is not one of the conversations "${caller.record.id}" created; ` +
-                    'threadDelete releases your own descendants (see threadList) — never your current thread, ' +
-                    'an ancestor, a sibling, or another agent\'s conversation.'
-            );
+        if (!ownerChainReaches(caller.record.id, target.record.ownerThreadId)) {
+            throw threadNotOwnedError(threadId, caller.record.id);
         }
 
         return deleteThread(threadId);
@@ -6624,6 +7291,43 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             throw new HarnessError(`Invocation "${invocationId}" must be archived terminal, not running.`);
         }
 
+        // Review finding #5 / issues 0020 + 0033 (2026-11-14): the FORENSIC PAIR of a run that did
+        // not finish, validated HERE — before a single line below moves state. `completedOrder` is
+        // minted by incrementing harness-owned sequence state a few lines down, so a value rejected
+        // AFTER that point would burn an order and leave the canonical record half-written, and the
+        // lane seam (./server/workers/lane-authority.ts replays this call) would then report
+        // `invalid-mutation` for an op whose canonical state it already corrupted.
+        //
+        // The bounds are the SNAPSHOT READER'S OWN, reused verbatim from ../core/snapshot-validation.ts
+        // rather than re-derived: `core/snapshot.ts:242-298` is what reads these two fields back off
+        // disk, so an archive that accepted a looser value would mint a live record the next snapshot
+        // cannot persist and reload. `min: 1` on the partial is what makes "present means it said
+        // something" checkable; `min: 0` on the message count. A wrong type throws instead of being
+        // coerced — issue 0020 lists coercion as a defect, and silent repair would erase the audit
+        // trail of who wrote garbage into the archive.
+        //
+        // A value that is present-but-blank (whitespace only) is refused on top of the `min: 1` bound:
+        // a run that streamed its preamble and nothing else means NO partial, the same signal as an
+        // absent field, and storing it would put a value in the row that means "nothing" while the
+        // rule says present means "something".
+        const partialContent =
+            input.partialContent === undefined
+                ? undefined
+                : readSnapshotString(input.partialContent, `Invocation "${invocationId}".partialContent`, { min: 1 });
+
+        if (partialContent !== undefined && partialContent.trim().length === 0) {
+            throw new HarnessError(
+                `Invocation "${invocationId}".partialContent cannot be blank; a run that said nothing archives no partial at all.`
+            );
+        }
+
+        const cancelledAtMessage =
+            input.cancelledAtMessage === undefined
+                ? undefined
+                : readSnapshotInteger(input.cancelledAtMessage, `Invocation "${invocationId}".cancelledAtMessage`, {
+                      min: 0,
+                  });
+
         const replaced = invocationRecords.has(invocationId);
         const completedOrder =
             input.completedOrder === undefined
@@ -6643,6 +7347,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             content: status === 'completed' ? input.content ?? '' : '',
             completedOrder,
             ...(status === 'completed' ? {} : { error: input.error ?? 'The run ended without a result.' }),
+            // Review finding #5 / issues 0020 + 0033 (2026-11-14): the FORENSIC PAIR, validated above
+            // and stored only when the caller sent it AND the status is non-completed. That exclusion
+            // is `error`'s own rule one line up, and it is the rule ../core/snapshot.ts:280-300 enforces
+            // when READING a row back: a completed row that carries the pair is refused, so a pair left
+            // on a completed archive here would make the whole next snapshot unloadable. A cancelled row
+            // that later COMPLETES is the case that matters — the row is replaced wholesale by this
+            // literal, so dropping the pair on `completed` is what stops a stale partial outliving the
+            // cancellation it described.
+            ...(status === 'completed' || partialContent === undefined ? {} : { partialContent }),
+            ...(status === 'completed' || cancelledAtMessage === undefined ? {} : { cancelledAtMessage }),
             ...(input.threadId === undefined ? {} : { threadId: input.threadId })
         };
 
@@ -6660,7 +7374,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 kind: archived.kind,
                 status,
                 content: archived.content,
-                ...(archived.error === undefined ? {} : { error: archived.error })
+                ...(archived.error === undefined ? {} : { error: archived.error }),
+                // Carried exactly as stored, because the LANE COMMITS THIS OBJECT: the live replay in
+                // ./server/workers/lane-authority.ts digests `archiveDigestOf(archived.record)` and
+                // compares it to the digest the worker computed from the payload it sent. Once the
+                // digest covers the pair, a field it names that this return omits puts the two sides
+                // permanently out of agreement — the writer would see its op rejected with a different
+                // digest and re-derive the archive forever, which is the same class of failure as a
+                // result op that never settles.
+                ...(archived.partialContent === undefined ? {} : { partialContent: archived.partialContent }),
+                ...(archived.cancelledAtMessage === undefined
+                    ? {}
+                    : { cancelledAtMessage: archived.cancelledAtMessage })
             },
             replaced
         };
@@ -7440,7 +8165,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     const projectTranscript = (
         brain: Agent,
-        pending: readonly HarnessPendingTool[]
+        pending: readonly HarnessPendingTool[],
+        // Issue 0024 (2026-11-14) — the scheduler SCOPE of the run whose request this is. It is
+        // needed by exactly one branch below: a pending `delegate` placeholder resolves ITS OWN
+        // child record, and a child record is addressed by the pair (`parentScope`,
+        // `parentCallId`) the child stamped itself. Optional by design — a projection with no
+        // run has nothing to name, and AC2 of the issue is that the placeholder then carries
+        // NEITHER id rather than an invented one.
+        scope?: string
     ): HarnessMessage[] => {
         const pendingById = new Map(pending.map((entry) => [entry.callId, entry]));
         const projected: HarnessMessage[] = [];
@@ -7533,6 +8265,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 const entry = pendingById.get(call.id);
 
+                // 0024 — A PENDING DELEGATION NAMES ITS CHILD. Every other async call gets the
+                // generic stand-in below, whose only handle is the call id, and for a tool with
+                // no run of its own that IS the whole story. A `delegate` call is different: the
+                // child's invocation record exists from the moment the call is launched
+                // (`registerInvocation` stamps `parentScope` + `parentCallId`), so the two ids
+                // the terminal envelope advertises — `agentResult` by `invocationId`,
+                // `threadSend`/`threadRead` by `threadId` — already exist at the one moment the
+                // caller learns the child is still working. It is addressed by the same pair the
+                // terminal path uses, never by "the newest run of that agent", so with three
+                // siblings in flight each placeholder can only match its own child (AC3).
+                //
+                // A child that never started (refused before dispatch) or whose record was
+                // evicted contributes NEITHER key: no `""` substitute, exactly as the terminal
+                // path behaves when it has no record (AC2).
+                const child =
+                    scope === undefined || call.name !== 'delegate'
+                        ? undefined
+                        : delegatedRecordOf(scope, call.id);
+
                 projected.push({
                     role: 'tool',
                     toolCallId: call.id,
@@ -7541,6 +8292,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         status: 'pending',
                         callId: call.id,
                         name: call.name,
+                        ...(child === undefined ? {} : { invocationId: child.invocationId }),
+                        ...(child?.threadId === undefined ? {} : { threadId: child.threadId }),
                         ...(entry === undefined ? {} : { elapsedMs: entry.elapsedMs }),
                         note:
                             entry === undefined
@@ -7612,7 +8365,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const deliverTask = async (
         task: ReturnType<typeof scheduler.schedule>,
         run: RunState,
-        call: HarnessToolCall
+        call: HarnessToolCall,
+        // D2 (issue 0021) — this call's DELEGATION trace, captured by `onSettled` in the
+        // cancellation's own stack when the released call was a `delegate` dispatch. `undefined`
+        // for every other call and for every other door, which is what keeps the historical
+        // sentence byte-for-byte everywhere else.
+        released?: DelegateCallTrace
     ): Promise<void> => {
         // A run-level abort discards results that lost the race with cancellation.
         // Keep a tool's own abort error, though: a tool that observed the signal
@@ -7628,11 +8386,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // A cancelled run still drains its sync group: a member whose delivery is
             // skipped must not stay registered, or a parked batch gate would wait on a
             // call that will never be delivered.
+            //
+            // Issue 0019 door 1: a DELEGATION result dropped here is an account the caller is
+            // still owed. The ledger keeps the answer, and this conversation may well run again
+            // (a background child posts the mailbox, or the user sends the next message), so the
+            // debt is registered and paid on that turn instead of dying with this run.
+            recordOwedDelivery(run, call);
             settleCompletion(run, call.id);
             return;
         }
 
         if (!run.active) {
+            // Issue 0019 door 2: same debt, different door — the run's turn budget or lifecycle
+            // ended, so the transcript this result would touch is no longer being written.
+            recordOwedDelivery(run, call);
             settleCompletion(run, call.id);
             return;
         }
@@ -7667,14 +8434,65 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // so "no result is available" used to send the caller past the only address it
             // could still read. Every other cancelled call keeps the historical sentence
             // byte for byte (the background suite pins it).
-            const branchId = branchCallIds.get(`${run.scope}\u0000${call.id}`);
+            const branchId = branchCallIds.get(callTraceKey(run.scope, call.id));
+
+            // D2 (issues 0021/0019) — A RELEASED DELEGATION STILL OWES ITS RESULT.
+            //
+            // `delegate` names `toolCancel` as the recovery for a child that will not answer, and
+            // promises an unfinished child as a structured envelope. The release is synchronous
+            // (JavaScript cannot be preempted) and the scheduler then treats the child's late
+            // resolution as data on a dead task, so the envelope `delegateFor` computed was
+            // produced and thrown away: the caller read "no result is available" and had to issue
+            // a second call for forensics that already existed in the child's ledger entry.
+            //
+            // The release races the child, so the record readable on THIS stack is only one of two
+            // states — and neither one is the envelope the caller finally gets. Most often the child
+            // has NOT terminalised when the release notifies: the abort is still unwinding through
+            // its model/tool boundaries, and `partialContent`/`cancelledAtMessage` exist only on the
+            // terminal transition (`finishInvocation`, ./harness.ts:3876-3893, fed by
+            // `runAgentCore`'s catch at :11926-11938), so what a read on this stack sees is a
+            // `running` record with neither field. The other state is a child that terminalised on
+            // the far side of the release while its task was still pending — the record is then
+            // already terminal, `completed` included, which is the case
+            // `releasedDelegateResultOf` refuses an `error` for (see the `status === 'completed'`
+            // branch in its call below).
+            //
+            // What the first state does NOT license is what this annotation used to assert — that a
+            // released child therefore has no partial to report. The envelope is
+            // computed AFTER the wait, from the child's terminal record, and a child that had
+            // committed text is cancelled WITH that text. The door is reached by exactly that case,
+            // and it is pinned byte-for-byte at `src/harness.delegation.test.ts:1600-1655` — a
+            // `delegate` released by `toolCancel` after its child committed "half an answer"
+            // delivers `content: 'half an answer'`, `partialContent: 'half an answer'`,
+            // `cancelledAtMessage: 2`, `status: 'cancelled'` and `callCancelled: true`, while the
+            // `toolCancel` receipt itself stays the bare `{ cancelled, callId, name }`
+            // acknowledgement (see that control's `immediateResult` below) and the released call
+            // still has exactly one result. The same pair is what the T4/T9 probes recorded under
+            // `Temp/t12-verify/` (`pre-fix-logs/c2a.log`: the historical sentence alone;
+            // `post-fix-logs/c2a.log`: the envelope, with the partial).
+            //
+            // The single wait below is the child's OWN settle promise, which is already in flight
+            // and abort-bound: no new timer is armed (the source pin on `armWallClock` in this file
+            // stays exact), and the mailbox this runs in is a different actor than the child's, so
+            // it cannot deadlock — it only observes work already happening. A child whose tool
+            // ignores its abort signal holds the delivery open for exactly as long as it holds its
+            // OWN run open — and `delegate`'s optional `timeoutMs` is the bound a caller already
+            // has for stopping that child, which is the reason no second clock is armed here.
+            if (released !== undefined) await task.promise.catch(() => undefined);
+
+            // The envelope, or `undefined` when the child left no record to report (it never
+            // started, or its entry was purged). Falling back to the historical sentence is what
+            // keeps AC4 of 0029 honest: no identity is invented for work the runtime never saw.
+            const releasedResult = released === undefined ? undefined : releasedDelegateResultOf(released);
 
             content = boundDelivery(
                 run,
                 call,
-                branchId === undefined
-                    ? `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
-                    : `Tool call "${call.name}" (${call.id}) was cancelled before it completed; its branch "${branchId}" still holds what it produced — read it with threadRead "${branchId}" or agentResult by that id.`
+                releasedResult !== undefined
+                    ? serialize(releasedResult)
+                    : branchId === undefined
+                      ? `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
+                      : `Tool call "${call.name}" (${call.id}) was cancelled before it completed; its branch "${branchId}" still holds what it produced — read it with threadRead "${branchId}" or agentResult by that id.`
             );
             outcome = 'cancelled';
         } else if (task.failed) {
@@ -7695,7 +8513,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // two doors that read the rest. Every other failed call — and a fork whose
             // branch never said anything, the `produced no substantive answer` case —
             // keeps the historical sentence byte for byte.
-            const failedBranchId = branchCallIds.get(`${run.scope}\u0000${call.id}`);
+            // D3/F8: the SAME key builder as the publisher and the cancelled branch above
+            // (8241, :4552). A second spelling of an identity is how the two drift apart.
+            const failedBranchId = branchCallIds.get(callTraceKey(run.scope, call.id));
             const failedPartial =
                 failedBranchId === undefined
                     ? undefined
@@ -7762,7 +8582,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // T1.2 — the classification is persisted on the canonical message at the single
         // insertion point, so it survives a restart/snapshot/fork. `completed` writes no
         // key; nothing here re-reads `content` to decide what happened.
-        insertToolMessage(brain, call, content, run.branch === undefined, media, outcome);
+        //
+        // Issue 0019 door 3: the writer DECLINES when the call's slot is gone (issue 0017's
+        // `insertToolMessage` false — the transcript moved under this delivery, typically
+        // because the run's rollback already spliced it). A declined insert means the answer
+        // exists and nobody has it, so the debt is registered; the sweep's `hasToolResult`
+        // guard makes the OTHER false case (already answered) a no-op rather than a duplicate.
+        if (!insertToolMessage(brain, call, content, run.branch === undefined, media, outcome)) {
+            recordOwedDelivery(run, call);
+        }
 
         // The outcome is CANONICAL at this point (P1-A). Wake the loop BEFORE the
         // reporter runs: a slow progress callback must not be able to keep
@@ -7834,6 +8662,256 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 agent: run.actorKey,
                 pending: []
             }));
+        }
+    };
+
+    // Issue 0019 (2026-11-14) — the OWED-DELIVERIES register.
+    //
+    // A `delegate` call promises its caller an ACCOUNT of the child. Four doors drop that
+    // fulfilment while the ledger keeps the answer, and each of them used to end the story:
+    //   1. the child lands while the parent run is being cancelled (`deliverTask`'s
+    //      `run.aborted` guard) — the wake is consumed and the rolled-back transcript cannot see
+    //      the message;
+    //   2. the child lands after the parent's turn budget is gone (`!run.active`, the sibling of
+    //      the `run.disposed` condition that guard documents);
+    //   3. the transcript insert itself declines (issue 0017's `insertToolMessage` false — the
+    //      call is no longer in the transcript, so the result cannot be attached anywhere);
+    //   4. the parent run is ABANDONED: turn exhaustion, a throw, or the run's finally arm calls
+    //      `scheduler.abandonScope` (src/core/scheduler.ts:300-311), which marks the task
+    //      `abandoned` and CLEARS `_notify` — so `deliverTask` is never called at all and the
+    //      settled result is dropped on the board.
+    // Doors 1-2 already carried a comment admitting "the caller was promised this account and
+    // never got it"; door 4 was silent, and the abandoned call still shows up in `thread` output
+    // as a tool call that never answered.
+    //
+    // A door closing does NOT mean "no further turn will happen": a background child posts the
+    // mailbox and wakes this conversation, the user sends the next message, or a sibling
+    // completion drains the queue. So the debt is recorded here and PAID AT THE TOP OF THE
+    // CONVERSATION'S NEXT TURN, where the result re-enters through the existing per-conversation
+    // queue: exactly one reprinted account, and the `hasToolResult` guard in
+    // `deliverOwedAccounts` (AC3) is what keeps a live delivery that DID land from becoming a
+    // second one.
+    //
+    // WHY THE DEBT CARRIES THE CALLER'S SCOPE AND THE CHILD'S ID. `run.scope` is minted per run
+    // (`String(++runSequence)`), and the ledger stamps a child with its PARENT's scope
+    // (`parentScope`/`parentCallId`, the pair 0029 made the only honest way to address a child).
+    // The debt is paid in a LATER run whose own scope is different, so a lookup keyed on the
+    // paying run would find nothing — the door's scope plus the child's invocation id travel with
+    // the debt, and payment resolves the record value-first with the pair as fallback, exactly
+    // like `releasedDelegateResultOf` (src/harness.ts:4371-4373). Nothing is invented: an entry
+    // is only ever created for a call whose child record already exists.
+    //
+    // RUNTIME-ONLY, like the mailbox FIFOs above: `snapshot()`/`restore()` model the PERSISTED
+    // contract, and AC5 accepts the window in which the process dies with an unpaid debt — the
+    // durable ledger still resolves the id through `agentResult`, and no new wake source or
+    // timer is introduced (the same AC protects the invariant that a settled child never holds
+    // its parent open forever).
+    type OwedDelivery = {
+        // The scope of the run that owned the call — the child's `parentScope`.
+        scope: string;
+        // The call the account belongs to: the transcript slot the tool result is owed at.
+        callId: string;
+        // The tool name, kept so the account can be re-inserted as the result of the SAME call:
+        // `insertToolMessage` writes `name` on the message and `boundDelivery` keys the per-turn
+        // result budget on `{ name, callId }`, so neither needs the assistant message that asked
+        // for it. `arguments` is read by neither, hence the empty payload used to rebuild one.
+        name: string;
+        // The child's identity AS RECORDED AT THE DOOR. The id is what payment addresses; the
+        // thread id is carried so an account whose call slot is gone can still name the
+        // conversation it describes (AC1).
+        invocationId: string;
+        threadId?: string;
+    };
+
+    /** Owed accounts, grouped by the owed conversation, in the order the doors closed. */
+    const owedDeliveries = new Map<string, OwedDelivery[]>();
+
+    // The child record this call spawned, by the pair the child itself stamped. Exported to no
+    // one: it is the probe that says whether a dropped delivery owes an account at all.
+    const owedChildRecordOf = (scope: string, callId: string): AgentInvocationRecord | undefined =>
+        delegatedRecordOf(scope, callId);
+
+    // Record one dropped account, at the door where it dropped.
+    //
+    // ONLY a call that started a child owes an account. An ordinary tool dropped by a
+    // cancellation or a dead run was never promised one, and reprinting those would change the
+    // transcript of every aborted run for no benefit; the child-record probe tells the two
+    // apart, so the test needs no tool-name string and covers `delegate` and a nested `ctx.run`
+    // alike.
+    //
+    // The DEBT is stored, not the text. At doors 1, 2 and 4 the child may still be running, and
+    // AC1 puts the source of truth for the content in the LEDGER rather than in a second store
+    // of answer text: `owedAccountOf` rebuilds the envelope at payment time.
+    const recordOwedDelivery = (run: RunState, call: HarnessToolCall): void => {
+        const record = owedChildRecordOf(run.scope, call.id);
+
+        if (record === undefined) return;
+
+        const queue = owedDeliveries.get(run.actorKey);
+
+        // Idempotent by (ownerKey, callId): one call can reach two doors (a declined insert on a
+        // delivery that runs again, or a call seen by both the failure arm and the finally arm of
+        // one run), and one unpaid debt must stay ONE account.
+        if (queue?.some((entry) => entry.callId === call.id)) return;
+
+        const debt: OwedDelivery = {
+            scope: run.scope,
+            callId: call.id,
+            name: call.name,
+            invocationId: record.invocationId,
+            ...(record.threadId === undefined ? {} : { threadId: record.threadId })
+        };
+
+        if (queue === undefined) owedDeliveries.set(run.actorKey, [debt]);
+        else queue.push(debt);
+    };
+
+    // The same debt for a task the board released without notifying. The scheduler's pending
+    // view carries `callId` and `name` — everything a debt needs beyond the child it points at —
+    // so an abandonment sweep builds the shape `recordOwedDelivery` takes rather than reaching
+    // into the board.
+    const recordOwedDebtOfTask = (run: RunState, task: { callId: string; name: string }): void =>
+        recordOwedDelivery(run, { id: task.callId, name: task.name, arguments: '{}' });
+
+    // Issue 0019 door 4, the loud one: a run that exhausts its turn budget, throws, or reaches
+    // its finally arm calls `scheduler.abandonScope`, which never notifies — so a delegated
+    // result that had not landed yet used to die on the board. Reading the board's own pending
+    // view is what makes this honest: `pendingOfScope` returns exactly the tasks this
+    // abandonScope releases, and each one is judged by `recordOwedDelivery`'s child probe, so an
+    // ordinary in-flight tool contributes nothing and a call with no child of its own is never
+    // reported as an account.
+    const recordOwedAbandonments = (run: RunState): void => {
+        for (const task of scheduler.pendingOfScope(run.scope)) recordOwedDebtOfTask(run, task);
+    };
+
+    // The child record a debt points at, at payment time. Value first, pair as fallback — the
+    // rule `releasedDelegateResultOf` documents: the id the child wrote is exact, and the pair
+    // covers a host-supplied `run` closure that ignored the identity carrier.
+    const owedRecordOf = (debt: OwedDelivery): AgentInvocationRecord | undefined =>
+        invocationRecords.get(debt.invocationId) ?? owedChildRecordOf(debt.scope, debt.callId);
+
+    // The account one debt owes its caller, in the shape the live delivery WOULD have inserted.
+    // `undefined` means "nothing to report": the record was purged or evicted, or the child is
+    // STILL running — its own delivery answers the call when it lands, and that account is the
+    // real one, so the register must not get ahead of it.
+    const owedAccountOf = (run: RunState, debt: OwedDelivery): string | undefined => {
+        const record = owedRecordOf(debt);
+
+        if (record === undefined || record.status === 'running') return undefined;
+
+        // The answer text, by the live readers' own rule (see `releasedDelegateResultOf`): a
+        // child that answered anyway is reported by its FINAL text, a child that was cut off by
+        // the partial it reached. `error` comes from the record and is therefore ABSENT for a
+        // completed child — which is the shape the live `delegate` result and `agentResult` use
+        // for one — so this is not a new envelope, it is the envelope this invocation already
+        // answers with.
+        //
+        // The one deliberate difference is the PAGE SIZE: a debt records the door, not the
+        // call's `maxChars`, so the reprint pages at the default width (`delegatePageLimitOf
+        // (undefined)` — a supplied `maxChars` can only ever have been smaller), and the rest of
+        // the answer stays reachable through `agentResult` for that invocationId.
+        const answer =
+            typeof record.content === 'string' && record.content.length > 0
+                ? record.content
+                : (record.partialContent ?? '');
+
+        // The one thing this register exists for is an ANSWER nobody received. A child that the
+        // parent's own cancellation stopped, and that had produced no text, has nothing to
+        // report: its "account" would be the sentence "the caller cancelled it", which the
+        // caller caused, and printing that on the next turn would rewrite the clean rollback a
+        // cancelled run is meant to leave behind (the whole-run-cancel pin in
+        // src/harness.background.test.ts). A cancelled child that DID produce text still owes
+        // the account, because that partial exists nowhere else in the caller's transcript —
+        // which is exactly issue 0019's second failing case.
+        if (record.status === 'cancelled' && answer.length === 0) return undefined;
+
+        return boundDelivery(
+            run,
+            { id: debt.callId, name: debt.name, arguments: '{}' },
+            serialize(
+                unfinishedDelegateEnvelopeOf(
+                    record,
+                    record.agent,
+                    delegatePageLimitOf(undefined),
+                    // The helper reads this only when the record has no measured span, and a
+                    // SETTLED record always does (`finishInvocation` writes `durationMs` on the
+                    // terminal transition) — so this is a placeholder for an unreachable branch.
+                    Date.now(),
+                    record.error,
+                    answer
+                )
+            )
+        );
+    };
+
+    // Pay every debt this conversation owes, at the top of its next turn — BEFORE the mailbox
+    // drain, so an owed account and any queued message reach one request in order.
+    //
+    // Position is the whole point: an ORPHAN tool result (a result whose call is gone) is what
+    // the projection's pairing rule exists to avoid (see `resultInsertIndex` and the strict
+    // `tool_calls` contract documented on `projectTranscript`), so the account rides the CALL's
+    // slot whenever the transcript still carries it — the ordinary late arrival, since nothing
+    // removes the assistant's `delegate` call — and becomes a labelled non-orphan entry only
+    // when the slot was spliced away by the rollback of an exhausted or throwing run.
+    //
+    // AC2's drain invariant: the queue is TAKEN before anything is inserted, so one debt can
+    // never be reported twice by this register, and an unpayable debt is CONSUMED rather than
+    // retried forever — `agentResult` still resolves the id, which is the durable half.
+    const deliverOwedAccounts = (run: RunState): void => {
+        const queue = owedDeliveries.get(run.actorKey);
+
+        if (queue === undefined) return;
+
+        owedDeliveries.delete(run.actorKey);
+
+        for (const debt of queue) {
+            // Already answered (a live delivery won, or a sibling insert covered the call): the
+            // account exists, so the debt is paid. This is AC3, and it is why a reprinted account
+            // can never turn into a duplicate.
+            if (hasToolResult(run.agent, debt.callId)) continue;
+
+            const content = owedAccountOf(run, debt);
+
+            if (content === undefined) continue;
+
+            if (resultInsertIndex(run.agent, debt.callId) >= 0) {
+                insertToolMessage(
+                    run.agent,
+                    { id: debt.callId, name: debt.name, arguments: '{}' },
+                    content,
+                    // A branch transcript is ephemeral: the same persistence rule the live
+                    // delivery passes to the writer (see `insertToolMessage`'s `notify`).
+                    run.branch === undefined,
+                    undefined,
+                    // The CALL succeeded — the account arrived — even when the child did not
+                    // finish, which is what the live delivery of a cancelled child's envelope
+                    // reports too (`deliverTask`'s success arm). `completed` writes no key, so
+                    // the message shape is identical to a live one.
+                    'completed'
+                );
+                continue;
+            }
+
+            // The slot is gone. Append the account on the same channel a mailbox message uses —
+            // a committed transcript entry the next request carries — labelled so neither the
+            // model nor a reader can mistake it for the caller's own words, and naming the child
+            // it describes (AC1: an account, not a hint, and never an orphan).
+            run.agent.messages.push(
+                assignMessageId(
+                    {
+                        role: 'system',
+                        content:
+                            `A delegated run (invocation "${debt.invocationId}"` +
+                            (debt.threadId === undefined ? '' : ` in conversation "${debt.threadId}"`) +
+                            ') finished after its parent turn ended, so its result could not be ' +
+                            'attached to the original call. This is the account that run produced, reported once here: ' +
+                            content
+                    },
+                    run.agent.messages
+                )
+            );
+
+            if (run.branch === undefined) notifyStateChange('agent_message', { agent: run.agent.name });
         }
     };
 
@@ -8272,7 +9350,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     run: (
                         agentName: string,
                         input: string,
-                        options?: { signal?: AbortSignal; tools?: readonly string[]; maxTurns?: number }
+                        options?: ToolRunOptions
                     ) => {
                         // T14: refuse BEFORE anything is resolved, so no child thread state, no
                         // transcript append and no provider request can exist behind the refusal.
@@ -8317,9 +9395,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                                 childSignal,
                                 run,
                                 call.id,
-                                delegateAnswerDefinitions.has(definition)
-                                    ? DELEGATE_ANSWER
-                                    : undefined,
+                                // D1: the delegate policy AND the identity carrier come from the
+                                // definition marker. A delegate call that supplied a carrier gets
+                                // its own internals object; every other call keeps the shared one.
+                                delegateInternalsFor(definition, options?.identity),
                                 undefined,
                                 undefined,
                                 undefined,
@@ -8350,8 +9429,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 }
             },
             onSettled: (task) => {
+                // D2 (issue 0021) — the released-call door. `scheduler.cancel` notifies through
+                // THIS hook with the task already marked cancelled, so this is where a delegation
+                // that `toolCancel` let go is delivered. Enqueuing the mailbox defers that
+                // delivery behind a drain that may still be busy, and by then the tool body has
+                // returned and cleared its trace — so the trace is read SYNCHRONOUSLY here, in the
+                // cancel's own stack, and handed to the delivery as an argument (`released`).
+                const released =
+                    task.status === 'cancelled'
+                        ? delegateCallTraces.get(callTraceKey(run.scope, call.id))
+                        : undefined;
+
                 enqueueMailbox(run.actorKey, () =>
-                    deliverTask(task, run, call).catch((error) => {
+                    deliverTask(task, run, call, released).catch((error) => {
                         // Keep the mailbox chain healthy and fail the RUN on the
                         // loop, where the rollback path is.
                         if (run.deliveryError === undefined) run.deliveryError = error;
@@ -9411,7 +10501,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const currentProjection = (): readonly HarnessMessage[] => {
             if (!inclusionChanged) return projected;
 
-            projected = projectTranscript(brain, runPending(run));
+            projected = projectTranscript(brain, runPending(run), run.scope);
             inclusionChanged = false;
 
             return projected;
@@ -10309,7 +11399,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // turn of the same agent: never start a provider request for it.
             throwIfAborted(run);
 
-            const projection = projectTranscript(brain, runPending(run));
+            const projection = projectTranscript(brain, runPending(run), run.scope);
             // Capture the exact offered definitions for this request. Tool calls
             // returned by it execute these objects even if a replacement publishes
             // before the calls are launched.
@@ -10350,6 +11440,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // read, no await, no allocation (T2.4).
             if (decision !== undefined) applyTurnDecision(run, decision);
 
+            // issue 0020: a fresh request owns a fresh in-flight buffer. Everything
+            // this run streamed on EARLIER turns is already committed to the
+            // transcript, which `partialContent` reads separately.
+            run.streamedText = '';
+
             const iterator = brain
                 .turn({
                     signal: run.signal,
@@ -10380,6 +11475,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                     switch (event.type) {
                         case 'text':
+                            // issue 0020: the delta is buffered as it is emitted, BEFORE
+                            // the turn commits. A cancellation that lands in the middle of
+                            // this loop is precisely the state the partial answer must
+                            // describe, and the rollback below erases the transcript.
+                            run.streamedText += event.delta;
                             await emit(run, { type: 'text', agent: brain.name, delta: event.delta });
                             break;
 
@@ -10395,6 +11495,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         // frame); consumers discard them, and no tool from that
                         // attempt can exist because the agent commits nothing.
                         case 'retry':
+                            // The failed attempt's own deltas are discarded by the agent
+                            // (no commit happened), so the in-flight buffer restarts with
+                            // the re-sent request.
+                            run.streamedText = '';
+
                             await emit(run, {
                                 type: 'retry',
                                 agent: brain.name,
@@ -10615,6 +11720,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // Explicit drain: release everything this run started before
                     // the rollback below, so a failure cannot leave a task that
                     // later inserts into a dead transcript.
+                    //
+                    // Issue 0019 (door 4): register any delegated result this drain releases
+                    // BEFORE releasing it, because `abandonScope` never notifies — this is the
+                    // exit where a child that finished honestly was stranded by the parent's
+                    // budget, with no log line and no account.
+                    recordOwedAbandonments(run);
                     scheduler.abandonScope(run.scope);
                     const limit = turnLimit;
                     throw new HarnessError(
@@ -10624,13 +11735,32 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                               // the run, and a caller-set `maxTurns` says so explicitly — a
                               // model that hit its own budget needs to know that widening it
                               // is its choice, not the harness's.
-                              `Agent "${brain.name}" requested tools more than ${limit} times without answering${
-                                  limit === maxIterations ? '' : `, the ${limit} turns this run was given`
+                              //
+                              // STRESS REPORT #17 (2026-11-14): the old sentence said
+                              // "requested tools MORE THAN ${limit} times", which over-reported
+                              // by one — the guard above fires when `run.iteration` REACHES the
+                              // bound, so the child requested tools exactly `limit` times — and
+                              // it mis-pluralised (`1 times`, `the 1 turns`). The count now
+                              // states what happened and agrees in number with its noun; the
+                              // `limit === maxIterations` test that decides whether the per-run
+                              // suffix appears is unchanged, so "my cap" and "the session's cap"
+                              // are still distinguishable from the text alone.
+                              `Agent "${brain.name}" requested tools on ${
+                                  limit === 1 ? 'its single model turn' : `all ${limit} model turns`
+                              } without answering${
+                                  limit === maxIterations ? '' : `, the maxTurns this run was given`
                               }.`
                     );
                 }
 
                 run.iteration++;
+                // Issue 0019: an account the caller was owed and a door dropped is paid HERE,
+                // before the drain, so the oldest fact in the queue is the first one this turn
+                // sees and the model can answer the child it never heard from. A debt whose call
+                // is still in the transcript lands as that call's tool result; one whose slot was
+                // spliced away lands as a labelled entry. Either way it is the turn's first act,
+                // so it cannot be starved by a run that stops after this request.
+                deliverOwedAccounts(run);
                 // Deliveries that landed before this turn must be visible to it;
                 // reset dirty AFTER draining so the reset does not hide a real
                 // outcome from `changedDuringRequest` below.
@@ -10853,6 +11983,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // `failed` while the caller was told "stopped", and the rollback below is
             // the same either way.
             run.aborted = run.pluginStopped || run.signal?.aborted === true;
+            // Issue 0019 (door 4, cancel/throw exit): the same registration as the budget
+            // exhaustion above. This is the exit test 2 of the issue exercises — the run is
+            // aborted with its delegate call in flight, `abandonScope` never notifies, and the
+            // answer used to be discarded while the caller was left with a call that never
+            // answered.
+            recordOwedAbandonments(run);
             scheduler.abandonScope(run.scope);
 
             // T28 FORENSICS, captured BEFORE the rollback below. The splice is what
@@ -10861,7 +11997,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // nothing left to inspect. These two values are the run's own counters, so
             // they survive the rollback and reach agentResult/delegate.
             run.messagesProduced = Math.max(0, brain.messages.length - commitIndex);
-            run.partialContent = lastSubstantiveText(brain.messages, commitIndex);
+            // issue 0020 (AC1): "interrupted with an answer in hand" includes the answer
+            // it was still streaming. The in-flight buffer is the FRESHER evidence and
+            // wins; an empty buffer means the run really had nothing in hand, so the
+            // committed text is reported exactly as before. The empty case stays empty
+            // (no synthetic empty string), which is what keeps the snapshot reader's
+            // `min: 1` guard meaningful: a present `partialContent` always says the
+            // child did say something.
+            run.partialContent =
+                run.streamedText.trim().length > 0
+                    ? run.streamedText
+                    : lastSubstantiveText(brain.messages, commitIndex);
+            run.streamedText = '';
 
             // R5 preservation: steering this run drained is rolled back with the
             // transcript, so hand it to the NEXT host turn in its original order.
@@ -11003,6 +12150,53 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // same rule the `finally` enforces), and no thread state-change notification fires
     // here for the reason documented at the run-start site (a run already emits
     // `agent_message` per append).
+    // D1 (issue 0029) — writes the terminal status onto the identity carrier a delegation handed
+    // down. The value is READ BACK from the ledger entry `finishInvocation` finalized one line
+    // earlier (./harness.ts:3859-3890), so the carrier and the record can never state different
+    // statuses and the rule is not duplicated here; the local expression is only the fallback for
+    // a run whose entry a delete-thread purge has already removed, and it mirrors
+    // `finishInvocation`'s own derivation byte for byte.
+    const commitTerminalIdentity = (
+        internals: RunInternals | undefined,
+        run: RunState,
+        outcome: { message?: HarnessAssistantMessage; error?: unknown }
+    ): void => {
+        const identity = internals?.identity;
+        if (identity === undefined) return;
+
+        // Review finding #5 (2026-11-14): the write is BEST-EFFORT, and that is a correctness
+        // decision rather than a tidy-up. The carrier reaches this code through the
+        // `context.run(..., { identity })` escape hatch, so its shape is the HOST's — a frozen object,
+        // or a Proxy with a throwing `set`, makes this assignment throw in strict mode. Both call
+        // sites run this line IMMEDIATELY AFTER `commitRunTerminal`, so the throw unwound into
+        // `runAgent`'s `catch`, which called `commitRunTerminal(run, { error })` a second time and
+        // `finishInvocation` archived the invocation again. The observable damage was a finished
+        // child's own answer being overwritten by the host's carrier defect: status `completed`
+        // became `failed`, `content` sat beside a non-completed status, a row that already had a
+        // `completedOrder` was re-minted a second one, and `agentResult` answered `content: ''` with
+        // no `partialContent` for a run that had completed cleanly.
+        //
+        // The carrier is a MIRROR, never the source of truth: the value written here is read back
+        // from the ledger entry `finishInvocation` just finalized (./harness.ts:3859-3890), and that
+        // record stays canonical whatever the host's object accepts. So a refused mirror write costs
+        // one convenience for a caller that used an escape hatch; a thrown one costs the run's answer.
+        // Swallow the failure here, change nothing else, and keep `identity.status` — it is part of
+        // the published carrier contract (`HarnessRunIdentity`, ../types/index.ts), and the delegation
+        // envelope still reads it as the fallback for a ledger entry a `purgeThread` has removed.
+        try {
+            identity.status =
+                invocationRecords.get(invocationIdOf(run))?.status ??
+                (outcome.message !== undefined
+                    ? 'completed'
+                    : run.aborted || run.signal?.aborted === true
+                      ? 'cancelled'
+                      : 'failed');
+        } catch {
+            // Empty on purpose (see the rule above): a carrier that refuses its status write is the
+            // host's problem, not a reason to re-terminalize a run that already terminalized.
+        }
+    };
+
     const commitRunTerminal = (
         run: RunState,
         outcome: { message?: HarnessAssistantMessage; error?: unknown }
@@ -11286,6 +12480,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 signal: runSignal,
                 ...(resolvedThread === undefined ? {} : { threadState: resolvedThread }),
                 ...(runThreadId === undefined ? {} : { threadId: runThreadId }),
+                // T5/#1: the reply target this run was STARTED with (see
+                // `RunState.replyThreadId`). Only `postThreadMessage`'s dormant-start branch
+                // supplies it, through `RunInternals`, so every other path leaves the field
+                // absent and the family is exactly what it was before.
+                ...(internals?.replyThreadId === undefined
+                    ? {}
+                    : { replyThreadId: internals.replyThreadId }),
                 lineage: [...ancestors, runBrain],
                 parent,
                 active: true,
@@ -11313,6 +12514,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 syncGroups: new Map(),
                 syncWakers: [],
                 steering: [],
+                // issue 0020: the in-flight stream buffer starts empty and is owned by
+                // whichever model request is currently open (see RunState.streamedText).
+                streamedText: '',
                 attachments: validatedAttachments,
                 startedAt: Date.now(),
                 ...(callId === undefined ? {} : { parentCallId: callId }),
@@ -11425,15 +12629,85 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // it never touches history or events.
             registerInvocation(run);
 
-            // R2/R3 plugin hooks around ONE run. `run.started` fires after the
-            // invocation is registered (so a handler that reads the roster sees this
-            // run) and after the actor is owned (so it cannot report a run that was
-            // refused in the queue). Guarded by `has()` — see the `thread.started` note.
-            if (hookBus.has('run.started')) {
-                await hookBus.emit('run.started', () => runLifecycleContext(run));
-            }
-
+            // T5 (2026-11-14, stress report #9 follow-up) — THE SETTLE GUARD COVERS THE
+            // RUN-START HOOKS.
+            //
+            // `registerInvocation` files the record as `running` above, and the ONLY place
+            // that ever makes it terminal is inside this `try` (`commitRunTerminal` on both
+            // the success and the failure path). So anything that throws between
+            // `registerInvocation` and that commit orphaned the record: a `running` entry is
+            // never evicted (retention takes terminal records only), never snapshotted, and
+            // reported live by `agentManage`/`agentResult` for the life of the session — and
+            // the conversation's release in the `finally` below never ran either, so the
+            // thread stayed `running` with a dead run attached.
+            //
+            // The bus is fail-OPEN (./plugin/hooks.ts rule 2), so nothing a PLUGIN does can
+            // reach here: a handler that throws, rejects, outlives its budget, or returns a
+            // decision the contract cannot parse is dropped and reported, and even the
+            // host's diagnostic reporter is wrapped (`notifyPluginDiagnostic`). What this
+            // `try` guards against is therefore a failure the bus itself does not swallow —
+            // today only a defect inside the dispatch (a payload factory that throws, a
+            // handler list that changes mid-round) — plus anything the fail-open contract is
+            // ever widened to stop swallowing. Covering the emit inside the same `try` that
+            // commits the ledger makes the invariant unconditional and cheap: once an
+            // invocation is registered, it settles, whatever the round does.
+            //
+            // Nothing moves in the success path. `run.started` still fires after
+            // `registerInvocation` and before `runAgentCore`, still guarded by `has()` so a
+            // hookless harness keeps its exact microtask order (./plugin/hooks.ts rule 5),
+            // and the settle ordering / atomic terminal commit are untouched. The D1 identity
+            // carrier write below is now covered by this guard too (C1) — it was the one
+            // non-hook statement in the gap and could throw on a host-supplied carrier.
             try {
+                // D1 (issue 0029) — IDENTITY BY VALUE. The run that owns an invocation identity is
+                // the only component that can report it without guessing: whoever started this run
+                // handed down a carrier through `context.run(..., { identity })`, and this is where
+                // the carrier learns what only THIS run knows. `invocationIdOf(run)` is the exact
+                // expression `registerInvocation` used above to key the ledger entry, so the id the
+                // caller reports and the id the entry is filed under cannot disagree — no matching,
+                // no candidate scanning, no recency. `threadId` is the PERSISTENT conversation (the
+                // child's default thread for a delegation), distinct from the per-run invocation id,
+                // and a branch/ctx.run child that has none reports none. A run that nobody delegated
+                // into has no carrier and writes nothing.
+                //
+                // C1 (2026-11-14, independent review) — THE WRITE IS THE FIRST STATEMENT INSIDE THE
+                // GUARD, not a statement before it. The assignment is not automatically total: a host
+                // can hand back any object as the carrier through the `context.run(..., { identity })`
+                // escape hatch, and a frozen object or a Proxy with a throwing `set` makes this
+                // assignment throw (see the same escape hatch acknowledged beside `newInvocationOf`
+                // in `delegateFor`). Before this move that throw landed in the gap the guard exists
+                // to close — a `running` ledger record that retention never
+                // evicts, plus a conversation whose release lives in the `finally` below and never
+                // ran. Inside the guard the throw instead takes the normal `catch` path: the
+                // record is made terminal by `commitRunTerminal` there, and the `finally` still
+                // releases the conversation — which is the whole invariant.
+                //
+                // Correction (review #5, 2026-11-14): the parenthetical this note closed with — "a
+                // carrier frozen enough to reject this write also rejects the `status` write in
+                // `commitTerminalIdentity`, so the `run.failed` emit after it is skipped and the
+                // propagated error is the carrier's own" — is no longer what happens. That second
+                // throw is now caught where it happens (see `commitTerminalIdentity`), so a frozen
+                // carrier still emits `run.finished` on the success path and never re-archives the
+                // run through the outer `catch`. What stays true, and what the guard is FOR, is the
+                // orphan this move closed: a `running` ledger record that retention never evicts and a
+                // conversation whose release never ran.
+                //
+                // Ordering is unchanged: this still runs after `registerInvocation`, before the
+                // `run.started` hook, and before `runAgentCore`; the write itself is synchronous and
+                // sits before the first `await`, so no interleaving point is introduced.
+                if (internals?.identity !== undefined) {
+                    internals.identity.invocationId = invocationIdOf(run);
+                    if (run.threadId !== undefined) internals.identity.threadId = run.threadId;
+                }
+
+                // R2/R3 plugin hooks around ONE run. `run.started` fires after the
+                // invocation is registered (so a handler that reads the roster sees this
+                // run) and after the actor is owned (so it cannot report a run that was
+                // refused in the queue). Guarded by `has()` — see the `thread.started` note.
+                if (hookBus.has('run.started')) {
+                    await hookBus.emit('run.started', () => runLifecycleContext(run));
+                }
+
                 const message = await runAgentCore(run, input);
 
                 // B2: terminal ledger entry AND released conversation, synchronously,
@@ -11441,6 +12715,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // reaps finished conversations works from, so the state it reads has to
                 // already agree with the answer it was handed.
                 commitRunTerminal(run, { message });
+
+                // D1: the terminal status is recorded on the carrier at the two commit points,
+                // mirroring `finishInvocation`'s rule exactly (./harness.ts:3869-3874) — a message
+                // means 'completed', an aborted run means 'cancelled', anything else 'failed'. The
+                // caller's catch-path envelope reads this when the ledger entry is unavailable, so
+                // the status a parent reports about its child is the child's own outcome, never an
+                // assumption from the parent's side of the boundary.
+                commitTerminalIdentity(internals, run, { message });
 
                 // Only a run that produced an answer gets `run.finished`; the failure
                 // path below reports `run.failed` instead, so a handler never sees both
@@ -11459,6 +12741,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // conversation is the state this makes unrepresentable).
                 commitRunTerminal(run, { error });
 
+                // D1: the failure path stamps the carrier too — a child that threw, timed out,
+                // or was cancelled is exactly the case where the parent needs its status.
+                commitTerminalIdentity(internals, run, { error });
+
                 // `toErrorInfo` is total (util/errors.ts), so a tool that threw a
                 // primitive/object/Proxy still yields a serializable payload here.
                 if (hookBus.has('run.failed')) {
@@ -11476,6 +12762,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // Idempotent: the catch path already drained; a successful run has
                 // nothing left. This also handles an unexpected throw outside the
                 // loop's own catch.
+                //
+                // Issue 0019 (door 4, finally arm): registered before the release for the same
+                // reason as the other two exits, and idempotent by call id — the catch arm
+                // above already covers a run that got there, and a run that ends with a child
+                // STILL in flight owes its caller the account when that child lands.
+                recordOwedAbandonments(run);
                 scheduler.abandonScope(run.scope);
                 // Release branch/action bookkeeping this run owned. abandonScope
                 // does not notify, so these are the only cleanup for work that never
@@ -11594,6 +12886,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // as a fabricated/cancelled result. Its eventual completion is recorded by
         // the next mutation-boundary snapshot (or lost only if the process dies
         // mid-run, which is the same guarantee as any other in-flight work).
+        //
+        // Issue 0033: the two FORENSIC fields of an unfinished run travel with the row.
+        // `finishInvocation` keeps `content` for a completed run and
+        // `partialContent`/`cancelledAtMessage` for every other terminal state (the same
+        // mutual exclusion `archiveInvocation` enforces), and the live readers serve
+        // `record.content || record.partialContent` — so a projection that writes only
+        // `content` silently un-derives that answer: the caller of a cancelled child was
+        // shown `content: "half an answer"`, and after a restart the same id answered
+        // `content: ""`. Both keys are written ONLY when the record holds them, which is
+        // what keeps every completed-only and every failed-on-first-request snapshot
+        // byte-for-byte identical to what this build already wrote.
         const agentResults = [...invocationRecords.values()]
             .filter((record) => record.status !== 'running')
             .sort((left, right) => left.sequence - right.sequence)
@@ -11606,7 +12909,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 kind: record.kind,
                 status: record.status as 'completed' | 'failed' | 'cancelled',
                 content: record.content,
-                ...(record.error === undefined ? {} : { error: record.error })
+                ...(record.error === undefined ? {} : { error: record.error }),
+                ...(record.partialContent === undefined ? {} : { partialContent: record.partialContent }),
+                ...(record.cancelledAtMessage === undefined
+                    ? {}
+                    : { cancelledAtMessage: record.cancelledAtMessage }),
+                // Issue 0033/0024: the OWNER travels too. `purgeThread`'s delete cascade matches
+                // `record.threadId`, and this projection is the only thing that rebuilds those
+                // records after a reload — so writing the key here (only when the invocation has
+                // a conversation, exactly like the live record) is what lets a conversation
+                // deleted after a restart still take its archived results with it. The key is
+                // ABSENT only for a record that resolved no conversation at all (`runThreadId`,
+                // src/harness.ts:12277 — a branch whose parent had none, or a brain outside the
+                // registry): a default-thread root run DOES own one, `agent:<name>`, so the row
+                // says so and the cascade matches it after the reload like every other one.
+                ...(record.threadId === undefined ? {} : { threadId: record.threadId })
             }));
 
         // R2: persist HOST threads only. An agent's default conversation is its
@@ -11931,9 +13248,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // high-water marks; otherwise a new root run could reuse an archived
         // numeric invocation id, or a new fork `branch-N` could overwrite the
         // archived result with the same id.
+        //
+        // Issue 0033: the forensic pair is rebuilt with the row, so an unfinished run
+        // keeps the answer its caller was already shown. The keys are OPTIONAL on the
+        // persisted row (an old-generation file simply omits them), and they are spread
+        // only when present — a restored row therefore has exactly the same shape as a
+        // live one, which is what keeps `agentResult`'s "absent means it never said
+        // anything" rule honest across a restart instead of turning a missing partial
+        // into an empty string.
         const restoredResults = next.agentResults ?? [];
 
         invocationRecords.clear();
+        // Issue 0019: an unpaid account is RUNTIME state, and a restore replaces runtime state.
+        // A debt owned by the pre-restore conversation is dropped rather than replayed into a
+        // session that may not contain it — the durable ledger still resolves the id
+        // (`agentResult`), which is the guarantee issue 0019 AC5 accepts for this window.
+        owedDeliveries.clear();
         for (const result of restoredResults) {
             invocationRecords.set(result.invocationId, {
                 invocationId: result.invocationId,
@@ -11944,7 +13274,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 kind: result.kind,
                 status: result.status,
                 content: result.content,
-                ...(result.error === undefined ? {} : { error: result.error })
+                ...(result.error === undefined ? {} : { error: result.error }),
+                ...(result.partialContent === undefined
+                    ? {}
+                    : { partialContent: result.partialContent }),
+                ...(result.cancelledAtMessage === undefined
+                    ? {}
+                    : { cancelledAtMessage: result.cancelledAtMessage }),
+                // Issue 0033/0024: the owner is rebuilt with the row, so `purgeThread`'s
+                // delete-cascade predicate (`record.threadId`) still matches after a reload. The
+                // key is optional on disk and spread only when present, which restores a record
+                // with exactly the shape a live one has — no `""` owner for a root run.
+                ...(result.threadId === undefined ? {} : { threadId: result.threadId })
             });
         }
 
@@ -12393,7 +13734,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // T14: the live nested-run policy of THIS instance.
             nestedRuns: nestedRunPolicy,
             ...(options.threadId === undefined ? {} : { threadId: options.threadId }),
-            run: (agentName: string, input: string) => {
+            run: (agentName: string, input: string, options?: ToolRunOptions) => {
                 // T14: this door carries NO parent run (a manual `executeTool` or a nested
                 // `callTool` is depth 1 by design), so `runAgent`'s lineage guard could not see
                 // it — the ToolContext guard is what closes it. Thrown before the agent is
@@ -12415,7 +13756,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         signal,
                         undefined,
                         undefined,
-                        delegateAnswerDefinitions.has(definition) ? DELEGATE_ANSWER : undefined
+                        // D1: same carrier-aware policy as the model path, so a delegation started
+                        // through a nested `context.callTool` can report its own identity too.
+                        delegateInternalsFor(definition, options?.identity)
                     )
                 );
             }
@@ -12498,11 +13841,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // the historical full-catalogue shape (unrestricted = the R2 baseline).
             // T14: the live nested-run policy of THIS instance.
             nestedRuns: nestedRunPolicy,
-            run: (
-                agentName: string,
-                input: string,
-                options?: { signal?: AbortSignal; tools?: readonly string[]; maxTurns?: number }
-            ) => {
+            run: (agentName: string, input: string, options?: ToolRunOptions) => {
                 // T14: refuse this door before anything resolves (no parent run reaches
                 // `runAgent`'s lineage guard from here).
                 if (nestedRunsRefused()) {
@@ -12525,9 +13864,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         options?.signal,
                         undefined,
                         undefined,
-                        delegateAnswerDefinitions.has(definition)
-                            ? DELEGATE_ANSWER
-                            : undefined,
+                        // D1: same carrier-aware policy as the model path; the manual door must
+                        // not be the one place a host `executeTool('delegate')` cannot report its
+                        // own identity.
+                        delegateInternalsFor(definition, options?.identity),
                         undefined,
                         undefined,
                         undefined,
@@ -13104,6 +14444,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             discoveryOffsets.clear();
             recordEngine.reset();
             invocationRecords.clear();
+            // Issue 0019: same rule as `restore()` above — a reset session starts with no
+            // outstanding promise to any caller.
+            owedDeliveries.clear();
             // R2: host conversations belong to the session's conversation state,
             // so they are removed with it. The id high-water mark is NOT restored
             // (a deleted id stays retired, like the creation budget), and the

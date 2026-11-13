@@ -9540,11 +9540,19 @@ export class SessionStore {
                 const thread = (event as { thread?: { id?: string; kind?: string; branchId?: string } })
                     .thread;
 
-                // Branch results are not scoped to a persistent conversation, so the
-                // runtime keeps them; removing them here would make disk and runtime
-                // disagree.
+                // A branch run IS thread-scoped, and this scan used to claim the opposite.
+                // Its record's `threadId` is the requester's persistent conversation: a
+                // branch run has no `resolvedThread` of its own in `runAgent`, so `runThreadId`
+                // (src/harness.ts:11737, the "M2" comment) falls back to `parent.threadId`, and
+                // `registerInvocation` writes that id onto the record. `purgeThread` matches on
+                // exactly that field, so deleting the conversation removes the branch's result
+                // with it — the behaviour src/harness.thread-runtime.test.ts pins as "purges
+                // thread-owned branches AND THEIR RESULTS on delete (M2)". Skipping the branch
+                // ids here (the retired `thread.kind !== undefined` guard) asserted "the runtime
+                // keeps them" and left the durable registry holding a lookup the live session had
+                // already dropped; the F6 consistency guard below then hid the divergence by
+                // persisting the runtime's snapshot instead of this projection.
                 if (thread?.id === undefined) continue;
-                if (thread.kind !== undefined || thread.branchId !== undefined) continue;
 
                 ids.add(thread.id);
             }
@@ -10053,9 +10061,9 @@ export class SessionStore {
         // purge removes. The snapshot does not expose a result's thread, so the
         // doomed invocation ids are reconstructed from what the server recorded:
         // every root invocation of a doomed thread's turn, every invocation that
-        // appeared in its events (delegated children included), and each doomed
-        // thread's latest invocation. Branch invocations are NOT thread-scoped and
-        // are deliberately left alone.
+        // appeared in its events (delegated children AND branch runs included — a
+        // branch's record is owned by the conversation that forked it, see
+        // `doomedInvocationIds`), and each doomed thread's latest invocation.
         const doomedInvocations = this.doomedInvocationIds(session, doomed, removedIds);
 
         const projectedCore = ((): HarnessSnapshot => {

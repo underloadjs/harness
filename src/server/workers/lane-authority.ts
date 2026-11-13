@@ -953,7 +953,22 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                 const record = harness.thread(request.threadId, callerThreadId);
 
                 if (record === undefined) {
-                    throw new Error(`Thread "${request.threadId}" has no record in this session; it was never created, or it was deleted.`);
+                    // THE SAME FACT, THE SAME SENTENCE (issue 0034, 2026-11-14). A
+                    // missing thread record is one fact with three doors — the core's
+                    // `threadStateOf` (src/harness.ts:5404), this routed read, and
+                    // `threadRead`'s own record tail (src/tools/runtime/threadRead.tool.ts)
+                    // — and a caller comparing a lane's refusal with an inline one used to
+                    // read two different heads for it ("has no record in this session" vs
+                    // "is not available in this harness"). The head chosen is the core's,
+                    // because it is the only one true in BOTH execution modes: in worker
+                    // mode this answer comes from the CANONICAL harness object, and in
+                    // inline mode from the harness the host is holding — in both cases it
+                    // is the harness that has no such record. "Session" is not an object an
+                    // inline caller has: a library host gets a harness and never sees the
+                    // server's session, so the session-phrased head would be false at the
+                    // door that emits it most. Change the sentence HERE and there, or not
+                    // at all.
+                    throw new Error(`Thread "${request.threadId}" is not available in this harness; it was never created, or it was deleted.`);
                 }
 
                 const messages = harness.threadMessages(request.threadId, callerThreadId);
@@ -1140,7 +1155,25 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         kind: mutation.runKind,
                         status: mutation.status,
                         ...(mutation.content === undefined ? {} : { content: mutation.content }),
-                        ...(mutation.error === undefined ? {} : { error: mutation.error })
+                        ...(mutation.error === undefined ? {} : { error: mutation.error }),
+                        // #5/0020+0033: the FORENSIC PAIR, forwarded verbatim. THIS is the seam that
+                        // lost a cancelled lane child's answer: the replica holds both fields (its own
+                        // `finishInvocation` wrote them) and the snapshot projection writes them, but
+                        // this call named neither, so the canonical row was archived with `content: ''`
+                        // and no partial at all — a significant cancelled child reporting nothing, with
+                        // no restart involved. The core validates them before it mints an order
+                        // (src/harness.ts `archiveInvocation`), so a malformed pair throws here instead
+                        // of corrupting the canonical record.
+                        ...(mutation.partialContent === undefined ? {} : { partialContent: mutation.partialContent }),
+                        ...(mutation.cancelledAtMessage === undefined
+                            ? {}
+                            : { cancelledAtMessage: mutation.cancelledAtMessage }),
+                        // #6 (2026-11-14): the conversation the result belongs to, forwarded
+                        // verbatim. `purgeThread`'s delete cascade keys on exactly this field,
+                        // so an omission here is the lane/inline divergence the stress report
+                        // found — the same `threadDelete` released an inline conversation's
+                        // results and left a lane conversation's behind.
+                        ...(mutation.threadId === undefined ? {} : { threadId: mutation.threadId })
                     });
 
                     // The digest the lane compares against is `archiveDigestOf`, the projection
@@ -1149,7 +1182,18 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                     // lane's own view of its result (T10 finding M3).
                     return { ok: true, digest: archiveDigestOf(archived.record) };
                 } catch (error) {
-                    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+                    // The named code, the way `transcript:patch` above already does it (T10 finding
+                    // S5's rule: a receipt whose code names the wrong conflict sends the lane to the
+                    // wrong fix). Every throw from `archiveInvocation` here is a structurally bad
+                    // archive — an unregistered agent, a running status, a malformed forensic pair —
+                    // which is permanent, whereas the kind's default live conflict (`stale-record`,
+                    // see `liveRejectionCodeOf`) tells the lane its base moved and invites it to
+                    // re-derive the same row forever.
+                    return {
+                        ok: false,
+                        code: 'invalid-mutation',
+                        reason: error instanceof Error ? error.message : String(error)
+                    };
                 }
             }
 

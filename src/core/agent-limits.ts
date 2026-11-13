@@ -87,8 +87,13 @@ export const MODEL_TIMEOUT_MAX_MS = 3600000;
 // wall clock, so dropping the bound does not open a hang.
 export const FORK_TIMEOUT_MS = Number.POSITIVE_INFINITY;
 
-// The ceiling on the OPTIONAL `maxTurns` a caller may set on `delegate`: the number
-// of model turns (tool rounds) a delegated child may take before it has to answer.
+// The ceiling on the OPTIONAL `maxTurns` a caller may set on `delegate`: how many
+// MODEL REQUESTS a delegated child may make. Stress report #7 (2026-11-14) corrected
+// the gloss this comment used to carry ("model turns (tool rounds)"): the gate in
+// ../harness.ts is `run.iteration >= turnLimit` checked BEFORE the increment, so the
+// cap is a count of model requests and the child's ANSWER must be one of them —
+// `maxTurns: N` therefore permits at most N-1 tool rounds, and `maxTurns: 1` only
+// suits a child that answers without calling a tool.
 // Omitting `maxTurns` leaves the harness-wide count bound (`maxIterations` in
 // ../harness.ts — unarmed unless a host names one) in charge, so this ceiling only
 // ever LOWERS what one child may do, never raises the session limit. The delegate

@@ -21,6 +21,10 @@
 //     (`discovery.withheld`, see ./harness.ts `withheldTools`). Both are written only when
 //     non-empty and read as "nothing recorded" when absent, so every pre-feature v2 file
 //     (and every fixture) still validates and restores with its exact prior meaning.
+//     The same mechanism serves a key INSIDE one section: the two forensic fields of an
+//     unfinished agent result (`agentResults[].partialContent` / `.cancelledAtMessage`,
+//     issue 0033) are optional ROW fields, so a file written before them — and every
+//     fixture that has since pinned an agent-result row — keeps restoring unchanged.
 //
 // Cross-references:
 //   - ../types            — HarnessSnapshot and its parts
@@ -131,10 +135,28 @@ const readAgentResults = (
                 'kind',
                 'status',
                 'content',
-                'error'
+                'error',
+                'partialContent',
+                'cancelledAtMessage',
+                // Issue 0033/0024: the conversation an archived result belongs to. The key was
+                // already accepted by `HarnessInvocationArchiveInput` and is what
+                // `purgeThread`'s delete cascade matches on, but it was NOT part of the
+                // persisted row: the projection dropped it and this reader would have REFUSED a
+                // row that carried it, so after one restart the archived results of a deleted
+                // conversation were unreachable to the cascade — the lane/inline divergence the
+                // stress report found, moved onto the durability path.
+                'threadId'
             ],
             entryLabel,
-            ['error']
+            // Issue 0033: the two forensic keys join `error` as MAY-BE-ABSENT, which is
+            // exactly the backwards-compatibility mechanism. An old-generation row that
+            // never carried them is still valid (they are in `optional`, so nothing
+            // demands them) and restores with its exact prior meaning; a current row that
+            // carries them is read, not dropped. `threadId` joins the same list for the same
+            // reason: the writers spread it only when the invocation resolved no conversation
+            // at all (src/harness.ts:12277 `runThreadId`), so absence is a fact about that row,
+            // not a defect — while an old file that simply never carried the key stays valid.
+            ['error', 'partialContent', 'cancelledAtMessage', 'threadId']
         );
 
         const invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
@@ -214,6 +236,64 @@ const readAgentResults = (
         if (status !== 'completed' && result.error === undefined) {
             throw new HarnessError(
                 `${entryLabel}.error is required when status is ${status}.`
+            );
+        }
+
+        // Issue 0033 — the forensic pair of an unfinished run, read under exactly the
+        // rules `error` already sets, because they are the same kind of field: optional
+        // on the row, never blank on a row that carries one, and meaningless once the
+        // run completed.
+        //
+        //   * `min: 1` mirrors the writer. `finishInvocation` stores the partial only
+        //     when it trims to something (src/harness.ts:3887-3889), so an
+        //     empty-string partial on disk is not a fact this build can produce — it is
+        //     a hand edit, and accepting it would restore an `agentResult` shape
+        //     (`partialContent: ""`) that the runtime never answers with.
+        //   * `cancelledAtMessage` may legitimately be 0: the counter is
+        //     `Math.max(0, brain.messages.length - commitIndex)` (src/harness.ts:11471),
+        //     so a run stopped before it appended anything reports zero.
+        //   * The two are NOT required to appear together, and no rule here says they
+        //     must: a run cancelled inside its first tool round commits messages without
+        //     committing substantive TEXT, which is exactly 0020's open case.
+        //   * Both must be ABSENT on a completed result, like `error`. A completed row
+        //     that carried them would restore a record the snapshot projection then
+        //     re-drops, so `restore -> snapshot` would stop being idempotent — the same
+        //     reason `error` is refused there.
+        if (record.partialContent !== undefined) {
+            result.partialContent = readSnapshotString(
+                record.partialContent,
+                `${entryLabel}.partialContent`,
+                { min: 1 }
+            );
+        }
+
+        if (record.cancelledAtMessage !== undefined) {
+            result.cancelledAtMessage = readSnapshotInteger(
+                record.cancelledAtMessage,
+                `${entryLabel}.cancelledAtMessage`,
+                { min: 0 }
+            );
+        }
+
+        // The owning conversation, read under the same "never blank on a row that carries one"
+        // rule as `error`/`partialContent`: the writer stores the key only when the invocation
+        // HAS a thread (`archiveInvocation` and the snapshot projection both spread
+        // conditionally), so `threadId: ""` on disk is a hand edit, and restoring one would give
+        // `purgeThread` an owner that matches no conversation. Unlike the forensic pair, this key
+        // is legal on a COMPLETED result — a finished turn of a host thread still belongs to that
+        // thread.
+        if (record.threadId !== undefined) {
+            result.threadId = readSnapshotString(record.threadId, `${entryLabel}.threadId`, {
+                min: 1
+            });
+        }
+
+        if (
+            status === 'completed' &&
+            (result.partialContent !== undefined || result.cancelledAtMessage !== undefined)
+        ) {
+            throw new HarnessError(
+                `${entryLabel}.partialContent and .cancelledAtMessage must be absent on a completed result.`
             );
         }
 

@@ -1095,7 +1095,7 @@ describe('snapshot persistence of the context-inclusion flag', () => {
             'snapshot.agents["writer"].messages[1].messageId must be a string.'
         );
         expect(() => target.restore(blank)).toThrow(
-            'snapshot.agents["writer"].messages[0].messageId must be at least 1 characters.'
+            'snapshot.agents["writer"].messages[0].messageId must be at least 1 character.'
         );
         expect(target.snapshot()).toEqual(before);
     });
@@ -2261,7 +2261,7 @@ describe('snapshot persistence of the conversation tool switches', () => {
         // SHAPE stays strict (only the registration check is lenient), and the closed key
         // list around it is unchanged: `withheld` joined it, nothing else may.
         rejects((discovery) => (discovery.withheld = 'tasks'), 'snapshot.discovery.withheld must be an array.');
-        rejects((discovery) => (discovery.withheld = ['']), 'snapshot.discovery.withheld[0] must be at least 1 characters.');
+        rejects((discovery) => (discovery.withheld = ['']), 'snapshot.discovery.withheld[0] must be at least 1 character.');
         rejects(
             (discovery) => (discovery.switches = ['tasks']),
             'snapshot.discovery has an unknown field "switches".'

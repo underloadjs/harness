@@ -172,7 +172,15 @@ writer.threads();                                            // default + host r
   transcript, owned terminal children, its invocation results, and every branch
   (`threadFork`/autoanswer, including nested ones) materialized from that
   conversation. The agent's default conversation cannot be deleted (use
-  `reset()`). Deletion purges THIS conversation only: it never promises to forget
+  `reset()`), and a `threadFork` branch id is refused as an address rather than
+  deleted — it holds no thread slot, and its record leaves with the conversation that
+  forked it. The receipt states the whole state change, in four fields: `{ deleted,
+  removedThreadIds, removedInvocationIds, removedBranchIds }` — the id you named, every
+  conversation that actually went (the cascade included), and which agent-result
+  records and branch lookups were purged with them, because a released conversation's
+  answers stop being readable by id and a caller needs to see that, not infer it. The
+  two id lists are always present: empty means "purged nothing".
+  Deletion purges THIS conversation only: it never promises to forget
   what other histories were already told, and it does not undo what this thread
   copied into session-shared memory (tasks, profiles, chapters, locations) or what
   a connected thread already received through a `#` reference. The one shared write it
@@ -183,23 +191,42 @@ Threads may only be OWNED by an independent host thread: `ownerThreadId` must
 name a `createThread` record, never an implicit `agent:<name>` conversation
 (its owner link could not be persisted/restored). Delegation children from host
 threads satisfy this automatically.
-- **Cross-thread chat & discovery** — once the session owns a host thread, three
-  conditional core tools are registered: `threadList` returns this session's live
-  conversations (id, agent, origin, status, owner/label) with the caller's own
-  `currentThreadId`, `threadRead` reads one of them back (the whole transcript, one
+- **Cross-thread chat & discovery** — once the session owns a host thread, FOUR
+  conditional core tools are registered: `threadList` returns the live
+  conversations this caller can address (id, agent, origin, status, owner/label) with the caller's own
+  `currentThreadId`, `threadRead` reads one of them back (**the FIRST PAGE only** —
+  a page of up to 20 messages under its own 32 KiB text budget, one
   message by index, or a regex/role-filtered page with per-message content paging;
+  `hasMore`/`nextOffset` continue the message list and `contentHasMore`/`nextContentOffset`
+  continue one long message, so a full transcript is a sequence of reads, never one
+  read;
   attachments come back as descriptors, never base64 bytes; omitting `thread` reads
-  the calling run's own conversation), and `threadSend` posts into one of them. Ids
+  the calling run's own conversation), `threadSend` posts into one of them, and
+  `threadDelete` releases a finished conversation the caller owns. Ids
   are therefore observed, never invented by a model or injected by the server;
   deleted threads are absent, and only this session is visible. The runtime records
   the REAL sender (agent + thread from the calling run, not a tool argument). The
+  roster and the three address doors are scoped to the caller's **THREAD FAMILY** — its
+  own thread, its ancestors, its descendants, and the default `agent:<name>`
+  conversations of the agents that family spans — because a tool that lists ids the
+  caller cannot use is worse than one that lists none; a threadless caller (a host view
+  outside any conversation) stays unscoped and sees everything, and a SIBLING is
+  deliberately outside the family. The
   post is STATE-AWARE and the receipt names the outcome: a RUNNING target is
   steered (`delivered: 'queued'` — the message lands at its next safe boundary, in
-  the turn already in flight), a DORMANT target — `idle`, or `paused` by a plugin
-  and resumed here — is started (`delivered: 'started'`, the message is its prompt),
+  the turn already in flight), a conversation a plugin PARKED (`paused`) is QUEUED
+  into the park and the park is LEFT ALONE (`delivered: 'queued'` — the holder parked
+  for its own next turn, and only a host `sendThreadInput` lifts a park from outside),
+  a DORMANT `idle` target is started (`delivered: 'started'`, the message is its prompt),
   and a STOPPED one is refused. Neither path waits for the answer.
   CORRECTED IN PLACE: an idle target used to get an inert append
-  (`delivered: 'appended'`) that no run was obliged to read.
+  (`delivered: 'appended'`) that no run was obliged to read, and a parked target used to
+  be resumed by the message that only arrived.
+  A message that STARTS a dormant default conversation also opens a route back: the run
+  that answers it carries the SENDER's thread id as a transient, per-run reply target, so
+  that one turn can list, read and reply to the conversation that woke it; when the run
+  ends the route reverts, and nothing about the woken agent's standing conversation is
+  rewired for the callers that come after it.
 
 Threads persist through snapshot v2 as an optional `threads`/`threadSequence`
 pair (absent while only default conversations exist). See `src/harness.ts` and
@@ -1829,7 +1856,10 @@ child a tool body starts would exist only inside that lane; see
 Two controls shape a child without changing that rule. **Time:** a delegated child has
 no wall-clock limit — `timeoutMs` is an optional bound the caller sets when it wants
 one (see [The loop](#the-loop)), and a child that is still running is abandoned with
-`toolCancel` on the `callId` its pending placeholder names. **Scope:**
+`toolCancel` on the `callId` its pending placeholder names — abandoning it does not discard
+the outcome: the child's terminal envelope is still delivered, as that call's own tool
+message, marked `callCancelled: true` to say that YOU released the call, while the
+`toolCancel` result itself stays an acknowledgement. **Scope:**
 `scope: { tools: [...] }` is a hard allowlist the child neither sees nor calls outside
 of — with one door that can never be locked, `toolRequest`, so a restricted child can
 always report the capability it is missing instead of looping on what it has. Enabling
@@ -1922,7 +1952,9 @@ state after waking. This changes four things a caller must know:
     records `stopped`, the invocation records `cancelled`, and everything the run
     appended is rolled back). A child that is stuck is abandoned by naming its
     pending `callId` to `toolCancel`; the placeholder the model receives while the
-    child runs says so. And because a thread is unbounded, a stopped conversation is
+    child runs says so, and abandoning it that way does not discard its outcome — the
+    child's terminal envelope still arrives as that call's own tool message, marked
+    `callCancelled: true`. And because a thread is unbounded, a stopped conversation is
     restarted by a **host** prompt (`sendThreadInput`), never by an agent's
     `threadSend` — the host owns stopping and reviving, so a model cannot undo a
     Stop the operator pressed.
@@ -1957,9 +1989,19 @@ commit is guarded by the core precommit check. One host-side caveat: a
 cancellation); there is no guaranteed reporter watchdog.
 
 Delegation is the same mechanism: an `delegate` call stays **pending** until
-the child fully completes, and the parent's `pending` list names it. Calling the
-same child again queues a follow-up on that child's existing transcript instead of
-starting a fresh conversation.
+the child fully completes, and the parent's `pending` list names it. A second
+delegation to the same subagent does NOT continue the first child's conversation:
+from a thread-backed conversation (a server session, any `createThread` host thread)
+each delegation MINTS ITS OWN child conversation, so a re-`delegate` starts fresh and
+remembers nothing — the follow-up door is `threadSend` into the `threadId` the envelope
+returned, and `threadRead` is how you re-read the answer. Only a delegation issued from
+an agent's own DEFAULT conversation runs in that subagent's standing
+`agent:<name>` conversation, which is the one case where a second call does continue
+the first transcript. Abandoning an in-flight call with `toolCancel` answers the ACK
+immediately (`{ cancelled: true, callId, name }`) and puts the child's terminal envelope
+in the call's own tool message — `status`, the harness's own `error` sentence,
+`partialContent`, `cancelledAtMessage`, the identity fields, and `callCancelled: true` —
+so the recovery the description recommends is not the path that loses the result.
 
 Failures split in two:
 
@@ -3395,10 +3437,22 @@ decides each one against the canonical harness:
   claim to be "latest finished" without colliding;
 - every session-shared operation a core tool performs (`tasks`, `profiles`,
   `chapters`, `locations`, `toolCreate`, `toolManage`, `toolRegistry`,
-  `toolRequest`, `toolList`, `threadSend`, `threadList`, `agentManage`,
+  `toolRequest`, `toolList`, `threadSend`, `threadList`, `threadDelete`, `agentManage`,
   `agentResult`) is **routed**, not executed locally: the lane replica's own
   `harness.runtime` object is replaced, so the canonical harness performs the work
-  and the answer crosses back. Tool sources are unchanged.
+  and the answer crosses back. Tool sources are unchanged. `threadDelete` routes
+  because it moves canonical state — the record, its transcript, its invocation and
+  branch lookups, and the thread slot the 256 cap counts — and the CALLER's id travels
+  inside the request's `identity` (the TARGET is the request's `threadId`), because the
+  delete is scoped to that caller's own descendants and must be enforced authority-side
+  (`AUTHORITY_RUNTIME_METHODS`, `src/server/workers/capability.ts`).
+- a terminal run's archived invocation travels WITH ITS CONVERSATION: the `result:archive`
+  operation names the thread the invocation ran in, and the durable projection the
+  coordinator keeps reconstructs the same ownership, so deleting a conversation purges
+  its results in a worker-mode session exactly as it does inline — including a fork
+  branch's result, whose owner is the conversation that forked it
+  (`src/server/workers/{lane-commit,lane-authority,lane-worker-loop}.ts`,
+  `src/server/sessions.ts`).
 - an `actionRequest` (an owner question) crosses as data, is registered in the
   session's normal pending map, and is answered by the usual HTTP route; a lane
   whose run ends leaves no orphaned question.
@@ -3460,7 +3514,8 @@ name and a fix — never a quiet inline fallback:
   itself; it is the lens, and the armed core is the guarantee, which is why a spelling the pattern
   misses (a computed member, a renamed context parameter) is still refused. Worker mode therefore
   does **not** promise nested conversation state — and cross-thread work (`threadRead`,
-  `threadSend`, `threadList`) is unaffected, because it is routed to the canonical harness rather
+  `threadSend`, `threadList`, `threadDelete`) is unaffected, because it is routed to the
+  canonical harness rather
   than answered from a private copy.
 - no worker entry on disk is a `ServerRuntimeError` naming both candidate paths, and
   a handshake that times out fails the turn.

@@ -1,6 +1,9 @@
 # 0025 — `requireClarification` refuses briefs that state a target and an output shape, because its acceptance test is a word list
 
-> **Status:** Open
+> **Status:** Fixed — 2026-11-14 (the minimum-change alternative shipped, not the warning
+> proposal: the acceptance test reads shape and count now, the incidental words are gone, and the
+> refusal no longer demands a `done when` clause — see the updates; the third pass of 2026-11-14
+> re-derived every address at the current tree and retired the stale-comment residual)
 > **Severity:** Minor
 > **Area:** `src/harness.ts` (`missingBriefParts`), `src/tools/runtime/delegate.tool.ts` (property description)
 > **Date opened:** 2026-11-11
@@ -87,8 +90,6 @@ to soften the refusal text so it does not demand a `done when` clause specifical
   assert it is not refused for a missing acceptance criterion.
 - `src/harness.delegation.test.ts` — a brief with an acceptance word but no target
   ("must pass the tests"): assert it is still refused for the missing target.
-- `src/harness.delegation.test.ts` — if warnings replace the soft refusal: assert the
-  child runs and the envelope carries the warning.
 
 ## Out of scope
 
@@ -117,3 +118,99 @@ to soften the refusal text so it does not demand a `done when` clause specifical
   causal or incidental word should not pass.
 - **Test gap confirmed:** no test exercises a brief that satisfies exactly one predicate, and
   none exercises a brief that passes acceptance on an incidental word.
+
+## Update (2026-11-14) — shipped, by the minimum-change route
+
+Read from the current source and tests; **no test was executed by this doc pass**. Every line number
+in the sections above predates the change (`src/harness.ts` has moved throughout), so this update is
+the address map; the dated analysis stays as written.
+
+- **AC1 — the acceptance test reads substance now.** `missingBriefParts` is
+  `src/harness.ts:3979`, and the acceptance side is no longer one word list. It ORs the old
+  `statesCondition` (`:3996-3999`) with three named shape tests: `BRIEF_ARTIFACTS` (`:3961`, the
+  nouns a deliverable is measured in), `BRIEF_COUNT` (`:3963`, digits plus the spelled-out numbers),
+  `BRIEF_COUNTED_SHAPE` (`:3966`, an `in/as/of/within/exactly/at most/…` preposition followed by a
+  count and an artifact — this is the door `"in three bullets"` now walks through, matched at
+  `:4003`), `BRIEF_NAMED_FORMAT` (`:3973`, matched at `:4004`) and `BRIEF_BOUND` (`:3977`, a numeric
+  bound, matched at `:4005`).
+- **AC2 — and the gate did not only get looser.** The review's over-acceptance finding shipped too:
+  `because`, `without`, `test` and `tests` are **out** of the acceptance list and `criterion` is in.
+  The list today, in full, is `acceptance|criteria|criterion|expect|expects|expected|should|must|
+  verify|verified|pass|passes|passed|repro|reproduce|done when|so that|instead of`
+  (`:3996-3999`) — every remaining word states an outcome, none is a causal connective.
+- **AC3 — the refusal stopped naming a magic phrase.** `:4604-4618`: one enumeration of the missing
+  parts and one remedy (`Add those parts to the brief and delegate again.`). The old second sentence
+  restated the parts, demanded a `done when` clause, and promised "any constraint", which this gate
+  never checked. Pinned by `expect(refusal).not.toContain('done when')` at
+  `src/harness.delegation.test.ts:1264-1265`.
+- **What did NOT ship: the warning route.** `briefWarnings` appears nowhere in `src/`, so a brief
+  whose acceptance signal is missing is still **refused**, not warned-and-run — the Proposal's own
+  "minimum change" fallback ("add the output-shape forms to the regex and soften the refusal text")
+  is the option taken. The **Out of scope** bullet about the gate not holding the whole call is
+  therefore still accurate.
+- **The pins, all four directions, in one describe.** AC1 `src/harness.delegation.test.ts:1167`
+  (`Summarize the file README.md in three bullets.` → the child runs, `:1186`); AC2 `:1190` (an
+  acceptance-worded brief with no target is refused, the refusal names `concrete target`, and `:1213`
+  asserts it does **not** claim the criterion is missing); the causal-word direction `:1217`
+  (refused, names `acceptance criterion`, and `:1239` asserts the target is not reported missing);
+  both parts missing `:1243`. Both of the review's test gaps are closed — each predicate is now
+  exercised on its own, in both directions. AC4 holds: the two pre-existing pins (then `:590`, `:615`)
+  are `:1108` and `:1133` today and still assert the same behaviour.
+- **One stale source comment to fix, and it is not this pass's file.** The block at
+  `:4609-4614` still reads "the GATE IS UNCHANGED — 0025's semantic proposals (over-acceptance and a
+  richer acceptance test) are separate work", which the shipped change contradicts on both halves.
+  `src/harness.ts` is owned by the sibling pass, so this is reported rather than edited.
+
+## Update (2026-11-14, third pass) — every address re-derived; the stale-comment residual is closed
+
+Read from source and tests; **no test was executed by this doc pass**. Addresses are from the working
+tree at 07:45-08:05 on 2026-11-14 (HEAD `cef43af`, dirty worktree). `src/harness.ts` was rewritten
+during the pass (it is 14,764 lines now, and was over 15,000 an hour earlier) and the runtime tool
+files were renamed (`agentDelegate.tool.ts` → `delegate.tool.ts`), so every number below is a snapshot
+and the quoted identifiers are what should be re-grepped.
+
+- **The gate is unchanged in substance; the addresses moved ~5 lines and the file name changed.** The
+  explanatory comment now runs `src/harness.ts:3944-3966` (the 0025 half — over-acceptance and
+  under-acceptance, with the incident brief — at `:3949-3966`); `BRIEF_ARTIFACTS` at `:3967-3968`,
+  `BRIEF_COUNT` at `:3969`, `BRIEF_COUNTED_SHAPE` at `:3972-3975`, `BRIEF_NAMED_FORMAT` at
+  `:3979-3980`, `BRIEF_BOUND` at `:3983`, and `missingBriefParts` at `:3985-4016`: `hasTarget` at
+  `:3990-3993`, the push of `concrete target (file, symbol, URL, or id)` at `:3995`, the
+  `statesCondition` word list at `:4002-4005` (the incidental causal words gone, `criterion` added
+  exactly as recorded in AC2), and the four-way `hasAcceptance` at `:4007-4011` — so the shape tests
+  are now matched at `:4009`, `:4010`, `:4011`, not `:4003-4005`.
+- **AC3's message, re-read.** The gate's own block is `:4602-4608` (`T28 UNDER-SPECIFIED BRIEFS ARE
+  GATED AT DISPATCH`, with "the refusal happens BEFORE the child runs"), the read at `:4610`, the
+  `if (missing.length > 0)` at `:4612`, and the message at `:4630-4631`:
+  ``The brief for "${target}" is under-specified: it names no ${missing.join(', no ')}. `` +
+  `'Add those parts to the brief and delegate again.'` — one enumeration, one remedy, and the string
+  `done when` does not appear anywhere in it.
+- **Reduction: the second pass's last item — "one stale source comment to fix" — is CLOSED, so the
+  item is retired here rather than carried.** The block that used to read "the GATE IS UNCHANGED —
+  0025's semantic proposals … are separate work" was corrected in-source and now runs `:4613-4629`;
+  its `Correction (review #5, 2026-11-14)` paragraph says the opposite of what it said, by name: "Only
+  the **MESSAGE** was untouched by #18; 0025 changed what this gate accepts, by widening the acceptance
+  signal inside `missingBriefParts` (the over-accepted causal words are gone and `BRIEF_COUNTED_SHAPE`
+  / `BRIEF_NAMED_FORMAT` / `BRIEF_BOUND` let a brief that fixes done-ness by SHAPE through)." A reader
+  who takes the comment at face value now grades the gate correctly, which is what the item asked for.
+- **Reduction, dated: the third bullet of Tests to add is deleted from that section.** It was
+  conditional — "if warnings replace the soft refusal: assert the child runs and the envelope carries
+  the warning" — and the owner's choice is final on the shipped tree: `briefWarnings` still appears
+  nowhere in `src/`, so there is no warning to assert. The first two bullets are the shipped tests
+  themselves and are pinned (below).
+- **The pins, at current addresses.** All six cases sit inside `describe('delegation result contract
+  (T28)')` at `src/harness.delegation.test.ts:1011` — there is no separate brief-gate describe. AC4's
+  pre-existing pair: `:1108` (refuses at dispatch, asserts `is under-specified` and `concrete target`
+  and `expect(researcher.messages).toEqual([])`) and `:1133` (accepts target + criterion, asserts the
+  child's answer at `:1151`). AC1: `:1167`, asserted at `:1187`. AC2's other direction: `:1190`, with
+  `not.toContain('acceptance criterion')` at `:1213`. Causal-word direction: `:1217`, with
+  `not.toContain('concrete target')` at `:1239`. Both parts missing: `:1243`, with
+  `not.toContain('done when')` at `:1265`.
+- **What is still owed, and it is documentation only.** Nothing outside this issue records the rule:
+  `grep -rn requireClarification knowledge.md docs/` hits only this file, so the two-part rule and the
+  shape signals are undocumented for operators. The model-facing text is thinner still —
+  `src/tools/runtime/delegate.tool.ts:145` says only that the flag "refuse[s] the delegation BEFORE the
+  child runs if the brief names no concrete target (file, symbol, URL, or id) or no acceptance
+  criterion", and never mentions that a shape or a count **is** a criterion. A model that writes
+  "in three bullets" therefore cannot know from the schema that its brief will pass; it learns by
+  being refused or not. Left as-is deliberately: widening that description is a prompt-contract change
+  with a manifest consequence (`yarn tools:manifest:check`), not a docs fix.

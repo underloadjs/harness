@@ -26,7 +26,11 @@
 //       hook, EVERY schedule site has to emit it — an ordinary async tool call, a
 //       `threadFork` branch and an `actionRequest` owner answer — or that board loses
 //       the heartbeat the old board-wide timer used to give it. Whole-run cancel rolls
-//       back every actor, aborts children, and leaves the harness reusable.
+//       back every actor, aborts children, and leaves the harness reusable. The
+//       rollback erases the cancelled turn, and issue 0019 adds the other half: a
+//       delegated call that the rollback released without ever delivering is reprinted
+//       ONCE as a labelled account on the conversation's next turn (see the
+//       whole-run-cancel test for the exact entry).
 //       A thrown/rejected tool is recoverable data; `maxIterations` still bounds a
 //       run and its pending state is cleaned up on the rollback path.
 //
@@ -2491,7 +2495,28 @@ describe('whole-run cancel', () => {
 
         expect(next.status).toBe('resolved');
         expect(next.value?.content).toBe('recovered');
-        expect(shape(writer.agent.messages)).toEqual(['user:again', 'assistant:recovered:']);
+        // Issue 0019 (2026-11-14) changed this shape, and the change is the point. The delegate
+        // call `d1` was released by `scheduler.abandonScope` when the cancel rolled the run back,
+        // and `abandonScope` NEVER notifies (`src/core/scheduler.ts:300-311`) — so `deliverTask`
+        // never ran and the child's answer died on the board while the caller was left with a
+        // call that never answered. The rollback still erases the cancelled TURN (the two empty
+        // transcripts asserted above), but the conversation's next turn now opens with exactly
+        // ONE labelled account of that child, before the model's reply, because the child had
+        // produced text worth reporting (`child-waiting`) and that partial exists nowhere else in
+        // this transcript. The cancelled call's slot is gone with the rolled-back turn, so the
+        // account cannot be an orphan tool result — it rides the system channel, names the
+        // invocation and conversation it describes, and carries the same envelope `agentResult`
+        // answers with for that id. Fake timers own the clock in this file, so `durationMs` is
+        // exact and the whole entry is pinned rather than approximated.
+        expect(shape(writer.agent.messages)).toEqual([
+            'user:again',
+            'system:A delegated run (invocation "2" in conversation "agent:researcher") finished after its parent turn ended, ' +
+                'so its result could not be attached to the original call. This is the account that run produced, reported once here: ' +
+                '{"agent":"researcher","content":"child-waiting","contentLength":13,"offset":0,"limit":8000,"truncated":false,' +
+                '"invocationId":"2","threadId":"agent:researcher","status":"cancelled","durationMs":0,"error":"run aborted",' +
+                '"partialContent":"child-waiting","cancelledAtMessage":3}',
+            'assistant:recovered:'
+        ]);
         expect(vi.getTimerCount()).toBe(0);
     });
 });
@@ -2614,7 +2639,7 @@ describe('failure paths', () => {
         expect(seen).toHaveLength(2);
         expect(state.status).toBe('rejected');
         expect(String((state.error as Error).message)).toBe(
-            'Agent "writer" requested tools more than 2 times without answering.'
+            'Agent "writer" requested tools on all 2 model turns without answering.'
         );
 
         // R5: the rollback path abandons the pending calls — no timer, no result,

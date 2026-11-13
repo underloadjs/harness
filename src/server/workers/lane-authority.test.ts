@@ -9,6 +9,13 @@
 //   - a committed terminal invocation becomes addressable through the core's OWN
 //     agentManage/agentResult reader (the archive a lane produces is central), and the
 //     completion ORDER is the authority's, never the lane's guess (T3 F2);
+//   - that archive names the CONVERSATION it belongs to, so deleting the conversation
+//     purges the lane's result exactly as it purges an inline one — and an op without
+//     the field keeps the weaker, documented behaviour (stress report #6, 2026-11-14);
+//   - that archive carries the FORENSIC PAIR of a run that did not finish, so the canonical
+//     row says what a stopped lane child actually said; a malformed value is refused before
+//     anything moves and burns no completion order; and a live refusal names the permanent
+//     code rather than the op kind's usual conflict (review #5, issues 0020 + 0033);
 //   - memory commits are compare-and-set against the canonical map: a stale digest is
 //     refused and the canonical digest comes back (T3 F4/F7);
 //   - routed `runtime` operations mutate the canonical store with a core-minted id (the
@@ -30,8 +37,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '@underload/harness';
 import type { Harness, HarnessMessage, HarnessStream, HarnessStreamEvent } from '@underload/harness';
 import { canonicalViewOf, createLaneAuthority } from './lane-authority';
-import { expectsDigestOf } from './lane-commit';
-import type { MutationGroup } from './lane-commit';
+// `archiveDigestOf` is the projection both sides of the archive seam must agree on; the pair pins
+// below compare a receipt against it, so the test states the writer's own rule rather than trusting
+// the authority to restate it.
+import { archiveDigestOf, expectsDigestOf } from './lane-commit';
+import type { MutationGroup, SharedMutation } from './lane-commit';
 import { ABSENT_DIGEST, digestMemoryValue } from './lane-memory';
 
 
@@ -494,6 +504,277 @@ describe('commit: a lane terminal invocation is central', () => {
         ]));
 
         expect(outcome.complete).toBe(false);
+        expect(core.snapshot().agentResults ?? []).toEqual([]);
+    });
+
+    // STRESS REPORT #6 / worker mode (2026-11-14) — THE PURGE RULE WAS SILENTLY WEAKER ON A
+    // LANE.
+    //
+    // `purgeThread`'s predicate is `record.threadId === the deleted conversation`, plus the
+    // roster's own `record.invocationId === state.record.invocationId` for the newest turn. A
+    // lane-archived record used to carry NO threadId at all (the `result:archive` op did not
+    // name one, and `archiveInvocation` rebuilds the record whole), so on a conversation that
+    // never ran on the authority — where the roster's invocation slot is empty — the delete
+    // caught only the newest result at best and left every earlier lane turn addressable. The
+    // same delete inline removed all of them. The op now carries the conversation, and these
+    // two cases pin both halves: what the field buys, and that an omitted field is still the
+    // documented weaker behaviour rather than a guess.
+    it('archives the owning conversation, so deleting it purges the lane result (F6 parity with inline)', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        // A lane-minted identity: NOT the thread id, and the authority's roster never named it
+        // (the run happened on the replica), so `record.threadId` is the only join the delete
+        // purge can use.
+        const outcome = authority.commit(EPOCH_A, group(1, [
+            {
+                kind: 'result:archive',
+                invocationId: '513',
+                sequence: 7,
+                completedOrder: 999,
+                agent: 'primary',
+                role: 'primary',
+                runKind: 'root',
+                status: 'completed',
+                content: 'the lane answered',
+                threadId: thread.id
+            }
+        ]));
+
+        expect(outcome.complete).toBe(true);
+        expect((core.snapshot().agentResults ?? []).map((record) => record.invocationId)).toEqual(['513']);
+
+        // The receipt states the purge, exactly as it does for an inline conversation.
+        expect(core.deleteThread(thread.id)).toEqual({
+            deleted: thread.id,
+            removedThreadIds: [thread.id],
+            removedInvocationIds: ['513'],
+            removedBranchIds: []
+        });
+        expect(core.snapshot().agentResults ?? []).toEqual([]);
+    });
+
+    it('without the conversation on the op the result survives the delete (the retired weaker lane rule)', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        // An older send, or a session-side archive that names no conversation: the authority
+        // stores the result, and NOTHING joins it to the conversation. This is the state the
+        // stress report found — `agentResult` still answering for a released conversation —
+        // pinned so the omission stays a named case instead of an accident.
+        authority.commit(EPOCH_A, group(1, [
+            {
+                kind: 'result:archive',
+                invocationId: '513',
+                sequence: 7,
+                completedOrder: 999,
+                agent: 'primary',
+                role: 'primary',
+                runKind: 'root',
+                status: 'completed',
+                content: 'the lane answered'
+            }
+        ]));
+
+        expect(core.deleteThread(thread.id)).toEqual({
+            deleted: thread.id,
+            removedThreadIds: [thread.id],
+            removedInvocationIds: [],
+            removedBranchIds: []
+        });
+        expect((core.snapshot().agentResults ?? []).map((record) => record.invocationId)).toEqual(['513']);
+    });
+
+    // Review finding #5 / issues 0020 + 0033 (2026-11-14) — THE FORENSIC PAIR, AUTHORITY END.
+    //
+    // A lane replica has always known what its stopped run said: `finishInvocation` writes
+    // `partialContent`/`cancelledAtMessage` on the terminal transition (src/harness.ts:3886-3898) and
+    // the snapshot projection carries both. What the archive seam never carried was the pair, so a
+    // lane-archived cancellation reached canonical state as `content: ''` with no partial at all —
+    // issue 0020's "significant cancelled child reports no partial content", with NO restart
+    // involved, because the loss was in this payload. These three cases pin the authority end: the
+    // pair lands on the canonical row, a malformed value is refused without moving canonical state,
+    // and a live refusal names the code a lane can act on.
+    it('archives the forensic pair so the canonical row says what the stopped run said', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        const stopped = {
+            kind: 'result:archive',
+            invocationId: '513',
+            sequence: 7,
+            // The lane's LOCAL order: the authority reassigns it, and `archiveDigestOf` ignores it,
+            // which is exactly why the pair — a writer-owned field — is not in the same exemption.
+            completedOrder: 999,
+            agent: 'primary',
+            role: 'subagent',
+            runKind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'I will read the file, then summarise it',
+            cancelledAtMessage: 2,
+            threadId: thread.id
+        } satisfies SharedMutation;
+
+        const outcome = authority.commit(EPOCH_A, group(1, [stopped]));
+
+        expect(outcome.complete).toBe(true);
+
+        // The CORE's own projection, not a restatement of the payload: this row is what a session
+        // read, `/results`, `agentResult` and the next snapshot all serve.
+        const archived = (core.snapshot().agentResults ?? []).find((record) => record.invocationId === '513');
+
+        expect(archived).toEqual({
+            invocationId: '513',
+            sequence: 7,
+            completedOrder: 1,
+            agent: 'primary',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'I will read the file, then summarise it',
+            cancelledAtMessage: 2,
+            threadId: thread.id
+        });
+
+        // The receipt digest is the digest the WRITER computes from the record it sent. That
+        // equality is load-bearing twice over: `deriveOperations` decides whether to emit the op at
+        // all from `lane.archived` vs `archiveDigestOf(record)`, and a lane that lands an op whose
+        // receipt digest differs re-derives it forever. `completedOrder` is the one excluded field
+        // (the authority re-mints it above); the pair is NOT excluded, so it has to be here.
+        const writerProjection = {
+            invocationId: '513',
+            sequence: 7,
+            completedOrder: 999,
+            agent: 'primary',
+            role: 'subagent',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'I will read the file, then summarise it',
+            cancelledAtMessage: 2
+        };
+
+        expect(outcome.receipts[0].effect?.digest).toBe(archiveDigestOf(writerProjection));
+
+        // And the fold view the NEXT commit is staged against is built from that row, pair included
+        // — the round trip is what makes a replay a no-op instead of a fresh diff every boundary.
+        const view = canonicalViewOf(core, (core.memory as unknown as { data: Record<string, unknown> }).data);
+
+        expect(view.results['513']).toEqual(archived);
+        expect(outcome.receipts[0].effect?.digest).toBe(archiveDigestOf(view.results['513']));
+
+        // Re-committing the same archive is idempotent in the only way that matters: the digest (and
+        // therefore the lane's skip test) is unchanged. `completedOrder` is the one field the
+        // authority re-mints on a replace, which is exactly the field the digest excludes — so the
+        // row's order moves and the writer still sees its own op as landed.
+        const replay = authority.commit(EPOCH_A, group(2, [stopped]));
+
+        expect(replay.complete).toBe(true);
+        expect(replay.receipts[0].effect?.digest).toBe(outcome.receipts[0].effect?.digest);
+        expect(core.snapshot().agentResults ?? []).toEqual([{ ...archived, completedOrder: 2 }]);
+    });
+
+    it('refuses a malformed forensic pair before canonical state moves, and burns no completion order', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+        const thread = core.createThread('primary');
+
+        authority.leases.claim({ kind: 'thread', id: thread.id }, EPOCH_A);
+
+        // The op shape is written once; each case below supplies only the forensic pair it wants to
+        // exercise, so a payload typo cannot quietly turn a refusal test into a no-op test.
+        type ArchiveOp = Extract<SharedMutation, { kind: 'result:archive' }>;
+
+        const archiveFor = (overrides: Partial<ArchiveOp>, invocationId: string, seq: number) =>
+            authority.commit(EPOCH_A, group(seq, [
+                {
+                    kind: 'result:archive',
+                    invocationId,
+                    sequence: 7,
+                    completedOrder: 999,
+                    agent: 'primary',
+                    role: 'subagent',
+                    runKind: 'delegation',
+                    status: 'cancelled',
+                    content: '',
+                    error: 'The run was cancelled.',
+                    threadId: thread.id,
+                    ...overrides
+                } satisfies ArchiveOp
+            ]));
+
+        // A negative message index: `>= 0` is the bound ../core/snapshot.ts reads the row back with,
+        // so a value below it is a payload that could never survive a reload.
+        const negative = archiveFor({ partialContent: 'half an answer', cancelledAtMessage: -1 }, '513', 1);
+
+        expect(negative.complete).toBe(false);
+        expect(negative.receipts[0].status).toBe('rejected');
+        expect(negative.receipts[0].rejection?.code).toBe('invalid-mutation');
+
+        // A present-but-blank partial, the other malformed shape, refused for the same reason:
+        // "present" is the claim that the run said something.
+        const blank = archiveFor({ partialContent: '   ', cancelledAtMessage: 1 }, '514', 2);
+
+        expect(blank.complete).toBe(false);
+        expect(blank.receipts[0].rejection?.code).toBe('invalid-mutation');
+
+        // NOTHING moved on the canonical harness: no rows at all, and a refusal that half-wrote the
+        // pair would leave a row whose forensics disagree with its status.
+        expect(core.snapshot().agentResults ?? []).toEqual([]);
+
+        // And the refusal burned no completion ORDER. `archiveInvocation` validates before it
+        // increments `invocationCompletionSequence`, so the next real archive is order 1: an
+        // authority that minted first would hand `/results` a gap nobody can explain.
+        const landed = archiveFor({ partialContent: 'half an answer', cancelledAtMessage: 1 }, '515', 3);
+
+        expect(landed.complete).toBe(true);
+        expect((core.snapshot().agentResults ?? []).map((record) => [record.invocationId, record.completedOrder])).toEqual([
+            ['515', 1]
+        ]);
+    });
+
+    it('names `invalid-mutation` when the LIVE core refuses an archive, not the kind default conflict (S5)', () => {
+        const core = coreOf();
+        const authority = authorityFor(core);
+
+        // The fold has no roster, so an archive for an unregistered agent is ACCEPTED by the staged
+        // view and refused by the live write. The kind's default live conflict is `stale-record`
+        // (`liveRejectionCodeOf`), which tells the lane its base moved and invites it to re-derive
+        // the same row forever. This throw is permanent, so the replay names it as such — the way
+        // `transcript:patch` already does.
+        const outcome = authority.commit(EPOCH_A, group(1, [
+            {
+                kind: 'result:archive',
+                invocationId: '7',
+                sequence: 7,
+                completedOrder: 1,
+                agent: 'ghost',
+                role: 'primary',
+                runKind: 'root',
+                status: 'completed',
+                content: 'x'
+            }
+        ]));
+
+        expect(outcome.complete).toBe(false);
+        expect(outcome.receipts[0].rejection?.code).toBe('invalid-mutation');
+        expect(outcome.receipts[0].rejection?.message).toBe(
+            'Agent "ghost" is not registered in this harness, so its invocation cannot be archived.'
+        );
         expect(core.snapshot().agentResults ?? []).toEqual([]);
     });
 });
@@ -1242,8 +1523,11 @@ describe('answer: the canonical transcript delta and the routed thread read (T10
         expect(value.length).toBe(1);
 
         // An id that never existed is the harness's own honest error, not an empty answer.
+        // F2 (2026-11-14): the sentence is the CORE's, byte-for-byte — the routed door and the
+        // inline door (src/harness.ts:5403) answer the same fact with the same head, so this
+        // pin is an exact string, not a loose fragment of one variant.
         await expect(authority.answer(EPOCH_A, { op: 'thread:read', threadId: 'thread-999', identity: {} })).rejects.toThrow(
-            /has no record in this session/
+            'Thread "thread-999" is not available in this harness; it was never created, or it was deleted.'
         );
     });
 });

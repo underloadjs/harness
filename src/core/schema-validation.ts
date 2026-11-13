@@ -104,6 +104,19 @@ const jsonEqual = (left: unknown, right: unknown): boolean =>
 
 const childPath = (path: string, key: string): string => `${path}.${key}`;
 
+// Count/noun agreement for the four limit messages below (report #17): a bound of
+// exactly 1 reads "1 character" / "1 item", anything else stays plural ("3
+// characters"). Mirrors the idiom already used in
+// ../tools/runtime/threadRead.ts:702 (`message${total === 1 ? '' : 's'}`); kept
+// file-local because the package has no shared plural helper and exporting one for
+// this would widen the public API.
+//
+// Edge cases: 0 and non-integer bounds (a hand-built schema may declare
+// `minLength: 1.5`) take the plural form, and the count is interpolated exactly as
+// before, so every other byte of every message is unchanged.
+const countNoun = (count: number, noun: string): string =>
+    `${count} ${noun}${count === 1 ? '' : 's'}`;
+
 // Validate one value against one schema node. `path` is the JSON path used in
 // messages ($, $.paths, $.paths[0].path), so a model can locate the mistake.
 export const validateSchemaValue = (
@@ -153,23 +166,23 @@ export const validateSchemaValue = (
         }
     }
 
-    // String limits.
+    // String limits. The noun agrees with the bound (see `countNoun` above).
     if (typeof value === 'string') {
         if (typeof schema.minLength === 'number' && value.length < schema.minLength) {
-            return invalid(`${path} must be at least ${schema.minLength} characters.`);
+            return invalid(`${path} must be at least ${countNoun(schema.minLength, 'character')}.`);
         }
         if (typeof schema.maxLength === 'number' && value.length > schema.maxLength) {
-            return invalid(`${path} must be at most ${schema.maxLength} characters.`);
+            return invalid(`${path} must be at most ${countNoun(schema.maxLength, 'character')}.`);
         }
     }
 
-    // Array item limits and the item schema.
+    // Array item limits and the item schema. The noun agrees with the bound.
     if (Array.isArray(value)) {
         if (typeof schema.minItems === 'number' && value.length < schema.minItems) {
-            return invalid(`${path} must contain at least ${schema.minItems} items.`);
+            return invalid(`${path} must contain at least ${countNoun(schema.minItems, 'item')}.`);
         }
         if (typeof schema.maxItems === 'number' && value.length > schema.maxItems) {
-            return invalid(`${path} must contain at most ${schema.maxItems} items.`);
+            return invalid(`${path} must contain at most ${countNoun(schema.maxItems, 'item')}.`);
         }
 
         if (schema.items !== undefined) {

@@ -55,7 +55,7 @@ const THREAD_PARAMETER = {
     type: 'string',
     minLength: 1,
     description:
-        'Id of the finished thread to release, as reported by threadList - one of YOUR descendants. A running thread, this agent\'s default conversation (agent:<name>), a thread outside your lineage, and a deleted or unknown id all fail. There is no default: your own current thread is never the target.'
+        'Id of the finished thread to release, as reported by threadList - one of YOUR descendants. A running thread, a finished target with a running descendant, this agent\'s default conversation (agent:<name>), a thread outside your lineage, a fork\'s branch-N id, and a deleted or unknown id all fail. There is no default: your own current thread is never the target.'
 };
 
 // The two errors the entry can raise itself. The runtime owns every other refusal
@@ -63,8 +63,10 @@ const THREAD_PARAMETER = {
 const NEEDS_HARNESS = 'threadDelete requires the live harness reference.';
 const NEEDS_THREAD = 'threadDelete needs a thread: pass "thread" (see threadList).';
 
-// A runtime stub that records exactly what the entry forwarded and hands back the
-// contracted receipt shape (`{ deleted, removedThreadIds }`, cascade included).
+// A runtime stub that records exactly what the entry forwarded and hands back a receipt
+// (`{ deleted, removedThreadIds }`, cascade included). The four-field shape a current runtime
+// returns — `removedInvocationIds` and `removedBranchIds` too — is pinned whole by its own case
+// below, so this stub stays the minimal one the argument-wiring assertions need.
 const stubRuntime = (deleted: string, removedThreadIds: readonly string[]) => {
     const threadDelete = vi.fn(
         async (_callerThreadId: string | undefined, _threadId: string): Promise<unknown> => ({
@@ -145,25 +147,41 @@ describe('threadDelete metadata literal', () => {
         expect(description).toContain(
             'a deleted id becomes unknown to threadList, threadRead, threadSend and this tool'
         );
-        // Scope and refusals — ALL FIVE, in the order the runtime reaches them
+        // Scope and refusals — ALL SIX, in the order the runtime reaches them
         // (`threadDeleteFor` lineage gate, then `deleteThread`: default conversation,
         // live target, live descendant, unknown id). The running-descendant refusal is the
         // one a description used to omit, and it is the one that saves a caller from
         // believing a delete was half-applied: `deleteThread`'s descendant pass in
         // `src/harness.ts` throws with the CHILD's id and removes nothing.
+        //
+        // THE SIXTH (T4 / stress report #5, 2026-11-14): a fork `branch-N` id. It resolves
+        // on the READ seams, so the delete door resolves the branch ledger first
+        // (`branchRecordOf`, ahead of `threadStateOf`) and refuses with its own sentence
+        // (`branchDeleteRefusal`) instead of the false "never created, or it was deleted".
         expect(description).toContain('one of YOUR DESCENDANTS that is no longer running');
-        expect(description).toContain('Five things are refused');
+        expect(description).toContain('Six things are refused');
         expect(description).toContain('a thread that is RUNNING (stop it first)');
         expect(description).toContain('a finished target that still has a RUNNING descendant');
         expect(description).toContain('nothing is half-deleted');
         expect(description).toContain("this agent's default conversation (agent:<name>)");
         expect(description).toContain('a thread outside your lineage');
-        // The cascade, and both receipt fields.
+        expect(description).toContain('a fork\'s `branch-N` id');
+        expect(description).toContain('it holds no thread slot, so there is nothing to release');
+        expect(description).toContain('it goes when the conversation that forked it is deleted');
+        // The cascade, and all FOUR receipt fields. `removedInvocationIds` and
+        // `removedBranchIds` are required on `HarnessThreadDeleteResult` (src/types/index.ts
+        // ~1213-1215): the purge computes them, and an empty array has to be distinguishable
+        // from a build that says nothing (stress report #6).
         expect(description).toContain('Deleting cascades');
         expect(description).toContain(
-            'The receipt reports `deleted` (the id you named) and `removedThreadIds`'
+            'The receipt reports `deleted` (the id you named), `removedThreadIds`'
         );
         expect(description).toContain('the cascaded ones included');
+        expect(description).toContain('`removedInvocationIds`');
+        expect(description).toContain('`removedBranchIds`');
+        // Deleting a conversation releases its RESULT records, which is the symptom that
+        // used to be silent: `agentResult` stops resolving those ids afterwards.
+        expect(description).toContain('`agentResult` can no longer read that `invocationId`');
     });
 });
 
@@ -286,6 +304,37 @@ describe('threadDelete execute', () => {
 
         expect(() => threadDeleteEntry.execute(wrong.context(42 as never, 'thread-3'))).toThrow(NEEDS_THREAD);
         expect(wrong.threadDelete.mock.calls).toEqual([]);
+    });
+
+    // STRESS REPORT #6 (2026-11-14) — THE TWO PURGE SETS TRAVEL THE SAME WAY.
+    //
+    // `removedInvocationIds` and `removedBranchIds` are part of the runtime's receipt, and this
+    // entry must hand the object over WITHOUT reshaping it: the point of the fields is that a
+    // reaping caller can see which `agentResult` lookups left with the conversation, and an
+    // entry that rebuilt the object field by field would drop them exactly where a model reads
+    // the answer. Pinned with the whole four-field object, cascade and purge both non-empty.
+    it('returns a receipt that names the purged invocations and branches, field for field', async () => {
+        const threadDelete = vi.fn(
+            async (): Promise<unknown> => ({
+                deleted: 'thread-7',
+                removedThreadIds: ['thread-7', 'thread-9'],
+                removedInvocationIds: ['12', 'branch-3'],
+                removedBranchIds: ['branch-3']
+            })
+        );
+        const context = {
+            harness: { runtime: { threadDelete } },
+            threadId: 'thread-3',
+            parameters: { thread: 'thread-7' }
+        } as unknown as ToolContext;
+
+        await expect(threadDeleteEntry.execute(context)).resolves.toEqual({
+            deleted: 'thread-7',
+            removedThreadIds: ['thread-7', 'thread-9'],
+            removedInvocationIds: ['12', 'branch-3'],
+            removedBranchIds: ['branch-3']
+        });
+        expect(threadDelete.mock.calls).toEqual([['thread-3', 'thread-7']]);
     });
 
     it('refuses a call with no live harness', () => {

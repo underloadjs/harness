@@ -2,7 +2,39 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-13 for the session-tool-switch (`withheldTools`) documentation
+> **Last verified:** 2026-11-14 for the delegated-threads documentation pass — the
+> `threadDelete` receipt growing `removedInvocationIds`/`removedBranchIds`, the branch-id
+> refusal and the left-the-family sentence a default conversation now answers, the
+> `threadSend` TRANSIENT REPLY ROUTE (a conversation started on an agent's default
+> conversation can answer the thread that woke it, and the route reverts with the run) and
+> the `note` rule narrowed to an address the caller can actually use, the fifth member of
+> the thread family and the address a caller loses when its last thread of an agent is
+> deleted, the `threadRead` truncation vocabulary (page BUDGET vs per-message `contentLimit`)
+> and the `total`/`matched` split, the `threadList` field vocabulary (`origin`'s two values,
+> `sequence` as the creation-order sort key, fork branches absent by design), the
+> `agentManage` counting fields, the carried-and-verified delegation identity
+> (`HarnessRunIdentity` — addressed by the id the child run wrote, never invented; two
+> no-carrier fallbacks survive and the last of them is still discovery, as the C5
+> correction inside the Delegation section states), the terminal
+> envelope a released or abandoned `delegate` call now carries in its OWN tool message
+> (`callCancelled`), the `maxTurns`-counts-model-REQUESTS correction, and the content-conditional
+> preview clause of a cancelled/failed `threadFork` branch; every statement was cross-checked
+> at source level against `src/harness.ts` (`threadFamilyOf` step 5, `postThreadMessage`,
+> `liveSiblingNoteFor`, `deleteThread`/`threadDeleteFor`/`purgeThread`/`branchDeleteRefusal`/
+> `defaultFamilyClauseOf`, `releasedDelegateResultOf`, `delegateFor`, `deliverTask`,
+> `runAgentCore`, `commitRunTerminal`, `commitTerminalIdentity`, `threadRoster`),
+> `src/types/index.ts` (`HarnessThreadDeleteResult`, `HarnessDelegationResult`,
+> `HarnessRunIdentity`, `HarnessThreadOrigin`), `src/tools/runtime/threadRead.ts`
+> (`ThreadReadResult`, `truncated`), `src/tools/runtime/{threadList,threadDelete}.tool.ts`,
+> `src/core/{agent-limits,branch}.ts`, `src/plugin/hooks.ts`, `src/server/sessions.ts`,
+> `src/server/workers/{capability,lane-authority,lane-commit,lane-worker-loop}.ts`, and the
+> pins in `src/harness.thread-runtime.test.ts`, `src/harness.delegation.test.ts`,
+> `src/harness.fork.test.ts`, `src/tools/runtime/threadDelete.test.ts`,
+> `src/server/threads.test.ts` and `src/server/workers/lane-authority.test.ts` — no line
+> anchor is restated into a file this pass rewrote (those are cited by symbol), the test
+> suite was NOT re-run beyond `src/structure.test.ts` and `src/core/metadata.ownership.test.ts`
+> as a docs guard (the integrated run owns the rest), and no code was touched — and
+> 2026-11-13 for the session-tool-switch (`withheldTools`) documentation
 > pass — EVERY registered name being switchable per conversation (the former core names and the
 > pending-only `toolCancel` included), the mechanism being a per-harness WITHHELD SET rather
 > than cap-set membership (`occupiesSearchableSlot`/`Harness.isToolSwitchable` reduced to cap
@@ -1733,7 +1765,7 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 
 | Tool | Input | Result |
 |---|---|---|
-| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` |
+| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` — top-level `truncated` is the LISTING flag (some agent has more retained invocations than this view shows), NOT a text cut; see the listing bullet below |
 | `agentResult` | `{ agent, invocationId?, offset?, limit? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` — for a failed/cancelled run `content` is the paged partial answer and `error` (plus `cancelledAtMessage` when the run appended anything) comes with it; `status: 'empty'` with empty `content` only when NOTHING has finished for that agent to select (no completed AND no failed/cancelled record — an agent whose only finished runs failed selects the newest of those, per the selector bullet below) |
 
 - **Identity.** `invocationId` is the run id for a root run and the thread id for
@@ -1745,6 +1777,37 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   the archived high-water marks, so a future run cannot reuse/overwrite an archived
   invocation id. Old snapshots without the field restore an empty registry, and
   `reset()` clears it with the conversation.
+- **An unfinished run keeps its partial on disk (2026-11-14, issue 0033).** The live
+  envelope of a cancelled or failed run reports the assistant TEXT it had in hand when it was
+  cut off (`partialContent`) and how many messages were committed when it stopped
+  (`cancelledAtMessage`). Both are part of the PERSISTED record — OPTIONAL keys beside
+  `error`, written by the snapshot projection and carried back by `restore()`, and the pair
+  crosses the worker/lane archive seam the same way, so a lane-archived cancellation keeps it
+  too (see [Lane workers](#lane-workers-threadexecution-worker)). Before this
+  they were runtime-only: `content` is empty for a non-completed run, so a save/restart/
+  reload answered the very same `invocationId` with `content: ""` and no `partialContent`
+  key at all, and the caller lost an answer it had already been shown. The server persists
+  `core` verbatim (`src/server/persistence.ts`), so this array IS what lands in
+  `state.json`, and `src/core/snapshot.ts` had to start accepting the pair for that file to
+  come back at all — the record shape and the reader are one fix, not two. The pair is mutually exclusive with `content` by construction —
+  `finishInvocation` and `archiveInvocation` write `content` for a COMPLETED run and
+  `partialContent` for every other terminal state, never both — so the archive still holds
+  AT MOST one answer string per record and `AGENT_RESULT_RETENTION` (64) is unchanged; no
+  new bound was added, and `content` has always been stored whole and paged on READ. WHICH
+  text a row's partial holds was WIDENED the same day by 0020's AC1, and the wording here
+  follows the capture: `runAgentCore`'s cancellation catch reads the answer the run was still
+  STREAMING when the cut landed — the per-request buffer `RunState.streamedText` (declared
+  `src/harness.ts:5355`, reset per request at `:11446`, accumulated at `:11482`, dropped at
+  `:11501`) — and falls back to the last COMMITTED assistant text (`lastSubstantiveText`) only
+  when that buffer is empty (`:12007-12010`); `finishInvocation` then stores whichever of the
+  two it was handed (`:3896-3899`). The in-flight buffer WINS because it is the fresher
+  evidence and the caller of a cancelled child had already been shown it; an empty buffer
+  means the run really had nothing in hand, and the answer stays ABSENT rather than becoming a
+  synthetic `""` (which is what keeps the reader's `min: 1` bound meaningful, below). What has
+  NOT moved is the leak boundary, and it stays emphatic: a row's partial is TEXT and nothing
+  else — never a tool call, never a tool result. Those are rolled back out of the transcript
+  with the run and appear in no door's answer (issue 0020's leak boundary, the criterion
+  issue 0032 is written against).
 - **Completed answers only.** The registry records the value `runAgentCore`
   returns, never a streamed delta, so an explicitly addressed running invocation
   has `status: 'running'` and no content and is OMITTED from a snapshot (never
@@ -1758,14 +1821,59 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   record, which made a finished-earlier child look like it had said nothing).
   Live invocations are still reported by `agentManage`, and an explicit
   `invocationId` still reaches a running record.
+- **A registered invocation always settles (2026-11-14, stress report #9).**
+  `registerInvocation` files the record as `running`, and the ONLY code that makes it
+  terminal is `commitRunTerminal` — on the success path and on the failure path of the
+  same `try` in `runAgent`. That `try` now also covers the `run.started` emit, so
+  nothing between registration and the terminal commit can strand the record:
+  a `running` entry is never evicted (retention takes terminal records only), never
+  snapshotted, and would be reported live forever, with the conversation left `running`
+  beside it. This is an UNCONDITIONAL INVARIANT, not a bug fix — the hook bus is
+  fail-open end to end (`src/plugin/hooks.ts` rule 2: a handler that throws, rejects,
+  outlives its `timeoutMs`, or returns an unparseable decision is dropped and reported,
+  and even the host's diagnostic reporter is wrapped), so no PLUGIN could orphan a
+  record in the first place; what the guard covers is a defect inside the dispatch
+  itself (a payload factory that throws, a handler list that changes mid-round) and
+  anything the fail-open contract is ever widened to stop swallowing. The emit order is
+  unchanged: `run.started` still fires after `registerInvocation` and before
+  `runAgentCore`, still behind `hookBus.has()` so a hookless harness keeps its exact
+  microtask order, and the terminal commit and the `finally` release block stay where
+  B2 put them (pinned by `src/harness.thread-runtime.test.ts`).
 - **Durability is strict.** `snapshot.agentResults` is validated before any restore
   mutation: unique `invocationId`/`sequence`/`completedOrder`, an agent present in
   `snapshot.agents`, terminal status only, `error` required exactly for
   failed/cancelled, and at most 64 records. A corrupt array rejects the whole
-  restore and leaves the live registry untouched.
-- **Previews are bounded.** `agentManage` lists up to 5 recent invocations per
-  agent and at most 200 characters of each answer (whitespace-trimmed); the full
-  answer stays in the registry.
+  restore and leaves the live registry untouched. The forensic pair of issue 0033 rides
+   the SAME rule `error` already sets, which is what keeps the old files loading:
+   `partialContent` must be at least 1 character when present (an empty one is a hand
+   edit, and accepting it would restore a `partialContent: ""` shape the runtime never
+   answers with), `cancelledAtMessage` is a safe integer >= 0 (a run stopped before it
+   appended anything legitimately reports 0), and both must be ABSENT on a `completed`
+   record so that `restore -> snapshot` re-projects byte-for-byte instead of drifting the
+   archive a second time. They are NOT required to appear together — a run cancelled
+   inside its first tool round commits messages without committing substantive text, which
+   is 0020's still-open case. And a row that carries NEITHER key, i.e. every snapshot
+   written before 2026-11-14, is still valid and restores with its exact prior meaning.
+- **The listing is a WINDOW, not a cursor (spelled out 2026-11-14).** `agentManage`
+  takes no input, so there is no page to continue and no token to carry back: it lists the
+  **5 most recent invocations per agent** (`AGENT_MANAGE_LIST_PER_AGENT`,
+  `core/agent-limits.ts`, newest first by `sequence`) and at most **200 characters** of
+  each answer (`AGENT_MANAGE_PREVIEW_CHARS`, whitespace-trimmed, an ellipsis marking the
+  cut with the per-row `truncated` flag as the machine-readable version). The fields
+  around that window say how much is off-screen: `invocationCount` is how many records
+  that agent has RETAINED (bounded by `AGENT_RESULT_RETENTION` = 64 across the session),
+  `totalResults` counts every retained record in the session (running included), and
+  `activeResults` counts the `running` ones — all three are COUNTING fields, never
+  continuations, and nothing about the listing changes what is stored. Top-level
+  `truncated` is `records.length > listed`: at least one agent has more retained
+  invocations than this view shows. The ids that do NOT appear here are not lost — the
+  caller already holds them, because every door that STARTS a run reports its own
+  identity in its envelope (`delegate`'s `invocationId`, `threadFork`'s `branchId`, which
+  doubles as the invocation id, and the terminal envelope a cancelled call carries), and
+  `agentResult` pages any of them by id while it is retained. An id evicted from the
+  bounded registry is gone from every door at once (issue 0029's retention trigger),
+  which is why the envelopes, not a listing cursor, are the address channel
+  (`agentManageView`, `invocationPreviewOf`, `recordsForAgent`).
 - **No private data.** Neither tool reads system instructions, transcript
   messages, tool arguments, or tool bodies. Only answer text crosses the
   boundary — a finished answer in `content`, an unfinished one in
@@ -2497,14 +2605,25 @@ const team = harness({
   delegation.
 - **A delegation is a pending tool.** The parent's `delegate` call stays in
   flight until the child fully completes, so it can appear in the parent's
-  `done.pending` list and the resume arrives as a `wakeup`. Calling the same child
-  again queues a follow-up on that child's EXISTING transcript (it does not restart
-  and does not lose history).
+  `done.pending` list and the resume arrives as a `wakeup`. WHICH conversation the
+  child answers from depends on the caller's own address (`runAgent`'s
+  `resolvedThread`): from a HOST-thread parent (a server session conversation, or
+  any `createThread` record) every delegation MINTS A NEW child conversation —
+  siblings never share a transcript, and the follow-up door is `threadSend` into the
+  `threadId` the envelope returned, not a second `delegate` (issue 0028: fresh-thread
+  per delegation is the documented design, so a re-`delegate` remembers nothing);
+  from the primary's own DEFAULT conversation the child runs in the target's standing
+  `agent:<name>` conversation, and a second delegation to that agent continues that
+  transcript.
 - **No time limit by default (policy 2026-11-09).** The child runs to its own final
   answer; `timeoutMs` is an optional bound the caller sets when it wants one, and an
   omitted or non-finite value arms no timer at all. While the call is in flight the
   parent's next request carries a `{ status: "pending", callId, … }` placeholder that
-  NAMES `toolCancel` as the way to abandon the child, and `toolRequest` reports
+  NAMES `toolCancel` as the way to abandon the child — and abandoning does not discard
+  the outcome: the child's terminal envelope is still delivered, as that call's own tool
+  message, with `callCancelled: true` marking the release while the `toolCancel` result
+  stays an acknowledgement (see the D2 bullet below; the `delegate` description now says
+  the same to the model) — and `toolRequest` reports
   `toolCancel` under `alreadyAvailable` in exactly that window (it is a
   `pendingOnly` core control, declared only while work is in flight, so the report —
   not the catalogue — is where it is discoverable). A conversation that SWITCHES
@@ -2512,16 +2631,26 @@ const team = harness({
   to a pending-only control like any other name — which is the hazard worth naming: the model
   is left with no way to withdraw an in-flight call while the server-side machinery it cannot
   reach keeps running.
-- **`maxTurns` is a second OPTIONAL, caller-set bound (I5, 2026-11-13).** A count of
-  model turns (tool rounds) beside `timeoutMs`'s wall clock: an integer 1–64 (the
+- **`maxTurns` is a second OPTIONAL, caller-set bound (I5, 2026-11-13; unit corrected
+  2026-11-14, stress report #7).** It counts the child's MODEL REQUESTS — the
+  `run.iteration` the loop increments once per `requestTurn` — beside `timeoutMs`'s
+  wall clock: an integer 1–64 (the
   ceiling equals `DELEGATE_MAX_TURNS_MAX` in `core/agent-limits.ts`, restated as a
   literal in the entry and pinned equal by `core/metadata.ownership.test.ts`),
   enforced as `min(harness-wide maxIterations, maxTurns)` in `runAgentCore` — an
   omitted value is `Infinity`, so the argument can only LOWER what one child may do,
-  never raise the session limit. A child that runs out of turns has not answered, and
+  never raise the session limit. Because the ANSWER must itself be one of the requests,
+  `maxTurns: N` leaves room for at most **N−1 tool rounds**: `maxTurns: 1` is a child
+  that answers with no tool call at all, and a child that spends its last permitted
+  request on tools hits the bound rather than answering. (The earlier wording, "a count
+  of model turns (tool rounds)", read as if N rounds were available and is what report
+  #7 corrected.) A child that runs out of turns has not answered, and
   its result is the unfinished-run envelope (status plus `partialContent`), never a
-  final answer it never gave. No scheduling priority was added: per-actor FIFO is
-  unchanged.
+  final answer it never gave; the refusal names the bound that fired and says the cap
+  was the caller's own (``Agent "…" requested tools on all N model turns without
+  answering, the maxTurns this run was given`` — and `on its single model turn` when
+  N is 1). No scheduling priority was added:
+  per-actor FIFO is unchanged.
 - **The envelope's `threadId` is the follow-up HANDLE (C1, 2026-11-13).** A
   delegation from a host-thread parent mints its own conversation (the documented
   sibling-isolation design, issue 0027) and the envelope names it: `threadSend` posts
@@ -2529,12 +2658,62 @@ const team = harness({
   releases it once its answer has been read — the release is also how a session frees
   a slot under the 256-thread cap. The `agent:<name>` spelling targets the subagent's
   DEFAULT conversation, which is NOT the live delegation thread (`threadSend` adds a
-  receipt `note` naming the live thread when that distinction matters). The identity
-  fields now report truth, not ceremony: when the ledger entry is unresolvable
-  (purged with its thread mid-run, or evicted from the bounded archive), the envelope
-  OMITS `invocationId`/`status` instead of fabricating `''`/`completed` — absent means
-  "this run produced no ledger entry to point at", and the content/paging fields stay
-  exact either way (`delegateFor`).
+  receipt `note` naming the live thread when that distinction matters — and only when
+  that thread is addressable from the caller's family, 2026-11-14).
+- **Identity is CARRIED AND VERIFIED, never discovered (D1, 2026-11-14 — closes the
+  fabrication half of issue 0029).** `delegate` hands the child an OUT-carrier,
+  `HarnessRunIdentity` (`src/types/index.ts`), through `context.run(..., { identity })`;
+  the RUN ITSELF writes `invocationId`/`threadId` into it immediately after
+  `registerInvocation` and `status` at its two terminal commits (`runAgent`'s identity
+  block, `commitTerminalIdentity` beside `commitRunTerminal`). The parent then ADDRESSES
+  the ledger entry with that id (`invocationRecords.get(carried.invocationId)`) and the
+  two checks left in `delegateFor` only CONFIRM the entry is still the one that run wrote
+  (same id, expected agent). On that path nothing searches by parent call id, and nothing
+  matches by recency: a tool-call id is unique only within one run, and a concurrent host
+  thread of the same agent writes into the same shared ledger, so both retired heuristics
+  could hand a caller ANOTHER run's identity and status. CORRECTED IN PLACE (2026-11-14,
+  independent review — C5): the two sentences above read as if the carrier path were the
+  whole rule. `newInvocationOf` (`src/harness.ts:4595-4623`) is a THREE-step chain and only
+  TWO steps are exact — (1) the carrier address plus its verification (`:4596-4607`),
+  (2) the `(parentCallId, parentScope)` pair, compared with `===` on both fields
+  (`:4611-4621`), and (3) a set-difference that is still DISCOVERY: "the first record for
+  that agent that was not already known at dispatch" (`:4623`, against the snapshot taken at
+  `:4576-4578`). Steps 2 and 3 run only when the child wrote no carrier, and step 3 can
+  therefore still adopt a concurrent run of the same agent and report it as this call's
+  child — the residual the in-code comment already admits ("both are fallible; a carrier
+  always wins", `:4590-4594`). NO TEST exercises step 3: every child a harness run starts
+  writes the carrier, and the two fixtures that call `runtime.delegate` directly forward
+  `context.run!` unchanged (`src/harness.delegation.test.ts:1640`, `:2091`). The
+  pair-addressed fallback
+  (`parentScope` + `parentCallId`, `delegatedRecordOf`) survives only for a run that never
+  reached `registerInvocation` and so wrote no carrier — a child refused before it owned
+  its actor, or a host calling `runtime.delegate` with its own `run` closure. A record
+  that cannot be confirmed is OMITTED: `invocationId`/`threadId`/`status` stay absent
+  rather than `''`/`'completed'` being invented, and the content and paging fields stay
+  exact either way.
+- **A released or abandoned `delegate` call answers with the CHILD'S TERMINAL ENVELOPE,
+  not an acknowledgement (D2, 2026-11-14 — partially closes issue 0021).** A live
+  delegation publishes a `DelegateCallTrace` (its scope + call id as key, the identity
+  carrier, the target agent, the page size and the start time) into `delegateCallTraces`
+  for exactly as long as the call runs. When `toolCancel` releases the call, the
+  scheduler's `onSettled` reads that trace SYNCHRONOUSLY in the cancel's own stack (the
+  tool body clears it a moment later) and hands it to `deliverTask`, which awaits the
+  child's own already-in-flight settle promise — no second timer — and inserts the
+  terminal envelope as the call's tool message: `status`, `error`, `partialContent`,
+  `cancelledAtMessage`, the identity fields, the paged answer, and `callCancelled: true`
+  (`releasedDelegateResultOf`). `error` is the harness's own sentence
+  (`Delegation to "…" was cancelled by the caller before the call returned.`), never the
+  raw `"This operation was aborted"` the record still holds for `agentResult`.
+  `callCancelled` separates "the caller let go of the call" from "the child did not
+  finish" — a child that answered a moment after the release reports
+  `status: 'completed'` beside the marker, because a release races the child and its
+  final answer wins the `content` page. Two things did NOT change: the `toolCancel` ACK
+  is still the control receipt `{ cancelled: true, callId, name }` (and
+  `{ cancelled: true, …, alreadySettled: true }` for an id that already settled in this
+  conversation) — it is a control result, not the result channel — and when the child
+  left no record to report (refused before it started, or purged mid-run) the delivery
+  falls back to the historical "no result is available" sentence byte for byte, which is
+  what keeps "no invented identity" true on this door too.
 - **`scope.tools` cannot block the discovery door.** The allowlist hides and refuses
   every capability it omits, `toolRequest` excepted: a restricted child must always
   be able to ask for what it is missing. Before this, a child scoped to
@@ -2595,9 +2774,9 @@ writer, reaper — an id is always discoverable before a tool that addresses it.
 With `threadDelete` added, the generated `core/tool-manifest.ts` carries **32**
 descriptors (22 runtime entries).
 
-- **THREAD FAMILY is the address space (B3/B4).** A model-facing thread tool is
-  scoped to the caller's thread family: the thread itself, its ancestors and
-  descendants (the `ownerThreadId` lineage, however deep), the DEFAULT
+- **THREAD FAMILY is the address space (B3/B4, fifth member added 2026-11-14).** A
+  model-facing thread tool is scoped to the caller's thread family: the thread itself, its
+  ancestors and descendants (the `ownerThreadId` lineage, however deep), the DEFAULT
   `agent:<name>` conversations of the agents the family spans, and a default whose
   first-wins owner link falls in the family. A SIBLING is deliberately not in the
   set — it shares an ancestor but was not created by this caller. Threadless
@@ -2605,11 +2784,34 @@ descriptors (22 runtime entries).
   manual `executeTool`) stay UNSCOPED and see everything: the host is the one party
   that may address any conversation, and the server's thread surfaces depend on
   that (`threadFamilyOf`/`familyOfCaller`, `src/harness.ts`).
+  - **THE FIFTH MEMBER IS TRANSIENT: THE RUN'S REPLY TARGET.** A `threadSend` that STARTS
+    a dormant DEFAULT conversation fires the child run with no parent (a parent would put
+    the sender's brain in the lineage and turn two threads of one agent into a delegation
+    cycle), so nothing ever writes `ownerThreadId` for it and steps 1-4 compute a SINGLETON
+    family — the started turn could see nothing but itself and its reply to the party that
+    woke it was refused "outside your lineage" (issue 0030). The sender's id therefore
+    travels on the RUN (`RunState.replyThreadId`, set from `RunInternals.replyThreadId` by
+    `postThreadMessage`'s dormant-start branch) and `threadFamilyOf` step 5 folds it in as
+    ONE extra member, read off `state.run`. It is transient by construction: the route is
+    gone when the run releases its thread state, and the PERSISTENT first-wins
+    `ownerThreadId` write was deliberately NOT reused — welding one caller's family onto
+    another agent's standing transcript outlives the conversation that earned it
+    (`RunState.replyThreadId`, `threadFamilyOf`, `postThreadMessage`, `src/harness.ts`).
+  - **THE FAMILY SHRINKS WHEN YOU REAP.** Membership in step 4 is computed from the agents
+    the family SPANS, so deleting your last conversation running agent `X` drops
+    `agent:<X>` out of your addressable set with no visible cause — the default itself is
+    still alive, it is simply no longer yours. One `delegate` to `X` re-admits the address
+    (the conversation it mints spans `X` again). Both read doors state the cause and the
+    remedy instead of leaving the caller to guess: `threadNotVisibleError` and the
+    `threadSend` gate append `defaultFamilyClauseOf`'s sentence for a DEFAULT target only,
+    and every other out-of-family address keeps its refusal byte for byte (stress report #5,
+    pinned by `src/harness.thread-runtime.test.ts`).
   - **PERSISTENCE CAVEAT for that last clause.** The first-wins owner link a DEFAULT
-    conversation adopts (`src/harness.ts:11181-11185`, written at a run start with no
+    conversation adopts (`src/harness.ts` `runAgent`'s run-start block, written with no
     state-change notification) is NOT persisted: `snapshot()` ships HOST threads only
-    (`src/harness.ts:11424-11444`), because a default IS the registry agent's
-    transcript with a name-derived id. So after a snapshot→restore the link is gone and
+    (`.filter((state) => state.record.origin === 'host')` in the same file), because a
+    default IS the registry agent's transcript with a name-derived id. So after a
+    snapshot→restore the link is gone and
     a default's family visibility is RE-DERIVED from the agents the family spans —
     which can NARROW what a restored conversation may read or write into: a default
     that was reachable only through the owner link (an agent the family does not itself
@@ -2619,6 +2821,26 @@ descriptors (22 runtime entries).
   session, as before. Deleted threads are absent by construction — and permanently
   so: threadList/Read/Send/Delete all treat a released id as unknown ("it was never
   created, or it was deleted").
+  - **The fields, exactly.** `origin` has TWO values (`HarnessThreadOrigin`,
+    `src/types/index.ts`): `'agent'` is an agent's DEFAULT standing conversation (the
+    `agent:<name>` address), `'host'` is a conversation on top of an agent — a
+    `createThread` record or the child conversation a delegation mints (a finished
+    fork's `branch-N` reads as `'host'` for the same reason: `threadRecordOfBranch`
+    synthesizes the record, and it is not an agent's default). `sequence` is the
+    monotonic per-harness creation counter, which is the sort key — deliberately not a
+    wall clock, so the order is stable across a restore and under tests
+    (`HarnessThreadRecord`, `src/types/index.ts`; `threadRoster` sorts by it).
+    `status`/`ownerThreadId`/`invocationId`/`label` carry their record values.
+  - **Fork branches are absent from the roster on purpose.** A `threadFork` branch is an
+    INVOCATION with an ephemeral transcript, not a thread slot, so it never enters
+    `threadStates` and never appears here; its `branch-N` id is still readable through
+    `threadRead`/`agentResult` via the branch ledger (see
+    [threadFork](#threadfork)), and `threadDelete` refuses it as an address, not as a
+    release.
+  - **The roster is a LIVE, caller-relative snapshot**, computed per call
+    (`threadRoster(currentThreadId)` reads the current `threadStates` map and the caller's
+    family at that instant). Nothing is cached, nothing is a projection of an earlier turn,
+    and two callers in one session get different lists.
 - **`threadRead` reads the FIRST PAGE, not "the whole thread from the start"
   (I1–I4).** The old docstring promised a full read the tool never performed; the
   description now states the applied defaults: `limit` 20 messages, per-message
@@ -2627,11 +2849,24 @@ descriptors (22 runtime entries).
   case cannot blow past the harness's serialized tool-result cap
   (`core/result-budget.ts`) and come back as an opaque truncation envelope instead
   of the pagination metadata (`THREAD_READ_*`, `src/tools/runtime/threadRead.ts`).
-  Nothing is cut silently:
-  `truncated`/`hasMore`/`nextOffset`/`nextContentOffset` are the continuation
-  contract — pass `nextOffset` back as `offset` while `hasMore`, and
-  `nextContentOffset` back as `contentOffset` to finish one long message. New
-  parameters:
+  Nothing is cut silently, and the TWO truncation vocabularies are distinct
+  (`ThreadReadResult`/`ThreadReadMessage`, `src/tools/runtime/threadRead.ts`):
+  - top-level `truncated` means the 32 KiB PAGE BUDGET did the cutting — it trimmed text
+    below what `contentLimit` allowed, or it dropped whole messages off the end of the page
+    (an exhausted budget breaks the loop); a `contentLimit` cut ALONE does not set it,
+    because that is the caller's own bound, not the reader running out of room;
+  - a per-message `contentLimit` (or `contentOffset`) cut is reported on THAT message as
+    `contentHasMore` plus `nextContentOffset`, never as top-level `truncated`;
+  - `hasMore`/`nextOffset` address the MATCHED MESSAGE LIST — pass `nextOffset` back as
+    `offset` while `hasMore` — while `nextContentOffset` goes back as `contentOffset` to
+    finish one long message; the two cursors are independent, and a `message`-mode read
+    never has a next list page;
+  - `total` counts the UNFILTERED transcript — the system seed included even when
+    `includeSystem` is false — while `matched` counts what survives `includeSystem` + `role`
+    + `regex`, and is the length `offset`/`limit`/`nextOffset` page through. Each message's
+    `index` still addresses the FULL transcript (`total`'s numbering), so an index reported
+    by a filtered page stays re-readable with `message`.
+  New parameters:
   - `includeSystem` (default **FALSE**) keeps the leading system seed out of the
     pages AND out of regex matching — one decision, not two — so it no longer
     occupies every page's budget; `true` restores the old behavior, and `message`
@@ -2675,12 +2910,24 @@ descriptors (22 runtime entries).
   own default while it runs is simply `"queued"`. A different agent's idle
   default conversation still starts a run of its own — the historical cross-agent
   chat survives, and it is what the family's default-conversation rule exists for.
+  When that start happens, the sender's id rides on the RUN as its REPLY TARGET (see the
+  family rule's fifth member above), so the started turn — and only that turn — can
+  `threadList`, `threadRead` and `threadSend` the conversation that woke it; the route
+  reverts when the run ends (issue 0030).
   A `note` naming the live thread id is added CONDITIONALLY — exactly when the target is
   an `agent:` DEFAULT and at least one OTHER thread of that addressed agent is
   `running` (`liveSiblingNoteFor`, `src/harness.ts`; it prefers a thread the sender
   owns, and otherwise names the newest): the default conversation is NOT the live
   delegation, the message went where it was addressed, and the note names the thread
-  whose turn is in flight. A stopped thread remains host-revive-only.
+  whose turn is in flight. The candidate list is FILTERED THROUGH THE CALLER'S FAMILY
+  (2026-11-14, issue 0031): the note names a live thread ONLY when that thread is
+  addressable from your family, because every other thread tool refuses anything outside
+  it — before this, the newest-running-SIBLING fallback usually advised an id the caller
+  could not send to (a sibling is excluded from the family by design), so the receipt
+  promised a door it then refused. A receipt with NO note now means "no live thread of
+  that agent is reachable from here", which is a truthful answer rather than a missing
+  hint; a threadless (host) caller is unscoped and keeps every candidate.
+  A stopped thread remains host-revive-only.
 - **`threadDelete` releases a FINISHED thread you own (B5 — closes issue 0027).**
   The model-facing counterpart of the host `deleteThread`: explicit and PERMANENT
   (the issue's rejection of auto-delete holds — a settled child stays readable
@@ -2689,17 +2936,91 @@ descriptors (22 runtime entries).
   thread, an ancestor, a sibling, and another agent's conversation are refused by
   name; a RUNNING thread is refused ("stop it first"); the default `agent:<name>`
   conversations are refused; a threadless caller gets the unscoped host operation
-  verbatim. Deletion CASCADES (the finished descendants go with the target — a
+  verbatim. A FORK's `branch-N` id gets its OWN truthful refusal, not the generic
+  not-found (2026-11-14, stress report #4): the delete seam resolves the branch ledger
+  BEFORE the thread table (`branchRecordOf` ahead of `threadStateOf` in `deleteThread`
+  and in `threadDeleteFor`) and `branchDeleteRefusal` states the rule — a branch is a
+  record, not a conversation, it holds no thread slot, it leaves when the conversation
+  that forked it is deleted, and the branch ledger keeps only its newest
+  `maxBranchRecords` (64 by default, `core/branch.ts`). The refusal is still a refusal:
+  no branch became deletable, and a caller that does not own the FORKING conversation
+  still gets the lineage refusal rather than a probe of which subtree an id belongs to.
+  Deletion CASCADES (the finished descendants go with the target — a
   running descendant refuses the whole delete, so no partial removal), and the
-  receipt `{ deleted, removedThreadIds }` (`HarnessThreadDeleteResult`) is the
-  state the caller caused. The purge (`purgeThread`) drops the record plus its
-  invocation and branch lookups, so deleted ids are unknown to every thread door,
+  receipt is FOUR fields — `{ deleted, removedThreadIds, removedInvocationIds,
+  removedBranchIds }` (`HarnessThreadDeleteResult`) — the state the caller caused.
+  The last two were added because the purge silently SHRINKS the agent-result registry:
+  `purgeThread` releases the invocation records owned by everything that went (it now
+  RETURNS the two id sets instead of throwing them away), so `agentManage`'s counts drop
+  and `agentResult(id)` starts throwing, and a caller auditing a reaping loop needs to see
+  which ids went with the conversation. Both arrays are ALWAYS present, and empty means
+  "purged nothing", not "did not say" — this is a report, not a durability change: nothing
+  is moved out of the registry, and a released conversation's results stay released.
+  Deleted ids are unknown to every thread door,
   and the 256-thread cap (`MAX_THREAD_RECORDS`, `core/thread.ts` — `createThreadState`
   THROWS at it) is finally actionable from inside a session. Worker mode classifies
   it as authority work: `threadDelete` is in `AUTHORITY_RUNTIME_METHODS`
   (`src/server/workers/capability.ts`), the target travels as the request's
   `threadId` and the CALLER inside `identity`, so the canonical harness performs
-  the scoped delete and the lane mirror rebases (`lane-worker-loop.ts`).
+  the scoped delete and the lane mirror rebases (`lane-worker-loop.ts`). Two
+  worker-mode holes closed on 2026-11-14 made the release honest there: the durable
+  server projection no longer skips branch results when it reconstructs which
+  invocations a delete dooms (`SessionStore.doomedInvocationIds` used to exclude any
+  event thread with a `kind`/`branchId`, asserting "the runtime keeps them" while the
+  live session had already dropped them), and a LANE-ARCHIVED result now carries its
+  `threadId` (`SharedMutation`'s `result:archive` op in `lane-commit.ts`, stated by the
+  worker as `lane.targetId` in `lane-worker-loop.ts`, forwarded verbatim by
+  `lane-authority.ts`) — the delete cascade predicates on `record.threadId`, so without
+  it the same `threadDelete` removed an inline conversation's results and left a lane
+  conversation's behind. **THE CASCADE IS A DURABLE RULE (the C6 hole this passage recorded on
+  2026-11-14 — issue 0027's dated update — is CLOSED):** the owner travels with the row end to
+  end. `HarnessAgentResultSnapshot.threadId` exists (`src/types/index.ts:3405`), the snapshot
+  projection writes it when the invocation has a conversation (`src/harness.ts:12900-12926`,
+  the `agentResults` map in `snapshot()`), `restore()` rebuilds it with the row
+  (`:13259-13288`), and the reader accepts and validates the key — MAY-BE-ABSENT like `error`,
+  so an old file still loads, and a present one must be a non-blank string, so a hand-edited
+  `threadId: ""` is refused rather than restored into an owner that matches no conversation
+  (`src/core/snapshot.ts:148,159,285-289`). After a `snapshot()` → `restore()` round trip the
+  cascade's PRIMARY predicate (`record.threadId === threadId`, `src/harness.ts:6446`) therefore
+  still matches: deleting a conversation AFTER a reload takes its archived results exactly as
+  the same delete does BEFORE it, inline or lane-archived, and the four-field receipt names the
+  same ids either way. That parity is pinned, both doors in one run, by
+  `src/harness.agent-results.test.ts` (the `deleteThread` pair inside its
+  `carries a cancelled run partial and its message position through snapshot -> restore` case,
+  and the `threadId` rows of its forensic-value case) and by the on-disk row plus reload
+  asserted in `src/server/threads.test.ts`. TWO boundaries survive and neither is a cascade
+  hole: `threadId` is ABSENT only on a row whose run resolved no conversation at all
+  (`runThreadId`, `src/harness.ts:12415` — an ephemeral branch whose parent had none, or a brain
+  outside the registry), while an ordinary root run names the agent's default conversation,
+  `agent:<name>`, and matches after a reload like every other one; and a run still `running` at
+  snapshot time is not persisted at all (the projection filters it at `:12901`, and the thread
+  row drops its `invocationId` for the same reason, `:12949-12951`), which is the unchanged "a
+  snapshot never claims work is live" rule. WHAT A RELOAD STILL DOES NOT RESTORE is the
+  PER-CALL attribution: `parentScope`/`parentCallId` live on the in-memory record
+  (`:3798-3803`, stamped at `:12522-12523`) but on no persisted row — the reader's key list
+  names neither (`src/core/snapshot.ts:127-160`) — and `delegatedRecordOf` addresses a child by
+  exactly that pair (`src/harness.ts:4500-4517`), so the OWNER chain is durable while the doors
+  that reach a child by its spawning tool call go quiet after a reload even though the row is
+  intact (the half issue 0033 records as still owed).
+  **Worker mode no longer diverges about the forensic pair either.** The same `result:archive`
+  op that states the owner also carries `partialContent`/`cancelledAtMessage`
+  (`HarnessInvocationArchiveInput`, `src/types/index.ts:3448-3451`; emitted by
+  `lane-worker-loop.ts` from the replica's own terminal record, `:1112-1113` beside its
+  `threadId` at `:1126`), and every leg is shipped: the op digest covers the pair
+  (`archiveDigestOf`, `lane-commit.ts:143-167`) so a lane cannot skip the very archive that
+  would carry it, the fold validates the pair BEFORE it touches the canonical view and answers a
+  permanent `invalid-mutation` for a malformed one (`:1006-1024` via `readArchiveForensicPair`,
+  which reuses `src/core/snapshot-validation.ts` — the same bounds `src/core/snapshot.ts` uses
+  to read those fields back off disk, so nothing is ever legal to archive and illegal to
+  reload), the authority forwards it verbatim (`lane-authority.ts:1167-1170`), and
+  `archiveInvocation` returns the pair with the row it stores (`src/harness.ts:7266-7359`)
+  because the lane digests the RETURN value. What the lane still cannot do is unchanged:
+  `delegate` and `threadFork` are REFUSED on a lane (the nested-run policy is armed at the hello
+  handshake, `lane-worker-loop.ts` `refuseNestedRuns`), 0034's structured lane rejection (a
+  `code` plus the refused id on the wire) was DECLINED as a protocol change — a failed request
+  still crosses as `{ ok: false, error: message }` (`src/server/workers/protocol.ts`
+  `request.reply`) — and `threadExecution` still DEFAULTS to `inline`
+  (`DEFAULT_THREAD_EXECUTION`, `src/server/config.ts:118`).
 - **Terminal state is ONE synchronous commit (B2).** A finished run's terminal
   ledger entry (`finishInvocation`) AND its thread-status release to `idle` now
   happen together in `commitRunTerminal`, BEFORE the post-run hooks and branch
@@ -2855,10 +3176,27 @@ threadFork({ input: string; label?: string; timeoutMs?: number })
   `Infinity`); a finite value arms the branch's OWN controller, linked into the
   scheduler's signal, so the requester's run keeps its signal and still receives
   a structured outcome. On expiry the branch is recorded `cancelled` (the honest
-  control outcome, not `failed`) and the delivered result carries its partial
-  content instead of a final summary. A cancelled fork's tool-delivery sentence
-  names the branchId and points at `threadRead`/`agentResult` — a fork is the one
-  background call whose work survives its own cancellation.
+  control outcome, not `failed` — `branchFailureStatus` reads the LINKED signal, which is
+  why the branch's own clock counts as a cancellation and not a throw). What the
+  requester reads is CONTENT-CONDITIONAL, and only the pointer is unconditional: a
+  cancelled fork call answers with the branch id and the two doors that still read it
+  (`Tool call "threadFork" (id) was cancelled before it completed; its branch
+  "branch-N" still holds what it produced — read it with threadRead "branch-N" or
+  agentResult by that id.`), while the FAILED-door sentence embeds an inline preview of
+  what the branch had produced ONLY when a partial actually exists (the branch's
+  invocation `partialContent`, capped at `FORK_PARTIAL_PREVIEW_CHARS`); a branch that
+  produced nothing reports only the reason, byte for byte the historical
+  `Tool "…" failed: <message>` sentence, and the same holds for the `produced no
+  substantive answer` case. So the branch's committed WORK survives; the inline preview
+  does not exist independently of it.
+  `threadRead branch-N` and the partial are two different facts, though (corrected
+  2026-11-14): a cancelled or failed branch rolls back its OWN turns, so the transcript
+  that address serves is the baseline the branch was forked from — the origin conversation
+  up to and including the fork call — while the text the branch had actually produced
+  lives in the invocation record and pages through `agentResult` with `branch-N` as
+  `invocationId` (`finishBranch`'s terminal `messages`, `lastSubstantiveText`, and the
+  pins in `src/harness.fork.test.ts`). A fork is still the one background call whose work
+  survives its own cancellation — it survives as a RECORD, not as a transcript tail.
 - Runtime identity is private: `actorKeyOf(branch)` is `branch:<branchId>`, never
   the display name, so a fork cannot deadlock behind a same-name source run.
   `actorRoles` inherits the source role; `agentBranchOf` reads the `WeakMap`.
@@ -2960,7 +3298,10 @@ await writer('tell me about new year');
   not (`core/agent-limits.ts` `DELEGATE_TIMEOUT_MS` is now `Number.POSITIVE_INFINITY`,
   and `src/harness.delegation.test.ts` pins both halves). Consequences a reader must
   accept: a stuck child is abandoned by an explicit `toolCancel` on its pending
-  `callId` (named in the `status: "pending"` placeholder), and a `writer(input)` whose
+  `callId` (named in the `status: "pending"` placeholder), and that release does not
+  discard the outcome — the child's terminal envelope still arrives as the call's own
+  tool message, marked `callCancelled: true` (see [Delegation](#delegation)); a
+  `writer(input)` whose
   child never settles never resolves — that is the drain contract above working as
   specified, not a bug. What DOES bound a long run: every tool's own timeout (below),
   the OPTIONAL `maxIterations` REQUEST COUNT (`DEFAULT_MAX_ITERATIONS` is
@@ -3287,7 +3628,10 @@ call (`toolCancel({ callId })` targets one): `toolCancel` logically settles/abor
 that call's own task and its late result is ignored; cancelling an already settled
 (or already cancelled) call is a SUCCESS with `alreadySettled: true`, because
 cancellation is a state to reach rather than a one-shot transition, while a
-`callId` this run never started is an error. Command tools honour the abort
+`callId` this run never started is an error. The ack is a CONTROL receipt
+(`{ cancelled: true, callId, name }`) and not the result channel: for a released
+`delegate` call the child's terminal envelope arrives in that call's OWN tool message,
+tagged `callCancelled: true` — see [Delegation](#delegation). Command tools honour the abort
 and kill their process tree, but arbitrary JavaScript cannot be preempted. A
 whole-run abort preempts an uncooperative provider request, releases the child
 actor/restore slot and rolls back the cancelled turn's in-flight prompt state
@@ -5602,6 +5946,20 @@ In the order they are expected:
    (`src/frontend/main.ts:8198`) — but the third scope this pass introduced (a session's own
    configuration) has no harness-level twin to fall back on, which is exactly why the panes
    hide instead of falling back.
+9. **no surviving record of what a killed child DID** — a cancelled or failed run rolls
+   its own turns back out of the transcript (`runAgentCore`'s catch splices to
+   `commitIndex`), and the forensic field that survives the splice is ASSISTANT TEXT: the
+   answer the run was still streaming when the cut landed, falling back to its last committed
+   text (`RunState.streamedText` → `lastSubstantiveText` → `partialContent`) — never its tool
+   calls or tool results. That text is now durable and lane-portable (issue 0033); the ACTIVITY
+   is not, and that is what this item is about. A post-mortem can therefore say what a stopped
+   child was SAYING and not what it DID; `threadRead` on the child answers with the pre-run
+   conversation. Carrying the tool blocks is deliberately not solved by widening
+   `partialContent` (issue 0020's leak-boundary criterion) nor by retaining the rolled-back
+   transcript (a lone `tool_calls` block with no results is exactly the pairing a strict
+   provider rejects, which is why `src/server/persistence.ts` synthesizes an
+   `INTERRUPTED_TOOL_RESULT_TEXT` result instead). The direction under discussion is a
+   bounded, SEPARATE forensic field — see issue 0032.
 
 Parallel tool execution is no longer on this list: calls are scheduled
 concurrently (see “The loop”). There is no ordered side-effect guarantee, and the
