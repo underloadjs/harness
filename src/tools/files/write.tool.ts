@@ -66,12 +66,67 @@
 // batches cannot deadlock. This orders calls inside ONE process; it makes no claim
 // about another process or another worker thread, and never did.
 //
+// EACH FILE IS PUBLISHED ATOMICALLY (M10)
+// ---------------------------------------
+// Each file is written to a STAGING file in the same directory as the target and then
+// renamed over it, so the directory ENTRY is swapped instead of the bytes being
+// rewritten in place. A reader that opens the target during a write therefore sees the
+// whole previous file or the whole new file, never a prefix, and a failure before the
+// rename (ENOSPC, EACCES, a signal, a kill) leaves the target exactly as it was, with
+// the half-written staging file removed.
+//
+// `writeFile` alone could not make that claim: its default 'w' flag is
+// O_WRONLY|O_TRUNC, which empties the file at OPEN, before a single byte of the new
+// payload has arrived. Every reader inside the write window and every crash in it used
+// to see — and keep — a truncated file. A stress probe (200 concurrent reads of a 2 MB
+// write) measured 3 such partial observations.
+//
+// The same DIRECTORY is the whole guarantee, which is why the staging file is created
+// next to the RESOLVED target rather than next to the spelling the caller passed: a
+// symlink can name another device, and a cross-device rename is a copy, not a publish.
+// The target's mode is copied onto the staging file because a rename swaps the inode —
+// in-place writing had kept 0755-style bits for free, and the fix must not lose them.
+//
+// What it does NOT claim, stated plainly:
+//   - no fsync is added, so the durability boundary on power loss is the one in-place
+//     writing already had. Fixed here is the state a reader can observe and the outcome
+//     of a PROCESS-level failure, which is what the stress report measured;
+//   - the target gets a NEW inode, so an already-open handle, a hard link, `uid`/`gid`,
+//     and xattrs keep describing the old file. The mode travels, ownership does not;
+//   - a read-only target FILE (0444) can now be overwritten, because the write goes to
+//     a fresh staging file and only the DIRECTORY's permissions gate the rename. The
+//     published file still carries the 0444 mode, and a read-only directory still
+//     refuses the write outright;
+//   - a DANGLING symlink is still honored the way a live one is: the link is followed to
+//     the name it names (that name's parent is created when missing), the staging file is
+//     created in THAT directory, and the rename lands on the name the link points at — so
+//     the link survives and the file the link names is the one that appears. A symlink
+//     chain that loops is refused with an ELOOP-style error instead of replacing the link,
+//     which is what the in-place write hit through open() anyway;
+//   - the publish is a NAME swap, so a hard link to the target keeps the previous bytes
+//     under the sibling name: `a.txt` and `b.txt` share an inode before the write and
+//     diverge after it. Nothing here can update both, because the caller named one;
+//   - the target is handled as a NAME in a directory, so a target that is not a regular
+//     file (a FIFO, a character device) now needs create permission in that directory
+//     and has its node replaced, where the in-place write streamed through the existing
+//     node. Everything this tool is for — source, config, notes — is a regular file or
+//     does not exist yet.
+//
+// It is per-file atomicity, not a batch transaction — see FAILURE SEMANTICS below.
+//
 // FAILURE SEMANTICS (honest, not transactional)
 // ---------------------------------------------
 // Writes are sequential. A filesystem error on file N may leave files 1..N-1
 // written: there is NO transaction and NO rollback, and the error says so by
 // naming the completed paths and the path that failed. Pretending otherwise would
 // be a lie a model could act on.
+//
+// What file N itself looks like IS defined, and the atomic publish above is what makes
+// that honest: a failed write leaves its own target with its PREVIOUS content (or not
+// created at all, when it did not exist), never a partial prefix, and its staging file
+// is gone — so the message can name only 1..N-1 under "already completed" without
+// implying N is half-written. The raw reason may still quote the staging path, which
+// no longer exists by the time the caller reads it.
 //
 // ONE mkdir PER DISTINCT DIRECTORY
 // --------------------------------
@@ -97,8 +152,19 @@
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
 // and a consistency test proves the projection equal.
 
-import { mkdir, writeFile as writeTextFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import {
+    chmod,
+    lstat,
+    mkdir,
+    readlink,
+    realpath,
+    rename,
+    rm,
+    stat,
+    writeFile as writeTextFile
+} from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
 import type { PresetToolMetadata } from '../catalogue';
@@ -143,6 +209,179 @@ type PreparedWrite = {
     // takes for the same file — two spellings of one file must share one lock.
     identity: string;
     content: string;
+};
+
+// Unique staging-file token: `<base36 pid>-<48-bit hex>`.
+//
+// The rename below is only safe while one staging name belongs to exactly one writer.
+// Two collision sources exist: two PROCESSES in the same directory (the per-file lock in
+// ./lock.ts is per-process, so they really do race) and two writes in the SAME process
+// that overlap across their awaits. The pid covers the first, 6 random bytes cover the
+// second, and the staging open uses `wx` below, so a collision that still happens (about
+// 1 in 2^48 per process) surfaces as an honest write error instead of silently
+// truncating a neighbour's payload. Same shape of reasoning as the `<file>.<pid>.<n>.tmp`
+// staging names in ../../server/persistence.ts.
+const stagingToken = (): string => `${process.pid.toString(36)}-${randomBytes(6).toString('hex')}`;
+
+// How many links one path may walk before `write` calls it a cycle. Linux caps link
+// resolution at MAXSYMLINKS = 40 and Node reports ELOOP past that; the same order of
+// magnitude here keeps the hand-rolled walk below finite without ever refusing a chain a
+// real filesystem would have followed.
+const SYMLINK_FOLLOW_LIMIT = 40;
+
+// The path the rename must land on: `target` with its symlinks followed.
+//
+// `write` has always written THROUGH a symlink, because open() follows it, and the
+// contract (and ./identity.ts, which keys duplicates by realpath) depends on the link
+// surviving while its target is updated. A rename is different: it replaces the NAME, so
+// renaming onto the link path would delete the link and leave a regular file behind.
+// Resolving first makes the rename land on the real file, and puts the staging file in
+// that file's own directory, which is what keeps the rename on one device.
+//
+// Anything that does not resolve is written at its own spelling: the usual case is a
+// target that does not exist yet (this tool creates files) or a missing ancestor, and
+// creating it where the caller asked is the whole point. A symlinked ANCESTOR needs no
+// special case either — creating and renaming inside a symlinked directory both follow
+// that link onto the same real directory, so the rename stays same-device.
+//
+// A DANGLING symlink is the one spelling that looks "missing" to `realpath` but is a real
+// entry, and it is not written at its own spelling: an in-place write followed the link and
+// CREATED THE FILE THE LINK NAMES, keeping the link, and that is the behavior the live-link
+// contract already promises. `realpath` cannot walk past the missing end, so the chain is
+// walked by hand below (D7a): land on the missing end, create its parent, stage beside it,
+// rename onto it. The link is never touched, and the staging file sits in the landing's own
+// directory, so the publish is still a same-directory rename.
+const realWriteTarget = async (target: string): Promise<string> => {
+    try {
+        return await realpath(target);
+    } catch {
+        // ENOENT / ENOTDIR: there is nothing to resolve yet. Expected, never surfaced;
+        // an actually unusable path fails a syscall below with a real message.
+    }
+
+    // Walk the chain by hand. Only `lstat` sees a link without following it, which is the
+    // only way to tell "a name with nothing behind it" from "a link whose end is missing".
+    let landing = target;
+    // Did the landing move away from the caller's spelling? Only then can its parent be a
+    // directory the write loop has not created yet (see the mkdir below).
+    let followed = false;
+
+    for (let hop = 0; hop < SYMLINK_FOLLOW_LIMIT; hop += 1) {
+        let text: string | undefined;
+
+        try {
+            const info = await lstat(landing);
+            // A regular file or directory at this name is a landing too — reachable only if
+            // the link chain closed on an existing entry after realpath already failed.
+            text = info.isSymbolicLink() ? await readlink(landing) : undefined;
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException | undefined)?.code;
+
+            // ENOENT / ENOTDIR is the end of the chain: that missing name IS the landing,
+            // and it is either a dangling end or a plain path that does not exist yet.
+            if (code === 'ENOENT' || code === 'ENOTDIR') break;
+
+            // Anything else (EACCES on an ancestor) is a real failure. Surfacing it beats
+            // the alternative of quietly renaming onto the LINK path, which would delete
+            // a link this tool has always written through.
+            throw error;
+        }
+
+        // Not a link (a real entry, or the missing end handled above by break): landed.
+        if (text === undefined) break;
+
+        // A link's text is relative to the LINK's own directory, not to the working
+        // directory, and `resolve` also normalizes `.`/`..` and honours a text that is
+        // absolute on its own — one call covers both spellings.
+        landing = resolve(dirname(landing), text);
+        followed = true;
+
+        // The hop budget ran out while still on links: the chain closed on itself. `open()`
+        // used to fail this path with ELOOP; failing here is the same honest answer, and
+        // quietly renaming onto the link path would not be.
+        if (hop === SYMLINK_FOLLOW_LIMIT - 1) {
+            throw new HarnessError(
+                `write cannot resolve the symlink at ${target}: too many levels of symbolic links (over ${SYMLINK_FOLLOW_LIMIT} hops).`
+            );
+        }
+    }
+
+    if (followed) {
+        // A dangling link can name a directory the caller never mentioned (`link.txt ->
+        // missing/deep/target.txt`), and the write loop only created the parent of the
+        // CALLER's spelling. Create the landing's own parent here so the staging file has
+        // a directory to be created in — the same directory the rename publishes into, so
+        // the rename stays on one device. A parent that cannot be created (EACCES, a file
+        // in the middle of the path) fails the write outright rather than degrading to the
+        // link path, which would silently change which file the caller's content landed in.
+        await mkdir(dirname(landing), { recursive: true });
+    }
+
+    return landing;
+};
+
+// The permission bits of an EXISTING target, or undefined when there is no mode to
+// preserve.
+const existingMode = async (path: string): Promise<number | undefined> => {
+    try {
+        // `mode` also carries the file-type bits (0o100644 for a regular file); chmod()
+        // consumes only the low 12, and masking keeps exactly the bits an in-place write
+        // inherited, setuid/setgid/sticky included.
+        return (await stat(path)).mode & 0o7777;
+    } catch (error) {
+        // "There is no file here" is the ONLY reason not to preserve a mode. Any other
+        // failure (EACCES, an unreadable ancestor) would otherwise publish the default
+        // 0666&~umask file over one that had, say, 0755 — a silent mode change on the
+        // very path the caller cannot see, so it surfaces like any other write error.
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+
+        if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
+
+        throw error;
+    }
+};
+
+// Publish ONE file atomically: staging file in the target's own directory, mode copied
+// over, then a same-directory rename. See the M10 section of this file's header for the
+// guarantee and for the semantics the trade buys away.
+const writeAtomically = async (target: string, content: string): Promise<void> => {
+    // Resolve before staging: the staging file has to sit next to the file the rename
+    // replaces, not next to the link that names it.
+    const real = await realWriteTarget(target);
+    const staging = join(dirname(real), `${basename(real)}.tmp-${stagingToken()}`);
+    // Read the mode before anything is created, so a failure below cannot have changed
+    // the target between the read and the rename.
+    const mode = await existingMode(real);
+    // What separates "the rename swapped it into place" from "it is still litter":
+    // the staging file is removed on every path that did not publish it.
+    let published = false;
+
+    try {
+        // `wx` (O_CREAT|O_EXCL): the unique token above makes a collision vanishingly
+        // rare, and this is the flag that makes a collision an error instead of a
+        // truncated neighbour. The payload lands here, never on the target's inode.
+        await writeTextFile(staging, content, { encoding: 'utf8', flag: 'wx' });
+
+        if (mode !== undefined) {
+            // The rename swaps the inode, so the mode has to travel with it: a script
+            // that silently lost its 0755 is a regression against in-place writing. A
+            // chmod that cannot run surfaces as a write error rather than publishing a
+            // mode nobody asked for.
+            await chmod(staging, mode);
+        }
+
+        // The publish. Same directory, so this replaces the directory entry atomically:
+        // a concurrent open() sees the old inode or the new one, never a mix.
+        await rename(staging, real);
+        published = true;
+    } finally {
+        if (!published) {
+            // Best effort and never throwing: the error already propagating is the
+            // actionable one, and a leftover temp file must not replace it. `force`
+            // swallows the ENOENT case where the failure happened before the create.
+            await rm(staging, { force: true }).catch(() => undefined);
+        }
+    }
 };
 
 // Validate the whole batch and resolve every target BEFORE the first write.
@@ -232,10 +471,17 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
 // Authoritative registration/details for this preset (T13): the catalogue keeps
 // a synchronous data projection for lazy enumeration and a consistency test
 // asserts the two stay equal. Edit the metadata HERE.
+//
+// The added clause at the end of the atomic-publish sentence is the D7b disclosure: that
+// publish swaps the target's NAME, so a hard link to it keeps the previous bytes under the
+// sibling name, and a 0444 existing file is overwritable because only the DIRECTORY's
+// permissions gate the rename. Both are inherent to the rename (see the M10 section of this
+// header) and neither is guessable by a caller, so they are published, not left in the
+// source comments.
 export const WRITE_METADATA: PresetToolMetadata = {
     name: 'write',
     description:
-        'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. A call accepts at most 100 files; split a larger batch. Every entry is validated before anything is written, and the same target path twice is rejected. Writes are serialized per file against concurrent edit calls on the same path, so neither can silently overwrite the other. A write error part-way through is reported with the paths already completed: there is no rollback.',
+        'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. A call accepts at most 100 files; split a larger batch. Every entry is validated before anything is written, and the same target path twice is rejected. Writes are serialized per file against concurrent edit calls on the same path, so neither can silently overwrite the other. Each file is published atomically, so a reader sees either its previous content or its new content, never a partial write, and a failed write leaves that file untouched; the publish replaces the file, so a hard link to it keeps the previous bytes and a read-only existing file can still be overwritten. A write error part-way through is reported with the paths already completed: there is no rollback.',
     tags: ['files', 'write', 'filesystem'],
     // R18: writing files is core, like the rest of the everyday file set.
     visibility: 'core',
@@ -315,11 +561,17 @@ export const write = tool<FileWriteParameters, FileWriteResult>({
                             made.add(parent);
                         }
 
-                        await writeTextFile(target, content, 'utf8');
+                        // M10: staged + renamed, not `writeFile(target)`. The target is
+                        // never emptied in place, so a concurrent reader, an ENOSPC, or a
+                        // kill cannot leave — or report — a partial file.
+                        await writeAtomically(target, content);
                     } catch (error) {
                         // Partial success is reported honestly: the completed paths are
                         // named so the caller can tell what exists now, and there is no
                         // claim of a transaction or rollback (there is neither).
+                        // The failed target is deliberately NOT listed: it still holds the
+                        // text it had before (or does not exist yet), which the staged
+                        // publish above is what guarantees.
                         const completed =
                             written.length === 0 ? 'none' : written.map((entry) => entry.path).join(', ');
                         const reason = error instanceof Error ? error.message : String(error);

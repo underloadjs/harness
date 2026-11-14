@@ -1494,7 +1494,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "read",
     metadata: {
         name: "read",
-        description: "Read a BOUNDED window of UTF-8 text files. A `paths` item is a path string or { path, startLine, startColumn, startByte, maxLines, maxBytes, lossy, numbered }. Result: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, error? }], truncated, bytes, wireBytes, contentBudget, modelBytes, skipped, note? }. Per-file defaults startLine 1, startColumn 0, startByte null, maxLines 2000, maxBytes 65536 - deliberately SMALL, because this feeds a context window, not a pipe (ceilings 20000 lines, 262144 bytes). `content` is raw text whose first line is `startLine`; `numbered: true` prefixes the model's copy with `123: `. Act on `truncated`/`limit` before assuming you have the file: \"maxLines\" raise maxLines, \"maxBytes\" raise maxBytes, \"budget\" means the batch's 256 KiB envelope is full (want fewer bytes across the batch), null means EOF. Continue with startByte = nextByte (a SEEK) or { startLine: nextLine, startColumn: nextColumn }; files 65536+ bytes cut are also named in `note`. A seek past EOF is an ERANGE entry naming the file size or line count, never an empty window. The 256 KiB budget is measured on the SERIALIZED result and allocated by demand; max 100 paths. An unreadable path stays IN ORDER with `error: { code, message }` - ENOENT (names likely paths), EISDIR (previews entries), EACCES/EPERM, EBINARY (`lossy: true` substitutes U+FFFD), ERANGE, EIO - and costs no budget. Only a malformed request rejects the call. Paths are relative to the working directory.",
+        description: "Read a BOUNDED window of UTF-8 text files. A `paths` item is a path string or { path, startLine, startColumn, startByte, maxLines, maxBytes, lossy, numbered }. Result: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, error? }], truncated, bytes, wireBytes, contentBudget, modelBytes, skipped, note? }. Per-file defaults startLine 1, startColumn 0, startByte null, maxLines 2000, maxBytes 65536 (escaped wire bytes, not raw) - deliberately SMALL: this feeds a context window, not a pipe (ceilings 20000 lines, 262144 bytes). `content` is raw text whose first line is `startLine`; `numbered: true` prefixes THAT file's model copy with `123: `. Act on `truncated`/`limit` first: \"maxLines\" raise maxLines, \"maxBytes\" raise maxBytes, \"budget\" means the batch's 256 KiB envelope is full (want fewer across the batch), null means EOF. A truncated entry's `nextByte` names its first unread byte, so paging terminates and loses nothing - a tiny maxBytes costs extra round trips, not bytes. Continue with startByte = nextByte (a SEEK) or { startLine: nextLine, startColumn: nextColumn }; files 65536+ bytes cut are also named in `note`. A seek at or past EOF is an ERANGE entry naming the file size or line count, never an empty window. The 256 KiB budget is measured on the SERIALIZED result and allocated by demand; max 100 paths. An unreadable path stays IN ORDER with `error: { code, message }` - ENOENT (names likely paths), EISDIR (previews entries), EACCES/EPERM, EBINARY (`lossy: true` substitutes U+FFFD), ERANGE, EIO - and costs no budget. Only a malformed request rejects the call.",
         tags: [
             "files",
             "read",
@@ -1526,32 +1526,32 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                                     startColumn: {
                                         type: "integer",
                                         minimum: 0,
-                                        description: "0-based UTF-8 byte offset within startLine, for continuing a giant line. Defaults to 0."
+                                        description: "0-based UTF-8 byte offset within startLine, for continuing a giant line. Past the end of that line it lands on the next line, and the entry reports the line it actually returned. Defaults to 0."
                                     },
                                     startByte: {
                                         type: "integer",
                                         minimum: 0,
-                                        description: "0-based UTF-8 byte offset to SEEK to; feed back a previous nextByte. Inside a multi-byte character it moves to the next boundary (startByteAligned); at or past EOF it is an ERANGE entry. Without startLine the true line here is counted and reported. Defaults to null."
+                                        description: "0-based UTF-8 byte offset to SEEK to; feed back a previous nextByte - it names the first unread byte. Inside a multi-byte character it moves to the next boundary (startByteAligned); at or past EOF it is an ERANGE entry. Without startLine the true line here is counted. Defaults to null."
                                     },
                                     maxLines: {
                                         type: "integer",
                                         minimum: 1,
                                         maximum: 20000,
-                                        description: "Lines to return. Default 2000; an explicit value is an integer in [1, 20000]. A window cut by this cap reports limit: \"maxLines\"."
+                                        description: "Lines to return. Default 2000, max 20000. A window cut by this cap reports limit: \"maxLines\"."
                                     },
                                     maxBytes: {
                                         type: "integer",
                                         minimum: 1,
                                         maximum: 262144,
-                                        description: "Bytes this file may take, in the units `bytes`/`wireBytes` report. Default 65536; an explicit value is an integer in [1, 262144]. The only knob that widens ONE file. A window cut by it reports limit: \"maxBytes\"."
+                                        description: "Byte allowance for THIS file, charged in ESCAPED wire bytes (the unit `wireBytes` counts), not the raw bytes `bytes` reports: a newline costs 2 here and 1 there, a quote costs 2, and a non-ASCII character costs its raw UTF-8 length unless JSON escapes it. One character is always returned, up to 6 bytes over; a window can still stop with `bytes` well under this number. Default 65536; max 262144. The only knob that widens ONE file. A window cut by it reports limit: \"maxBytes\"."
                                     },
                                     lossy: {
                                         type: "boolean",
-                                        description: "Substitute U+FFFD for bytes that are not valid UTF-8 instead of reporting EBINARY, so a Latin-1 log stays readable; the entry then says `lossy: true`. Default false."
+                                        description: "Substitute U+FFFD for bytes that are not valid UTF-8 instead of reporting EBINARY, so a Latin-1 log stays readable; the entry then says `lossy: true`. A NUL byte is still EBINARY either way: it says \"binary\", not \"wrong codepage\". Default false."
                                     },
                                     numbered: {
                                         type: "boolean",
-                                        description: "Prefix each line of the model's copy with its line number (`123: `) so it can cite lines without arithmetic. `content` stays raw. Costs bytes. Default false."
+                                        description: "Prefix each line of this file's model copy with its line number (`123: `) so it can cite lines without arithmetic. `content` stays raw and `bytes` excludes the gutter, but the gutter is charged against maxBytes — a numbered window holds fewer bytes than the same call without it. Other files are unaffected. Default false."
                                     }
                                 },
                                 required: [
@@ -1586,7 +1586,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "write",
     metadata: {
         name: "write",
-        description: "Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. A call accepts at most 100 files; split a larger batch. Every entry is validated before anything is written, and the same target path twice is rejected. Writes are serialized per file against concurrent edit calls on the same path, so neither can silently overwrite the other. A write error part-way through is reported with the paths already completed: there is no rollback.",
+        description: "Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. A call accepts at most 100 files; split a larger batch. Every entry is validated before anything is written, and the same target path twice is rejected. Writes are serialized per file against concurrent edit calls on the same path, so neither can silently overwrite the other. Each file is published atomically, so a reader sees either its previous content or its new content, never a partial write, and a failed write leaves that file untouched; the publish replaces the file, so a hard link to it keeps the previous bytes and a read-only existing file can still be overwritten. A write error part-way through is reported with the paths already completed: there is no rollback.",
         tags: [
             "files",
             "write",
@@ -1640,7 +1640,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "edit",
     metadata: {
         name: "edit",
-        description: "Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Calls that name the same file are serialized per file (read-match-write is one critical section), so a concurrent edit never silently clobbers another - the later one fails with \"no match\" against the text the earlier one produced. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used (\"typographic\" or \"trailing-whitespace\"), so a fuzzy match is never silent. Creates nothing: use write for new files.",
+        description: "Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. A call accepts at most 100 entries; split a larger batch. Calls that name the same file are serialized per file (read-match-write is one critical section), so a concurrent edit never silently clobbers another - the later one fails with \"no match\" against the text the earlier one produced. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file, and the replacement is re-joined line by line with the endings of the region it replaced: a line standing in for a matched line keeps the ending of that line, a genuinely new line takes the dominant ending of the region (that of the file when the region has none), and the last line gets no ending of its own, so a mixed-ending file stays mixed and the endings the caller typed survive only when it spells them itself: with \\r, or in the differ-only-in-carriage-returns form below; a newString that contains \\r is ending-explicit and is written verbatim, byte for byte, so an explicit \\r\\n is never rewritten into the endings of the file; to convert the endings themselves, pass oldString and newString that differ only in carriage returns (a `\\r` in one and not the other): that form matches exact bytes, so it converts the endings of exactly the region it matched and nothing else. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. That trailing-whitespace tier matches WHOLE LINES, so an edit that matched through it replaces those whole lines and removes the trailing whitespace inside them. A target whose bytes are not valid UTF-8, or that holds a NUL byte, is refused with EBINARY naming the byte offset: edit rewrites files byte for byte and never substitutes for bytes it cannot decode. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used (\"typographic\" or \"trailing-whitespace\"), so a fuzzy match is never silent. Creates nothing: use write for new files.",
         tags: [
             "files",
             "edit",
@@ -1653,6 +1653,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
             properties: {
                 edits: {
                     type: "array",
+                    maxItems: 100,
                     items: {
                         type: "object",
                         properties: {
@@ -1705,7 +1706,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "files",
     metadata: {
         name: "files",
-        description: "Manage files and folders: list, move, copy, delete, and mkdir in ONE call, applied in the order given. Pass an array of operations, each `{ op, ... }`: list takes `path` (one directory or several, default the working directory) plus `offset`/`limit`; move and copy take `from` and `to` plus `overwrite` (default false, so an existing destination is an EEXIST error, not a silent replace); delete takes `path` plus `recursive` (a non-empty directory without it is refused) and `force` (a missing path becomes `removed: false, skipped: true` instead of an error); mkdir takes `path` and creates missing parents, reporting an existing directory as `created: false`. Returns `{ results, bytes, contentBudget }` with ONE ordered receipt per op: list gives `{ entries, truncated, nextOffset, offset, limit, bytes }` (a page holds at most 200 entries by default, 1000 maximum, and 64 KiB of entry text across the whole call, so pass `nextOffset` back as that entry's `offset` for more), move/copy give `{ path, to, kind, bytes }`, delete gives `{ path, removed, recursive }`, and mkdir gives `{ path, created }`. Entry names are prefixed with the directory they came from, directories end with \"/\", and listings are sorted by code point, so paging is deterministic. Every entry is validated before anything runs, so a malformed call changes nothing; a failing mutation names the ops already applied and there is NO rollback, while a failing list entry reports its own `error: { code, message }` without failing the batch. Cross-device moves report EXDEV rather than copying behind your back. Use read/write/edit for content and glob/grep for searching.",
+        description: "Manage files and folders: list, move, copy, delete, and mkdir in ONE call, applied in the order given. Pass an array of operations, each `{ op, ... }`: list takes `path` (one directory or several, default the working directory) plus `offset`/`limit`; move and copy take `from` and `to` plus `overwrite` (default false, so an existing destination is an EEXIST error, not a silent replace; a destination that is the source, inside it, or an ancestor of it is refused before anything moves, and a copy stops at a depth of 64 directory levels); delete takes `path` plus `recursive` (a non-empty directory without it is refused; for a symlink it removes the link only, never the target or its contents) and `force` (a missing path becomes `removed: false, skipped: true` instead of an error); mkdir takes `path` and creates missing parents, reporting an existing directory as `created: false`. Returns `{ results, bytes, contentBudget }` with ONE ordered receipt per op: list gives `{ entries, truncated, nextOffset, offset, limit, bytes }` (a page holds at most 200 entries by default, 1000 maximum, larger values being clamped rather than rejected, and the entry text of the WHOLE call shares one 64 KiB budget, so pass `nextOffset` back as that entry's `offset` for more), move/copy give `{ path, to, kind, bytes }`, delete gives `{ path, removed, recursive }`, and mkdir gives `{ path, created }`. Entry names are prefixed with the directory they came from, directories end with \"/\", and listings are sorted by code point, so paging is deterministic. Every entry is validated before anything runs, so a malformed call changes nothing; a failing mutation names the ops already applied and there is NO rollback, while a failing list entry reports its own `error: { code, message }` without failing the batch. Cross-device moves report EXDEV rather than copying behind your back. Use read/write/edit for content and glob/grep for searching.",
         tags: [
             "files",
             "list",
@@ -1766,7 +1767,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                             },
                             recursive: {
                                 type: "boolean",
-                                description: "delete: remove a directory and everything under it. Defaults to false."
+                                description: "delete: allow removing a real directory that is not empty, together with everything under it. For a symlink it removes the LINK only — the directory it points at and its contents always stay. Defaults to false."
                             },
                             force: {
                                 type: "boolean",
@@ -1774,14 +1775,11 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                             },
                             offset: {
                                 type: "integer",
-                                minimum: 0,
-                                description: "list: 0-based index into the flat entry list. Defaults to 0; pass the previous nextOffset here."
+                                description: "list: 0-based index into the flat entry list. Defaults to 0; pass the previous nextOffset here. A negative value is clamped to 0."
                             },
                             limit: {
                                 type: "integer",
-                                minimum: 1,
-                                maximum: 1000,
-                                description: "list: maximum entries in this page, 1-1000. Defaults to 200."
+                                description: "list: maximum entries in this page. Defaults to 200; values above 1000 are clamped to 1000 and values below 1 to 1, so an oversized page is never rejected."
                             }
                         },
                         required: [

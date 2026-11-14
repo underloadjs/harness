@@ -255,7 +255,11 @@ describe('preset catalogue', () => {
                         additionalProperties: false
                     },
                     description:
-                        'Edits to apply, in the order the results are returned. Several entries may name the same file; they are applied in array order.'
+                        'Edits to apply, in the order the results are returned. Several entries may name the same file; they are applied in array order.',
+                    // The batch cap is part of the published schema (`./files/edit.tool.ts:1109`,
+                    // mirroring `write`), so the pin carries it too: an uncapped array
+                    // argument is an unbounded response. Same reason as the `write` pin above.
+                    maxItems: 100
                 }
             },
             required: ['edits'],

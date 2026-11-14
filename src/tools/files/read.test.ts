@@ -9,24 +9,37 @@
 //     harness's single-property rule hands `execute` the array itself; per-path
 //     range objects live on the ITEM, not as a second top-level property;
 //   - every window reports line numbering (`startLine`/`endLine`), explicit
-//     truncation (`truncated`), and continuation (`nextLine`/`nextColumn`/`nextByte`);
+//     truncation (`truncated`), and continuation (`nextLine`/`nextColumn`/`nextByte`) —
+//     and a TRUNCATED window's cursor names a position strictly past where the window
+//     started, whatever the allowance was (C2), with `nextColumn` counted from the
+//     PHYSICAL start of the line it names (H4), so the documented continuation makes
+//     progress instead of re-reading the same empty window;
 //   - the DEFAULT window is a CONTEXT budget, not a memory budget (D11): 2000 lines and
 //     64 KiB per file, both raisable per request up to the 20 000 / 262 144 ceilings,
 //     and `limit` names which of the three governors (maxLines / maxBytes / budget)
 //     actually cut the window — the difference between "raise it" and "want less";
 //   - a window that counted the whole file publishes `lineCount`, and a seek past the
-//     end — on EITHER axis, byte or line — is an ERANGE entry naming the file's size or
-//     line count, never an empty window that reads as "this file is empty";
+//     end is an ERANGE entry naming the file's size or line count, never an empty window
+//     that reads as "this file is empty" — on the BYTE axis for any offset at or past EOF,
+//     on the LINE axis for a line past `lineCount + 1`. The two axes are not the same rule
+//     (M11): `startLine: lineCount + 1` is a legal request for the boundary one past the
+//     last line, and a 0-byte file has no lines to be past, so ANY `startLine` there
+//     answers the empty window with `lineCount: 0` and no error;
 //   - the model receives a PROSE rendering of these same facts (`toolText`), never the
-//     escaped JSON, and it is provably no larger than the machine view (`modelBytes`),
-//     so the harness envelope can never cut it;
+//     escaped JSON. The two views are BUDGETED, not ordered (F4): `wireBytes` is what the
+//     machine view costs and it must stay inside `contentBudget`, while `modelBytes` is the
+//     prose — usually the LARGER number, because gutters, escapes and continuation notes are
+//     the model's cost — and it is what the scanner charges for up front, which is what
+//     keeps the harness envelope from ever cutting it;
 //   - the aggregate budget is measured on the SERIALIZED result, so a full-budget
 //     read always survives the harness's own wire cap intact — the fields needed to
 //     continue are never destroyed;
 //   - allocation is by DEMAND: a small file hands its unused share back instead of
 //     stranding a large one at 1/N of the budget;
 //   - UTF-8 bytes (not UTF-16 code units) are counted, and CRLF/empty files keep
-//     their exact text;
+//     their exact text — with the two UNITS kept apart (M2): `maxBytes` and the batch
+//     budget are charged in escaped wire bytes, while `bytes` reports raw ones, so a
+//     newline-heavy window stops at `limit: "maxBytes"` well under the number it named;
 //   - a missing path, a directory, a permission denial, or binary content is
 //     reported IN PLACE as an errored entry and does NOT destroy the rest of the
 //     batch; only a malformed request rejects the whole call. An unreadable path also
@@ -559,6 +572,56 @@ describe('read', () => {
         expect(mixed.files[0].content).toBe('alpha\n');
         expect(mixed.files[0].error).toBeUndefined();
         expect(mixed.files[1].error?.code).toBe('ERANGE');
+    });
+
+    it('draws the line-axis boundary where the BYTES are, terminated against unterminated (F3)', async () => {
+        // M11 as corrected by the reviewer's F3. The old prose claimed `startLine` was
+        // "always clamped to the first line", which is false twice over (a `startLine`
+        // inside the file is honoured, and a missing one is ERANGE), and the boundary it
+        // left implicit was inconsistent: `startLine: lineCount + 1` succeeded on a
+        // file-final newline and failed on a file with no final newline. The rule the
+        // implementation actually enforces, and the one the description now states, is
+        // about BYTES: the boundary is the last byte of the file. A final newline makes an
+        // extra empty line addressable, because its start is a real offset; a final line
+        // without a terminator has no such offset, so one line past it is the first
+        // out-of-range line.
+        const terminated = await seed('axis-terminated.txt', 'a\nb\nc\n'); // 6 bytes, 3 lines
+        const unterminated = await seed('axis-unterminated.txt', 'a\nb\nc'); // 5 bytes, 3 lines
+
+        // The line after the last terminated line is LEGAL: line 4 starts at byte 6, which
+        // is the file size, and the ERANGE contract refuses only a byte PAST that.
+        const legal = await read([{ path: terminated, startLine: 4 }]);
+
+        expect(legal.files[0].error).toBeUndefined();
+        expect(legal.files[0]).toMatchObject({
+            content: '',
+            startLine: 4,
+            endLine: 3, // an empty window names a line that does not exist
+            truncated: false,
+            limit: null,
+            nextLine: null,
+            nextColumn: null,
+            nextByte: null,
+            bytes: 0,
+            sizeBytes: 6
+        });
+
+        // One line further and the file is exhausted: the empty window is a legitimate
+        // "no lines left here", while a missing line is an error naming the total.
+        expect((await read([{ path: terminated, startLine: 5 }])).files[0].error?.code).toBe('ERANGE');
+
+        // The same line number on the unterminated file is the FIRST missing line, because
+        // line 3 is terminated by EOF rather than by a newline and line 4 has no start
+        // offset at all.
+        const illegal = await read([{ path: unterminated, startLine: 4 }]);
+
+        expect(illegal.files[0].error?.code).toBe('ERANGE');
+        expect(illegal.files[0].error?.message).toContain('the file has 3 lines');
+
+        // The last real line is readable on both, and the unterminated one keeps its text
+        // with no newline added — the same answer `startByte` gives at that offset.
+        expect((await read([{ path: terminated, startLine: 3 }])).files[0].content).toBe('c\n');
+        expect((await read([{ path: unterminated, startLine: 3 }])).files[0].content).toBe('c');
     });
 
     it('keeps CRLF exact inside a single-line window', async () => {
@@ -1504,6 +1567,494 @@ describe('read', () => {
     });
 
     // -----------------------------------------------------------------------
+    // THE CONTINUATION CURSOR, THE UNITS OF THE ALLOWANCE, AND THE OFF-THE-END CASES.
+    // Every test in this block exists because a caller could not act on the answer it
+    // got: a truncated window whose cursor named the offset it had already read (C2), a
+    // column counted from the wrong end of the line (H4), a window reported under a line
+    // number it did not start on (H5), an out-of-range line indistinguishable from an
+    // empty file (M11), `maxBytes` silently meaning escaped bytes while `bytes` meant raw
+    // (M2), and `EIO` for a file that was never read (zero allowance).
+    // -----------------------------------------------------------------------
+
+    it('emits one code point even when the allowance cannot hold it', async () => {
+        // C2, as corrected by the reviewer's F1. The byte cut used to fire BEFORE the
+        // character was emitted, so an allowance smaller than the one code point at the
+        // window start produced `content: ""` with `nextByte` equal to the offset the
+        // window started at. The cursor was then repaired by STEPPING to the next code
+        // point — which silently deleted every character whose escape cost exceeded the
+        // allowance. The rule in force is the one-code-point floor: while a window has
+        // emitted nothing, every byte check (allowance, chunk end, per-line budget, gutter
+        // charge) is bypassed, so a window with content always carries at least one code
+        // point, nothing is ever skipped, and `nextByte` is literally the first unread
+        // byte. The overshoot is bounded: one code point escapes to at most 6 bytes, and
+        // while the floor is armed the gutter is charged as part of the same emission.
+        const emoji = await seed('emoji.txt', '😀abc\n');
+        const unaffordable = await read([{ path: emoji, maxBytes: 3 }]);
+
+        expect(unaffordable.files[0]).toEqual({
+            path: join(workdir, 'emoji.txt'),
+            content: '😀',
+            startLine: 1,
+            endLine: 1,
+            truncated: true,
+            limit: 'maxBytes',
+            startByteAligned: null,
+            // 4: the emoji was emitted anyway, and the cursor names the byte AFTER all
+            // four of its bytes — 'a'. It used to stall at 0, then to skip to 4 with the
+            // emoji gone; the emoji is now on the page AND the cursor moves.
+            nextLine: 1,
+            nextColumn: 4,
+            nextByte: 4,
+            // The overshoot the floor promises: the escaped emoji costs 4 bytes against a
+            // `maxBytes` of 3, and no line was rendered, so the gutter adds nothing.
+            bytes: 4,
+            sizeBytes: 8
+        });
+
+        // The proof that this is a cursor and not a decoration: the same 3-byte allowance
+        // from the reported offset reads the three bytes that follow the emoji.
+        expect((await read([{ path: emoji, startByte: 4, maxBytes: 3 }])).files[0].content).toBe('abc');
+
+        // A tab is ONE raw byte but costs two escaped ones, so `maxBytes: 1` cannot hold
+        // it either — the same floor, reached through the accounting the allowance
+        // actually uses rather than through the raw-byte check.
+        const tab = await seed('tab.txt', '\tfoo\n');
+
+        expect((await read([{ path: tab, maxBytes: 1 }])).files[0]).toEqual({
+            path: join(workdir, 'tab.txt'),
+            content: '\t',
+            startLine: 1,
+            endLine: 1,
+            truncated: true,
+            limit: 'maxBytes',
+            startByteAligned: null,
+            nextLine: 1,
+            nextColumn: 1,
+            nextByte: 1,
+            // 1: `bytes` reports the RAW span (a tab occupies one byte on disk), while the
+            // allowance was emptied by the ESCAPED charge of 2. The asymmetry is the M2
+            // contract, not this fix; what this case pins is that the tab is on the page.
+            bytes: 1,
+            sizeBytes: 5
+        });
+
+        // A `numbered` window pays a `1: ` gutter per line out of the same allowance, so
+        // an allowance that cannot hold the gutter alone is this case with a different
+        // reason. The floor covers the gutter too — the charge is what a rendered line costs,
+        // gutter included — so the smallest numbered window is a whole line of text, and the
+        // cursor still moves. `content` carries the source bytes only; the gutter exists
+        // solely in the model's copy.
+        const gutter = await seed('gutter.txt', 'abc\n');
+
+        expect((await read([{ path: gutter, maxBytes: 1, numbered: true }])).files[0]).toEqual({
+            path: join(workdir, 'gutter.txt'),
+            content: 'a',
+            startLine: 1,
+            endLine: 1,
+            truncated: true,
+            limit: 'maxBytes',
+            startByteAligned: null,
+            nextLine: 1,
+            nextColumn: 1,
+            nextByte: 1,
+            // 1 raw byte, while the charge that emptied the allowance was the 3-byte gutter
+            // plus that byte: the floor's overshoot is a rendered line, never a silent drop.
+            bytes: 1,
+            sizeBytes: 4
+        });
+
+        // When the unaffordable code point IS a line terminator, the floor emits THAT
+        // newline and the cursor lands on the NEXT line at column 0: `nextLine`/`nextColumn`
+        // describe where the cursor stands, which is the only pair a `{ startLine,
+        // startColumn }` continuation can feed back without re-reading the newline. A
+        // CRLF file read this way used to lose every `\r\n` pair in the file.
+        const newlines = await seed('cursor-newlines.txt', 'a\nbb\nccc\n');
+
+        expect((await read([{ path: newlines, startByte: 1, maxBytes: 1 }])).files[0]).toEqual({
+            path: join(workdir, 'cursor-newlines.txt'),
+            content: '\n',
+            startLine: 1,
+            // 1: a newline belongs to the line it TERMINATES, and `nextLine` is the line
+            // that starts at `nextByte` — the pair a `{ startLine, startColumn }` request
+            // feeds back without re-reading the terminator.
+            endLine: 1,
+            truncated: true,
+            limit: 'maxBytes',
+            startByteAligned: null,
+            nextLine: 2,
+            nextColumn: 0,
+            nextByte: 2,
+            // 1, not 2: `bytes` reports the RAW span (the newline occupies one byte on
+            // disk) while the allowance was emptied by its ESCAPED cost of 2 — the M2 split
+            // of units, the same one the `maxBytes` schema spells out. What this case pins
+            // is that the newline itself is on the page instead of being stepped over.
+            bytes: 1,
+            sizeBytes: 9
+        });
+
+        // The limit that the header documents: a NUL at the window start is EBINARY, not
+        // stepped over — the caller pointed at the byte that says "this is not text".
+        const nulled = await seedBytes('cursor-nul.txt', Buffer.from([0x61, 0x00, 0x62]));
+
+        expect((await read([{ path: nulled, startByte: 1, maxBytes: 1 }])).files[0].error?.code).toBe('EBINARY');
+    });
+
+    it('walks a tiny allowance to a CLEAN end rather than into an ERANGE wall (F5)', async () => {
+        // The reviewer's F5-4, which the header's promise ("the two EOF answers are
+        // equivalent — an end-of-file continuation ends the walk cleanly") did not hold.
+        // The cursor repair used to STEP the last code point of a file without emitting it,
+        // so the walk reached EOF with that character unread and the next request carried
+        // `startByte === sizeBytes` — the one value ERANGE rejects. A line-axis walk ended
+        // `truncated: false`; a byte-axis walk of the same file ended in an error. The
+        // one-code-point floor removed the asymmetry, and this pins the walk end to end.
+        const text = 'a\nbb\nccc\n';
+        const file = await seed('tiny-walk.txt', text);
+        const pages: FileReadEntry[] = [];
+
+        for (let guard = 0; guard < 32; guard += 1) {
+            const entry = (await read([{ path: file, startByte: pages.length === 0 ? 0 : (pages[pages.length - 1].nextByte as number), maxBytes: 1 }])).files[0];
+
+            pages.push(entry);
+            if (!entry.truncated) break; // the clean end; ERANGE would have set entry.error
+        }
+
+        // The walk ended on its own terms: no ERANGE anywhere, and the last page says
+        // "finished" the way the line-axis answer does — untruncated, cursor null.
+        expect(pages.some((entry) => entry.error !== undefined)).toBe(false);
+        expect(pages[pages.length - 1].truncated).toBe(false);
+        expect(pages[pages.length - 1].nextByte).toBeNull();
+        // The equivalence itself: one page per code point, and their concatenation IS the
+        // file. Nothing was stepped over (the old repair) and nothing was read twice.
+        expect(pages.map((entry) => entry.content)).toEqual(['a', '\n', 'b', 'b', '\n', 'c', 'c', 'c', '\n']);
+        expect(pages.map((entry) => entry.content).join('')).toBe(text);
+
+        // An unterminated final line ends the same way: the last page carries the partial
+        // line and reports EOF, so a caller does not need a second request to find out.
+        const ragged = await seed('tiny-walk-ragged.txt', 'a\nb');
+        const raggedPages: FileReadEntry[] = [];
+
+        for (let guard = 0; guard < 8; guard += 1) {
+            const entry = (await read([{ path: ragged, startByte: raggedPages.length === 0 ? 0 : (raggedPages[raggedPages.length - 1].nextByte as number), maxBytes: 1 }])).files[0];
+
+            raggedPages.push(entry);
+            if (!entry.truncated) break;
+        }
+
+        expect(raggedPages.map((entry) => entry.content)).toEqual(['a', '\n', 'b']);
+        expect(raggedPages[raggedPages.length - 1]).toMatchObject({ truncated: false, nextByte: null, endLine: 2 });
+    });
+
+    it('gives every file of a one-byte batch a code point, inside the wire cap (C1)', async () => {
+        // F1 with the batch allocation. The floor is what makes these pages carry anything;
+        // the RESERVE is what keeps the floor from breaking the envelope. The batch used to
+        // hand every file an allowance of 1 with no headroom, so the escaped overshoot the
+        // floor needs came out of nothing and a `maxBytes: 1` batch of 100 files used to
+        // return 100 empty entries (the reviewer's probe measured 492 wire bytes for 100
+        // files, all of it metadata, with 100 empty contents). Now the per-file floor
+        // headroom is taken off the top BEFORE the pool is split, so the sum of what the
+        // floor may emit is budgeted, not hoped for.
+        const files = await Promise.all(
+            Array.from({ length: 100 }, (_, index) => seed(`tiny-batch/f${index}.txt`, `${index} line\n`))
+        );
+        const batch = await read(files.map((path) => ({ path, maxBytes: 1 })));
+
+        expect(batch.files.every((entry) => entry.error === undefined)).toBe(true);
+        // One code point each, in caller order — the first character of each file.
+        expect(batch.files.map((entry) => entry.content)).toEqual(files.map((_, index) => String(index)[0]));
+        expect(batch.files.map((entry) => entry.bytes)).toEqual(files.map(() => 1));
+        // The envelope holds with the floors included, and the accounting is exact.
+        // The envelope holds with the floors included: `bytes` is exactly the 100 code
+        // points the floor emitted, and the rest of the wire is the fixed metadata.
+        expect(batch.bytes).toBe(100);
+        expect(batch.wireBytes).toBeLessThanOrEqual(FILE_READ_WIRE_BUDGET);
+        expect(batch.wireBytes).toBeGreaterThan(batch.bytes);
+        // And every cursor moved, so paging from any of them is progress, not a loop.
+        expect(batch.files.every((entry) => entry.truncated && entry.nextByte === 1)).toBe(true);
+    });
+
+    it('refuses a NUL only on the page that contains it', async () => {
+        // Decision 10, and the two-scope contract the header states. BINARY rejection is
+        // not a whole-file verdict: the NUL check is WINDOW-scoped (it fires on the
+        // character the window is about to emit) while the invalid-UTF-8 check is
+        // CHUNK-scoped (the strict decoder is handed the whole read chunk). A caller that
+        // cannot predict which of its windows gets the verdict cannot page a 100 KB log at
+        // all, which is what the old whole-chunk `includes('\u0000')` made it.
+        const body = Buffer.alloc(102_400, 0x61);
+        body.writeUInt8(0x00, 100_000); // one stray NUL, 100 001 bytes into the file
+        const nulled = await seedBytes('windowed-nul.txt', body);
+
+        // The default window stops 36 KiB short of the NUL, so it is TEXT.
+        const before = (await read([{ path: nulled }])).files[0];
+
+        expect(before.error).toBeUndefined();
+        expect([before.bytes, before.truncated, before.nextByte]).toEqual([65_536, true, 65_536]);
+
+        // The page that walks over it is EBINARY, and so is the read that covers the file.
+        expect((await read([{ path: nulled, startByte: 99_000, maxBytes: 2_048 }])).files[0].error?.code).toBe('EBINARY');
+        expect((await read([{ path: nulled, maxBytes: 262_144 }])).files[0].error?.code).toBe('EBINARY');
+
+        // The chunk half, in both directions: `0xFF` at byte 50 000 is INSIDE the chunk a
+        // window at byte 0 decodes, so that window is refused even though its 10 bytes are
+        // clean; the same read from byte 60 000 has the bad byte BEHIND the seek and reads
+        // fine.
+        const mixed = Buffer.alloc(70_000, 0x61);
+        mixed.writeUInt8(0xff, 50_000);
+        const bad = await seedBytes('chunked-bad.txt', mixed);
+
+        expect((await read([{ path: bad, maxBytes: 10 }])).files[0].error?.code).toBe('EBINARY');
+        expect((await read([{ path: bad, startByte: 60_000, maxBytes: 10 }])).files[0].content).toBe('a'.repeat(10));
+    });
+
+    it('pages one giant line with columns that count from the start of the line', async () => {
+        // H4. `startColumn` is a byte offset INTO a physical line, so `nextColumn` has to
+        // be one too. It used to be counted from wherever THIS window began, which is the
+        // same thing only when the window starts at a line start — so paging a 100 KB line
+        // with the documented `{ startLine, startColumn: nextColumn }` pair reported
+        // column 1000 on every page and read the same 1000 bytes forever.
+        const giant = await seed('giant.txt', `${'x'.repeat(100_000)}\nsecond\n`);
+
+        const first = (await read([{ path: giant, startLine: 1, maxBytes: 1_000 }])).files[0];
+        const second = (await read([
+            { path: giant, startLine: 1, startColumn: first.nextColumn as number, maxBytes: 1_000 }
+        ])).files[0];
+        const third = (await read([
+            { path: giant, startLine: 1, startColumn: second.nextColumn as number, maxBytes: 1_000 }
+        ])).files[0];
+
+        // Each page is 1 000 bytes of the line, and the column it hands back is where the
+        // NEXT page starts — measured from byte 0 of the line, which is also
+        // `nextByte`, because this line begins at byte 0.
+        expect([first.bytes, first.nextLine, first.nextColumn, first.nextByte]).toEqual([1_000, 1, 1_000, 1_000]);
+        expect([second.bytes, second.nextLine, second.nextColumn, second.nextByte]).toEqual([1_000, 1, 2_000, 2_000]);
+        expect([third.bytes, third.nextLine, third.nextColumn, third.nextByte]).toEqual([1_000, 1, 3_000, 3_000]);
+
+        // Byte-exact, in order, with no gap and no repeat: page 2 is the bytes the window
+        // of page 1 never returned.
+        expect(first.content).toBe('x'.repeat(1_000));
+        expect(second.content).toBe('x'.repeat(1_000));
+        expect(third.content).toBe('x'.repeat(1_000));
+
+        // The same rule on a line that does NOT start at byte 0: a seek lands mid-line, so
+        // the window-relative and line-relative answers differ, and the line-relative one
+        // is what the entry owes. Line 2 of this file starts at byte 6.
+        const two = await seed('giant-two-lines.txt', `line1\n${'x'.repeat(200)}\n`);
+        const sought = (await read([{ path: two, startByte: 7, maxBytes: 10 }])).files[0];
+
+        expect(sought.content).toBe('x'.repeat(10));
+        // 17 - 6: the cut is at byte 17 and the line begins at byte 6.
+        expect([sought.nextLine, sought.nextColumn, sought.nextByte]).toEqual([2, 11, 17]);
+    });
+
+    it('names the line a startColumn past the end of the line actually returned', async () => {
+        // H5. A `startColumn` longer than `startLine` consumes that line's terminator and
+        // starts on the next line — the behaviour every version of the skip had, and what
+        // a caller walking `{ startLine, startColumn }` depends on. What was wrong is that
+        // the entry kept REPORTING the line the caller named, so it printed line 2's text
+        // under line 1's number and derived `lineCount` from `startLine - 1`, under-counting
+        // by exactly the newline the skip crossed.
+        const shifted = await seed('column-past-line.txt', 'abcdefghij\nsecond\nthird\n');
+
+        expect((await read([{ path: shifted, startLine: 1, startColumn: 20 }])).files[0]).toEqual({
+            path: join(workdir, 'column-past-line.txt'),
+            content: 'second\nthird\n',
+            // The line the window starts on (2), not the one that was asked for (1), and
+            // the whole file's count is right (3), not short by the crossed newline (2).
+            startLine: 2,
+            endLine: 3,
+            truncated: false,
+            limit: null,
+            startByteAligned: null,
+            nextLine: null,
+            nextColumn: null,
+            nextByte: null,
+            bytes: 13,
+            sizeBytes: 24,
+            lineCount: 3
+        });
+
+        // A column that fits inside the line keeps reporting the line it was given — the
+        // fix is about the position actually reached, not about rewriting every read.
+        const inside = (await read([{ path: shifted, startLine: 1, startColumn: 4 }])).files[0];
+
+        expect([inside.startLine, inside.lineCount, inside.content]).toEqual([1, 3, 'efghij\nsecond\nthird\n']);
+    });
+
+    it('answers any startLine of an empty file with the empty window it always had', async () => {
+        // M11. The line axis made `startLine: 5000` of a 1300-line file an ERANGE entry
+        // (and it stays one — pinned above), but the same rule applied to a 0-BYTE file
+        // told a caller its offset was out of range in a file that has nothing out of
+        // range: the walk that "ran out of file" never ran, because there was no file to
+        // walk. An empty file answers the empty window, with the line count that says so.
+        const nothing = await seed('m11-empty.txt', '');
+
+        expect((await read([{ path: nothing, startLine: 5 }])).files[0]).toEqual({
+            path: join(workdir, 'm11-empty.txt'),
+            content: '',
+            startLine: 5,
+            endLine: 4,
+            truncated: false,
+            limit: null,
+            startByteAligned: null,
+            nextLine: null,
+            nextColumn: null,
+            nextByte: null,
+            bytes: 0,
+            sizeBytes: 0,
+            lineCount: 0
+        });
+
+        // `startLine: 1` is the same answer with the number the caller stood on, and the
+        // byte axis keeps its own rule: an empty file still has no byte at offset 0, so
+        // `startByte: 0` there is ERANGE, not an empty window.
+        expect((await read([nothing])).files[0].lineCount).toBe(0);
+        expect((await read([{ path: nothing, startByte: 0 }])).files[0].error?.code).toBe('ERANGE');
+
+        // And a NON-empty file is still strict about a line past its end, naming the
+        // count. `startLine: 1301` of 1300 is the legal boundary one past the last line;
+        // 1302 is a line the file does not have.
+        const lines = join(workdir, 'lines.txt');
+        const boundary = (await read([{ path: lines, startLine: 1_301 }])).files[0];
+
+        expect([boundary.error, boundary.bytes, boundary.truncated, boundary.startLine]).toEqual([
+            undefined,
+            0,
+            false,
+            1_301
+        ]);
+
+        const past = (await read([{ path: lines, startLine: 1_302 }])).files[0];
+
+        expect(past.error?.code).toBe('ERANGE');
+        expect(past.error?.message).toContain('1300');
+    });
+
+    it('gives up on an endless continuation run instead of calling the file binary', async () => {
+        // L8. A seek into a byte that is not a code-point start is aligned FORWARD, and
+        // the search is BOUNDED: a run of continuation bytes longer than any real code
+        // point is invalid data, and walking an unbounded run of them from a seek into a
+        // 200 MB file would be unbounded work for an answer that is "these bytes are not
+        // text" either way. Giving up reports EOF — the empty window at the end of the
+        // file — rather than a window that starts mid-sequence and decodes to EBINARY.
+        const misaligned = await seedBytes(
+            'misaligned.txt',
+            Buffer.concat([Buffer.from('a'), Buffer.from([0x80, 0x80, 0x80, 0x80, 0x80])])
+        );
+
+        expect((await read([{ path: misaligned, startByte: 1, lossy: false }])).files[0]).toEqual({
+            path: join(workdir, 'misaligned.txt'),
+            content: '',
+            startLine: 1,
+            endLine: 0,
+            truncated: false,
+            limit: null,
+            // The alignment did happen, and the entry says where the window really began:
+            // at the end of the file, because the bytes in between are not decodable.
+            startByteAligned: 6,
+            nextLine: null,
+            nextColumn: null,
+            nextByte: null,
+            bytes: 0,
+            sizeBytes: 6,
+            lineCount: 1
+        });
+
+        // A run of 5 continuation bytes is already past the 4-byte ceiling of a code
+        // point, and the probe grows 4 -> 16 -> 64 before it gives up, so a 300-byte run
+        // is answered the same way without scanning the rest of a big file.
+        const long = await seedBytes('misaligned-long.txt', Buffer.concat([Buffer.from('a'), Buffer.alloc(300, 0x80)]));
+        const walked = (await read([{ path: long, startByte: 1 }])).files[0];
+
+        expect([walked.bytes, walked.startByteAligned, walked.error]).toEqual([0, 301, undefined]);
+
+        // Ordinary UTF-8 is still aligned, not given up on: a seek into the MIDDLE of a
+        // 2-byte character moves to the next whole one and reads it, and the entry says
+        // where the window really began. In `café`, the `é` is bytes 3-4, so a seek to the
+        // continuation byte at 4 begins at 5.
+        const accents = await seed('misaligned-fine.txt', 'café\n');
+        const aligned = (await read([{ path: accents, startByte: 4 }])).files[0];
+
+        expect([aligned.content, aligned.startByteAligned, aligned.bytes]).toEqual(['\n', 5, 1]);
+    });
+
+    it('charges maxBytes in escaped bytes while bytes stays raw', async () => {
+        // M2. The two numbers are deliberately different units, and a caller that cannot
+        // predict the difference reads `bytes: 67` from a `maxBytes: 100` window as an
+        // off-by-33 bug. The allowance bounds what the CONTEXT pays — the escaped form —
+        // while `bytes` bounds what the FILE holds. Both are exact; neither is the other.
+        const newlines = await seed('escaped-units.txt', 'a\n'.repeat(60));
+        const cut = (await read([{ path: newlines, maxBytes: 100 }])).files[0];
+
+        // 33 whole lines plus the `a` of line 34: 67 raw bytes, 34 `a`s and 33 newlines.
+        expect(cut.content).toBe(`${'a\n'.repeat(33)}a`);
+        expect([cut.bytes, cut.startLine, cut.endLine, cut.truncated, cut.limit]).toEqual([67, 1, 34, true, 'maxBytes']);
+        expect([cut.nextLine, cut.nextColumn, cut.nextByte]).toEqual([34, 1, 67]);
+
+        // The allowance was spent EXACTLY, in its own units: the escaped cost of what was
+        // returned is 100, and the raw count is 33 bytes short of it.
+        expect(Buffer.byteLength(JSON.stringify(cut.content), 'utf8') - 2).toBe(100);
+        expect(Buffer.byteLength(cut.content, 'utf8')).toBe(67);
+
+        // The same shape from the other side: quote-heavy content costs the escape twice,
+        // so a 8-byte allowance returns 5 raw bytes.
+        const quotes = await seed('escaped-quotes.txt', '"a\n"a\n"a\n');
+
+        expect((await read([{ path: quotes, maxBytes: 8 }])).files[0]).toEqual({
+            path: join(workdir, 'escaped-quotes.txt'),
+            content: '"a\n"a',
+            startLine: 1,
+            endLine: 2,
+            truncated: true,
+            limit: 'maxBytes',
+            startByteAligned: null,
+            nextLine: 2,
+            nextColumn: 2,
+            nextByte: 5,
+            bytes: 5,
+            sizeBytes: 9
+        });
+    });
+
+    it('reads a file whose share the per-entry reserves ate instead of reporting EIO', async () => {
+        // Zero allowance. The allocation passes used to be guarded by `allowance > 0`, so
+        // a batch whose per-entry reserves exceeded the envelope (here: 95 unreadable
+        // paths with long names, each of whose error message is reserved up front) ran NO
+        // pass at all, the readable file kept `entry: null`, and the fallback called it
+        // `EIO` — an I/O failure for a file that was never read. A 0-byte allowance is
+        // just the tightest allowance there is.
+        const lines = join(workdir, 'lines.txt');
+        const missing = Array.from(
+            { length: 95 },
+            (_, index) => join(workdir, 'reserves', `${'x'.repeat(1_200)}-missing-${index}.txt`)
+        );
+
+        const starved = await read([...missing, { path: lines }]);
+
+        // `EIO` is back to meaning "this handle could not be read": it appears nowhere.
+        expect(starved.files.some((entry) => entry.error?.code === 'EIO')).toBe(false);
+        expect(starved.files.filter((entry) => entry.error !== undefined)).toHaveLength(95);
+
+        // The readable file got the smallest window the floor allows — one code point,
+        // cut by the batch, with a cursor that moves — so a caller paging from a share of
+        // nothing still makes progress instead of looping on an empty page.
+        expect(starved.files[95]).toEqual({
+            path: lines,
+            content: 'l',
+            startLine: 1,
+            endLine: 1,
+            truncated: true,
+            limit: 'budget',
+            startByteAligned: null,
+            nextLine: 1,
+            nextColumn: 1,
+            // > the offset the window started at (0): the C2 floor, applied to a share of
+            // nothing rather than to a small `maxBytes`.
+            nextByte: 1,
+            bytes: 1,
+            sizeBytes: Buffer.byteLength(LINES_1300, 'utf8')
+        });
+    });
+
+    // -----------------------------------------------------------------------
     // THE MODEL PROJECTION. The machine view (`files[]`) and the model's copy are the
     // SAME facts in two renderings, delivered through one branded envelope
     // (../../core/tool-text.ts) and peeled in exactly one place. What these tests pin:
@@ -1554,6 +2105,152 @@ describe('read', () => {
         // allowance the same allowance bought unnumbered.
         expect(numbered.result.modelBytes).toBeGreaterThan(plain.result.modelBytes);
         expect(numbered.result.files[0].bytes).toBeLessThanOrEqual(plain.result.files[0].bytes);
+    });
+
+    it('numbers the model copy of ONE file, not of the whole batch', async () => {
+        // M1. Numbering was a BATCH-wide flag (`requested.some(...)`), so one caller
+        // asking for line numbers printed a gutter on every other file in the call — and
+        // since a gutter is charged, it also shrank the windows of files whose owners
+        // never asked for one. The flag is per entry now, index-aligned with `files[]`.
+        const lines = join(workdir, 'lines.txt');
+        const caps = { startLine: 995, maxLines: 10, maxBytes: 128 };
+
+        // A cap chosen so the difference is visible: 128 bytes is exactly the point where
+        // paying for a gutter decides how much text fits.
+        const solo = await read([{ path: lines, ...caps }]);
+        const mixed = await read([{ path: lines, ...caps }, { path: lines, ...caps, numbered: true }]);
+
+        // The unnumbered file's entry is the SAME object shape and the SAME window it
+        // gets alone: its bytes were not spent on a gutter it never asked for.
+        expect(mixed.files[0]).toEqual(solo.files[0]);
+        expect(mixed.files[0].content.startsWith('line 995\n')).toBe(true);
+        expect(mixed.files[0].content).toContain('line 1004');
+
+        // The numbered sibling paid for its gutter, so it holds less text — 73 raw bytes
+        // against 95, cut at line 1002 instead of running to the 10-line cap.
+        expect([mixed.files[1].bytes, mixed.files[1].endLine, mixed.files[1].nextByte]).toEqual([73, 1_002, 8_911]);
+
+        // And the prose says which file has gutters: only the one that asked.
+        const alpha = await seed('m1-alpha.txt', 'alpha\n');
+        const bravo = await seed('m1-bravo.txt', 'bravo\n');
+        const both = await readBoth([{ path: alpha }, { path: bravo, numbered: true }]);
+
+        expect(both.text).toContain('\nalpha\n');
+        expect(both.text).toContain('\n1: bravo\n');
+        expect(both.text).not.toContain('1: alpha');
+        // The machine view is untouched in both directions.
+        expect(both.result.files.map((entry) => entry.content)).toEqual(['alpha\n', 'bravo\n']);
+    });
+
+    it('charges the gutter at the width the model copy pads to', async () => {
+        // L1, restated after the reviewer's F4. The invariant this charge exists for is NOT
+        // "the model's copy is never larger than the machine view" — escapes and the
+        // continuation note can make the prose bigger, and it legitimately is here. What has
+        // to hold is that the gutter the SCANNER charges is at least the gutter the RENDERER
+        // prints, so a window can never be cut at an allowance the wire then cannot pay.
+        // Charging `String(lineNumber).length` per line under-charged every line of a window
+        // that later crossed a digit boundary (995-999 are 3 wide, 1000 onward are 4).
+        const lines = join(workdir, 'lines.txt');
+        const capped = await readBoth([
+            { path: lines, startLine: 995, maxLines: 10, maxBytes: 128, numbered: true }
+        ]);
+
+        // 128 is the discriminating cap. Charged per line at the CURRENT width, lines
+        // 995-999 cost 16 escaped bytes of text ('line 995\n') plus 5 of gutter each and
+        // line 1002 (12 + 6) fits at 126 — the window would end at line 1002 complete, 79
+        // bytes, cursor 8913. Charged at the width the renderer pads to (4 digits for a
+        // window that reaches 1000), all of line 1002 costs 132, does not fit, and the
+        // window stops 8 bytes into it — which is what the entry has to report.
+        expect(capped.result.files[0]).toEqual({
+            path: lines,
+            content: `${['995', '996', '997', '998', '999', '1000', '1001'].map((n) => `line ${n}\n`).join('')}line 100`,
+            startLine: 995,
+            endLine: 1_002,
+            truncated: true,
+            limit: 'maxBytes',
+            startByteAligned: null,
+            nextLine: 1_002,
+            // 8911 - 8903: 8 bytes into line 1002, counted from the start of THAT line.
+            nextColumn: 8,
+            nextByte: 8_911,
+            bytes: 73,
+            sizeBytes: Buffer.byteLength(LINES_1300, 'utf8')
+        });
+
+        // The invariant the charge exists for, on the read that stresses it, is not an
+        // ordering of the two views (F4) — it is that the machine view fits the budget it
+        // names. Here the JSON is the larger number (476 against 368) because the entry's
+        // fixed fields and the escaped content outweigh a 73-byte prose window; either way
+        // the wire is inside `contentBudget`, which is what keeps the continuation from
+        // being cut.
+        expect(capped.result.wireBytes).toBe(476);
+        expect(capped.result.modelBytes).toBe(368);
+        expect(capped.result.wireBytes).toBeLessThanOrEqual(capped.result.contentBudget);
+
+        // One steady gutter across the 999 -> 1000 boundary — the alignment is the
+        // feature, and a ragged gutter is what the per-line width produced.
+        expect(capped.text).toContain(
+            '\n 995: line 995\n 996: line 996\n 997: line 997\n 998: line 998\n 999: line 999\n' +
+                '1000: line 1000\n1001: line 1001\n1002: line 100\n'
+        );
+        expect(capped.text).toContain('  [truncated by maxBytes; 73 bytes returned; continue from startByte 8911, or startLine 1002 +8 bytes into it]\n');
+    });
+
+    it('states the real relationship between the two views, in both directions (F4)', async () => {
+        // F4. The header used to promise `modelBytes <= wireBytes` ("the model's copy is
+        // provably no larger than the machine view"), and the test that appeared to prove it
+        // ran a plain, single-digit, one-line window where the escapes happened to cost the
+        // prose nothing. The two views are BUDGETED, not ordered, and this pins both
+        // directions with numbers a reader can recompute.
+        const pair = await seed('views.txt', 'x\ny\n');
+        const numbered = await readBoth([{ path: pair, numbered: true }]);
+
+        // Direction 1 — the shape a reader meets first, and the only one the old invariant
+        // ever saw: a four-byte window costs MORE on the machine view than in prose, because
+        // the entry carries twelve fixed fields whatever the content is. These two numbers
+        // move with the fixture's path length; the direction is the point.
+        expect(numbered.result.files[0].content).toBe('x\ny\n');
+        expect(numbered.result.files[0].bytes).toBe(4);
+        expect(numbered.result.wireBytes).toBe(404);
+        expect(numbered.result.modelBytes).toBe(179);
+
+        // Direction 2 — the one the old invariant ruled out. The gutter lives only in the
+        // prose, yet it is charged against the machine allowance, so a large numbered window
+        // delivers more bytes of TEXT than the machine view costs: this window is the whole
+        // of `lines.txt`, the machine view serializes it once, and the model's copy pays a
+        // gutter on all 1300 lines on top of it.
+        const lines = join(workdir, 'lines.txt');
+        const whole = await readBoth([{ path: lines, startLine: 1, maxLines: 1_300, maxBytes: 65_536, numbered: true }]);
+
+        expect(whole.result.files[0].endLine).toBe(1_300);
+        expect(whole.result.files[0].bytes).toBe(Buffer.byteLength(LINES_1300, 'utf8'));
+        // Pinned exactly. The larger number is the PROSE — the asymmetry the header
+        // documents rather than a bug in it.
+        expect(whole.result.wireBytes).toBe(13_613);
+        expect(whole.result.modelBytes).toBe(19_876);
+
+        // What the guarantee actually is, on both shapes: the machine view — the part the
+        // harness envelope would have to fit — always fits the budget it names, so the
+        // continuation fields survive and the prose is never the thing that gets cut.
+        expect(numbered.result.wireBytes).toBeLessThanOrEqual(numbered.result.contentBudget);
+        expect(whole.result.wireBytes).toBeLessThanOrEqual(whole.result.contentBudget);
+
+        // And the property the projection exists for: whatever the machine view delivered,
+        // the prose carries the SAME content, so neither consumer can be cut off from a fact
+        // the other one has. For a plain window that is literal — the bytes of `content`
+        // appear in the prose exactly as they are.
+        const controls = await seed('views-controls.txt', 'a"b\tc\n');
+        const plain = await readBoth([{ path: controls, maxBytes: 7 }]);
+
+        // `maxBytes: 7` is spent on 'a' (1) + '"' (2, escaped) + 'b' (1) + '\t' (2, escaped)
+        // + 'c' (1) = 7, so the newline does not fit: 5 RAW bytes in `content` against the
+        // 7-byte ESCAPED allowance that paid for them — the M2 units, visible in one window.
+        expect(plain.result.files[0].content).toBe('a"b\tc');
+        expect(plain.result.files[0].bytes).toBe(5);
+        expect(plain.text).toContain(plain.result.files[0].content);
+        // For a numbered window, the same fact in the rendering the model reads: every line
+        // the machine view delivered appears with its gutter.
+        expect(numbered.text).toContain('1: x\n2: y\n');
     });
 
     it('substitutes for invalid UTF-8 only when asked, and still refuses NUL', async () => {

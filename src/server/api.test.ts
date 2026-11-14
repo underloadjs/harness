@@ -1736,7 +1736,8 @@ describe('harness catalogue reads', () => {
                         additionalProperties: boolean;
                         properties: {
                             op: { enum: string[] };
-                            limit: { maximum: number };
+                            offset: { type: string; description: string };
+                            limit: { type: string; description: string };
                         };
                     };
                 };
@@ -1759,8 +1760,26 @@ describe('harness catalogue reads', () => {
             'mkdir'
         ]);
         // Paging is a property of the list operation, not of the call, so the entry-level
-        // cap is where a paged answer is bounded.
-        expect(filesSchema.properties.ops.items.properties.limit.maximum).toBe(1000);
+        // bound is where a paged answer is described. The published item carries NO
+        // `minimum`/`maximum` for `offset`/`limit`, deliberately: out-of-range values are
+        // CLAMPED by the tool (negative offset -> 0, limit below 1 -> 1, above
+        // FILES_LIST_MAX_LIMIT=1000 -> 1000) rather than rejected, and a bound published
+        // HERE would be enforced by ../core/schema-validation.ts before `execute` ever ran,
+        // turning the "an oversized page is never rejected" promise into a 400. That is the
+        // contract ./files/files.test.ts:162 pins at the tool level and
+        // ./files/files.test.ts:886 pins for the clamp itself; this is the same contract read
+        // through the HTTP schema endpoint, so it is pinned FIELD BY FIELD — an added bound
+        // or a lost sentence fails here.
+        expect(filesSchema.properties.ops.items.properties.offset).toEqual({
+            type: 'integer',
+            description:
+                'list: 0-based index into the flat entry list. Defaults to 0; pass the previous nextOffset here. A negative value is clamped to 0.'
+        });
+        expect(filesSchema.properties.ops.items.properties.limit).toEqual({
+            type: 'integer',
+            description:
+                'list: maximum entries in this page. Defaults to 200; values above 1000 are clamped to 1000 and values below 1 to 1, so an oversized page is never rejected.'
+        });
 
         // The unconfigured environment row is listed but not manually executable, and a name the
         // catalogue never had is a 404.

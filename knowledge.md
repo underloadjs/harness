@@ -1954,10 +1954,10 @@ list (`enableAllTools`, see [Tool discovery](#tool-discovery)).
 | Export | Call | Result |
 |---|---|---|
 | `syntax` | `({ code, language: string })` — validated free name: `javascript`/`js`, `typescript`/`ts`, `tsx`, `jsx`, `json`, `python`/`py`/`python3` (trimmed, case-folded, a leading dot allowed) | `boolean`; an unsupported language, a non-string `code`, a missing interpreter, and a cancelled or timed-out Python run are all ERRORS, never a verdict |
-| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines?, maxBytes?, lossy?, numbered? })[])` — non-empty, ≤100 | a `toolText()` **envelope**, not a plain value: `{ content: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, error? }], truncated, bytes, wireBytes, contentBudget, modelBytes, skipped, note? }, __toolText: <projection> }` — `unwrapToolResult` hands the object to a programmatic caller (the server's manual-execute answer included) and the prose to the transcript. Per-file defaults `startLine 1`, `startColumn 0`, `startByte null`, **`maxLines 2000`, `maxBytes 65536`** — deliberately SMALL, because a read feeds a context window; ceilings 20000 lines / 262144 bytes, and an explicit value outside them is refused, never clamped. `limit` names WHICH governor cut a window (`'maxLines'` / `'maxBytes'` / `'budget'` / `null` for EOF) and `lineCount` (the `wc -l` figure) appears only when the newlines were counted to EOF. The 256 KiB budget is measured on the **serialized** result and water-filled by demand, so `modelBytes <= wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap — the `note`'s own size is reserved before the split, and it appears only for a file of `65536` bytes or more whose window was cut (up to 2 paths named, the rest counted). A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'ERANGE' \| 'EIO', message }` and consumes no budget: ENOENT names up to 3 near-miss siblings (`FILE_READ_SUGGESTION_MAX`) or the nearest existing ancestor, EISDIR previews up to 12 entries (`FILE_READ_PREVIEW_MAX`), an `ERANGE` seek past EOF names the file's size or line count, and `lossy: true` substitutes U+FFFD for undecodable bytes instead of reporting EBINARY (the entry then says `lossy: true`; a NUL is still binary). Only a malformed request rejects the call. Binary detection is window-scoped, not whole-file |
-| `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected by file identity, NUL content rejected (read would refuse it). Serialized per file against a concurrent `edit` on the same path |
-| `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes, match? }[]`; exact-first matching (typographic and trailing-whitespace fallbacks, line endings preserved), all preflighted before the first write, each file written once. `match` names a fallback tier. Read-match-write is one per-file critical section (`./tools/files/lock.ts`), so a concurrent call fails with "no match" instead of clobbering the other's change |
-| `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` - non-empty, ≤100 | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` → `{ path, entries, truncated, nextOffset, offset, limit, bytes }` (ONE page of `dir/entry`, directories end with `/`, non-recursive, 200 entries default / 1000 max, 64 KiB of entry text shared by every list operation in the call); `move`/`copy` → `{ path, to, kind, bytes }`, and an existing destination is refused unless `overwrite`; `delete` → `{ path, removed, recursive }` (a non-empty directory needs `recursive`, a missing path needs `force` and is then reported `removed: false, skipped: true`); `mkdir` → `{ path, created }`, creating parents and reporting an existing directory as `created: false`. A failed list entry carries its own `error: { code, message }`; a failed mutation rejects the call and names the operations already applied (there is no rollback). Operations run in array order against the state each one finds, and mutations hold the same per-file locks as `write`/`edit` (`./tools/files/lock.ts`) |
+| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines?, maxBytes?, lossy?, numbered? })[])` — non-empty, ≤100 | a `toolText()` **envelope**, not a plain value: `{ content: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, error? }], truncated, bytes, wireBytes, contentBudget, modelBytes, skipped, note? }, __toolText: <projection> }` — `unwrapToolResult` hands the object to a programmatic caller (the server's manual-execute answer included) and the prose to the transcript. Per-file defaults `startLine 1`, `startColumn 0`, `startByte null`, **`maxLines 2000`, `maxBytes 65536`** — deliberately SMALL, because a read feeds a context window; ceilings 20000 lines / 262144 bytes, and an explicit value outside them is refused, never clamped. `maxBytes` is charged in **escaped wire bytes** — the unit `wireBytes` counts, not the raw bytes `bytes` reports — so a newline-heavy window stops with `bytes` well under the allowance and `limit: 'maxBytes'`. `limit` names WHICH governor cut a window (`'maxLines'` / `'maxBytes'` / `'budget'` / `null` for EOF) and `lineCount` (the `wc -l` figure) appears only when the newlines were counted to EOF. A truncated entry's `nextByte` is always STRICTLY PAST the offset its own window started at, so paging terminates, and `nextColumn` is counted from the PHYSICAL start of `nextLine` (never from a seek), so `{ startLine: nextLine, startColumn: nextColumn }` resumes exactly — including through a line longer than `maxBytes`. A `startColumn` past the end of `startLine` lands on the NEXT line and the entry reports the line it actually returned. The off-the-end axes answer differently: `startByte` at or past EOF is `ERANGE`, `startLine === lineCount + 1` is a legal empty window, `startLine > lineCount + 1` is `ERANGE`, and a 0-byte file answers ANY `startLine` with the empty window and `lineCount: 0`. `numbered: true` is PER FILE — the `123: ` gutter lands on that file's model copy only and is charged against that file's `maxBytes` at the padded width the projection pads to. The 256 KiB budget is measured on the **serialized** result and water-filled by demand, so `modelBytes <= wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap — the `note`'s own size is reserved before the split, and it appears only for a file of `65536` bytes or more whose window was cut (up to 2 paths named, the rest counted). A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'ERANGE' \| 'EIO', message }` and consumes no budget: ENOENT names up to 3 near-miss siblings (`FILE_READ_SUGGESTION_MAX`) or the nearest existing ancestor, EISDIR previews up to 12 entries (`FILE_READ_PREVIEW_MAX`), an `ERANGE` seek past EOF names the file's size or line count, and `lossy: true` substitutes U+FFFD for undecodable bytes instead of reporting EBINARY (the entry then says `lossy: true`; a NUL is still binary). Only a malformed request rejects the call. The NUL check is WINDOW-scoped and the invalid-UTF-8 check CHUNK-scoped; neither is whole-file validation. A readable file whose share of the envelope was consumed by the per-entry reserves gets an empty truncated window (`limit: 'budget'`), never `EIO` |
+| `write` | `(files: { path, content }[])` — non-empty, ≤100 (`FILE_WRITE_MAX_TARGETS`) | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected by file identity, NUL content rejected (read would refuse it). Serialized per file against a concurrent `edit` on the same path. Each file is PUBLISHED ATOMICALLY (`writeAtomically`): the payload goes into a staging file created next to the RESOLVED target (`realWriteTarget`, so the rename stays on one device), the existing file's mode is copied onto it (`existingMode` + `chmod`), and a same-directory rename swaps the directory ENTRY — so a reader sees the whole previous content or the whole new content, never a prefix, and a failure before the rename leaves the target exactly as it was with the staging file removed. What that trade buys, stated plainly: the target gets a NEW inode, so an already-open handle, a hard link, `uid`/`gid` and xattrs keep describing the OLD file (the mode travels, ownership does not); a read-only FILE is now overwritable, because only the DIRECTORY's permissions gate the rename; a DANGLING symlink is replaced by a regular file, where the in-place write created the file the link pointed at; and no `fsync` was added, so the power-loss durability boundary is the one in-place writing already had |
+| `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty, ≤100 (`FILE_EDIT_MAX_TARGETS`, and the same `maxItems: 100` is published in the schema) | ordered `{ path, replacements, bytes, match? }[]`; exact-first matching (typographic and trailing-whitespace fallbacks), all preflighted before the first write, each file written once. `match` names a fallback tier and can ONLY be `'typographic'` or `'trailing-whitespace'` — there is no ending-related value; the trailing-whitespace tier matches WHOLE LINES, so an edit that came through it replaces those whole lines and the trailing whitespace inside the region goes with them. Line endings: an LF-only `newString` adopts the endings of the matched region, while a `newString` containing `\r` is ENDING-EXPLICIT and is written VERBATIM, byte for byte (`edit.tool.ts` `verbatim`), so an explicit `\r\n` is never rewritten into the file's endings — converting endings is an `oldString`/`newString` pair that differs only in `\r`, which matches exact bytes. A target whose bytes are not valid UTF-8, or that holds a NUL, is refused with `EBINARY` naming the byte offset during the preflight (`decodeEditSource` / `firstInvalidUtf8Byte`), rewriting nothing — it used to round-trip a Latin-1 file as U+FFFD and report success. The file itself is still written IN PLACE (truncate + write, so the inode and its mode survive). Read-match-write is one per-file critical section (`./tools/files/lock.ts`), so a concurrent call fails with "no match" instead of clobbering the other's change |
+| `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` - non-empty, ≤100 (`FILES_MAX_OPS`) | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` → `{ path, entries, truncated, nextOffset, offset, limit, bytes, error? }` (ONE page of `dir/entry`, directories end with `/` — including a symlink that resolves to one, since "walkable" is what the slash means — non-recursive; `limit` defaults to 200 and is CLAMPED into 1..1000, `offset` is clamped to ≥0, and neither is ever rejected, which is why the published schema carries NO `minimum`/`maximum` on those two fields — a schema bound would be enforced before `execute` and turn the runtime clamp into a dead branch; the 64 KiB `FILES_CONTENT_BUDGET` of entry text is ONE mutable allowance threaded through every list op in the CALL, so an op whose turn arrives after it is spent answers `entries: []` with `truncated: true` and `nextOffset` naming its own offset while entries remain past it, and `nextOffset` is `null` when nothing was withheld); duplicate or aliased spellings of one directory in a `path` array are walked ONCE, first spelling wins (`dedupePaths` by `fileIdentity`); `move`/`copy` → `{ path, to, kind, bytes }`, an existing destination is refused unless `overwrite`, and a destination that IS the source or lies INSIDE it is refused BEFORE any filesystem change (`selfOrContained`: resolved text first, then real identity, so a symlinked alias is caught) — that guard is what stops `copy X → X` with `overwrite: true` from deleting the tree and reporting success, and `copyDirectory` additionally stops at `FILES_COPY_MAX_DEPTH` (64) levels; a symlink inside a copied tree is copied AS a symlink (target string verbatim, 0 bytes) while a symlinked directory used as the SOURCE is still followed at the top level; `delete` → `{ path, removed, recursive }` (a NON-EMPTY directory needs `recursive`, an EMPTY directory is removed without it, a DANGLING symlink is deletable because the path is examined with `lstat` before anything follows it, and a missing path needs `force` and is then reported `removed: false, skipped: true`); `mkdir` → `{ path, created }`, creating parents and reporting an existing directory as `created: false`. A failed list entry carries its own `error: { code, message }` and does NOT void the directories that could be read — the surviving entries stay in the receipt, the `code` comes from the closed set `ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO` (`failureOf` folds every other errno onto `EIO`) and the raw errno stays in `message`; a failed mutation rejects the call and names the operations already applied (there is no rollback). Operations run in array order against the state each one finds, and mutations hold the same per-file locks as `write`/`edit` (`./tools/files/lock.ts`) |
 | `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — names only; the old `content` property is gone and the schema rejects it |
 | `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }` (required `pattern`; 1 KiB snippet per line, 64 KiB aggregate) |
 | `shell` | `({ command, cwd?, timeoutMs?, input?, saveOutput? })` | `{ exitCode, stdout, stderr, truncated, stdoutTruncated, stderrTruncated, stdoutBytes, stderrBytes, stdoutDroppedBytes, stderrDroppedBytes, outputPath, timedOut, aborted, exitSignal, durationMs, linesChained }`; stdout 128 KiB / stderr 16 KiB **head+tail** with an in-band `[... N bytes omitted ...]` marker (`./boundedOutput`, because build and test output is read from the end) and the full stream teed to `outputPath` when either was cut; timeout 1..600000 ms (default 120000), process tree killed best-effort (`taskkill /T` cannot reach detached/reparented descendants), and a run that finished on its own is never reported `timedOut`; stdin is closed by default and `input` feeds it; on Windows a multi-line `command` is chained with `&&` because cmd.exe otherwise executes only its first line; `exitCode` is normalised to the signed convention |
@@ -2006,6 +2006,13 @@ Implementation notes worth keeping:
   An explicit value outside `[1, ceiling]` is REFUSED, not clamped — a silent clamp of
   `maxBytes: 10000000` down to the envelope would report `limit: "budget"` for a request the
   caller believed was unlimited, and `limit` is the field that decides whether to ask again.
+  `maxBytes` is a WIRE figure, not a `bytes` figure: it is charged in the escaped form the
+  caller's context pays (`\n` costs 2 escaped bytes there and 1 raw byte in `bytes`), so a
+  newline-heavy window stops at `limit: "maxBytes"` with `bytes` near HALF the allowance —
+  measured, `maxBytes: 100` over `a\n` lines returns 67 raw bytes — and long lines cannot reach
+  the 20 000-line ceiling on bytes at all (measured: 30 001 lines of 24 characters with
+  `maxLines: 20000, maxBytes: 262144` ends at line 10 036 with 250 889 RAW bytes, and its
+  `limit` is `"budget"`, because one file's share of the envelope bit before its own cap).
   The exported defaults round-trip: a caller that reads `FILE_READ_DEFAULT_MAX_LINES` and
   passes it back gets that behaviour, not a validation error.
   **Corrected in place (D11, 2026-11-12):** the bullet this one replaces — and the D6
@@ -2032,14 +2039,37 @@ Implementation notes worth keeping:
   nothing was withheld. It streams 64 KiB chunks and stops at the cap, so a huge file or
   giant line is never read wholesale. `content` is raw text (line 1 is `startLine`); a
   truncated entry reports `nextLine`/`nextColumn`/`nextByte`, where `nextColumn` is a 0-based
-  byte offset inside the line (non-zero only for a line cut mid-line). `startByte = nextByte`
+  byte offset inside the line counted from that line's PHYSICAL start and never from a seek
+  (the removed seek-relative exception made `{ startLine: nextLine, startColumn: nextColumn }`
+  re-read the offset it had just returned, so a mid-line walk never advanced); it is non-zero
+  only for a line cut mid-line. A TRUNCATED entry's `nextByte` is always STRICTLY PAST the
+  offset its own window started at, whatever the allowance: the byte cut happens BEFORE the
+  character is emitted, so an allowance smaller than the first code point at the window start
+  (a 4-byte emoji with `maxBytes: 3`, or a numbered window whose `123: ` gutter alone does not
+  fit) used to answer an empty window whose documented continuation returned that same empty
+  window forever. `startByte = nextByte`
   resumes by SEEKING with no line counting, which is the O(window) way to walk a large file;
   a line-based window at line N rescans from byte 0. A seek past EOF is an `ERANGE` entry that
   names the file's size (a byte seek) or its line count (a `startLine` past the end), never an
-  empty window — an empty success teaches a model that the file is shorter than it is. A NUL
-  or invalid UTF-8 sequence in the chunks DECODED WHILE STREAMING rejects that ENTRY as binary;
-  this is not whole-file validation, since bytes after the last read chunk are never inspected,
-  so one file can read as text for a narrow window and as `EBINARY` for a wide one. A call
+  empty window — an empty success teaches a model that the file is shorter
+  than it is. The two off-the-end axes are deliberately NOT one rule, because "either axis is
+  `ERANGE`" hides a legal case: `startByte >= sizeBytes` is `ERANGE` INCLUDING the offset
+  exactly AT EOF, `startLine === lineCount + 1` is a LEGAL request for the position one past
+  the last line (the empty window at EOF, which is where a finished `nextLine` walk stands),
+  `startLine > lineCount + 1` is `ERANGE`, and a 0-byte file answers ANY `startLine` with the
+  empty window and `lineCount: 0` — a file with no lines has nothing out of range. A
+  `startColumn` past the end of `startLine` is not an error either: the skip crosses that
+  line's terminator and stops on the line after it (the behaviour every version of the skip
+  had), and the entry now REPORTS the line it actually returned, with `lineCount` built from
+  the same prefix walk, instead of repeating the caller's `startLine` with a count one newline
+  short. Binary rejection is scoped rather than whole-file, and its two checks see different
+  amounts of the file: the NUL check is WINDOW-scoped (it fires on a NUL the window would have
+  to CONTAIN, so a stray NUL far past the window reads as text there and as `EBINARY` on the
+  page that reaches it, which is paging working as designed), while the invalid-UTF-8 check is
+  CHUNK-scoped (the strict decoder is handed the whole read chunk before the window is cut, so
+  a bad byte after the cut but inside that chunk also answers `EBINARY`). Bytes before the
+  window and past the last chunk are never decoded, so one file can read as text for a narrow
+  window and as `EBINARY` for a wide one. A call
   accepts at most 100 paths (`FILE_READ_MAX_TARGETS`) so metadata cannot grow without bound
   either.
   A path that cannot be read is DATA, not a failed call: it keeps its ordered slot as
@@ -2047,7 +2077,11 @@ Implementation notes worth keeping:
   `error: { code, message }` — `ENOENT`, `EISDIR`, `EACCES`/`EPERM`, `EBINARY`, `ERANGE`, or
   `EIO` — and it consumes no budget (the split is computed across files that actually
   opened, see `execute`'s two phases), so the readable files are still returned in
-  full. Only a malformed REQUEST rejects the whole call.
+  full. A readable file whose share of the envelope was consumed by the per-entry reserves is
+  NOT an I/O failure either: the first allocation pass runs whatever the share turns out to be,
+  so a 0-byte allowance is simply the tightest one — an empty window, `limit: "budget"`, and a
+  cursor that still advances — while `EIO` goes back to meaning "this handle could not be
+  read". Only a malformed REQUEST rejects the whole call.
   `wireBytes` is the exact serialized length of the response and always satisfies
   `wireBytes <= contentBudget`, which is what keeps the continuation fields alive
   through the harness's own cap.
@@ -2068,7 +2102,14 @@ Implementation notes worth keeping:
   (`[truncated by maxBytes; 64258 bytes returned; continue from startByte 64258]`).
   `numbered: true` adds the `123: ` gutter to the PROJECTION ONLY — `content` stays raw — but
   the gutter's bytes are charged inside the scanner, so numbering cannot silently push the
-  window past the allowance the same call bought unnumbered. The boundary rules are the same
+  window past the allowance the same call bought unnumbered. It is PER FILE (one item asking
+  for gutters used to number the whole batch), and the charge is the width the RENDERER pads
+  to — `numberProjectionText` sizes the gutter on the WIDEST line number in the window, so a
+  window over lines 998-2000 has a 4-digit gutter on every line — because billing the digits of
+  each line's own number under-charged such a window, and an under-charged gutter is the one
+  place `modelBytes` could exceed `wireBytes`. `bytes` never counts the gutter: it exists only
+  in the model's copy, so a numbered read shows fewer bytes than the model was given. The
+  boundary rules are the same
   as the other two brands: `unwrapToolResult(plain)` answers `{ content }` with NO `text` key,
   so every tool that does not use the seam is byte-for-byte unchanged at the delivery
   boundary; `toolText()` validates at the tool; and a forged or hand-built envelope is
@@ -2103,7 +2144,12 @@ Implementation notes worth keeping:
   caught, while Linux keeps `a.ts`/`A.ts` as two files), and (for edits) every file
   is read and match-checked before the first byte is written, so one bad entry leaves
   every file untouched. A filesystem error during the write phase names the completed
-  paths: there is **no transaction and no rollback**.
+  paths: there is **no transaction and no rollback**. What the failed entry looks like IS
+  defined, and `write`'s staged publish is what makes it honest: the target it failed on keeps
+  the text it had before (or stays uncreated), never a partial prefix, and its staging file is
+  removed — so the "already completed" list never implies a half-written file. `edit` writes
+  its files in place (truncate + write), so it keeps the target's inode and mode and does not
+  carry that per-file publish guarantee.
 - **`write` / `edit` hold one critical section per file** (`tools/files/lock.ts`,
   keyed by that same file identity). Read-match-write is three awaits, so two
   overlapping calls used to read one original text, both match, both report success,
@@ -2119,11 +2165,27 @@ Implementation notes worth keeping:
   three-tier cascade on an LF view of the file: exact bytes, then typographic
   quote/dash/space folding, then trailing-whitespace-ignoring whole-line matching —
   a fallback tier only runs when the tier above found NOTHING, and indentation is
-  never forgiven. CRLF/mixed endings are matched and preserved (replacements are
-  re-joined with the matched region's endings); an oldString/newString pair that
-  differs only in `\r` applies to the exact bytes. `oldString` must appear exactly
+  never forgiven. That trailing-whitespace tier compares WHOLE LINES, so its match is the whole
+  line SPAN rather than the caller's `oldString`: replacing "a\nb" in "a   \nb\t\t\nz\n"
+  through it removes the two tabs on the second line too, because they were inside the matched
+  lines, and the `match: "trailing-whitespace"` receipt is what makes that widening visible
+  instead of incidental. CRLF/mixed endings are matched, and an LF-only `newString` comes back
+  with the endings of the matched region (a line that survives the edit reuses that line's
+  ending); an oldString/newString pair that differs only in `\r` matches exact bytes, which is
+  how endings get CONVERTED. A `newString` containing a `\r` is ENDING-EXPLICIT and is written
+  VERBATIM, byte for byte — no fold to LF, no region re-join — so an explicit `\r\n` is never
+  rewritten into the file's endings; before that rule the fold deleted every `\r\n` in
+  `newString` and a lone `\r` it left behind produced a carriage return the caller never asked
+  for. There is no ending-related `match` value and no ending knob in the schema at all: `match`
+  is only ever `"typographic"` or `"trailing-whitespace"`. `oldString` must appear exactly
   once or `replaceAll: true` must be passed; a match whose replacement equals the
-  file text is rejected, not reported as applied. A missing file is an error that says
+  file text is rejected, not reported as applied. Each file is read as BYTES and must decode as
+  UTF-8 with no NUL (`decodeEditSource`): a Latin-1 target used to round-trip as U+FFFD and
+  report a plain success, and it is now refused with `EBINARY` naming the offending byte offset
+  — in the preflight, so the refusal rewrites nothing. One call carries at most
+  `FILE_EDIT_MAX_TARGETS` (100) entries, the cap `read`, `write` and `files` already publish,
+  enforced BEFORE any validation or filesystem work so a refused batch never appears to have
+  applied its first 100 entries. A missing file is an error that says
   so and names `write` (the raw errno used to leak as `ENOENT: no such file or
   directory, open '...'`, which named no remedy); a directory target is classified as
   a directory rather than a permission denial, which matters because Windows reports
@@ -2137,21 +2199,78 @@ Implementation notes worth keeping:
   names. Paging state lives INSIDE the list receipt (`{ entries, truncated, nextOffset,`
   `offset, limit, bytes }`), which is what lets `files` declare ONE array property (`ops`)
   where `fileList` needed three - the catalogue's last exception to the batching rule is
-  gone. The 64 KiB entry-text budget is shared by every list operation in one call. Unlike
-  `fileList`, a directory that cannot be read is that entry’s own `error`
-  (`ENOENT`/`ENOTDIR`/`EACCES`…) rather than a failed call, because a read-only miss must not
-  discard mutations the same call already applied; the server's direct-call route resolves both the
+  gone. The 64 KiB entry-text budget (`FILES_CONTENT_BUDGET`) is ONE mutable `{ remaining }`
+  allowance threaded through every list op in the CALL, so it means "64 KiB across the whole
+  call", not per op: the second list op starts where the first stopped, a page stops BEFORE the
+  entry that would cross it (no entry is ever split), and an op whose turn arrives to a spent
+  budget answers `entries: []`, `truncated: true`, `nextOffset: <its own offset>` — a cursor at
+  the entry that did not fit, never one that silently walks past it. An entry whose OWN UTF-8
+  size exceeds the whole budget is a refusal naming it and its offset, because its cursor could
+  never advance. Unlike `fileList`, a directory that cannot be read is that entry's own `error`
+  (`ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO` — a CLOSED set, so a caller can switch on it;
+  `failureOf` folds every other raw errno onto `EIO` and keeps the real name in `message`, where
+  the person reading it needs it) rather than a failed call, because a read-only miss must not
+  discard mutations the same call already applied — and it does NOT void the directories that
+  could be read: each requested directory is collected in its own `try/catch`, the window is
+  computed over the SURVIVING sequence, and the receipt carries those entries beside an `error`
+  naming the directory the tool actually tried to read (answering `entries: []` with
+  `truncated: false` would claim a COMPLETE listing of a directory the tool never managed to
+  open). The server's direct-call route resolves both the
   legacy bare value and the wrapper through the shared validator
   (`resolveToolParameters`, 'direct' mode), so they are the same request. An explicit
   `[]` is still an error. Directories are visited in the caller's order, each listing
-  sorted by code point, and a missing directory rejects the whole call (no partial
-  result).
-  The result is `{ entries, truncated, nextOffset, offset, limit, bytes, contentBudget }`:
-  a page holds at most 200 entries by default (hard maximum 1000) and at most 64 KiB
-  of UTF-8 entry text. `truncated` is measured against the WHOLE list and `nextOffset`
-  is always `offset + entries.length`, so passing it back as `offset` walks the tree
-  once, in order, with no gaps or duplicates. The old `string[]` return is gone: a
+  sorted by code point, and a directory named twice (`src`, `./src`, or a symlinked alias) is
+  walked ONCE: `dedupePaths` compares by `fileIdentity` and keeps the first spelling, because a
+  second pass duplicates every entry AND moves `offset` underneath a caller that is paging. A
+  symlink that resolves to a directory carries the trailing `/` — "walkable" is what the slash
+  means to a caller and the walk does follow it — while a link whose target is gone or looping
+  keeps the plain name instead of failing the listing.
+  The receipt is `{ entries, truncated, nextOffset, offset, limit, bytes, error? }`:
+  `contentBudget` belongs to the ENVELOPE (`{ results, bytes, contentBudget }`) and never to a
+  receipt. A page holds at most 200 entries by default (hard maximum 1000) beside the byte
+  budget above, and `limit`/`offset` are CLAMPED, never rejected — `limit` into 1..1000,
+  `offset` to ≥0, a non-number still an error — with NO `minimum`/`maximum` in the published
+  JSON Schema on purpose: this harness validates a model's arguments BEFORE `execute`, so a
+  bound written there would reject `limit: 5000` first and turn the runtime clamp into a dead
+  branch, leaving the "an oversized page is never rejected" promise true only for a host holding
+  the tool object. `truncated` means entries exist past this page — cut by the entry cap or by
+  the shared byte allowance — and `nextOffset` is then `offset + entries.length`, or `null` when
+  nothing was withheld, so passing it back as `offset` walks the list once, in order, with no
+  gaps or duplicates. There is no `total` and no keyset cursor, so an `offset` past what the
+  directory holds now simply reads as an empty page. The old `string[]` return is gone: a
   caller that only wants names reads `.entries`.
+- **`files` refuses a destination that IS or CONTAINS its source, before a byte moves.** A
+  `copy`/`move` whose `to` is the source or lies under it is a refusal naming both paths
+  (`selfOrContained`), whatever `overwrite` says, because both shapes destroy the call: `copy
+  X → X` with `overwrite: true` removed the destination — which WAS the source — and then copied
+  nothing onto it, so the tree was gone and the receipt reported success; `copy X → X/inside`
+  walked into its own freshly written output until the path overflowed, leaving a half-built
+  garbage tree with no rollback; `move X → X/inside` is the same impossibility one syscall deep
+  (POSIX answers `EINVAL`, and only after the destination was removed). The check is TEXT first
+  (`resolve`, so `X`, `./X` and `a/../X` are one path) and then by REAL IDENTITY, so a symlinked
+  alias of the source — or a destination that is itself a link pointing at it — is caught as the
+  same thing on disk rather than different spellings. NOTHING on the filesystem is touched
+  before it passes: not the destination's parents, and not the `overwrite` removal.
+  `copyDirectory` refuses past `FILES_COPY_MAX_DEPTH` (64) levels as the belt behind those
+  braces — a source that slips the guard is named instead of overflowing the stack mid-tree —
+  and a symlink inside a copied tree is copied AS a symlink (`readlink` → `symlink`, target
+  string verbatim, 0 bytes because a link holds no payload), which is also what stops a link
+  pointing at an ancestor from being dereferenced into an endless walk. A symlinked DIRECTORY
+  named as the source is still followed at the top level, which is what a caller naming it
+  means.
+- **`files`' `delete` asks permission for trees, not for empty directories.** A NON-EMPTY
+  directory without `recursive` is refused with the instruction to pass it; an EMPTY directory
+  is removed, because that is exactly what the caller named (emptiness is decided by `readdir`,
+  and a directory that cannot be listed is treated as non-empty rather than deleted). The path
+  is examined with `lstat` FIRST and only followed with `stat` for the directory question, so a
+  DANGLING symlink — `stat` calls it missing because its target is gone — stays a real,
+  deletable entry with or without `force`. A missing path is an error unless `force: true`,
+  which reports `removed: false, skipped: true`: "already gone" is a success, not a surprise.
+  The failure halves differ on purpose: a failed MUTATION is a `HarnessError` sentence naming
+  what already ran, with the errno in the MESSAGE and no machine-readable code on the error,
+  while the closed `code` set belongs to list receipts. A mutation holds the same per-file locks
+  as `write`/`edit`, but only for its ENDPOINTS: a concurrent `write` to a file INSIDE a
+  directory being moved is not ordered against that move, and nothing here claims it is.
 - **Search is TWO tools, not one tool with two modes.** `glob` answers with names
   (`{ files, truncated }`) and `grep` answers with lines
   (`{ matches, truncated, bytes, contentBudget }`); the old `content` discriminator is

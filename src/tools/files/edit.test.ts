@@ -16,17 +16,28 @@
 //   - every file is then read and match-checked BEFORE the first write, so a
 //     failure on the LAST entry leaves the FIRST file untouched, and each distinct
 //     file is written exactly ONCE with its final text;
+//   - a target whose bytes are not valid UTF-8 (or that holds a NUL byte) is refused
+//     with EBINARY naming the byte offset, also in the preflight, so a batch never
+//     rewrites a file it cannot decode back byte for byte;
+//   - at most 100 entries per call, the cap `read`, `write` and `files` publish;
 //   - the result is one entry per requested edit, in request order, naming the path
 //     that entry asked for and reporting replacements + the file's final byte size
 //     (entries sharing a file therefore report the same size).
+//
+// Line endings are pinned from both sides on purpose. A LF-only newString adopts the
+// endings of the file (the documented default); a newString that contains a carriage
+// return is ending-explicit and is written verbatim, so the exact resulting BYTES are
+// asserted for every shape, including the doubled-CR shapes the rule makes honest.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
     mkdir,
     mkdtemp,
+    readFile,
     readFile as readTextFile,
     rm,
     symlink,
+    writeFile,
     writeFile as writeTextFile
 } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -45,6 +56,53 @@ const seed = async (name: string, content: string): Promise<string> => {
     await mkdir(join(path, '..'), { recursive: true });
     await writeTextFile(path, content, 'utf8');
     return path;
+};
+
+// ---------------------------------------------------------------------------
+// BYTE-GRADE fixtures. Line-ending and encoding behaviour is a statement about BYTES,
+// and a UTF-8 text round-trip is exactly what is under test, so both the seed and the
+// expectation are written as hex and compared as bytes. A text fixture would fold the
+// Latin-1 byte into U+FFFD before an assertion could see the tool do it, and a text
+// assertion would render "\r\n" and "\r\r\n" as nearly the same invisible nothing.
+// ---------------------------------------------------------------------------
+
+const fromHex = (value: string): Buffer => Buffer.from(value.replace(/\s+/g, ''), 'hex');
+
+const toHex = (bytes: Uint8Array): string =>
+    [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join(' ');
+
+// Seed a file with EXACT BYTES (the hex form, so a fixture reads as the byte pattern the
+// defect report named).
+const seedBytes = async (name: string, hex: string): Promise<string> => {
+    const path = join(workdir, name);
+    await mkdir(join(path, '..'), { recursive: true });
+    await writeFile(path, fromHex(hex));
+    return path;
+};
+
+const readHex = async (path: string): Promise<string> => toHex(await readFile(path));
+
+// The EBINARY refusal, spelled once so every encoding test asserts the SAME sentence the
+// tool owes a model: the path the caller passed, what is wrong with the bytes, and where
+// the offending byte sits. `code` and `name` are both asserted because HarnessError sets
+// `name` from the code (./util/errors.ts:31), and a caller switches on one while the
+// message is the half that reaches the model.
+const expectBinaryRefusal = async (
+    call: () => Promise<unknown>,
+    path: string,
+    detail: string
+): Promise<void> => {
+    const failure = await call().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(HarnessError);
+
+    const error = failure as HarnessError;
+    expect(error.code).toBe('EBINARY');
+    expect(error.name).toBe('EBINARY');
+    expect(error.message).toBe(
+        `edit refused "${path}": the file contains binary data (${detail}). ` +
+            'edit reads and writes UTF-8 text, so it refuses a file it cannot rewrite byte for byte.'
+    );
 };
 
 beforeAll(async () => {
@@ -238,6 +296,40 @@ describe('edit', () => {
         await expect(readTextFile(path, 'utf8')).resolves.toBe('ONE\nTWO\nTHREE\n');
     });
 
+    // M4, by design and pinned. The trailing-whitespace tier COMPARES whole lines (with
+    // trailing whitespace ignored), so what it REPLACES is the whole-line span, not the
+    // caller's oldString. These are the two shapes the stress report called surprising:
+    // whitespace the caller never named disappears, including the final newline of the
+    // last matched line. The receipt says `match: "trailing-whitespace"`, which is the
+    // honest half — the tier is what widened the region. Changing the span to end where
+    // oldString ends would keep the file's trailing whitespace, and would make the tier
+    // rewrite bytes the caller did copy; reporting the replaced span instead (a receipt
+    // that says "N lines replaced") is the follow-up option, not this behaviour.
+    it('replaces the whole matched lines through the trailing-whitespace tier, tabs and all', async () => {
+        const path = await seed('tiers/wide-tabs.txt', 'a   \nb\t\t\nz\n');
+
+        const result = await edit([{ path, oldString: 'a\nb', newString: 'Q' }]);
+
+        // 'Q\nz\n' is 4 bytes, and the `b\t\t` tabs are gone with the line they lived on.
+        expect(result).toEqual([
+            { path, replacements: 1, bytes: 4, match: 'trailing-whitespace' }
+        ]);
+        await expect(readHex(path)).resolves.toBe('51 0a 7a 0a');
+    });
+
+    it('takes the final newline of the last matched line on the trailing-whitespace tier', async () => {
+        const path = await seed('tiers/wide-final.txt', 'a   \nb\n');
+
+        const result = await edit([{ path, oldString: 'a\nb', newString: 'Q' }]);
+
+        // The search has NO trailing newline, so the span stops at the END OF LINE 2's
+        // CONTENT (before its newline, and before a CRLF's CR — see `contentEnds` in
+        // findLineOccurrences): 'a   \nb' is replaced and the file's own final newline is
+        // the only thing left after 'Q'.
+        expect(result).toEqual([{ path, replacements: 1, bytes: 2, match: 'trailing-whitespace' }]);
+        await expect(readHex(path)).resolves.toBe('51 0a');
+    });
+
     it('finds a trailing-whitespace window in the middle of many lines', async () => {
         // Exercises the sliding window: the match starts at line 402 of 800, so a
         // one-pass scan must still align the window and report the right offsets.
@@ -370,6 +462,94 @@ describe('edit', () => {
         await expect(readTextFile(mixed, 'utf8')).resolves.toBe('y1\r\ny2\ny3\r\n');
     });
 
+    // ---------------------------------------------------------------------
+    // H6 — the line-ending contract, pinned as BYTES in both directions.
+    //
+    //   - a newString with NO carriage return adopts the endings of the file (the
+    //     documented default: "write oldString and newString with \n even for a CRLF
+    //     file"), and a line that keeps a region line keeps that line's ending;
+    //   - a newString that CONTAINS a carriage return is ending-explicit and is written
+    //     verbatim, so an explicit "\r\n" is neither rewritten into the file's endings
+    //     nor answered with a carriage return the caller did not type.
+    //
+    // Before this rule `foldLf(newString)` deleted every "\r\n" the caller passed and
+    // left every LONE "\r" in place, which the region join then hung off the end of a
+    // line — the bytes below are the rows that made the report, and each one names the
+    // shape it covers.
+    // ---------------------------------------------------------------------
+
+    it('writes an explicit CRLF newString into an LF file instead of folding it to LF', async () => {
+        // The report's "explicit CRLF on an LF file is discarded" rows. Each one now
+        // carries the caller's CR: 0d 0a, exactly where the caller typed it.
+        const single = await seedBytes('h6/lf-single.txt', '61 0a 62 0a');
+        await edit([{ path: single, oldString: 'b', newString: 'B\r\nX' }]);
+        await expect(readHex(single)).resolves.toBe('61 0a 42 0d 0a 58 0a');
+
+        const region = await seedBytes('h6/lf-region.txt', '61 0a 62 0a');
+        await edit([{ path: region, oldString: 'a\nb', newString: 'A\r\nB' }]);
+        await expect(readHex(region)).resolves.toBe('41 0d 0a 42 0a');
+
+        // A trailing "\r\n" in newString used to fold into an extra LF (the caller asked
+        // for one ending and got two), and a doubled CR used to come back single because
+        // the fold removed exactly one CR from it.
+        const trailing = await seedBytes('h6/lf-trailing.txt', '61 0a 62 0a');
+        await edit([{ path: trailing, oldString: 'a\nb', newString: 'A\nB\r\n' }]);
+        await expect(readHex(trailing)).resolves.toBe('41 0a 42 0d 0a 0a');
+
+        const doubled = await seedBytes('h6/lf-doubled.txt', '61 0a 62 0a');
+        await edit([{ path: doubled, oldString: 'a\nb', newString: 'A\r\r\nB' }]);
+        await expect(readHex(doubled)).resolves.toBe('41 0d 0d 0a 42 0a');
+    });
+
+    it('writes a mixed newString on a CRLF file exactly as the caller spelled it', async () => {
+        // The same rule on the other kind of file: the caller wrote line 1 with a bare LF
+        // and line 2 with CRLF, so that is what the file holds. It used to come back as
+        // 41 0d 0a 42 0d 0a 0d 0a — the tool converting a line the caller had chosen.
+        const path = await seedBytes('h6/crlf-mixed.txt', '61 0d 0a 62 0d 0a');
+        await edit([{ path, oldString: 'a\nb', newString: 'A\nB\r\n' }]);
+        await expect(readHex(path)).resolves.toBe('41 0a 42 0d 0a 0d 0a');
+
+        // A doubled CR inside newString is the caller's own byte, not one the tool adds
+        // after a fold the way it used to (41 0d 0d 0a via region re-joining).
+        const doubled = await seedBytes('h6/crlf-doubled.txt', '61 0d 0a 62 0d 0a');
+        await edit([{ path: doubled, oldString: 'a\nb', newString: 'A\r\r\nB' }]);
+        await expect(readHex(doubled)).resolves.toBe('41 0d 0d 0a 42 0d 0a');
+
+        // The one honest doubling left, and why it is honest: newString ENDS in a lone CR
+        // and the CR that follows it belongs to the file, outside the matched span ('b'
+        // was matched, its CR was not). The tool writes the caller's bytes and nothing
+        // else's; a caller who wants the file's ending replaced matches the ending.
+        const lone = await seedBytes('h6/crlf-lone-cr.txt', '78 0d 0a 62 0d 0a');
+        await edit([{ path: lone, oldString: 'b', newString: 'B\r' }]);
+        await expect(readHex(lone)).resolves.toBe('78 0d 0a 42 0d 0d 0a');
+    });
+
+    it('keeps a LF-only newString adopting the endings of the file, line by line', async () => {
+        // THE DOCUMENTED DEFAULT, which the ending-explicit rule must not break: no CR in
+        // newString means the file decides. A CRLF file keeps CRLF, an LF file keeps LF,
+        // and a MIXED region hands each line back the ending that line already had.
+        const crlf = await seedBytes('h6/default-crlf.txt', '61 0d 0a 62 0d 0a');
+        await edit([{ path: crlf, oldString: 'a\r\nb', newString: 'A\nB' }]);
+        await expect(readHex(crlf)).resolves.toBe('41 0d 0a 42 0d 0a');
+
+        const lf = await seedBytes('h6/default-lf.txt', '61 0a 62 0a');
+        await edit([{ path: lf, oldString: 'a\nb', newString: 'A\nB' }]);
+        await expect(readHex(lf)).resolves.toBe('41 0a 42 0a');
+
+        const mixed = await seedBytes('h6/default-mixed.txt', '6f 6e 65 0d 0a 74 77 6f 0a 74 68 72 65 65 0d 0a');
+        await edit([{ path: mixed, oldString: 'one\ntwo\nthree', newString: 'A\nB\nC' }]);
+        await expect(readHex(mixed)).resolves.toBe('41 0d 0a 42 0a 43 0d 0a');
+    });
+
+    it('still changes the endings themselves through the differ-only-in-CR form', async () => {
+        // The other documented route to a line-ending change: oldString and newString that
+        // differ ONLY in carriage returns match the RAW bytes, so LF->CRLF converts exactly
+        // the region that was matched and nothing else.
+        const path = await seedBytes('h6/endings-only.txt', '61 0a 62 0a');
+        await edit([{ path, oldString: 'a\nb', newString: 'a\r\nb' }]);
+        await expect(readHex(path)).resolves.toBe('61 0d 0a 62 0a');
+    });
+
     it('never forgives indentation on the trailing-whitespace tier', async () => {
         // Leading whitespace is NOT ignored: a wrong-indent oldString simply does not
         // match, which is the failure mode the flexible replacers got wrong.
@@ -430,6 +610,112 @@ describe('edit', () => {
 
         await expect(readTextFile(first, 'utf8')).resolves.toBe('alpha\n');
         await expect(readTextFile(second, 'utf8')).resolves.toBe('beta\n');
+    });
+
+    // ---------------------------------------------------------------------
+    // H7 — the encoding boundary. The target is read as BYTES and must decode as UTF-8
+    // with no NUL, or the call is refused with EBINARY naming the byte offset, which is
+    // the contract `read` already publishes (./read.tool.ts). Before this, `readFile`'s
+    // lossy UTF-8 decoding substituted U+FFFD for whatever it could not read and the
+    // write phase saved the substitution back, so an edit of a Latin-1 file rewrote a
+    // byte the caller never named — bytes 63 61 66 e9 20 78 came back as the eight bytes
+    // 43 61 66 ef bf bd 20 78 and the call reported a plain success.
+    // ---------------------------------------------------------------------
+
+    it('refuses a non-UTF-8 target with EBINARY naming the byte offset, and rewrites nothing', async () => {
+        // The report's exact row: 'caf' 0xE9 ' x' (a Latin-1 'é'), edited at 'c'. The
+        // invalid sequence STARTS at offset 3, and the file is still 6 bytes.
+        const path = await seedBytes('encoding/latin1.txt', '63 61 66 e9 20 78');
+
+        await expectBinaryRefusal(
+            () => edit([{ path, oldString: 'c', newString: 'C' }]),
+            path,
+            'invalid UTF-8 at offset 3'
+        );
+        await expect(readHex(path)).resolves.toBe('63 61 66 e9 20 78');
+    });
+
+    it('names the first invalid sequence for every UTF-8 shape the decoder rejects', async () => {
+        // Each row is one arm of the decoder's rejection table, and the offset is the
+        // START of the offending sequence — where a caller has to go look. A truncated
+        // sequence reports its lead byte, because that is where it began.
+        const shapes: Array<[string, string]> = [
+            ['41 c0 80 0a', '1'], // overlong two-byte form (C0 is never a lead byte)
+            ['41 ed a0 80 0a', '1'], // ED A0..BF would encode a surrogate
+            ['41 f4 90 80 80 0a', '1'], // past U+10FFFF
+            ['41 e9 0a', '1'], // three-byte lead with no continuations: truncated
+            ['41 e9 20 0a', '1'], // continuation byte is an ASCII space
+            ['80 41 0a', '0'] // stray continuation byte
+        ];
+
+        for (const [index, [hex, offset]] of shapes.entries()) {
+            const path = await seedBytes(`encoding/shape-${index}.txt`, hex);
+
+            await expectBinaryRefusal(
+                () => edit([{ path, oldString: 'A', newString: 'B' }]),
+                path,
+                `invalid UTF-8 at offset ${offset}`
+            );
+            await expect(readHex(path)).resolves.toBe(hex);
+        }
+    });
+
+    it('refuses a target holding a NUL byte, the way read and write already do', async () => {
+        // A NUL is valid UTF-8, so the decoder would have accepted it — but `read` calls
+        // the file binary and `write` will not create it, so an edit that accepted one was
+        // rewriting a file no other tool in this package can open again.
+        const path = await seedBytes('encoding/nul.txt', '41 00 41 0a');
+
+        await expectBinaryRefusal(
+            () => edit([{ path, oldString: 'A', newString: 'B' }]),
+            path,
+            'NUL byte at offset 1'
+        );
+        await expect(readHex(path)).resolves.toBe('41 00 41 0a');
+    });
+
+    it('leaves every earlier file untouched when a later target is not valid UTF-8', async () => {
+        // The refusal is a PREFLIGHT decision, so the all-or-nothing guarantee covers it:
+        // an edited-and-then-refused batch writes nothing, exactly like a batch whose last
+        // oldString is missing.
+        const good = await seedBytes('encoding/preflight-good.txt', '61 0a');
+        const bad = await seedBytes('encoding/preflight-bad.txt', '61 e9 0a');
+
+        await expectBinaryRefusal(
+            () =>
+                edit([
+                    { path: good, oldString: 'a', newString: 'A' },
+                    { path: bad, oldString: 'a', newString: 'B' }
+                ]),
+            bad,
+            'invalid UTF-8 at offset 1'
+        );
+        await expect(readHex(good)).resolves.toBe('61 0a');
+        await expect(readHex(bad)).resolves.toBe('61 e9 0a');
+    });
+
+    it('rewrites a valid UTF-8 target byte for byte, BOM and astral code points included', async () => {
+        // The other half of H7: refusing is only right if a good file is untouched except
+        // where the edit put it. A BOM survives (a decoder that stripped it would silently
+        // delete three bytes from every BOM file this tool edited), and a multi-byte code
+        // point is neither substituted nor split.
+        const bom = await seedBytes('encoding/bom.txt', 'ef bb bf 41 0a');
+        expect(await edit([{ path: bom, oldString: 'A', newString: 'B' }])).toEqual([
+            { path: bom, replacements: 1, bytes: 5 }
+        ]);
+        await expect(readHex(bom)).resolves.toBe('ef bb bf 42 0a');
+
+        const astral = await seedBytes('encoding/astral.txt', 'f0 9f 98 80 41 0a');
+        expect(await edit([{ path: astral, oldString: 'A', newString: 'B' }])).toEqual([
+            { path: astral, replacements: 1, bytes: 6 }
+        ]);
+        await expect(readHex(astral)).resolves.toBe('f0 9f 98 80 42 0a');
+
+        const twoByte = await seedBytes('encoding/two-byte.txt', '41 c3 a9 0a');
+        expect(await edit([{ path: twoByte, oldString: 'A', newString: 'B' }])).toEqual([
+            { path: twoByte, replacements: 1, bytes: 4 }
+        ]);
+        await expect(readHex(twoByte)).resolves.toBe('42 c3 a9 0a');
     });
 
     it('applies several entries that name one file, in array order', async () => {
@@ -580,6 +866,63 @@ describe('edit', () => {
         );
     });
 
+    it('rejects a batch larger than the published cap, before reading anything', async () => {
+        // M12. `read`, `write` and `files` each refuse a batch over 100 targets; `edit`
+        // carried no cap, so one call could name an arbitrary number of files, hold a
+        // per-file lock on every one of them, and return a result of arbitrary length.
+        // The refusal comes BEFORE the first read, so the rejected batch left nothing
+        // behind — the paths below were never created, which is what the ENOENT check
+        // proves.
+        const tooMany = Array.from({ length: 101 }, (_, index) => ({
+            path: join(workdir, 'cap', `${index}.txt`),
+            oldString: 'a',
+            newString: 'b'
+        }));
+
+        await expect(edit(tooMany)).rejects.toThrow(
+            'edit accepts at most 100 edits per call; received 101. Split the batch.'
+        );
+        await expect(readTextFile(join(workdir, 'cap', '0.txt'), 'utf8')).rejects.toThrow(/ENOENT/);
+
+        // Exactly AT the cap is accepted: one result entry per entry, each naming the
+        // path it asked for, each reporting the 2 bytes ('b' + newline) its file ended
+        // with.
+        const atCap = await Promise.all(
+            Array.from({ length: 100 }, (_, index) => seedBytes(`cap-ok/${index}.txt`, '61 0a'))
+        );
+
+        expect(await edit(atCap.map((path) => ({ path, oldString: 'a', newString: 'b' })))).toEqual(
+            atCap.map((path) => ({ path, replacements: 1, bytes: 2 }))
+        );
+    });
+
+    it('reports the real final byte size of every entry, never a placeholder', async () => {
+        // L7. `bytes` used to be `sizes.get(identity) ?? 0`. The `?? 0` was unreachable by
+        // construction (every prepared identity is a key of the map the write loop fills),
+        // but it reported a CONFIDENT zero had the bookkeeping ever missed — so it is now a
+        // throw, and this pins the invariant that guard protects: every entry names the
+        // size the file really ended with, including the two entries that share one file
+        // and the multi-byte text where the character count and the byte count differ.
+        const shared = await seed('sizes/shared.txt', 'alpha\nbeta\n');
+        const texted = await seed('sizes/multibyte.txt', 'caf\u00E9\n');
+
+        expect(
+            await edit([
+                { path: shared, oldString: 'alpha', newString: 'one' },
+                { path: texted, oldString: 'caf\u00E9', newString: 'CAF\u00C9' },
+                { path: shared, oldString: 'one\nbeta', newString: 'two' }
+            ])
+        ).toEqual([
+            { path: shared, replacements: 1, bytes: 4 },
+            // 'CAF' + U+00C9 (two UTF-8 bytes) + newline: 6 bytes for 5 characters.
+            { path: texted, replacements: 1, bytes: 6 },
+            { path: shared, replacements: 1, bytes: 4 }
+        ]);
+
+        await expect(readHex(shared)).resolves.toBe('74 77 6f 0a');
+        await expect(readHex(texted)).resolves.toBe('43 41 46 c3 89 0a');
+    });
+
     it('does not create a file that is missing, and says what to use instead', async () => {
         const path = join(workdir, 'absent', 'new.txt');
 
@@ -652,12 +995,15 @@ describe('edit', () => {
         expect(['FROM-WRITE\n', 'FROM-EDIT\n']).toContain(text);
     });
 
-    it('declares a single "edits" array property of { path, oldString, newString, replaceAll? }', () => {
+    it('declares a single "edits" array property capped at 100 entries', () => {
         expect(edit.parameters).toEqual({
             type: 'object',
             properties: {
                 edits: {
                     type: 'array',
+                    // M12: the cap is published in the schema, the same way `write`
+                    // publishes its own, and the runtime rejection names the same number.
+                    maxItems: 100,
                     items: {
                         type: 'object',
                         properties: {

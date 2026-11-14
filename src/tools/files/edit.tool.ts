@@ -36,14 +36,46 @@
 // which is the failure mode opencode v1's indentation-flexible replacers got
 // wrong (they silently rewrote Python at the model's indentation).
 //
-// Line endings are PRESERVED: the replacement's lines are re-joined with the
-// endings of the matched region — a line that keeps a region line (longest common
-// subsequence, compared like the trailing-whitespace tier) reuses that line's
-// ending, a line that changes in place reuses the ending of the line it replaces,
-// and only genuinely new lines take the region's dominant ending. Unchanged
-// context inside a match therefore keeps its bytes even in a mixed-ending file.
-// The one exception: oldString and newString that differ ONLY in carriage returns
-// ask to change the line endings themselves, so that edit applies to exact bytes.
+// Line endings are PRESERVED for a LF-only newString: the replacement's lines are
+// re-joined with the endings of the matched region — a line that keeps a region line
+// (longest common subsequence, compared like the trailing-whitespace tier) reuses that
+// line's ending, a line that changes in place reuses the ending of the line it
+// replaces, and only genuinely new lines take the region's dominant ending. Unchanged
+// context inside a match therefore keeps its bytes even in a mixed-ending file. That is
+// the documented default — "write oldString and newString with \n even for a CRLF
+// file" — and it means a LF-only newString on a CRLF file COMES BACK AS CRLF: the file
+// decides the endings, not the caller.
+//
+// THE ENDING-EXPLICIT RULE (H6). A newString that contains a carriage return says what
+// endings the caller wants, so its bytes are written VERBATIM: no fold to LF, no region
+// re-joining. Before this rule the fold deleted every "\r\n" in newString (so an
+// explicit CRLF on an LF file silently became LF) and left every LONE "\r" behind,
+// which the region join then put next to a real ending — "A\r\r\nB" came back as the
+// bytes 41 0d 0d 0a on a CRLF file and as 41 0d 0a on an LF file, i.e. the tool invented
+// a carriage return the caller never asked for. Two shapes follow from writing the
+// caller's bytes literally, and both are honest rather than silent: a newString ending
+// in a lone "\r" sits beside the file's own CR ("B\r" on a CRLF file gives 42 0d 0d 0a,
+// because the matched span did not include that CR), and a mixed newString keeps the
+// endings it spells instead of adopting the file's. To convert endings explicitly, pass
+// oldString and newString that differ ONLY in carriage returns — that edit matches exact
+// bytes — or spell every ending in newString.
+//
+// WHAT THE TRAILING-WHITESPACE TIER REPLACES (M4). That tier compares whole lines with
+// trailing whitespace ignored, so its match is the WHOLE LINE SPAN, not the caller's
+// oldString: replacing "a\nb" in "a   \nb\t\t\nz\n" removes the two tabs on the second
+// line too, because they were inside the matched lines. The tier is reported as
+// `match: "trailing-whitespace"` so the widening is visible, and the behaviour is pinned
+// by tests rather than incidental.
+//
+// ENCODING — UTF-8 ONLY, REFUSED IN PREFLIGHT (H7). The file is read as BYTES and must
+// decode as UTF-8 with no NUL byte. A non-UTF-8 file used to round-trip lossily: the
+// bytes 63 61 66 e9 20 78 ("café x" in Latin-1) came back as 43 61 66 ef bf bd 20 78,
+// eight bytes reported as a plain success, because `readFile(path,'utf8')` substitutes
+// U+FFFD for bytes it cannot decode and the write encodes the substitution. Now such a
+// file is refused with EBINARY naming the byte offset of the offending sequence — the
+// same contract `read` publishes — and the refusal happens during the preflight, so an
+// unreadable file in a batch leaves every earlier file untouched. A leading BOM is kept
+// (ignoreBOM), so a successful edit writes the file back byte for byte.
 //
 // SEVERAL HUNKS PER FILE (T20)
 // ----------------------------
@@ -57,10 +89,11 @@
 // PREFLIGHT — ALL-OR-NOTHING (this is what makes batching safe)
 // ------------------------------------------------------------
 // Before the first byte is written, EVERY edit is validated (shape, non-empty
-// oldString, distinct oldString/newString, no NUL) and EVERY file is read,
-// match-checked, and fully computed — a failure anywhere, including on the last
-// entry, therefore leaves every file untouched, which is why the batch can be
-// trusted. Each file is then written exactly ONCE with its final text.
+// oldString, distinct oldString/newString, no NUL) and EVERY file is read, DECODED
+// (valid UTF-8 with no NUL byte — see "ENCODING" above), match-checked, and fully
+// computed — a failure anywhere, including on the last entry, therefore leaves every
+// file untouched, which is why the batch can be trusted. Each file is then written
+// exactly ONCE with its final text.
 //
 // ONE CRITICAL SECTION PER FILE (D4: no lost update)
 // --------------------------------------------------
@@ -71,6 +104,15 @@
 // call now sees the earlier call's text and fails honestly ("edit found no match")
 // instead of clobbering a change it never saw. A multi-file batch takes its locks in
 // sorted identity order, so two overlapping batches cannot deadlock.
+//
+// BOUNDED BATCHES (M12)
+// --------------------
+// One call carries at most FILE_EDIT_MAX_TARGETS (100) entries, the cap `read`, `write`
+// and `files` already publish. Without it a single call could name an arbitrary number of
+// files, hold a lock on every one of them, and return an unbounded result array — the
+// response size of a batched tool should be bounded by the contract, not by luck. The cap
+// is enforced BEFORE any validation or filesystem work, so a refused batch reads nothing,
+// writes nothing, and never appears to have applied the first 100 entries.
 //
 // BOUNDED WORK ON THE FAILURE AND replaceAll PATHS
 // ------------------------------------------------
@@ -120,6 +162,13 @@ import { HarnessError } from '../../util';
 import type { PresetToolMetadata } from '../catalogue';
 import { fileIdentity } from './identity';
 import { withFileLocks } from './lock';
+
+// How many entries one `edit` call may carry. `read`, `write` (./write.tool.ts:114) and
+// `files` all cap a batch at 100; `edit` carried none (M12), so a single call could name
+// an arbitrary number of files, take a lock on every one of them, and return a result
+// array of arbitrary length. Enforced in `normalizeEdits` BEFORE any validation or
+// filesystem work, so a refused batch reads nothing and writes nothing.
+export const FILE_EDIT_MAX_TARGETS = 100;
 
 // One replacement to apply.
 export type FileEditEntry = {
@@ -394,6 +443,15 @@ const ALIGN_CELL_LIMIT = 1_000_000;
 // inserted or deleted in a MIXED-ending region, and that is the honest trade: a
 // mixed-ending region several thousand lines deep, edited by a single call, is rare;
 // stalling the process for 275 ms and 95 MB on every such call is worse.
+//
+// WHAT THAT COSTS EXACTLY (L9, by design): past the cap an UNCHANGED line of the
+// replacement can come back with a DIFFERENT ending from the line it stands for — line i
+// borrows the ending of line i whether or not those two lines are the same line — and
+// every line past the shorter side takes the region's dominant ending instead of its own.
+// Under the cap the LCS keeps each unchanged line's own bytes. So a mixed-ending region
+// bigger than 1e6 cell comparisons (about 1,000 x 1,000 lines) edited by one call is the
+// one case where an unchanged line's ending may move; the result is still well-formed
+// text, and it is the alignment table's cost, not a matching change.
 const alignLines = (before: string[], after: string[]): (number | undefined)[] => {
     if (before.length * after.length > ALIGN_CELL_LIMIT) {
         const shared = Math.min(before.length, after.length);
@@ -547,15 +605,32 @@ const matchView = (
     let fileEnding: string | null = null;
     const endingOfWholeFile = (): string => (fileEnding ??= lineEnding(source, '\n'));
 
+    // H6 — a newString that carries a carriage return is ENDING-EXPLICIT: the caller
+    // spelled the line endings it wants, so its bytes are written VERBATIM, with no fold
+    // to LF and no re-joining against the matched region. Both halves of the old pipeline
+    // were silent in opposite directions. `foldLf` deleted every "\r\n" the caller passed,
+    // so an explicit CRLF on an LF file came back as LF and LF->CRLF was unreachable
+    // outside the differ-only-in-CR form; a LONE "\r" survived that fold, and the region
+    // join then appended a real ending after it, so "A\r\r\nB" came back as the bytes
+    // 41 0d 0d 0a on a CRLF file and 41 0d 0a on an LF file — a carriage return the tool
+    // invented, in both directions, from input the tool claimed to preserve.
+    //
+    // A LF-only newString keeps the documented default and re-adopts the file's endings
+    // ("write oldString and newString with \n even for a CRLF file"), which is what makes
+    // the CR case unambiguous: no CR in newString means "the file decides", a CR means
+    // "I decided".
+    const endingExplicit = newString.includes('\r');
+    const replacement = endingExplicit ? newString : foldLf(newString);
+
     // A replacement with NO newline is one line, and `withRegionEndings` returns a
     // one-line replacement VERBATIM: its only line is also its last line, and the last
     // line never receives an ending. So the ending choice cannot change the output, and
     // neither the region scan nor the whole-file tie-break is worth paying for. This is
     // the common case — a one-line hunk replaced by one line — and without it a
     // single-line edit on a large file still rescans the whole file for a tie-break it
-    // never uses.
-    const replacement = foldLf(newString);
-    const verbatim = !replacement.includes('\n');
+    // never uses. An ending-explicit replacement skips the same scans for the stronger
+    // reason above: the caller's bytes ARE the answer, so no ending has to be chosen.
+    const verbatim = endingExplicit || !replacement.includes('\n');
 
     const singleLine = !oldString.includes('\r') && !oldString.includes('\n');
     const rawExact = singleLine ? findOccurrences(source, oldString) : [];
@@ -592,11 +667,15 @@ const matchView = (
             end: match.end + countBefore(removed, match.end)
         })),
         tier,
-        // The whole file's dominant ending is only a TIE-BREAK for a region that has no
-        // opinion of its own, so it is computed on demand and memoised: a region with a
-        // clear majority — nearly every real one — never pays for the scan, and a
-        // `replaceAll` pays for it once rather than per match.
         replace: (match: Match) => {
+            // The whole file's dominant ending is only a TIE-BREAK for a region that has
+            // no opinion of its own, so it is computed on demand and memoised: a region
+            // with a clear majority — nearly every real one — never pays for the scan, and
+            // a `replaceAll` pays for it once rather than per match. `verbatim` skips both
+            // scans, because for a one-line replacement the ending cannot change the bytes
+            // and for an ending-explicit one the caller's bytes are the answer (H6).
+            if (verbatim) return replacement;
+
             const region = source.slice(match.start, match.end);
             return withRegionEndings(region, replacement, dominantEnding(region) ?? endingOfWholeFile());
         }
@@ -675,6 +754,15 @@ const normalizeEdits = async (edits: FileEditParameters): Promise<NormalizedEdit
 
     if (edits.length === 0) {
         throw new HarnessError('edit received an empty edits array; pass at least one edit.');
+    }
+
+    // M12: rejected before any validation or filesystem work, like read's batch cap and
+    // write's (./write.tool.ts:169). A caller that sends 400 entries needs to split the
+    // batch, not to have 100 files locked, edited and reported while 300 were dropped.
+    if (edits.length > FILE_EDIT_MAX_TARGETS) {
+        throw new HarnessError(
+            `edit accepts at most ${FILE_EDIT_MAX_TARGETS} edits per call; received ${edits.length}. Split the batch.`
+        );
     }
 
     const normalized: NormalizedEdit[] = [];
@@ -791,6 +879,106 @@ const isDirectoryPath = async (path: string): Promise<boolean> => {
     }
 };
 
+// ---------------------------------------------------------------------------
+// ENCODING — the target must be UTF-8 text with no NUL byte, or the call is refused.
+// ---------------------------------------------------------------------------
+
+// The rejection shared by the NUL path and the invalid-UTF-8 path, so the message (and
+// therefore a test's expectation) cannot drift between them, and so it says the same
+// thing about the same bytes that `read` says (./read.tool.ts:1207). The OFFSET is named
+// because the caller cannot find it: the byte that broke the decode is somewhere in a
+// file the caller has so far only ever seen substituted.
+const binaryMessage = (path: string, detail: string): string =>
+    `edit refused "${path}": the file contains binary data (${detail}). edit reads and writes UTF-8 text, so it refuses a file it cannot rewrite byte for byte.`;
+
+// The continuation-byte range each UTF-8 lead byte allows, or null when the byte cannot
+// lead a sequence at all. This is the WHATWG decoder's own rejection table: C0/C1 are
+// overlong two-byte forms, E0 must be followed by A0..BF (no overlong three-byte form),
+// ED by 80..9F (no surrogates), F0 by 90..BF, F4 by 80..8F (nothing past U+10FFFF), and
+// F5..FF plus a bare 80..BF are not lead bytes.
+const utf8ContinuationRange = (lead: number): [number, number] | null => {
+    if (lead >= 0xc2 && lead <= 0xdf) return [0x80, 0xbf];
+    if (lead === 0xe0) return [0xa0, 0xbf];
+    if (lead >= 0xe1 && lead <= 0xec) return [0x80, 0xbf];
+    if (lead === 0xed) return [0x80, 0x9f];
+    if (lead >= 0xee && lead <= 0xef) return [0x80, 0xbf];
+    if (lead === 0xf0) return [0x90, 0xbf];
+    if (lead >= 0xf1 && lead <= 0xf3) return [0x80, 0xbf];
+    if (lead === 0xf4) return [0x80, 0x8f];
+    return null;
+};
+
+// How many continuation bytes a lead byte declares. Only called for the lead bytes the
+// table above accepts, so the three branches below cover every case it can be handed
+// (C2..DF -> 1, E0..EF -> 2, F0..F4 -> 3).
+const utf8SequenceLength = (lead: number): number => (lead >= 0xf0 ? 3 : lead >= 0xe0 ? 2 : 1);
+
+// Byte offset of the first structurally invalid UTF-8 sequence, or -1 when the buffer is
+// valid. The strict decoder in `decodeEditSource` is the AUTHORITY for whether a file is
+// accepted — its `TypeError` carries no position, so this scan exists only to name the
+// byte a caller can act on. A sequence that runs out of buffer is invalid, and the
+// reported offset is the LEAD BYTE's, because that is where the invalid sequence starts.
+// Runs only on the rejection path, so its one pass costs nothing on a good file.
+const firstInvalidUtf8Byte = (buffer: Buffer): number => {
+    let index = 0;
+
+    while (index < buffer.length) {
+        const lead = buffer[index];
+
+        if (lead < 0x80) {
+            index += 1;
+            continue;
+        }
+
+        const range = utf8ContinuationRange(lead);
+        if (range === null) return index;
+
+        const extra = utf8SequenceLength(lead);
+        // A truncated sequence is invalid whatever follows it — report the lead byte.
+        if (index + extra >= buffer.length) return index;
+
+        for (let offset = 1; offset <= extra; offset++) {
+            const byte = buffer[index + offset];
+            if (byte < range[0] || byte > range[1]) return index;
+            // Only the FIRST continuation byte is range-restricted; the rest just have to
+            // be continuations, exactly as the decoder's table has it.
+            range[0] = 0x80;
+            range[1] = 0xbf;
+        }
+
+        index += extra + 1;
+    }
+
+    return -1;
+};
+
+// Decode one edit target, or refuse it. `fatal: true` is the same authority `read` uses
+// (./read.tool.ts:2263), so the two tools cannot disagree about which files are text.
+// `ignoreBOM: true` keeps a leading BOM in the decoded text: `readFile(path,'utf8')`
+// never stripped one either, and letting the decoder drop it would turn every successful
+// edit of a BOM file into a three-byte rewrite the caller never asked for.
+const decodeEditSource = (target: string, buffer: Buffer): string => {
+    // A NUL byte IS valid UTF-8, so the decoder alone would accept it — but `read` calls
+    // it binary (EBINARY) and `write` refuses to create it, so accepting it here would
+    // let `edit` rewrite a file no other tool in this package can open again.
+    const nul = buffer.indexOf(0);
+
+    if (nul !== -1) {
+        throw new HarnessError(binaryMessage(target, `NUL byte at offset ${nul}`), {
+            code: 'EBINARY'
+        });
+    }
+
+    try {
+        return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer);
+    } catch (error) {
+        throw new HarnessError(
+            binaryMessage(target, `invalid UTF-8 at offset ${firstInvalidUtf8Byte(buffer)}`),
+            { code: 'EBINARY', cause: error }
+        );
+    }
+};
+
 // Read, match-check, and fully compute every edit. Nothing is written here, so a
 // failure on the last entry still leaves the first file untouched. Each file is
 // read ONCE; its entries are applied in request order to the text the previous one
@@ -812,11 +1000,21 @@ const prepareEdits = async (
             // is classified into a sentence that says what to do, because a model
             // reading `ENOENT: no such file or directory, open '...'` has nothing to
             // act on and read's message is right next door (see ./read.tool.ts).
+            //
+            // The file is read as BYTES and decoded by hand (see decodeEditSource).
+            // `readFile(path,'utf8')` used to do the decoding, and that decoding is
+            // LOSSY: one Latin-1 byte in an otherwise ordinary file became U+FFFD and
+            // the edit reported a plain success, so a byte the caller never touched was
+            // rewritten by this tool. Refusing is also a preflight decision — a file
+            // rejected for its encoding fails the call before the first write, exactly
+            // like a file whose oldString is missing.
+            const bytes = await readFile(edit.target).catch((error) =>
+                classifyReadFailure(edit.target, error)
+            );
+
             state = {
                 target: edit.target,
-                content: await readFile(edit.target, 'utf8').catch((error) =>
-                    classifyReadFailure(edit.target, error)
-                )
+                content: decodeEditSource(edit.target, bytes)
             };
             texts.set(edit.identity, state);
         }
@@ -825,8 +1023,9 @@ const prepareEdits = async (
 
         // oldString and newString that differ ONLY in carriage returns ask to change
         // the file's line endings themselves, so that edit applies to the exact
-        // bytes instead of the LF view. Every other edit matches the LF view and
-        // keeps the file's endings.
+        // bytes instead of the LF view. Every other edit matches the LF view; its
+        // replacement then either re-adopts the file's endings (a LF-only newString)
+        // or is written exactly as given (a newString carrying a CR — see matchView).
         const endingsOnly =
             edit.oldString.split('\r').join('') === edit.newString.split('\r').join('');
 
@@ -893,7 +1092,7 @@ const prepareEdits = async (
 export const FILE_EDIT_METADATA: PresetToolMetadata = {
     name: 'edit',
     description:
-        'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Calls that name the same file are serialized per file (read-match-write is one critical section), so a concurrent edit never silently clobbers another - the later one fails with "no match" against the text the earlier one produced. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use write for new files.',
+        'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. A call accepts at most 100 entries; split a larger batch. Calls that name the same file are serialized per file (read-match-write is one critical section), so a concurrent edit never silently clobbers another - the later one fails with "no match" against the text the earlier one produced. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file, and the replacement is re-joined line by line with the endings of the region it replaced: a line standing in for a matched line keeps the ending of that line, a genuinely new line takes the dominant ending of the region (that of the file when the region has none), and the last line gets no ending of its own, so a mixed-ending file stays mixed and the endings the caller typed survive only when it spells them itself: with \\r, or in the differ-only-in-carriage-returns form below; a newString that contains \\r is ending-explicit and is written verbatim, byte for byte, so an explicit \\r\\n is never rewritten into the endings of the file; to convert the endings themselves, pass oldString and newString that differ only in carriage returns (a `\\r` in one and not the other): that form matches exact bytes, so it converts the endings of exactly the region it matched and nothing else. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. That trailing-whitespace tier matches WHOLE LINES, so an edit that matched through it replaces those whole lines and removes the trailing whitespace inside them. A target whose bytes are not valid UTF-8, or that holds a NUL byte, is refused with EBINARY naming the byte offset: edit rewrites files byte for byte and never substitutes for bytes it cannot decode. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use write for new files.',
     tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
     // R18: editing files is core, so a model never spends a discovery round on it.
     visibility: 'core',
@@ -902,6 +1101,12 @@ export const FILE_EDIT_METADATA: PresetToolMetadata = {
         properties: {
             edits: {
                 type: 'array',
+                // The batch cap is part of the published schema, exactly as `write`
+                // publishes its own (./write.tool.ts:400), so a caller reads the bound
+                // instead of discovering it through a rejection. The literal matches
+                // FILE_EDIT_MAX_TARGETS and a test pins both, so the declared schema and
+                // the runtime rejection cannot drift.
+                maxItems: 100,
                 items: {
                     type: 'object',
                     properties: {
@@ -1005,10 +1210,25 @@ export const edit = tool<FileEditParameters, FileEditResult>({
                 // file each report their own replacement count against that file's final
                 // size.
                 return prepared.map((edit) => {
+                    // L7: `bytes` is a claim about a file this call just wrote, so a
+                    // missing size is a broken bookkeeping, never a zero. Every prepared
+                    // identity is a key of `texts`, and `files` is built from `texts`, so
+                    // this lookup cannot miss — but the previous `?? 0` would have reported
+                    // a confidently wrong byte count if that ever stopped being true, and a
+                    // wrong byte count is the silent rewriting this tool exists to avoid.
+                    // Fail loudly, and say which path the bookkeeping lost.
+                    const bytes = sizes.get(edit.identity);
+
+                    if (bytes === undefined) {
+                        throw new HarnessError(
+                            `edit lost the byte size of ${edit.target}: the edit was matched and applied, but no write recorded the file's size.`
+                        );
+                    }
+
                     const entry: FileEditResultEntry = {
                         path: edit.target,
                         replacements: edit.replacements,
-                        bytes: sizes.get(edit.identity) ?? 0
+                        bytes
                     };
 
                     // Only mention the tier when it was not exact, so the common case
