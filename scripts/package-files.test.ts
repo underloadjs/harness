@@ -14,13 +14,14 @@
 // `t.after(cleanup)` -> a module-level `afterEach` that removes exactly the
 // fixture roots the tests created.
 //
-// Scratch lives under the repository-root Temp/ (root AGENTS.md). The fixture is
-// removed after each test.
+// Scratch lives under the repository-root Temp/ (root AGENTS.md), or the
+// package-local Temp/ in the standalone GitHub checkout (./scratch.ts rule 3).
+// The fixture is removed after each test.
 
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { copyPublishedPackage, isPublished, publishedFiles } from './package-files.ts';
+import { PACKAGE_ROOT, copyPublishedPackage, isPublished, publishedFiles } from './package-files.ts';
 import { findWorkspaceRoot, resolveScratchRoot } from './scratch.ts';
 
 const scratchRoot = resolveScratchRoot({ kind: 'package-files-test' });
@@ -148,16 +149,35 @@ describe('publishedFiles / isPublished / copyPublishedPackage', () => {
 });
 
 describe('scratch root', () => {
-    it('defaults to the workspace Temp directory', () => {
-        // `findWorkspaceRoot()` only answers undefined above the filesystem root, so
-        // a missing workspace is itself the failure this case is about.
-        const workspaceRoot = findWorkspaceRoot();
-        if (workspaceRoot === undefined) {
-            throw new Error('no workspace root carries both AGENTS.md and Temp/');
-        }
+    it('defaults to the workspace Temp directory, falling back to the package Temp', () => {
+        // A synthetic workspace pins the workspace branch in every environment:
+        // `findWorkspaceRoot` inspects the start root itself before walking up, so
+        // the AGENTS.md + Temp/ fixture wins before any real ancestor is reached.
+        // The nested package root mirrors the real layout ./scratch.ts describes —
+        // a package `Temp/` without AGENTS.md must not be mistaken for the workspace.
+        const syntheticWorkspace = mkdtempSync(path.join(scratchRoot, 'workspace-'));
+        fixtureRoots.push(syntheticWorkspace);
+        writeFileSync(path.join(syntheticWorkspace, 'AGENTS.md'), '', 'utf8');
+        mkdirSync(path.join(syntheticWorkspace, 'Temp'), { recursive: true });
 
-        const expected = path.join(workspaceRoot, 'Temp', 'underload-harness', 'probe');
-        expect(resolveScratchRoot({ kind: 'probe' })).toBe(expected);
+        const syntheticPackageRoot = path.join(syntheticWorkspace, 'packages', 'harness');
+        mkdirSync(path.join(syntheticPackageRoot, 'Temp'), { recursive: true });
+        expect(resolveScratchRoot({ kind: 'probe', packageRoot: syntheticPackageRoot })).toBe(
+            path.join(syntheticWorkspace, 'Temp', 'underload-harness', 'probe')
+        );
+
+        // The real default follows the same rule from the actual package root and
+        // branches on the environment: inside the noobscript workspace the scratch
+        // lands under its Temp/, while the standalone GitHub checkout
+        // (./.github/workflows/ci.yml) has no AGENTS.md + Temp/ ancestor and falls
+        // back to the package-local Temp/ that .gitignore ignores.
+        const workspaceRoot = findWorkspaceRoot();
+        expect(resolveScratchRoot({ kind: 'probe' })).toBe(
+            workspaceRoot === undefined
+                ? path.join(PACKAGE_ROOT, 'Temp', 'probe')
+                : path.join(workspaceRoot, 'Temp', 'underload-harness', 'probe')
+        );
+
         // argv[0] is inert filler here: `resolveScratchRoot` only reads `--scratch`.
         expect(resolveScratchRoot({ kind: 'probe', argv: ['vite-node', 'x', '--scratch', 'relative/dir'] })).toBe(
             path.resolve('relative/dir')
