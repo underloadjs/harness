@@ -246,12 +246,15 @@ describe('plugin manifest parity', () => {
                         key: 'thoughtTurns',
                         group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
                         parentKey: 'trimThoughts',
-                        label: 'Thoughts · trim after (thoughts)',
+                        label: 'Thoughts · trim after (model steps)',
                         type: 'number',
                         default: 2,
                         min: 0,
                         max: 4096,
-                        step: 1
+                        step: 1,
+                        // The UNIT of account is part of the contract: an operator reading "(turns)"
+                        // sizes this against a conversation, and the axis counts model steps.
+                        description: 'Protects the newest N model steps; the newest step always travels.'
                     },
                     // Filed with the thinking rule it gates, not with the economy knobs.
                     {

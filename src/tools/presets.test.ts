@@ -47,6 +47,17 @@ import { MODEL_TOOL_RESULT_BUDGET_BYTES } from '../core/result-budget';
 // Importing the leaf module pulls in no tool body, so laziness.test.ts is unaffected.
 const FILE_READ_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 
+// M7 (./files/read.tool.ts:1026-1032): every read result also publishes `budgetPool`, the
+// bytes that were ACTUALLY splittable — `contentBudget` minus the serialized scaffolding of
+// the result and of every entry, minus the `note`'s worst case and the per-file headroom.
+// Every one of those reserves embeds the absolute path of the per-run Temp/ workdir, so the
+// figure has a different value (and sometimes a different digit count) on every checkout:
+// it is masked here exactly like `wireBytes`/`modelBytes` are. Nothing in THIS file is about
+// the pool, and ./files/read.test.ts pins it as the arithmetic that defines it
+// (`budgetGranted === floor(budgetPool / files)`), which is exact and path-free.
+// Same helper name as read.test.ts's `anyPool` on purpose - one masking style, not two.
+const anyPool = expect.any(Number);
+
 // Mirrors FILES_CONTENT_BUDGET / FILES_LIST_DEFAULT_LIMIT in ./files/files.tool.ts
 // for the same lazy-loading reason as above.
 const FILES_CONTENT_BUDGET = 64 * 1024;
@@ -212,6 +223,8 @@ describe('syntax', () => {
             // per-run workdir path and is matched rather than hardcoded.
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            // M7: the splittable pool, path-dependent like `wireBytes` (see `anyPool`).
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 2
         });
@@ -278,6 +291,8 @@ describe('file tools', () => {
             bytes: 7,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            // M7: the splittable pool, path-dependent like `wireBytes` (see `anyPool`).
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 0
         });
@@ -437,6 +452,8 @@ describe('file tools', () => {
             bytes: 2,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            // M7: the splittable pool, path-dependent like `wireBytes` (see `anyPool`).
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 0
         });
@@ -581,6 +598,8 @@ describe('file tools', () => {
             bytes: 6,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            // M7: the splittable pool, path-dependent like `wireBytes` (see `anyPool`).
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 0
         });
@@ -617,6 +636,10 @@ describe('file tools', () => {
             bytes: 0,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_CONTENT_BUDGET,
+            // M7: the splittable pool, path-dependent like `wireBytes` (see `anyPool`).
+            // A not-found entry costs no budget, but the result still carries every key a
+            // successful read carries, `budgetPool` included.
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 1
         });

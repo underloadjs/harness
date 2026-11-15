@@ -44,10 +44,12 @@ import {
     symlink,
     writeFile as writeTextFile
 } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toolParameterKey } from '../../core';
-import { write } from './write.tool';
+import { HarnessError } from '../../util';
+import { write, FILE_WRITE_ERROR_CODES, WRITE_METADATA } from './write.tool';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 
@@ -771,3 +773,362 @@ const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\
 // either a success or a failure the list is empty. Sorted so a comparison is stable.
 const stagingEntries = async (dir: string): Promise<string[]> =>
     (await readdir(dir)).filter((name) => name.includes('.tmp-')).sort();
+
+// The thrown failure as a VALUE, so `code` and `details` (M11) can be asserted next to the
+// sentence. `toThrow(errorInstance)` compares the message and nothing machine-readable.
+const failureOf = async (call: () => Promise<unknown>): Promise<HarnessError> => {
+    const failure = await call().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(HarnessError);
+
+    return failure as HarnessError;
+};
+
+// A FIFO (named pipe) at `path`, false when this host has no `mkfifo`. L5's fixture: a pipe
+// is a perfectly creatable name that is not a file, and the publish would rename a regular
+// file on top of it, leaving a reader holding a node nobody asked to replace.
+const makeFifo = (path: string): boolean => spawnSync('mkfifo', [path]).status === 0;
+
+describe('write - the published refusals and disclosures (L5, L6, M9, M11, H6)', () => {
+    it('refuses a FIFO instead of renaming a regular file onto it', async () => {
+        const dir = join(workdir, 'l5-fifo');
+        const fifo = join(dir, 'pipe.txt');
+        await mkdir(dir, { recursive: true });
+
+        if (!makeFifo(fifo)) {
+            await expect(readdir(dir)).resolves.toEqual([]);
+
+            return;
+        }
+
+        const startedAt = Date.now();
+        const failure = await failureOf(() => write([{ path: fifo, content: 'nope' }]));
+        const elapsedMs = Date.now() - startedAt;
+
+        expect(failure.code).toBe('EOPNOTSUPP');
+        expect(failure.name).toBe('EOPNOTSUPP');
+        // The refusal sentence is the shared one from ./atomic-publish.ts, inside this tool's
+        // batch-failure wrapper, so `write` and `edit` cannot disagree about what a file is.
+        expect(
+            failure.message.startsWith(
+                `write failed on ${fifo}: write refused ${fifo}: the target is a FIFO (named pipe), not a regular file. `
+            )
+        ).toBe(true);
+        expect(failure.message.endsWith(' Writes already completed: none. No rollback was performed.')).toBe(true);
+        // Refused BEFORE any staging file existed, so the pipe's directory is untouched.
+        await expect(stagingEntries(dir)).resolves.toEqual([]);
+        expect((await lstat(fifo)).isFIFO()).toBe(true);
+        expect(elapsedMs).toBeLessThan(5_000);
+    });
+
+    it('refuses a character device instead of writing through it', async () => {
+        // `/dev/null` used to be happily "written": the in-place open succeeded, the bytes
+        // vanished, and the receipt reported success with a byte count for a file that cannot
+        // hold any. Staging cannot create a sibling in /dev for an unprivileged process at
+        // all, so both halves of that answer are gone — the target is refused for what it is.
+        let isCharDevice = false;
+
+        try {
+            isCharDevice = (await lstat('/dev/null')).isCharacterDevice();
+        } catch {
+            isCharDevice = false;
+        }
+
+        if (!isCharDevice) return;
+
+        const failure = await failureOf(() => write([{ path: '/dev/null', content: 'x' }]));
+
+        expect(['EOPNOTSUPP', 'EACCES']).toContain(failure.code);
+        expect(failure.message).toContain('Writes already completed: none. No rollback was performed.');
+    });
+
+    it('refuses a directory with the node type in the published code', async () => {
+        // The sentence is pinned by the test above; what this adds is the machine-readable
+        // half (M11) — EISDIR, not a prose guess — and the fact that no staging file was
+        // created inside the directory on the way to that answer.
+        const dir = join(workdir, 'l5-dir-code');
+        await mkdir(dir, { recursive: true });
+        await writeTextFile(join(dir, 'keep.txt'), 'keep', 'utf8');
+
+        const failure = await failureOf(() => write([{ path: dir, content: 'nope' }]));
+
+        expect(failure.code).toBe('EISDIR');
+        expect(failure.name).toBe('EISDIR');
+        expect((await readdir(dir)).sort()).toEqual(['keep.txt']);
+    });
+
+    it('carries a 0000 mode onto the file it publishes', async () => {
+        // The mode-preservation claim is about ANY existing mode, not just the executable one
+        // the test above pins: the publish copies the low permission bits onto the staging
+        // file, so a 0000 target comes back 0000 (and NOT the 0600 a fresh create would have
+        // picked). Asserted through `stat`, because on an unprivileged host the file cannot be
+        // read back at that mode — the size and the code are the observable halves.
+        const path = join(workdir, 'mode-0000.txt');
+        await writeTextFile(path, 'PREVIOUS', 'utf8');
+        await chmod(path, 0o000);
+
+        await expect(write([{ path, content: 'replaced' }])).resolves.toEqual([{ path, bytes: 8 }]);
+
+        const after = await stat(path);
+        expect(after.isFile()).toBe(true);
+        expect(after.size).toBe(8);
+        if (process.platform !== 'win32') expect(after.mode & 0o777).toBe(0);
+    });
+
+    it('refuses an unknown field by name instead of ignoring it', async () => {
+        // M9. The schema says `additionalProperties: false`, but the direct call path never
+        // sees the schema, and an unknown key used to be destructured away: `{ path, content,
+        // overwrite: false }` wrote straight through the flag the caller thought they set.
+        const path = join(workdir, 'm9-unknown-field.txt');
+
+        const failure = await failureOf(() =>
+            write([{ path, content: 'x', overwrite: true } as never])
+        );
+
+        expect(failure.message).toBe(
+            'write files entries do not accept "overwrite". Allowed fields: path, content.'
+        );
+
+        const exists = await stat(path).then(
+            () => true,
+            () => false
+        );
+        expect(exists).toBe(false);
+    });
+
+    it('discloses an unpaired surrogate as lossy, with the exact bytes that landed', async () => {
+        // L6. A lone surrogate has no UTF-8 encoding, so the encoder substitutes U+FFFD and
+        // the original code point is GONE: re-reading the file cannot reveal it, and the
+        // byte count the receipt reports is not the caller's string length. This call is the
+        // only place that fact can be said, so `lossy: true` is the disclosure.
+        const path = join(workdir, 'l6-lone-surrogate.txt');
+        const content = 'a\uD800b';
+
+        await expect(write([{ path, content }])).resolves.toEqual([
+            { path, bytes: Buffer.byteLength(content, 'utf8'), lossy: true }
+        ]);
+
+        // 'a', U+FFFD (ef bf bd), 'b' — five bytes, and the surrogate is unrecoverable.
+        await expect(readBytes(path)).resolves.toEqual(Buffer.from([0x61, 0xef, 0xbf, 0xbd, 0x62]));
+        expect(Buffer.byteLength(content, 'utf8')).toBe(5);
+    });
+
+    it('does not flag a paired astral character as lossy', async () => {
+        // The other side of the flag: a real surrogate PAIR encodes fine, so a test that only
+        // asserted the lossy case would pass even if every write were flagged. No `lossy`
+        // key at all — the exact receipt shape.
+        const path = join(workdir, 'l6-paired.txt');
+
+        await expect(write([{ path, content: 'a😀b' }])).resolves.toEqual([
+            { path, bytes: 6 }
+        ]);
+
+        await expect(readBytes(path)).resolves.toEqual(
+            Buffer.from([0x61, 0xf0, 0x9f, 0x98, 0x80, 0x62])
+        );
+    });
+
+    it('reports the failing path and the completed paths as data, not only as prose', async () => {
+        // M11, on the same fixture the sentence-level test above uses: the OS error is also a
+        // code from the published set, and the completed list is a field a caller can switch
+        // on instead of parsing out of a sentence.
+        const dir = join(workdir, 'm11-partial');
+        const locked = join(dir, 'locked');
+        const writable = join(dir, 'writable');
+        await mkdir(locked, { recursive: true });
+        await mkdir(writable, { recursive: true });
+
+        await chmod(locked, 0o500);
+
+        let createBlocked = false;
+
+        try {
+            await writeTextFile(join(locked, 'probe.txt'), 'x', 'utf8');
+        } catch {
+            createBlocked = true;
+        }
+
+        if (!createBlocked) {
+            await rm(join(locked, 'probe.txt'), { force: true });
+            await chmod(locked, 0o700);
+
+            return;
+        }
+
+        const failing = join(locked, 'target.txt');
+        await chmod(locked, 0o700);
+        await writeTextFile(failing, 'PREVIOUS', 'utf8');
+        await chmod(locked, 0o500);
+
+        const completed = join(writable, 'done.txt');
+
+        try {
+            const failure = await failureOf(() =>
+                write([
+                    { path: completed, content: 'written' },
+                    { path: failing, content: 'NEVER WRITTEN' }
+                ])
+            );
+
+            expect(['EACCES', 'EPERM', 'EROFS']).toContain(failure.code);
+            expect(FILE_WRITE_ERROR_CODES).toContain(failure.code);
+            expect((failure.details as { failedPath: string }).failedPath).toBe(failing);
+            expect((failure.details as { completedPaths: string[] }).completedPaths).toEqual([completed]);
+
+            await expect(readTextFile(completed, 'utf8')).resolves.toBe('written');
+            await expect(readTextFile(failing, 'utf8')).resolves.toBe('PREVIOUS');
+            await expect(stagingEntries(locked)).resolves.toEqual([]);
+        } finally {
+            await chmod(locked, 0o700);
+        }
+    });
+
+    it('publishes the per-process qualifier and the new disclosures (H6, C2, L5, L6)', async () => {
+        // The description IS the contract a model reads, so each of these clauses is the
+        // published form of a behavior pinned by a test in this file. The lock qualifier is
+        // the H6 fix: ./lock.ts is one Map on one event loop, and a worker-thread lane has
+        // its own (../../server/config.ts), so an unqualified promise was false on the
+        // configuration the server can be configured onto.
+        const description = WRITE_METADATA.description;
+
+        expect(description).toContain(
+            'serialized per file (in this process only - a second harness process or a worker-thread lane keeps its own locks)'
+        );
+        expect(description).toContain('this write wins and that change is gone');
+        expect(description).toContain('never a partial write');
+        expect(description).toContain('a hard link to it keeps the previous bytes');
+        expect(description).toContain('a read-only existing file can still be overwritten');
+        expect(description).toContain(
+            'a target that is not a regular file (a directory, a FIFO, a device) is refused instead of silently replaced'
+        );
+        expect(description).toContain('so that entry says `lossy: true`');
+        expect(description).toContain(
+            'an entry naming any field other than `path` or `content` is rejected rather than ignored'
+        );
+        // T14: a cancelled call now refuses with the published `ECANCELED` (./cancellation.ts),
+        // and the sentence the model reads says so — a code that lives only in the exported set
+        // is a code the model cannot branch on. It was paid for INSIDE the existing failure
+        // sentence instead of appended as a new one, so the description grew by one clause and
+        // no ceiling moved.
+        expect(description).toContain(
+            'a cancelled call rejects with `ECANCELED` naming the files already written: there is no rollback'
+        );
+    });
+
+    it('reports a symlink loop as ELOOP, never as the transient EIO', async () => {
+        // A publish that cannot resolve its target raises this from ./atomic-publish.ts's
+        // hand-rolled link walk (`realWriteTarget`), and that throw has to CARRY its code:
+        // `publishErrorCode` reads `error.code`, and a throw with no code folds to `EIO`.
+        // `EIO` is the harness's TRANSIENT code — the one the description teaches a model to
+        // retry — so an uncoded loop turned a permanent condition into a retry loop. Measured
+        // on the same self-referential link, `edit` and `files` both answered ELOOP while
+        // `write` answered `{ code: 'EIO', rawCode: null }`; these are the pins that were
+        // missing on the `write` side.
+        const loop = join(workdir, 'loop-ELOOP.txt');
+
+        try {
+            await symlink('loop-ELOOP.txt', loop, 'file');
+        } catch {
+            // Link creation is privileged on Windows: nothing to prove on this host.
+            return;
+        }
+
+        const failure = await failureOf(() => write([{ path: loop, content: 'x' }]));
+
+        // `code` AND `name` carry it (src/util/errors.ts: the code is the machine name and
+        // `name` is set to the same value), and `ELOOP` is a published member.
+        expect(failure.code).toBe('ELOOP');
+        expect(failure.name).toBe('ELOOP');
+        expect(FILE_WRITE_ERROR_CODES).toContain('ELOOP');
+        // The whole defect: `EIO` is what the caller used to see.
+        expect(failure.code).not.toBe('EIO');
+
+        // `rawCode` follows the published rule — present ONLY when it differs from `code`.
+        // Here the published code IS the real errno, so the key is absent entirely.
+        expect(failure.details).toEqual({ failedPath: loop, completedPaths: [] });
+        expect((failure.details as { rawCode?: string }).rawCode).toBeUndefined();
+        expect(failure.message).toContain('too many levels of symbolic links');
+
+        // The link survived the refusal, and no staging entry was left next to it. `lstat`
+        // (not `stat`) is what proves it: the loop still resolves to itself.
+        const loopStats = await lstat(loop);
+        expect(loopStats.isSymbolicLink()).toBe(true);
+        await expect(stagingEntries(workdir)).resolves.toEqual([]);
+    });
+
+    it('refuses a cancelled call with ECANCELED before touching the filesystem', async () => {
+        // Cancellation used to be invisible to this tool: `context.signal` was never read, so
+        // an aborted call wrote its files anyway and reported success. It now refuses with the
+        // published `ECANCELED` (./cancellation.ts), with the applied-ops facts in `details`
+        // like every other partial failure, and with the host's own abort reason kept as
+        // `cause` (harness.ts prefers a tool's own explanation of a cancellation, so the
+        // reason has to survive the substitution somewhere).
+        const target = join(workdir, 'cancelled-write.txt');
+        const controller = new AbortController();
+        controller.abort();
+
+        const failure = await failureOf(() =>
+            write.execute({ parameters: [{ path: target, content: 'x' }], signal: controller.signal })
+        );
+
+        expect(failure.code).toBe('ECANCELED');
+        expect(failure.name).toBe('ECANCELED');
+        expect(FILE_WRITE_ERROR_CODES).toContain('ECANCELED');
+        expect(failure.code).not.toBe('EIO');
+        expect(failure.details).toEqual({ rawCode: 'AbortError', completedPaths: [] });
+        // `cause` is not a declared field of `HarnessError` (src/util/errors.ts assigns it
+        // through a cast because the package does not pull in lib es2022.error), so tests
+        // reach it through the same cast, as ./glob.test.ts and ./grep.test.ts do.
+        const cause = (failure as { cause?: { name?: string } }).cause;
+        expect(cause?.name).toBe('AbortError');
+
+        // Nothing ran: no file, no staging litter.
+        const exists = await stat(target).then(
+            () => true,
+            () => false
+        );
+        expect(exists).toBe(false);
+        await expect(stagingEntries(workdir)).resolves.toEqual([]);
+    });
+
+    it('stops a cancelled batch at the next file and names the failing target', async () => {
+        // The per-entry check lives inside the shared publish (./atomic-publish.ts), which is
+        // where the abort lands when the call had already started: the abort below is issued
+        // synchronously after `execute` is invoked, so it always arrives after the top-of-call
+        // check and before the first entry's publish — the deterministic middle case between
+        // "cancelled before the call" and "cancelled after one file landed".
+        const first = join(workdir, 'cancel-mid-1.txt');
+        const second = join(workdir, 'cancel-mid-2.txt');
+        const controller = new AbortController();
+
+        const pending = write.execute({
+            parameters: [
+                { path: first, content: 'one' },
+                { path: second, content: 'two' }
+            ],
+            signal: controller.signal
+        });
+
+        controller.abort();
+
+        const failure = await failureOf(() => pending);
+
+        expect(failure.code).toBe('ECANCELED');
+        // The wrapper's own shape, so a caller cannot tell a cancellation from any other
+        // partial failure by the DETAILS alone — it switches on `code`.
+        expect(failure.details).toEqual({ failedPath: first, completedPaths: [] });
+        expect(failure.message).toContain(`write failed on ${first}:`);
+        expect(failure.message).toContain('was cancelled (ECANCELED)');
+        expect(failure.message).toContain('Writes already completed: none.');
+
+        for (const path of [first, second]) {
+            const exists = await stat(path).then(
+                () => true,
+                () => false
+            );
+            expect(exists).toBe(false);
+        }
+
+        await expect(stagingEntries(workdir)).resolves.toEqual([]);
+    });
+});

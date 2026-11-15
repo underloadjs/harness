@@ -79,9 +79,9 @@ const prepareFixtures = (): void => {
     fs.writeFileSync(EDIT_TARGET, 'before value', 'utf8');
 };
 
-// The exact result of reading the 5-byte fixture. `wireBytes` is the serialized
-// length of the response, so it depends on the length of this scratch path and is
-// matched rather than hardcoded; every other field is asserted exactly.
+// The exact result of reading the 5-byte fixture. `wireBytes`, `modelBytes` and `budgetPool`
+// are all figures derived from the serialized response, so they depend on the length of this
+// scratch path and are matched rather than hardcoded; every other field is asserted exactly.
 const readAlphaExpected = () => ({
     files: [
         {
@@ -104,6 +104,13 @@ const readAlphaExpected = () => ({
     bytes: 5,
     wireBytes: expect.any(Number),
     contentBudget: 262_144,
+    // M7 (./files/read.tool.ts:1026-1032): `budgetPool` is what the batch actually had
+    // left to split after every reserve was taken. Each reserve embeds the absolute
+    // scratch path, so the figure moves with the checkout exactly like `wireBytes` and
+    // `modelBytes` do; masked here for the same reason. Nothing in this file is about the
+    // pool — the point of these assertions is that the compiled BODY produces the full
+    // result shape, so the key has to be present, and `expect.any(Number)` says that.
+    budgetPool: expect.any(Number),
     // The projection's byte length, which moves with the per-run scratch path like
     // `wireBytes` does, so it is matched rather than hardcoded.
     modelBytes: expect.any(Number),

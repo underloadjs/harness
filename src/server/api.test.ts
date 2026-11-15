@@ -3293,6 +3293,14 @@ describe('manual tool execution', () => {
                     // the absolute fixture path, so it is matched rather than hardcoded.
                     wireBytes: expect.any(Number),
                     contentBudget: 262144,
+                    // M7 (./tools/files/read.tool.ts:1026-1032): `contentBudget` is the
+                    // envelope, `budgetPool` is what was left to split after every
+                    // reserve — and each reserve embeds the absolute fixture path, so the
+                    // figure is path-dependent like the two byte counters beside it. The
+                    // relationship this response pins is the SHAPE of a full read result
+                    // over HTTP, and it stays exact: the key must be here, and it must be
+                    // a number.
+                    budgetPool: expect.any(Number),
                     // The size of the PROJECTION (`read`'s model-facing text) for the same
                     // facts; it scales with the fixture path like `wireBytes` does.
                     modelBytes: expect.any(Number),
@@ -3404,6 +3412,11 @@ describe('manual tool execution', () => {
             // transcript got), and it is NOT an envelope key: the response is the tool's
             // own object, with no `content`/`budgetBytes` wrapper.
             expect(Object.keys(result).sort()).toEqual([
+                // M7 (./tools/files/read.tool.ts:1026-1032) added `budgetPool`, another
+                // key of the tool's OWN object — like `modelBytes`, it is not an envelope
+                // key, which is exactly what this assertion is about. Sorted position:
+                // `budgetPool` precedes `bytes` ('u' < 'y').
+                'budgetPool',
                 'bytes',
                 'contentBudget',
                 'files',

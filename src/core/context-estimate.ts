@@ -31,8 +31,29 @@
 //     counting the data would overstate a transcript with one screenshot by orders of
 //     magnitude.
 //
-// WHAT IS NEVER COUNTED: `reasoning`. It is retained for replay (types/index.ts) and
-// is not resent to the provider.
+// WHAT IS COUNTED FOR THINKING, AND WHY THAT CHANGED
+// ---------------------------------------------------
+// An assistant entry's `reasoning` is counted UNLESS that entry carries
+// `reasoningIncluded === false`. That flag is the whole rule, and it is the rule the projection
+// already applies: `core/agent.ts` `withoutWithheldReasoning` DELETES the `reasoning` key from the
+// request copy of a flagged entry, and `transport/openai.ts` emits `reasoning_content` for an entry
+// only when the projected copy still has non-empty `reasoning`. So:
+//
+//   - a flagged entry's thinking is on disk and NOT on the wire  -> not counted;
+//   - an unflagged entry's thinking is on the wire and billed    -> counted.
+//
+// This term used to be absent outright ("`reasoning` is retained for replay and is not resent"),
+// which was true of the pre-trimmer harness and stopped being true the day the context trimmer grew
+// a thinking axis. The cost of the stale rule was that EVERY thinking saving the trimmer writes read
+// as zero — in `estimatedTokens`, in `currentEstimatedTokens()`, in the `maxPromptTokens` /
+// `provider.contextWindow` guard and in the UI context bar. An operator turned the trimmer on, it
+// worked, and not one number they could see moved.
+//
+// The flag is read here rather than filtering entries at the call sites because BOTH callers need
+// the same rule and neither may be trusted to pre-filter: `transcriptChars` measures a PROJECTED
+// request (a withheld entry has no `reasoning` key at all, so the term contributes 0 by itself),
+// while `estimateContextTokens` is also handed CANONICAL entries by the trimmer's and compactor's
+// `minTokens` floor, where the flag is the only thing that says whether the text travels.
 //
 // TOTALITY: nothing here throws. A hostile/restored message may carry a number, an
 // object, or a Proxy as `content`; `textOf` stringifies defensively and a stringify
@@ -77,6 +98,15 @@ import type { HarnessMessage, HarnessUsage } from '../types';
 // Characters per token. The convention the whole product shares; see the header.
 const CHARS_PER_TOKEN = 4;
 
+// The same rule of thumb on its own, for a caller holding a CHARACTER count rather than a
+// transcript. The context trimmer's thinking axis measures what one write removes in characters
+// (`../plugins/context-trimmer.plugin.ts` `minThoughtChars`, `ThoughtCandidate.chars`) and its pass
+// report has to name the token figure in the ONE convention the rest of the product shares — a
+// second `ceil(n / 4)` written by hand in the plugin is a second formula that can drift. `0`, a
+// negative and a non-finite input are all `0`.
+export const estimateTokensFromChars = (chars: number): number =>
+    Number.isFinite(chars) && chars > 0 ? Math.ceil(chars / CHARS_PER_TOKEN) : 0;
+
 // Defensive stringification of one unknown field. Numbers and booleans are counted as
 // their literal text (a provider serializes them the same way); anything else goes
 // through a total JSON pass, falling back to `String()` semantics only when the value
@@ -113,6 +143,18 @@ const messageChars = (message: HarnessMessage): number => {
 
     // Tool results carry their own name on the wire (pairing), and a `name` costs a
     // handful of characters per call — measured, not guessed.
+    // The replayed thinking, per the header: on the wire unless this entry's own flag says it was
+    // withheld. Read defensively like every other field here — a restored message may carry a number
+    // or an object, and only a non-empty STRING is provider-visible text.
+    const reasoning = (message as { reasoning?: unknown }).reasoning;
+    if (
+        typeof reasoning === 'string' &&
+        reasoning.length > 0 &&
+        (message as { reasoningIncluded?: unknown }).reasoningIncluded !== false
+    ) {
+        total += reasoning.length;
+    }
+
     const name = (message as { name?: unknown }).name;
     if (typeof name === 'string') total += name.length;
 
@@ -168,19 +210,20 @@ export const transcriptChars = (
 // PUBLISHED FROM THE ROOT BARREL (issue 0004), so the contract a host may rely on is
 // stated here rather than only in the header above: this is an ESTIMATE, derived as
 // `ceil(chars / 4)` over exactly the text listed under WHAT IS COUNTED (message
-// content, tool-call names and raw arguments, the instruction strings handed in, and
-// an attachment's name and MIME — never attachment bytes, never `reasoning`, and never
-// the tool schemas that ride in the same request body, which is why the prompt a
-// provider really measures is a little larger than this number). A provider's real
-// count is not available before the request, so a call costs nothing
-// and answers before the round trip. It is total — nothing throws — and it is the very
+// content, tool-call names and raw arguments, the instruction strings handed in, an
+// attachment's name and MIME, and a replayed assistant `reasoning` UNLESS that entry
+// carries `reasoningIncluded: false`) — never attachment bytes, and never the tool
+// schemas that ride in the same request body, which is why the prompt a provider really
+// measures is a little larger than this number. A provider's real count is not available
+// before the request, so this costs nothing and answers before the round trip. It is
+// total — nothing throws — and it is the very
 // number `agent({ maxPromptTokens })` / `provider.contextWindow` measure a request
 // against (see ../core/agent.ts), which is why a host that trims its own history and
 // the package's own floor cannot disagree.
 export const estimateContextTokens = (
     messages: readonly HarnessMessage[] | undefined,
     instructions?: string | readonly string[]
-): number => Math.ceil(transcriptChars(messages, instructions) / CHARS_PER_TOKEN);
+): number => estimateTokensFromChars(transcriptChars(messages, instructions));
 
 // ---------------------------------------------------------------------------
 // T5.4 — the provider-anchored half

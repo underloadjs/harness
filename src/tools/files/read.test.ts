@@ -51,13 +51,19 @@
 // server/environment.test.ts.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, readFile, rm, writeFile as writeTextFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile as writeTextFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { boundToolResult, toolParameterKey, unwrapToolResult } from '../../core';
 import { MODEL_TOOL_RESULT_BUDGET_BYTES } from '../../core/result-budget';
 import {
     read as readTool,
+    readFileBatch,
+    DEFAULT_FILE_READ_LIMITS,
+    FILE_READ_ERROR_CODES,
+    FILE_READ_IO_DEADLINE_MS,
     FILE_READ_METADATA,
     FILE_READ_CONTENT_BUDGET,
     FILE_READ_DEFAULT_MAX_BYTES,
@@ -69,7 +75,7 @@ import {
     FILE_READ_NOTE_MIN_BYTES,
     FILE_READ_WIRE_BUDGET
 } from './read.tool';
-import type { FileReadEntry, FileReadResult } from './read.tool';
+import type { FileReadEntry, FileReadLimits, FileReadResult } from './read.tool';
 
 // A DIRECT call now receives the `toolText()` envelope, because the whole point of the
 // tool is that a model and a machine consume the same facts in two different renderings
@@ -87,6 +93,62 @@ const readBoth = async (paths: Parameters<typeof readTool>[0]) => {
     const unwrapped = unwrapToolResult<FileReadResult>(await readTool(paths));
 
     return { result: unwrapped.content, text: unwrapped.text as string };
+};
+
+// THE TEST SEAM H2 needs (deadline + cancellation). `read`'s `execute` passes the
+// published limits and the harness's own signal; `readFileBatch` takes them as
+// arguments — the same shape `./grep.tool.ts:626-639` publishes — so a test can ask for
+// `ioDeadlineMs: 0` and pin the timeout path synchronously instead of racing the 10 s
+// production ceiling, and can hand over an AbortSignal exactly as a harness run does.
+const readWith = async (
+    paths: Parameters<typeof readTool>[0],
+    limits?: Partial<FileReadLimits>,
+    signal?: AbortSignal
+): Promise<FileReadResult> =>
+    unwrapToolResult<FileReadResult>(
+        await readFileBatch(paths, { ...DEFAULT_FILE_READ_LIMITS, ...limits }, signal)
+    ).content;
+
+// POSIX-only fixture makers for the target CLASSES H2 is about, because Node exposes no
+// FIFO API at all (`fs.mkfifo` does not exist in any supported runtime — measured), so a
+// FIFO comes from the platform binary. `null` / `false` means "this box cannot build the
+// target", which the test turns into an early return; anything else that goes wrong
+// throws, so a broken fixture fails loudly rather than skipping the assertion away.
+const exec = (command: string, args: string[]): Promise<void> =>
+    new Promise((resolveRun, rejectRun) =>
+        execFile(command, args, (error) => (error === null ? resolveRun() : rejectRun(error)))
+    );
+
+const makeFifo = async (relativePath: string): Promise<string | null> => {
+    if (process.platform === 'win32') return null;
+
+    const target = join(workdir, relativePath);
+
+    try {
+        await exec('mkfifo', [target]);
+    } catch (error) {
+        // No `mkfifo` binary on this box: the case cannot exist here.
+        if ((error as { code?: string }).code === 'ENOENT') return null;
+
+        throw error;
+    }
+
+    // A FIFO that is not actually a FIFO would make the assertions below meaningless.
+    if (!(await lstat(target)).isFIFO()) throw new Error(`mkfifo did not create a FIFO at ${target}`);
+
+    return target;
+};
+
+// The `/proc` guard: the pseudo-file IS the fixture for the H3/EXTRA-4 tests, and it only
+// exists on Linux. Everything else in this file is platform-independent.
+const exists = async (target: string): Promise<boolean> => {
+    try {
+        await lstat(target);
+
+        return true;
+    } catch {
+        return false;
+    }
 };
 
 // Repo-root Temp/ (six levels up from src/tools/files/: files -> tools -> src ->
@@ -109,14 +171,52 @@ const seedBytes = async (relativePath: string, content: Uint8Array): Promise<str
     return path;
 };
 
-// `wireBytes` and `modelBytes` both depend on the length of the per-run temp directory
-// name, so they are replaced with matchers rather than literals. Everything else is
-// asserted exactly, which keeps the strict whole-object comparison the contract needs.
+// `wireBytes` and `modelBytes` both carry the fixture's ABSOLUTE path once — the
+// serialized entry for the first, the projection's header line for the second — so a
+// whole-number literal is a number for one checkout path only. CI checks this package
+// out as `underloadjs/harness` from its own repo root, a shorter path than the
+// monorepo checkout the literals were written on. Where an exact figure is the point,
+// the tests below pin the path-INDEPENDENT cost and add the path back, and everything
+// else is asserted exactly, which keeps the strict whole-object comparison the contract
+// needs.
+//
+// `budgetPool` is masked for the same reason, and it is not the only place the number is
+// checked: it is the batch's splittable bytes (M7), which is `contentBudget` minus the
+// per-entry scaffolding — every one of which embeds a path. The exact figure is pinned by
+// arithmetic in the budget tests below (`budgetGranted === floor(budgetPool / paths)`), so
+// masking it here costs no precision, only the path.
 const withWire = (result: FileReadResult) => ({
     ...result,
     wireBytes: expect.any(Number),
-    modelBytes: expect.any(Number)
+    modelBytes: expect.any(Number),
+    budgetPool: anyPool
 });
+
+// M7: the batch's SPLITTABLE bytes, masked everywhere it is not the subject of the test.
+// `budgetPool = contentBudget - (per-entry JSON scaffolding + the projection's fixed line +
+// the floor headroom)`, and every one of those reserves embeds the fixture's absolute path,
+// so no checkout can write it as a literal. Where the pool IS the subject, the tests below
+// pin it as the arithmetic it is defined by (`budgetGranted === floor(budgetPool / files)`),
+// which is exact and path-free.
+const anyPool = expect.any(Number);
+
+// Raw bytes, the unit `modelBytes` measures the prose in.
+const pathBytes = (path: string): number => Buffer.byteLength(path, 'utf8');
+
+// The serialized path is the JSON form: on Windows each separator doubles, and a
+// non-ASCII segment is escaped. `- 2` removes only the surrounding quotes.
+const serializedPathBytes = (path: string): number => Buffer.byteLength(JSON.stringify(path), 'utf8') - 2;
+
+// The wire cost of one NUMBER field in the result object, `"name":N,` separators included
+// — because `wireBytes` measures the serialized object, not its fields. M7 added
+// `budgetPool`, whose digit count follows the pool, which follows the fixture path: adding
+// this term keeps a `wireBytes` pin exact on every checkout instead of freezing the number
+// for one of them.
+const fieldWire = (name: string, value: number): number => Buffer.byteLength(`"${name}":${value},`, 'utf8');
+
+// M7 in one term: the result's own `budgetPool`, priced wherever a `wireBytes` literal was
+// written before the field existed.
+const poolWire = (result: FileReadResult): number => fieldWire('budgetPool', result.budgetPool);
 
 // The line fixtures are generated rather than pasted; the assertions below spell out
 // the exact slice expected for each window. `lines.txt` is 1300 lines, which is INSIDE
@@ -241,6 +341,7 @@ describe('read', () => {
             bytes: 11,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_WIRE_BUDGET,
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 0
         });
@@ -290,6 +391,7 @@ describe('read', () => {
                 bytes: 11,
                 wireBytes: expect.any(Number),
                 contentBudget: FILE_READ_WIRE_BUDGET,
+                budgetPool: anyPool,
                 modelBytes: expect.any(Number),
                 skipped: 0
             });
@@ -338,6 +440,7 @@ describe('read', () => {
             bytes: 10,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_WIRE_BUDGET,
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 0
         });
@@ -368,6 +471,7 @@ describe('read', () => {
             bytes: 7,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_WIRE_BUDGET,
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 0
         });
@@ -509,6 +613,7 @@ describe('read', () => {
             bytes: 24,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_WIRE_BUDGET,
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 0
         });
@@ -888,6 +993,7 @@ describe('read', () => {
             bytes: 6,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_WIRE_BUDGET,
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 1
         });
@@ -1928,13 +2034,16 @@ describe('read', () => {
         expect(past.error?.message).toContain('1300');
     });
 
-    it('gives up on an endless continuation run instead of calling the file binary', async () => {
-        // L8. A seek into a byte that is not a code-point start is aligned FORWARD, and
-        // the search is BOUNDED: a run of continuation bytes longer than any real code
-        // point is invalid data, and walking an unbounded run of them from a seek into a
-        // 200 MB file would be unbounded work for an answer that is "these bytes are not
-        // text" either way. Giving up reports EOF — the empty window at the end of the
-        // file — rather than a window that starts mid-sequence and decodes to EBINARY.
+    it('refuses an endless continuation run by name and offset, not with a silent empty window', async () => {
+        // M1, restating L8's bound. The probe stays BOUNDED on purpose: walking an
+        // unbounded run of `0x80`s from a seek into a 200 MB file is unbounded work for an
+        // answer that is "these bytes are not text" either way. What L8 did with that answer
+        // was the defect: giving up reported EOF, the same value the legitimate end-of-file
+        // exits report, so a caller that aimed `startByte` at a run of continuation bytes
+        // got `content: ""`, `truncated: false` and no error — "the file ends here", for a
+        // file with readable bytes before the run. The bound is unchanged; the outcome is
+        // now the published `EBINARY` naming the byte the caller pointed at, which is what
+        // the same file already answers when the window LANDS on those bytes.
         const misaligned = await seedBytes(
             'misaligned.txt',
             Buffer.concat([Buffer.from('a'), Buffer.from([0x80, 0x80, 0x80, 0x80, 0x80])])
@@ -1947,24 +2056,37 @@ describe('read', () => {
             endLine: 0,
             truncated: false,
             limit: null,
-            // The alignment did happen, and the entry says where the window really began:
-            // at the end of the file, because the bytes in between are not decodable.
-            startByteAligned: 6,
+            // Nothing was aligned TO: the offset the caller gave is the offset that was
+            // refused, and it is named in the message instead of posing as a window start.
+            startByteAligned: null,
             nextLine: null,
             nextColumn: null,
             nextByte: null,
             bytes: 0,
             sizeBytes: 6,
-            lineCount: 1
+            error: {
+                code: 'EBINARY',
+                message:
+                    `read refused "${join(workdir, 'misaligned.txt')}": byte 1 is inside a run of UTF-8 continuation ` +
+                    'bytes longer than any code point, so no whole character starts there (invalid UTF-8). read reads ' +
+                    'UTF-8 text only; seek to a byte before the run, or to one after it.'
+            }
         });
 
-        // A run of 5 continuation bytes is already past the 4-byte ceiling of a code
-        // point, and the probe grows 4 -> 16 -> 64 before it gives up, so a 300-byte run
-        // is answered the same way without scanning the rest of a big file.
+        // `lossy: true` does not buy a pass over this: the refusal is about the OFFSET being
+        // inside data that is not a character at all, which is why NUL is fatal in both decode
+        // modes too. A lossy read of the same bytes WITHOUT the seek still substitutes.
+        expect((await read([{ path: misaligned, startByte: 1, lossy: true }])).files[0].error?.code).toBe('EBINARY');
+        expect((await read([{ path: misaligned, lossy: true }])).files[0].content).toBe('a\ufffd\ufffd\ufffd\ufffd\ufffd');
+
+        // A run of 5 continuation bytes is already past the 4-byte ceiling of a code point,
+        // and the probe grows 4 -> 16 -> 64 before it gives up, so a 300-byte run is answered
+        // the same way WITHOUT reading the rest of it: bounded work, honest outcome. The old
+        // answer for this one was `startByteAligned: 301` and "the file ends".
         const long = await seedBytes('misaligned-long.txt', Buffer.concat([Buffer.from('a'), Buffer.alloc(300, 0x80)]));
         const walked = (await read([{ path: long, startByte: 1 }])).files[0];
 
-        expect([walked.bytes, walked.startByteAligned, walked.error]).toEqual([0, 301, undefined]);
+        expect([walked.bytes, walked.startByteAligned, walked.error?.code]).toEqual([0, null, 'EBINARY']);
 
         // Ordinary UTF-8 is still aligned, not given up on: a seek into the MIDDLE of a
         // 2-byte character moves to the next whole one and reads it, and the entry says
@@ -2050,7 +2172,13 @@ describe('read', () => {
             // nothing rather than to a small `maxBytes`.
             nextByte: 1,
             bytes: 1,
-            sizeBytes: Buffer.byteLength(LINES_1300, 'utf8')
+            sizeBytes: Buffer.byteLength(LINES_1300, 'utf8'),
+            // M7: this is the case `budgetGranted` exists for. The batch share that bound
+            // this file was 0 bytes — the 95 error reservations ate the envelope — and a
+            // caller that raises `maxBytes` to 262144 and gets the SAME one-character
+            // window can now see why instead of guessing. `limit: "budget"` says which
+            // governor cut it; this says what that governor was worth.
+            budgetGranted: 0
         });
     });
 
@@ -2179,12 +2307,14 @@ describe('read', () => {
 
         // The invariant the charge exists for, on the read that stresses it, is not an
         // ordering of the two views (F4) — it is that the machine view fits the budget it
-        // names. Here the JSON is the larger number (476 against 368) because the entry's
-        // fixed fields and the escaped content outweigh a 73-byte prose window; either way
-        // the wire is inside `contentBudget`, which is what keeps the continuation from
-        // being cut.
-        expect(capped.result.wireBytes).toBe(476);
-        expect(capped.result.modelBytes).toBe(368);
+        // names. Both views also carry the same fixture path, so the path-independent
+        // costs are what the numbers pin: the entry's fixed fields and the escaped
+        // content outweigh the 73-byte prose window by 108 bytes (379 against 271). The
+        // wire also pays M7's `budgetPool` field, whose cost is its own digits. Either
+        // way the wire is inside `contentBudget`, which is what keeps the continuation
+        // from being cut.
+        expect(capped.result.wireBytes).toBe(379 + serializedPathBytes(lines) + poolWire(capped.result));
+        expect(capped.result.modelBytes).toBe(271 + pathBytes(lines));
         expect(capped.result.wireBytes).toBeLessThanOrEqual(capped.result.contentBudget);
 
         // One steady gutter across the 999 -> 1000 boundary — the alignment is the
@@ -2207,12 +2337,12 @@ describe('read', () => {
 
         // Direction 1 — the shape a reader meets first, and the only one the old invariant
         // ever saw: a four-byte window costs MORE on the machine view than in prose, because
-        // the entry carries twelve fixed fields whatever the content is. These two numbers
-        // move with the fixture's path length; the direction is the point.
+        // the entry carries twelve fixed fields whatever the content is. Both views also
+        // carry this fixture's path, so the pinned bases carry the direction on their own.
         expect(numbered.result.files[0].content).toBe('x\ny\n');
         expect(numbered.result.files[0].bytes).toBe(4);
-        expect(numbered.result.wireBytes).toBe(404);
-        expect(numbered.result.modelBytes).toBe(179);
+        expect(numbered.result.wireBytes).toBe(307 + serializedPathBytes(pair) + poolWire(numbered.result));
+        expect(numbered.result.modelBytes).toBe(82 + pathBytes(pair));
 
         // Direction 2 — the one the old invariant ruled out. The gutter lives only in the
         // prose, yet it is charged against the machine allowance, so a large numbered window
@@ -2224,10 +2354,10 @@ describe('read', () => {
 
         expect(whole.result.files[0].endLine).toBe(1_300);
         expect(whole.result.files[0].bytes).toBe(Buffer.byteLength(LINES_1300, 'utf8'));
-        // Pinned exactly. The larger number is the PROSE — the asymmetry the header
-        // documents rather than a bug in it.
-        expect(whole.result.wireBytes).toBe(13_613);
-        expect(whole.result.modelBytes).toBe(19_876);
+        // Pinned exactly, path included. The larger number is the PROSE — the asymmetry
+        // the header documents rather than a bug in it.
+        expect(whole.result.wireBytes).toBe(13_516 + serializedPathBytes(lines) + poolWire(whole.result));
+        expect(whole.result.modelBytes).toBe(19_779 + pathBytes(lines));
 
         // What the guarantee actually is, on both shapes: the machine view — the part the
         // harness envelope would have to fit — always fits the budget it names, so the
@@ -2370,6 +2500,34 @@ describe('read', () => {
         await expect(read([{ path: 7 } as never])).rejects.toThrow('read paths must be non-empty strings.');
     });
 
+    it('refuses an unknown range field by name instead of serving the default window', async () => {
+        // The sibling of ./write.test.ts's `write files entries do not accept ...` pin, and the
+        // half THIS tool was missing. The schema says `additionalProperties: false`, but the
+        // DIRECT call path hands `execute` its argument untouched (../../core/tool.ts), and the
+        // bare-ARRAY form of `paths` skips the `parameters.paths` wrapper the harness validates
+        // at all. So `[{ path, offset: 3 }]` — and the typos `maxByte`, `maxLine`, `maxlines`,
+        // which are one character from a real field — were served the DEFAULT window with no
+        // signal whatsoever: the caller believed it had bounded the read, and the entry reported
+        // a window it never asked for. Naming the key and the accepted set (./read.tool.ts's
+        // `FILE_READ_FIELDS`) turns that silence into one round trip. Mirrors the wording of
+        // `write files entries do not accept ...` and `edit edits entries do not accept ...`.
+        const alpha = join(workdir, 'a.txt');
+
+        // Refused before any syscall: the guard runs inside `normalizeTargets`, so a typo in the
+        // LAST entry cannot produce a misleading partial answer.
+        for (const field of ['offset', 'maxByte', 'maxLine', 'maxlines']) {
+            await expect(read([{ path: alpha, [field]: 1 } as never])).rejects.toThrow(
+                `read paths entries do not accept "${field}". Allowed fields: path, startLine, startColumn, startByte, maxLines, maxBytes, lossy, numbered.`
+            );
+        }
+
+        // The same key inside a mixed bare batch, where the first entry is a valid bare string:
+        // the guard cannot be avoided by changing the shape of the entry around it.
+        await expect(read([alpha, { path: alpha, offset: 2 } as never])).rejects.toThrow(
+            'read paths entries do not accept "offset". Allowed fields: path, startLine, startColumn, startByte, maxLines, maxBytes, lossy, numbered.'
+        );
+    });
+
     it('rejects invalid range values instead of silently clamping', async () => {
         await expect(read([{ path: join(workdir, 'a.txt'), startLine: 0 }])).rejects.toThrow(
             'read startLine must be an integer between 1 and 9007199254740991; received 0.'
@@ -2410,7 +2568,10 @@ describe('read', () => {
         // into text the caller believed was exact - the silent change the flag exists to
         // opt INTO - so a non-boolean is refused rather than coerced.
         await expect(read([{ path: join(workdir, 'a.txt'), lossy: 'yes' } as never])).rejects.toThrow(
-            'read lossy must be a boolean or omitted; received yes.'
+            // L11: the value is echoed as JSON, so a quoted string reads as a quoted
+            // string. `received yes` was the same sentence for `'yes'` and for `yes`,
+            // which is the one distinction the caller needed.
+            'read lossy must be a boolean or omitted; received "yes".'
         );
         await expect(read([{ path: join(workdir, 'a.txt'), numbered: 1 } as never])).rejects.toThrow(
             'read numbered must be a boolean or omitted; received 1.'
@@ -2454,6 +2615,7 @@ describe('read', () => {
             bytes: 6,
             wireBytes: expect.any(Number),
             contentBudget: FILE_READ_WIRE_BUDGET,
+            budgetPool: anyPool,
             modelBytes: expect.any(Number),
             skipped: 0
         });
@@ -2562,6 +2724,14 @@ describe('read', () => {
         // because a description only ever grows - the reasoning that belongs in a
         // sentence here is worth 400 bytes on every request, and the reasoning that
         // belongs in a paragraph belongs in the source header or the projection.
+        //
+        // T14 raised the number by 10 bytes, and paid for them the same way T6 did: naming
+        // `ECANCELED` (the description has to name every published code, and the loop below is
+        // what enforces that) costs 34 bytes for " or a cancelled call (`ECANCELED`)", which two
+        // clauses that restated the parameter schema paid for — "Max 100 paths. " (15, already in
+        // `maxItems`) and "(a SEEK) " (9, a description of a description). The description now
+        // says what a cancelled call does, which is the fact a caller cannot infer from
+        // `error: { code }`, and the ceiling did not move.
         const descriptionBytes = Buffer.byteLength(FILE_READ_METADATA.description, 'utf8');
         const schemaBytes = Buffer.byteLength(JSON.stringify(readTool.parameters), 'utf8');
 
@@ -2573,6 +2743,50 @@ describe('read', () => {
         expect(FILE_READ_METADATA.description).toContain(String(FILE_READ_DEFAULT_MAX_BYTES));
         for (const reason of ['maxLines', 'maxBytes', 'budget']) {
             expect(FILE_READ_METADATA.description).toContain(reason);
+        }
+        // T6 raised the description's WORK (it now has to explain the new wire surface:
+        // `rawCode`, `budgetPool`, `budgetGranted`, `sizeBytes: null`, the physical-start
+        // rule for `startColumn`, and three codes that did not exist before) without raising
+        // the ceiling: the text was rewritten so every clause that merely restated the
+        // parameter schema — which travels with it on every request anyway — gave up its
+        // bytes to those facts. Measured after the rewrite, and again after T14's 10-byte
+        // addition: 1,695 description bytes and 2,580 schema bytes, against 1,700 and 2,600, so
+        // the declaration tax is still inside the envelope it was capped at. The headroom is 5
+        // bytes on purpose: the next fact that wants a sentence has to pay for it out of the
+        // description, not out of the ceiling.
+        //
+        // One clause the rewrite dropped and the rewrite's own follow-up put BACK: "The 256
+        // KiB budget is measured on the SERIALIZED result". A caller that takes `content`'s
+        // raw length as its allowance is wrong, because the envelope counts the SERIALIZED
+        // result — path, escaping and the note included — and that is the one fact about the
+        // budget a model cannot infer from the field names. `src/tools/laziness.test.ts:160`
+        // pins the same phrase; the assertion below is what stops a future trim from silently
+        // breaking it from this side.
+        expect(descriptionBytes).toBe(1_695);
+        // Every code this tool can publish is named in the description, because a model that
+        // is not told a code exists cannot branch on one (H5 made the set closed and
+        // enumerable, which is what makes this assertion possible).
+        for (const code of FILE_READ_ERROR_CODES) {
+            expect(FILE_READ_METADATA.description).toContain(code);
+        }
+        // The same argument for the new receipts and the two rules a caller cannot infer from
+        // the shape alone: the per-file deadline's number, and the fact that a `sizeBytes` of
+        // 0 or null is not EOF.
+        // The same argument for the new receipts and the three rules a caller cannot infer
+        // from the shape alone: the per-file deadline's number, the fact that a `sizeBytes`
+        // of 0 or null is not EOF, and the fact that the envelope is measured on the
+        // SERIALIZED result rather than on `content`'s raw length.
+        for (const fact of [
+            'rawCode',
+            'budgetPool',
+            'budgetGranted',
+            'skipped',
+            'sizeBytes',
+            '256 KiB budget is measured on the SERIALIZED result',
+            String(FILE_READ_IO_DEADLINE_MS),
+            'null as EOF'
+        ]) {
+            expect(FILE_READ_METADATA.description).toContain(fact);
         }
     });
 
@@ -2616,5 +2830,597 @@ describe('read', () => {
         expect(result.truncated).toBe(true);
         expect(result.bytes).toBe(7);
         expect(result.contentBudget).toBe(FILE_READ_WIRE_BUDGET);
+    });
+
+    // -------------------------------------------------------------------------
+    // T6 REGRESSION COVERAGE — one test per audit finding, in the id's own words.
+    // Each comment names the id and the `read.tool.ts` region that implements the
+    // fix, so a future edit that changes the behavior fails a test that says which
+    // behavior it was. Platform-dependent fixtures (FIFO, unix socket, symlink loop,
+    // `/proc`) are guarded at the top of each test and explained there.
+    // -------------------------------------------------------------------------
+
+    it('opens a FIFO without hanging the call and answers EAGAIN for an empty pipe (H2)', async () => {
+        // H2: `open` was mode `'r'` (`O_RDONLY` with no `O_NONBLOCK`) for EVERY target, so
+        // a FIFO with no writer blocked IN THE KERNEL — no deadline, no cancellation, the
+        // whole batch lost with it. The open flags are now chosen from the target's mode
+        // (`kindOfTarget` + `OPEN_NONBLOCKING`), decided BEFORE the open because nothing on
+        // the JavaScript side can interrupt an `open(fifo, 'r')` that never returns.
+        //
+        // This test IS the no-hang proof: with the old flags the call would sit here until
+        // the runner's own timeout. With `O_NONBLOCK` the open returns at once, the empty
+        // pipe answers "no bytes right now", and the entry publishes `EAGAIN` instead of the
+        // EOF it used to pose as (`wouldBlock` in `scanFile` + `WouldBlockError`).
+        const fifo = await makeFifo('pipe');
+
+        if (fifo === null) return; // no FIFO on this box — the target cannot be built
+
+        const result = await read([fifo, join(workdir, 'a.txt')]);
+
+        expect(result.files[0]).toEqual({
+            path: fifo,
+            content: '',
+            startLine: 1,
+            endLine: 0,
+            truncated: false,
+            limit: null,
+            startByteAligned: null,
+            nextLine: null,
+            nextColumn: null,
+            nextByte: null,
+            bytes: 0,
+            // H3: what a pipe holds is not a `st_size` fact, so nothing is published here.
+            sizeBytes: null,
+            error: {
+                code: 'EAGAIN',
+                message:
+                    `read found no bytes to read in "${fifo}": nothing is writing to it right now, so the read had ` +
+                    'nothing to take (EAGAIN). A FIFO only carries what a writer sends: start the writer, or read a ' +
+                    'regular file. This is NOT "the file is empty" — retry once there is a writer.'
+            }
+        });
+        // EXTRA-1: the failure stayed in its own entry — and this one is raised in the SCAN
+        // phase, which is exactly where the old code let an error escape the batch.
+        expect(result.files[1].content).toBe('alpha\n');
+        expect(result.files[1].error).toBeUndefined();
+        expect(result.skipped).toBe(1);
+    });
+
+    it('refuses a startByte on a FIFO as ESPIPE rather than reading it from nowhere (H2)', async () => {
+        // H2: a POSITIONAL read on a pipe, socket or device is ESPIPE. So a `startByte` on
+        // such a target is not a value to ignore but a request that cannot be answered, and
+        // phase 1 says so before the budget is split (`unseekableMessage`).
+        const fifo = await makeFifo('pipe-seek');
+
+        if (fifo === null) return;
+
+        expect((await read([{ path: fifo, startByte: 5 }])).files[0]).toEqual({
+            path: fifo,
+            content: '',
+            startLine: 1,
+            endLine: 0,
+            truncated: false,
+            limit: null,
+            startByteAligned: null,
+            nextLine: null,
+            nextColumn: null,
+            nextByte: null,
+            bytes: 0,
+            sizeBytes: null,
+            error: {
+                code: 'ESPIPE',
+                message:
+                    `read cannot seek "${fifo}": it is not a regular file (a pipe, socket or device has no file ` +
+                    'offset, so startByte cannot be answered there — ESPIPE). Read it without startByte, which ' +
+                    'streams it from wherever it currently is.'
+            }
+        });
+    });
+
+    it('gives an unresponsive file its own ETIMEDOUT entry instead of taking the call (H2)', async () => {
+        // H2: a per-file wall-clock budget (`FILE_READ_IO_DEADLINE_MS`, threaded through
+        // `FileIo`/`IoBudget` and enforced by `bounded` around every syscall). A file that
+        // runs out is ONE entry's outcome; its siblings keep their content.
+        //
+        // `ioDeadlineMs: 0` is the deterministic seam: a non-positive ceiling produces an
+        // already-expired deadline, which `bounded` refuses SYNCHRONICALLY before the first
+        // syscall — so this pins the path without racing a timer or waiting out 10 seconds.
+        const alpha = join(workdir, 'a.txt');
+        const beta = join(workdir, 'b.txt');
+
+        expect(FILE_READ_IO_DEADLINE_MS).toBe(10_000);
+        expect(DEFAULT_FILE_READ_LIMITS.ioDeadlineMs).toBe(FILE_READ_IO_DEADLINE_MS);
+
+        const timedOut = await readWith([alpha, beta], { ioDeadlineMs: 0 });
+
+        expect(timedOut.files.map((file) => file.error?.code)).toEqual(['ETIMEDOUT', 'ETIMEDOUT']);
+        expect(timedOut.files[0].error?.message).toBe(
+            `read gave up on "${alpha}" after 0ms of filesystem I/O (ETIMEDOUT): the device or mount holding it did ` +
+                "not answer in time, so this file's window is empty and the other paths in the call are unaffected. " +
+                'Try the path again, or read a file on a responsive mount.'
+        );
+        // An honest empty window: no bytes, no claim of truncation, and `sizeBytes: null`
+        // because nothing was ever learned about the file.
+        expect([timedOut.files[0].bytes, timedOut.files[0].truncated, timedOut.files[0].sizeBytes]).toEqual([
+            0,
+            false,
+            null
+        ]);
+        expect(timedOut.bytes).toBe(0);
+        expect(timedOut.skipped).toBe(2);
+
+        // The ceiling is a limit, not a law: `Infinity` switches the bound off and the same
+        // file reads normally, which is what a host with longer patience binds.
+        const patient = await readWith([alpha], { ioDeadlineMs: Number.POSITIVE_INFINITY });
+
+        expect(patient.files[0].content).toBe('alpha\n');
+        expect(patient.files[0].error).toBeUndefined();
+        expect(patient.skipped).toBe(0);
+    });
+
+    it('rejects the whole call when the harness cancels it, and does not invent an entry (H2)', async () => {
+        // Cancellation is not a fact about one file. The harness discards a late result
+        // anyway (src/types/index.ts:2356-2357), so `execute` hands the run's signal to
+        // `readFileBatch` and an aborted call REJECTS; a per-file DEADLINE is the opposite
+        // case and stays one entry (test above). The two must not be confused, which is also
+        // why `errorCodeOf` refuses to read an AbortError's NUMERIC `code` as an errno —
+        // otherwise cancellation would have been folded into `EIO` per entry.
+        //
+        // What the rejection IS changed (T14). It used to be whatever the host's signal
+        // carried: measured on this exact call, a DOMException whose `name` is `AbortError` and
+        // whose `code` is the NUMBER 20 — not a string errno, not a member of
+        // `FILE_READ_ERROR_CODES`, and one careless `errorCodeOf` away from the `EIO` fold this
+        // very comment warns about. It is now the published `ECANCELED` (./cancellation.ts), so
+        // the caller that has to branch has a CODE, while the platform reason it caused is still
+        // there as `rawCode` (present because it differs from `code`, the published rule) and as
+        // `cause`.
+        const alpha = join(workdir, 'a.txt');
+        const controller = new AbortController();
+
+        // A live signal changes nothing about the answer.
+        const live = await readWith([alpha], undefined, controller.signal);
+
+        expect(live.files[0].content).toBe('alpha\n');
+
+        controller.abort();
+
+        const failure = await readFileBatch([alpha], DEFAULT_FILE_READ_LIMITS, controller.signal)
+            .then(() => null)
+            .catch((error: unknown) => error as { name?: string; code?: string; message?: string; details?: unknown });
+
+        expect(failure).not.toBeNull();
+        expect(failure?.name).toBe('ECANCELED');
+        expect(failure?.code).toBe('ECANCELED');
+        expect(failure?.code).not.toBe('EIO');
+        expect(failure?.message).toBe(
+            `read was cancelled (ECANCELED) on ${JSON.stringify(alpha)}: the caller's abort signal fired, so nothing further ran. Re-run the call if the cancellation was not intended.`
+        );
+        expect(failure?.details).toEqual({ rawCode: 'AbortError', path: alpha });
+        // Reached through the cast src/util/errors.ts itself uses: `cause` is assigned, not
+        // declared, because the package does not pull in lib es2022.error.
+        expect((failure as { cause?: { name?: string } }).cause?.name).toBe('AbortError');
+    });
+
+    it('answers a cancelled call to a host with one ECANCELED rejection, never with partial results', async () => {
+        // The same contract from the CALLABLE side, because this is what a host actually sees.
+        // The abort below is issued synchronously after `execute`, so it arrives after the
+        // callable's own pre-check and on the FIRST entry's check: the deterministic form of a
+        // mid-call cancellation, and the reason `details.path` names `alpha` rather than `beta`.
+        // The half that matters for the contract is that the call REJECTS: a cancelled read does
+        // not come back holding whichever file it happened to reach, because a cancelled call has
+        // no consumer left for a result.
+        const alpha = join(workdir, 'a.txt');
+        const beta = join(workdir, 'b.txt');
+        const controller = new AbortController();
+
+        const pending = readTool.execute({ parameters: [alpha, beta], signal: controller.signal });
+
+        controller.abort();
+
+        const failure = await pending
+            .then(() => null)
+            .catch((error: unknown) => error as { name?: string; code?: string; details?: unknown; files?: unknown });
+
+        expect(failure).not.toBeNull();
+        expect(failure?.name).toBe('ECANCELED');
+        expect(failure?.code).toBe('ECANCELED');
+        expect(failure?.details).toEqual({ rawCode: 'AbortError', path: alpha });
+        // No `files` array survived the rejection: the caller is never handed half a batch and
+        // told it is the answer.
+        expect(failure?.files).toBeUndefined();
+        expect((failure as { cause?: { name?: string } }).cause?.name).toBe('AbortError');
+    });
+
+    it('reads a size-less pseudo-file honestly and lets its own cursor resume it (H3)', async () => {
+        // H3 + EXTRA-2: a `/proc` entry is a REGULAR file that reports `st_size === 0` while
+        // really holding over a kilobyte of text. Publishing that 0 as `sizeBytes` made three
+        // separate wrong answers: the documented `startByte = nextByte` continuation was an
+        // ERANGE on a file with bytes in it; the byte walks were bounded by 0, so a
+        // `startLine` was silently answered from byte 0 (EXTRA-2); and a full window
+        // short-circuited to `lineCount: 0` (EXTRA-4). The size is now a model (`FileSize`),
+        // a phase-1 one-byte probe separates "empty" from "unknown", and only a fact is
+        // published.
+        //
+        // FIXTURE: `/proc/self/limits`, NOT `/proc/self/status`. Measured: `status` re-renders
+        // on EVERY read and its `State:` line changes LENGTH ("S (sleeping)" is 12 characters,
+        // "R (running)" 10), so the absolute offset of every later line moves between the chunk
+        // whose newlines this tool counted and the positional read that follows — 21 of 40
+        // line-axis windows disagreed with the file's own line 3, which is exactly how this
+        // test came to fail under the parallel suite while passing focused. `limits` is the
+        // same pseudo-file shape (`st_size` 0, regular, text, newline-terminated) with 0
+        // differing re-renders in 40 reads, so the cross-read expectations below are exact.
+        //
+        // `/proc` IS the fixture, so this test is Linux by nature: absent it, it returns.
+        if (!(await exists('/proc/self/limits'))) return;
+
+        const path = '/proc/self/limits';
+        const whole = (await read([path])).files[0];
+
+        expect(whole.error).toBeUndefined();
+        expect(whole.sizeBytes).toBeNull();
+        // The bytes the entry reports are the bytes the content holds, whatever `stat` said.
+        expect(whole.bytes).toBe(Buffer.byteLength(whole.content, 'utf8'));
+        expect(whole.truncated).toBe(false);
+        expect(whole.nextByte).toBeNull();
+        // EXTRA-4: the line count is a COUNT, not a `st_size` reading. A newline TERMINATES
+        // the line above it, so the terminators are the count, and the walk that read this
+        // file to EOF earned that number without probing the tail.
+        expect(whole.content.endsWith('\n')).toBe(true);
+        expect(whole.lineCount).toBe(whole.content.split('\n').length - 1);
+        expect(whole.lineCount).toBe(whole.endLine);
+
+        // A 3-line window, then the documented resume from the byte it names.
+        const window = (await read([{ path, maxLines: 3 }])).files[0];
+
+        expect(window.truncated).toBe(true);
+        expect(window.limit).toBe('maxLines');
+        expect(window.startLine).toBe(1);
+        expect(window.endLine).toBe(3);
+        expect(window.nextLine).toBe(4);
+        expect(window.nextColumn).toBe(0);
+        expect(window.nextByte).toBe(Buffer.byteLength(window.content, 'utf8'));
+        // A window stopped mid-file on a target with no proven end has no whole-file answer,
+        // so the key is absent rather than 0 (the old EXTRA-4 false answer).
+        expect('lineCount' in window).toBe(false);
+
+        const resumed = (await read([{ path, startByte: window.nextByte as number }])).files[0];
+
+        // THE defect's executable answer: not ERANGE and not empty — the REST of the same
+        // file, byte for byte, with no invented size. The split/join here round-trips exactly
+        // (`whole.content` ends with a terminator, so the last element is an empty string),
+        // which makes this a byte-exact expectation rather than a prefix check.
+        expect(resumed.error).toBeUndefined();
+        expect(resumed.startLine).toBe(4);
+        expect(resumed.sizeBytes).toBeNull();
+        expect(resumed.content).toBe(whole.content.split('\n').slice(3).join('\n'));
+        // Paging to the end earns the count even with no size to stand on (EXTRA-4): the walk
+        // proved the end, and `endsWithNewline` settles the terminator question from the byte
+        // that walk actually stopped on instead of a positional probe a pseudo-file can answer
+        // arbitrarily.
+        expect(resumed.truncated).toBe(false);
+        expect(resumed.lineCount).toBe(resumed.endLine);
+
+        // EXTRA-2: the LINE axis on the same lying `st_size`. A walk bounded by the bogus 0
+        // asked for `0 - cursor` bytes, moved nothing, and answered `startLine: 5` from byte 0
+        // — line 1's text under line 5's number, with no error to say so. With the size
+        // modelled as unknown the walk is unbounded and stops at a real EOF instead.
+        const fifth = (await read([{ path, startLine: 5, maxLines: 2 }])).files[0];
+
+        expect(fifth.error).toBeUndefined();
+        expect(fifth.startLine).toBe(5);
+        expect(fifth.endLine).toBe(6);
+        expect(fifth.content).toBe(`${whole.content.split('\n').slice(4, 6).join('\n')}\n`);
+        // Not line 1 again — the exact shape of the old bug (line 1 of this file is its
+        // `Limit ... Units` column header).
+        expect(fifth.content.startsWith('Limit')).toBe(false);
+        // And it did not start at byte 0: the absolute cursor the window ends at is the end of
+        // line 6 measured from the top of the file, which a from-byte-0 answer could not be.
+        expect(fifth.nextByte).toBe(Buffer.byteLength(`${whole.content.split('\n').slice(0, 6).join('\n')}\n`, 'utf8'));
+        // Stopped mid-file, so the whole-file count is still not earned (EXTRA-4).
+        expect(fifth.truncated).toBe(true);
+        expect(fifth.limit).toBe('maxLines');
+        expect('lineCount' in fifth).toBe(false);
+    });
+
+    it('names a real line count when a pseudo-file cannot answer the line axis (EXTRA-4)', async () => {
+        // The count in this message is what makes "you are past the end" actionable, and it
+        // used to be 0 because the whole calculation went through a `sizeBytes === 0` shortcut
+        // (`lineCountAtEof`). `/proc/self/status` is the fixture here — a single read, and the
+        // assertion is about the SHAPE of the number, not its value: how many lines that file
+        // has depends on the kernel, and its own content re-renders between reads (see the H3
+        // test above), so the honest exactness level is "a positive integer that is not 0".
+        if (!(await exists('/proc/self/status'))) return;
+
+        const entry = (await read([{ path: '/proc/self/status', startLine: 5000 }])).files[0];
+
+        expect(entry.error?.code).toBe('ERANGE');
+        expect(entry.sizeBytes).toBeNull();
+        expect(entry.error?.message).toMatch(
+            /^read could not start "\/proc\/self\/status" at line 5000: the file has [1-9]\d* lines, so that line does not exist \(ERANGE\)\./
+        );
+        expect(entry.error?.message).not.toContain('has 0 lines');
+    });
+
+    it('folds an errno it does not publish into EIO with the untouched name in rawCode (H5)', async () => {
+        // H5: the published code set is CLOSED — `FileReadErrorCode` plus the
+        // `FILE_READ_ERROR_CODES` value a caller can enumerate. `open()` on a unix-domain
+        // socket answers ENXIO, which has no published entry, so the entry carries
+        // `code: 'EIO'` (branchable) and `rawCode: 'ENXIO'` (loggable). Before the fix the
+        // arbitrary errno WAS the code, with no contract saying it could be.
+        //
+        // POSIX/Linux only: the fixture is a socket inode, and opening one is what yields
+        // the errno.
+        if (process.platform === 'win32') return;
+
+        const socketPath = join(workdir, 's');
+        const server = createServer((client) => client.end());
+
+        try {
+            await new Promise<void>((resolve, reject) => {
+                server.once('error', reject);
+                server.listen(socketPath, () => resolve());
+            });
+        } catch {
+            server.close();
+
+            return; // no unix sockets here (unsupported, or the path outgrew the sockaddr)
+        }
+
+        try {
+            const result = await read([socketPath, join(workdir, 'a.txt')]);
+
+            expect(result.files[0].error?.code).toBe('EIO');
+            expect(result.files[0].error?.rawCode).toBe('ENXIO');
+            // This tool's own sentence plus the errno it refused to lose. The rest of the
+            // line is libuv's wording, which the contract does not promise.
+            expect(result.files[0].error?.message).toContain(`read failed to read "${socketPath}": ENXIO`);
+            // The fold stayed in its entry: the sibling is untouched, and an entry with no
+            // error carries no `rawCode`.
+            expect(result.files[1].content).toBe('alpha\n');
+            expect(result.files[1].error).toBeUndefined();
+            expect(result.skipped).toBe(1);
+        } finally {
+            await new Promise((resolve) => server.close(resolve));
+            await rm(socketPath, { force: true });
+        }
+    });
+
+    it('publishes exactly the error codes its contract says it publishes (H5)', () => {
+        // The closed set, pinned as a value (the type is erased at runtime, so this list IS
+        // the contract a caller can enumerate). 14 members, no duplicates, no gap. T14 added
+        // `ECANCELED`: a cancelled call REJECTED before this too (H2 above), but with whatever
+        // the host's signal carried — measured: a DOMException named `AbortError` whose `code`
+        // is the NUMBER 20 — which is not a member of this set and cannot be branched on.
+        expect([...FILE_READ_ERROR_CODES].sort()).toEqual([
+            'EACCES',
+            'EAGAIN',
+            'EBINARY',
+            'ECANCELED',
+            'EIO',
+            'EISDIR',
+            'ELOOP',
+            'ENAMETOOLONG',
+            'ENOENT',
+            'ENOTDIR',
+            'EPERM',
+            'ERANGE',
+            'ESPIPE',
+            'ETIMEDOUT'
+        ]);
+        expect(new Set(FILE_READ_ERROR_CODES).size).toBe(FILE_READ_ERROR_CODES.length);
+    });
+
+    it('answers ENOTDIR and ELOOP by name, with the remedy each one needs (H5)', async () => {
+        // Two of the newly-named codes. Both used to reach the caller as a bare errno with a
+        // Node message; each has a published entry now because the two need OPPOSITE
+        // remedies — one is a path spelling, the other a link cycle.
+        const notADirectory = join(workdir, 'a.txt', 'inner');
+        const notDir = (await read([notADirectory, join(workdir, 'a.txt')])).files;
+
+        expect(notDir[0].error).toEqual({
+            code: 'ENOTDIR',
+            message:
+                `read cannot resolve "${notADirectory}": a component of the path before the file is not a directory ` +
+                '(ENOTDIR), so nothing can be looked up inside it. Check that the separator belongs where the name does.'
+        });
+        expect(notDir[1].content).toBe('alpha\n');
+
+        // A symlink loop needs the POSIX symlink call; skip where it cannot be created.
+        if (process.platform === 'win32') return;
+
+        const loop = join(workdir, 'loop-a');
+        const loopOther = join(workdir, 'loop-b');
+
+        await symlink(loopOther, loop);
+        await symlink(loop, loopOther);
+
+        expect((await read([loop])).files[0].error).toEqual({
+            code: 'ELOOP',
+            message:
+                `read cannot resolve "${loop}": the path crosses more symbolic-link levels than the filesystem allows ` +
+                '(ELOOP), so it almost certainly links back to itself. Read the link\'s target directly.'
+        });
+    });
+
+    it('keeps a scan-phase rejection inside its own entry (EXTRA-1)', async () => {
+        // EXTRA-1: an error raised AFTER phase 1 — while a window was being scanned — used to
+        // escape the allocation loop, rejecting the whole call and destroying the content its
+        // siblings had already produced. `scanSafely` classifies it into that ONE entry now.
+        // The deterministic case is the M1 binary rejection (a `startByte` inside a run of
+        // continuation bytes); the FIFO's `EAGAIN` above is the filesystem-error case.
+        const misaligned = await seedBytes(
+            'extra1-binary.txt',
+            Buffer.concat([Buffer.from('a'), Buffer.from([0x80, 0x80, 0x80, 0x80, 0x80])])
+        );
+
+        const result = await read([{ path: misaligned, startByte: 1 }, join(workdir, 'a.txt')]);
+
+        expect(result.files[0].error?.code).toBe('EBINARY');
+        expect(result.files[0].content).toBe('');
+        expect(result.files[1].content).toBe('alpha\n');
+        expect(result.files[1].error).toBeUndefined();
+        expect(result.bytes).toBe(6);
+        expect(result.skipped).toBe(1);
+    });
+
+    it('publishes what the batch actually granted, and only when the batch was the limit (M7)', async () => {
+        // M7: `limit: "budget"` named WHICH governor cut a window but not what it was worth,
+        // so "raise maxBytes" advice that changed nothing was unexplainable. Two receipts:
+        // the result's `budgetPool` (bytes left to split after every reserve) and each
+        // share-bound entry's `budgetGranted` (the exact allowance the scanner cut against).
+        const paths = [0, 1, 2, 3].map((index) => join(workdir, 'many', `${index}.txt`));
+        const shared = await read(paths);
+
+        // Four files that all want more than the envelope holds: the water-filling pass opens
+        // at an equal share and gets no surplus back, so the share IS floor(pool / 4) — the
+        // arithmetic `budgetGranted` publishes.
+        expect(shared.files.map((file) => file.limit)).toEqual(['budget', 'budget', 'budget', 'budget']);
+        expect(shared.budgetPool).toBeLessThan(shared.contentBudget);
+        expect(shared.files.map((file) => file.budgetGranted)).toEqual([
+            Math.floor(shared.budgetPool / 4),
+            Math.floor(shared.budgetPool / 4),
+            Math.floor(shared.budgetPool / 4),
+            Math.floor(shared.budgetPool / 4)
+        ]);
+        // Not decoration: on these single-line files the window ends exactly AT the grant, so
+        // the number is the cap that bound it.
+        expect(shared.files.map((file) => file.nextByte)).toEqual(shared.files.map((file) => file.budgetGranted));
+
+        // The other half of the rule: a file bound by its OWN `maxBytes` — every file in a
+        // one-path call, the common shape — keeps the entry it always had. A key that is not
+        // true is not published at all.
+        const own = (await read([{ path: join(workdir, 'giant.txt'), maxBytes: 10 }])).files[0];
+
+        expect(own.limit).toBe('maxBytes');
+        expect('budgetGranted' in own).toBe(false);
+    });
+
+    it('flags lossy only for bytes it replaced, not for a U+FFFD already in the file (EXTRA-3)', async () => {
+        // EXTRA-3: the old test was `text.includes('\ufffd')`, which cannot tell a
+        // replacement this tool made from a U+FFFD that is legitimately IN the file — a log
+        // line that already held one was reported as if read had rewritten bytes. The
+        // question that IS answerable is "would a STRICT decoder accept these same bytes?",
+        // so a lossy read runs one over the identical stream (`noteTwin`).
+        const native = await seed('lossy-native.txt', 'a\ufffdb\n');
+
+        expect((await read([native])).files[0].content).toBe('a\ufffdb\n');
+        // A strict read of valid UTF-8 publishes no flag at all...
+        expect('lossy' in (await read([native])).files[0]).toBe(false);
+        // ...and neither does a LOSSY read of it: nothing was substituted, whatever the
+        // text happens to contain.
+        const asked = (await read([{ path: native, lossy: true }])).files[0];
+
+        expect(asked.content).toBe('a\ufffdb\n');
+        expect('lossy' in asked).toBe(false);
+
+        // The genuine case: `0xc3` starts a 2-byte sequence and `0x28` is not a continuation
+        // byte, so one byte really is replaced — strict refuses, lossy substitutes and says.
+        const broken = await seedBytes('lossy-invalid.bin', Buffer.from([0x61, 0xc3, 0x28, 0x0a]));
+
+        expect((await read([broken])).files[0].error?.code).toBe('EBINARY');
+
+        const replaced = (await read([{ path: broken, lossy: true }])).files[0];
+
+        expect(replaced.content).toBe('a\ufffd(\n');
+        expect(replaced.lossy).toBe(true);
+        expect(replaced.bytes).toBe(6);
+    });
+
+    it('measures startColumn from the physical start of its line, whichever axis got there (H4)', async () => {
+        // H4: `startColumn` is a byte offset into a PHYSICAL line, and `nextColumn` is
+        // reported from that same base — so the pair this tool prints is the pair this tool
+        // accepts. It used to be added to the SEEK instead, which started the window
+        // `startColumn` bytes deeper than the line it was naming, and the documented
+        // `{ startLine: nextLine, startColumn: nextColumn }` continuation re-read bytes.
+        //
+        // `cols.txt` is 'abcdef\nghijkl\n': line 1 starts at byte 0 and its terminator is
+        // byte 6, so line 2 starts at byte 7. Every expected offset below is that arithmetic.
+        const cols = join(workdir, 'columns-h4.txt');
+
+        await seed('columns-h4.txt', 'abcdef\nghijkl\n');
+
+        const table = [
+            {
+                // Line axis with a column: base 0 + 2 = byte 2, capped by `maxLines: 1`.
+                request: { startLine: 1, startColumn: 2, maxLines: 1 },
+                content: 'cdef\n',
+                startLine: 1,
+                bytes: 5,
+                nextLine: 2,
+                nextColumn: 0,
+                nextByte: 7
+            },
+            {
+                // THE defect. Seek 1 + column 2 measures from the line's physical start
+                // (0 + 2 = byte 2), NOT from the seek (which gave byte 3, 'def\n'). The
+                // window is identical to the row above — that is the point.
+                request: { startByte: 1, startColumn: 2, maxLines: 1 },
+                content: 'cdef\n',
+                startLine: 1,
+                bytes: 5,
+                nextLine: 2,
+                nextColumn: 0,
+                nextByte: 7
+            },
+            {
+                // A column past the terminator lands on the NEXT line, and the entry says
+                // THAT line is the first one it returned (H5).
+                request: { startLine: 1, startColumn: 7, maxLines: 1 },
+                content: 'ghijkl\n',
+                startLine: 2,
+                bytes: 7,
+                nextLine: null,
+                nextColumn: null,
+                nextByte: null
+            },
+            {
+                // Seek 8 (the 'h' of line 2) + column 2: line 2 starts at 7, so the column
+                // resolves to byte 9, ahead of the seek — and the seek's line is still the
+                // counted one, 2, not the default 1.
+                request: { startByte: 8, startColumn: 2, maxLines: 1 },
+                content: 'ijkl\n',
+                startLine: 2,
+                bytes: 5,
+                nextLine: null,
+                nextColumn: null,
+                nextByte: null
+            },
+            {
+                // The `max` half: a column that resolves BEHIND the seek (0 + 1 = byte 1)
+                // cannot pull the window back before the position the caller pinned.
+                request: { startByte: 3, startColumn: 1, maxLines: 1 },
+                content: 'def\n',
+                startLine: 1,
+                bytes: 4,
+                nextLine: 2,
+                nextColumn: 0,
+                nextByte: 7
+            }
+        ];
+
+        for (const row of table) {
+            const entry = (await read([{ path: cols, ...row.request }])).files[0];
+
+            expect([entry.content, entry.startLine, entry.bytes, entry.nextLine, entry.nextColumn, entry.nextByte]).toEqual([
+                row.content,
+                row.startLine,
+                row.bytes,
+                row.nextLine,
+                row.nextColumn,
+                row.nextByte
+            ]);
+        }
+
+        // The continuation the whole rule exists for: page one line of any size by the pair
+        // the previous entry printed, with no re-read and no `startByte` at all.
+        const giant = join(workdir, 'giant.txt'); // 1000 x 'x', one line
+        const first = (await read([{ path: giant, maxBytes: 100 }])).files[0];
+
+        expect([first.bytes, first.nextLine, first.nextColumn, first.nextByte]).toEqual([100, 1, 100, 100]);
+
+        const second = (await read([{ path: giant, startLine: 1, startColumn: 100, maxBytes: 100 }])).files[0];
+
+        // Bytes 100..199, then the cursor for the next hop — the window ADVANCED.
+        expect([second.bytes, second.nextLine, second.nextColumn, second.nextByte]).toEqual([100, 1, 200, 200]);
     });
 });

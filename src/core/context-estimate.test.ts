@@ -5,9 +5,16 @@
 // derived by hand from the input, because a compaction limit is a USER-VISIBLE setting:
 // if the formula drifts, 100000 stops meaning what the operator typed.
 //
-// Also pinned: what is deliberately NOT counted (attachment BYTES, assistant
-// `reasoning`) and the totality rule — a hostile/restored message shape must not throw
-// in the middle of a turn boundary.
+// Also pinned: what is deliberately NOT counted (attachment BYTES) and the totality rule — a
+// hostile/restored message shape must not throw in the middle of a turn boundary.
+//
+// ASSISTANT `reasoning` IS counted, and only when the entry's own `reasoningIncluded` flag does not
+// say it was withheld. That is not a new opinion about what a provider receives — it is the same
+// rule the projection applies (`core/agent.ts` `withoutWithheldReasoning` deletes the key from a
+// flagged entry's request copy, `transport/openai.ts` then emits `reasoning_content` for whatever
+// survives). An unflagged entry's thinking rides and is billed, so an estimator that ignored it
+// under-measured every conversation on a thinking model — and made every thinking saving the
+// context trimmer writes read as zero.
 //
 // The second half of the file pins the T5.4 hybrid: `transcriptChars` (the character
 // weight the estimator divides by 4), `anchorFromUsage` (the one-sided sanity rule for a
@@ -19,6 +26,7 @@ import {
     anchorFromUsage,
     estimateContextTokens,
     estimateContextTokensHybrid,
+    estimateTokensFromChars,
     transcriptChars
 } from './context-estimate';
 import type { HarnessMessage } from '../types';
@@ -105,13 +113,63 @@ describe('estimateContextTokens', () => {
         expect(estimateContextTokens(withMedia)).toBe(6);
     });
 
-    it('does not count retained assistant reasoning (it is never re-sent)', () => {
+    it('counts replayed assistant reasoning, and drops it exactly when the entry is flagged off', () => {
+        // 'answer' (6) -> 2 tokens.
         const bare: HarnessMessage[] = [{ role: 'assistant', content: 'answer' }];
+        // 6 + 400 = 406 -> ceil(101.5) = 102. The thinking is on the wire, so it is context.
         const reasoned: HarnessMessage[] = [
             { role: 'assistant', content: 'answer', reasoning: 'x'.repeat(400) }
         ];
 
-        expect(estimateContextTokens(bare)).toBe(estimateContextTokens(reasoned));
+        expect(estimateContextTokens(bare)).toBe(2);
+        expect(estimateContextTokens(reasoned)).toBe(102);
+
+        // THE FLAG IS THE ONLY THING THAT REMOVES IT. `reasoningIncluded: false` is what the
+        // projection resolves out of the request copy, so the estimate has to agree with the wire or
+        // a thinking trim saves nothing anyone can measure.
+        const withheld: HarnessMessage[] = [
+            { role: 'assistant', content: 'answer', reasoning: 'x'.repeat(400), reasoningIncluded: false }
+        ];
+
+        expect(estimateContextTokens(withheld)).toBe(2);
+        // The TEXT survives — only the replay is withheld — so the saving is exactly the 100 tokens
+        // the thinking was worth, and it is the number `currentEstimatedTokens()` moves by.
+        expect(estimateContextTokens(reasoned) - estimateContextTokens(withheld)).toBe(100);
+
+        // `true` is the documented no-op (the runtime normalizes it away), and an ABSENT flag is the
+        // same thing: an entry nobody trimmed keeps its thinking.
+        expect(
+            estimateContextTokens([
+                { role: 'assistant', content: 'answer', reasoning: 'x'.repeat(400), reasoningIncluded: true }
+            ])
+        ).toBe(102);
+
+        // An empty thinking string is nothing to send, flagged or not.
+        expect(estimateContextTokens([{ role: 'assistant', content: 'answer', reasoning: '' }])).toBe(2);
+
+        // Only an assistant entry carries `reasoning`; the rule is per-entry, so a flagged tool
+        // message's stray field cannot switch an assistant's thinking off.
+        expect(
+            estimateContextTokens([
+                { role: 'assistant', content: 'answer', reasoning: 'x'.repeat(400) },
+                { role: 'tool', toolCallId: 'c1', name: 'read', content: 'out', reasoningIncluded: false } as never
+            ])
+        ).toBe(104);
+    });
+
+    it('exposes the shared chars-to-tokens rule on its own', () => {
+        // The trimmer's thinking axis holds a CHARACTER count (that is what one write removes) and
+        // has to publish a token figure in this file's convention. Same rule, one implementation.
+        expect(estimateTokensFromChars(0)).toBe(0);
+        expect(estimateTokensFromChars(1)).toBe(1);
+        expect(estimateTokensFromChars(4)).toBe(1);
+        expect(estimateTokensFromChars(5)).toBe(2);
+        expect(estimateTokensFromChars(400)).toBe(100);
+        expect(estimateTokensFromChars(40)).toBe(estimateContextTokens([], 'x'.repeat(40)));
+        // Total, like everything here: a nonsense figure is 0, never NaN.
+        expect(estimateTokensFromChars(-5)).toBe(0);
+        expect(estimateTokensFromChars(Number.NaN)).toBe(0);
+        expect(estimateTokensFromChars(Number.POSITIVE_INFINITY)).toBe(0);
     });
 
     it('is total for hostile or restored message shapes', () => {

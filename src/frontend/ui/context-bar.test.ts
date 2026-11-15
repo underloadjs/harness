@@ -273,8 +273,9 @@ describe('context bar, DOM mode', () => {
         // WHY THIS IS THE PIN. `../view-context.ts` prints one clause for EVERY block the server
         // marks `inPrompt !== true`, and `../server/turn-projector.ts` mints that flag for the
         // whole REASONING CLASS. The trimmer's thinking policy (`trimThoughts` + `thoughtTurns`;
-        // the shipped default replays the two newest thoughts, whatever turn they sit in) decides
-        // per ENTRY, so that clause is no longer a property of the class,
+        // the shipped default replays the thinking of the two newest MODEL STEPS — assistant
+        // entries ranked newest-first, not thought entries — whatever turn those steps sit in)
+        // decides per ENTRY, so that clause is no longer a property of the class,
         // and the bar has no per-entry verdict to read — only the block-detail route can name
         // the entry behind a segment. So the bar states the policy for thinking, and keeps the
         // fact for every segment that is un-in-prompt for a real reason.

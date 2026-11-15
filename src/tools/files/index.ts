@@ -85,12 +85,20 @@
 // constants (FILES_CONTENT_BUDGET, FILE_GREP_CONTENT_BUDGET, …) are imported from
 // the entry file itself by the implementation and its focused tests.
 //
-// Five private helpers sit beside the tools and are shared by the batch:
+// Seven private helpers sit beside the tools and are shared by the batch:
 //   - ./identity       — one canonical key per real file, so duplicate targets (Windows
 //     case aliases, symlink aliases, aliased roots) cannot slip through;
 //   - ./lock           — the per-file async mutex write, edit, and the mutating
 //     operations of files share, so two calls that name one file serialize instead of
 //     one silently overwriting the other;
+//   - ./atomic-publish — the ONE staged publish write and edit share: content goes to a
+//     `.tmp-` sibling in the target's own directory and only then renames over the
+//     target, so a process-level failure leaves either the whole previous file or the
+//     whole new one, never a truncated prefix, and no staging entry survives the run;
+//   - ./cancellation   — the ONE way read, write, edit and files answer a cancelled call:
+//     the published `ECANCELED`, the host's abort reason as `details.rawCode` and as `cause`,
+//     and the check sites (per call, per file, per operation, per syscall), so the four
+//     cannot fork into four mappings;
 //   - ./search         — the pattern/root/candidate plumbing both search presets walk,
 //     so glob and grep cannot drift apart: brace expansion and `!` negation, the root
 //     error boundary, the per-root coverage counters, and the bounded-concurrency read
@@ -113,11 +121,24 @@ export type {
     FileEditResult,
     FileEditResultEntry
 } from './edit.tool';
+// `FilesErrorCode`, `FilesOperationError` and `FilesReplacedEntry` join the envelope types
+// for the same reason `FileGrepOutput` does below: they are the pieces a caller switches on,
+// not prose. `code` is always a member of the CLOSED `FilesErrorCode` set (every other errno
+// folds onto EIO with the true name in `rawCode`), so typing that switch requires naming the
+// set. `FilesOperationError` is the per-list-entry failure object carried in
+// `results[].error`, and `FilesReplacedEntry` is the price receipt `results[].replaced`
+// carries whenever `overwrite` (plus `replaceDirectory`, for a directory) removed an existing
+// destination — C1 made that removal explicit, so a caller has to be able to name what it
+// paid for. All three are `type`-only, so this barrel stays free of `node:fs` (see the
+// TYPE-ONLY BARREL note above).
 export type {
+    FilesErrorCode,
     FilesOperation,
+    FilesOperationError,
     FilesOperationKind,
     FilesOperationResult,
     FilesParameters,
+    FilesReplacedEntry,
     FilesResult
 } from './files.tool';
 // The two search entries publish more than a result object: the verdict selector

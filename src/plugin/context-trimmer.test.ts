@@ -2885,10 +2885,11 @@ describe('context-trimmer metadata', () => {
         // `openPluginDialog`), and Context Compacting — the row this one sits next to in the pane —
         // declares SIX controls and ZERO descriptions. So the previous shape, "every one of the
         // seventeen rows must explain itself in >30 characters", is the assertion that LOCKED IN
-        // the divergence, and it is replaced by the exact copy table below: eight rows now carry no
-        // description at all, and the nine that do state something the label plus `min`/`max`
+        // the divergence, and it is replaced by the exact copy table below: seven rows now carry no
+        // description at all, and the ten that do state something the label plus `min`/`max`
         // cannot answer (the two closed sets, the gates that no-op silently, the one horizon
-        // sentence that covers all five horizons, and the withhold-only caveat once). Pinning the
+        // sentence that covers the four TOOL horizons, the `thoughtTurns` sentence that names its
+        // own unit plus the newest-step floor, and the withhold-only caveat once). Pinning the
         // table means a row that grows boilerplate back fails here, not in the pane.
         expect(
             (metadata.settings ?? []).map(
@@ -2906,7 +2907,16 @@ describe('context-trimmer metadata', () => {
                 'Comma-separated subset of failed, rejected, cancelled, empty; empty means a blank result.'
             ],
             ['trimThoughts', null],
-            ['thoughtTurns', null],
+            // THE THINKING HORIZON NAMES ITS OWN UNIT, because it is the one horizon in this plugin
+            // that does not count tool turns: `thoughtTurns` counts MODEL STEPS (assistant entries,
+            // newest = 0), and its hint states the floor the tool horizons do not have — the newest
+            // step's reasoning always travels, so `0` and `1` are the same window. A row whose label
+            // said "(turns)" is what let the axis ship inert for a day (src/plugins/
+            // context-trimmer.plugin.ts, "THE HORIZON COUNTS MODEL STEPS, AND WHY").
+            [
+                'thoughtTurns',
+                'Protects the newest N model steps; the newest step always travels.'
+            ],
             ['minThoughtChars', null],
             ['dropSupersededToolCalls', null],
             ['supersededTurns', null],
@@ -2923,18 +2933,18 @@ describe('context-trimmer metadata', () => {
             ['maxUnits', 'Tool units one axis may withhold per pass; 0 is unbounded, not disabled.']
         ]);
 
-        // THE COPY BUDGET, as measured numbers rather than a mood: nine hints across seventeen rows
-        // (was seventeen hints), 693 characters of hint in total (was 1,206), eight rows with no
-        // hint, and the longest clause at 89 characters. `metadata.description` is 83 characters,
+        // THE COPY BUDGET, as measured numbers rather than a mood: ten hints across seventeen rows
+        // (was seventeen hints), 759 characters of hint in total, seven rows with no hint, and the
+        // longest clause at 89 characters. `metadata.description` is 83 characters,
         // SHORTER than compaction's 87 — the row has to read at least as plainly as its neighbour.
         const hints = (metadata.settings ?? [])
             .map((setting) => setting.description)
             .filter((description): description is string => typeof description === 'string');
 
-        expect(hints).toHaveLength(9);
-        expect(hints.reduce((total, description) => total + description.length, 0)).toBe(693);
+        expect(hints).toHaveLength(10);
+        expect(hints.reduce((total, description) => total + description.length, 0)).toBe(759);
         expect(Math.max(...hints.map((description) => description.length))).toBe(89);
-        expect((metadata.settings ?? []).length).toBe(hints.length + 8);
+        expect((metadata.settings ?? []).length).toBe(hints.length + 7);
 
         for (const setting of metadata.settings ?? []) {
             expect(typeof setting.label).toBe('string');
@@ -2964,6 +2974,13 @@ describe('context-trimmer metadata', () => {
         expect(labelOf('dropDuplicateCalls')).toBe('Automatic Trim Duplicate Tools');
         expect(labelOf('truncateToolRequests')).toBe('Automatic Truncate Tool Requests');
         expect(labelOf('invalidToolTurns')).toBe('Invalid tools · trim after (tool turns)');
+        // THE THINKING HORIZON'S UNIT, IN THE LABEL: "(model steps)" is the whole operator-facing
+        // claim of the 2026-11-14 fix — the horizon counts assistant entries, newest = 0, exactly
+        // like the provider's own `keep: { type: 'thinking_turns' }` window. "(thoughts)" and
+        // "(turns)" were both wrong, and both were why the axis read as broken: a thought-entry rank
+        // slid one slot per thinking block, and a conversation-turn rank never fired inside a tool
+        // loop at all (src/plugins/context-trimmer.plugin.ts, header).
+        expect(labelOf('thoughtTurns')).toBe('Thoughts · trim after (model steps)');
 
         // The master switch keeps the wording that mirrors `title` — it is not one of the five
         // policy labels, and renaming it would move the framework-reserved row's identity on screen.
@@ -3563,17 +3580,35 @@ describe('context-trimmer through a harness', () => {
 // `dropOldThoughts` off|turn|all tier and its `thoughtKeepUnits` rescue — is gone: the horizon
 // answers "which thinking" in one number, and it IS the recent-N protection.)
 //
-// THE HORIZON COUNTS THOUGHTS, newest-first, not turns and not units: `thoughtTurns: 2` protects the
-// two newest recorded thoughts, and `0` reaches the open turn's thinking too. THE LAST `user` ENTRY is
-// still the turn boundary, and still REPORTED (`turn: 'open' | 'closed'` on every candidate, because
-// the operator's line says which turn a write came out of) — it no longer GATES anything, so the
-// fixtures below place their user entries deliberately and each expected list says which side of that
-// line every entry sits on.
+// THE HORIZON COUNTS MODEL STEPS, newest-first — not thought entries and not conversation turns:
+// `thoughtTurns: N` protects the thinking of the N newest assistant entries (the newest is rank `0`)
+// and every thinking block behind them is withheld in the SAME pass. The newest step is exempt
+// whatever the number says, so `0` and `1` are one window (plugin header, "THE HORIZON COUNTS MODEL
+// STEPS, AND WHY"). THE LAST `user` ENTRY is still REPORTED (`turn: 'open' | 'closed'` on every
+// candidate, because the operator's first question is "why did MY current reasoning disappear") but it
+// gates nothing, so the fixtures below say which side of that line every entry sits on AND what step
+// rank each one carries.
+//
+// WHY THE UNIT MOVED TWICE ON 2026-11-14, AND WHY IT STOPS HERE. (1) Counting THOUGHT ENTRIES made the
+// horizon a SLIDING WINDOW — "the newest N thoughts" is a different set every time the model commits a
+// thinking block, which happens several times inside one tool loop — so the provider's prefix-cache
+// divergence point walked backwards once per model step. (2) The cut that replaced it, counting
+// CONVERSATION TURNS (the last `user` entry and everything after it), was INERT in exactly the run that
+// needs trimming: an agentic turn commits dozens of thinking blocks after ONE user message, so all of
+// them ranked `0`, all of them were "protected", and a live 82-entry session with 35 thinking blocks
+// produced ZERO candidates in every pass while the operator watched their thoughts ride — a user message
+// is a fact about the USER's cadence, not about how much thinking the model has stacked up since it
+// last spoke. (3) Counting MODEL STEPS is the unit the PROVIDER counts (`clear_thinking_20251015`,
+// `keep: { type: 'thinking_turns', value: N }`, default 1 — a tool-result-only user message CONTINUES a
+// turn rather than opening one), it FIRES inside a tool loop, and it is the same rank arithmetic the
+// four tool horizons already use, so the plugin has one horizon convention instead of three.
 
 // An assistant entry that CARRIES thinking of exactly `chars` characters. Every character figure
 // asserted in this section is one of these literals — never a count taken back off an implementation
-// run — because the thinking axis measures CHARACTERS (the estimator does not count reasoning, so a
-// token figure here would be a number this plugin cannot compute).
+// run — because the thinking axis measures CHARACTERS (that is what one write removes, and what
+// `minThoughtChars` gates on). The report ALSO states the saving in tokens, derived from the same
+// figure by the shared `estimateTokensFromChars`, so an operator can see what a thinking pass is
+// worth in the unit every other size number in the product uses.
 const think = (content: string, chars: number): HarnessMessage => ({
     role: 'assistant',
     content,
@@ -3589,15 +3624,21 @@ const callThinking = (id: string, name: string, args: string, chars: number): Ha
     reasoning: 'x'.repeat(chars)
 });
 
-// The thinking transcript. Canonical indexes are the contract, so the layout is spelled out:
+// The thinking transcript. Canonical indexes are the contract, so the layout is spelled out, with the
+// STEP RANK each entry carries (assistant entries counted newest-first: 6 → 0, 4 → 1, 3 → 2, 1 → 3):
 //   0 user    'question'                 opens turn 1
-//   1 assistant 10 chars of thinking     CLOSED  (a candidate under `turn` and `all`)
+//   1 assistant 10 chars of thinking     rank 3, CLOSED — the oldest step, eligible at every horizon
 //   2 user    'again'                    closes turn 1, opens turn 2
-//   3 assistant 20 chars of thinking     CLOSED  (a candidate under `turn` and `all`)
-//   4 assistant, NO thinking             never a candidate: flagging it would be a write, a
+//   3 assistant 20 chars of thinking     rank 2, CLOSED — eligible at the shipped 2
+//   4 assistant, NO thinking             rank 1 — never a candidate: flagging it would be a write, a
 //                                        notification and a save for zero effect
 //   5 user    'now'                      THE BOUNDARY — everything after it is the open turn
-//   6 assistant 30 chars of thinking     OPEN    (only `all` may touch it)
+//   6 assistant 30 chars of thinking     rank 0, OPEN — the newest step, which the continuity floor
+//                                        exempts at EVERY horizon, `0` included
+//
+// The ranks are why `thoughtTurns: 0`, `1` and `2` all select entries 1 and 3 here: one entry per step
+// means the horizon can only shed entries older than the protected newest step, and the newest step is
+// protected whatever the number says.
 const THOUGHTS: readonly HarnessMessage[] = [
     { role: 'user', content: 'question' },
     think('one', 10),
@@ -3608,18 +3649,42 @@ const THOUGHTS: readonly HarnessMessage[] = [
     think('four', 30)
 ];
 
+// THE DEEP TRANSCRIPT (the shape of the reported defect, 2026-11-14). One user message, then TWELVE
+// model steps that each carry thinking — what a session with extended thinking on looks like mid-task.
+// The step ranks run 11 (entry 1) down to 0 (entry 12), and every entry is in the OPEN turn, because
+// the user entry that opened it is index 0. In the retired conversation-turn unit of account all twelve
+// were rank 0 and `thoughtTurns: 2` withheld NOTHING; in model steps the same transcript is unambiguous.
+// Characters are 10..21 so each row is separately identifiable in the report, and `tokens` is
+// `ceil(chars / 4)` per ../core/context-estimate.ts.
+const LONG_THOUGHTS: readonly HarnessMessage[] = [
+    { role: 'user', content: 'start' },
+    think('t01', 10),
+    think('t02', 11),
+    think('t03', 12),
+    think('t04', 13),
+    think('t05', 14),
+    think('t06', 15),
+    think('t07', 16),
+    think('t08', 17),
+    think('t09', 18),
+    think('t10', 19),
+    think('t11', 20),
+    think('t12', 21)
+];
+
 // The readable form of a thinking plan: exactly the fields a table case is about. `chars` stays in
-// it because the floor is measured over it; `turn` and `turnsAgo` stay in it because they are what
-// an operator reads to find out WHICH thought left and HOW old it was — the two numbers the report
-// line carries, and the only way to tell "the current turn's thinking" from "something from last
-// week" without opening the transcript.
+// it because the floor is measured over it; `turn` and `stepsAgo` stay in it because they are what an
+// operator reads to find out WHICH thought left and HOW old it was — the two numbers the report line
+// carries, and the only way to tell "the newest step's reasoning" from "something from last week"
+// without opening the transcript.
 const thoughtShape = (plan: readonly ThoughtCandidate[]) =>
     plan.map((candidate) => ({
         index: candidate.entryIndex,
         messageId: candidate.entryMessageId,
         turn: candidate.turn,
-        turnsAgo: candidate.turnsAgo,
+        stepsAgo: candidate.stepsAgo,
         chars: candidate.chars,
+        tokens: candidate.tokens,
         firedBy: candidate.firedBy,
         horizon: candidate.horizon
     }));
@@ -3643,20 +3708,22 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
         ).toEqual([]);
     });
 
-    it('the horizon protects the N newest thoughts — the N / N+1 boundary, exactly', () => {
-        // `ago` over THOUGHTS: entry 6 is the newest thought (0), 3 is the one above it (1), 1 is
-        // two above (2). A horizon of N admits `ago >= N`, so each row is one entry different, and
-        // the step from N to N+1 moves EXACTLY the thought that sits at `ago === N`.
+    it('the horizon protects the N newest MODEL STEPS — the N / N+1 boundary, exactly', () => {
+        // `ago` over STEPS: entry 6 is the newest assistant entry (0), 4 the step before it (1, and it
+        // carries no thinking), 3 is two steps up and 1 is three steps up. A horizon of N admits
+        // `ago >= N`, and rank 0 is exempt at every value, so `0`, `1` and `2` all stop at the same
+        // entry — the step from 2 to 3 is the only one that moves anything on this fixture.
         const table: Array<[number, number[]]> = [
-            [0, [1, 3, 6]],
+            [0, [1, 3]],
             [1, [1, 3]],
-            [2, [1]],
-            [3, []],
+            [2, [1, 3]],
+            [3, [1]],
+            [4, []],
             [5, []],
-            // A nonsense horizon is "protect nothing", the same reading every other number edge in
-            // this plugin gives a -1 or a NaN.
-            [-5, [1, 3, 6]],
-            [Number.NaN, [1, 3, 6]]
+            // A nonsense horizon is "protect nothing but the newest step", the same reading every
+            // other number edge in this plugin gives a -1 or a NaN.
+            [-5, [1, 3]],
+            [Number.NaN, [1, 3]]
         ];
 
         for (const [thoughtTurns, indexes] of table) {
@@ -3668,44 +3735,70 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
         }
     });
 
-    it('the DEFAULT horizon leaves the two newest thoughts alone, open turn included', () => {
+    it('the DEFAULT horizon sheds every thought behind the two newest steps, in one pass', () => {
         const plan = planWithheldThoughts(entriesFrom(THOUGHTS), TRIMMER_DEFAULT_SETTINGS);
 
-        // Exact candidate objects, hardcoded from the fixture: entry 1 is the only thought two or
-        // more thoughts old. `turn` is report context, not a rule — it says which side of the last
-        // user entry the entry sits on — and `turnsAgo` plus `horizon` are the comparison itself.
+        // Exact candidate objects, hardcoded from the fixture: entries 1 (3 steps old) and 3 (2 steps
+        // old) are BOTH at or beyond the shipped horizon of 2, so the DEFAULT posture already trims
+        // them — under the conversation-turn rank this same transcript shed only entry 1, which is
+        // exactly the "it trimmed nothing" report. `turn` is report context, not a rule — it says which
+        // side of the last user entry the entry sits on — and `stepsAgo` plus `horizon` are the
+        // comparison itself. `tokens` is `ceil(chars / 4)` of `chars`, never an independent measurement.
         expect(plan).toEqual([
             {
                 entryIndex: 1,
                 entryMessageId: 'msg-2',
                 turn: 'closed',
-                turnsAgo: 2,
+                stepsAgo: 3,
                 chars: 10,
+                tokens: 3,
+                firedBy: 'trimThoughts',
+                horizon: 2
+            },
+            {
+                entryIndex: 3,
+                entryMessageId: 'msg-4',
+                turn: 'closed',
+                stepsAgo: 2,
+                chars: 20,
+                tokens: 5,
                 firedBy: 'trimThoughts',
                 horizon: 2
             }
         ]);
-        // The declared default IS 2, which is why the current turn's thinking (thought `ago` 0) is
-        // safe out of the box without a separate tier for it.
+        // The declared default IS 2, which is why the two newest steps are safe out of the box without
+        // a separate tier for them — and why everything behind them is not.
         expect(TRIMMER_DEFAULT_SETTINGS.thoughtTurns).toBe(2);
         expect(thoughtShape(planWithheldThoughts(entriesFrom(THOUGHTS)))).toEqual([
             {
                 index: 1,
                 messageId: 'msg-2',
                 turn: 'closed',
-                turnsAgo: 2,
+                stepsAgo: 3,
                 chars: 10,
+                tokens: 3,
+                firedBy: 'trimThoughts',
+                horizon: 2
+            },
+            {
+                index: 3,
+                messageId: 'msg-4',
+                turn: 'closed',
+                stepsAgo: 2,
+                chars: 20,
+                tokens: 5,
                 firedBy: 'trimThoughts',
                 horizon: 2
             }
         ]);
     });
 
-    it('the horizon counts THOUGHT ENTRIES — not turns, not units, not `iteration`', () => {
-        // One CLOSED turn carrying three thoughts in a row (a multi-call turn: the block, a second
-        // block, and a plain message), then the boundary user entry, then the open turn's thought.
-        // A knob counting TURNS would see 2 turns and protect all three thoughts; a knob counting
-        // UNITS would see the tool units; this one sees 4 thoughts.
+    it('the horizon counts MODEL STEPS, so a tool loop sheds its own thinking one step at a time', () => {
+        // One CLOSED turn carrying three thinking blocks in a row — the shape of a multi-call tool
+        // loop — then the boundary user entry, then the open turn's thought. There is ONE user entry
+        // above the three blocks, so a rank counting CONVERSATION TURNS gave all three rank `0` and
+        // protected them for the whole turn: the inert axis the GL8 report is about. Counting steps
+        // ranks them 3, 2 and 1, and the shipped 2 sheds two of the three immediately.
         const MANY: readonly HarnessMessage[] = [
             { role: 'user', content: 'open' },
             think('a', 10),
@@ -3715,30 +3808,56 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
             think('open', 40)
         ];
 
-        // Thoughts: 5 (ago 0), 3 (1), 2 (2), 1 (3). Horizon 2 therefore admits 1 and 2 only.
+        // THE WHOLE POINT, in numbers: entries 1 and 2 leave at the default 2 while the loop is still
+        // running, and entry 5 — the newest step — never does.
         expect(
-            planWithheldThoughts(entriesFrom(MANY), settingsWith({ thoughtTurns: 2 })).map(
-                (candidate) => ({ index: candidate.entryIndex, turnsAgo: candidate.turnsAgo })
-            )
+            planWithheldThoughts(entriesFrom(MANY), settingsWith({ thoughtTurns: 2 })).map((candidate) => ({
+                index: candidate.entryIndex,
+                stepsAgo: candidate.stepsAgo
+            }))
         ).toEqual([
-            { index: 1, turnsAgo: 3 },
-            { index: 2, turnsAgo: 2 }
+            { index: 1, stepsAgo: 3 },
+            { index: 2, stepsAgo: 2 }
         ]);
 
-        // And the rank map does NOT renumber when a flag is written: the same transcript with entry
-        // 5 already flagged reaches the same verdicts, which is the idempotence proof in numbers.
+        // One step back admits entry 3 as well; `0` cannot go past the continuity floor, so `0` and `1`
+        // select the identical set.
+        expect(
+            planWithheldThoughts(entriesFrom(MANY), settingsWith({ thoughtTurns: 1 })).map((candidate) => ({
+                index: candidate.entryIndex,
+                stepsAgo: candidate.stepsAgo
+            }))
+        ).toEqual([
+            { index: 1, stepsAgo: 3 },
+            { index: 2, stepsAgo: 2 },
+            { index: 3, stepsAgo: 1 }
+        ]);
+        expect(
+            planWithheldThoughts(entriesFrom(MANY), settingsWith({ thoughtTurns: 0 })).map((candidate) => ({
+                index: candidate.entryIndex,
+                stepsAgo: candidate.stepsAgo
+            }))
+        ).toEqual([
+            { index: 1, stepsAgo: 3 },
+            { index: 2, stepsAgo: 2 },
+            { index: 3, stepsAgo: 1 }
+        ]);
+
+        // And the rank map does NOT renumber when a flag is written: the same transcript with entry 5
+        // already flagged reaches the same verdicts, which is the idempotence proof in numbers.
         const flagged = entriesFrom(MANY);
 
         (flagged[5].message as { reasoningIncluded?: boolean }).reasoningIncluded = false;
 
         expect(
-            planWithheldThoughts(flagged, settingsWith({ thoughtTurns: 2 })).map((candidate) => ({
+            planWithheldThoughts(flagged, settingsWith({ thoughtTurns: 1 })).map((candidate) => ({
                 index: candidate.entryIndex,
-                turnsAgo: candidate.turnsAgo
+                stepsAgo: candidate.stepsAgo
             }))
         ).toEqual([
-            { index: 1, turnsAgo: 3 },
-            { index: 2, turnsAgo: 2 }
+            { index: 1, stepsAgo: 3 },
+            { index: 2, stepsAgo: 2 },
+            { index: 3, stepsAgo: 1 }
         ]);
 
         // `iteration` cannot express any of this: the fake turn reports `iteration: 1` for the whole
@@ -3747,12 +3866,13 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
 
     it('an entry with no thinking, and an entry whose thinking is already flagged, are never candidates', () => {
         // Entry 4 has no `reasoning` key at all: flagging it would be a write, a notification and a
-        // save for zero effect.
+        // save for zero effect. Entry 6 is the newest step, and the continuity floor keeps it at every
+        // horizon (`0` included), so the open set is exactly the two entries behind it.
         expect(
             planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0 })).map(
                 (candidate) => candidate.entryIndex
             )
-        ).toEqual([1, 3, 6]);
+        ).toEqual([1, 3]);
 
         // An EMPTY reasoning string is the same case one level down: nothing to remove.
         expect(
@@ -3766,12 +3886,12 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
     it('a second pass over an already-flagged transcript has no candidate left, and neither has a restored one', () => {
         const entries = entriesFrom(THOUGHTS);
 
-        // Pass one through the policy: every thought, horizon open.
+        // Pass one through the policy: every thought the floor does not exempt, horizon open.
         const first = planWithheldThoughts(entries, settingsWith({ thoughtTurns: 0 })).map(
             (candidate) => candidate.entryIndex
         );
 
-        expect(first).toEqual([1, 3, 6]);
+        expect(first).toEqual([1, 3]);
 
         // The write, applied the way the runtime applies it — on the canonical MESSAGE object, which
         // is what `entries` hands out.
@@ -3782,11 +3902,11 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
         expect(planWithheldThoughts(entries, settingsWith({ thoughtTurns: 0 })).length).toBe(0);
 
         // A RESTART, modelled exactly: a fresh entry list (no in-process state survives) whose
-        // messages carry the flags the first process wrote. Re-deriving finds all three already
-        // flagged and proposes nothing, so a continued session writes no duplicate flags.
+        // messages carry the flags the first process wrote. Re-deriving finds both already flagged and
+        // proposes nothing, so a continued session writes no duplicate flags.
         const restored = entriesFrom(
             THOUGHTS.map((message, index) =>
-                index === 1 || index === 3 || index === 6 ? { ...message, reasoningIncluded: false } : message
+                index === 1 || index === 3 ? { ...message, reasoningIncluded: false } : message
             )
         );
 
@@ -3806,17 +3926,9 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
                 index: 1,
                 messageId: 'msg-2',
                 turn: 'closed',
-                turnsAgo: 2,
+                stepsAgo: 3,
                 chars: 10,
-                firedBy: 'trimThoughts',
-                horizon: 0
-            },
-            {
-                index: 6,
-                messageId: 'msg-7',
-                turn: 'open',
-                turnsAgo: 0,
-                chars: 30,
+                tokens: 3,
                 firedBy: 'trimThoughts',
                 horizon: 0
             }
@@ -3830,70 +3942,181 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
                 settingsWith({ thoughtTurns: 0 }),
                 new Set([1, 2])
             ).map((candidate) => candidate.entryIndex)
-        ).toEqual([3, 6]);
+        ).toEqual([3]);
 
-        // The rank map is unchanged by that skip, so the two remaining candidates still report the
-        // ages the transcript says they have.
+        // The rank map is unchanged by that skip, so the surviving candidate still reports the age the
+        // transcript says it has.
         expect(
             planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0 }), new Set([1, 2])).map(
-                (candidate) => ({ index: candidate.entryIndex, turnsAgo: candidate.turnsAgo })
+                (candidate) => ({ index: candidate.entryIndex, stepsAgo: candidate.stepsAgo })
             )
-        ).toEqual([
-            { index: 3, turnsAgo: 1 },
-            { index: 6, turnsAgo: 0 }
-        ]);
+        ).toEqual([{ index: 3, stepsAgo: 2 }]);
     });
 
-    it('a transcript with no user entry is ALL one turn, and the horizon still decides — never index arithmetic', () => {
+    it('the STEP rank counts MODEL STEPS IN THE TRANSCRIPT, not the steps still visible in the request', () => {
+        // WHY THIS PIN EXISTS. `thoughtAgoOf` (../plugins/context-trimmer.plugin.ts:1772-1789) ranks
+        // over EVERY assistant entry, whatever its `included` flag says. A mutant that instead counted
+        // model steps ONLY over the assistant entries that still travel (`entry.included !== false`)
+        // reproduces every other table in this section, because the entries it renumbers never change
+        // verdict there. This fixture is what separates them: an INTERIOR (mid-transcript, not a
+        // prefix) assistant entry that is `included: false`, sitting between the candidates and the
+        // newest step. Every candidate older than it is one step FURTHER BACK than a visible-only count
+        // reports — and at a horizon boundary that difference moves the withheld SET, not just numbers.
+        //
+        // THE FIXTURE, with the rank each assistant entry carries counted over ALL of them
+        // (6 → 0, 5 → 1, 4 → 2, 3 → 3, 1 → 4):
+        //   0 user    'open'                  opens turn 1
+        //   1 assistant 10 chars of thinking  rank 4, CLOSED — beyond every horizon up to 4
+        //   2 user    'next'                  THE BOUNDARY — everything after it is the open turn
+        //   3 assistant 20 chars of thinking  rank 3, OPEN — the boundary case: admitted at 3, kept at 4
+        //   4 assistant 30 chars of thinking  rank 2, `included: false` — the tool axis withheld this
+        //                                     unit mid-run, so its thinking is not a candidate (that
+        //                                     candidacy rule is the pin at :3916); what matters HERE is
+        //                                     that its STEP is still a step the provider counts
+        //   5 assistant 40 chars of thinking  rank 1 — inside the horizon at 3 and 2, a candidate at 1
+        //   6 assistant 50 chars of thinking  rank 0 — the continuity floor, exempt at every horizon
+        const GAP: readonly HarnessMessage[] = [
+            { role: 'user', content: 'open' },
+            think('one', 10),
+            { role: 'user', content: 'next' },
+            think('two', 20),
+            think('gap', 30),
+            think('four', 40),
+            think('five', 50)
+        ];
+
+        // THE BOUNDARY, exactly: the gate is `stepsAgo >= 3` (and `stepsAgo !== 0`), so entry 3 (rank 3)
+        // is the last thing admitted and entry 5 (rank 1) is kept. Asserted as FULL candidate objects —
+        // the withheld index list AND the exact `stepsAgo` — because a visible-only rank puts entry 3 at
+        // 2 and entry 1 at 3, and therefore sheds `[1]` instead of `[1, 3]`. Both the list and the
+        // numbers fail, so the pin cannot be satisfied by a renumbering that happens to select the
+        // same entries.
+        expect(
+            thoughtShape(planWithheldThoughts(entriesFrom(GAP, [4]), settingsWith({ thoughtTurns: 3 })))
+        ).toEqual([
+            {
+                index: 1,
+                messageId: 'msg-2',
+                turn: 'closed',
+                stepsAgo: 4,
+                chars: 10,
+                tokens: 3,
+                firedBy: 'trimThoughts',
+                horizon: 3
+            },
+            {
+                index: 3,
+                messageId: 'msg-4',
+                turn: 'open',
+                stepsAgo: 3,
+                chars: 20,
+                tokens: 5,
+                firedBy: 'trimThoughts',
+                horizon: 3
+            }
+        ]);
+
+        // THE SHIPPED DEFAULT says the same thing with the selection unchanged: the identical two
+        // entries leave, and their ages are 4 and 3 — NOT the 3 and 2 the mutant reports. An assertion
+        // over index lists alone would pass under the mutant here, which is why `stepsAgo` is pinned.
+        expect(
+            planWithheldThoughts(entriesFrom(GAP, [4]), TRIMMER_DEFAULT_SETTINGS).map((candidate) => ({
+                index: candidate.entryIndex,
+                stepsAgo: candidate.stepsAgo
+            }))
+        ).toEqual([
+            { index: 1, stepsAgo: 4 },
+            { index: 3, stepsAgo: 3 }
+        ]);
+
+        // THE LIST DISCRIMINATOR: one step further back and only entry 1 is beyond the horizon. A rank
+        // over visible steps puts entry 1 at 3 and entry 3 at 2, so the mutant withholds NOTHING at all
+        // — a different decision, not a different spelling of the same one.
+        expect(
+            planWithheldThoughts(entriesFrom(GAP, [4]), settingsWith({ thoughtTurns: 4 })).map((candidate) => ({
+                index: candidate.entryIndex,
+                stepsAgo: candidate.stepsAgo
+            }))
+        ).toEqual([{ index: 1, stepsAgo: 4 }]);
+
+        // And the floor still outranks the horizon: `0` and `1` select the identical set — three
+        // entries, never entry 4 (withheld entirely) and never entry 6 (the newest step) — while the
+        // ages stay the transcript's 4 / 3 / 1 rather than the mutant's 3 / 2 / 1.
+        for (const thoughtTurns of [0, 1]) {
+            expect(
+                planWithheldThoughts(entriesFrom(GAP, [4]), settingsWith({ thoughtTurns })).map((candidate) => ({
+                    index: candidate.entryIndex,
+                    stepsAgo: candidate.stepsAgo
+                }))
+            ).toEqual([
+                { index: 1, stepsAgo: 4 },
+                { index: 3, stepsAgo: 3 },
+                { index: 5, stepsAgo: 1 }
+            ]);
+        }
+    });
+
+    it('a transcript with no user entry is ALL one open turn, and the STEP rank still decides', () => {
         const noUser = entriesFrom([think('one', 10), think('two', 20)]);
 
-        // There is no last user entry, so both entries are the open turn and BOTH are reportable as
-        // `open`. The horizon, not a tier, is what keeps the newest one.
+        // There is no last user entry, so BOTH entries are reportable as `open` — and the rank proves
+        // they are not the same thing: entry 1 is the newest step (0, protected whatever the horizon
+        // says) and entry 0 is one step behind it, so it leaves at `1` and at `0`. A conversation-turn
+        // rank saw one turn and protected BOTH, which is the inert reading this fixture would never
+        // have caught.
         expect(planWithheldThoughts(noUser, settingsWith({ thoughtTurns: 2 }))).toEqual([]);
         expect(
             planWithheldThoughts(noUser, settingsWith({ thoughtTurns: 1 })).map((candidate) => ({
                 index: candidate.entryIndex,
                 turn: candidate.turn,
-                turnsAgo: candidate.turnsAgo
+                stepsAgo: candidate.stepsAgo
             }))
-        ).toEqual([{ index: 0, turn: 'open', turnsAgo: 1 }]);
+        ).toEqual([{ index: 0, turn: 'open', stepsAgo: 1 }]);
+        expect(
+            planWithheldThoughts(noUser, settingsWith({ thoughtTurns: 0 })).map((candidate) => ({
+                index: candidate.entryIndex,
+                turn: candidate.turn,
+                stepsAgo: candidate.stepsAgo
+            }))
+        ).toEqual([{ index: 0, turn: 'open', stepsAgo: 1 }]);
     });
 
     it('minThoughtChars rejects the thinking side BELOW the floor, over what the horizon leaves, and 0 is inert', () => {
-        // The would-be total with the horizon open is 10 + 20 + 30 = 60 characters.
+        // The would-be total with the horizon open is 10 + 20 = 30 characters (entry 6 is the newest
+        // step and the continuity floor keeps it, so it never contributes).
         expect(
-            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0, minThoughtChars: 61 })).map(
+            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0, minThoughtChars: 31 })).map(
                 (candidate) => candidate.entryIndex
             )
         ).toEqual([]);
-        // Exactly at the floor is NOT below it, so the pass writes — the boundary is `chars < floor`.
+        // Exactly at the floor is NOT below it, so the pass writes — the comparison is `chars < floor`.
         expect(
-            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0, minThoughtChars: 60 })).map(
+            planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ thoughtTurns: 0, minThoughtChars: 30 })).map(
                 (candidate) => candidate.entryIndex
             )
-        ).toEqual([1, 3, 6]);
-        // ORDER: horizon → floor. The shipped 2-thought horizon leaves only the 10-character entry
-        // in play, so a floor of 11 rejects a pass the OPEN horizon would have cleared — the floor
-        // measures what would ACTUALLY be written, never the transcript's whole thinking.
+        ).toEqual([1, 3]);
+        // ORDER: horizon → floor. `thoughtTurns: 3` leaves only the 10-character entry in play, so a
+        // floor of 11 rejects a pass the OPEN horizon would have cleared — the floor measures what would
+        // ACTUALLY be written, never the transcript's whole thinking.
         expect(
             planWithheldThoughts(
                 entriesFrom(THOUGHTS),
-                settingsWith({ thoughtTurns: 2, minThoughtChars: 11 })
+                settingsWith({ thoughtTurns: 3, minThoughtChars: 11 })
             )
         ).toEqual([]);
         expect(
             planWithheldThoughts(
                 entriesFrom(THOUGHTS),
-                settingsWith({ thoughtTurns: 2, minThoughtChars: 10 })
+                settingsWith({ thoughtTurns: 3, minThoughtChars: 10 })
             ).map((candidate) => candidate.entryIndex)
         ).toEqual([1]);
-        // An entry this pass already excludes contributes NOTHING to that total (the tool side took
-        // it whole): with entry 6 gone the would-be total is 10 + 20 = 30, not the transcript's 60.
+        // An entry this pass already excludes contributes NOTHING to that total (the tool side took it
+        // whole): with entry 3 gone the would-be total is 10, not the transcript's 30.
         expect(
             planWithheldThoughts(
                 entriesFrom(THOUGHTS),
-                settingsWith({ thoughtTurns: 0, minThoughtChars: 51 }),
-                new Set([6])
+                settingsWith({ thoughtTurns: 0, minThoughtChars: 11 }),
+                new Set([3])
             ).map((candidate) => candidate.entryIndex)
         ).toEqual([]);
         // The same floor WITHOUT the exclusion clears, which is the proof the removed entry was
@@ -3901,22 +4124,23 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
         expect(
             planWithheldThoughts(
                 entriesFrom(THOUGHTS),
-                settingsWith({ thoughtTurns: 0, minThoughtChars: 51 })
+                settingsWith({ thoughtTurns: 0, minThoughtChars: 11 })
             ).map((candidate) => candidate.entryIndex)
-        ).toEqual([1, 3, 6]);
+        ).toEqual([1, 3]);
         // Exactly at the reduced total writes.
         expect(
             planWithheldThoughts(
                 entriesFrom(THOUGHTS),
-                settingsWith({ thoughtTurns: 0, minThoughtChars: 30 }),
-                new Set([6])
+                settingsWith({ thoughtTurns: 0, minThoughtChars: 10 }),
+                new Set([3])
             ).map((candidate) => candidate.entryIndex)
-        ).toEqual([1, 3]);
+        ).toEqual([1]);
         // 0 (the shipped default) measures nothing at all, and a 1-character thinking entry still
-        // writes with the floor off.
+        // writes with the floor off — the entry has to be one step behind the newest one to be a
+        // candidate at all, hence the two-entry transcript.
         expect(
             planWithheldThoughts(
-                entriesFrom([think('tiny', 1)]),
+                entriesFrom([think('tiny', 1), think('newest', 40)]),
                 settingsWith({ thoughtTurns: 0, minThoughtChars: 0 })
             ).map((candidate) => candidate.entryIndex)
         ).toEqual([0]);
@@ -3925,10 +4149,10 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
             planWithheldThoughts(entriesFrom(THOUGHTS), settingsWith({ minThoughtChars: -5 })).map(
                 (candidate) => candidate.entryIndex
             )
-        ).toEqual([1, 3, 6]);
+        ).toEqual([1, 3]);
     });
 
-    it('minTokens NEVER gates the thinking side, at any value (the estimator does not count reasoning)', () => {
+    it('minTokens NEVER gates the thinking side, at any value (the two floors measure different things)', () => {
         const entries = entriesFrom(THOUGHTS);
 
         // The plan function does not read the token floor at all: an unreachable one leaves the
@@ -3942,6 +4166,69 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
         expect(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ minTokens: 1000000 }))).toEqual([]);
         expect(planTrimmedUnits(entriesFrom(TRIMMABLE), TRIMMER_DEFAULT_SETTINGS)).toHaveLength(0);
     });
+
+    // REGRESSION (2026-11-14, live session GL8): an operator running a thinking-heavy model set
+    // `thoughtTurns: 2` and saw NOTHING withheld — the report named no thinking entry at all. The axis
+    // was measuring CONVERSATION TURNS, and every one of that session's thinking blocks sat behind a
+    // single user message, i.e. inside the one "open turn" the horizon protects wholesale. Twelve steps
+    // of thinking is the case that unit of account cannot express; below is what the step rank says
+    // about it, entry by entry, with nothing approximated.
+    it('withholds EVERY thought older than N model steps in ONE pass — the twelve-step transcript the turn rank could not see', () => {
+        expect(
+            thoughtShape(planWithheldThoughts(entriesFrom(LONG_THOUGHTS), settingsWith({ thoughtTurns: 2 })))
+        ).toEqual([
+            { index: 1, messageId: 'msg-2', turn: 'open', stepsAgo: 11, chars: 10, tokens: 3, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 2, messageId: 'msg-3', turn: 'open', stepsAgo: 10, chars: 11, tokens: 3, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 3, messageId: 'msg-4', turn: 'open', stepsAgo: 9, chars: 12, tokens: 3, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 4, messageId: 'msg-5', turn: 'open', stepsAgo: 8, chars: 13, tokens: 4, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 5, messageId: 'msg-6', turn: 'open', stepsAgo: 7, chars: 14, tokens: 4, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 6, messageId: 'msg-7', turn: 'open', stepsAgo: 6, chars: 15, tokens: 4, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 7, messageId: 'msg-8', turn: 'open', stepsAgo: 5, chars: 16, tokens: 4, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 8, messageId: 'msg-9', turn: 'open', stepsAgo: 4, chars: 17, tokens: 5, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 9, messageId: 'msg-10', turn: 'open', stepsAgo: 3, chars: 18, tokens: 5, firedBy: 'trimThoughts', horizon: 2 },
+            { index: 10, messageId: 'msg-11', turn: 'open', stepsAgo: 2, chars: 19, tokens: 5, firedBy: 'trimThoughts', horizon: 2 }
+        ]);
+
+        // THE SHAPE OF THAT LIST, stated separately because it is the provider-facing invariant: a
+        // transcript-ordered PREFIX of the thinking entries, oldest first, contiguous, with the two
+        // newest steps (11 and 12) left intact and no hole anywhere. "Omit the oldest, never an interior
+        // one" holds by construction, since the rank falls strictly toward the end of the transcript.
+        expect(
+            planWithheldThoughts(entriesFrom(LONG_THOUGHTS), settingsWith({ thoughtTurns: 2 })).map(
+                (candidate) => candidate.entryIndex
+            )
+        ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    });
+
+    it('protects the newest step at EVERY horizon, so 0 and 1 are the same window and the horizon never restores', () => {
+        // The same transcript at every horizon value, as an exact (horizon → withheld indices) table.
+        // The three claims that only a sweep can show, and that the turn rank got wrong in BOTH
+        // directions:
+        //   - rank 0 is out of reach of every number, so `0` and `1` select the SAME set — the newest
+        //     step's thinking is what a provider replays when it is answering a tool round;
+        //   - the set grows monotonically as the horizon shrinks: raising the bound can only ADD
+        //     thoughts to the wire, never take one away, so a pass never restores a flag it already
+        //     wrote (the rank only ever grows, and the writer is withhold-only);
+        //   - past the horizon the answer is empty rather than "everything": a bound of 12 on a
+        //     12-step transcript protects the whole transcript, and there is nothing to write.
+        for (const [thoughtTurns, withheld] of [
+            [0, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]],
+            [1, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]],
+            [2, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]],
+            [3, [1, 2, 3, 4, 5, 6, 7, 8, 9]],
+            [6, [1, 2, 3, 4, 5, 6]],
+            [11, [1]],
+            [12, []],
+            [13, []]
+        ] as Array<[number, number[]]>) {
+            expect({
+                thoughtTurns,
+                withheld: planWithheldThoughts(entriesFrom(LONG_THOUGHTS), settingsWith({ thoughtTurns })).map(
+                    (candidate) => candidate.entryIndex
+                )
+            }).toEqual({ thoughtTurns, withheld });
+        }
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -3949,34 +4236,73 @@ describe('context-trimmer thinking plan (planWithheldThoughts)', () => {
 // ---------------------------------------------------------------------------
 // The `data.thoughts` entries of a pass over THOUGHTS with the horizon OPEN (what `createFakeApi`
 // seeds — see the note there), spelled out once because half the cases below need them and each one
-// is a line the operator reads: the entry, its durable id, WHICH TURN it belongs to, how many
-// THOUGHTS old it was, and the characters the flag removes. `horizon` is the value the age was
-// compared against, so a reader can re-derive the decision from the record alone.
+// is a line the operator reads: the entry, its durable id, WHICH TURN it belongs to, how many MODEL
+// STEPS old it was, and what the flag removes — in characters (what the write took off the wire, and
+// what `minThoughtChars` gates on) and in tokens (the same figure through the product's
+// `ceil(chars / 4)` convention, so the saving is readable next to the context bar). `horizon` is the
+// value the age was compared against, so a reader can re-derive the decision from the record alone.
+// Entry 6 is NOT in here: it is the newest model step, and the continuity floor exempts it at every
+// horizon, `0` included.
 const THOUGHTS_REPORT = [
-    { index: 1, messageId: 'msg-2', turn: 'closed', turnsAgo: 2, chars: 10, firedBy: 'trimThoughts', horizon: 0 },
-    { index: 3, messageId: 'msg-4', turn: 'closed', turnsAgo: 1, chars: 20, firedBy: 'trimThoughts', horizon: 0 },
-    { index: 6, messageId: 'msg-7', turn: 'open', turnsAgo: 0, chars: 30, firedBy: 'trimThoughts', horizon: 0 }
+    {
+        index: 1,
+        messageId: 'msg-2',
+        turn: 'closed',
+        stepsAgo: 3,
+        chars: 10,
+        tokens: 3,
+        firedBy: 'trimThoughts',
+        horizon: 0
+    },
+    {
+        index: 3,
+        messageId: 'msg-4',
+        turn: 'closed',
+        stepsAgo: 2,
+        chars: 20,
+        tokens: 5,
+        firedBy: 'trimThoughts',
+        horizon: 0
+    }
 ];
 
 // The one message that pass writes, hardcoded from the format and the fixture — the byte-identity
 // claim for the thinking section, in the same style as A1's for the tool section. The age is counted
-// in THOUGHTS (entry 6 is 0 old, 3 is 1 old, 1 is 2 old) and the figure is characters, never tokens:
-// the estimator does not count reasoning, so a token figure here would be a number the pass cannot
-// compute.
+// in MODEL STEPS (entry 1 is three assistant entries behind the newest one, entry 3 two), and both
+// figures of the saving are stated: 10 chars is ceil(10/4) = 3 tokens, 20 is 5.
 const THOUGHTS_MESSAGE =
-    'context-trimmer withheld 3 thinking entry(s): ' +
-    '#1 msg-2 closed 2 thoughts old 10 chars via trimThoughts=0; ' +
-    '#3 msg-4 closed 1 thoughts old 20 chars via trimThoughts=0; ' +
-    '#6 msg-7 open 0 thoughts old 30 chars via trimThoughts=0';
+    'context-trimmer withheld 2 thinking entry(s): ' +
+    '#1 msg-2 closed 3 steps old 10 chars ~3 tokens via trimThoughts=0; ' +
+    '#3 msg-4 closed 2 steps old 20 chars ~5 tokens via trimThoughts=0';
 
-// The SAME transcript at the shipped horizon (2 thoughts): only the oldest entry is old enough, and
-// the line says so with `2 thoughts old` next to `trimThoughts=2` — the age and the bound that
-// accepted it, side by side.
+// The SAME transcript at the shipped horizon (2 model steps): both entries are still at or beyond it,
+// and the line says so with the age next to `trimThoughts=2` — the age and the bound that accepted it,
+// side by side. That the SET is identical at 0, 1 and 2 on this fixture is the point of the continuity
+// floor: the newest step is out of reach of every horizon value.
 const DECLARED_THOUGHTS_MESSAGE =
-    'context-trimmer withheld 1 thinking entry(s): #1 msg-2 closed 2 thoughts old 10 chars via trimThoughts=2';
-// A COPY with the shipped horizon in it — the shared row above must stay untouched, because half the
-// tables below compare against it with `horizon: 0`.
-const DECLARED_THOUGHTS_REPORT = [{ ...THOUGHTS_REPORT[0], horizon: 2 }];
+    'context-trimmer withheld 2 thinking entry(s): ' +
+    '#1 msg-2 closed 3 steps old 10 chars ~3 tokens via trimThoughts=2; ' +
+    '#3 msg-4 closed 2 steps old 20 chars ~5 tokens via trimThoughts=2';
+// A COPY with the shipped horizon in it — the shared rows above must stay untouched, because half the
+// tables below compare against them with `horizon: 0`.
+const DECLARED_THOUGHTS_REPORT = [
+    { ...THOUGHTS_REPORT[0], horizon: 2 },
+    { ...THOUGHTS_REPORT[1], horizon: 2 }
+];
+
+// The same two entries on the `THOUGHTS_AND_UNIT` transcript, where entries 1 and 3 are the two tool
+// blocks of ONE turn. The step rank separates them (2 and 1) while the retired conversation-turn rank
+// had them equal — the clearest statement of which unit of account the axis uses: a tool loop's own
+// blocks age one step at a time, and the newest one (entry 6, the open turn's thought) never ages out.
+const UNIT_THOUGHTS_REPORT = [
+    { ...THOUGHTS_REPORT[0], stepsAgo: 2 },
+    { ...THOUGHTS_REPORT[1], stepsAgo: 1 }
+];
+
+const UNIT_THOUGHTS_MESSAGE =
+    'context-trimmer withheld 2 thinking entry(s): ' +
+    '#1 msg-2 closed 2 steps old 10 chars ~3 tokens via trimThoughts=0; ' +
+    '#3 msg-4 closed 1 steps old 20 chars ~5 tokens via trimThoughts=0';
 
 // The tool rule AND the thinking rule on one transcript, so the two axes can be pinned inside ONE
 // pass — one pause window, one diagnostic, one report:
@@ -4024,17 +4350,14 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         // One write per candidate, canonical order, and NOTHING else touched — no `setIncluded`, no
         // `edit`, no `replaceHistory`, no `setTranscript`. The thinking-less entry (4) is not in it:
-        // flagging it would be a write, a notification and a save for zero effect.
-        expect(calls).toEqual([
-            'setReasoningIncluded:1:false',
-            'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false'
-        ]);
+        // flagging it would be a write, a notification and a save for zero effect. Entry 6 is not in
+        // it either: it is the newest model step, and the continuity floor outranks the horizon.
+        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
         // The WRITE is the flag, on the canonical message, and only `false` is ever stored: no entry
         // gained `true`, which is what keeps a later restore exact.
         expect((entries[1].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
         expect((entries[3].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
-        expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
+        expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
         expect((entries[4].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
         expect(calls.every((call) => call.endsWith(':false'))).toBe(true);
         // The THINKING TEXT SURVIVES the write — the flag is not an edit, which is what keeps this
@@ -4059,21 +4382,21 @@ describe('context-trimmer thinking writes and report (T6)', () => {
         });
     });
 
-    it('the DEFAULT horizon reaches exactly the entries older than two thoughts, end to end', async () => {
-        // Nothing overridden: the shipped 2-thought horizon, which is the posture an operator gets
-        // without touching the pane. `createFakeApi` opens the horizons for the predicate tables, so
-        // this table asks for the declared ones.
+    it('the DEFAULT horizon reaches every thought behind the two newest steps, end to end', async () => {
+        // Nothing overridden: the shipped horizon of 2 model steps, which is the posture an operator
+        // gets without touching the pane. `createFakeApi` opens the horizons for the predicate tables,
+        // so this table asks for the declared ones.
         const { api, diagnostics } = createFakeApi({ atDeclaredHorizons: true });
         const calls: string[] = [];
         const entries = entriesFrom(THOUGHTS);
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries }));
 
-        // The two newest thoughts (entries 3 and 6, ranks 1 and 0) keep riding; the 2-thoughts-old
-        // one goes. The OPEN turn is not special here — entry 6 survives because of its rank, and a
-        // 3rd-from-newest open-turn thought would go with the horizon at 2.
-        expect(calls).toEqual(['setReasoningIncluded:1:false']);
-        expect((entries[3].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
+        // Entries 1 (3 steps old) and 3 (2 steps old) both go in the SAME pass — this is the GL8 shape
+        // in miniature: the conversation is one open turn, and the axis still fires. Entry 6, the newest
+        // step, is the only thought that survives, and it survives on the floor rather than on the turn.
+        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        expect((entries[3].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
         expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
         expect(diagnostics).toHaveLength(1);
         expect(diagnostics[0].message).toBe(DECLARED_THOUGHTS_MESSAGE);
@@ -4091,18 +4414,14 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         await executeTrimming(api, context);
 
-        expect(calls).toEqual([
-            'setReasoningIncluded:1:false',
-            'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false'
-        ]);
+        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
         expect(diagnostics).toHaveLength(1);
 
         // Same round, same transcript, settings unchanged. The fake flips the very field the policy
         // re-reads, so this is the real re-derive, not a fake that forgot.
         await executeTrimming(api, context);
 
-        expect(calls).toHaveLength(3);
+        expect(calls).toHaveLength(2);
         expect(diagnostics).toHaveLength(1);
         // The only thing the second round cost was the settings reads — no write, no notification,
         // and therefore no save, and no diagnostic.
@@ -4118,8 +4437,8 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS) }));
 
-        // Behaviour: the declared horizon 2, i.e. the oldest thought only.
-        expect(calls).toEqual(['setReasoningIncluded:1:false']);
+        // Behaviour: the declared horizon 2, i.e. every thought behind the two newest steps.
+        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
         expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
         expect(diagnostics).toHaveLength(1);
         // The line names `trimThoughts=2`, the value that RAN, and nothing else.
@@ -4145,11 +4464,7 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         await executeTrimming(api, createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS) }));
 
-        expect(calls).toEqual([
-            'setReasoningIncluded:1:false',
-            'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false'
-        ]);
+        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
         expect(diagnostics).toHaveLength(1);
         expect(diagnostics[0].message).toBe(THOUGHTS_MESSAGE);
 
@@ -4165,24 +4480,21 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api: toolFloor.api, calls: toolCalls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
         );
 
-        expect(toolCalls).toEqual([
-            'setReasoningIncluded:1:false',
-            'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false'
-        ]);
+        expect(toolCalls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
         expect((toolFloor.diagnostics[0].data as { units: unknown[] }).units).toEqual([]);
         expect(
             (toolFloor.diagnostics[0].data as { thoughts: unknown[] }).thoughts
-        ).toEqual(THOUGHTS_REPORT);
+        ).toEqual(UNIT_THOUGHTS_REPORT);
         expect((toolFloor.diagnostics[0].data as { policy: { fired: string[] } }).policy.fired).toEqual([
             'trimThoughts'
         ]);
     });
 
     it('minThoughtChars bites at the pass level, and the TOOL side is untouched by it', async () => {
-        // Above the 60 characters this pass would remove: nothing at all happens — no flag, no
-        // notification, no save, no diagnostic.
-        const high = createFakeApi({ minThoughtChars: 61 });
+        // Above the 30 characters this pass would remove (entries 1 and 3 — entry 6 is the newest
+        // model step, and the continuity floor keeps it out of every plan): nothing at all happens —
+        // no flag, no notification, no save, no diagnostic.
+        const high = createFakeApi({ minThoughtChars: 31 });
         const highCalls: string[] = [];
 
         await executeTrimming(
@@ -4195,7 +4507,7 @@ describe('context-trimmer thinking writes and report (T6)', () => {
         expect(high.touches).toEqual([...TURN_READS]);
 
         // Exactly at the floor it writes (the comparison is `chars < floor`).
-        const exact = createFakeApi({ minThoughtChars: 60 });
+        const exact = createFakeApi({ minThoughtChars: 30 });
         const exactCalls: string[] = [];
 
         await executeTrimming(
@@ -4203,17 +4515,14 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api: exact.api, calls: exactCalls, entries: entriesFrom(THOUGHTS) })
         );
 
-        expect(exactCalls).toEqual([
-            'setReasoningIncluded:1:false',
-            'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false'
-        ]);
+        expect(exactCalls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
 
         // THE INDEPENDENCE, in the other direction: a floor that suppresses the thinking side leaves
         // the tool rule's message BYTE-IDENTICAL to A1's — no empty section, no trailing separator.
-        // The thinking total on this transcript is 20 + 30 = 50 characters (the unit leader is
-        // already leaving whole, so its thinking contributes nothing), and 51 is above it.
-        const mixed = createFakeApi({ minThoughtChars: 51 });
+        // The thinking total on this transcript is 20 characters: the unit leader is already leaving
+        // whole, so its thinking contributes nothing, and entry 6 is the newest model step, which no
+        // horizon reaches. 21 is above the total.
+        const mixed = createFakeApi({ minThoughtChars: 21 });
         const mixedCalls: string[] = [];
 
         await executeTrimming(
@@ -4232,7 +4541,7 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             thoughts: [],
             // The policy block echoes the settings the pass RAN with, so the moved floor is part of
             // the record even though the thinking side wrote nothing — and `fired` says so too.
-            policy: { ...DEFAULT_POLICY, minThoughtChars: 51 }
+            policy: { ...DEFAULT_POLICY, minThoughtChars: 21 }
         });
     });
 
@@ -4248,20 +4557,19 @@ describe('context-trimmer thinking writes and report (T6)', () => {
         // Unit writes first (leader, then result), then the thinking writes — one pause window around
         // all of them (the trigger section below pins the park itself). The unit leader's OWN
         // thinking is not flagged: it leaves with the entry, and flagging it would only inflate the
-        // character figure the floor is measured against.
+        // character figure the floor is measured against. Entry 6 is not flagged either, for the
+        // other reason: it is the newest model step, which no horizon reaches.
         expect(calls).toEqual([
             'setIncluded:1:false',
             'setIncluded:2:false',
-            'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false'
+            'setReasoningIncluded:3:false'
         ]);
 
         expect(diagnostics).toHaveLength(1);
         expect(diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4' +
-                ' | context-trimmer withheld 2 thinking entry(s):' +
-                ' #3 msg-4 closed 1 thoughts old 20 chars via trimThoughts=0;' +
-                ' #6 msg-7 open 0 thoughts old 30 chars via trimThoughts=0'
+                ' | context-trimmer withheld 1 thinking entry(s):' +
+                ' #3 msg-4 closed 1 steps old 20 chars ~5 tokens via trimThoughts=0'
         );
 
         const data = diagnostics[0].data as {
@@ -4273,7 +4581,8 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         expect(data.units).toEqual([UNIT_RECORD]);
         expect(data.truncated).toEqual([]);
-        expect(data.thoughts).toEqual([THOUGHTS_REPORT[1], THOUGHTS_REPORT[2]]);
+        // The thinking row is the one entry this pass flagged, with the STEP rank it was selected on.
+        expect(data.thoughts).toEqual([UNIT_THOUGHTS_REPORT[1]]);
         // Declared order, both axes named: the two tool switches that account for the unit, then the
         // thinking switch that accounts for the flags.
         expect(data.policy.fired).toEqual(['dropSupersededToolCalls', 'trimInvalidTools', 'trimThoughts']);
@@ -4303,7 +4612,8 @@ describe('context-trimmer thinking writes and report (T6)', () => {
         });
 
         // The other half: both TOOL switches off, thinking still withheld, and the tool section gone.
-        // With no unit leaving, the leader's thinking is a candidate again — 60 characters this time.
+        // With no unit leaving, the leader's thinking is a candidate again — 30 characters this time
+        // (entry 6 is the newest model step and stays out of the plan whatever the switches do).
         const toolOff = createFakeApi({
             dropSupersededToolCalls: false,
             trimInvalidTools: false
@@ -4315,17 +4625,8 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             createFakeTurn({ api: toolOff.api, calls: toolCalls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
         );
 
-        expect(toolCalls).toEqual([
-            'setReasoningIncluded:1:false',
-            'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false'
-        ]);
-        expect(toolOff.diagnostics[0].message).toBe(
-            'context-trimmer withheld 3 thinking entry(s): ' +
-                '#1 msg-2 closed 2 thoughts old 10 chars via trimThoughts=0; ' +
-                '#3 msg-4 closed 1 thoughts old 20 chars via trimThoughts=0; ' +
-                '#6 msg-7 open 0 thoughts old 30 chars via trimThoughts=0'
-        );
+        expect(toolCalls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
+        expect(toolOff.diagnostics[0].message).toBe(UNIT_THOUGHTS_MESSAGE);
         expect((toolOff.diagnostics[0].data as { policy: { fired: string[] } }).policy.fired).toEqual([
             'trimThoughts'
         ]);
@@ -4339,11 +4640,7 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         await executeTrimming(api, context);
 
-        expect(calls).toEqual([
-            'setReasoningIncluded:1:false',
-            'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false'
-        ]);
+        expect(calls).toEqual(['setReasoningIncluded:1:false', 'setReasoningIncluded:3:false']);
         expect(diagnostics).toHaveLength(1);
 
         // An operator moves the switch between turns. `api.settings` is LIVE by contract
@@ -4352,7 +4649,7 @@ describe('context-trimmer thinking writes and report (T6)', () => {
 
         await executeTrimming(api, context);
 
-        expect(calls).toHaveLength(3);
+        expect(calls).toHaveLength(2);
         expect(diagnostics).toHaveLength(1);
 
         // And the flags the earlier turn wrote are STILL there: `false` stops new writes and restores
@@ -4360,7 +4657,9 @@ describe('context-trimmer thinking writes and report (T6)', () => {
         // per-round decision the plugin had to remember would have evaporated with the round.
         expect((entries[1].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
         expect((entries[3].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
-        expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBe(false);
+        // The newest model step was never touched, so its thinking is still on the wire — the flip
+        // that was off has not eaten the entry the provider may still be replaying.
+        expect((entries[6].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
     });
 
     it('reads no policy and writes no flag on a branch round or with the plugin disabled', async () => {
@@ -4415,7 +4714,6 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             'pause',
             'setReasoningIncluded:1:false',
             'setReasoningIncluded:3:false',
-            'setReasoningIncluded:6:false',
             'resume'
         ]);
 
@@ -4446,14 +4744,18 @@ describe('context-trimmer thinking writes and report (T6)', () => {
     it('a stale thinking index is skipped, and an already-flagged entry is not written twice', async () => {
         const { api, diagnostics, touches } = createFakeApi();
         const calls: string[] = [];
-        // What the plan sees: three thoughts, all eligible at the open horizon (ranks 2, 1 and 0).
+        // What the plan sees: three thoughts, all at or beyond the open horizon, at MODEL-STEP ranks
+        // 3 (`one`), 2 (`two`) and 1 (`three`). The trailing assistant entry is what makes rank 1
+        // reachable: the newest step is exempt at every horizon, so without a step behind it `three`
+        // would never be planned and the writer would have nothing to re-locate.
         const planned = entriesFrom([
             { role: 'user', content: 'go' },
             think('one', 3),
             call('c1', 'read', '{"path":"a.ts"}'),
             result('c1', 'read', 'contents'),
             think('two', 4),
-            think('three', 5)
+            think('three', 5),
+            { role: 'assistant', content: 'next' }
         ]);
         // What the transcript actually holds when the writer runs: index 1 is now a TOOL message (an
         // entry that cannot carry thinking), index 4 already carries the flag, and only index 5 is
@@ -4464,7 +4766,8 @@ describe('context-trimmer thinking writes and report (T6)', () => {
             call('c1', 'read', '{"path":"a.ts"}'),
             result('c1', 'read', 'contents'),
             { ...think('two', 4), reasoningIncluded: false },
-            think('three', 5)
+            think('three', 5),
+            { role: 'assistant', content: 'next' }
         ]);
         const { context, reads } = withStaleEntries(
             createFakeTurn({ api, calls, entries: planned }),
@@ -4480,17 +4783,161 @@ describe('context-trimmer thinking writes and report (T6)', () => {
         expect(calls).toEqual(['setReasoningIncluded:5:false']);
         expect(diagnostics).toHaveLength(1);
         // The report names the one entry this pass wrote, with the age and horizon the PLAN measured:
-        // the plan's snapshot is the transcript the operator's horizon was compared against, and the
-        // skipped entries are reported as neither written nor withheld.
+        // the plan's snapshot is the transcript the operator's horizon was compared against. The two
+        // refused writes are no longer silent — they are counted per axis, and counted rather than
+        // listed because their indices address a transcript that is not the one in front of the reader.
         expect(diagnostics[0].message).toBe(
-            'context-trimmer withheld 1 thinking entry(s): #5 msg-6 open 0 thoughts old 5 chars via trimThoughts=0'
+            'context-trimmer withheld 1 thinking entry(s): #5 msg-6 open 1 steps old 5 chars ~2 tokens via trimThoughts=0' +
+                ' | context-trimmer skipped 2 planned write(s) whose entry had moved or was already off (units 0, requests 0, thinking 2)'
         );
+        expect((diagnostics[0].data as { skipped?: Record<string, number> }).skipped).toEqual({
+            units: 0,
+            requests: 0,
+            thinking: 2,
+            total: 2
+        });
         expect((diagnostics[0].data as { thoughts: unknown[] }).thoughts).toEqual([
-            { index: 5, messageId: 'msg-6', turn: 'open', turnsAgo: 0, chars: 5, firedBy: 'trimThoughts', horizon: 0 }
+            {
+                index: 5,
+                messageId: 'msg-6',
+                turn: 'open',
+                stepsAgo: 1,
+                chars: 5,
+                tokens: 2,
+                firedBy: 'trimThoughts',
+                horizon: 0
+            }
         ]);
         expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
         // The fixture, pinned: three plan reads, one writer read.
         expect(reads()).toBe(4);
+    });
+
+    // REGRESSION (2026-11-14, the same live session): the plan is only half the complaint. The operator
+    // saw no flags written and a report that named no thinking entry, because the plan itself was empty.
+    // Over the deep transcript one pass has to write EVERY withheld thought — in transcript order, in
+    // ONE pause window — and the report has to name each one with the step age it was selected on.
+    it('writes the whole twelve-step backlog in one pass, oldest first, and names every one of them', async () => {
+        const { api, diagnostics } = createFakeApi({ thoughtTurns: 2 });
+        const calls: string[] = [];
+        const entries = entriesFrom(LONG_THOUGHTS);
+        const context = createFakeTurn({ api, calls, entries });
+
+        await executeTrimming(api, context);
+
+        // Ten writes, in canonical order, and nothing else touched: the two newest steps stay on the
+        // wire, and a single pass does not batch — the operator's `2` is a bound, not a rate.
+        expect(calls).toEqual([
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:2:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:4:false',
+            'setReasoningIncluded:5:false',
+            'setReasoningIncluded:6:false',
+            'setReasoningIncluded:7:false',
+            'setReasoningIncluded:8:false',
+            'setReasoningIncluded:9:false',
+            'setReasoningIncluded:10:false'
+        ]);
+        expect(diagnostics).toHaveLength(1);
+        // The whole line, hardcoded: the count, then one row per entry in the order the pass walked
+        // them, each naming the entry, its durable id, WHICH TURN it sits in, how many MODEL STEPS old
+        // it was, what the flag removes, and the bound that accepted it.
+        expect(diagnostics[0].message).toBe(
+            'context-trimmer withheld 10 thinking entry(s): ' +
+                '#1 msg-2 open 11 steps old 10 chars ~3 tokens via trimThoughts=2; ' +
+                '#2 msg-3 open 10 steps old 11 chars ~3 tokens via trimThoughts=2; ' +
+                '#3 msg-4 open 9 steps old 12 chars ~3 tokens via trimThoughts=2; ' +
+                '#4 msg-5 open 8 steps old 13 chars ~4 tokens via trimThoughts=2; ' +
+                '#5 msg-6 open 7 steps old 14 chars ~4 tokens via trimThoughts=2; ' +
+                '#6 msg-7 open 6 steps old 15 chars ~4 tokens via trimThoughts=2; ' +
+                '#7 msg-8 open 5 steps old 16 chars ~4 tokens via trimThoughts=2; ' +
+                '#8 msg-9 open 4 steps old 17 chars ~5 tokens via trimThoughts=2; ' +
+                '#9 msg-10 open 3 steps old 18 chars ~5 tokens via trimThoughts=2; ' +
+                '#10 msg-11 open 2 steps old 19 chars ~5 tokens via trimThoughts=2'
+        );
+        // The machine-readable record carries the same ten rows, oldest first, each with the rank it was
+        // selected on — the figure an operator needs to tell "the thought from 11 steps back" from
+        // "something the provider is still replaying".
+        expect(
+            (diagnostics[0].data as { thoughts: Array<{ index: number; stepsAgo: number; horizon: number }> })
+                .thoughts.map((row) => [row.index, row.stepsAgo, row.horizon])
+        ).toEqual([
+            [1, 11, 2],
+            [2, 10, 2],
+            [3, 9, 2],
+            [4, 8, 2],
+            [5, 7, 2],
+            [6, 6, 2],
+            [7, 5, 2],
+            [8, 4, 2],
+            [9, 3, 2],
+            [10, 2, 2]
+        ]);
+
+        // THE MONOTONIC CLAIM, on the writer's own terms: a second pass over the SAME transcript writes
+        // NOTHING, because every candidate it would consider is already flagged and rank 0 never becomes
+        // a candidate. One diagnostic, then silence — the flags are durable state, not a per-round
+        // decision the plugin has to remember.
+        await executeTrimming(api, context);
+
+        expect(calls).toHaveLength(10);
+        expect(diagnostics).toHaveLength(1);
+
+        // And the two protected steps still carry their thinking on the wire, twelve steps later: the
+        // floor is not a grace period that expires.
+        expect((entries[11].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
+        expect((entries[12].message as { reasoningIncluded?: boolean }).reasoningIncluded).toBeUndefined();
+    });
+
+    it('does not ride on the request axis: the same writes with `truncateToolRequests` on and off', async () => {
+        // H2's independence claim on the deep transcript, where it matters operationally: an operator
+        // who has never switched on `truncateToolRequests` (the shipped default is `false`) still gets a
+        // thinking trim, and one who has gets EXACTLY the same thinking trim — the request axis owns a
+        // different entry set and never suppresses a thinking write that is not leaving with its entry.
+        const writesOf = async (truncateToolRequests: boolean) => {
+            const { api, diagnostics } = createFakeApi({ thoughtTurns: 2, truncateToolRequests, truncateTurns: 0 });
+            const calls: string[] = [];
+
+            await executeTrimming(
+                api,
+                createFakeTurn({ api, calls, entries: entriesFrom(LONG_THOUGHTS) })
+            );
+
+            return { calls, diagnostics };
+        };
+
+        const off = await writesOf(false);
+        const on = await writesOf(true);
+        // Spelled out rather than generated, so the expected write set is readable as a list of
+        // entries and not as a loop over an index range.
+        const backlog = [
+            'setReasoningIncluded:1:false',
+            'setReasoningIncluded:2:false',
+            'setReasoningIncluded:3:false',
+            'setReasoningIncluded:4:false',
+            'setReasoningIncluded:5:false',
+            'setReasoningIncluded:6:false',
+            'setReasoningIncluded:7:false',
+            'setReasoningIncluded:8:false',
+            'setReasoningIncluded:9:false',
+            'setReasoningIncluded:10:false'
+        ];
+
+        expect(off.calls).toEqual(backlog);
+        expect(on.calls).toEqual(backlog);
+        // The request axis wrote nothing in either direction — there is no answered unit on this
+        // transcript to truncate — so the record shows an empty `truncated` list and one thinking
+        // section, identical byte for byte.
+        expect((off.diagnostics[0].data as { truncated: unknown[] }).truncated).toEqual([]);
+        expect((on.diagnostics[0].data as { truncated: unknown[] }).truncated).toEqual([]);
+        expect(on.diagnostics[0].message).toBe(off.diagnostics[0].message);
+        // Plan level, same claim: with no tool unit in the transcript the truncate axis has no candidate
+        // at any setting, on or off, so it cannot be what gates the thinking side.
+        expect(
+            planTruncatedRequests(entriesFrom(LONG_THOUGHTS), settingsWith({ truncateToolRequests: true }))
+        ).toEqual([]);
+        expect(planTruncatedRequests(entriesFrom(LONG_THOUGHTS), settingsWith({}))).toEqual([]);
     });
 });
 
@@ -4872,11 +5319,18 @@ describe('context-trimmer truncate tool requests (planTruncatedRequests)', () =>
 
         expect(calls).toEqual(['setIncluded:3:false']);
         expect(diagnostics[0].message).toBe(
-            'context-trimmer truncated 1 tool request(s): #3 msg-4 read results kept #4'
+            'context-trimmer truncated 1 tool request(s): #3 msg-4 read results kept #4' +
+                ' | context-trimmer skipped 1 planned write(s) whose entry had moved or was already off (units 0, requests 1, thinking 0)'
         );
         expect((diagnostics[0].data as { truncated: unknown[] }).truncated).toEqual([
             { index: 3, messageId: 'msg-4', names: ['read'], results: [4], firedBy: 'truncateToolRequests' }
         ]);
+        expect((diagnostics[0].data as { skipped?: Record<string, number> }).skipped).toEqual({
+            units: 0,
+            requests: 1,
+            thinking: 0,
+            total: 1
+        });
         expect(touches).toEqual([...TURN_READS, 'report.diagnostic']);
         // The fixture, pinned: three reads for the plan, one for the writer. If the plan ever walks
         // the list again, this fails here instead of quietly comparing one list against itself.
@@ -4932,16 +5386,25 @@ describe('context-trimmer truncate tool requests (planTruncatedRequests)', () =>
 
     it('three axes, one diagnostic, in the order they RAN', async () => {
         // A transcript where all three axes have work: the failed unit goes whole (trim), the
-        // answering unit's request goes (truncate), and its thinking goes (thinking). The sections are
-        // in run order — trim, truncate, thinking — joined by the same ' | ' the fallback clauses
-        // use, so one operator reading one line can attribute every entry.
+        // answering unit's request goes (truncate), and entry 6's thinking goes (thinking). The
+        // sections are in run order — trim, truncate, thinking — joined by the same ' | ' the fallback
+        // clauses use, so one operator reading one line can attribute every entry.
+        //
+        // The two trailing entries are what keeps the thinking axis alive here: on `THOUGHTS_AND_UNIT`
+        // alone, entry 6 is the NEWEST model step, and the continuity floor exempts the newest step at
+        // every horizon. Adding a user turn and a thinking answer puts entry 6 one step behind the
+        // newest one (rank 1) and puts entry 8 in the floor's place, so the pass has exactly one
+        // thinking write to report — which is also the clearest statement that the axis ages entries by
+        // steps and not by the user turn they sit in.
+        const threeAxes = entriesFrom([
+            ...THOUGHTS_AND_UNIT,
+            { role: 'user', content: 'then' },
+            think('latest', 40)
+        ]);
         const { api, diagnostics } = createFakeApi({ truncateToolRequests: true });
         const calls: string[] = [];
 
-        await executeTrimming(
-            api,
-            createFakeTurn({ api, calls, entries: entriesFrom(THOUGHTS_AND_UNIT) })
-        );
+        await executeTrimming(api, createFakeTurn({ api, calls, entries: threeAxes }));
 
         expect(calls).toEqual([
             'setIncluded:1:false',
@@ -4952,12 +5415,13 @@ describe('context-trimmer truncate tool requests (planTruncatedRequests)', () =>
         // Entry 3 is the truncated leader, and its thinking is NOT flagged: the entry itself leaves the
         // request, so a flag on it would be a second write for zero effect and would inflate the
         // character figure `minThoughtChars` is measured against. Rule (3b) reads the whole REMOVE
-        // set of the pass — trim members and truncate leaders alike — not just the unit plan.
+        // set of the pass — trim members and truncate leaders alike — not just the unit plan. Entry 8
+        // is not flagged either: it is the newest model step.
         expect(diagnostics[0].message).toBe(
             'context-trimmer withheld 1 superseded tool unit(s): #1 msg-2 [failed] read answered by msg-4' +
                 ' | context-trimmer truncated 1 tool request(s): #3 msg-4 read results kept #4' +
                 ' | context-trimmer withheld 1 thinking entry(s):' +
-                ' #6 msg-7 open 0 thoughts old 30 chars via trimThoughts=0'
+                ' #6 msg-7 closed 1 steps old 30 chars ~8 tokens via trimThoughts=0'
         );
         // The record keeps the three axes in three lists: `units` (whole units), `truncated` (one
         // request entry plus the results that stay) and `thoughts` (one flagged entry) — a reader can
@@ -4968,7 +5432,18 @@ describe('context-trimmer truncate tool requests (planTruncatedRequests)', () =>
         expect(data.truncated).toEqual([
             { index: 3, messageId: 'msg-4', names: ['read'], results: [4], firedBy: 'truncateToolRequests' }
         ]);
-        expect(data.thoughts).toEqual([THOUGHTS_REPORT[2]]);
+        expect(data.thoughts).toEqual([
+            {
+                index: 6,
+                messageId: 'msg-7',
+                turn: 'closed',
+                stepsAgo: 1,
+                chars: 30,
+                tokens: 8,
+                firedBy: 'trimThoughts',
+                horizon: 0
+            }
+        ]);
         expect(policyOf(diagnostics[0])).toMatchObject({
             truncateToolRequests: true,
             truncateTurns: 0,

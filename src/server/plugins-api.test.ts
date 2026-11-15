@@ -576,12 +576,15 @@ describe('GET /v1/harness/plugins', () => {
                 },
                 {
                     key: 'thoughtTurns',
-                    label: 'Thoughts · trim after (thoughts)',
+                    label: 'Thoughts · trim after (model steps)',
                     type: 'number',
                     default: 2,
                     min: 0,
                     max: 4096,
                     step: 1,
+                    // Literal, not read back from the plugin: the copy the operator reads in the pane IS
+                    // the contract, and it names the unit the horizon counts.
+                    description: 'Protects the newest N model steps; the newest step always travels.',
                     group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
                     parentKey: 'trimThoughts'
                 },
@@ -720,12 +723,14 @@ describe('GET /v1/harness/plugins', () => {
         // THE HINT SHAPE ON THE WIRE (the 2026-11-13 trimmer copy trim). The deep-equal above is not
         // enough to pin WHICH rows stopped explaining themselves: `toEqual` cannot tell an absent key
         // from a key holding `undefined`, and `pluginSettingOf` (src/server/api.ts) deliberately
-        // omits an undeclared `description` rather than emitting one. So the nine rows that still
+        // omits an undeclared `description` rather than emitting one. So the ten rows that still
         // carry operator-facing copy are asserted against the plugin's own declared string, and the
-        // other eight must emit NO `description` key at all — the shape Context Compacting has
+        // other seven must emit NO `description` key at all — the shape Context Compacting has
         // always had, and what the pane renders as no `.plugin-setting-hint`
         // (src/frontend/main.ts `buildSettingField`). The exact copy text is pinned in
-        // src/plugin/context-trimmer.test.ts, which owns it.
+        // src/plugin/context-trimmer.test.ts, which owns it. `thoughtTurns` is on this list because
+        // its hint is the only place the pane states which UNIT the horizon counts — the row that
+        // used to read "(turns)" while the axis counted model steps.
         const hinted = [
             'enabled',
             'trimInvalidTools',
@@ -735,7 +740,8 @@ describe('GET /v1/harness/plugins', () => {
             'invalidOutcomes',
             'supersedeMatch',
             'minTokens',
-            'maxUnits'
+            'maxUnits',
+            'thoughtTurns'
         ];
 
         for (const setting of page.body.items[2].settings) {

@@ -335,11 +335,21 @@ const wireMessage = (message: HarnessMessage, policy: AttachmentPolicy): Record<
             // `projectTranscript`), and no request object carries the
             // `reasoningIncluded` flag. So the transport's whole rule is "echo what
             // is present": a projected entry that still has a non-empty `reasoning`
-            // string is, by construction, thinking the policy left eligible — the
-            // newest `thoughtTurns` (shipped default 2) thought entries under
-            // `trimThoughts: true`, every entry with the switch off, and nothing once
-            // the horizon is 0 (which makes every thought eligible and therefore
-            // reproduces the pre-T8 wire byte-for-byte).
+            // string is, by construction, thinking the policy left eligible. THE UNIT
+            // IS MODEL STEPS, not thought entries: `thoughtAgoOf` ranks every assistant
+            // entry newest-first (rank 0 = the newest step), so `trimThoughts: true` +
+            // the shipped `thoughtTurns: 2` echoes the thinking of the two newest
+            // STEPS, and a thinking-free assistant step still occupies a step that
+            // pushes everything behind it out. THE RANK-0 FLOOR: the newest step is
+            // exempt at every horizon (`context-trimmer.plugin.ts:1880`), because its
+            // thinking may belong to a tool round the provider is still finishing. So
+            // `thoughtTurns: 0` is NOT an empty wire — it replays exactly the rank-0
+            // step's `reasoning_content`, which is why `0` and `1` are the same window
+            // (§13.1 of `src/harness.inclusion.test.ts` pins that one-field wire end to
+            // end). A request with NO echoed field at all needs a projected transcript
+            // with no thinking on the newest step: `trimThoughts: false` keeps every
+            // thought, and a lower horizon cannot empty it past the floor, so the old
+            // "horizon 0 reproduces the pre-T8 wire" reading no longer holds.
             //
             // `reasoning_content` is the DeepSeek-compatible spelling, the same one
             // the read side accepts (chunk parsing, below:

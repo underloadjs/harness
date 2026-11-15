@@ -6,6 +6,8 @@
 // the kernel/implementation; scripted model turns cover schema capture and
 // scheduled-call semantics.
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { agent, harness, tool } from '@underload/harness';
 import type {
     HarnessStream,
@@ -378,9 +380,20 @@ describe('self-modifying tool kernel', () => {
             'contract:tool',
             'schema:json'
         ]);
-        // Harness framework imports resolve to live package modules; this entry
-        // has no local helper dependency.
-        expect(preset?.dependencies).toEqual([]);
+        // Harness framework imports resolve to live package modules, so the only dependency a
+        // source-backed preset entry can carry is a LOCAL helper. `read` gained its first one in
+        // T14: ./cancellation.ts, the shared cancellation mapping the four filesystem tools answer
+        // a cancelled call with. The kernel has to capture it, because a revision that skipped a
+        // helper would stop covering code the entry actually runs, and a replacement that shipped
+        // only `read.tool.ts` would compile against a helper that is no longer the one captured
+        // here. The `text` is pinned against the shipped file rather than a copy pasted into this
+        // test, so the pin cannot drift from the source it claims to hold.
+        expect(preset?.dependencies).toEqual([
+            {
+                path: 'tools/files/cancellation.ts',
+                text: readFileSync(fileURLToPath(new URL('./tools/files/cancellation.ts', import.meta.url)), 'utf8')
+            }
+        ]);
 
         const registry = writer.toolSource('toolRegistry');
         expect(registry?.sourcePath).toBe('tools/runtime/toolRegistry.tool.ts');

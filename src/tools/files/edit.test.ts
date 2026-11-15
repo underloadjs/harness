@@ -7,8 +7,15 @@
 // so a partial assert would test nothing.
 //
 // The batch guarantees are the new part:
-//   - every edit is validated (shape, non-empty oldString, distinct strings, no NUL)
-//     BEFORE any read;
+//   - every edit is validated (shape, no unknown field, oldString/newString types, no NUL
+//     in the path) BEFORE any read;
+//   - every target is STATTED before it is read, so a directory, a FIFO, a device or a
+//     file over FILE_EDIT_MAX_BYTES is refused with a code and a remedy instead of being
+//     opened (L5, L9);
+//   - a file that cannot be READ (0o000) is refused; a file that cannot be WRITTEN but
+//     can be read (0o444) is not, because the publish renames into the DIRECTORY (M3);
+//   - a no-op entry (oldString === newString) and an empty oldString against an EMPTY file
+//     are ACCEPTED (M12); a no-op says `changed: false` and is not republished;
 //   - entries are grouped by FILE IDENTITY (./identity.ts), so several entries may
 //     name one file — the same path twice, two case spellings on Windows, or a
 //     symlink alias on any platform. They are applied in ARRAY order, each matched
@@ -30,12 +37,19 @@
 // asserted for every shape, including the doubled-CR shapes the rule makes honest.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import {
+    chmod,
+    link as hardLink,
+    lstat,
     mkdir,
     mkdtemp,
     readFile,
     readFile as readTextFile,
+    readdir,
+    readlink,
     rm,
+    stat,
     symlink,
     writeFile,
     writeFile as writeTextFile
@@ -44,7 +58,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toolParameterKey } from '../../core';
 import { HarnessError } from '../../util';
-import { edit } from './edit.tool';
+import { STAGING_MARKER } from './atomic-publish';
+import { edit, FILE_EDIT_ERROR_CODES, FILE_EDIT_MAX_BYTES, FILE_EDIT_METADATA } from './edit.tool';
 import { write } from './write.tool';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
@@ -144,12 +159,29 @@ describe('edit', () => {
     it('refuses an ambiguous match and leaves the file untouched', async () => {
         const path = await seed('ambiguous.txt', 'a a a\n');
 
+        // L4: three candidates on ONE line name that line ONCE. The match count is still
+        // exact (3), and the named list is what a caller uses to find the candidates, so
+        // "lines 1, 1, 1" used to spend three of the ten published slots repeating a fact
+        // while pushing the lines that actually differ off the end of the list.
         await expect(edit([{ path, oldString: 'a', newString: 'b' }])).rejects.toThrow(
             new HarnessError(
-                `edit found 3 matches for oldString in ${path} (lines 1, 1, 1). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+                `edit found 3 matches for oldString in ${path} (lines 1). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
             )
         );
         await expect(readTextFile(path, 'utf8')).resolves.toBe('a a a\n');
+    });
+
+    it('names each candidate line once, however many candidates share it', async () => {
+        // L4, the other half: the list must still name the DISTINCT lines. Six matches
+        // live on three lines here, and the answer a caller can act on is those three.
+        const path = await seed('ambiguous-lines.txt', 'x\n\nx\n\nx\n');
+
+        await expect(edit([{ path, oldString: 'x', newString: 'y' }])).rejects.toThrow(
+            new HarnessError(
+                `edit found 3 matches for oldString in ${path} (lines 1, 3, 5). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+            )
+        );
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('x\n\nx\n\nx\n');
     });
 
     // CRASH REGRESSION. A broad oldString on a large file used to make the ambiguity
@@ -830,18 +862,27 @@ describe('edit', () => {
         await expect(readTextFile(throughLink, 'utf8')).resolves.toBe('two\n');
     });
 
-    it('rejects an empty oldString, a no-op edit, and a non-boolean replaceAll', async () => {
+    it('rejects a non-boolean replaceAll, an empty newString type error, and an unknown field', async () => {
         const path = await seed('validation.txt', 'text\n');
 
-        await expect(edit([{ path, oldString: '', newString: 'x' }])).rejects.toThrow(
-            new HarnessError('edit requires a non-empty oldString.')
-        );
-        await expect(edit([{ path, oldString: 'text', newString: 'text' }])).rejects.toThrow(
-            new HarnessError('edit did not change the file: oldString and newString are identical.')
-        );
         await expect(
             edit([{ path, oldString: 'text', newString: 'x', replaceAll: 'yes' as never }])
         ).rejects.toThrow(new HarnessError('edit replaceAll must be a boolean when provided.'));
+        await expect(
+            edit([{ path, oldString: 'text', newString: 7 as never }])
+        ).rejects.toThrow(new HarnessError('edit requires a "newString" string.'));
+
+        // M9: the schema refuses unknown fields, but a direct call never sees the schema,
+        // and `{ replaceAll: true, replace: 'all' }` used to be silently dropped — the
+        // entry applied ONE replacement and reported success.
+        await expect(
+            edit([{ path, oldString: 'text', newString: 'x', replace: 'all' as never }])
+        ).rejects.toThrow(
+            new HarnessError(
+                `edit edits entries do not accept "replace". Allowed fields: path, oldString, newString, replaceAll.`
+            )
+        );
+
         await expect(readTextFile(path, 'utf8')).resolves.toBe('text\n');
     });
 
@@ -1050,3 +1091,634 @@ describe('edit', () => {
 
 // A path interpolated into a RegExp needs its Windows separators and dots escaped.
 const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// ---------------------------------------------------------------------------
+// The C2 / M3 / M11 half of the contract: WHAT happens to the file when an edit lands.
+// Before this fix `edit` ended in `writeFile`, which truncated the target's OWN inode at
+// open; every test below is a statement about inodes, modes, links, and what a failure
+// leaves behind — none of which the pre-fix write could promise.
+// ---------------------------------------------------------------------------
+
+// The staging entries of one directory. The publish creates a sibling
+// `<name>.tmp-<token>` and renames it, so after ANY outcome — success, refusal, or a
+// failure between the create and the rename — this list has to be empty. Matched on the
+// marker ./atomic-publish.ts exports, so the token format is not hard-coded here.
+const stagingEntries = async (dir: string): Promise<string[]> =>
+    (await readdir(dir)).filter((name) => name.includes(STAGING_MARKER)).sort();
+
+// The thrown failure as a VALUE, so a test can assert `code`, `name` and `details` next to
+// the sentence. `toThrow(errorInstance)` compares the MESSAGE (and, given an Error, also
+// fails when the thrown error carries `details` the expected one lacks), which is the half
+// M11 adds.
+const failureOf = async (call: () => Promise<unknown>): Promise<HarnessError> => {
+    const failure = await call().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(HarnessError);
+
+    return failure as HarnessError;
+};
+
+// A FIFO (named pipe) at `path`, false when this host has no `mkfifo`. The fixture exists
+// for L5: `readFile` on a pipe BLOCKS until a writer closes it, which on a `mode: 'sync'`
+// tool running on the default inline lane is a hung process, not a slow call. The
+// stat-before-read guard answers it instead; the elapsed bound below is what pins
+// "answered" rather than "waited".
+const makeFifo = (path: string): boolean => spawnSync('mkfifo', [path]).status === 0;
+
+describe('edit - the publish (C2, M3)', () => {
+    it('publishes the new text through a rename onto a NEW inode, keeping the mode', async () => {
+        const dir = join(workdir, 'publish');
+        const path = join(dir, 'script.sh');
+        await mkdir(dir, { recursive: true });
+        await writeTextFile(path, '#!/bin/sh\none\n', 'utf8');
+        await chmod(path, 0o755);
+
+        const before = await stat(path);
+        // The mode worth preserving, asserted before the call so a platform that models chmod
+        // loosely (Windows) fails the fixture rather than silently passing it.
+        if (process.platform !== 'win32') expect(before.mode & 0o7777).toBe(0o755);
+
+        await expect(edit([{ path, oldString: 'one', newString: 'ONE' }])).resolves.toEqual([
+            { path, replacements: 1, bytes: Buffer.byteLength('#!/bin/sh\nONE\n', 'utf8') }
+        ]);
+
+        const after = await stat(path);
+        // C2: a DIFFERENT inode holds the new text. The in-place write kept this inode and
+        // emptied it first, which is the window the staging rename closes.
+        expect(after.ino).not.toBe(before.ino);
+        expect(after.isFile()).toBe(true);
+        expect(after.size).toBe(Buffer.byteLength('#!/bin/sh\nONE\n', 'utf8'));
+        // The rename swaps the inode, so the mode has to travel with it: a 0755 script that
+        // came back 0644 would silently stop being executable.
+        expect(after.mode & 0o7777).toBe(before.mode & 0o7777);
+        // No staging sibling survives the success.
+        await expect(stagingEntries(dir)).resolves.toEqual([]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('#!/bin/sh\nONE\n');
+    });
+
+    it('leaves a hard-link partner holding the previous bytes under its own name', async () => {
+        // The published trade of the publish (D7b): one name was named, one name is replaced.
+        // An in-place write would have changed BOTH names' bytes while the receipt spoke about
+        // one file.
+        const dir = join(workdir, 'publish-hardlink');
+        const path = join(dir, 'target.txt');
+        const partner = join(dir, 'partner.txt');
+        await mkdir(dir, { recursive: true });
+        await writeTextFile(path, 'one\n', 'utf8');
+
+        try {
+            await hardLink(path, partner);
+        } catch {
+            // Hard links are privileged on Windows without Developer Mode.
+            await expect(readTextFile(path, 'utf8')).resolves.toBe('one\n');
+
+            return;
+        }
+
+        const shared = (await stat(partner)).ino;
+        expect((await stat(path)).ino).toBe(shared);
+
+        await expect(edit([{ path, oldString: 'one', newString: 'ONE' }])).resolves.toEqual([
+            { path, replacements: 1, bytes: 4 }
+        ]);
+
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('ONE\n');
+        await expect(readTextFile(partner, 'utf8')).resolves.toBe('one\n');
+        expect((await stat(partner)).ino).toBe(shared);
+        expect((await stat(path)).ino).not.toBe(shared);
+        await expect(stagingEntries(dir)).resolves.toEqual([]);
+    });
+
+    it('edits through a symlink, updating the target and keeping the link itself', async () => {
+        // A rename replaces a NAME, so renaming onto the LINK path would delete the link and
+        // leave a regular file where an alias used to be. The staging file and the rename
+        // therefore go to the RESOLVED target — and the link has to still be a link, still
+        // pointing at the same place, with the new bytes reachable through it.
+        const dir = join(workdir, 'publish-symlink');
+        const real = join(dir, 'real.txt');
+        const alias = join(dir, 'alias.txt');
+        await mkdir(dir, { recursive: true });
+        await writeTextFile(real, 'original\n', 'utf8');
+
+        try {
+            await symlink(real, alias);
+        } catch {
+            await expect(readTextFile(real, 'utf8')).resolves.toBe('original\n');
+
+            return;
+        }
+
+        await expect(edit([{ path: alias, oldString: 'original', newString: 'updated' }])).resolves.toEqual([
+            { path: alias, replacements: 1, bytes: Buffer.byteLength('updated\n', 'utf8') }
+        ]);
+
+        // The bytes moved into the file the link names, not into a new file at the link's own
+        // name, and the entry still reports the path the caller asked for.
+        await expect(readTextFile(real, 'utf8')).resolves.toBe('updated\n');
+        expect((await lstat(alias)).isSymbolicLink()).toBe(true);
+        await expect(readlink(alias)).resolves.toBe(real);
+        expect((await readdir(dir)).sort()).toEqual(['alias.txt', 'real.txt']);
+    });
+
+    it('leaves the previous text, the mode and no staging file when the directory refuses the publish', async () => {
+        // C2 + M11, the failure half. The target's DIRECTORY is made read-only AFTER the
+        // target exists, so the staging file cannot be created and the call must fail before
+        // it can publish — the deterministic stand-in for ENOSPC or a kill mid-write. What is
+        // pinned is the promise the sentence makes: the earlier file really is on disk
+        // complete, and the failing file really still holds what it had, whole.
+        const dir = join(workdir, 'publish-failed');
+        const locked = join(dir, 'locked');
+        const writable = join(dir, 'writable');
+        await mkdir(locked, { recursive: true });
+        await mkdir(writable, { recursive: true });
+
+        await chmod(locked, 0o500);
+
+        let createBlocked = false;
+
+        try {
+            await writeTextFile(join(locked, 'probe.txt'), 'x', 'utf8');
+        } catch {
+            createBlocked = true;
+        }
+
+        if (!createBlocked) {
+            // root ignores the directory write bit and Windows has no such bit: there is no
+            // failure to construct here, so the case is skipped openly, not weakened.
+            await rm(join(locked, 'probe.txt'), { force: true });
+            await chmod(locked, 0o700);
+
+            return;
+        }
+
+        const failing = join(locked, 'target.txt');
+        await chmod(locked, 0o700);
+        await writeTextFile(failing, 'PREVIOUS', 'utf8');
+        await chmod(failing, 0o640);
+        await chmod(locked, 0o500);
+
+        const completed = join(writable, 'done.txt');
+        await writeTextFile(completed, 'before\n', 'utf8');
+
+        try {
+            const failure = await failureOf(() =>
+                edit([
+                    { path: completed, oldString: 'before', newString: 'AFTER' },
+                    { path: failing, oldString: 'PREVIOUS', newString: 'NEVER' }
+                ])
+            );
+
+            expect(['EACCES', 'EPERM', 'EROFS']).toContain(failure.code);
+            expect(failure.name).toBe(failure.code);
+            expect(failure.message).toMatch(
+                new RegExp(
+                    `^edit failed on ${escapeRegExp(failing)}: (EACCES|EPERM|EROFS).*\\. Edits already applied: ${escapeRegExp(
+                        completed
+                    )}\\. No rollback was performed\\.$`
+                )
+            );
+            // M11: the same facts as data, so a caller does not parse the completed list out of
+            // prose. The failing path is deliberately NOT in the completed list: it still holds
+            // the text it had, which is what the staged publish guarantees.
+            expect((failure.details as { failedPath: string }).failedPath).toBe(failing);
+            expect((failure.details as { completedPaths: string[] }).completedPaths).toEqual([completed]);
+
+            await expect(readTextFile(completed, 'utf8')).resolves.toBe('AFTER\n');
+            await expect(readTextFile(failing, 'utf8')).resolves.toBe('PREVIOUS');
+            expect((await stat(failing)).mode & 0o777).toBe(0o640);
+            await expect(stagingEntries(locked)).resolves.toEqual([]);
+        } finally {
+            // The fixture directory has to be writable again for the suite cleanup.
+            await chmod(locked, 0o700);
+        }
+    });
+
+    it('edits a 0444 file, which the in-place write could not open, and keeps the mode', async () => {
+        // M3. Writing INTO a read-only file needs write permission on the INODE; publishing
+        // needs write permission on the DIRECTORY, which is why `write` has always accepted
+        // this and `edit` did not. The two tools now agree, and the file's 0444 survives the
+        // rename because the mode is copied onto the staging file.
+        const path = join(workdir, 'read-only-file.txt');
+        await writeTextFile(path, 'one\n', 'utf8');
+        await chmod(path, 0o444);
+
+        // The fixture has to DISCRIMINATE: a 0444 file is exactly what an in-place write
+        // cannot open for writing, so on an unprivileged host the scratch file below proves
+        // the pre-fix shape fails where the publish succeeds. Where the host is privileged
+        // (root, CAP_FOWNER) the in-place write also succeeds, that half is vacuous, and only
+        // the published behavior — success, mode intact — is asserted.
+        const scratch = join(workdir, 'read-only-scratch.txt');
+        await writeTextFile(scratch, 'one\n', 'utf8');
+        await chmod(scratch, 0o444);
+
+        const inPlaceBlocked = await writeTextFile(scratch, 'two\n', 'utf8').then(
+            () => false,
+            () => true
+        );
+
+        if (inPlaceBlocked) {
+            // And `write` has always accepted this target, which is the inconsistency M3 was:
+            // one tool editing what the other one could already replace.
+            await expect(write([{ path: scratch, content: 'three\n' }])).resolves.toEqual([
+                { path: scratch, bytes: 6 }
+            ]);
+            await expect(readTextFile(scratch, 'utf8')).resolves.toBe('three\n');
+            expect((await stat(scratch)).mode & 0o777).toBe(0o444);
+        }
+
+        await expect(edit([{ path, oldString: 'one', newString: 'ONE' }])).resolves.toEqual([
+            { path, replacements: 1, bytes: 4 }
+        ]);
+
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('ONE\n');
+
+        const after = await stat(path);
+        if (process.platform !== 'win32') expect(after.mode & 0o777).toBe(0o444);
+    });
+
+    it('refuses a file it cannot read, with the permission code and the target as data', async () => {
+        // The other half of M3: a publish needs only the directory, but an EDIT has to READ
+        // the file first, so a 0000 target is still a refusal — an honest one, with the code
+        // that says so (M11) rather than a bare errno sentence.
+        const path = join(workdir, 'unreadable-file.txt');
+        await writeTextFile(path, 'secret\n', 'utf8');
+        await chmod(path, 0o000);
+
+        // Capability probe: root (or CAP_DAC_OVERRIDE) reads a 0000 file, and then there is
+        // no refusal on this host to assert.
+        const readBlocked = await readFile(path).then(
+            () => false,
+            () => true
+        );
+
+        if (!readBlocked) {
+            await chmod(path, 0o600);
+
+            return;
+        }
+
+        const failure = await failureOf(() => edit([{ path, oldString: 'secret', newString: 'public' }]));
+
+        expect(['EACCES', 'EPERM']).toContain(failure.code);
+        expect(failure.name).toBe(failure.code);
+        expect(failure.message).toMatch(
+            new RegExp(
+                `^edit was denied permission to read ${escapeRegExp(path)}: .*\\. This is a filesystem permission problem, not a missing path\\.$`
+            )
+        );
+        expect((failure.details as { target: string }).target).toBe(path);
+
+        await chmod(path, 0o600);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('secret\n');
+    });
+});
+
+describe('edit - the preflight (L5, L9, M12, M9, H6)', () => {
+    it('refuses a FIFO without blocking on it', async () => {
+        // L5. `readFile` on a pipe waits for a writer that never comes, and this tool is
+        // `mode: 'sync'` on the default inline lane, so the old read-first shape could hang
+        // the process on one argument. One `stat` answers instead, with the sentence and the
+        // code shared with ./write.tool.ts.
+        const dir = join(workdir, 'preflight-fifo');
+        const fifo = join(dir, 'pipe.txt');
+        await mkdir(dir, { recursive: true });
+
+        if (!makeFifo(fifo)) {
+            await expect(readdir(dir)).resolves.toEqual([]);
+
+            return;
+        }
+
+        const startedAt = Date.now();
+        const failure = await failureOf(() => edit([{ path: fifo, oldString: 'x', newString: 'y' }]));
+        const elapsedMs = Date.now() - startedAt;
+
+        expect(failure.code).toBe('EOPNOTSUPP');
+        expect(failure.name).toBe('EOPNOTSUPP');
+        expect(
+            failure.message.startsWith(
+                `edit refused ${fifo}: the target is a FIFO (named pipe), not a regular file. `
+            )
+        ).toBe(true);
+        expect(failure.message.length).toBeLessThan(600);
+        expect((failure.details as { kind: string }).kind).toBe('a FIFO (named pipe)');
+        expect((failure.details as { target: string }).target).toBe(fifo);
+        // Loose on purpose, but nowhere near the seconds-to-forever a blocked read is.
+        expect(elapsedMs).toBeLessThan(5_000);
+    });
+
+    it('refuses a character device as not a regular file', async () => {
+        // L5, the shape whose read does not block but never ends (`/dev/zero`) or answers once
+        // with no bytes (`/dev/null`). Guarded on the host actually having a character device
+        // at that path, because the refusal is a claim about the node type.
+        let isCharDevice = false;
+
+        try {
+            isCharDevice = (await lstat('/dev/null')).isCharacterDevice();
+        } catch {
+            isCharDevice = false;
+        }
+
+        if (!isCharDevice) return;
+
+        const failure = await failureOf(() =>
+            edit([{ path: '/dev/null', oldString: 'nothing here', newString: 'x' }])
+        );
+
+        expect(failure.code).toBe('EOPNOTSUPP');
+        expect(
+            failure.message.startsWith('edit refused /dev/null: the target is a character device, not a regular file. ')
+        ).toBe(true);
+        expect((failure.details as { kind: string }).kind).toBe('a character device');
+    });
+
+    it('refuses a directory with the sentence a model can act on, and creates no staging file', async () => {
+        // L5 + C2 together: the refusal happens BEFORE the read and before any staging file,
+        // so the directory still holds exactly the children it had.
+        const dir = join(workdir, 'preflight-dir');
+        await mkdir(dir, { recursive: true });
+        await writeTextFile(join(dir, 'keep.txt'), 'keep', 'utf8');
+
+        const failure = await failureOf(() => edit([{ path: dir, oldString: 'x', newString: 'y' }]));
+
+        expect(failure.code).toBe('EISDIR');
+        expect(failure.name).toBe('EISDIR');
+        expect(failure.message).toBe(
+            `edit was given the directory ${dir}. edit changes one existing file; pass a file path, or use write.`
+        );
+        expect((failure.details as { kind: string }).kind).toBe('directory');
+        expect((await readdir(dir)).sort()).toEqual(['keep.txt']);
+    });
+
+    it('refuses a symlink loop as ELOOP, never as the transient EIO', async () => {
+        // The read leg of a publish resolves its target through the SAME hand-rolled link walk
+        // as `write` (./atomic-publish.ts's `realWriteTarget`), and the throw there has to CARRY
+        // its code: `publishErrorCode` reads `error.code`, and a throw with no code folds to
+        // `EIO` — the harness's TRANSIENT code, the one the published descriptions tell a model
+        // to retry. Measured on one self-referential link, `edit` and `files` already answered
+        // `ELOOP` and `write` answered `{ code: 'EIO', rawCode: null }`; this is the pin that
+        // keeps `edit` on the right side of that fix as the shared walk changes.
+        const loop = join(workdir, 'edit-loop-ELOOP.txt');
+
+        // A symlink is privileged on Windows (Developer Mode or elevation), so the assertion is
+        // about a link that this host was able to create — the same concession the symlink
+        // fixtures above and ./identity.test.ts:46-53 make. Linux and macOS always create one,
+        // so the pin is never silently skipped where the defect was reported.
+        try {
+            await symlink('edit-loop-ELOOP.txt', loop);
+        } catch {
+            return;
+        }
+
+        const failure = await failureOf(() => edit([{ path: loop, oldString: 'x', newString: 'y' }]));
+
+        expect(failure.code).toBe('ELOOP');
+        expect(failure.name).toBe('ELOOP');
+        expect(FILE_EDIT_ERROR_CODES).toContain('ELOOP');
+        // The whole defect, in one assertion: `EIO` is what a caller used to see.
+        expect(failure.code).not.toBe('EIO');
+        expect(failure.details).toEqual({ target: loop, reason: 'unreadable-target' });
+        expect(failure.message).toContain('ELOOP: too many symbolic links encountered');
+
+        // The refusal happens before the read, so nothing was staged next to the link, and the
+        // link itself is still a link (`lstat`, because `stat` on this one never answers).
+        await expect(stagingEntries(workdir)).resolves.toEqual([]);
+        const loopStats = await lstat(loop);
+        expect(loopStats.isSymbolicLink()).toBe(true);
+    });
+
+    it('publishes the size ceiling and refuses a file over it with EFBIG, leaving it untouched', async () => {
+        // L9: a file AT the ceiling is accepted and one byte over it is refused, with the limit
+        // named in both the sentence and the data, and the refused file provably not rewritten
+        // (same inode, same size).
+        expect(FILE_EDIT_MAX_BYTES).toBe(8 * 1024 * 1024);
+        expect(FILE_EDIT_ERROR_CODES).toContain('EFBIG');
+        expect(new Set(FILE_EDIT_ERROR_CODES).size).toBe(FILE_EDIT_ERROR_CODES.length);
+
+        const dir = join(workdir, 'size-bound');
+        await mkdir(dir, { recursive: true });
+
+        const atLimit = join(dir, 'at-limit.txt');
+        const overLimit = join(dir, 'over-limit.txt');
+        const atLimitText = 'a'.repeat(FILE_EDIT_MAX_BYTES - 6) + 'UNIQUE';
+        const overLimitText = 'a'.repeat(FILE_EDIT_MAX_BYTES) + 'b';
+
+        await writeTextFile(atLimit, atLimitText, 'utf8');
+        await writeTextFile(overLimit, overLimitText, 'utf8');
+        expect(Buffer.byteLength(atLimitText, 'utf8')).toBe(FILE_EDIT_MAX_BYTES);
+        expect(Buffer.byteLength(overLimitText, 'utf8')).toBe(FILE_EDIT_MAX_BYTES + 1);
+
+        await expect(edit([{ path: atLimit, oldString: 'UNIQUE', newString: 'ONCE' }])).resolves.toEqual([
+            { path: atLimit, replacements: 1, bytes: FILE_EDIT_MAX_BYTES - 2 }
+        ]);
+
+        const before = await stat(overLimit);
+        const failure = await failureOf(() => edit([{ path: overLimit, oldString: 'ab', newString: 'x' }]));
+
+        expect(failure.code).toBe('EFBIG');
+        expect(failure.name).toBe('EFBIG');
+        expect(failure.message).toBe(
+            `edit refused ${overLimit}: the file is ${FILE_EDIT_MAX_BYTES + 1} bytes, over the ${FILE_EDIT_MAX_BYTES}-byte ceiling this tool reads and rewrites in memory. Read the region you want to change with read, then edit that text, or replace the whole file with write.`
+        );
+        expect(failure.details).toEqual({ target: overLimit, size: FILE_EDIT_MAX_BYTES + 1, limit: FILE_EDIT_MAX_BYTES });
+
+        const after = await stat(overLimit);
+        expect(after.ino).toBe(before.ino);
+        expect(after.size).toBe(FILE_EDIT_MAX_BYTES + 1);
+    });
+
+    it('accepts a no-op entry, reports changed: false, and does not republish the file', async () => {
+        // M12. Passing the same text twice is a CHECK: the match and uniqueness rules still
+        // run (the next test pins that), and the receipt says what actually happened — nothing
+        // — instead of either failing or claiming a change. The inode and mtime assertions are
+        // the "was not republished" half: after C2 a no-op that still renamed would churn the
+        // inode and invalidate a reader's open handle for nothing.
+        const path = join(workdir, 'no-op.txt');
+        await writeTextFile(path, 'x alpha y\n', 'utf8');
+        const before = await stat(path);
+
+        await expect(edit([{ path, oldString: 'alpha', newString: 'alpha' }])).resolves.toEqual([
+            { path, replacements: 1, bytes: Buffer.byteLength('x alpha y\n', 'utf8'), changed: false }
+        ]);
+
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('x alpha y\n');
+        const after = await stat(path);
+        expect(after.ino).toBe(before.ino);
+        expect(after.mtimeMs).toBe(before.mtimeMs);
+        expect(after.size).toBe(before.size);
+    });
+
+    it('still fails a no-op whose text is missing, and one that is not unique', async () => {
+        const absent = join(workdir, 'no-op-absent.txt');
+        const ambiguous = join(workdir, 'no-op-ambiguous.txt');
+        await writeTextFile(absent, 'x alpha y\n', 'utf8');
+        await writeTextFile(ambiguous, 'a a a\n', 'utf8');
+
+        await expect(edit([{ path: absent, oldString: 'missing', newString: 'missing' }])).rejects.toThrow(
+            new HarnessError(
+                `edit found no match for oldString in ${absent}. Read the file first and copy the text exactly, including indentation.`
+            )
+        );
+
+        // L4 from the other direction: a no-op is diagnosed exactly like the real edit it
+        // stands for, deduped line list included.
+        await expect(edit([{ path: ambiguous, oldString: 'a', newString: 'a' }])).rejects.toThrow(
+            new HarnessError(
+                `edit found 3 matches for oldString in ${ambiguous} (lines 1). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+            )
+        );
+
+        await expect(readTextFile(absent, 'utf8')).resolves.toBe('x alpha y\n');
+        await expect(readTextFile(ambiguous, 'utf8')).resolves.toBe('a a a\n');
+    });
+
+    it('matches a no-op written with \\n against a CRLF file and changes nothing', async () => {
+        // M12 and the ending rules together: two identical strings trivially "differ only in
+        // carriage returns", which would send the entry down the exact-bytes branch and answer
+        // "no match" for a file whose text is plainly there. A no-op is routed through the
+        // normal cascade instead, so it is diagnosed like the real edit it stands for — found,
+        // through the LF view, reported unchanged, with the BYTES not one bit different.
+        const path = await seedBytes('no-op-crlf.txt', '61 0d 0a 62 0d 0a');
+        const before = await stat(path);
+
+        await expect(edit([{ path, oldString: 'a\nb', newString: 'a\nb' }])).resolves.toEqual([
+            { path, replacements: 1, bytes: 6, changed: false }
+        ]);
+
+        await expect(readHex(path)).resolves.toBe('61 0d 0a 62 0d 0a');
+        expect((await stat(path)).ino).toBe(before.ino);
+    });
+
+    it('inserts into an empty file with an empty oldString, and refuses that needle anywhere else', async () => {
+        // M12: the empty needle names exactly one place — the start of a file with no text —
+        // and it is the only way an empty file can be edited at all, since no non-empty
+        // oldString can match it. Against a file with text the same needle matches between
+        // every pair of characters, so it keeps the message this tool has always used.
+        const empty = join(workdir, 'empty-insert.txt');
+        await writeTextFile(empty, '', 'utf8');
+
+        await expect(edit([{ path: empty, oldString: '', newString: 'inserted' }])).resolves.toEqual([
+            { path: empty, replacements: 1, bytes: 8 }
+        ]);
+        await expect(readTextFile(empty, 'utf8')).resolves.toBe('inserted');
+
+        const full = join(workdir, 'empty-needle.txt');
+        await writeTextFile(full, 'text\n', 'utf8');
+
+        const failure = await failureOf(() => edit([{ path: full, oldString: '', newString: 'x' }]));
+
+        expect(failure.message).toBe('edit requires a non-empty oldString.');
+        expect(failure.details).toEqual({ target: full, reason: 'empty-needle-on-non-empty-file' });
+        await expect(readTextFile(full, 'utf8')).resolves.toBe('text\n');
+    });
+
+    it('publishes that the lock is per process and that a writer outside it wins (H6)', async () => {
+        // H6: the two claims the old description made were stronger than ./lock.ts supports.
+        // Pinned as TEXT, because the description IS the contract a model reads — and pinned
+        // for both writers, so the qualifier cannot be added to one tool and forgotten in the
+        // other.
+        const description = FILE_EDIT_METADATA.description;
+
+        expect(description).toContain(
+            'serialized per file (in this process only - a second harness process or a worker-thread lane keeps its own locks)'
+        );
+        expect(description).toContain('a concurrent edit cannot silently clobber another edit');
+        expect(description).toContain('a writer outside that lock');
+        // The overclaim this replaced, verbatim: an unqualified promise that no concurrent edit
+        // could ever clobber another.
+        expect(description).not.toContain(
+            'serialized per file (read-match-write is one critical section), so a concurrent edit never silently clobbers another'
+        );
+        // And the facts the publish made true (C2, M3, L5, L9, M12), each one clause of the
+        // same description, so the prose cannot drift back.
+        expect(description).toContain('never a partial write');
+        expect(description).toContain('a hard link to it keeps the previous bytes');
+        expect(description).toContain('(0444) can still be edited');
+        expect(description).toContain('is refused with a code rather than replaced by one');
+        expect(description).toContain('EFBIG');
+        expect(description).toContain('{ path, replacements, bytes, match?, changed? }');
+        // T14: the cancelled-call refusal is published in the same breath as the other codes,
+        // pinned as text for the same reason — the description IS the contract a model reads,
+        // and `ECANCELED` is now a code this tool can answer with (./cancellation.ts).
+        expect(description).toContain(
+            'A cancelled call rejects with `ECANCELED` and names the files already edited: there is no rollback'
+        );
+    });
+});
+
+describe('edit - a cancelled call is refused with the published ECANCELED (T14)', () => {
+    // Cancellation used to be invisible here: `context.signal` was never read, so an aborted
+    // call still read its files, still published new ones, and still reported success to a
+    // caller that had already walked away (src/types/index.ts:2349-2364 says the harness
+    // discards a late result, so that "success" had no consumer at all). It now refuses with
+    // the published `ECANCELED` (./cancellation.ts), as a CALL-level rejection like every
+    // other refused edit, with `completedPaths` in `details` and the host's own abort reason
+    // kept as `cause` (src/harness.ts:7804-7816 prefers a tool's own explanation of a
+    // cancellation over the generic reason, so the reason has to survive somewhere).
+    it('refuses a cancelled call with ECANCELED before reading any file', async () => {
+        const target = await seed('cancel-pre.txt', 'one\n');
+        const controller = new AbortController();
+        controller.abort();
+
+        const failure = await failureOf(() =>
+            edit.execute({ parameters: [{ path: target, oldString: 'one', newString: 'ONE' }], signal: controller.signal })
+        );
+
+        expect(failure.code).toBe('ECANCELED');
+        expect(failure.name).toBe('ECANCELED');
+        expect(FILE_EDIT_ERROR_CODES).toContain('ECANCELED');
+        // `EIO` is the fold this replaces: transient, and the one the descriptions teach a model
+        // to retry — a cancelled call is permanent by construction.
+        expect(failure.code).not.toBe('EIO');
+        expect(failure.message).toBe(
+            'edit was cancelled (ECANCELED) before any file was edited: the caller\'s abort signal fired, so nothing further ran. Re-run the call if the cancellation was not intended.'
+        );
+        expect(failure.details).toEqual({ rawCode: 'AbortError', completedPaths: [] });
+
+        // Reached through the cast src/util/errors.ts itself uses: `cause` is assigned, not
+        // declared, because the package does not pull in lib es2022.error.
+        const cause = (failure as { cause?: { name?: string } }).cause;
+        expect(cause?.name).toBe('AbortError');
+
+        // Nothing ran: the file still holds the bytes it had.
+        await expect(readTextFile(target, 'utf8')).resolves.toBe('one\n');
+        await expect(stagingEntries(workdir)).resolves.toEqual([]);
+    });
+
+    it('stops a cancelled batch at the next file, names that file, and changes nothing', async () => {
+        // The abort below is issued synchronously after `execute`, so it lands after the
+        // top-of-call check and on the FIRST entry's own check — the deterministic middle case
+        // between "cancelled before the call" and "cancelled after one file landed". There is no
+        // seam in the published API to abort inside the loop, so `completedPaths: []` is the
+        // honest, reproducible half-state here; the call-level channel and the named target are
+        // what the contract promises.
+        const first = await seed('cancel-mid-a.txt', 'one\n');
+        const second = await seed('cancel-mid-b.txt', 'two\n');
+        const controller = new AbortController();
+
+        const pending = edit.execute({
+            parameters: [
+                { path: first, oldString: 'one', newString: 'ONE' },
+                { path: second, oldString: 'two', newString: 'TWO' }
+            ],
+            signal: controller.signal
+        });
+
+        controller.abort();
+
+        const failure = await failureOf(() => pending);
+
+        expect(failure.code).toBe('ECANCELED');
+        expect(failure.message).toBe(
+            `edit was cancelled (ECANCELED) before reading ${JSON.stringify(first)}: the caller's abort signal fired, so nothing further ran. Re-run the call if the cancellation was not intended.`
+        );
+        expect(failure.details).toEqual({ rawCode: 'AbortError', completedPaths: [] });
+
+        // Both files still hold the text the call was asked to replace, and no staging file was
+        // left behind — a cancelled edit is not a half-edited file.
+        await expect(readTextFile(first, 'utf8')).resolves.toBe('one\n');
+        await expect(readTextFile(second, 'utf8')).resolves.toBe('two\n');
+        await expect(stagingEntries(workdir)).resolves.toEqual([]);
+    });
+});
+

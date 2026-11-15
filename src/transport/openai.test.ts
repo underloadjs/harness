@@ -319,10 +319,15 @@ describe('openAICompatible', () => {
     // therefore reaches this transport with either a non-empty `reasoning` string or
     // no `reasoning` key at all, and each policy setting below is written as the
     // projected shape it produces:
-    //   `trimThoughts: true` + `thoughtTurns: N` (default 2) — the N newest THOUGHT
-    //       entries carry `reasoning`, every older thought's entry carries none;
-    //   `thoughtTurns: 0`    — every thought is eligible, so no entry carries
-    //       `reasoning`, which is the byte-identity case against the pre-T8 wire;
+    //   `trimThoughts: true` + `thoughtTurns: N` (default 2) — the thinking of the N newest
+    //       MODEL STEPS carries `reasoning` — a STEP is an assistant entry, ranked
+    //       newest-first, rank 0 = the newest step — and every older step's entry carries
+    //       none. The unit is steps, NOT thought entries: an assistant step with no
+    //       thinking still occupies a step and pushes the ones behind it out;
+    //   `thoughtTurns: 0`    — not an empty wire: the rank-0 continuity floor
+    //       (`plugins/context-trimmer.plugin.ts:1880`) keeps the newest step's thinking, so
+    //       the projected copy carries exactly ONE `reasoning`; `0` and `1` are the same
+    //       window (the end-to-end version is `src/harness.inclusion.test.ts` §13.1);
     //   `trimThoughts: false` — every entry carries its thinking.
     // ---------------------------------------------------------------------------
 
@@ -486,12 +491,13 @@ describe('openAICompatible', () => {
         expect(JSON.stringify(body)).not.toContain('reasoning');
     });
 
-    // The `trimThoughts: true` + `thoughtTurns: 0` equivalence (every thought eligible, so
-    // nothing echoed), stated as a byte comparison: with no
+    // The no-thinking transcript, stated as a byte comparison: with no MODEL STEP carrying
     // thinking anywhere in the projected transcript the payload is exactly what this
-    // transport sent before the echo existed — same keys, same KEY ORDER. The
-    // expected payload is declared in wire key order, because `JSON.stringify` of
-    // both sides compares bytes, not just structure.
+    // transport sent before the echo existed — same keys, same KEY ORDER. It is the ONLY
+    // shape that is byte-identical to the pre-echo wire: the rank-0 continuity floor means a
+    // transcript whose newest step has thinking always echoes one field, whatever
+    // `thoughtTurns` says. The expected payload is declared in wire key order, because
+    // `JSON.stringify` of both sides compares bytes, not just structure.
     it('is byte-identical to the pre-echo wire when no message carries thinking', async () => {
         const fetchMock = stubFetch(['data: [DONE]\n\n']);
 

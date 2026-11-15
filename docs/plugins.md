@@ -480,8 +480,8 @@ switch is on:
 | `invalidToolTurns` | `2` | Protects the newest N **tool turns** from that rule; `0` protects none and anything older is eligible |
 | `invalidOutcomes` | `"failed,rejected"` | The closed set `failed` \| `rejected` \| `cancelled` \| `empty` the invalid-tools rule may act on. Unknown names are dropped (so is `completed`), the pass says which it used, and a set that resolves to nothing disables the rule |
 | `trimThoughts` | `true` | The model's own recorded `reasoning` stops being replayed — a per-entry flag, never a text edit |
-| `thoughtTurns` | `2` | Protects the newest N **thoughts** (entries that actually carry thinking), open turn included; `0` protects none |
-| `minThoughtChars` | `0` | A THINKING pass under this character floor writes nothing at all, measured over what the horizon actually left to write |
+| `thoughtTurns` | `2` | Protects the newest N **model steps**: an entry's rank is how many `assistant` entries sit after it and the newest is `0`, so a tool loop ages its own thinking one step at a time. Rank `0` is exempt at **every** value — a provider that is answering a tool round replays that round's thinking, and a replayed round with the thinking stripped is an error rather than a saving — which makes `0` and `1` the same window and `2` the two newest steps. Until 2026-11-14 this axis counted **thought entries**, then **conversation turns**, both the same day; the turn reading withheld nothing at all on a session that thinks on every step, because all of its thoughts sat behind one `user` entry |
+| `minThoughtChars` | `0` | A THINKING pass under this character floor writes nothing at all, measured over what the horizon actually left to write. The pass line states the same saving in tokens too (`ceil(chars / 4)`, the shared estimator rule), because every other size in the product is a token figure |
 | `dropSupersededToolCalls` | `true` | The shipped rule, verbatim: a fully answered unit whose every committed result `failed` or `rejected`, where EVERY tool NAME it called has a `completed` answer in a still-included later unit, stops being sent — as a whole unit |
 | `supersededTurns` | `2` | Protects the newest N tool turns from that rule; `0` protects none |
 | `supersedeMatch` | `"name"` | `name` is the shipped loosening; `fingerprint` is compaction's exact rule (`src/core/argument-fingerprint.ts`), which makes the two passes agree by construction — the value that makes compaction's failure-retry prune redundant, per the overlap note below |
@@ -489,17 +489,35 @@ switch is on:
 | `duplicateTurns` | `2` | Protects the newest N tool turns from that rule; `0` protects none |
 | `truncateToolRequests` | `false` | Withholds an old tool **request** entry while its tool **results** keep riding — the one switch that breaks the unit in half, on purpose. The pass line and `data.truncated[].results` list ONLY the results still being sent, so a result somebody switched off by hand reads `results kept none` rather than an index the provider never receives |
 | `truncateTurns` | `2` | Protects the newest N tool turns from truncation; `0` protects none |
-| `minTokens` | `0` | A TOOL pass under the floor writes nothing at all — and the floor is measured **per axis**, so each of the two tool axes has to earn it on its own. It never gates thinking, because the estimator does not count `reasoning` (`src/core/context-estimate.ts`) |
+| `minTokens` | `0` | A TOOL pass under the floor writes nothing at all — and the floor is measured **per axis**, so each of the two tool axes has to earn it on its own. It never gates thinking: the figure is the estimator delta of DELETING whole entries, while a thinking write deletes no entry (it drops one `reasoning` key from an entry that keeps travelling), so the same measurement would read 0 for every thinking pass. Thinking has its own floor, `minThoughtChars` |
 | `safetyUnits` | `0` | Units at the END of the transcript no tool rule may touch; `0` removes the horizon. Counts UNITS, and is independent of the tool-turn horizons above |
 | `maxUnits` | `0` | Cap on how many candidates ONE axis withholds in one pass; `0` is unbounded |
 
-A **horizon is a rank, not a distance**: `ago` counts the tool turns (or thoughts) sitting NEWER
-than the entry, the newest is `0`, and an entry is eligible when `ago >= horizon`. So `2`
-protects exactly the two newest, `0` protects nothing, and the value is never clamped in the
+A **horizon is a rank, not a distance**: `ago` counts the tool turns — or, for `thoughtTurns`, the
+MODEL STEPS, i.e. the `assistant` entries — sitting NEWER than the entry, the newest is `0`, and an
+entry is eligible when `ago >= horizon`. So `2` protects exactly the two newest, `0` protects nothing
+on the tool axes (on the thinking axis it protects one thought anyway, see below), and the value
+is never clamped in the
 pass itself — the published `min`/`max` belong to the pane and the PATCH edge, and a nonsense
 number submitted out of band resolves to the declared `2`. The horizons are per rule on
 purpose: an operator who trusts the invalid-tools rule but not the duplicate rule says so per
 rule, and one horizon leaking into a neighbour is a test failure.
+
+**The thinking horizon has one exemption the tool axes do not, and it is a transport constraint.**
+`thoughtTurns` never withholds rank `0` at any value: a provider that is answering a tool round
+replays that round WITH its thinking, and a replayed round whose thinking was stripped is a rejected
+request rather than a saving. That is why the pane's hint says the newest step always travels, and
+why `0` and `1` select the same set. The prefix-cache consequence is the reason the axis counts
+model steps rather than thoughts or turns: a rank only ever GROWS as the transcript grows, so the
+thinking boundary walks forward monotonically — one model step moves at most one thought out of the
+request, at a position strictly older than the one the previous step moved, and a flag is never
+un-written (`trimThoughts: false` stops new writes and restores nothing). A cached prefix therefore
+diverges at one advancing point per step. The two retired units of account could not hold that: an
+entry rank advanced the boundary only when a new thought happened to appear, so which entry lost its
+thinking depended on where thinking landed rather than on how far back the step was, and a turn rank
+protected everything after the last `user` entry wholesale, which withheld nothing at all inside a
+long tool loop — the session that reported it had twelve thinking steps behind one user message and
+got zero flags.
 
 **The two invalid-tool switches are ONE rule at the shipped settings, and that is stated rather
 than discovered.** With `invalidOutcomes` at its declared `"failed,rejected"`, the generalisation

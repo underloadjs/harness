@@ -3288,6 +3288,61 @@ describe('context inclusion — the entry-time and live context estimates (conte
         expect(JSON.stringify(seen[0])).not.toContain('included');
         expect(JSON.stringify(seen[0])).not.toContain('messageId');
     });
+
+    // THE THINKING AXIS IS BILLABLE TEXT (uplift F2). The estimator used to skip
+    // `reasoning` outright — "retained for replay and not resent" — which was true of the
+    // pre-trimmer harness and stopped being true the day the trimmer grew a thinking axis.
+    // Every thinking saving the trimmer wrote therefore read as ZERO, in `estimatedTokens`,
+    // in `currentEstimatedTokens()`, in the `maxPromptTokens` guard and in the UI bar: an
+    // operator turned the trimmer on, it worked, and no number they could see moved. This is
+    // the end-to-end pin for that claim — a real `turn.before` write on the SECOND axis,
+    // measured by the live accessor the shipped policies compare against.
+    //
+    // The shipped trimmer is live here exactly as it is in the test above (this file's
+    // fixtures do not silence it), and the fixture is self-checking about that: the seeded
+    // thinking sits at MODEL-STEP rank 0 (it is the newest assistant entry), inside the exemption the
+    // continuity floor gives rank 0 at EVERY `thoughtTurns` value, so nothing but the hook below can
+    // withhold it — and if the trimmer ever did, `before` would come back at the already-trimmed figure
+    // and this case would fail loudly rather than quietly.
+    it('moves currentEstimatedTokens() when a write withholds thinking but keeps the entry (uplift F2)', async () => {
+        const record: Record<string, unknown> = {};
+
+        const { seen } = await controlRun({
+            seed: [
+                { role: 'system', content: 'Write.' },
+                { role: 'assistant', content: 'answered', reasoning: 'a thought worth four tokens' }
+            ],
+            plugins: [
+                turnBeforePlugin('thinking-estimate', (context) => {
+                    if (Object.keys(record).length > 0) return;
+
+                    // The projection at entry is 43 characters of counted text — 6 + 8 + the
+                    // 27-character thought + the run's own 2-character prompt — so 11 tokens,
+                    // and 27 of those characters are the thinking. `core/agent.ts`
+                    // `withoutWithheldReasoning` deletes the `reasoning` key from the request
+                    // COPY of a flagged entry, so this is exactly the text the provider bills.
+                    record.before = context.currentEstimatedTokens();
+
+                    context.setReasoningIncluded(entryWith(context, 'answered'), false);
+
+                    // 16 characters now, so 4. The entry still travels, in the same slot, with
+                    // its `content` — only its thinking stopped riding, and the number knows it.
+                    record.after = context.currentEstimatedTokens();
+                })
+            ]
+        });
+
+        expect(record).toEqual({ before: 11, after: 4 });
+
+        // The provider received the view the accessor measured: the answer is still there, its
+        // thinking is not, and neither the flag nor the withheld text reaches the wire.
+        expect(seen[0]).toStrictEqual([
+            { role: 'system', content: 'Write.' },
+            { role: 'assistant', content: 'answered' },
+            { role: 'user', content: 'go' }
+        ]);
+        expect(JSON.stringify(seen[0])).not.toContain('reasoning');
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -4120,8 +4175,8 @@ describe('context inclusion — the thinking flag resolves out of the projection
     // `controlRun` plus a settings provider, which a thinking fixture HERE cannot do without: the
     // auto-discovered built-ins load in every case in this file (a host plugin only REPLACES a
     // built-in it names, src/plugin/host.ts), so the shipped trimmer is live unless a provider
-    // turns it off — and its thought axis ships ON with a 2-entry horizon (`trimThoughts: true`,
-    // `thoughtTurns: 2`). A fixture that reads that
+    // turns it off — and its thought axis ships ON with a 2-MODEL-STEP horizon (`trimThoughts: true`,
+    // `thoughtTurns: 2`: the two newest assistant entries keep their thinking). A fixture that reads that
     // implicitly is a fixture whose request was produced by a switch it never named (F5).
     // Only the trimmer's keys are pinned; every other (plugin, key) returns `undefined`, which is the
     // harness's signal to use the DECLARED default (src/plugin/settings.ts reads through this
@@ -4536,17 +4591,18 @@ describe('context inclusion — the thinking flag resolves out of the projection
         expect(JSON.stringify(normalizer.snapshot()).match(/reasoningIncluded/g)).toHaveLength(1);
     });
 
-    it('runs the shipped thought horizon: the newest thought travels, every older one loses its thinking, and the request stays pair-clean', async () => {
+    it('runs the built-in thought horizon: the newest step\'s thinking travels, every older step loses it, and the request stays pair-clean', async () => {
         // THE POLICY, end to end: no hand-driven write here at all — the built-in's horizon rule
         // produced these flags. The tool switches are pinned OFF so thinking is the ONLY thing
         // this pass can withhold, which makes the request difference unambiguous.
         //
-        // The axis is a toggle plus a THOUGHT-ENTRY horizon now
-        // (src/plugins/context-trimmer.plugin.ts `trimThoughts` / `thoughtTurns`: N protects the
-        // N newest thought ENTRIES, 0 protects nothing), which is not the retired
-        // `off|turn|all` tier. `thoughtTurns: 1` is the horizon that protects exactly the newest
-        // thought, which inside a tool loop is the OPEN turn's — and outside one, as in request 1
-        // below, it is the newest seeded thought.
+        // The axis is a toggle plus a MODEL-STEP horizon (src/plugins/context-trimmer.plugin.ts
+        // `trimThoughts` / `thoughtTurns`, and `thoughtAgoOf` for the rank): N protects the N newest
+        // assistant entries — the newest is rank 0 and is exempt at EVERY value, because the provider
+        // replays a tool round with its thinking — which is not the retired `off|turn|all` tier and
+        // not a conversation-turn count either. `thoughtTurns: 1` therefore protects exactly ONE
+        // thinking block: the newest step's. A tool loop's own blocks age out one step at a time, so
+        // the set the provider sees changes by at most one thought per step.
         const policy = {
             enabled: true,
             dropSupersededToolCalls: false,
@@ -4557,9 +4613,11 @@ describe('context inclusion — the thinking flag resolves out of the projection
 
         const { writer, seen } = await thinkingRun({ seed: thinkingSeed(), turns: TOOL_TURNS, settings: policy });
 
-        // Request 1: no thought of this run exists yet, so the NEWEST thought in the transcript is
-        // the second seeded answer's — that one travels, and the older one goes. The entry itself
-        // travels either way: the thinking axis removes a key, never a row.
+        // Request 1: the seeded answers are step ranks 1 (`first answer`) and 0 (`second answer`) — the
+        // `go` prompt is a USER entry, and a user entry is not a step — so the older one is withheld and
+        // the newest one travels. That is the continuity floor doing its job on the first pass of a real
+        // run: with nothing but the seed in front of it, the horizon can only ever shed one thought. The
+        // entries themselves travel either way: the thinking axis removes a key, never a row.
         expect(seen[0]).toStrictEqual([
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'question' },
@@ -4569,9 +4627,10 @@ describe('context inclusion — the thinking flag resolves out of the projection
             { role: 'user', content: 'go' }
         ]);
 
-        // Request 2: the run's OWN assistant entry has landed, so IT is the newest thought, the
-        // seeded one that travelled a moment ago is now older, and the pass catches up — the
-        // horizon is re-derived from the transcript every round, not remembered.
+        // Request 2: the run's OWN assistant entry has landed, and it is the newest step (rank 0), so it
+        // keeps the thinking that produced the tool call. `second answer` has been pushed to rank 1 by
+        // that very entry and is flagged by THIS pass — the horizon is re-derived from canonical order
+        // every round, never remembered — while `first answer` is already flagged and stays out.
         expect(seen[1]).toStrictEqual([
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'question' },
@@ -4590,9 +4649,12 @@ describe('context inclusion — the thinking flag resolves out of the projection
         expect(seen.map(pairIssues)).toEqual([[], []]);
         expect(seen.map(carriesFlag)).toEqual([false, false]);
 
-        // Canonical after run 1: the two seeded thoughts are flagged (the second one only once the
-        // run's own thought displaced it) and the OPEN turn's thought is not. Every thinking TEXT is
-        // still stored — the flag is a switch, not a deletion.
+        // Canonical after run 1: the two seeded thoughts are flagged, ONE PER PASS — `first answer` on
+        // pass 1 (it was rank 1 there) and `second answer` on pass 2 (the run's own tool block pushed it
+        // from rank 0 to rank 1). Neither of the run's own thoughts is flagged, because each was the
+        // NEWEST step at the moment its pass ran: the tool block was rank 0 on pass 2, and the answer
+        // that closed the run was not in the transcript yet. Every thinking TEXT is still stored — the
+        // flag is a switch, not a deletion.
         expect(
             writer.agent.messages.map((message, index) => ({
                 index,
@@ -4611,15 +4673,20 @@ describe('context inclusion — the thinking flag resolves out of the projection
             { index: 8, thinking: 'the final thought', flag: undefined }
         ]);
 
-        // A SECOND RUN makes a new thought the newest one (index 8, the answer run 1 ended with), so
-        // the horizon moves with it: the entry that was protected a moment ago (index 6) is flagged
-        // now, and nothing that was flagged is ever un-flagged. This is the re-derive claim from the
-        // spec — the rule is a function of the transcript, not a note the plugin keeps.
+        // A SECOND RUN appends one more step (the `again` prompt plus whatever the run commits), and
+        // EVERY step's rank grows by exactly the number of steps that landed: the run-1 tool block (index
+        // 6) is now rank 1, so THIS pass flags it, while `settled` (index 8) has been promoted to rank 0
+        // and the continuity floor keeps it. Nothing already flagged is ever un-flagged, and that is not
+        // a policy choice the writer has to remember — a rank only ever GROWS as the transcript grows,
+        // so an entry that left the window can never come back into it. The unit of account is the
+        // step, so the protected set walks forward one step per model step and a pass withholds at most
+        // one thought per step, oldest first.
         await writer('again');
 
-        // The request the second run's first iteration sent, in full: every thought but the newest
-        // travels WITHOUT its thinking, the entries themselves (including the tool-call block and
-        // its answer) travel unchanged, and the new `again` prompt is last.
+        // The request the second run's first iteration sent, in full: the three thoughts behind the
+        // newest step travel WITHOUT their thinking, the newest one (`the final thought`, on `settled`)
+        // travels WITH its, the entries themselves (including the tool-call block and its answer) travel
+        // unchanged, and the new `again` prompt is last.
         const third = seen[2];
 
         expect(third).toStrictEqual([
@@ -4637,9 +4704,10 @@ describe('context inclusion — the thinking flag resolves out of the projection
         expect(pairIssues(third)).toEqual([]);
         expect(carriesFlag(third)).toBe(false);
 
-        // Exactly THREE flagged entries now — 2, 4 and 6. The newest thought (index 8) and the
-        // second run's own answer (index 10, which the replayed frame gives no thinking at all) are
-        // not among them.
+        // Exactly THREE flagged entries now — 2, 4 and 6: every thought behind the newest step, oldest
+        // first, with no hole in the middle. The run-1 answer (index 8) is the NEWEST step at this
+        // moment, so the continuity floor holds it out of the plan; the second run's own answer
+        // (index 10, which the replayed frame gives no thinking at all) was never a candidate.
         expect(seen).toHaveLength(3);
         expect(
             writer.agent.messages.map((message, index) => ({
@@ -4659,8 +4727,8 @@ describe('context inclusion — the thinking flag resolves out of the projection
             { index: 9, flag: undefined },
             { index: 10, flag: undefined }
         ]);
-        // And the text of every one of those three withheld thoughts is still in canonical state:
-        // the policy withheld replay, not the record.
+        // And the text of every one of those three withheld thoughts is still in canonical state: the
+        // policy withheld replay, not the record.
         expect(
             writer.agent.messages.filter(
                 (message, index) =>
@@ -4729,9 +4797,9 @@ describe('context inclusion — the thinking flag resolves out of the projection
     //      `sendToProvider` shape section 4 established (:793-821).
     //
     // The fixture is §13's own (`thinkingSeed` + `TOOL_TURNS`), and the payload compared is the
-    // TOOL-LOOP continuation: the only request that carries BOTH halves of the claim at once —
-    // two CLOSED turns with recorded thinking (the seeded answers) and the run's own OPEN-turn
-    // entry (the tool call, with the thinking that produced it).
+    // TOOL-LOOP continuation: the only request that carries BOTH halves of the claim at once — two
+    // older steps with recorded thinking (the seeded answers) and the run's own NEWEST step (the tool
+    // call, with the thinking that produced it).
     // -------------------------------------------------------------------
 
     // The wire capture: an SSE body the transport can stream to completion, a `fetch` stub that
@@ -4776,12 +4844,15 @@ describe('context inclusion — the thinking flag resolves out of the projection
     });
 
     // The same settings every thought-policy run uses, with the thought axis named explicitly —
-    // the trimmer replaced the retired `off|turn|all` tier with a toggle plus a THOUGHT-ENTRY
-    // horizon (src/plugins/context-trimmer.plugin.ts `trimThoughts` + `thoughtTurns`, where N
-    // protects the N NEWEST thought entries and 0 protects nothing). So the arms below are:
-    //   'turn' -> `thoughtTurns: 1`, the newest thought only — inside a tool loop that is the
-    //             entry the run itself just committed;
-    //   'all'  -> `thoughtTurns: 0`, nothing protected, every recorded thought withheld;
+    // the trimmer replaced the retired `off|turn|all` tier with a toggle plus a MODEL-STEP horizon
+    // (src/plugins/context-trimmer.plugin.ts `trimThoughts` + `thoughtTurns`, and `thoughtAgoOf` for
+    // the rank: N protects the N newest assistant entries, and the newest one — rank 0 — is exempt at
+    // EVERY value because the provider replays an in-flight tool round with its thinking). So the arms
+    // below are:
+    //   'turn' -> `thoughtTurns: 1`, one step protected — the newest step's thought, whoever committed
+    //             it: in a tool loop that is the block the run itself just wrote;
+    //   'all'  -> `thoughtTurns: 0`, which is the SAME window as 1: nothing the operator asks for can
+    //             reach the newest step, so exactly that one thought still travels;
     //   'off'  -> `trimThoughts: false`, the axis switched off;
     //   omitted -> the SHIPPED DEFAULTS (`trimThoughts: true`, `thoughtTurns: 2`), because an
     //             unlisted key resolves to the declared descriptor value (src/plugin/settings.ts).
@@ -4796,7 +4867,7 @@ describe('context inclusion — the thinking flag resolves out of the projection
               : { trimThoughts: true, thoughtTurns: tier === 'turn' ? 1 : 0 })
     });
 
-    it('puts the thought policy on the wire: horizon 1 echoes only the newest thought, horizon 0 echoes none, off echoes every recorded thought (uplift H4)', async () => {
+    it('puts the thought policy on the wire: horizons 1 and 0 both echo exactly the newest step\'s thought, off echoes every recorded thought (uplift H4)', async () => {
         // One setting's TOOL-LOOP continuation, all the way to the provider payload. The projection
         // assertions are the pair-clean invariants FIRST: if the policy moved a key, the oracle
         // fails here instead of hiding inside a byte diff.
@@ -4812,7 +4883,9 @@ describe('context inclusion — the thinking flag resolves out of the projection
             return wireBodyOf(seen[1]);
         };
 
-        // --- horizon 1: exactly ONE echoed entry — the newest thought — and every older one. ----
+        // --- horizon 1: exactly ONE echoed entry — the thinking of the rank-0 MODEL STEP (the
+        //     continuity floor, which survives at every horizon), not "the newest thought" — and
+        //     every older step's thinking stripped. ------------------------------------------
         const turn = await wireOf('turn');
 
         expect(JSON.stringify(turn.messages)).toBe(
@@ -4832,7 +4905,7 @@ describe('context inclusion — the thinking flag resolves out of the projection
                 { role: 'tool', tool_call_id: 'c1', content: 'A' }
             ])
         );
-        // The older turns' field is ABSENT, never `""` (a strict provider reads an empty string
+        // The older steps' field is ABSENT, never `""` (a strict provider reads an empty string
         // as a thinking block whose content is missing), and the total is exactly the number of
         // entries this horizon left eligible — so a per-entry omission cannot be confused with a
         // whole-request one.
@@ -4841,9 +4914,10 @@ describe('context inclusion — the thinking flag resolves out of the projection
         expect(JSON.stringify(turn).match(/reasoning_content/g)).toHaveLength(1);
 
         // THE SHIPPED DEFAULT IS THE HORIZON AT 2: the identical run with `trimThoughts` and
-        // `thoughtTurns` never supplied protects the TWO newest thoughts — the run's own entry and
-        // the seeded answer one above it — and strips every older one. That is the out-of-the-box
-        // wire, and it is one echoed entry wider than the `turn` arm above.
+        // `thoughtTurns` never supplied protects the TWO newest model steps — the run's own entry
+        // (rank 0) and `second answer` (rank 1) — and strips every older one (`first answer`, rank 2).
+        // That is the out-of-the-box wire, and it is one echoed entry wider than the horizon-1 arm
+        // above, which is what the number buys: one more step of thinking, not one more turn.
         const byDefault = await wireOf(undefined);
 
         expect(JSON.stringify(byDefault.messages)).toBe(
@@ -4865,13 +4939,38 @@ describe('context inclusion — the thinking flag resolves out of the projection
         );
         expect(JSON.stringify(byDefault).match(/reasoning_content/g)).toHaveLength(2);
 
-        // --- `all` (horizon 0): the pre-T8 payload, byte for byte. ------------------------------
+        // --- horizon 0: the newest step travels anyway, so this is the `turn` arm byte for byte. --
         const all = await wireOf('all');
 
-        // Declared in wire key order, because `JSON.stringify` of both sides compares BYTES:
-        // every withheld entry still travels, in the same slot, with the same `content` and the
-        // same `tool_calls`, and no thinking field anywhere — exactly what this transport sent
-        // before the echo existed.
+        // THE CONTINUITY FLOOR ON THE WIRE. `thoughtTurns: 0` asks for nothing protected, and the plan
+        // still protects the newest step: this request is the continuation of a tool round the provider
+        // is about to answer, and a replayed round whose thinking has been stripped is a 400 rather
+        // than a saving. `0` and `1` are therefore the SAME window, and the payload below is the `turn`
+        // arm's, key for key.
+        expect(JSON.stringify(all.messages)).toBe(
+            JSON.stringify([
+                { role: 'system', content: 'Write.' },
+                { role: 'user', content: 'question' },
+                { role: 'assistant', content: 'first answer' },
+                { role: 'user', content: 'second question' },
+                { role: 'assistant', content: 'second answer' },
+                { role: 'user', content: 'go' },
+                {
+                    role: 'assistant',
+                    content: '',
+                    reasoning_content: 'planning the c1 call',
+                    tool_calls: [wireCall('c1', 'alpha')]
+                },
+                { role: 'tool', tool_call_id: 'c1', content: 'A' }
+            ])
+        );
+        expect(JSON.stringify(all).match(/reasoning_content/g)).toHaveLength(1);
+
+        // The request every tier produces ONCE the echoed field is deleted, declared in wire key order
+        // because `JSON.stringify` of both sides compares BYTES: every withheld entry still travels, in
+        // the same slot, with the same `content` and the same `tool_calls`, and no thinking field
+        // anywhere — exactly what this transport sent before the echo existed, and the shape the
+        // structural claim at the end of this case compares against.
         const preEchoWire = [
             { role: 'system', content: 'Write.' },
             { role: 'user', content: 'question' },
@@ -4883,10 +4982,19 @@ describe('context inclusion — the thinking flag resolves out of the projection
             { role: 'tool', tool_call_id: 'c1', content: 'A' }
         ];
 
-        expect(JSON.stringify(all.messages)).toBe(JSON.stringify(preEchoWire));
-        // The substring is the whole claim: not one `reasoning`/`reasoning_content` key in the
-        // body, on any role.
-        expect(JSON.stringify(all)).not.toContain('reasoning');
+        // Stripping the one echoed field is what makes this payload the pre-echo request: the claim is
+        // about WHICH thinking travelled, and nothing else about the request moved.
+        expect(
+            JSON.stringify(
+                wireMessagesOf(all).map((message) => {
+                    const copy: Record<string, unknown> = { ...message };
+
+                    delete copy.reasoning_content;
+
+                    return copy;
+                })
+            )
+        ).toBe(JSON.stringify(preEchoWire));
 
         // --- `off` (the axis switched off): every recorded thought is echoed, in place. ---------
         const off = await wireOf('off');

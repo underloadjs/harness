@@ -416,7 +416,15 @@ describe('live Node descriptor catalogue (T24)', () => {
             bytes: 5,
             wireBytes: expect.any(Number),
             contentBudget: 262144,
-            // Both of these scale with the per-run scratch path, like `wireBytes`.
+            // M7 (./files/read.tool.ts:1026-1032): the bytes actually left to split. It
+            // is `contentBudget` minus the serialized scaffolding of the result and of
+            // every entry, so it embeds the per-run scratch path and cannot be a literal
+            // any more than `wireBytes` can; matched like it. What this test pins is that
+            // the COMPILED BODY returns the entry's full result shape, so the key being
+            // present and numeric is the load-bearing part.
+            budgetPool: expect.any(Number),
+            // The projection's byte length; it scales with the per-run scratch path too,
+            // like `wireBytes`.
             modelBytes: expect.any(Number),
             skipped: 0
         };

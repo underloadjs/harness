@@ -51,20 +51,42 @@
 // silently breaks the read side. There is no binary write API here to opt into, so
 // the content is rejected during preflight, before any file is touched, rather than
 // creating an unreadable artifact. Every other character, including invalid
-// Unicode escapes the caller built by hand, still writes (Node substitutes U+FFFD
-// for lone surrogates; that is documented behavior of the encoding, not a NUL
-// binary marker).
+// Unicode escapes the caller built by hand, still writes — but a LONE SURROGATE does not
+// survive the encoding: Node substitutes U+FFFD for an unpaired surrogate (documented
+// behavior of the encoding, not a NUL binary marker), and the substitution is permanent
+// and invisible on re-read. The entry therefore says `lossy: true` whenever the content
+// carried one, because the file on disk is NOT the string the caller passed and only this
+// call knows it.
 //
-// ONE CRITICAL SECTION PER FILE (D4: no lost update)
-// --------------------------------------------------
+// ONE CRITICAL SECTION PER FILE (D4: no torn state, no lost edit-vs-edit update)
+// ------------------------------------------------------------------------------
 // A write racing a concurrent `edit` on the same path used to interleave: the edit
 // read the pre-write text, matched, and wrote it back over the write's content (or
 // vice versa), and BOTH calls reported success. Each write therefore runs under the
 // same per-file lock `edit` takes (./lock.ts), keyed by FILE IDENTITY so a Windows
 // case alias or a symlink alias queues behind the real file rather than racing it.
 // Locks for a multi-file batch are taken in sorted identity order, so two overlapping
-// batches cannot deadlock. This orders calls inside ONE process; it makes no claim
-// about another process or another worker thread, and never did.
+// batches cannot deadlock.
+//
+// WHAT THE LOCK DOES BUY, AND WHAT IT DOES NOT (H6). It orders the critical sections,
+// so (a) no reader can observe a torn or interleaved file, and (b) two concurrent
+// `edit`s cannot both claim success against text the other one overwrote — the later
+// one sees the earlier one's text and fails honestly with "no match". A full-content
+// `write` is DIFFERENT by design: it replaces whatever text is current (see "Replaces
+// the previous contents" on FileWriteEntry), and the rename never re-stats or
+// version-checks the destination, because ./lock.ts rejects compare-and-swap outright
+// ("WHY A MUTEX AND NOT AN mtime/hash CHECK": a CAS reopens the window the mutex
+// closes and pushes a retry loop onto the caller). So a `write` that runs after a
+// concurrent `edit` on the same path wins the content, and the edit's change is gone
+// with nothing but the ordering to explain it. Last-writer-wins on a whole-file write
+// is the documented semantics, not an accident of the lock.
+//
+// ONE PROCESS ONLY (EXTRA-7). `withFileLocks` is a Map on THIS event loop. Under
+// `threadExecution: 'worker'` (../../server/config.ts) every lane worker has its OWN
+// lock map, so two lanes naming one file are not serialized at all — nor is any other
+// process, or an editor outside the harness. The default is 'inline', which is the
+// single-loop case the guarantee holds for, and the published description says the
+// same thing so a caller does not have to read ./lock.ts to learn the bound.
 //
 // EACH FILE IS PUBLISHED ATOMICALLY (M10)
 // ---------------------------------------
@@ -87,6 +109,13 @@
 // The target's mode is copied onto the staging file because a rename swaps the inode —
 // in-place writing had kept 0755-style bits for free, and the fix must not lose them.
 //
+// The publish itself lives in ./atomic-publish.ts, because `edit` now uses the SAME one
+// (C2): a tool whose whole job is changing one line had no business being the only file
+// writer in the package that could expose a half-written file, and a copy of this
+// sequence in ./edit.tool.ts is how the symlink-following and mode-carrying rules would
+// have drifted apart. `edit`'s header owes its own version of the trade; this file and
+// that one describe the same code, so keep the two honest together.
+//
 // What it does NOT claim, stated plainly:
 //   - no fsync is added, so the durability boundary on power loss is the one in-place
 //     writing already had. Fixed here is the state a reader can observe and the outcome
@@ -106,11 +135,16 @@
 //   - the publish is a NAME swap, so a hard link to the target keeps the previous bytes
 //     under the sibling name: `a.txt` and `b.txt` share an inode before the write and
 //     diverge after it. Nothing here can update both, because the caller named one;
-//   - the target is handled as a NAME in a directory, so a target that is not a regular
-//     file (a FIFO, a character device) now needs create permission in that directory
-//     and has its node replaced, where the in-place write streamed through the existing
-//     node. Everything this tool is for — source, config, notes — is a regular file or
-//     does not exist yet.
+//   - a target that is NOT a regular file is REFUSED (L5), not written. The in-place
+//     write streamed through an existing FIFO or device node; this publish creates a
+//     regular file and renames it into place, so it would (a) need create permission in
+//     that directory — an incidental EACCES on /dev/null for a caller who only wanted to
+//     discard bytes — and (b) succeed by REPLACING the node with an ordinary file, which
+//     is a worse surprise than an error naming the target type and the remedy. A
+//     directory gets EISDIR, every other non-regular entry EOPNOTSUPP. A direct-write
+//     path for devices was considered and rejected: it forks the publish and reopens the
+//     hole C2 closed for `edit`. Everything this tool is for — source, config, notes — is
+//     a regular file or does not exist yet.
 //
 // It is per-file atomicity, not a batch transaction — see FAILURE SEMANTICS below.
 //
@@ -127,6 +161,25 @@
 // is gone — so the message can name only 1..N-1 under "already completed" without
 // implying N is half-written. The raw reason may still quote the staging path, which
 // no longer exists by the time the caller reads it.
+//
+// The throw also carries machine-readable data (M11), which the prose never gave a
+// caller that has to recover: `code` is the errno from the published
+// FILE_WRITE_ERROR_CODES list (EIO when it is not one of those, with the true errno in
+// `details.rawCode`), and `details` is { failedPath, completedPaths } so the completed
+// list does not have to be parsed out of the sentence. The message keeps naming both,
+// because the message is the half that reaches a model.
+//
+// CANCELLATION IS A CODED REFUSAL, NOT A SILENT WRITE
+// ---------------------------------------------------
+// `context.signal` (src/types/index.ts:2349-2364) is observed: once at the top of the call
+// and once per entry inside ./atomic-publish.ts. A cancelled `write` therefore REFUSES with
+// `ECANCELED` + { completedPaths } instead of performing the side effects of a call nobody
+// is waiting for, and a batch cancelled at file 12 of 60 reports files 1-11 as completed and
+// 12-60 as never touched. `ECANCELED` is in FILE_WRITE_ERROR_CODES because
+// FILE_PUBLISH_ERROR_CODES carries it, and it is NOT folded into `EIO`: `EIO` is the
+// transient code this tool's own description teaches a caller to retry, and a cancellation
+// is permanent. The host's own abort reason survives as the error's `cause`. The mapping and
+// its reasoning live in ./cancellation.ts, shared with `read`, `edit` and `files`.
 //
 // ONE mkdir PER DISTINCT DIRECTORY
 // --------------------------------
@@ -152,22 +205,17 @@
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
 // and a consistency test proves the projection equal.
 
-import { randomBytes } from 'node:crypto';
-import {
-    chmod,
-    lstat,
-    mkdir,
-    readlink,
-    realpath,
-    rename,
-    rm,
-    stat,
-    writeFile as writeTextFile
-} from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { mkdir } from 'node:fs/promises';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
 import type { PresetToolMetadata } from '../catalogue';
+import {
+    FILE_PUBLISH_ERROR_CODES,
+    publishAtomically,
+    publishErrorCode
+} from './atomic-publish';
+import { throwIfFileCancelled } from './cancellation';
 import { fileIdentity } from './identity';
 import { withFileLocks } from './lock';
 
@@ -178,6 +226,16 @@ import { withFileLocks } from './lock';
 // the response (one entry per file) and the number of sequential writes; content size is
 // still the caller's responsibility, and is reported per file in `bytes`.
 export const FILE_WRITE_MAX_TARGETS = 100;
+
+// Every machine code a `write` failure can carry, published so a caller enumerates it
+// instead of parsing prose (the same convention as ./read.tool.ts's `FileReadErrorCode`
+// and ./files.tool.ts's `PUBLISHED_ERROR_CODES` fold). It is the shared publish list:
+// `write` synthesizes no codes of its own, because the only failures past the preflight
+// checks come from the staging create, the chmod, the rename, or the cancellation guard
+// that runs before them (`ECANCELED`, ./cancellation.ts).
+export const FILE_WRITE_ERROR_CODES = [...FILE_PUBLISH_ERROR_CODES];
+
+export type FileWriteErrorCode = (typeof FILE_WRITE_ERROR_CODES)[number];
 
 // One file to write.
 export type FileWriteEntry = {
@@ -190,12 +248,28 @@ export type FileWriteEntry = {
 // The value `execute` receives: the `files` array itself (single-property rule).
 export type FileWriteParameters = FileWriteEntry[];
 
+// The fields one `files` entry may name. Enforced at runtime as well as in the schema,
+// because the DIRECT call path hands the tool its argument untouched
+// (../../core/tool.ts: "The argument IS the parameter value, so it is handed to `execute`
+// untouched") — a typo'd key would otherwise be dropped silently, which for a knob like
+// `overwrite` means the caller believes it asked for something it did not get. Same rule
+// ./files.tool.ts already enforces per operation.
+const FILE_WRITE_FIELDS = ['path', 'content'] as const;
+
 // One completed write, in request order.
 export type FileWriteResultEntry = {
     // The absolute path that was written.
     path: string;
-    // Size of the written UTF-8 payload, in bytes.
+    // Size of the written UTF-8 payload, in bytes. NOTE: this is the size of the bytes
+    // that landed, which for a `lossy` entry is NOT the size of the string the caller
+    // passed — each unpaired surrogate became the three bytes of U+FFFD.
     bytes: number;
+    // L6, present ONLY when the content carried an unpaired surrogate: UTF-8 cannot hold
+    // one, so Node substituted U+FFFD and the file on disk is not the string that was
+    // passed. The substitution is permanent and re-reading cannot show it (the replacement
+    // character is valid text on its own), so this call is the only place that can say so.
+    // `read` publishes the same flag name for the same fact on the way back in.
+    lossy?: true;
 };
 
 // The ordered result: one entry per requested file, never a subset.
@@ -209,179 +283,47 @@ type PreparedWrite = {
     // takes for the same file — two spellings of one file must share one lock.
     identity: string;
     content: string;
+    // L6: whether the payload contains an unpaired surrogate, i.e. whether the bytes that
+    // land are U+FFFD instead of the code unit the caller passed. Computed once, in the
+    // preflight, so the receipt cannot forget the disclosure.
+    lossy: boolean;
 };
 
-// Unique staging-file token: `<base36 pid>-<48-bit hex>`.
+// L6 — does `text` contain a code unit UTF-8 cannot encode?
 //
-// The rename below is only safe while one staging name belongs to exactly one writer.
-// Two collision sources exist: two PROCESSES in the same directory (the per-file lock in
-// ./lock.ts is per-process, so they really do race) and two writes in the SAME process
-// that overlap across their awaits. The pid covers the first, 6 random bytes cover the
-// second, and the staging open uses `wx` below, so a collision that still happens (about
-// 1 in 2^48 per process) surfaces as an honest write error instead of silently
-// truncating a neighbour's payload. Same shape of reasoning as the `<file>.<pid>.<n>.tmp`
-// staging names in ../../server/persistence.ts.
-const stagingToken = (): string => `${process.pid.toString(36)}-${randomBytes(6).toString('hex')}`;
-
-// How many links one path may walk before `write` calls it a cycle. Linux caps link
-// resolution at MAXSYMLINKS = 40 and Node reports ELOOP past that; the same order of
-// magnitude here keeps the hand-rolled walk below finite without ever refusing a chain a
-// real filesystem would have followed.
-const SYMLINK_FOLLOW_LIMIT = 40;
-
-// The path the rename must land on: `target` with its symlinks followed.
+// A surrogate PAIR (high D800..DBFF followed by low DC00..DFFF) is one astral code point
+// and encodes to four bytes; any other arrangement is a lone surrogate, and Node's
+// encoder substitutes U+FFFD for it (lossy, and permanent: the replacement character is
+// ordinary text on re-read, so nothing downstream can spot it).
 //
-// `write` has always written THROUGH a symlink, because open() follows it, and the
-// contract (and ./identity.ts, which keys duplicates by realpath) depends on the link
-// surviving while its target is updated. A rename is different: it replaces the NAME, so
-// renaming onto the link path would delete the link and leave a regular file behind.
-// Resolving first makes the rename land on the real file, and puts the staging file in
-// that file's own directory, which is what keeps the rename on one device.
-//
-// Anything that does not resolve is written at its own spelling: the usual case is a
-// target that does not exist yet (this tool creates files) or a missing ancestor, and
-// creating it where the caller asked is the whole point. A symlinked ANCESTOR needs no
-// special case either — creating and renaming inside a symlinked directory both follow
-// that link onto the same real directory, so the rename stays same-device.
-//
-// A DANGLING symlink is the one spelling that looks "missing" to `realpath` but is a real
-// entry, and it is not written at its own spelling: an in-place write followed the link and
-// CREATED THE FILE THE LINK NAMES, keeping the link, and that is the behavior the live-link
-// contract already promises. `realpath` cannot walk past the missing end, so the chain is
-// walked by hand below (D7a): land on the missing end, create its parent, stage beside it,
-// rename onto it. The link is never touched, and the staging file sits in the landing's own
-// directory, so the publish is still a same-directory rename.
-const realWriteTarget = async (target: string): Promise<string> => {
-    try {
-        return await realpath(target);
-    } catch {
-        // ENOENT / ENOTDIR: there is nothing to resolve yet. Expected, never surfaced;
-        // an actually unusable path fails a syscall below with a real message.
-    }
+// ONE forward pass over the code units, and a high surrogate that is correctly paired is
+// skipped with its partner rather than rescanned, so the cost is proportional to the
+// payload exactly once per write — the same order as the `Buffer.byteLength` the receipt
+// already pays for. `charCodeAt` on a UTF-16 string yields code units, which is precisely
+// what the encoder works from, so this asks the same question the encoder does.
+const hasUnpairedSurrogate = (text: string): boolean => {
+    for (let index = 0; index < text.length; index += 1) {
+        const code = text.charCodeAt(index);
 
-    // Walk the chain by hand. Only `lstat` sees a link without following it, which is the
-    // only way to tell "a name with nothing behind it" from "a link whose end is missing".
-    let landing = target;
-    // Did the landing move away from the caller's spelling? Only then can its parent be a
-    // directory the write loop has not created yet (see the mkdir below).
-    let followed = false;
+        if (code < 0xd800 || code > 0xdfff) continue;
 
-    for (let hop = 0; hop < SYMLINK_FOLLOW_LIMIT; hop += 1) {
-        let text: string | undefined;
+        if (code <= 0xdbff) {
+            // A high surrogate: paired only when the NEXT code unit is a low one. At the
+            // end of the string there is no next unit, so it is lone by definition.
+            const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0;
 
-        try {
-            const info = await lstat(landing);
-            // A regular file or directory at this name is a landing too — reachable only if
-            // the link chain closed on an existing entry after realpath already failed.
-            text = info.isSymbolicLink() ? await readlink(landing) : undefined;
-        } catch (error) {
-            const code = (error as NodeJS.ErrnoException | undefined)?.code;
+            if (next < 0xdc00 || next > 0xdfff) return true;
 
-            // ENOENT / ENOTDIR is the end of the chain: that missing name IS the landing,
-            // and it is either a dangling end or a plain path that does not exist yet.
-            if (code === 'ENOENT' || code === 'ENOTDIR') break;
-
-            // Anything else (EACCES on an ancestor) is a real failure. Surfacing it beats
-            // the alternative of quietly renaming onto the LINK path, which would delete
-            // a link this tool has always written through.
-            throw error;
+            // The pair is fine and encodes as one code point; step over the partner.
+            index += 1;
+            continue;
         }
 
-        // Not a link (a real entry, or the missing end handled above by break): landed.
-        if (text === undefined) break;
-
-        // A link's text is relative to the LINK's own directory, not to the working
-        // directory, and `resolve` also normalizes `.`/`..` and honours a text that is
-        // absolute on its own — one call covers both spellings.
-        landing = resolve(dirname(landing), text);
-        followed = true;
-
-        // The hop budget ran out while still on links: the chain closed on itself. `open()`
-        // used to fail this path with ELOOP; failing here is the same honest answer, and
-        // quietly renaming onto the link path would not be.
-        if (hop === SYMLINK_FOLLOW_LIMIT - 1) {
-            throw new HarnessError(
-                `write cannot resolve the symlink at ${target}: too many levels of symbolic links (over ${SYMLINK_FOLLOW_LIMIT} hops).`
-            );
-        }
+        // A low surrogate reached outside a pair (the loop above skips every paired one).
+        return true;
     }
 
-    if (followed) {
-        // A dangling link can name a directory the caller never mentioned (`link.txt ->
-        // missing/deep/target.txt`), and the write loop only created the parent of the
-        // CALLER's spelling. Create the landing's own parent here so the staging file has
-        // a directory to be created in — the same directory the rename publishes into, so
-        // the rename stays on one device. A parent that cannot be created (EACCES, a file
-        // in the middle of the path) fails the write outright rather than degrading to the
-        // link path, which would silently change which file the caller's content landed in.
-        await mkdir(dirname(landing), { recursive: true });
-    }
-
-    return landing;
-};
-
-// The permission bits of an EXISTING target, or undefined when there is no mode to
-// preserve.
-const existingMode = async (path: string): Promise<number | undefined> => {
-    try {
-        // `mode` also carries the file-type bits (0o100644 for a regular file); chmod()
-        // consumes only the low 12, and masking keeps exactly the bits an in-place write
-        // inherited, setuid/setgid/sticky included.
-        return (await stat(path)).mode & 0o7777;
-    } catch (error) {
-        // "There is no file here" is the ONLY reason not to preserve a mode. Any other
-        // failure (EACCES, an unreadable ancestor) would otherwise publish the default
-        // 0666&~umask file over one that had, say, 0755 — a silent mode change on the
-        // very path the caller cannot see, so it surfaces like any other write error.
-        const code = (error as NodeJS.ErrnoException | undefined)?.code;
-
-        if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
-
-        throw error;
-    }
-};
-
-// Publish ONE file atomically: staging file in the target's own directory, mode copied
-// over, then a same-directory rename. See the M10 section of this file's header for the
-// guarantee and for the semantics the trade buys away.
-const writeAtomically = async (target: string, content: string): Promise<void> => {
-    // Resolve before staging: the staging file has to sit next to the file the rename
-    // replaces, not next to the link that names it.
-    const real = await realWriteTarget(target);
-    const staging = join(dirname(real), `${basename(real)}.tmp-${stagingToken()}`);
-    // Read the mode before anything is created, so a failure below cannot have changed
-    // the target between the read and the rename.
-    const mode = await existingMode(real);
-    // What separates "the rename swapped it into place" from "it is still litter":
-    // the staging file is removed on every path that did not publish it.
-    let published = false;
-
-    try {
-        // `wx` (O_CREAT|O_EXCL): the unique token above makes a collision vanishingly
-        // rare, and this is the flag that makes a collision an error instead of a
-        // truncated neighbour. The payload lands here, never on the target's inode.
-        await writeTextFile(staging, content, { encoding: 'utf8', flag: 'wx' });
-
-        if (mode !== undefined) {
-            // The rename swaps the inode, so the mode has to travel with it: a script
-            // that silently lost its 0755 is a regression against in-place writing. A
-            // chmod that cannot run surfaces as a write error rather than publishing a
-            // mode nobody asked for.
-            await chmod(staging, mode);
-        }
-
-        // The publish. Same directory, so this replaces the directory entry atomically:
-        // a concurrent open() sees the old inode or the new one, never a mix.
-        await rename(staging, real);
-        published = true;
-    } finally {
-        if (!published) {
-            // Best effort and never throwing: the error already propagating is the
-            // actionable one, and a leftover temp file must not replace it. `force`
-            // swallows the ENOENT case where the failure happened before the create.
-            await rm(staging, { force: true }).catch(() => undefined);
-        }
-    }
+    return false;
 };
 
 // Validate the whole batch and resolve every target BEFORE the first write.
@@ -421,7 +363,23 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
             throw new HarnessError('write files must be objects with "path" and "content" strings.');
         }
 
-        const { path, content } = entry as Partial<FileWriteEntry>;
+        const record = entry as Record<string, unknown>;
+
+        // M9. The schema says `additionalProperties: false`, but the direct call path
+        // bypasses schema validation entirely, so an unknown key had to be DESTRUCTURED
+        // away to be noticed — and it was not. Naming the key and the allowed list is what
+        // turns "my overwrite flag did nothing" into one round trip. Checked before the
+        // field types, because a misspelled `path` is the case where "there is no path" is
+        // the least useful answer.
+        for (const key of Object.keys(record)) {
+            if (!(FILE_WRITE_FIELDS as readonly string[]).includes(key)) {
+                throw new HarnessError(
+                    `write files entries do not accept "${key}". Allowed fields: ${FILE_WRITE_FIELDS.join(', ')}.`
+                );
+            }
+        }
+
+        const { path, content } = record as Partial<FileWriteEntry>;
 
         if (typeof path !== 'string' || path.length === 0) {
             throw new HarnessError('write files require a non-empty "path" string.');
@@ -462,7 +420,9 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
         }
 
         seen.add(identity);
-        prepared.push({ target, identity, content });
+        // L6: decided during the preflight, next to the other content checks, so the write
+        // loop cannot report a success without the disclosure it owes.
+        prepared.push({ target, identity, content, lossy: hasUnpairedSurrogate(content) });
     }
 
     return prepared;
@@ -472,16 +432,25 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
 // a synchronous data projection for lazy enumeration and a consistency test
 // asserts the two stay equal. Edit the metadata HERE.
 //
-// The added clause at the end of the atomic-publish sentence is the D7b disclosure: that
-// publish swaps the target's NAME, so a hard link to it keeps the previous bytes under the
-// sibling name, and a 0444 existing file is overwritable because only the DIRECTORY's
-// permissions gate the rename. Both are inherent to the rename (see the M10 section of this
-// header) and neither is guessable by a caller, so they are published, not left in the
-// source comments.
+// WHAT THIS DESCRIPTION OWES A CALLER, and where each sentence came from:
+//   - the concurrency sentence (H6) used to claim "neither can silently overwrite the
+//     other", which is only true of edit-vs-edit: a full-content write replaces whatever
+//     text is current and the rename never version-checks the destination, so a write that
+//     runs after a concurrent edit DOES remove that edit. It also now names the bound
+//     ./lock.ts has always had (EXTRA-7): serialization is per-PROCESS, and a
+//     worker-thread lane has its own lock map;
+//   - the atomic-publish sentence carries the D7b trade (a hard link keeps the previous
+//     bytes; a 0444 file is overwritable because only the DIRECTORY gates the rename) and
+//     the L5 rule (a non-regular target is refused rather than replaced by a regular file);
+//   - `lossy` (L6) is disclosed because the corruption is permanent and cannot be spotted
+//     on re-read, so this call is the only place that can say it.
+//
+// The schema's field descriptions are NOT touched: ../../catalogue.test.ts pins the whole
+// `parameters` object by value, and none of the changes below alter what a caller may send.
 export const WRITE_METADATA: PresetToolMetadata = {
     name: 'write',
     description:
-        'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. A call accepts at most 100 files; split a larger batch. Every entry is validated before anything is written, and the same target path twice is rejected. Writes are serialized per file against concurrent edit calls on the same path, so neither can silently overwrite the other. Each file is published atomically, so a reader sees either its previous content or its new content, never a partial write, and a failed write leaves that file untouched; the publish replaces the file, so a hard link to it keeps the previous bytes and a read-only existing file can still be overwritten. A write error part-way through is reported with the paths already completed: there is no rollback.',
+        'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. A call accepts at most 100 files; split a larger batch. Every entry is validated before anything is written, an entry naming any field other than `path` or `content` is rejected rather than ignored, and the same target path twice is rejected. Calls that name the same file are serialized per file (in this process only - a second harness process or a worker-thread lane keeps its own locks), so a concurrent write and edit never interleave into a torn file and a concurrent edit cannot silently clobber another edit. A write replaces the WHOLE text by design and never checks what is currently in the file, so if a concurrent call changed it first, this write wins and that change is gone. Each file is published atomically, so a reader sees either its previous content or its new content, never a partial write, and a failed write leaves that file exactly as it was; the publish replaces the file, so a hard link to it keeps the previous bytes and a read-only existing file can still be overwritten, while a target that is not a regular file (a directory, a FIFO, a device) is refused instead of silently replaced. An unpaired surrogate in the content becomes U+FFFD on disk - permanently, and invisible when the file is read back - so that entry says `lossy: true`. A write error part-way through is reported with the paths already completed, and a cancelled call rejects with `ECANCELED` naming the files already written: there is no rollback.',
     tags: ['files', 'write', 'filesystem'],
     // R18: writing files is core, like the rest of the everyday file set.
     visibility: 'core',
@@ -532,7 +501,16 @@ export const registration = {
 
 export const write = tool<FileWriteParameters, FileWriteResult>({
     ...WRITE_METADATA,
-    execute: async ({ parameters: files }) => {
+    execute: async ({ parameters: files, signal }) => {
+        // Cancellation before ANY work, including the preflight: `prepareWrites` resolves
+        // every target and stats every identity, and a cancelled call has no consumer for
+        // any of it (src/types/index.ts:2356-2357 — the harness discards a late result).
+        // `ECANCELED`, not the platform AbortError, so the caller sees a code from
+        // FILE_WRITE_ERROR_CODES (./cancellation.ts).
+        throwIfFileCancelled('write', signal, 'before any file was written', {
+            completedPaths: []
+        });
+
         const prepared = await prepareWrites(files);
 
         // D4: hold every target's lock across the whole batch, in sorted identity
@@ -551,7 +529,7 @@ export const write = tool<FileWriteParameters, FileWriteResult>({
                 // header for the measurement and for what actually dominates that call.
                 const made = new Set<string>();
 
-                for (const { target, content } of prepared) {
+                for (const { target, content, lossy } of prepared) {
                     try {
                         // Agents write into directories that do not exist yet far more
                         // often than not; failing on that wastes a round trip.
@@ -561,10 +539,14 @@ export const write = tool<FileWriteParameters, FileWriteResult>({
                             made.add(parent);
                         }
 
-                        // M10: staged + renamed, not `writeFile(target)`. The target is
-                        // never emptied in place, so a concurrent reader, an ENOSPC, or a
-                        // kill cannot leave — or report — a partial file.
-                        await writeAtomically(target, content);
+                        // M10: staged + renamed, not `writeFile(target)` — the SAME publish
+                        // `edit` now uses (./atomic-publish.ts). The target is never emptied
+                        // in place, so a concurrent reader, an ENOSPC, or a kill cannot
+                        // leave — or report — a partial file. `signal` rides along because
+                        // that publish is where the per-entry cancellation check lives for
+                        // BOTH tools: a batch cancelled at entry 12 stops there and reports
+                        // 1-11 as completed (./cancellation.ts).
+                        await publishAtomically('write', target, content, signal);
                     } catch (error) {
                         // Partial success is reported honestly: the completed paths are
                         // named so the caller can tell what exists now, and there is no
@@ -572,16 +554,49 @@ export const write = tool<FileWriteParameters, FileWriteResult>({
                         // The failed target is deliberately NOT listed: it still holds the
                         // text it had before (or does not exist yet), which the staged
                         // publish above is what guarantees.
-                        const completed =
-                            written.length === 0 ? 'none' : written.map((entry) => entry.path).join(', ');
-                        const reason = error instanceof Error ? error.message : String(error);
+                        //
+                        // M11: the completed list goes in `details` as well as in the
+                        // sentence, because prose is the half that reaches a model and a
+                        // caller that has to recover switches on `code` + `details`.
+                        // `reason` is separated from the next sentence by `. ` after a
+                        // trailing-period strip — Node's errno messages have NO trailing
+                        // period, so the old interpolation glued the two sentences together
+                        // ("...open '/x' Writes already completed: none.").
+                        const completedPaths = written.map((entry) => entry.path);
+                        const { code, rawCode } = publishErrorCode(error);
+                        const reason = (error instanceof Error ? error.message : String(error)).replace(
+                            /[\s.]+$/,
+                            ''
+                        );
+                        const where = completedPaths.length === 0 ? 'none' : completedPaths.join(', ');
 
                         throw new HarnessError(
-                            `write failed on ${target}: ${reason} Writes already completed: ${completed}. No rollback was performed.`
+                            `write failed on ${target}: ${reason}. Writes already completed: ${where}. No rollback was performed.`,
+                            {
+                                code,
+                                details: {
+                                    failedPath: target,
+                                    completedPaths,
+                                    ...(rawCode === undefined ? {} : { rawCode })
+                                }
+                            }
                         );
                     }
 
-                    written.push({ path: target, bytes: Buffer.byteLength(content, 'utf8') });
+                    // `bytes` is the size of the payload that LANDED. For a `lossy` entry
+                    // that is not the length of the caller's string in UTF-8 code units —
+                    // each lone surrogate became the three bytes of U+FFFD — which is one
+                    // more reason the flag has to be visible next to the number.
+                    const entry: FileWriteResultEntry = {
+                        path: target,
+                        bytes: Buffer.byteLength(content, 'utf8')
+                    };
+
+                    // Additive, and present only when it is true, so every pre-existing
+                    // `{ path, bytes }` receipt (and the tests pinning them) is unchanged.
+                    if (lossy) entry.lossy = true;
+
+                    written.push(entry);
                 }
 
                 return written;

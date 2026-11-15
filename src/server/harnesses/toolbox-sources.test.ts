@@ -16,6 +16,7 @@
 // harness only builds transports).
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +53,16 @@ const stubNoSearchKeys = (): void => {
 // POSIX form of an absolute folder path, matching how folder discovery reports
 // descriptor source paths.
 const posix = (value: string): string => value.split(path.sep).join('/');
+
+// `read`'s ONE local helper, captured with its source text (T14 added it: ./cancellation.ts, the
+// mapping the four filesystem tools answer a cancelled call with). A dependency is part of the
+// entry's revision, so the production toolbox has to carry the helper, not just the tool body;
+// the expectation reads the SHIPPED file rather than pasting a copy, so this pin cannot drift from
+// the source it claims to hold.
+const READ_HELPER = {
+    path: 'tools/files/cancellation.ts',
+    text: readFileSync(fileURLToPath(new URL('../../tools/files/cancellation.ts', import.meta.url)), 'utf8')
+};
 
 // A scripted transport that never emits anything: a library harness is only
 // constructed here, never run.
@@ -106,7 +117,9 @@ describe('production toolbox source compilation', () => {
             name: 'read',
             sourcePath: 'tools/files/read.tool.ts',
             format: 'module',
-            dependencies: [],
+            // Framework imports resolve to live package modules; the only entry a source-backed
+            // preset can carry is a local helper, and `read` has exactly one (see `READ_HELPER`).
+            dependencies: [READ_HELPER],
             checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
         });
         expect(read?.revision).toMatch(/^[0-9a-f]{16}$/);

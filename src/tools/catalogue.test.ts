@@ -288,12 +288,18 @@ describe('preset catalogue', () => {
         expect(filesOps.ops.items.type).toBe('object');
         expect(filesOps.ops.items.required).toEqual(['op']);
         expect(filesOps.ops.items.additionalProperties).toBe(false);
+        // `replaceDirectory` joins the property list (C1): replacing a destination that is a
+        // DIRECTORY destroys the whole tree under it, and `overwrite` alone only permits
+        // removing the NAME at `to`. The flag is therefore part of the published schema —
+        // pinned beside its sibling permissions here, and with the runtime field list and the
+        // description in ./files/files.test.ts:366.
         expect(Object.keys(filesOps.ops.items.properties)).toEqual([
             'op',
             'path',
             'from',
             'to',
             'overwrite',
+            'replaceDirectory',
             'recursive',
             'force',
             'offset',

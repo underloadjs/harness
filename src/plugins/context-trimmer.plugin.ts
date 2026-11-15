@@ -54,9 +54,12 @@
 // --------------------------------------------------------
 // Every eligibility rule here is windowed by a HORIZON in turns, and every horizon is a number the
 // operator reads the same way: `N` protects the N most recent things of that kind, the entry is
-// eligible at N+1, and `0` protects nothing. The four turn horizons (`invalidToolTurns`,
+// eligible at N+1, and `0` protects nothing. The one documented exception is the thinking axis,
+// where the NEWEST model step is exempt whatever the number says — see "THE HORIZON COUNTS MODEL
+// STEPS, AND WHY" below. The four turn horizons (`invalidToolTurns`,
 // `thoughtTurns`, `truncateTurns`, `supersededTurns`, plus `duplicateTurns`) all DEFAULT to 2, so
-// out of the box nothing is touched in the last two tool turns and the last two recorded thoughts.
+// out of the box nothing is touched in the last two tool turns and the thinking of the last two
+// model steps.
 // That is a deliberate change from the first cut of this plugin, which had no horizon on its tool
 // rules at all: the operator-facing promise is now "the recent conversation is yours, the old
 // scaffolding is mine", and a failure the model replaced one step ago is exactly the pair an
@@ -64,10 +67,15 @@
 //
 // What the horizons count is stated per rule and never guessed: `invalidToolTurns` /
 // `supersededTurns` / `duplicateTurns` / `truncateTurns` count TOOL TURNS (a unit whose leader
-// carries `toolCalls`), and `thoughtTurns` counts THOUGHT ENTRIES (an assistant entry carrying a
-// non-empty `reasoning`). Neither is `context.iteration`, which counts model steps inside ONE run
-// (`../types`) and cannot express a conversation-level position, and neither is `safetyUnits`,
-// which is the separate, older knob that counts WHOLE transcript units from the end.
+// carries `toolCalls`), and `thoughtTurns` counts MODEL STEPS (assistant entries, newest = 0 — the
+// unit the provider's own thinking-retention policy counts). It did not always: the 2026-11-13 cut
+// counted THOUGHT ENTRIES, which made the horizon a sliding window that moved one slot per
+// thinking block, and the first 2026-11-14 cut counted CONVERSATION TURNS, which made the axis
+// inert inside one long agentic turn — both are why the rank is what it is now; see "THE HORIZON
+// COUNTS MODEL STEPS, AND WHY" below. Neither is `context.iteration`, which counts the model steps
+// of ONE run and restarts at 0 on the next one (`../types`), so it cannot express a
+// conversation-level position at all, and neither is `safetyUnits`, which is the separate, older
+// knob that counts WHOLE transcript units from the end.
 //
 // The ECONOMY knobs (`minTokens`, `safetyUnits`, `maxUnits`) still default to 0, and at 0 each gate
 // is a pass-through. Compaction is an expensive, rare, whole-conversation event, so it is guarded by
@@ -105,8 +113,10 @@
 // for compaction. That helper is PRIVATE to the core module (only `planContextPruning` and its
 // `PrunePlan` expose the number), so the delta is mirrored here, one function, same estimator, same
 // clamp at 0. Nothing else in this file invents a token figure, and `minTokens` is scoped to TOOL
-// writes on purpose: the estimator never counts `reasoning` (`../core/context-estimate.ts:34-35`),
-// so a floor shared with the thinking writes would silently disable the thoughts switch above 0.
+// writes on purpose: that floor measures a WHOLE-ENTRY removal (the delta of the estimator with the
+// selected entries deleted), while a thinking write deletes no entry at all — it drops one KEY from
+// an entry that keeps travelling — so the same delta would report 0 for every thinking pass and a
+// shared floor above 0 would silently disable the thoughts switch.
 // The gates below therefore run over the TOOL candidates only — and, deliberately, SEPARATELY for
 // each tool axis (the whole-unit set, then the truncate set), because a truncation that saves
 // nothing must not ride along on a trim that does. A thinking write is never measured in tokens —
@@ -127,33 +137,70 @@
 // `projectTranscript`), so the transport needs no new field: the ABSENCE of `reasoning` is the wire
 // signal.
 //
-// THE HORIZON COUNTS THOUGHTS, NOT TURNS AND NOT UNITS. `thoughtsAgo` is 0 for the newest entry in
-// the transcript that actually carries a non-empty `reasoning`, 1 for the one above it, and so on;
-// `thoughtTurns` admits everything at or beyond it. A unit is not the unit of account here because
-// one tool turn can carry zero, one or several thoughts (a multi-call block, a thought recorded
-// beside a tool result), and a knob that moved with units would let the operator's "2" mean three.
-// `context.iteration` is worse still: it counts model steps inside ONE run (`../types`) and says
-// nothing about where an entry sits in the conversation.
+// THE HORIZON COUNTS MODEL STEPS, AND WHY (2026-11-14, restated the same day). `stepsAgo` is 0 for
+// a thought on the NEWEST assistant entry — the model step committed most recently — 1 for the step
+// before it, and so on, and `thoughtTurns` admits everything at or beyond it. It is the same rank
+// arithmetic the tool axes use (`toolTurnAgoOf` below: count the domain newest-first, `ago >=
+// horizon`, `+Infinity` for anything outside the domain); only the domain differs, because a thought
+// rides on a MODEL STEP, not on a tool unit — a plain assistant answer carries thinking and is not a
+// tool turn, so the tool axes' map would read it `+Infinity` and a chat-only transcript would never
+// trim at all.
+//
+// WHY NOT CONVERSATION TURNS (the unit this file demanded for one day, and the bug it shipped). The
+// last-`user`-entry rank is INERT in exactly the run that needs trimming: an agentic turn commits
+// dozens of thinking blocks after ONE user message, so every one of them ranked `0`, every one was
+// "protected", and a 2-turn horizon admitted nothing — a live 82-entry session with 35 thinking
+// blocks produced ZERO candidates per pass while the operator watched their thoughts ride in every
+// request and reported that the trimmer was broken. A user message is a fact about the USER's
+// cadence, not about how much thinking the model has accumulated since it last spoke.
+//
+// WHY MODEL STEPS ARE THE RIGHT UNIT. They are the unit the PROVIDER counts. Anthropic's
+// thinking-retention policy (`clear_thinking_20251015`, `keep: { type: 'thinking_turns', value: N }`)
+// keeps the thinking of the last N ASSISTANT TURNS, default 1, and a tool-result-only user message
+// continues the same turn rather than opening a new one; OpenAI and Gemini replay the reasoning of
+// the latest step for the same reason. So `thoughtTurns: N` now says the one sentence in both
+// languages: "keep the thinking of the last N model steps, withhold everything older" — and it FIRES
+// inside a tool loop, which is the whole point of the switch.
+//
+// THE NEWEST STEP IS NEVER WITHHELD (the continuity floor, whatever the horizon). A thinking block
+// attached to the newest assistant entry belongs to a tool round the provider may still be finishing,
+// and a replayed tool round whose thinking has been stripped is a 400, not a saving. Rank `0` is
+// therefore exempt at every setting, including `thoughtTurns: 0`: `0` and `1` are the SAME window,
+// and the smallest meaningful protection is one step. Everything older is eligible, so the shipped
+// `2` keeps the thinking of the two newest steps and drops every thought behind them — in ONE pass,
+// because there is no batching and no hysteresis here: every entry the horizon admits gets its flag
+// written the same turn it was planned.
+//
+// TRIMMING IS OLDEST-FIRST AND LEAVES NO HOLE (the provider's other hard rule: kept thinking must be
+// an unbroken run — you may omit the OLDEST, never an interior one). The rank falls strictly as the
+// transcript advances, so the eligible set is always a PREFIX of the thinking entries: if an entry is
+// kept, every thinking entry after it is kept too. And a rank only ever GROWS — appending steps never
+// moves an old entry closer to the end — so a thought this plugin withheld can never fall back inside
+// the window. Withhold-only (`setReasoningIncluded(entry, false)`, never `true`) is therefore not the
+// only thing guaranteeing "nothing comes back": the arithmetic itself cannot restore one. `context-trimmer.test.ts`
+// pins the prefix property directly ("the withheld set is a transcript-order prefix — no interior hole").
+//
+// THE CACHE COST, STATED HONESTLY. The rank counts steps, so every new model step moves the protected
+// window forward one step and one more thought crosses the line; that is one new flag per pass,
+// written at a point that advances, and everything after it re-bills against the provider's prefix
+// cache. The retired user-message rank never moved and never trimmed anything either — the shipped
+// posture buys the axis working for the cache churn of one entry per step.
 //
 // THE TURN BOUNDARY IS REPORTED, NOT DECIDED. The OPEN turn is every committed assistant entry after
 // the last `user` entry in canonical order; everything at or before it is CLOSED. The rule is
 // re-read from canonical order every turn and never remembered, because a mailbox/autoanswer user
 // message legitimately MOVES the boundary — it really does open a new turn in the same transcript —
-// and `iteration` cannot express that. Each candidate carries `turn` and `turnsAgo` so the operator
-// can see WHICH thought left and HOW old it was; that is what makes the "why did my current turn's
-// reasoning go" question answerable from one line.
+// and `iteration` cannot express that. Each candidate carries `turn` and `stepsAgo` so the operator
+// can see WHICH thought left and HOW many steps old it was; that is what makes the "why did my
+// current turn's reasoning go" question answerable from one line. The two are independent readings
+// of the same transcript: `turn` says which side of the last user message the entry sits on, and
+// `stepsAgo` is the number the horizon was compared against.
 //
-// THE HORIZON CAN REACH THE OPEN TURN, AND THE DEFAULT IS NOT A BLANKET PROTECTION FOR IT. The rank
-// is over THOUGHTS, so a turn that carries only one or two thoughts keeps all of them at the shipped
-// horizon of 2 — but a turn carrying THREE or more thoughts has its OWN oldest thought ranked `2` by
-// now, and it goes on the turn it was committed. The arithmetic is pinned by
-// `context-trimmer.test.ts` "the horizon protects the N newest thoughts — the N / N+1 boundary,
-// exactly", and "a transcript with no user entry is ALL one turn, and the horizon still decides"
-// pins the open-turn candidate itself (`turn: 'open'` with a rank that qualifies). No separate
+// THE ARITHMETIC, PINNED. `context-trimmer.test.ts` "the horizon protects the N newest MODEL STEPS —
+// the N / N+1 boundary, exactly", "every thought at or beyond the horizon is withheld in ONE pass"
+// and "the newest model step's thinking is never withheld, at any horizon including 0". No separate
 // "protect the current turn" tier survives here: the old `off|turn|all` tier and its
-// `thoughtKeepUnits` rescue both answered a question the operator chose to move to a thought count,
-// in fewer numbers and with a smaller surface — the tier was removed because the operator replaced
-// its unit of account, NOT because the horizon cannot reach the open turn.
+// `thoughtKeepUnits` rescue both answered a question the horizon now answers in one number.
 //
 // The order is horizon → floor, and the floor measures what would ACTUALLY be written: an entry this
 // same pass is already withholding WHOLE (the tool axes take it, thinking and all) is not a thinking
@@ -377,7 +424,7 @@ import { groupUnits, PRUNE_CANDIDATE_OUTCOMES, RESOLVING_OUTCOME } from '../core
 import { toolCallFingerprint } from '../core/argument-fingerprint';
 // The estimator the UI context bar is built on. Every token figure this plugin reports or gates on
 // comes through it (header: "THE TOKENS COME FROM THE SAME ESTIMATOR THE CONTEXT BAR USES").
-import { estimateContextTokens } from '../core/context-estimate';
+import { estimateContextTokens, estimateTokensFromChars } from '../core/context-estimate';
 import { toolOutcomeOf } from '../core/tool-outcome';
 // Reused, not restated: the internal-agent lists (a summarizer thread must never be trimmed,
 // or the compactor's own helper loses the failures it was handed to explain).
@@ -431,8 +478,8 @@ export const metadata = {
     // reads. Context Compacting declares SIX rows and ZERO descriptions; this list used to declare
     // seventeen hints totalling ~1.2k characters, five of them the same sentence, and that is the
     // row that looked noisy. So: a row carries a hint ONLY when the label plus the published
-    // `min`/`max` cannot already answer the operator's question. Nine of the seventeen do, and each
-    // of those nine states something that is otherwise a SILENT surprise:
+    // `min`/`max` cannot already answer the operator's question. Ten of the seventeen do, and each
+    // of those ten states something that is otherwise a SILENT surprise:
     //   - the closed-set enumerations (`invalidOutcomes`, `supersedeMatch`) — the values are not
     //     listed anywhere the operator can see, and `outcomeSetOf` splits on `,` ONLY
     //     (`;`-separated input resolves to an empty set, which turns the rule off), so that
@@ -440,8 +487,10 @@ export const metadata = {
     //   - the gates that produce a silent NO-OP rather than an error: `trimInvalidTools`
     //     (the resolver gate below), `minTokens` (the floor runs PER AXIS), `maxUnits`
     //     (`0` is unbounded HERE, where compaction's same-named knob means "nothing");
-    //   - the one horizon hint (`invalidToolTurns`) states the rank semantics ONCE for all five
-    //     horizons instead of repeating "protect the newest N, 0 protects none" five times;
+    //   - the tool horizon hint (`invalidToolTurns`) states the rank semantics ONCE for the four
+    //     tool-turn horizons instead of repeating "protect the newest N, 0 protects none" four
+    //     times, and `thoughtTurns` states its OWN because that horizon's zero does NOT mean "none":
+    //     the newest model step is exempt at every value (header, "THE HORIZON COUNTS MODEL STEPS");
     //   - `enabled` carries the withhold-only caveat (see the rule below), stated exactly once
     //     where every operator reads it, instead of seventeen times;
     //   - `truncateToolRequests` states the half that survives, because "truncate" alone reads
@@ -503,12 +552,14 @@ export const metadata = {
             min: 0,
             max: 4096,
             step: 1,
-            // THE ONE HORIZON HINT. It states the rank semantics for ALL FIVE horizons
-            // (`invalidToolTurns`, `thoughtTurns`, `truncateTurns`, `supersededTurns`,
-            // `duplicateTurns`): N protects the N newest of that kind, counted newest-first, the
-            // entry is eligible at N+1, and 0 exempts nothing beyond the ordinary guards. The unit
-            // of each horizon is in its own label ("(tool turns)" / "(thoughts)"), so the four
-            // sibling rows need no copy of their own — this sentence used to appear five times.
+            // THE ONE HORIZON HINT FOR THE TOOL AXES. It states the rank semantics for the FOUR
+            // tool-turn horizons (`invalidToolTurns`, `truncateTurns`, `supersededTurns`,
+            // `duplicateTurns`): N protects the N newest tool turns, counted newest-first, the entry
+            // is eligible at N+1, and 0 exempts nothing beyond the ordinary guards. The unit of each
+            // horizon is in its own label ("(tool turns)"), so the three sibling rows need no copy of
+            // their own — this sentence used to appear five times. `thoughtTurns` counts a different
+            // domain (MODEL STEPS) and has a floor the tool axes do not (the newest step is always
+            // protected), so it states its own copy rather than borrowing this one.
             description: 'Protects the newest N tool turns; 0 protects none.'
         },
         {
@@ -536,24 +587,29 @@ export const metadata = {
             default: true
         },
         {
-            // The unit of account is IN THE LABEL ("(thoughts)"), and the rank semantics are stated
-            // once on `invalidToolTurns`; nothing left for this row to say.
+            // The unit of account is IN THE LABEL ("(model steps)" — ASSISTANT ENTRIES, newest = 0,
+            // the same unit the provider's own thinking-retention policy counts), and the hint states
+            // the one thing the label cannot: this horizon has a floor the tool horizons do not, so
+            // `0` does NOT mean "protect nothing" (header, "THE HORIZON COUNTS MODEL STEPS, AND WHY").
             key: 'thoughtTurns',
             group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
             parentKey: 'trimThoughts',
-            label: 'Thoughts · trim after (thoughts)',
+            label: 'Thoughts · trim after (model steps)',
             type: 'number',
             default: 2,
             min: 0,
             max: 4096,
-            step: 1
+            step: 1,
+            description: 'Protects the newest N model steps; the newest step always travels.'
         },
         {
             // The floor's thinking twin, filed WITH the rule it gates: it is read at step (5) of the
-            // thinking selector and reaches nothing else (the tool axes are measured by `minTokens`,
-            // and the estimator never counts `reasoning` — ../core/context-estimate.ts:34-35), so an
-            // operator who turns thinking off never has to wonder what this number gates. WHAT a
-            // floor does is stated once, on `minTokens`; this row adds nothing.
+            // thinking selector and reaches nothing else (the tool axes are measured by `minTokens`),
+            // so an operator who turns thinking off never has to wonder what this number gates. It is
+            // in CHARACTERS because that is what one write removes; the report line converts it with
+            // the shared `estimateTokensFromChars` so the saving is readable in the same unit the
+            // context bar and `minTokens` use. WHAT a floor does is stated once, on `minTokens`;
+            // this row adds nothing.
             key: 'minThoughtChars',
             group: { id: 'chain-of-thoughts', title: 'Chain of Thoughts' },
             parentKey: 'trimThoughts',
@@ -670,8 +726,8 @@ export const metadata = {
             // The per-axis scoping is the part an operator cannot see, so it is stated HERE, on the
             // floor the operator reaches for first: a floor that empties the whole-unit plan leaves
             // the truncate plan running (the gates run PER AXIS, `applyEconomyGates`), and the
-            // token floor never touches thinking at all, because the estimator does not count
-            // `reasoning` (`../core/context-estimate.ts:34-35`). Both are silent, so both are
+            // token floor never touches thinking at all — thinking has its own floor,
+            // `minThoughtChars`, because the two axes are measured in different units. Both are silent, so both are
             // stated — and `minThoughtChars`, now filed with the thinking rule it gates, needs no
             // copy of its own once this row says tokens stop at the tool axes.
             description: 'Each tool axis must save this many tokens, or it writes nothing; thinking is never gated.'
@@ -720,7 +776,9 @@ export const metadata = {
 const ENABLED_DEFAULT = true;
 // The three toggle+horizon pairs the operator sees first (the 2026-11-13 clean-up). Each `_TURNS`
 // constant is the horizon that protects the N newest tool turns / thoughts; 2 is the shipped
-// answer for all six, so the newest two tool turns and the newest two thoughts are never touched.
+// answer for all six, so the newest two tool turns and the thinking of the newest two model steps
+// are never touched (`thoughtTurns` additionally never touches the newest step at all — the
+// continuity floor, whatever the number says).
 const TRIM_INVALID_TOOLS_DEFAULT = true;
 const INVALID_TOOL_TURNS_DEFAULT = 2;
 const TRIM_THOUGHTS_DEFAULT = true;
@@ -802,10 +860,12 @@ export type TrimmerToolRule = 'dropSupersededToolCalls' | 'trimInvalidTools' | '
 //
 // THE HORIZONS. `invalidToolTurns`, `supersededTurns`, `duplicateTurns` and `truncateTurns` count
 // TOOL TURNS (a `ContextUnit` from `groupUnits` whose leader carries `toolCalls`); `thoughtTurns`
-// counts THOUGHT ENTRIES (an assistant entry carrying a non-empty `reasoning`) — never transcript
-// units and never the per-run `iteration`. In every case N protects the N newest and anything
-// older is eligible; 0 protects nothing. Each one is a plain number here, normalised once by
-// `horizonOf` at the gate.
+// counts MODEL STEPS (assistant entries, newest = 0 — the map is `thoughtAgoOf`) — never transcript
+// units, never a count of thought entries, never the distance between `user` messages, and never the
+// per-run `iteration`. In every case N protects the N newest of that kind and anything older is
+// eligible; 0 protects nothing, with the one exception the thinking axis documents (its newest step
+// is exempt at every value — the continuity floor in `planWithheldThoughts`). Each one is a plain
+// number here, normalised once by `horizonOf` at the gate.
 export type TrimmerSettings = {
     dropSupersededToolCalls: boolean;
     supersededTurns: number;
@@ -1262,8 +1322,11 @@ type MatchedUnit<T extends { members: readonly number[] } = TrimCandidate> = {
 };
 
 // THE ECONOMY GATES (T5), applied to the tool candidate set in one fixed order — horizon, cap,
-// floor — and never to a thinking write (the estimator does not count `reasoning`, so a shared
-// floor would silently disable the thoughts switch above 0). At the declared zeros every gate is a
+// floor — and never to a thinking write. They cannot be shared: `withheldTokensOf` measures a
+// WHOLE-ENTRY removal (the estimator over the transcript minus the same estimate with the selected
+// entries deleted), while a thinking write deletes no entry — it drops one `reasoning` key from an
+// entry that keeps travelling — so the same delta would read 0 for every thinking pass and a shared
+// floor above 0 would silently disable the thoughts switch. At the declared zeros every gate is a
 // pass-through, which is what makes the shipped request byte-identical.
 //
 // THEY RUN PER AXIS (whole-unit trim, then truncate), not over one merged set. The two axes remove
@@ -1650,19 +1713,27 @@ export type ThoughtCandidate = {
     entryIndex: number;
     entryMessageId?: string;
     // WHICH TURN the entry belongs to: `open` = after the last user entry, i.e. the turn the run is
-    // still building; `closed` = a finished turn. NOT a rule any more (the tier is gone) — the
-    // horizon decides eligibility — but the report line still names it, because "why did MY current
-    // reasoning disappear" is the first question an operator asks of a thinking policy, and `turn`
-    // plus `turnsAgo` is what answers it.
+    // still building; `closed` = a finished turn. NOT a rule any more (the tier is gone, and the
+    // horizon no longer counts turns either) — the step rank below decides eligibility — but the
+    // report line still names it, because "why did MY current reasoning disappear" is the first
+    // question an operator asks of a thinking policy, and `turn` plus `stepsAgo` is what answers it.
     turn: 'open' | 'closed';
-    // How many newer THOUGHTS sit above this entry: 0 is the newest recorded thinking in the
-    // transcript. This is the figure `thoughtTurns` was compared against, so the report can say
-    // "this one was 3 thoughts old, the one above it was 1" without re-walking the transcript.
-    turnsAgo: number;
+    // How many MODEL STEPS older this entry is than the newest one: 0 is the newest assistant entry
+    // (which the continuity floor exempts at every horizon), 1 the step before it, and so on. This is
+    // the figure `thoughtTurns` is compared against, so the report can say "this one was 3 steps old"
+    // without re-walking the transcript. It is the same rank convention `toolTurnAgoOf` uses for the
+    // tool axes, over a different domain, and it used to count conversation turns and thought entries
+    // before that — both are in the header memo, "THE HORIZON COUNTS MODEL STEPS, AND WHY".
+    stepsAgo: number;
     // Characters of thinking the flag removes from the request — the figure `minThoughtChars` is
-    // measured against and the figure the report names. Never converted to tokens: the estimator
-    // does not count reasoning, so the two numbers are not comparable.
+    // measured against, because a character count is what one write of THIS axis removes.
     chars: number;
+    // The SAME saving in the product's token convention (`ceil(chars / 4)`,
+    // ../core/context-estimate.ts `estimateTokensFromChars`), so the pass report can state what the
+    // write is worth in the unit every other number in the product — the context bar, `minTokens`,
+    // `maxPromptTokens` — is stated in. Derived from `chars`, never measured independently, so the two
+    // figures cannot disagree.
+    tokens: number;
     // The thinking side has one switch, so `firedBy` is a constant — but D4 #1 asks every withheld
     // item to name its switch, and a report that names it only for tool units is a report a host
     // has to guess about.
@@ -1673,33 +1744,45 @@ export type ThoughtCandidate = {
     horizon: number;
 };
 
-// THE THOUGHT RANK MAP (R2). One entry per canonical entry: how many NEWER entries carrying
-// non-empty `reasoning` sit above it, newest thought = 0, and `+Infinity` for anything that is not
-// a thought. The count is over THOUGHT ENTRIES — an assistant entry carrying a non-empty
-// `reasoning` string — and deliberately NOT over transcript units (one unit can carry zero, one or
-// several thoughts, and a multi-call turn would move the horizon by more than the operator reads)
-// and NEVER over `context.iteration`, which counts model steps inside one run and cannot express a
-// conversation-level position.
+// THE THOUGHT RANK MAP (R2; the unit changed twice on 2026-11-14, see the header memo). One entry
+// per canonical entry: how many MODEL STEPS sit NEWER than it — assistant entries counted
+// newest-first, the newest is `0` — and `+Infinity` for anything that is not an assistant entry, so
+// a horizon test on a user or tool entry can never accidentally admit it. Same convention as
+// `toolTurnAgoOf` (:1150), which is what makes every horizon in this plugin one arithmetic: rank
+// newest-first inside the axis's own domain, admit at `ago >= horizon`.
 //
-// It is computed over every thought entry, INCLUDING ones already flagged and ones whose unit is
-// withheld, and that is what makes the policy idempotent: writing a flag never renumbers anything,
-// so a second pass over the same transcript reaches the same verdicts and skips exactly the entries
-// it already flagged.
+// THE DOMAIN IS ASSISTANT ENTRIES, and that is the fix rather than a renaming. Two earlier units
+// both failed on the same run shape: counting THOUGHT ENTRIES slid the window one slot per thinking
+// block, and counting CONVERSATION TURNS (the 2026-11-14 cut that shipped broken) made the axis
+// inert — a long agentic tool loop commits its every thinking block after ONE user message, so all
+// of them ranked `0` and nothing was ever eligible. Counting steps is the unit the provider counts
+// for thinking retention (Anthropic `clear_thinking_20251015`, `keep: { type: 'thinking_turns',
+// value: N }`; a tool-result-only user message CONTINUES a turn rather than opening one, which is
+// exactly why a user-message rank cannot express this window), it fires inside a tool loop, and it
+// is monotonic in transcript order — which is what gives the axis its no-interior-hole property
+// (`planWithheldThoughts` below).
+//
+// EVERY assistant entry counts as a step, thinking or not (an assistant answer with no `reasoning`
+// is still a turn the provider counts), and steps are counted over the CANONICAL list including
+// entries that are already flagged or whose unit is withheld. Both halves matter: writing a flag
+// never renumbers anything, so a second pass over the same transcript reaches the same verdicts, and
+// a rank only ever GROWS as the transcript grows, so an entry that left the window can never come
+// back into it — the "never restore" promise holds from the arithmetic, not only from the
+// withhold-only write.
 const thoughtAgoOf = (entries: readonly HarnessContextEntry[]): number[] => {
-    const thoughts: number[] = [];
-
-    for (let index = 0; index < entries.length; index += 1) {
-        const message = entries[index].message;
-
-        if (message.role === 'assistant' && typeof message.reasoning === 'string' && message.reasoning.length > 0) {
-            thoughts.push(index);
-        }
-    }
-
+    // Non-steps read `+Infinity` (the `toolTurnAgoOf` convention); the walk below overwrites every
+    // assistant position with its step distance.
     const ago = entries.map((): number => Number.POSITIVE_INFINITY);
 
-    for (let position = 0; position < thoughts.length; position += 1) {
-        ago[thoughts[position]] = thoughts.length - 1 - position;
+    // Walking BACKWARDS counts the steps already passed, so the newest assistant entry is the first
+    // one touched and gets 0. `steps` is therefore "how many assistant entries sit after here".
+    let steps = 0;
+
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+        if (entries[index].message.role !== 'assistant') continue;
+
+        ago[index] = steps;
+        steps += 1;
     }
 
     return ago;
@@ -1715,16 +1798,25 @@ const thoughtAgoOf = (entries: readonly HarnessContextEntry[]): number[] => {
 //      question is what the horizon now answers, in one number the operator can read;
 //   2. the entry must be an `assistant` entry that actually CARRIES thinking (a non-empty string).
 //      An entry with no `reasoning` has nothing to withhold, and flagging it would be a write, a
-//      notification and a save for zero effect — which is also what `thoughtTurns` counts;
+//      notification and a save for zero effect;
 //   3. it must not ALREADY be flagged (idempotence — the exact trick the tool side uses with
 //      `unit.included`), and it must not be an entry the model never sees anyway (`entry.included`
 //      is the live flag: thinking on a withheld entry cannot be "removed from the request" because
 //      the entry is not in it, so the flag would cost a write and change nothing; if a host
 //      re-enables that entry later, the NEXT pass flags it);
-//   4. THE HORIZON: older than `thoughtTurns` thoughts, counted newest-first over the thought
-//      entries above. At the shipped 2 the open turn's thinking is safe (it is the newest thought,
-//      `ago` 0) — the tier's useful half, kept — and `0` reaches the open turn too;
-//   5. `minThoughtChars` measures the characters the write WOULD remove and below it the thinking
+//   4. THE CONTINUITY FLOOR, checked before the horizon: the NEWEST model step (rank `0`) is never
+//      withheld, at any setting. Its thinking may belong to a tool round the provider is still
+//      finishing, and a replayed round whose thinking has been stripped is a 400 rather than a
+//      saving, so this exemption is a provider constraint, not a policy (header, "THE HORIZON
+//      COUNTS MODEL STEPS, AND WHY"). `0` and `1` are therefore the same window;
+//   5. THE HORIZON: `thoughtTurns` MODEL STEPS newer than this entry. At the shipped 2 the two
+//      newest steps keep their thinking and EVERY thought behind them is flagged — in THIS pass,
+//      all at once, because there is no batching and no hysteresis on this axis. The rank falls
+//      strictly toward the end of the transcript, so what is selected is always a transcript-order
+//      PREFIX of the thinking entries: an entry is withheld only when every thinking entry after it
+//      is withheld too, which is the provider's "kept thinking is an unbroken run — omit the oldest,
+//      never an interior one" rule holding by construction;
+//   6. `minThoughtChars` measures the characters the write WOULD remove and below it the thinking
 //      side contributes NO writes. The tool side is untouched by this floor, exactly as the tool
 //      side's `minTokens` never touches these candidates.
 //
@@ -1779,23 +1871,30 @@ export const planWithheldThoughts = (
         if (withheldEntries?.has(entry.index)) continue;
 
         const turn: 'open' | 'closed' = entry.index > lastUserIndex ? 'open' : 'closed';
-        const turnsAgo = ago[entry.index];
+        // THE STEP RANK: how many assistant entries sit after this one (0 = the newest step).
+        const stepsAgo = ago[entry.index];
 
-        // (4) The horizon.
-        if (!olderThanHorizon(turnsAgo, settings.thoughtTurns)) continue;
+        // (4) THE CONTINUITY FLOOR, ahead of the horizon so no horizon value can reach it: the newest
+        // model step's thinking always travels. A provider that is about to answer this step's tool
+        // round replays its thinking, and a replayed round with the thinking stripped is a 400.
+        if (stepsAgo === 0) continue;
+
+        // (5) The horizon, same gate as every other horizon here (`ago >= N`).
+        if (!olderThanHorizon(stepsAgo, settings.thoughtTurns)) continue;
 
         selected.push({
             entryIndex: entry.index,
             ...(entry.messageId === undefined ? {} : { entryMessageId: entry.messageId }),
             turn,
-            turnsAgo,
+            stepsAgo,
             chars: message.reasoning.length,
+            tokens: estimateTokensFromChars(message.reasoning.length),
             firedBy: 'trimThoughts',
             horizon: horizonOf(settings.thoughtTurns)
         });
     }
 
-    // (5) THE FLOOR, in characters, over what would actually be written. `0` short-circuits it (the
+    // (6) THE FLOOR, in characters, over what would actually be written. `0` short-circuits it (the
     // shipped posture: no arithmetic on the default path). There is no rescue step any more: the
     // horizon IS the recent-N protection `thoughtKeepUnits` used to bolt on afterwards.
     const floor = Number.isFinite(settings.minThoughtChars)
@@ -2125,8 +2224,17 @@ const writableEntryOf = (
 // moved inside the awaited `pause()` used to produce a `false` → `false` write there — a
 // notification and a whole-document save for a change that did not happen, plus a report section
 // claiming a write this pass never made — and on the thinking side a shifted index could land on a
-// non-assistant entry, where the runtime THROWS. The loops skip silently for those reasons, and the
-// pass reports NOTHING when none of them wrote.
+// non-assistant entry, where the runtime THROWS. The loops skip for those reasons, and the pass
+// reports NOTHING when none of them wrote.
+//
+// A SKIP IS NOW NAMED, NOT SILENT (2026-11-14). A candidate the plan chose and the writer refused
+// used to vanish: the operator saw a pass that decided something and a report that said nothing, and
+// the only way to learn which entries had simply gone stale was to diff the plan against the
+// transcript by hand. `data.skipped` counts them per axis, and it is PRESENT ONLY WHEN NON-ZERO —
+// the same conditional-key shape the rest of this file uses — so a pass that wrote everything the
+// plan chose reports exactly the record it always reported, and the shipped byte-identity claims are
+// untouched. It is a COUNT and not a list: a skipped candidate's indices describe a transcript that
+// no longer exists, so naming them would quote addresses the reader cannot look up.
 const applyTrimPlan = async (
     api: HarnessPluginApi,
     context: HarnessTurnBeforeContext,
@@ -2140,6 +2248,11 @@ const applyTrimPlan = async (
 
     const entries = context.entries;
     const trimmed: TrimCandidate[] = [];
+    // Planned-but-not-written, per axis. See the header: counted, never listed, and reported only
+    // when non-zero.
+    let skippedUnits = 0;
+    let skippedTruncated = 0;
+    let skippedThoughts = 0;
 
     for (const candidate of candidates) {
         // (a) THE WHOLE UNIT — `members` is this candidate's WRITE SET (its STILL-SENT members,
@@ -2167,6 +2280,7 @@ const applyTrimPlan = async (
         }
 
         if (written) trimmed.push(candidate);
+        else skippedUnits += 1;
     }
 
     const truncatedWrites: TruncateCandidate[] = [];
@@ -2181,7 +2295,10 @@ const applyTrimPlan = async (
         // construction an assistant entry, so a role mismatch means the index moved.
         const entry = writableEntryOf(entries, candidate.leaderIndex, ['assistant']);
 
-        if (entry === undefined) continue;
+        if (entry === undefined) {
+            skippedTruncated += 1;
+            continue;
+        }
 
         // ONE entry: the request. Deliberately NOT `candidate.results` — those are exactly the
         // entries this switch keeps sending, and writing them would turn the truncate back into a
@@ -2199,7 +2316,10 @@ const applyTrimPlan = async (
         // either — the projection already skips it — so both are skips, not errors.
         const entry = writableEntryOf(entries, candidate.entryIndex, ['assistant']);
 
-        if (entry === undefined) continue;
+        if (entry === undefined) {
+            skippedThoughts += 1;
+            continue;
+        }
 
         // THE SECOND LIVE FLAG on the same entry. `included` says the entry rides; the thinking
         // flag is an independent switch on it, and the plan read that switch off the same snapshot
@@ -2207,7 +2327,10 @@ const applyTrimPlan = async (
         // otherwise get a `false` → `false` write: one notification, one save, no change.
         const message = entry.message as Extract<HarnessMessage, { role: 'assistant' }>;
 
-        if (message.reasoningIncluded === false) continue;
+        if (message.reasoningIncluded === false) {
+            skippedThoughts += 1;
+            continue;
+        }
 
         // The flag — not the text — is what changes, so `reasoning` survives in canonical state and
         // an operator can switch it back on.
@@ -2215,7 +2338,15 @@ const applyTrimPlan = async (
         withheld.push(candidate);
     }
 
-    if (trimmed.length === 0 && truncatedWrites.length === 0 && withheld.length === 0) return;
+    const skippedTotal = skippedUnits + skippedTruncated + skippedThoughts;
+
+    // A pass that wrote nothing AND skipped nothing is the ordinary no-op turn: no flag, no
+    // notification, no save, no report. A pass that wrote nothing but SKIPPED something is not that
+    // pass — it decided to trim and the transcript moved under it — and it now says so, because
+    // otherwise the operator's only evidence is a turn that looks untouched.
+    if (trimmed.length === 0 && truncatedWrites.length === 0 && withheld.length === 0 && skippedTotal === 0) {
+        return;
+    }
 
     // THE PASS REPORT — ONE diagnostic for the whole round, because a multi-unit pass is one
     // logical decision, and the three axes therefore share one report rather than producing three
@@ -2231,12 +2362,15 @@ const applyTrimPlan = async (
     //      took, which adds ` (request already withheld)` so the line is never read as a second
     //      truncation (see `requestAlreadyWithheldOnLine`);
     //   2. the truncate section — `#<index> <id> <names> results kept #<index>,…`;
-    //   3. the thinking section — `#<index> <id> <open|closed> <chars> chars via
-    //      trimThoughts=<horizon>` per entry. It names the turn because "why did the reasoning of MY
-    //      current turn go" is the first question an operator asks, the age in thoughts because that
-    //      is the number the horizon was compared against, and the characters rather than tokens
-    //      because the estimator does not count reasoning, so a token figure here would be a number
-    //      this pass cannot compute;
+    //   3. the thinking section — `#<index> <id> <open|closed> <n> steps old <chars> chars ~<tokens>
+    //      tokens via trimThoughts=<horizon>` per entry. It names the turn because "why did the
+    //      reasoning of MY current turn go" is the first question an operator asks, the age in MODEL
+    //      STEPS because that is the number the horizon is compared against (`turn` is context, not
+    //      the unit — the two would read as the same word and mean different things), and BOTH units
+    //      of the saving because the write is measured in characters (`minThoughtChars`) while every
+    //      other size in the product — the context bar, `minTokens`, `maxPromptTokens` — is a token
+    //      figure, and an operator who cannot see what a pass saved cannot tell a working trimmer
+    //      from a no-op;
     //   4. the fallback clauses for submitted values that were not honoured (unchanged).
     const clauses = fallbackClausesOf(settings);
     const sections: string[] = [];
@@ -2276,6 +2410,14 @@ const applyTrimPlan = async (
     }
 
     if (withheld.length > 0) {
+        // The per-entry age is in MODEL STEPS (the unit `thoughtTurns` is compared against — the
+        // `open|closed` turn the same line names is report context, not that unit), and the per-entry
+        // saving is stated TWICE — in characters, which is what the write removed and what
+        // `minThoughtChars` gates on, and in the shared `ceil(chars / 4)` token convention, which is
+        // the unit every other size number in the product uses. The token figure is DERIVED from the
+        // character figure, so the two can never disagree, and it is what makes a thinking pass
+        // visible to an operator reading the session: before it, the axis wrote flags and the only
+        // number anyone could see said the request had not changed.
         sections.push(
             `context-trimmer withheld ${withheld.length} thinking entry(s): ${withheld
                 .map(
@@ -2284,11 +2426,25 @@ const applyTrimPlan = async (
                             candidate.entryMessageId === undefined
                                 ? ''
                                 : ` ${candidate.entryMessageId}`
-                        } ${candidate.turn} ${candidate.turnsAgo} thoughts old ${candidate.chars} chars via ${
-                            candidate.firedBy
-                        }=${candidate.horizon}`
+                        } ${candidate.turn} ${candidate.stepsAgo} steps old ${candidate.chars} chars ~${
+                            candidate.tokens
+                        } tokens via ${candidate.firedBy}=${candidate.horizon}`
                 )
                 .join('; ')}`
+        );
+    }
+
+    // THE SKIP CLAUSE (2026-11-14), last of the axis sections and BEFORE the fallback clauses, and
+    // only when something was actually skipped: at zero the whole message is byte-identical to what
+    // this plugin has always written, which is what every shipped byte-identity claim in this file
+    // and its test suite rests on. It names the COUNT per axis rather than the indices, because a
+    // skipped candidate's indices address a transcript that is no longer the one in front of the
+    // reader — a number they can compare against "why did nothing move today" is useful, a list of
+    // stale addresses is not.
+    if (skippedTotal > 0) {
+        sections.push(
+            `context-trimmer skipped ${skippedTotal} planned write(s) whose entry had moved or was already off ` +
+                `(units ${skippedUnits}, requests ${skippedTruncated}, thinking ${skippedThoughts})`
         );
     }
 
@@ -2343,11 +2499,26 @@ const applyTrimPlan = async (
                     ? {}
                     : { messageId: candidate.entryMessageId }),
                 turn: candidate.turn,
-                turnsAgo: candidate.turnsAgo,
+                stepsAgo: candidate.stepsAgo,
                 chars: candidate.chars,
+                tokens: candidate.tokens,
                 firedBy: candidate.firedBy,
                 horizon: candidate.horizon
             })),
+            // Present ONLY when non-zero, for the same reason the message clause is: the shape of a
+            // clean pass's record is a pinned contract, and a zero-valued key added to every pass
+            // would make every existing `data` assertion a diff against a field that never means
+            // anything. A host that wants the figure can read `skipped ?? 0`.
+            ...(skippedTotal === 0
+                ? {}
+                : {
+                      skipped: {
+                          units: skippedUnits,
+                          requests: skippedTruncated,
+                          thinking: skippedThoughts,
+                          total: skippedTotal
+                      }
+                  }),
             policy: policyReportOf(settings, trimmed, withheld, truncatedWrites)
         }
     });
