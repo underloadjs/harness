@@ -63,7 +63,13 @@ import { AGENT_RESULT_RETENTION, DEFAULT_CREATED_TOOLS_LIMIT, MAX_THREAD_RECORDS
 // same malformed FORENSIC PAIR (review finding #5 / issues 0020 + 0033). Direct module import, the
 // same convention src/harness.ts uses for these two helpers: the core barrel does not re-export them.
 import { readSnapshotInteger, readSnapshotString } from '../../core/snapshot-validation';
-import type { HarnessAgentResultSnapshot, HarnessMessage } from '../../types';
+// R4: the ONLY definition of "why did a run stop", shared with the snapshot reader that validates the
+// same field on both durable rows (../core/snapshot.ts `readAgentResults` for the invocation row,
+// `readThreads` for the thread row). Same convention as the validation helpers above — the core
+// barrel does not re-export these, and importing the union from core is what keeps a lane payload
+// from inventing a reason that the reader then refuses on reload.
+import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from '../../core/snapshot';
+import type { HarnessAgentResultSnapshot, HarnessMessage, HarnessRunStopReason } from '../../types';
 import type { IdentityLedger } from './lane-identity';
 import { idOf } from './lane-identity';
 import { ABSENT_DIGEST, applyMemoryWrite, digestMemoryValue } from './lane-memory';
@@ -230,6 +236,40 @@ const readArchiveForensicPair = (mutation: {
     };
 };
 
+// R4: the third forensic field of a run that did not finish — WHY it stopped — with the identical
+// discipline `readArchiveForensicPair` applies to the pair above, because the same reader enforces
+// it on both (../core/snapshot.ts:342-364):
+//   * a value outside `HARNESS_RUN_STOP_REASONS` is REFUSED, never dropped. `'cancelled'` is the
+//     mistake that looks valid — it is a STATUS, not a reason — and quietly accepting it would send
+//     a consumer back to the prose-matching this field exists to end;
+//   * a `completed` status DROPS it. That is loadability, not leniency: ../core/snapshot.ts:360
+//     refuses to READ a completed invocation row that carries a stop reason, so a fold that kept one
+//     through a replacement archive would write a canonical view (and a next snapshot) that cannot be
+//     reloaded. A cancelled row that later completes is the ordinary case here.
+//
+// A throw is a PERMANENT refusal, mapped to `invalid-mutation` by the caller exactly as the pair's is.
+const readArchiveStopReason = (mutation: {
+    invocationId: string;
+    status: string;
+    stopReason?: string;
+}): { stopReason?: HarnessRunStopReason } => {
+    if (mutation.stopReason === undefined) return {};
+
+    const stopReason = readSnapshotString(mutation.stopReason, `Invocation "${mutation.invocationId}".stopReason`, {
+        min: 1
+    });
+
+    if (!isHarnessRunStopReason(stopReason)) {
+        throw new Error(
+            `Invocation "${mutation.invocationId}".stopReason must be one of: ${HARNESS_RUN_STOP_REASONS.join(', ')} (or be absent).`
+        );
+    }
+
+    if (mutation.status === 'completed') return {};
+
+    return { stopReason };
+};
+
 export type CanonicalView = {
     threads: Record<string, CanonicalThread>;
     stores: Record<RecordStoreName, CanonicalStore>;
@@ -394,6 +434,25 @@ export type SharedMutation =
           // the identical rule on the live side.
           partialContent?: string;
           cancelledAtMessage?: number;
+          // R4 (2026-11-15): WHY a run that did not finish ended — `stopped` (a host halt) vs
+          // `interrupted` (a lost worker) vs `refusal`/`error`. The forensic pair above says WHAT the
+          // run said and WHERE it stopped; this says WHO ended it, which is the one thing a client
+          // cannot derive from `status: 'stopped'` — the bare status also covers an approval hold and
+          // a parked subagent (../core/agent-limits.ts `AgentOutcomeStopReason`).
+          //
+          // Optional and validated (see `readArchiveStopReason`), so an older send stays valid. It is
+          // deliberately NOT in `archiveDigestOf`'s field list, and that is a load-bearing difference
+          // from the pair above rather than an oversight. The field NOW travels end to end — the op
+          // (./lane-worker-loop.ts), this fold, the canonical row, the authority's replay into
+          // `harness.archiveInvocation` (./lane-authority.ts), and the snapshot projection that reads
+          // it back — so the original blocker (an archive input that could not carry a cause) is
+          // closed. What still forbids putting it in the digest is VERSION SKEW, and it is the same
+          // failure the pair above documents: the digest is compared on BOTH sides of the seam, so a
+          // lane built before the field existed sends a row without the key while an authority built
+          // after it digests a row with the key. Add the field to the digest and every stop-reason row
+          // fails the idempotency test and re-archives on every boundary forever, on exactly the
+          // mixed pair that a rolling restart produces.
+          stopReason?: HarnessRunStopReason;
       }
     | { kind: 'tool:create'; name: string; source: string; revision: string }
     | { kind: 'tool:replace'; name: string; source: string; revision: string; expects: string }
@@ -1012,9 +1071,16 @@ export const applySharedMutation = (
             // worse than `applied`. Refusing here keeps the rule honest: a malformed pair never
             // becomes canonical state on either seam.
             let pair: { partialContent?: string; cancelledAtMessage?: number };
+            // R4: read in the SAME refusal site as the pair — a malformed reason is a permanent
+            // `invalid-mutation` on the same terms, and it must be checked before this fold touches
+            // `view`, exactly like the pair above. The rejection message KEEPS its original wording
+            // (a kernel-lane pin, ./lane-commit.test.ts:978); which field was malformed is already
+            // honest in the appended detail, because each validator names the field it rejected.
+            let reason: { stopReason?: HarnessRunStopReason };
 
             try {
                 pair = readArchiveForensicPair(mutation);
+                reason = readArchiveStopReason(mutation);
             } catch (error) {
                 return reject(
                     base,
@@ -1081,6 +1147,17 @@ export const applySharedMutation = (
                     // digests disagree permanently, which is the lane re-archiving the same row on
                     // every boundary.
                     ...pair,
+                    // R4: WHY the archived run stopped, carried into the canonical row with the same
+                    // completed-drop as the pair (see `readArchiveStopReason`). Kept OUT of
+                    // `archiveDigestOf`'s field list on purpose — ../core/snapshot.ts:360 shows the
+                    // reader treats it as forensic evidence of a run that did not finish, and the two
+                    // sides of this seam may disagree about whether the key exists at all while a
+                    // lane and an authority from different builds share a session. Both halves now
+                    // carry the field (the op in ./lane-worker-loop.ts and the kernel replay in
+                    // ./lane-authority.ts), so the only thing that would break it is adding the key to
+                    // the digest here while an older peer still digests without it: every stop-reason
+                    // row would re-archive on every boundary forever.
+                    ...reason,
                     ...(mutation.threadId === undefined ? {} : { threadId: mutation.threadId })
                 };
 
@@ -1120,7 +1197,10 @@ export const applySharedMutation = (
                 // validation and the same completed-drop as the replacement branch above. A first
                 // archive is the case the pair exists for: a cancelled lane child's canonical row gets
                 // what it SAID, not just the fact that it stopped.
-                ...pair
+                ...pair,
+                // R4: and the reason, on identical terms — see `replacedRecord` above for why the
+                // digest stays independent of it.
+                ...reason
             };
 
             view.results[record.invocationId] = record;

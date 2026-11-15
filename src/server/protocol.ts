@@ -13,6 +13,7 @@ import type {
     HarnessErrorInfo,
     HarnessEvent,
     HarnessMessage,
+    HarnessRunStopReason,
     HarnessUsage,
     ToolMediaDescriptor,
     ToolUiPanel
@@ -35,6 +36,7 @@ export type {
     HarnessErrorInfo,
     HarnessEvent,
     HarnessMessage,
+    HarnessRunStopReason,
     HarnessStopReason,
     HarnessThread,
     HarnessThreadOrigin,
@@ -174,13 +176,20 @@ export type SessionTurn = {
     references?: AgentResultReference[];
     // T14 gap (c): the `#LABEL`s this turn was submitted with that a DELETION took away.
     //
-    // A turn can be QUEUED (its lane had not claimed it yet) when the conversation it
-    // references is deleted, and `purgeDeletedThread` strips the dangling link because a
-    // persisted record must not name a target that no longer exists. Before this field the
-    // label simply VANISHED: the turn later ran bare, with no trace of the input it lost.
-    // The LABELS are kept and the ids are not — ids point at rows that are gone — so
+    // This field exists because a turn can be QUEUED (its lane had not claimed it yet) when a
+    // conversation it references goes away, and the retired purge stripped the dangling link:
+    // a persisted record must not name a target that no longer exists. Before this field the
+    // label simply VANISHED: the turn later ran bare, with no trace of the input it lost. The
+    // LABELS were kept and the ids were not — ids pointed at rows that were gone — so
     // `composeReferences` injects the same "was deleted, no result available" note that a
     // waiter whose target died mid-park gets, and the user is told what is missing.
+    //
+    // R2 CHANGED WHO WRITES IT: a thread deletion is a mark now, so the referenced turn's row
+    // SURVIVES, the link keeps resolving, and `markDeletedThread` strips nothing — it no
+    // longer populates this field. The field stays in the contract (and every reader still
+    // honours it) because a document written before this build carries it, and a turn whose
+    // target was destroyed by the one destructive path that remains — a reset, which drops
+    // every turn — can still owe the note.
     //
     // Persisted (./persistence.ts revalidates it) and additive: a document written before
     // this build has no key, and every turn that never lost a reference keeps its exact shape.
@@ -502,7 +511,23 @@ export type SessionThread = {
     origin: 'agent' | 'host';
     // 'paused' is the plugin-owned park at a turn boundary (types/index.ts
     // `HarnessThreadStatus`); the server only mirrors what the runtime reports.
+    //
+    // R4: 'stopped' does NOT mean "the host halted it". It means the conversation was
+    // HALTED BEFORE ITS CONCLUSION, by the host OR by an interruption (a restart, a
+    // provider failure, a budget or turn cap, a parent that released the call, a plugin
+    // park that outlived its run). WHICH of those it was is `stopReason` below — a client
+    // that reads the status alone must not claim the user did it. See ../types
+    // `HarnessRunStopReason` for the closed vocabulary.
     status: 'idle' | 'running' | 'paused' | 'stopped';
+    // WHY this conversation's LAST run ended short of its conclusion (../types
+    // `HarnessRunStopReason`), mirrored verbatim from the runtime record so a roster can
+    // tell "the user stopped it" from "it was interrupted, and its transcript is retained".
+    //
+    // ABSENT means "never ran" or "its last run concluded" — never guess the cause from
+    // `status` alone. The runtime clears the key when the conversation starts a fresh turn,
+    // so a stale reason is not possible; and a host submit (`sendThreadInput`) revives a
+    // halted conversation exactly as the resume route does.
+    stopReason?: HarnessRunStopReason;
     // Creation order (monotonic per session; copied from the runtime record).
     sequence: number;
     // The persistent parent thread (a delegated child links to its caller).
@@ -549,8 +574,14 @@ export type SessionThreadView = {
     agent: string;
     origin: 'agent' | 'host';
     // Same four states as `SessionThread.status` (the compact surface must not invent
-    // a narrower one, or a paused conversation would render as `undefined`).
+    // a narrower one, or a paused conversation would render as `undefined`), and the
+    // same R4 meaning: 'stopped' = halted before its conclusion, by the host OR by an
+    // interruption — the cause is `stopReason`, which this compact surface carries
+    // precisely so a strip does not have to open the transcript to explain itself.
     status: 'idle' | 'running' | 'paused' | 'stopped';
+    // Same rule as `SessionThread.stopReason`: present only for a run that stopped early,
+    // absent when it concluded (or never ran).
+    stopReason?: HarnessRunStopReason;
     sequence: number;
     ownerThreadId?: string;
     label?: string;
@@ -1061,10 +1092,18 @@ export type CancelThreadResult = {
 
 // Response of DELETE /sessions/:id/threads/:threadId (R6 delete).
 //
-// The thread, its descendants, every owning turn/result reference/transcript, and
-// their persisted copies are removed; `session` is the post-delete snapshot. A
-// running thread (or one with queued work) is rejected with 409 — stop it first —
-// and the default `agent:<name>` conversation is not deletable (400; use reset).
+// R2 (primary spec): a thread deletion is a MARK, not a purge. The conversation and its
+// descendants become INACTIVE — their rows, transcripts, turn records and agent results stay
+// in `state.json` and in `events.jsonl` — and `session` is the post-mark snapshot, which
+// simply no longer LISTS them. Nothing is destroyed here; the session itself being deleted
+// (or reset) is the only path that removes records, and a shell reading
+// `<databaseRoot>/harness/state.json` still finds every retired conversation.
+//
+// `removed_descendants`/`removed_turns` (the REST body's own fields, ../shared
+// `DeleteThreadResult`) therefore state the SIZE of the retired set, not a count of destroyed
+// rows. A running thread (or one with queued work) is stopped by the call
+// first; the default `agent:<name>` conversation is not deletable (400; use reset), and a
+// conversation that is already retired is a 404 — the tooling does not discover it any more.
 export type DeleteThreadResult = {
     deleted: true;
     session: SessionSnapshot;

@@ -15,6 +15,9 @@
 //     value before it mints an order or writes a row, drops the pair on a completed
 //     status, and returns what it stored, which is the record the lane seam digests
 //     (review finding #5, issues 0020 + 0033);
+//   - a non-completed row additionally carries `stopReason` (issue 0036 R3): the CAUSE of
+//     the halt (`api-error`, `caller-released`) beside `status`, never replacing it and
+//     never a progress measure;
 //   - no system prompt, transcript message, tool argument, or tool body is ever
 //     exposed: only the completed assistant answer value is recorded.
 
@@ -516,14 +519,23 @@ describe('agentResult', () => {
         await expect(writer('go')).rejects.toThrow('transport exploded');
 
         // T28: a failed run reports its forensic state too. `cancelledAtMessage` is how
-        // many messages the run had appended before the rollback removed them, and
-        // `durationMs` is the measured span. Both are present only when the run actually
-        // got that far, so this pins the shape of a run that failed on its first request.
+        // many messages the run had appended when it ended — issue 0036 R1 RETAINS those
+        // messages, so the count and the conversation now agree instead of describing a
+        // splice that no longer happened. `durationMs` is the measured span. Both are
+        // present only when the run actually got that far, so this pins the shape of a run
+        // that failed on its first request.
         expect(await writer.executeTool('agentResult', { agent: 'writer' })).toEqual({
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
             status: 'failed',
+            // F-A Defect 1 (2026-11-15): this door now projects the record's `stopReason`,
+            // the machine-readable cause. A transport error with `retry: false` is the
+            // classifier's `api-error` branch — the same value the SNAPSHOT row of this run
+            // already carried (see the `persists failed results` pin below). Added because
+            // the row genuinely has it now; `status: 'failed'` alone cannot tell a first-
+            // attempt provider failure from an exhausted retry policy.
+            stopReason: 'api-error',
             content: '',
             contentLength: 0,
             offset: 0,
@@ -981,6 +993,11 @@ describe('snapshot durability (R3)', () => {
                 role: 'primary',
                 kind: 'root',
                 status: 'failed',
+                // Issue 0036 R3: the CAUSE of the halt travels on the row beside the
+                // status. A transport failure that exhausted its attempts classifies as
+                // `api-error` — the classifier's fallback branch for a run that died on
+                // the provider, not a progress measure and not a second status.
+                stopReason: 'api-error',
                 content: '',
                 error: 'transport exploded',
                 // Issue 0033: the position the run reached is stored with the row, and it
@@ -1005,6 +1022,12 @@ describe('snapshot durability (R3)', () => {
             invocationId: '1',
             kind: 'root',
             status: 'failed',
+            // F-A Defect 1 (2026-11-15): the cause survives the restart in BOTH places —
+            // the row above carries it, and after `restore()` this door reads it back off
+            // the re-projected record. That is the durability half of R4: a caller asking
+            // "why did it stop" after a reboot gets the same machine-readable answer it
+            // would have got before one.
+            stopReason: 'api-error',
             content: '',
             contentLength: 0,
             offset: 0,
@@ -1605,6 +1628,12 @@ describe('terminal commit is atomic for a finished run (B2)', () => {
             invocationId: '2',
             kind: 'root',
             status: 'cancelled',
+            // F-A Defect 1 (2026-11-15): the run was halted by `writer.stopThread`, which
+            // is the host's intent, so the cause is `user-stopped` — not `caller-released`
+            // (a peer that walked away) and not `timeout`. This is the whole point of the
+            // field: the two runs above and below this one are BOTH non-completed, and only
+            // this key says which kind of non-completion each one is.
+            stopReason: 'user-stopped',
             content: '',
             contentLength: 0,
             offset: 0,
@@ -1677,10 +1706,15 @@ describe('terminal commit is atomic for a finished run (B2)', () => {
 // persistence
 // ---------------------------------------------------------------------------
 //
-// `partialContent` and `cancelledAtMessage` are the ONLY surviving account of a
-// cancelled or failed run: the transcript rollback in `runAgentCore`'s catch
-// (`src/harness.ts:11486`) splices the run's own messages out, so a post-mortem has
-// exactly these two fields plus `error`. They were also RUNTIME-ONLY. The snapshot
+// `partialContent` and `cancelledAtMessage` were, when issue 0033 shipped, the ONLY
+// surviving account of a cancelled or failed run: the transcript rollback in
+// `runAgentCore`'s catch spliced the run's own messages out, so a post-mortem had
+// exactly these two fields plus `error`. Issue 0036 R1 retired that splice for a
+// THREAD-BOUND run — its committed turns (plus one synthesized answer per unanswered
+// call) now stay in the conversation, so the pair is corroborating evidence beside a
+// readable transcript rather than the only trace. It is still the ONLY account for a
+// branch/ephemeral run, which keeps its rollback, and for any post-mortem that reads
+// the row without the conversation. They were also RUNTIME-ONLY. The snapshot
 // projection wrote `content` alone — empty for a non-completed run — and `restore()`
 // rebuilt the record without the pair, so the restart took back an answer the caller
 // had already been shown. `Temp/t12-verify/probes/t12-snapshot-partial.test.ts`
@@ -1704,7 +1738,9 @@ describe('terminal commit is atomic for a finished run (B2)', () => {
 // (64, `src/core/agent-limits.ts:25`). No new size cap was introduced; `content` was
 // already stored in full and paged on READ, and this field follows that precedent.
 //
-// What still does NOT survive, and deliberately: the run's transcript (rolled back),
+// What still does NOT survive, and deliberately: the run's transcript in the RESULT row
+// (0036 R1 retains it in the CONVERSATION for a thread-bound run; a branch run still
+// rolls back, and either way the result row itself never carried it),
 // its tool calls and tool bodies (0020's leak boundary, 0032), and `durationMs` — a
 // wall-clock measurement of the run this process made, not part of 0033's gap, so the
 // restored envelopes below assert its ABSENCE rather than inventing a value.
@@ -1808,6 +1844,12 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             invocationId: '1',
             kind: 'root',
             status: 'cancelled',
+            // F-A Defect 1 (2026-11-15): the run died on the CALLER's own abort signal
+            // (`controller.abort`), which is `caller-released`, and the persisted row below
+            // has always said so — this door was the one still answering `undefined`. It is
+            // pinned identically at every surface in this test on purpose: live row,
+            // durable row, and the post-restart read must not disagree about the cause.
+            stopReason: 'caller-released',
             content: 'half an answer',
             contentLength: 14,
             offset: 0,
@@ -1834,6 +1876,12 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             role: 'primary',
             kind: 'root',
             status: 'cancelled',
+            // Issue 0036 R3: the row names WHY the run halted, separately from the fact
+            // that it was cancelled. The caller released the run through its own abort
+            // (`operator stop` is the abort reason), which classifies as
+            // `caller-released`; a host stop would say `user-stopped` instead, and only
+            // the first of those is resumable by `threadSend`.
+            stopReason: 'caller-released',
             content: '',
             error: 'operator stop',
             partialContent: 'half an answer',
@@ -1852,6 +1900,10 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             invocationId: '1',
             kind: 'root',
             status: 'cancelled',
+            // F-A Defect 1 (2026-11-15): SURFACE 3 — the restart keeps the cause too, which
+            // is the point of validating it in `core/snapshot.ts`: a reader that dropped it
+            // would make this door answer `undefined` only after a reboot.
+            stopReason: 'caller-released',
             content: 'half an answer',
             contentLength: 14,
             offset: 0,
@@ -1866,12 +1918,12 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
         // drifting the archive a second time.
         expect(rowOf(target.snapshot(), invocationId)).toEqual(rowOf(snapshot, invocationId));
 
-        // SURFACE 4 — the owner is the point of persisting it: deleting the conversation AFTER
-        // the reload has to take the archived result with it, exactly as the same delete does
-        // BEFORE the reload. Before 0033/0024 the restored record had no `threadId`, so
-        // `purgeThread`'s predicate (`record.threadId === threadId`) missed it and the row
-        // outlived its conversation. Both doors are asserted, in the same run, so the parity is
-        // the finding rather than an assumption.
+        // SURFACE 4 — the owner is the point of persisting it, and BOTH doors have to
+        // behave the same way: the delete runs on the live record and on the RELOADED one.
+        // Before 0033/0024 the restored record had no `threadId`, so `purgeThread`'s
+        // predicate (`record.threadId === threadId`) missed it and only the live door
+        // reached the row. Both doors are asserted in the same run, so the parity is the
+        // finding rather than an assumption.
         expect(source.deleteThread(threadId)).toEqual({
             deleted: threadId,
             removedThreadIds: [threadId],
@@ -1885,11 +1937,22 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             removedBranchIds: []
         });
 
-        // Neither side keeps a row whose owner is gone, and the reloaded harness reads the id
-        // as archived-and-deleted, not as still addressable.
-        expect(rowOf(source.snapshot(), invocationId)).toBeNull();
-        expect(rowOf(target.snapshot(), invocationId)).toBeNull();
+        // What a delete leaves behind is issue 0036 R2's, and the two sentences of it are
+        // pinned together here: the CONVERSATION is no longer addressable (`thread()` is
+        // gone on both surfaces), while the FORENSIC ROW is retained — the delete marks the
+        // owner released, it does not destroy what the owner recorded. That is why the
+        // receipt above says `removedInvocationIds: ["1"]` and the row is still readable
+        // below: the id stopped being LISTED under a conversation that is itself no longer
+        // listed, which is not the same claim as "the row was deleted", and the whole value
+        // of a forensic partial is that it survives the register that carried it. Re-captured
+        // from an actual run: byte-for-byte the row that was archived before the delete,
+        // identical on the live and the reloaded surface (the parity half of this test).
+        const archived = rowOf(snapshot, invocationId);
+
+        expect(rowOf(source.snapshot(), invocationId)).toEqual(archived);
+        expect(rowOf(target.snapshot(), invocationId)).toEqual(archived);
         expect(target.thread(threadId)).toBeUndefined();
+        expect(source.thread(threadId)).toBeUndefined();
     });
 
     it('carries a failed run partial through snapshot -> restore', async () => {
@@ -1934,6 +1997,11 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             invocationId: '1',
             kind: 'root',
             status: 'failed',
+            // F-A Defect 1 (2026-11-15): the transport died mid-run, so the classifier's
+            // provider branch stamped `api-error`; the durable row below has always carried
+            // that value and this door now reads the same record. `cancelledAtMessage: 3`
+            // stays the POSITION — the two fields answer different questions.
+            stopReason: 'api-error',
             content: 'a partial before the crash',
             contentLength: 26,
             offset: 0,
@@ -1955,6 +2023,10 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             role: 'primary',
             kind: 'root',
             status: 'failed',
+            // Issue 0036 R3: the cause travels beside the status — a provider that died
+            // mid-run classifies as `api-error`, the classifier's transport branch. It is
+            // a cause, not a progress measure: `cancelledAtMessage` stays the position.
+            stopReason: 'api-error',
             content: '',
             error: 'transport died mid-run',
             partialContent: 'a partial before the crash',
@@ -1971,6 +2043,9 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             invocationId: '1',
             kind: 'root',
             status: 'failed',
+            // F-A Defect 1 (2026-11-15): after the JSON round trip the cause is still the
+            // same one the live door reported — persistence does not downgrade it to prose.
+            stopReason: 'api-error',
             content: 'a partial before the crash',
             contentLength: 26,
             offset: 0,

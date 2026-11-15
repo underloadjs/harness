@@ -33,7 +33,7 @@
 //   - ./handler.ts:170   — `runHarnessSseStream` (the `Readable.fromWeb` bridge)
 //   - ./index.ts:11-14   — the barrel surface this file imports from
 //   - ../../README.md ("Service host") — the recipe these tests back
-//   - docs/issues/minor-streaming-and-adapter-ergonomics.md — the gap being closed
+//   - issue 0006 (closed 2026-11-11) — the gap being closed
 
 import http from 'node:http';
 import { describe, expect, it } from 'vitest';

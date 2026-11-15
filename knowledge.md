@@ -1077,7 +1077,7 @@ declares:
 - every `visibility: 'core'` tool, and
 - every searchable tool the ENABLED set carries — what `toolRequest` or `toolManage`
   has switched on, plus whatever the host seeded at construction
-  (`HarnessConfiguration.enableAllTools`, `src/types/index.ts:3621`; a library
+  (`HarnessConfiguration.enableAllTools`, `src/types/index.ts:4008`; a library
   caller gets an empty set unless it asks, the shipped server asks for every session
   it creates, see below).
 
@@ -1142,10 +1142,10 @@ surfaces sit ABOVE that set, and their scope is a contract, not an implementatio
 CORRECTED IN PLACE 2026-11-13: this bullet list is new — the section previously said
 nothing about scope, which read as "process-wide, like the deny list". The copy is taken at
 session creation (`src/server/plugins.ts` `copyPluginSettingsStore:713`, called from
-`src/server/sessions.ts:2186`) and injected with the harness (`src/server/sessions.ts:2370`,
+`src/server/sessions.ts:2268`) and injected with the harness (`src/server/sessions.ts:2490`,
 `pluginSettings: plugins.provider`), so `PATCH /v1/harness/plugins/:id` changes only the
 sessions created AFTER the write while `PATCH /v1/harness/sessions/:id/plugins/:plugin_id`
-(`src/server/api.ts:2828`) changes one live conversation from its next turn. A session's own
+(`src/server/api.ts:2864`) changes one live conversation from its next turn. A session's own
 tool REGISTRATIONS were always session-scoped
 (`/v1/harness/sessions/:id/tools[/:tool_id]`) — the distinction worth keeping is that a
 registration changes what THIS session holds, while the deny list changes what the
@@ -1409,7 +1409,7 @@ made the collection key identical to the tool name, Decision I kept it `core`, a
 renamed the original `todoManage`.
 
 It is still a **deliberate exception to the stateless-tool rule**: the state lives in the
-engine instance the harness constructs (`src/harness.ts:3521`, `createRecordEngine()`), never in a module
+engine instance the harness constructs (`src/harness.ts:3851`, `createRecordEngine()`), never in a module
 singleton, so one harness owns exactly one store and two harnesses — i.e. two server
 sessions — can never share records.
 
@@ -1455,7 +1455,7 @@ const engine = createRecordEngine();   // collections + the single id counter + 
 - **Every recorded event also bumps the store**: one `RecordChange` per accepted change
   goes into THAT collection's FIFO window capped at `RECORD_MAX_CHANGES` (200,
   `src/core/records.ts:165`) and that collection's `storeRev` advances by one; the op is
-  `add` | `update` | `remove` ONLY (`src/types/index.ts:1491` — `claim`/`release` are
+  `add` | `update` | `remove` ONLY (`src/types/index.ts:1827` — `claim`/`release` are
   gone, so there is no ownership event to log and nothing to sweep when a thread dies).
   A no-op patch records nothing, which is why a heartbeat cannot knock a reader off its
   revision.
@@ -1491,7 +1491,7 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   reader is never woken by chapter edits. A `since` ahead of `storeRev` is an error, and those
   three keys are absent from every other result.
 - Validation names the offending field with a quoted, balanced path, labelled by the
-  TOOL name (the engine's `callLabelOf`, `src/core/records.ts:270-271`):
+  TOOL name (the engine's `callLabelOf`, `src/core/records.ts:279-280`):
   `tasks "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`
   (`src/core/records.ts:1538`);
   the harness turns the throw into a recoverable tool result.
@@ -1524,7 +1524,7 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   collection key is `tasks`, and the v1 sibling `records.todos` is gone (Decision K made
   the key equal the tool name). Entries are full records including `rev` and the
   attribution fields, and the definition persists with them (Decision M).
-  `readRecordsStoreState` (`src/core/records.ts:2218`) validates that block and returns
+  `readRecordsStoreState` (`src/core/records.ts:2369`) validates that block and returns
   deep copies; it is the SAME reader `src/core/snapshot.ts:985` runs the persisted value
   through before a session is accepted, so a corrupt file cannot half-restore a live
   store. A duplicate id inside one collection reports with the persisted field name
@@ -1805,9 +1805,15 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   means the run really had nothing in hand, and the answer stays ABSENT rather than becoming a
   synthetic `""` (which is what keeps the reader's `min: 1` bound meaningful, below). What has
   NOT moved is the leak boundary, and it stays emphatic: a row's partial is TEXT and nothing
-  else — never a tool call, never a tool result. Those are rolled back out of the transcript
-  with the run and appear in no door's answer (issue 0020's leak boundary, the criterion
-  issue 0032 is written against).
+  else — never a tool call, never a tool result, so `agentResult`'s answer stays text-only.
+  WHAT MOVED (IT19 R1, 2026-11-15) is where those blocks live: an interrupted run attached to
+  a conversation now KEEPS its committed turns, so its calls and results stay in that
+  transcript and `threadRead` shows them, with a lone unanswered call closed by the repair
+  helper's interrupted placeholder (`SYNTHESIZED_INTERRUPTED_TOOL_RESULT_TEXT`,
+  `src/core/transcript-repair.ts:79`). Only a forked BRANCH run still splices. The boundary
+  this bullet guards is therefore narrower than it used to be — row-level, not
+  transcript-level — and it is still the criterion issue 0032 is written against, whose
+  transcript half R1 retired (see the issue record for 0036).
 - **Completed answers only.** The registry records the value `runAgentCore`
   returns, never a streamed delta, so an explicitly addressed running invocation
   has `status: 'running'` and no content and is OMITTED from a snapshot (never
@@ -2889,6 +2895,28 @@ const team = harness({
   to a pending-only control like any other name — which is the hazard worth naming: the model
   is left with no way to withdraw an in-flight call while the server-side machinery it cannot
   reach keeps running.
+- **An unfinished child leaves an ADDRESSABLE trail (IT19 R1/R3/R5, 2026-11-15).** A cut run
+  keeps every turn it COMMITTED: its tool calls and tool results stay in that child's
+  transcript, which `threadRead` answers, and only a call left without an answer is recorded
+  as interrupted (`src/core/transcript-repair.ts:79`) — the pairing a strict provider demands
+  is what makes retention safe. Retention is keyed on the run OWNING a thread
+  (`run.threadState !== undefined`): a forked BRANCH run has none and still splices to its
+  fork baseline, which is why the `threadFork` branch wording is unchanged. The child's record
+  carries `stopReason` — WHY it halted, never how far it got — and an agent may continue a
+  child whose run was cut short with `threadSend` (receipt `"resumed"`), while a host stop
+  (`user-stopped`), a plugin park (`plugin-parked`) or an absent reason stay host-only; an
+  INACTIVE (deleted) child is refused before any status branch, because typing into a
+  conversation off the roster is not a door an agent owns.
+  A pending PLACEHOLDER is not the end of the account either: `deliverOwedAccounts`
+  (`src/harness.ts:9571-9656`, upgrade arm `:9583-9611`) pays every debt at the TOP of the parent's next turn, before
+  the mailbox drain, and rides the call's own slot. When that slot holds the R1 interrupted
+  placeholder — a retained run cut off mid-`delegate` whose child kept working and finished
+  later — the placeholder is UPGRADED IN PLACE with the real account: same call id, same
+  position, same `messageId`, no `outcome` key, so the model is never told two contradictory
+  facts about one call. If the account cannot be described (the child's ledger row is gone),
+  the placeholder stays: an honest "no outcome was recorded" beats an empty rewrite. A late
+  child never WAKES a concluded parent — the account defers to that parent's next turn, and
+  `agentResult` remains the durable half.
 - **`maxTurns` is a second OPTIONAL, caller-set bound (I5, 2026-11-13; unit corrected
   2026-11-14, stress report #7).** It counts the child's MODEL REQUESTS — the
   `run.iteration` the loop increments once per `requestTurn` — beside `timeoutMs`'s
@@ -2931,15 +2959,15 @@ const team = harness({
   thread of the same agent writes into the same shared ledger, so both retired heuristics
   could hand a caller ANOTHER run's identity and status. CORRECTED IN PLACE (2026-11-14,
   independent review — C5): the two sentences above read as if the carrier path were the
-  whole rule. `newInvocationOf` (`src/harness.ts:4595-4623`) is a THREE-step chain and only
-  TWO steps are exact — (1) the carrier address plus its verification (`:4596-4607`),
+  whole rule. `newInvocationOf` (`src/harness.ts:4909-4938`) is a THREE-step chain and only
+  TWO steps are exact — (1) the carrier address plus its verification (`:4913-4924`),
   (2) the `(parentCallId, parentScope)` pair, compared with `===` on both fields
-  (`:4611-4621`), and (3) a set-difference that is still DISCOVERY: "the first record for
-  that agent that was not already known at dispatch" (`:4623`, against the snapshot taken at
-  `:4576-4578`). Steps 2 and 3 run only when the child wrote no carrier, and step 3 can
+  (`:4928-4938`), and (3) a set-difference that is still DISCOVERY: "the first record for
+  that agent that was not already known at dispatch" (`:4940`, against the snapshot taken at
+  `:4893-4895`). Steps 2 and 3 run only when the child wrote no carrier, and step 3 can
   therefore still adopt a concurrent run of the same agent and report it as this call's
   child — the residual the in-code comment already admits ("both are fallible; a carrier
-  always wins", `:4590-4594`). NO TEST exercises step 3: every child a harness run starts
+  always wins", `:4909-4911`). NO TEST exercises step 3: every child a harness run starts
   writes the carrier, and the two fixtures that call `runtime.delegate` directly forward
   `context.run!` unchanged (`src/harness.delegation.test.ts:1640`, `:2091`). The
   pair-addressed fallback
@@ -3076,9 +3104,13 @@ descriptors (22 runtime entries).
     span) stops being reachable until a run mints the link again.
 - **`threadList` returns the family roster**, newest last, with `currentThreadId`
   naming the caller's own thread; a threadless caller gets every thread in the
-  session, as before. Deleted threads are absent by construction — and permanently
-  so: threadList/Read/Send/Delete all treat a released id as unknown ("it was never
-  created, or it was deleted").
+  session, as before. A RELEASED thread is absent by construction — but released means
+  MARKED, not destroyed (IT19 R2, 2026-11-15): `purgeThread` sets `inactive`/`inactiveAt` and
+  the record, its transcript and its invocation rows are RETAINED, so the roster and `actOn`
+  stop naming it while a host can still read it by id, and every AGENT door refuses it with its
+  own sentence rather than the "never created, or it was deleted" wording. The row also carries
+  `stopReason` (R3/R5) — see the `threadSend` bullet for which stopped rows an agent send may
+  continue.
   - **The fields, exactly.** `origin` has TWO values (`HarnessThreadOrigin`,
     `src/types/index.ts`): `'agent'` is an agent's DEFAULT standing conversation (the
     `agent:<name>` address), `'host'` is a conversation on top of an agent — a
@@ -3157,7 +3189,9 @@ descriptors (22 runtime entries).
   spans, not only the sender's own; anything else outside the lineage is refused with a
   sentence distinct from not-found ("the id exists — it is simply outside your
   lineage"), so a model can tell a roster problem from a typo. The target's state decides
-  delivery, and the receipt names it: running → `"queued"` (mid-run steering at
+  delivery, and since IT19 R5 the receipt names which of THREE operations it caused —
+  `"queued"` STEERING, `"started"` CONTINUE, `"resumed"` RESUME — never a bare word.
+  running → `"queued"` (mid-run steering at
   the next safe model boundary — including a message to your OWN running thread),
   a PLUGIN-PARKED (`paused`) target → also `"queued"`, and the park is LEFT EXACTLY AS IT
   WAS — no resume, no run, because the holder of the park is waiting for its own turn
@@ -3185,14 +3219,43 @@ descriptors (22 runtime entries).
   promised a door it then refused. A receipt with NO note now means "no live thread of
   that agent is reachable from here", which is a truthful answer rather than a missing
   hint; a threadless (host) caller is unscoped and keeps every candidate.
-  A stopped thread remains host-revive-only.
+  A STOPPED thread is no longer uniformly host-revive-only (IT19 R3/R5, 2026-11-15): the
+  record's `stopReason` decides. A run that was cut short — `caller-released`, `timeout`,
+  `turn-cap`, `budget-exhausted`, `api-error`, `retries-exhausted` or `parent-closed` — takes an
+  agent `threadSend`, and that send reports `"resumed"` because the retained turns continue the
+  same conversation instead of opening a fresh one. A thread the HOST stopped (`user-stopped`),
+  one a plugin parked (`plugin-parked`), and one stopped with NO recorded cause are refused —
+  only a host `sendThreadInput` revives those. An INACTIVE target is refused too, ahead of any
+  status branch: its record and transcript are retained for a host read, but it is off the
+  roster and takes no messages THROUGH THIS DOOR — `threadSend` is the agent-facing one, and the
+  host `sendThreadInput` remains the revival that lifts `inactive` (see the thread-lifecycle
+  bullet below). Every refusal queues nothing, so a failed send never leaves a message waiting to
+  land.
 - **`threadDelete` releases a FINISHED thread you own (B5 — closes issue 0027).**
-  The model-facing counterpart of the host `deleteThread`: explicit and PERMANENT
+  The model-facing counterpart of the host `deleteThread`: explicit and MANUAL
   (the issue's rejection of auto-delete holds — a settled child stays readable
-  until its owner says otherwise). `thread` must be a STRICT DESCENDANT of the
+  until its owner says otherwise). PERMANENT is retired wording (IT19 R2, 2026-11-15):
+  `deleteThread` MARKS the record `inactive` (+ `inactiveAt`) through `purgeThread`, and the
+  row, its transcript and its invocation rows SURVIVE — the generation still bumps, the queue
+  is still cleared, and a second `threadDelete` on a released descendant RESTATES the first
+  receipt without re-marking, without a fresh `inactiveAt` and without a second
+  `thread.deleted` hook. Nothing an agent does destroys a conversation; only deleting the
+  session does - with one bound this passage now states plainly: the roster holds at most
+  `MAX_THREAD_RECORDS` (256) rows, and once it is over that bound `capThreadRecords`
+  (`src/server/sessions.ts:4787`, mirrored inside the harness by `capRetiredThreadRecords` at
+  `src/harness.ts:762`, the constant being `core/thread.ts:46`) retires the OLDEST released rows
+  TOGETHER WITH their transcript rows. So a released conversation stays readable until the cap
+  passes it - a bounded roster of 256 thread records, not every row ever. The tool text states
+  the same bound (`src/tools/runtime/threadDelete.tool.ts`). `thread` must be a STRICT
+  DESCENDANT of the
   caller (`threadDeleteFor` walks the persistent owner chain): your own current
   thread, an ancestor, a sibling, and another agent's conversation are refused by
-  name; a RUNNING thread is refused ("stop it first"); the default `agent:<name>`
+  name; a RUNNING thread is refused ("stop it first") — and the remedy is named in the
+  description now, because the sentence used to imply a door that does not exist: there is NO
+  thread-stop tool, and an agent's only stop is `toolCancel` on a call ITS OWN run started,
+  which does end a delegated child (the child's signal is linked to that call's controller, so
+  the child lands `stopped` + `stopReason: 'caller-released'` with its turns retained); the
+  default `agent:<name>`
   conversations are refused; a threadless caller gets the unscoped host operation
   verbatim. A FORK's `branch-N` id gets its OWN truthful refusal, not the generic
   not-found (2026-11-14, stress report #4): the delete seam resolves the branch ledger
@@ -3209,12 +3272,26 @@ descriptors (22 runtime entries).
   removedBranchIds }` (`HarnessThreadDeleteResult`) — the state the caller caused.
   The last two were added because the purge silently SHRINKS the agent-result registry:
   `purgeThread` releases the invocation records owned by everything that went (it now
-  RETURNS the two id sets instead of throwing them away), so `agentManage`'s counts drop
-  and `agentResult(id)` starts throwing, and a caller auditing a reaping loop needs to see
-  which ids went with the conversation. Both arrays are ALWAYS present, and empty means
-  "purged nothing", not "did not say" — this is a report, not a durability change: nothing
-  is moved out of the registry, and a released conversation's results stay released.
-  Deleted ids are unknown to every thread door,
+  RETURNS the two id sets instead of throwing them away), so `agentManage`'s counts drop and
+  the released ids stop being LISTED — and a caller auditing a reaping loop needs to see which
+  ids went with the conversation. IT19 R2 changed what the two sets MEAN, not their names:
+  `removedInvocationIds` now lists the rows that stopped being LISTED (the rows themselves are
+  retained, and `agentResult` still answers an explicit `invocationId` the caller already
+  holds), while `removedBranchIds` is the one set genuinely REMOVED, because a branch lives in
+  the bounded branch ledger and not in a conversation. **A REPEAT DELETE RESTATES THE TWO HIDDEN
+  SETS (2026-11-15, F-A Defect 3):** re-deleting an already-released id used to answer three
+  fields under three different rules — `removedThreadIds` = only what THIS call newly marked (so a
+  cascade child the first release had already hidden was missing), `removedInvocationIds` = what
+  is STILL hidden (the first receipt's set), `removedBranchIds` = empty — while the tool text an
+  agent reads promises the retry "restates the same receipt". The code now follows that promise:
+  the two fields that describe RETAINED-but-hidden state (`removedThreadIds`,
+  `removedInvocationIds`) are restated in full, in the first receipt's order, and only
+  `removedBranchIds` keeps the "newly by this call" reading — that one is the accurate exception,
+  because the branch ledger row really did go. Pinned at `src/harness.thread-runtime.test.ts`
+  (the B5 reaping case, both receipts compared) and in `src/tools/runtime/threadDelete.test.ts`
+  (the receipt prose). Both arrays are ALWAYS present, and
+  empty means "released nothing", not "did not say". A released id is off every AGENT door,
+  while a host read still resolves it,
   and the 256-thread cap (`MAX_THREAD_RECORDS`, `core/thread.ts` — `createThreadState`
   THROWS at it) is finally actionable from inside a session. Worker mode classifies
   it as authority work: `threadDelete` is in `AUTHORITY_RUNTIME_METHODS`
@@ -3232,14 +3309,14 @@ descriptors (22 runtime entries).
   it the same `threadDelete` removed an inline conversation's results and left a lane
   conversation's behind. **THE CASCADE IS A DURABLE RULE (the C6 hole this passage recorded on
   2026-11-14 — issue 0027's dated update — is CLOSED):** the owner travels with the row end to
-  end. `HarnessAgentResultSnapshot.threadId` exists (`src/types/index.ts:3405`), the snapshot
-  projection writes it when the invocation has a conversation (`src/harness.ts:12900-12926`,
+  end. `HarnessAgentResultSnapshot.threadId` exists (`src/types/index.ts:3559`), the snapshot
+  projection writes it when the invocation has a conversation (`src/harness.ts:13911-13943`,
   the `agentResults` map in `snapshot()`), `restore()` rebuilds it with the row
   (`:13259-13288`), and the reader accepts and validates the key — MAY-BE-ABSENT like `error`,
   so an old file still loads, and a present one must be a non-blank string, so a hand-edited
   `threadId: ""` is refused rather than restored into an owner that matches no conversation
-  (`src/core/snapshot.ts:148,159,285-289`). After a `snapshot()` → `restore()` round trip the
-  cascade's PRIMARY predicate (`record.threadId === threadId`, `src/harness.ts:6446`) therefore
+  (`src/core/snapshot.ts:180,198,320-326`). After a `snapshot()` → `restore()` round trip the
+  cascade's PRIMARY predicate (`record.threadId === threadId`, `src/harness.ts:6915`) therefore
   still matches: deleting a conversation AFTER a reload takes its archived results exactly as
   the same delete does BEFORE it, inline or lane-archived, and the four-field receipt names the
   same ids either way. That parity is pinned, both doors in one run, by
@@ -3248,30 +3325,30 @@ descriptors (22 runtime entries).
   and the `threadId` rows of its forensic-value case) and by the on-disk row plus reload
   asserted in `src/server/threads.test.ts`. TWO boundaries survive and neither is a cascade
   hole: `threadId` is ABSENT only on a row whose run resolved no conversation at all
-  (`runThreadId`, `src/harness.ts:12415` — an ephemeral branch whose parent had none, or a brain
+  (`runThreadId`, `src/harness.ts:13405` — an ephemeral branch whose parent had none, or a brain
   outside the registry), while an ordinary root run names the agent's default conversation,
   `agent:<name>`, and matches after a reload like every other one; and a run still `running` at
-  snapshot time is not persisted at all (the projection filters it at `:12901`, and the thread
-  row drops its `invocationId` for the same reason, `:12949-12951`), which is the unchanged "a
+  snapshot time is not persisted at all (the projection filters it at `:13912`, and the thread
+  row drops its `invocationId` for the same reason, `:13966-13968`), which is the unchanged "a
   snapshot never claims work is live" rule. WHAT A RELOAD STILL DOES NOT RESTORE is the
   PER-CALL attribution: `parentScope`/`parentCallId` live on the in-memory record
-  (`:3798-3803`, stamped at `:12522-12523`) but on no persisted row — the reader's key list
-  names neither (`src/core/snapshot.ts:127-160`) — and `delegatedRecordOf` addresses a child by
-  exactly that pair (`src/harness.ts:4500-4517`), so the OWNER chain is durable while the doors
+  (`:3967-3972`, stamped at `:13515-13516`) but on no persisted row — the reader's key list
+  names neither (`src/core/snapshot.ts:176-198`) — and `delegatedRecordOf` addresses a child by
+  exactly that pair (`src/harness.ts:4716-4723`), so the OWNER chain is durable while the doors
   that reach a child by its spawning tool call go quiet after a reload even though the row is
   intact (the half issue 0033 records as still owed).
   **Worker mode no longer diverges about the forensic pair either.** The same `result:archive`
   op that states the owner also carries `partialContent`/`cancelledAtMessage`
-  (`HarnessInvocationArchiveInput`, `src/types/index.ts:3448-3451`; emitted by
-  `lane-worker-loop.ts` from the replica's own terminal record, `:1112-1113` beside its
-  `threadId` at `:1126`), and every leg is shipped: the op digest covers the pair
-  (`archiveDigestOf`, `lane-commit.ts:143-167`) so a lane cannot skip the very archive that
+  (`HarnessInvocationArchiveInput`, `src/types/index.ts:3570-3620`; emitted by
+  `lane-worker-loop.ts` from the replica's own terminal record, `:1115-1116` beside its
+  `threadId` at `:1142`), and every leg is shipped: the op digest covers the pair
+  (`archiveDigestOf`, `lane-commit.ts:148-159`) so a lane cannot skip the very archive that
   would carry it, the fold validates the pair BEFORE it touches the canonical view and answers a
-  permanent `invalid-mutation` for a malformed one (`:1006-1024` via `readArchiveForensicPair`,
+  permanent `invalid-mutation` for a malformed one (`:1079-1090` via `readArchiveForensicPair`,
   which reuses `src/core/snapshot-validation.ts` — the same bounds `src/core/snapshot.ts` uses
   to read those fields back off disk, so nothing is ever legal to archive and illegal to
-  reload), the authority forwards it verbatim (`lane-authority.ts:1167-1170`), and
-  `archiveInvocation` returns the pair with the row it stores (`src/harness.ts:7266-7359`)
+  reload), the authority forwards it verbatim (`lane-authority.ts:1171-1180`), and
+  `archiveInvocation` returns the pair with the row it stores (`src/harness.ts:7949-8103`)
   because the lane digests the RETURN value. What the lane still cannot do is unchanged:
   `delegate` and `threadFork` are REFUSED on a lane (the nested-run policy is armed at the hello
   handshake, `lane-worker-loop.ts` `refuseNestedRuns`), 0034's structured lane rejection (a
@@ -3495,7 +3572,7 @@ threadFork({ input: string; label?: string; timeoutMs?: number })
   hosts (CORRECTED IN PLACE 2026-11-11: this named "standalone `/api`, service
   `/v1/harness`", and the answer no longer replies with a bare `{ ok: true }`) — with
   body `{ choice }` and response `{ ok: true, request_id, resolved_at }`
-  (`src/server/api.ts:3056`).
+  (`src/server/api.ts:3570-3585`).
   `SessionStore.answerAction` validates against the recorded request and settles
   the handler promise exactly once. Status mapping: 400 malformed body/unknown
   option/out-of-bounds text, 404 unknown session or request id, 409 already
@@ -3570,10 +3647,21 @@ await writer('tell me about new year');
   user-facing lists landed — a `turn.before` plugin's `stop` decision
   (`HarnessTurnDecision`, `docs/plugins.md`): a policy assertion by shipped code at
   a turn boundary, not a clock, and it ends the run through the run's own abort path
-  (`stopped` record, `cancelled` invocation, the run's appended work rolled back).
-  A stopped conversation is restarted by a HOST
-  prompt (`sendThreadInput`), never by an agent's `threadSend`, which refuses
-  `stopped` — the host owns stopping and reviving.
+  (`stopped` record, `cancelled` invocation). The run's appended work is RETAINED
+  (IT19 R1, 2026-11-15 — `runAgentCore`'s catch no longer splices a conversation's turns; a
+  forked BRANCH run still splices, because it owns no thread state of its own) and the record
+  says WHY it halted (`stopReason`, R3). Whether an AGENT may continue a stopped conversation
+  now follows that reason: a run cut short (`caller-released`, `timeout`, `turn-cap`,
+  `budget-exhausted`, `api-error`, `retries-exhausted`, `parent-closed`) takes an agent
+  `threadSend`, which reports `"resumed"`; a thread the HOST stopped (`user-stopped`), one a
+  plugin parked (`plugin-parked`), and one stopped with no recorded cause stay host-only — a
+  host `sendThreadInput` revives those, and it revives the others too. An INACTIVE (deleted)
+  conversation takes no MESSAGE from an agent — `threadSend` and `steerThread` refuse it ahead of any
+  status branch, because a model cannot address what the roster no longer names — but a HOST
+  `sendThreadInput` IS the revival the spec reserves to the host: it lifts `inactive` / `inactiveAt`
+  and runs the turn (`src/harness.ts` `sendThreadInput`; the server's `reactivateThreadRow` plus the
+  `resumeThread` route drive it). So "host-reviveable" covers reads, restores AND an explicit host
+  turn; only the SESSION being deleted takes the thread away.
 - **Concurrency lives in the runtime, not in the provider stream.** Each agent has
   one serialized model stream; its tool calls are async work scheduled together.
   An agent's `done` event is one RESPONSE: it may list `pending` calls still running
@@ -3692,7 +3780,7 @@ await writer('tell me about new year');
 - `reset()` clears the entry agent's conversation, the discovered-tool set, the ONE
   session store (every collection with its entries, the shared id counter, each
   collection's `storeRev` and change window — the reset lives in the ENGINE,
-  `src/core/records.ts`, reached as `recordEngine.reset()` at `src/harness.ts:11905`;
+  `src/core/records.ts`, reached as `recordEngine.reset()` at `src/harness.ts:15541`;
   `src/core/task.ts` has no `reset()` of its own), and the agent-result archive, so a
   reset run starts from the core set and empty session state. The terminal result
   archive is otherwise durable through snapshot/restore (see
@@ -3712,11 +3800,13 @@ await writer('tell me about new year');
   shipped presets carry one either (`PRESET_MAX_ITERATIONS` is `Infinity` —
   `src/server/harnesses/toolbox.ts`). A finite value must be a positive safe
   integer; `Infinity` is accepted explicitly. On exhaustion the pending work is
-  aborted and the transcript rolled back.
+  aborted and the transcript is RETAINED (IT19 R1), and the record carries
+  `stopReason: 'turn-cap'` so a reader can tell a capped run from a host stop — and an agent
+  may send to it again, because a cap is a reason the run was cut short.
 - `threadForkTimeoutMs` — ADDED 2026-11-13 (B1; declared on `HarnessConfiguration`
   beside `maxIterations`): the DEFAULT wall clock for a `threadFork` branch when the
   caller does not name one, and it therefore covers the `threadFork` TOOL as well.
-  `src/harness.ts:8571-8574` calls `resolveForkTimeoutMs(parameters.timeoutMs,
+  `src/harness.ts:10599-10601` calls `resolveForkTimeoutMs(parameters.timeoutMs,
   threadForkTimeoutMs)` on the MODEL path too, so an OMITTED tool `timeoutMs` falls
   through to this configuration — `thread.forkThread()`, `api.threads.fork()` and
   `runtime.threadFork` resolve the same way, and every fork door takes the same
@@ -3781,10 +3871,10 @@ await writer('tell me about new year');
 - `pluginSettings` (`:3658`) — the host's read-only per-plugin settings provider
   (`<pluginName>.<key>`); absent means the library's own in-memory provider seeded from each
   plugin's declared defaults (`src/plugin/settings.ts:60`, installed per harness at
-  `src/harness.ts:1517-1518`) — so the fallback's lifetime is ONE HARNESS, not the process.
+  `src/harness.ts:1687-1691`) — so the fallback's lifetime is ONE HARNESS, not the process.
   CORRECTED IN PLACE 2026-11-13: this bullet described the shipped server as if one provider
   covered every session. It no longer does — each session's harness is built with ITS OWN
-  store's provider (`src/server/sessions.ts:2370`), while this config field keeps the same
+  store's provider (`src/server/sessions.ts:2490`), while this config field keeps the same
   read-only contract. That provider is still `get`-only (`src/server/plugins.ts:439-441`),
   which is exactly why a plugin calling `api.settings.setOwn` on the shipped server gets the
   library's "read-only (no writer)" refusal (`src/plugin/settings.ts:329-333`).
@@ -4579,7 +4669,7 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   session that survived a restart. See
   [Tool discovery](#tool-discovery) for the four rules that decide the seeded set.
 - **Session state is instance state, not module state.** The ONE record engine is
-  constructed per harness (`src/harness.ts:3521`, `createRecordEngine()`), so two sessions never share records —
+  constructed per harness (`src/harness.ts:3851`, `createRecordEngine()`), so two sessions never share records —
   and its id counter is shared ACROSS the `tasks`/`profiles`/`chapters`/`locations`
   collections plus anything an agent `define`s (F3), which is what makes an id
   conversation-wide rather than per-store. `reset()` is therefore a complete "start
@@ -4636,13 +4726,13 @@ as their own entries.
   task queue, so a second task continues the conversation in order, a reload can
   replay the transcript from `list()`/`get()`, and a watcher can reattach through
   `watch()`. Creating a session is its own operation, not a by-product of a first task:
-  `create()` (`src/server/sessions.ts:2141`) needs the harness NAME and nothing else
-  (`src/server/api.ts:2959`), mints the id itself with `randomUUID()`
-  (`src/server/sessions.ts:2211`) — the id is the server's, never the client's — copies the
+  `create()` (`src/server/sessions.ts:2223`) needs the harness NAME and nothing else
+  (`src/server/api.ts:2979-2983`), mints the id itself with `randomUUID()`
+  (`src/server/sessions.ts:2298`) — the id is the server's, never the client's — copies the
   template plugin-settings store down BEFORE the factory runs (`copyPluginSettingsStore`,
-  `src/server/plugins.ts:713`, called at `src/server/sessions.ts:2186`, because the provider
-  reference has to exist for `buildHarness` at `:2294`), and writes the record through before
-  the `201`, deleting the in-memory entry when that write fails (`:2269-2278`). The ordering is
+  `src/server/plugins.ts:713`, called at `src/server/sessions.ts:2268`, because the provider
+  reference has to exist for `buildHarness` at `:2276`), and writes the record through before
+  the `201`, deleting the in-memory entry when that write fails (`:2358-2366`). The ordering is
   load-bearing for the UI: `+` calls this route the moment it is pressed
   (`src/frontend/main.ts:13803` `newSession` → `:14138` `ensureSession`), so a first task never
   has to discover an id and a failed create is one visible error instead of a deferred one; a
@@ -4652,7 +4742,7 @@ as their own entries.
   guaranteed; the client used to create lazily on the first submit.
   The store owns TWO plugin-settings scopes (`src/server/plugins.ts`, "THE TWO SCOPES"): the
   template store the global routes edit, and one detached store per session whose live provider
-  is the one that session's harness reads (`src/server/sessions.ts:2370`), persisted on the
+  is the one that session's harness reads (`src/server/sessions.ts:2490`), persisted on the
   session's own record (`src/server/persistence.ts:293`) and rebuilt from it on restore
   (`src/server/sessions.ts:3677`). The TOOL switch beside it keeps the PROCESS scope alone
   (`toolSettings: this.tools.provider`, `:2380`) — the asymmetry is deliberate, and it is why
@@ -4909,32 +4999,32 @@ table.
 |---|---|
 | `GET /v1/harness/health` | Liveness and session count (`{ ok, sessions, epoch }`, `src/server/api.ts:1675-1680`) |
 | `GET /v1/harness/harnesses` | Harness definitions, **paged** (`q` matches name/title/description); every entry is an editable application copy and `editable` is always `true`. CORRECTED IN PLACE 2026-11-11: this row also used to promise "provider defaults, and `agents`" in the same answer — defaults are `GET /config` now and the registry is `GET /agents`, each its own bounded page |
-| `POST /v1/harness/harnesses` | `{ name, title?, description?, primary, subagents?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` (CORRECTED IN PLACE 2026-11-11: these fields are snake_case on the wire, not the old camelCase `agentModels`/`agentInstructions`, `src/shared/harness-api.ts:499-505`) |
+| `POST /v1/harness/harnesses` | `{ name, title?, description?, primary, subagents?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` (CORRECTED IN PLACE 2026-11-11: these fields are snake_case on the wire, not the old camelCase `agentModels`/`agentInstructions`, `src/shared/harness-api.ts:708-719,729-737`) |
 | `PATCH /v1/harness/harnesses/:name` | `{ title?, description?, primary?, subagents?, agent_models?, agent_instructions?, agent_colors? }` → `{ harness }`; every template is patchable, and each map field REPLACES the map it names |
 | `GET /v1/harness/harnesses/:name` | `200 { harness }` — one definition with the IDENTIFIED read's own projection, `agent_instructions` included when the card overrides any; the paged listing omits that map, so the configuration dialog reads the single card it opens. A legacy NAME alias (`writer` → `instruct`) resolves to its target; unknown is `404` |
 | `DELETE /v1/harness/harnesses/:name` | `200 { deleted: true, harness_name, tombstoned, restored_by_restart: false }`; `404` unknown name or repeat delete (name aliases are not deletable identities). Removes a user harness or a shipped built-in; a built-in's name is persisted in the database's additive `deleted` list so a restart keeps it removed. Existing and saved sessions keep the definition they captured, so deleting a harness never loses a conversation |
 | `GET /v1/harness/agents` | Trusted agent registry (`AgentDescriptor[]` rows), **paged** |
 | `GET /v1/harness/tools` | The host-wide catalogue, **paged**: session-bound core entries (`group: 'Core tools'`, `sessionBound: true`) plus every directly callable tool (including the core file tools); `search` always present with `availability` |
 | `GET /v1/harness/tools/:id` | One catalogue entry with its argument schema. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `GET /api/tools/bootstrap` alias ("the list the root bootstrap document carries") — the boot document carries no catalogue any more |
-| `POST /v1/harness/tools/:id/executions` | `{ parameters }` (the only accepted body field) → `200 { ok, result \| error, duration_ms, panels?, media? }`, run against the DEPLOYMENT catalogue with no session. A `sessionBound` name is a `403` naming the session route (`src/server/api.ts:2277-2282`); a listed-but-unconfigured tool is `200 { ok: false, error, duration_ms }` carrying the catalogue hint (`:2290-2297`); an unknown name is `404` whatever the body. CORRECTED IN PLACE 2026-11-11: the deleted `POST /api/tools/:name` route took `sessionId` in the BODY instead. See the R8/N4 note below |
+| `POST /v1/harness/tools/:id/executions` | `{ parameters }` (the only accepted body field) → `200 { ok, result \| error, duration_ms, panels?, media? }`, run against the DEPLOYMENT catalogue with no session. A `sessionBound` name is a `403` naming the session route (`src/server/api.ts:2572-2574`); a listed-but-unconfigured tool is `200 { ok: false, error, duration_ms }` carrying the catalogue hint (`:2587-2589`); an unknown name is `404` whatever the body. CORRECTED IN PLACE 2026-11-11: the deleted `POST /api/tools/:name` route took `sessionId` in the BODY instead. See the R8/N4 note below |
 | `GET /v1/harness/sessions/:id/plugins` | ONE conversation's plugin rows, **paged** by the global read's rules (`limit`/`cursor`/`q`; the catalogue itself is not session state — every store is seeded from the same generated manifest, so rows and defaults are identical and only the resolved `enabled`/`values` differ). Identity FIRST: an unknown session is a `404` before any paging parameter is read (`src/server/api.ts:2771`). `X-Harness-Revision` is that session's OWN store counter — 0 until this session accepts a `PATCH`, one bump per accepted write, and it never moves the template counter or vice versa |
-| `GET /v1/harness/sessions/:id/plugins/:plugin_id` | One row of that conversation's store (`src/server/api.ts:2811`) |
+| `GET /v1/harness/sessions/:id/plugins/:plugin_id` | One row of that conversation's store (`src/server/api.ts:2834`) |
 | `PATCH /v1/harness/sessions/:id/plugins/:plugin_id` | `{ settings }` → `{ plugin }`, write-anytime: no idle gate and no `409` path at all, because a settings write moves no registration and removes no schema the model was promised — the same reason the session TOOL switch (`enabled`-only `PATCH …/tools/:tool_id`) is write-anytime since the withheld set; `assertIdleForToolMutation` (`src/server/api.ts`) now gates only the tool writes that replace or remove an implementation (a source/metadata PATCH, and `DELETE`). Unknown session/plugin is `404` BEFORE the body is read; an unknown key, a wrong type or an out-of-range value is the store's `400`, thrown before it mutates, so a refused patch is a no-op on this conversation. Durable before the answer, and honoured from this session's next turn (`src/server/api.ts` `patchSessionPlugin` → `SessionStore.updateSessionPluginSettings`, `src/server/sessions.ts`) |
-| `POST /v1/harness/sessions/:id/tools/:toolId/executions` | Same body, executed through THIS session's registry (`SessionStore.callTool`, `src/server/api.ts:3950-3979`): a replaced preset, a created tool and a session-owned core tool all run what the session holds. `404` a name the session does not list, `409` a busy session, `403` a name whose execution scope is not manual. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `POST /api/tools/:name/call` alias |
+| `POST /v1/harness/sessions/:id/tools/:toolId/executions` | Same body, executed through THIS session's registry (`SessionStore.callTool`, `src/server/api.ts:4605-4620`): a replaced preset, a created tool and a session-owned core tool all run what the session holds. `404` a name the session does not list, `409` a busy session, `403` a name whose execution scope is not manual. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `POST /api/tools/:name/call` alias |
 | `POST /v1/harness/models` | `{ settings? }` → `{ models, observed_at }` (the generated `ModelIndex`); server-side `listModels`. CORRECTED IN PLACE 2026-11-11: the old answer was the bare `{ models: string[] }`, and `observed_at` is now part of the contract (`src/server/models.test.ts:16-18`) |
-| `POST /v1/harness/sessions` | `{ harness, title?, settings?, messages? }` → `201 { session }`. The harness NAME is the only requirement (`src/server/api.ts:2959`), and `messages` is the optional seeded transcript, validated BEFORE anything exists (`src/server/api.ts:2964-2972`). Session creation is its own operation, not a side effect of a first task: the id is the server's `randomUUID()` (`src/server/sessions.ts:2211`), the session's plugin-settings store is copied from the template at this moment (`:2186`), and the record is written before the answer — a failed write deletes the in-memory entry so a retry cannot observe a phantom (`:2269-2278`). A client holding a `201` may therefore `POST /sessions/:id/tasks` immediately with no retry loop, which is exactly what the UI's `+` relies on (`src/frontend/main.ts:14138` `ensureSession`) |
-| `GET /v1/harness/sessions`, `GET /v1/harness/sessions/:id` | BOUNDED reads, never a snapshot: the list is paged (`limit`/`cursor`, plus `status`/`harness` filters) and one session is its metadata + live `agent_models` + counters. CORRECTED IN PLACE 2026-11-11: this row used to promise "always including `turns` (with `eventTimes`) and the frozen `harnessDefinition`" — turns (`/turns`), threads (`/threads`), the queue (`/queue`), the frozen definition (`/definition`) and the display trees (`/turns/:turnId/display`) are each their own route, and no route assembles a session aggregate (`src/server/api.ts:22-23`). The old additive `invalidThreads` roster is not a session field on this contract either: an unreadable conversation is reported on the transcript read (`transcript_state: 'unreadable'` + `unreadable_reason`, `src/shared/harness-api.ts:1763-1779`) |
+| `POST /v1/harness/sessions` | `{ harness, title?, settings?, messages? }` → `201 { session }`. The harness NAME is the only requirement (`src/server/api.ts:2979-2983`), and `messages` is the optional seeded transcript, validated BEFORE anything exists (`src/server/api.ts:2985-3012`). Session creation is its own operation, not a side effect of a first task: the id is the server's `randomUUID()` (`src/server/sessions.ts:2298`), the session's plugin-settings store is copied from the template at this moment (`:2268`), and the record is written before the answer — a failed write deletes the in-memory entry so a retry cannot observe a phantom (`:2358-2366`). A client holding a `201` may therefore `POST /sessions/:id/tasks` immediately with no retry loop, which is exactly what the UI's `+` relies on (`src/frontend/main.ts:6308` `ensureSession`) |
+| `GET /v1/harness/sessions`, `GET /v1/harness/sessions/:id` | BOUNDED reads, never a snapshot: the list is paged (`limit`/`cursor`, plus `status`/`harness` filters) and one session is its metadata + live `agent_models` + counters. CORRECTED IN PLACE 2026-11-11: this row used to promise "always including `turns` (with `eventTimes`) and the frozen `harnessDefinition`" — turns (`/turns`), threads (`/threads`), the queue (`/queue`), the frozen definition (`/definition`) and the display trees (`/turns/:turnId/display`) are each their own route, and no route assembles a session aggregate (`src/server/api.ts:22-23`). The old additive `invalidThreads` roster is not a session field on this contract either: an unreadable conversation is reported on the transcript read (`transcript_state: 'unreadable'` + `unreadable_reason`, `src/shared/harness-api.ts:2934,2950`) |
 | `PATCH /v1/harness/sessions/:id` | `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key against the session's agents and every value as a model id (400 with nothing applied), rejects `{}` as a no-op, is allowed while the session is busy (no abort/rebuild), and leaves the frozen definition untouched. The current request keeps the model it started with; the next request uses the new one. CORRECTED IN PLACE 2026-11-11: the body field is `agent_models`, not `agentModels` |
-| `POST /v1/harness/sessions/:id/tasks` | `{ input, attachments?, references?, thread_id? }` → `202` **`TaskReceipt`** (`{ session_id, turn_id, status, thread_id, … }`, `src/shared/harness-api.ts:1366-1382`) — a task receipt, never the mutated document. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); queued turns are durable with a database root and paused after a restart. An `input` starting with `/` is a **slash command**: `dispatch()` runs it in this process through `harness.executeCommand`, never calls the model, never enters a lane, and returns the ALREADY-TERMINAL turn (`status: 'done' \| 'error'`, events `start`/`tool_call`/`tool_result`, no `usage`); `attachments`/`references` are `400` and `thread_id` is accepted and ignored. A `thread_id` that is RUNNING steers instead of queueing. CORRECTED IN PLACE 2026-11-11: the old answer was `202 { session, turn }` and the field was camelCase `threadId` |
-| `GET /v1/harness/sessions/:id/threads/:threadId/transcript` | `{ transcript }` = the transcript's cheap HEAD: `transcript_state`, `message_count`, `chars`, `bytes`, `role_counts`, `revision` (plus `unreadable_reason`/`stored_type` when it could not be parsed) — NO content. The messages are the paged `…/transcript/messages` read and the editor's JSON document is `…/transcript/document` (`src/shared/harness-api.ts:1763-1790`, `src/server/api.ts:4230`, `:4278`). `404` unknown session/thread. CORRECTED IN PLACE 2026-11-11: this row described the retired `{ threadId, agent, messages, raw, invalid? }` document |
-| `PUT /v1/harness/sessions/:id/threads/:threadId/transcript` | `{ messages, if_revision? }` → the **`TranscriptWriteReceipt`** (`{ session_id, thread_id, accepted_as, message_count, revision, invalid?, links? }`, `src/shared/harness-api.ts:1842-1857`). Wholesale transcript replace. A structurally invalid value is still a **200**: it is persisted, the live transcript becomes the `[transcript unreadable: …]` placeholder, and `receipt.invalid` explains why. `400` absent `messages`/non-object body, `404` unknown thread, `405` other methods, `409` running thread or a harness handle without `setThreadMessages`. CORRECTED IN PLACE 2026-11-11: the old answer was the `{ session, transcript }` aggregate |
+| `POST /v1/harness/sessions/:id/tasks` | `{ input, attachments?, references?, thread_id? }` → `202` **`TaskReceipt`** (`{ session_id, turn_id, status, thread_id, … }`, `src/shared/harness-api.ts:2280`) — a task receipt, never the mutated document. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); queued turns are durable with a database root and paused after a restart. An `input` starting with `/` is a **slash command**: `dispatch()` runs it in this process through `harness.executeCommand`, never calls the model, never enters a lane, and returns the ALREADY-TERMINAL turn (`status: 'done' \| 'error'`, events `start`/`tool_call`/`tool_result`, no `usage`); `attachments`/`references` are `400` and `thread_id` is accepted and ignored. A `thread_id` that is RUNNING steers instead of queueing. CORRECTED IN PLACE 2026-11-11: the old answer was `202 { session, turn }` and the field was camelCase `threadId` |
+| `GET /v1/harness/sessions/:id/threads/:threadId/transcript` | `{ transcript }` = the transcript's cheap HEAD: `transcript_state`, `message_count`, `chars`, `bytes`, `role_counts`, `revision` (plus `unreadable_reason`/`stored_type` when it could not be parsed) — NO content. The messages are the paged `…/transcript/messages` read and the editor's JSON document is `…/transcript/document` (`src/shared/harness-api.ts:2930-2956`, `src/server/api.ts:4899-4911`, messages `:4913-4959`, document `:4961-4985`). `404` unknown session/thread. CORRECTED IN PLACE 2026-11-11: this row described the retired `{ threadId, agent, messages, raw, invalid? }` document |
+| `PUT /v1/harness/sessions/:id/threads/:threadId/transcript` | `{ messages, if_revision? }` → the **`TranscriptWriteReceipt`** (`{ session_id, thread_id, accepted_as, message_count, revision, invalid?, links? }`, `src/shared/harness-api.ts:3039-3063`). Wholesale transcript replace. A structurally invalid value is still a **200**: it is persisted, the live transcript becomes the `[transcript unreadable: …]` placeholder, and `receipt.invalid` explains why. `400` absent `messages`/non-object body, `404` unknown thread, `405` other methods, `409` running thread or a harness handle without `setThreadMessages`. CORRECTED IN PLACE 2026-11-11: the old answer was the `{ session, transcript }` aggregate |
 | `GET /v1/harness/stream` | The ONE live-update channel: a **WebSocket** upgrade on the `harness.v1` subprotocol (`src/shared/harness-api.ts:42`); a plain `GET` is a `400` naming the upgrade (`src/server/api.ts:4759`). Frames, scopes and recovery are in the live-plane note below. CORRECTED IN PLACE 2026-11-11: this row replaces the two deleted SSE rows — `GET /api/sessions/:id/events` (the watcher) and `POST /api/sessions/:id/messages` (the run-owning stream whose close aborted the harness). Neither is aliased, and dropping the socket never cancels a task because execution is server-owned |
-| `POST /v1/harness/sessions/:id/reset` | Reset every agent + discovery + tasks + record stores → the **`ResetSessionResult`** receipt (`{ reset: true, session_id, discarded_turns, discarded_threads, dropped_queued_tasks, revision }`, `src/shared/harness-api.ts:1388-1395`); `409` while a run or queued work is pending |
-| `POST /v1/harness/sessions/:id/threads/:threadId/cancel` | `{}` → `200 { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }` (the generated `CancelThreadResult`, `src/shared/harness-api.ts:1749-1756`). `cancelled` is the STORE's honest answer: true exactly when this call terminated work — an aborted run, a turn released from a reference PARK (its lane had claimed work the runtime never started), or at least one dropped queued continuation, counting the named conversation and every conversation it owns; false when the stop only marked the conversation `stopped`. `status` is the conversation's real post-stop status read from its own record (never a constant), `dropped_queued_tasks` is the NAMED conversation's own backlog measured before the stop (a floor, not the cascade's total), and `revision` is the thread resource's counter the roster repaint reads |
-| `DELETE /v1/harness/sessions/:id/threads/:threadId` | `200 { deleted, thread_id, session_id, removed_descendants, removed_turns, revision }` (the generated `DeleteThreadResult`, `src/shared/harness-api.ts:1736-1743`). Stops that conversation first (the cancel above, so live and queued rows are dropped as `cancelled`) and only then purges it: the conversations it owns, their owning turns, transcripts and persisted copies. The agent's own `agent:<name>` conversation is `400` (use reset) |
-| `POST /v1/harness/sessions/:id/cancel` | `{ all?: true }` → the **`CancelSessionResult`** receipt (`{ cancelled, session_id, dropped_queued_tasks, active_turn_id?, revision }`, `src/shared/harness-api.ts:1409-1415`). Default aborts the active run only; `all: true` (the UI's Stop) also cancels every queued turn, which stays in `/turns` as a `cancelled` row. CORRECTED IN PLACE 2026-11-11: the old answer was the bare `{ cancelled }` |
-| `POST /v1/harness/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', option_id } \| { kind: 'custom', text } }` (the generated `AnswerActionRequest`, `src/shared/harness-api.ts:1592-1594`; the domain type is `HarnessActionChoice`) → `{ ok: true, request_id, resolved_at }` (`src/server/api.ts:3056`). Settles one pending `actionRequest`; 400 invalid body/unknown option/out-of-bounds text, 404 unknown session or request id, 409 answered or expired. Allowed while busy |
-| `DELETE /v1/harness/sessions/:id` | Forget the session → the **`DeleteSessionResult`** receipt (`{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }`, `src/shared/harness-api.ts:1000-1005`): abort active work, drop queued work, close watchers |
+| `POST /v1/harness/sessions/:id/reset` | Reset every agent + discovery + tasks + record stores → the **`ResetSessionResult`** receipt (`{ reset: true, session_id, discarded_turns, discarded_threads, dropped_queued_tasks, revision }`, `src/shared/harness-api.ts:2323-2331`); `409` while a run or queued work is pending |
+| `POST /v1/harness/sessions/:id/threads/:threadId/cancel` | `{}` → `200 { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }` (the generated `CancelThreadResult`, `src/shared/harness-api.ts:2894-2918`). `cancelled` is the STORE's honest answer: true exactly when this call terminated work — an aborted run, a turn released from a reference PARK (its lane had claimed work the runtime never started), or at least one dropped queued continuation, counting the named conversation and every conversation it owns; false when the stop only marked the conversation `stopped`. `status` is the conversation's real post-stop status read from its own record (never a constant), `dropped_queued_tasks` is the NAMED conversation's own backlog measured before the stop (a floor, not the cascade's total), and `revision` is the thread resource's counter the roster repaint reads |
+| `DELETE /v1/harness/sessions/:id/threads/:threadId` | `200 { deleted, thread_id, session_id, removed_descendants, removed_turns, revision }` (the generated `DeleteThreadResult`, `src/shared/harness-api.ts:2880-2888`). Stops that conversation first (the cancel above, so live and queued rows are dropped as `cancelled`) and only then purges it: the conversations it owns, their owning turns, transcripts and persisted copies. The agent's own `agent:<name>` conversation is `400` (use reset) |
+| `POST /v1/harness/sessions/:id/cancel` | `{ all?: true }` → the **`CancelSessionResult`** receipt (`{ cancelled, session_id, dropped_queued_tasks, active_turn_id?, revision }`, `src/shared/harness-api.ts:2349-2358`). Default aborts the active run only; `all: true` (the UI's Stop) also cancels every queued turn, which stays in `/turns` as a `cancelled` row. CORRECTED IN PLACE 2026-11-11: the old answer was the bare `{ cancelled }` |
+| `POST /v1/harness/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', option_id } \| { kind: 'custom', text } }` (the generated `AnswerActionRequest`, `src/shared/harness-api.ts:2633-2635`; the domain type is `HarnessActionChoice`) → `{ ok: true, request_id, resolved_at }` (`src/server/api.ts:3570-3585`). Settles one pending `actionRequest`; 400 invalid body/unknown option/out-of-bounds text, 404 unknown session or request id, 409 answered or expired. Allowed while busy |
+| `DELETE /v1/harness/sessions/:id` | Forget the session → the **`DeleteSessionResult`** receipt (`{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }`, `src/shared/harness-api.ts:1450-1457`): abort active work, drop queued work, close watchers |
 | `GET /v1/harness` | The **boot document**, on this host AND on the standalone listener: `{ api_root, service, api_version, server_time, epoch, capabilities, limits, links }` — CONSTANT SIZE, no catalogue, no defaults, no sessions (`src/server/api.ts:1643-1670`). CORRECTED IN PLACE 2026-11-11: this row was "Service only: bootstrap `{ rootPath, presets, agents, tools, defaults, sessions }`" — both the fat `{ rootPath, presets, … }` payload and the "service only" asymmetry are gone |
 
 **Two settings scopes, three catalogue scopes.** The table's process-level rows and its
@@ -4947,7 +5037,7 @@ session-level rows are not two views of one store, and the difference is a contr
   and `PATCH /v1/harness/sessions/:id/plugins/:plugin_id` move ONE conversation's values,
   honoured from its next turn (`SessionStore.updateSessionPluginSettings`,
   `src/server/sessions.ts:2055`). A session's store is a detached copy taken at creation
-  (`copyPluginSettingsStore`, `src/server/plugins.ts:713` → `src/server/sessions.ts:2186`) and
+  (`copyPluginSettingsStore`, `src/server/plugins.ts:713` → `src/server/sessions.ts:2268`) and
   persisted on its own record (`src/server/persistence.ts:293`, restored at
   `src/server/sessions.ts:3677`), so there is no override layer, no merge and no
   "inherit unless changed" flag to reason about — two stores simply share no map
@@ -5025,19 +5115,19 @@ mounted.` (`src/server/api.ts:4845-4846`). The bare `/v1/harness` answers the bo
 document on BOTH hosts; the dispatcher's `bootstrapRoot` flag is kept for source
 compatibility only and no longer changes behaviour (`src/server/api.ts:394-396`). The
 root URL in that document is `api_root` on the wire
-(`src/server/api.ts:1662`, mapped to the client's `rootPath` at
+(`src/server/api.ts:1947`, mapped to the client's `rootPath` at
 `src/frontend/api.ts:1650`) and it is the API URL `/v1/harness`, not a filesystem path.
 
 **Body policy (the one mount).** Action endpoints require a JSON object; `null`,
 arrays, and primitives are `400`. An execution body is a wrapper object and
 `parameters` is its only accepted field (`requireKnownFields`,
-`src/server/api.ts:2273`, `:3955`) — an unknown field is a `400`, while an ABSENT
+`src/server/api.ts:544`, `:2568`, `:4605`) — an unknown field is a `400`, while an ABSENT
 `parameters` is the same empty argument box as `{ "parameters": {} }`
-(`src/server/api.ts:2284-2288`). CORRECTED IN PLACE 2026-11-11: this paragraph used to
+(`src/server/api.ts:2579-2583`). CORRECTED IN PLACE 2026-11-11: this paragraph used to
 say `POST /tools/:name` *requires* a `parameters` property, "so an empty body cannot run
 a tool" — that was the deleted route's rule. An unknown tool name is `404` whatever the
 body looks like. Bounds: the Node adapter stops a streamed body over
-1,000,000 bytes with `413` (`MAX_API_BODY_BYTES`, `src/server/api.ts:297-300`); the
+1,000,000 bytes with `413` (`MAX_API_BODY_BYTES`, `src/server/api.ts:312-315`); the
 service adapter checks declared `content-length`
 and the serialized parsed body before dispatch. The service loader parses JSON
 before the endpoint runs, so it cannot prevent that upstream allocation and a
@@ -5079,7 +5169,7 @@ wrapper (`{ "ops": [{ op: 'list', path: 'src' }] }`) - and a wrong type is a `{ 
   `src/server/sessions.ts:4115`) or by that listing check — one session's tools are
   never listed or callable through another session's id. Listing surface: a created tool
   is registered and enabled at once, so `GET /v1/harness/sessions/:id/definition` reports
-  its name in `discovered_tools` (`src/server/api-reads.ts:1621-1623`);
+  its name in `discovered_tools` (`src/server/api-reads.ts:1697`);
   that key is emitted only when the enabled set is non-empty, and a session the server CREATED
   is seeded, so its first definition read already carries the toolbox
   (`src/server/sessions.ts` `create`) — as does one it RESETS (`SessionStore.reset`), CORRECTED IN PLACE
@@ -5096,7 +5186,7 @@ entries (T21 — CORRECTED IN PLACE 2026-11-11: the old text named a hand-writte
 eight entries and the dead `task`/`profileManage`/`chapterManage`/`locationManage` names,
 and cited the path without its `server/` segment). The rows are every
 `RUNTIME_DESCRIPTORS` row — `group === 'runtime'` and `listed !== false`,
-`src/tools/descriptors.ts:326-327`, which today is `toolRegistry`, `toolRequest`,
+`src/tools/descriptors.ts:326-328`, which today is `toolRegistry`, `toolRequest`,
 `toolList`, `toolManage`, `toolCreate`, `tasks`, `records`, `profiles`, `chapters`,
 `locations`, `agentManage`, `agentResult`, `delegate`, `threadFork` and `actionRequest`;
 `search`/`fetch`/`toolCancel`/`threadList`/`threadRead`/`threadSend`/`threadDelete`
@@ -5114,11 +5204,11 @@ DESCRIPTOR's (`?? 'core'`), so a searchable core tool stays searchable. They
 deliberately have **no** `tool` implementation:
 there is one implementation of each (the session's harness). `SessionStore.callTool(id, name, parameters)` →
 `harness.executeTool` is therefore the only path, and the ONE route that reaches it is
-`POST /v1/harness/sessions/:id/tools/:toolId/executions` (`src/server/api.ts:3950-3979`,
+`POST /v1/harness/sessions/:id/tools/:toolId/executions` (`src/server/api.ts:4605-4620`,
 mounted at `:4815`). CORRECTED IN PLACE 2026-11-11: this paragraph described the deleted
 standalone `POST /api/tools/:name` route, which took `sessionId` in the BODY ("a
 missing/blank `sessionId` is `400`"); the session now lives in the PATH, `parameters` is
-the only accepted body field (`requireKnownFields`, `src/server/api.ts:2273`), and the
+the only accepted body field (`requireKnownFields`, `src/server/api.ts:4605`), and the
 GLOBAL route answers a session-bound name with a `403` naming the session route
 (`src/server/api.ts:2278-2281`). An unknown session or a tool the session's harness does not register
 (delegate without subagents) is `404`, a name that is not callable manually is `403`
@@ -5253,8 +5343,8 @@ Retired SSE frames (history only — these routes answer `404` now):
   README's "Live updates (the WebSocket stream)" section). Losing it still falls back to
   `GET /sessions/:id` polling (1 s, ~120 attempts — `POLL_INTERVAL_MS`/`POLL_MAX_ATTEMPTS`,
   `src/frontend/main.ts:11548`, `:11551`; the poll is what runs when the plane reports
-  `closed`/`reconnecting`, `src/frontend/main.ts:11956-11975`) and a reconnect after 1 s
-  (`RECONNECT_DELAY_MS`, `src/frontend/main.ts:11554`). Reload re-reads the snapshot,
+  `closed`/`reconnecting`, `src/frontend/main.ts:12764-12775`) and a reconnect after 1 s
+  (`RECONNECT_DELAY_MS`, `src/frontend/main.ts:13611`). Reload re-reads the snapshot,
   calls `view.reconcile()` (merge by id, never rebuild), and reopens the observer
   when work is still pending. Settled history never re-lights an agent ring; only a
   `running` turn does.
@@ -5266,7 +5356,7 @@ Retired SSE frames (history only — these routes answer `404` now):
   contract. There is NO Reset control at all (R10 — starting over IS New session, while
   `POST /sessions/:id/reset` stays alive for other clients,
   `src/frontend/main.ts:4086-4088`). `+` has exactly one writer of `disabled`,
-  `paintSessionActions` (`src/frontend/main.ts:11220-11225`):
+  `paintSessionActions` (`src/frontend/main.ts:11852-11857`):
   `submitting || !booted || archivedSelection` — a live run is deliberately NOT in that
   expression, so a second independent conversation can start while the first one streams,
   and its `POST /sessions` create is eager (the SessionStore bullet above);
@@ -5280,7 +5370,7 @@ Retired SSE frames (history only — these routes answer `404` now):
   while no session is bound (`harnessTitleTools.hidden = toolsToggle.hidden =
   pluginsToggle.hidden = !bound`, `src/frontend/main.ts` `paintControls`, pinned by
   `src/frontend/compact-ui.test.ts:401-435`), because what they edit is THIS conversation:
-  `sessionIsBound()` / `configScope` (`src/frontend/main.ts:5888`) decide which routes the
+  `sessionIsBound()` / `configScope` (`src/frontend/main.ts:6011-6016`) decide which routes the
   panes dial — `GET /sessions/:id/tools` for tools (rows built by `sessionToolRowsOf`,
   `src/server/api-reads.ts:1003-1032`) and `GET /sessions/:id/plugins` for plugins
   (`src/frontend/main.ts:256` `listSessionPlugins`, read in `loadPlugins`) — and every write is
@@ -5639,7 +5729,7 @@ where a read failed.
 
 - **Reads.** `src/frontend/api.ts` adds the two bounded REST reads (`getSessionRecords` =
   `GET …/records`, `getSessionRecordsDelta` = `GET …/records?since=`). They are wrapped as
-  `readRecordsSnapshot` / `readRecordsDelta` in `src/frontend/view-api.ts:1188-1198`, and
+  `readRecordsSnapshot` / `readRecordsDelta` in `src/frontend/view-api.ts:1223-1231`, and
   `src/frontend/extensions/context.ts:74-76` surfaces those to panels as
   `PanelContext.api.readRecordsSnapshot` / `readRecordsDelta` so an injected host can answer
   them. `extensions/records-client.ts` is the
@@ -5740,7 +5830,7 @@ The three load-bearing decisions:
   `lane-worker-loop.ts` `refuseNestedRuns()` closes FOUR kinds of door at hello:
   1. it deletes the two registry entries (the run builds its declarations from that registry —
      `declared()` maps the enabled set through `tools[name]` and `visibleCoreTools`, which iterates
-     `Object.values(tools)` — `src/harness.ts:4551-4560`/`:1945`, and it resolves a call through the
+     `Object.values(tools)` — `src/harness.ts:2228-2240`/`:3620-3623`, and it resolves a call through the
      same map (`:7810`); `threadFork`'s dispatch is a core CONTROL path keyed on the definition
      OBJECT in `runtimeControlDefinitions`, a marker a rebuilt replica definition can never carry
      (`:1306`, read at `:7973`));
@@ -6109,7 +6199,7 @@ the exception a saved chat exposes directly.
   used to exfiltrate `HARNESS_API_KEY`.
 - **The boot document's root is an API URL.** CORRECTED IN PLACE 2026-11-11: this
   record named the bootstrap's `rootPath`; the generated document calls the field
-  `api_root` (`src/server/api.ts:1662`), and only the browser client keeps a `rootPath`
+  `api_root` (`src/server/api.ts:1947`), and only the browser client keeps a `rootPath`
   member (`src/frontend/api.ts:175`, mapped from `api_root` at `:1650`). Either way the
   value is `/v1/harness`, not a
   filesystem root. File tools use the process cwd and are unsandboxed, so no
@@ -6226,12 +6316,12 @@ In the order they are expected:
 3. **per-agent tool scoping** — searchable tools are catalogued once; every agent
    can discover every searchable tool (only `delegate` is primary-only). What DOES
    exist is narrower than per-agent configuration: a per-RUN allowlist (the delegation
-   `scope.tools`, `src/types/index.ts:1008`, carried into `ctx.run`'s `options.tools`,
+   `scope.tools`, `src/types/index.ts:1222-1226`, carried into `ctx.run`'s `options.tools`,
    `:1902`, and read back by a tool as `ToolContext.toolScope`, `:1923`) and one
    host-WIDE switch (`toolSettings`, `:3256`). Nothing keys a tool set to an agent
    PROFILE. "Host-wide" now applies to the TOOL switch only: plugin settings became
    per-session (R4), so the two `harness()` config fields describe different scopes
-   (`pluginSettings`, `src/types/index.ts:3658`; `toolSettings`, `:3673`).
+   (`pluginSettings`, `src/types/index.ts:4071`; `toolSettings`, `:4086`).
 4. **sandboxed presets and created tools** — the file and command tools, and any
    `toolCreate` body, run with host permissions; a `root`-scoped/fenced variant
    would be the natural next step.
@@ -6266,20 +6356,21 @@ In the order they are expected:
    (`src/frontend/main.ts:8198`) — but the third scope this pass introduced (a session's own
    configuration) has no harness-level twin to fall back on, which is exactly why the panes
    hide instead of falling back.
-9. **no surviving record of what a killed child DID** — a cancelled or failed run rolls
-   its own turns back out of the transcript (`runAgentCore`'s catch splices to
-   `commitIndex`), and the forensic field that survives the splice is ASSISTANT TEXT: the
-   answer the run was still streaming when the cut landed, falling back to its last committed
-   text (`RunState.streamedText` → `lastSubstantiveText` → `partialContent`) — never its tool
-   calls or tool results. That text is now durable and lane-portable (issue 0033); the ACTIVITY
-   is not, and that is what this item is about. A post-mortem can therefore say what a stopped
-   child was SAYING and not what it DID; `threadRead` on the child answers with the pre-run
-   conversation. Carrying the tool blocks is deliberately not solved by widening
-   `partialContent` (issue 0020's leak-boundary criterion) nor by retaining the rolled-back
-   transcript (a lone `tool_calls` block with no results is exactly the pairing a strict
-   provider rejects, which is why `src/server/persistence.ts` synthesizes an
-   `INTERRUPTED_TOOL_RESULT_TEXT` result instead). The direction under discussion is a
-   bounded, SEPARATE forensic field — see issue 0032.
+9. **no surviving record of what a killed child DID — now only for a BRANCH run.** The
+   premise this item was written on (a cancelled or failed run splices its own turns out of
+   the transcript, `runAgentCore`'s catch to `commitIndex`) was RETIRED for conversation runs
+   by IT19 R1 (2026-11-15, issue 0036): a cut run keeps its committed turns, and a lone
+   `tool_calls` block is closed by the repair helper's interrupted result
+   (`src/core/transcript-repair.ts:79`) — the same pairing rule that made the splice look
+   necessary is now satisfied by the placeholder instead of by deletion. What is still open is
+   the two-thirds the item actually cared about: (a) a forked BRANCH run still splices to its
+   fork baseline, because it owns no thread state, so a cancelled branch's activity is still
+   unrecoverable except through `partialContent`/`agentResult`; and (b) the RESULT ROW for a
+   cut run is still TEXT only — `partialContent` never carries a tool call or a tool result
+   (issue 0020's leak boundary), so a post-mortem that reads only the agent-result ledger
+   still sees what a stopped child was SAYING and not what it DID. `threadRead` is the door
+   that answers with the retained work. The bounded, SEPARATE forensic field under discussion
+   in issue 0032 is therefore now a ledger-side concern, not a transcript-side one.
 
 Parallel tool execution is no longer on this list: calls are scheduled
 concurrently (see “The loop”). There is no ordered side-effect guarantee, and the

@@ -372,16 +372,32 @@ describe('actionRequest runtime', () => {
         expect(beforeLateAnswer).toEqual([]);
 
         // A handler that ignores its signal may still resolve; the result must not
-        // be inserted into a rolled-back transcript or reported as an answer.
+        // be inserted into the (now retained) transcript or reported as an answer.
         handler.resolve({ kind: 'option', optionId: 'fast' });
         await flush();
 
         expect(events.filter((event) => event.type === 'action_answer')).toEqual([]);
-        expect(
-            entry.messages.some(
-                (message) => message.role === 'tool' && message.name === 'actionRequest'
-            )
-        ).toBe(false);
+        // Issue 0036 R1: an aborted thread-bound run is RETAINED, so the actionRequest
+        // call is still on the record — answered by exactly one synthesized interrupted
+        // placeholder, because the run died while the host was still deciding.
+        // The original purpose survives in the CONTENT of that row: a real host answer
+        // would have serialized an `{"answeredBy":"owner","choice":{...}}` payload, and
+        // the late answer must not have produced it. Asserting the interrupted marker AND
+        // the absence of `answeredBy` proves the placeholder stands for an unanswered
+        // call, while `action_answer` staying unemitted (above) proves it was not
+        // reported as an answer either.
+        const retainedRequests = entry.messages.filter(
+            (message) => message.role === 'tool' && message.name === 'actionRequest'
+        );
+
+        expect(retainedRequests).toHaveLength(1);
+        expect(retainedRequests[0]).toMatchObject({
+            role: 'tool',
+            toolCallId: 'q1',
+            name: 'actionRequest',
+            content: expect.stringContaining('cancelled or interrupted')
+        });
+        expect(String(retainedRequests[0]?.content)).not.toContain('answeredBy');
         expect(observed?.aborted).toBe(true);
     });
 

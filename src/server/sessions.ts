@@ -162,6 +162,7 @@ import type {
     HarnessSnapshot,
     HarnessStateChangeEvent,
     HarnessThreadRecord,
+    HarnessThreadSnapshot,
     HarnessThreadSteerReceipt
 } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
@@ -213,7 +214,7 @@ import { validateActionChoice } from '../core/action';
 // transcript its own restore would refuse, and a transcript it refuses is refused
 // with the exact same message everywhere. Barrel import (core/index.ts) keeps the
 // module graph identical to the rest of the server.
-import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
+import { MAX_THREAD_RECORDS, readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
 // The ONE slash-line parser (core/command.ts). The store uses it only to DECIDE
 // whether a submit is a command; the harness re-parses the same line when it
 // executes it, so a host can never disagree with the server about what "/x" means.
@@ -493,6 +494,21 @@ export type ThreadLane = {
     // pass the status check and the conversation gets TWO identical continuations.
     // Runtime-only (never persisted) and always released in a finally.
     resumePending?: boolean;
+    // THE TURN THAT MUST CONTINUE FROM ITS OWN RECORDED PROMPT (IT19 R2 retention).
+    //
+    // `requeueTurnInPlace` sets this to the id of the turn it puts back on the lane, and
+    // `executeTurn` consumes it once, at the moment the run is about to be dispatched. Why a lane
+    // field instead of a field on the turn: the lane is runtime-only (a turn is a durable record
+    // whose shape `./persistence.ts` reads back), and the claim is per-(lane, turn) — a stale id
+    // left here can only ever match that one terminal row, never a later submit.
+    //
+    // WHAT IT FIXES: a stopped or interrupted run of a THREAD-bound turn now RETAINS its tail
+    // (../harness.ts `runAgentCore`'s retention boundary), so the conversation already holds the
+    // `user` message of the turn being re-run. The resume route re-runs THAT row in place, and the
+    // runtime's root append (`brain.user(input)`) would add the same prompt a second time — the
+    // provider would be billed for a question the transcript already records, and every later
+    // request on that conversation would carry the duplicate.
+    resumeRecordedInput?: string;
     // Progress recorder of the ACTIVE run. Used only as the fallback when the
     // AsyncLocalStorage context is unavailable (a callback the runtime scheduled
     // outside this run's async chain) and exactly one lane is active.
@@ -645,6 +661,34 @@ export type Session = {
     // it and the operator can fix it. An entry is dropped as soon as a readable
     // transcript replaces it.
     invalidThreads: Map<string, HarnessInvalidThreadRecord>;
+    // R2 (retention) — the store's own RETENTION LEDGER: every host conversation this session has
+    // marked inactive, mapped to the epoch milliseconds of that transition.
+    //
+    // WHY A LEDGER AND NOT JUST THE `core.threads` ROW: `session.core` is re-captured wholesale from
+    // `harness.snapshot()` at a dozen places in this file (every persist, every stop, every lane
+    // commit, every rollback), and every one of those re-derives is a chance to lose the marker even
+    // though the kernel DOES write it today (../harness.ts `snapshot()`'s `hostThreads` projection
+    // emits `inactive`/`inactiveAt` when the live record holds them — verified, not assumed). What the
+    // ledger is the floor UNDER is precisely the cases where a re-derive cannot carry it: the
+    // projection taken in the window between this store writing the marked document and the runtime
+    // reaching its own boundary, a lane-committed core whose thread rows came from the authority's
+    // canonical fold (./workers/lane-authority.ts `threadsOf` rebuilds a row field by field and keeps
+    // no soft-delete key), and the row the kernel retires at the retention bound
+    // (../harness.ts `capRetiredThreadRecords`) while this store still holds the transcript. The
+    // ledger is the one copy of that fact no re-derive can erase, and it has exactly two writers:
+    // `markDeletedThread` (adds) and `reactivateThreadRow` (removes, because a host `sendThreadInput`
+    // revives — ../harness.ts clears the marker on its own record in the same call).
+    //
+    // It is applied to the document at the single write funnel (`sessionRecord`) and rehydrated on
+    // restore, so the file a `shell` reads always carries the marker, and the read projections
+    // (`isThreadInactive`) answer from it rather than from a core copy that may be mid-re-derive.
+    // Entries are dropped when the retention bound prunes the row (`capThreadRecords`, through
+    // `sessionRecord`), which is what keeps a pruned conversation from being rewritten forever.
+    //
+    // The value is the transition stamp, and `undefined` is a real value: a document may carry
+    // `inactive` without `inactiveAt` (../types documents the pair as independently optional), and
+    // the ledger must be able to re-write exactly the shape it read rather than invent a stamp.
+    inactiveThreads: Map<string, number | undefined>;
     // pipeline T1.5's last mile: the plugin diagnostics this session produced, OLDEST FIRST,
     // capped at `PLUGIN_DIAGNOSTIC_LIMIT` (the oldest entries are dropped once it is full — a
     // plugin that throws on every turn must not grow the durable document without bound).
@@ -1132,8 +1176,10 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
           }),
     // T14: the steer text archive rides with the turn record, because that is what makes a
     // displayed context-bar segment resolvable after the 64-entry audit ring has moved past
-    // it — and what makes it disappear correctly when the turn itself is deleted, reset or
-    // removed with its conversation. Detached like every other field: a response may not
+    // it — and what makes it disappear correctly when the turn itself is deleted or reset.
+    // IT19 R2 note: a CONVERSATION delete no longer removes the turn it owns (the row is marked
+    // and retained), so the archive survives that path too — only a turn-level removal, a reset,
+    // or the session going away drops it. Detached like every other field: a response may not
     // rewrite the stored text.
     ...(turn.steerTexts === undefined
         ? {}
@@ -1399,6 +1445,11 @@ const threadViewsOf = (threads: readonly SessionThread[]): SessionThreadView[] =
             agent: thread.agent,
             origin: thread.origin,
             status: thread.status,
+            // R3/R4: WHY the last run stopped early travels with the row, on the compact
+            // surface too — a strip that paints a halted conversation has to be able to say
+            // whether the host halted it or an interruption did (../types
+            // `HarnessThreadRecord.stopReason`, whose absence means "concluded or never ran").
+            ...(thread.stopReason === undefined ? {} : { stopReason: thread.stopReason }),
             sequence: thread.sequence,
             ...(thread.ownerThreadId === undefined ? {} : { ownerThreadId: thread.ownerThreadId }),
             ...(thread.label === undefined ? {} : { label: thread.label }),
@@ -1419,6 +1470,27 @@ const threadViewsOf = (threads: readonly SessionThread[]): SessionThreadView[] =
             hasTranscript: thread.messages.length > 0
         };
     });
+
+// The F6 guard's normalizer, used by `SessionStore.coresAgreeIgnoringMarker`: a detached copy
+// of `core` whose thread rows are keyed by id, and whose soft-delete marker (`inactive`,
+// `inactiveAt`) is stripped from the rows `doomed` names. Keying by id makes the compare
+// order-insensitive, which the guard needs because a mark is not a reordering of core state.
+const normalizeCoreForCompare = (core: HarnessSnapshot, doomed: ReadonlySet<string>): HarnessSnapshot => {
+    const copy = JSON.parse(JSON.stringify(core)) as HarnessSnapshot;
+
+    if (copy.threads === undefined) return copy;
+
+    for (const thread of copy.threads) {
+        if (!doomed.has(thread.id)) continue;
+
+        delete thread.inactive;
+        delete thread.inactiveAt;
+    }
+
+    copy.threads = [...copy.threads].sort((left, right) => left.id.localeCompare(right.id));
+
+    return copy;
+};
 
 // Trim + bound a task input. Shared by the legacy run() and the queue enqueue()
 // so the two submit surfaces cannot disagree about what a valid task is. Throws
@@ -2249,6 +2321,8 @@ export class SessionStore {
             invocationThreads: new Map(),
             // C4: a fresh session has no unreadable transcript by construction.
             invalidThreads: new Map(),
+            // R2: a fresh session has retired no conversation yet.
+            inactiveThreads: new Map(),
             // T1.5 last mile: no plugin has failed on it yet.
             pluginDiagnostics: [],
             // R4: the session's own plugin settings, seeded from the template store ABOVE and
@@ -3291,7 +3365,32 @@ export class SessionStore {
             // The last committed snapshot. During an active run this is the latest
             // mutation boundary the observer captured (a completed tool's store
             // writes and tool-result message together), plus the event log above.
-            core: session.core,
+            //
+            // R2: written through the retention ledger and then `capThreadRecords` — the ledger is
+            // what puts the soft-delete marker back on rows whose copy the runtime re-derived without
+            // it, and the cap is the one row loss the retention rule allows (a document over
+            // ./core/snapshot.ts's thread cap cannot be restored at all), and it can only ever cost
+            // inactive rows. The two are sequenced deliberately: stamp first, then bound, so the
+            // bound sees the marked rows it is allowed to retire.
+            core: (() => {
+                const marked = this.applyInactiveLedger(session, session.core);
+                const capped = this.capThreadRecords(marked);
+
+                if (capped === marked) return capped;
+
+                // The cap retired rows, so their ledger entries go with them. Without this the
+                // pruned ids would be re-appended from the ledger on every following write and the
+                // document could never come back under the bound. A row that left for any OTHER
+                // reason is dropped on the same rule: the store no longer holds it, so there is no
+                // transcript to retain and no point rewriting a marker for it forever.
+                const kept = new Set((capped.threads ?? []).map((thread) => thread.id));
+
+                for (const retiredId of [...session.inactiveThreads.keys()]) {
+                    if (!kept.has(retiredId)) session.inactiveThreads.delete(retiredId);
+                }
+
+                return capped;
+            })(),
             // Per-agent models are recorded OUTSIDE the core snapshot so a model
             // PATCH is durable even if it lands between snapshot boundaries.
             agentModels: Object.fromEntries(
@@ -4038,6 +4137,10 @@ export class SessionStore {
                 // C4: replaced by tolerant restore below (persisted entries are
                 // re-validated there, so a stale one cannot survive a restart).
                 invalidThreads: new Map(),
+                // R2: hydrated from the marked rows of this document below (after the retention
+                // cap), so a conversation retired before the restart is still retired in the next
+                // document no matter what the runtime re-derives in between.
+                inactiveThreads: new Map(),
                 // T1.5 last mile: the durable journal this document carried (the loader already
                 // dropped malformed entries and re-applied the cap). Absent means "nothing was
                 // ever reported", which is every document written before this field existed.
@@ -4109,8 +4212,43 @@ export class SessionStore {
             // was actually applied; the authoritative re-capture below replaces it again.
             const pruned = this.pruneStaleEnabledTools(core, harness, record.id);
 
-            session.core = pruned;
-            harness.restore(pruned);
+            // R2: a document that grew past the reader's thread-record cap (a long-lived
+            // session whose deleted conversations are all RETAINED) is made loadable exactly
+            // the way the writer holds a document — `capThreadRecords`, oldest inactive rows
+            // first — and the drop is REPORTED rather than swallowed: an operator reading the
+            // server log must be able to tell a cap retirement from a session that failed to
+            // restore. A hand-edited document may carry a non-numeric `sequence`; the sort is
+            // then simply arbitrary, which is why the value is only an ordering, never a fact.
+            const capped = this.capThreadRecords(pruned);
+
+            if (capped !== pruned) {
+                const retiredCount = (pruned.threads?.length ?? 0) - (capped.threads?.length ?? 0);
+
+                this.noteJournalError(
+                    session,
+                    `retired ${retiredCount} oldest soft-deleted thread record${
+                        retiredCount === 1 ? '' : 's'
+                    } so this session stays within the ${MAX_THREAD_RECORDS}-record snapshot cap`
+                );
+            }
+
+            session.core = capped;
+
+            // R2: rehydrate the retention ledger from the rows this document actually carries, and
+            // only AFTER the cap above — a row the cap retired is no longer a conversation the file
+            // claims is retired, and a ledger entry for it would fight the bound on every write.
+            // `inactiveAt` is read as-is (absent stays absent) so the next document re-writes exactly
+            // the shape this one had. Hydrating here is what makes a conversation deleted before the
+            // restart stay deleted AFTER it: the runtime re-derives `session.core` from its own
+            // snapshot the moment anything changes, and that re-derive is not guaranteed to carry the
+            // marker (see `Session.inactiveThreads` for the cases where it cannot).
+            for (const thread of capped.threads ?? []) {
+                if (thread.inactive !== true) continue;
+
+                session.inactiveThreads.set(thread.id, thread.inactiveAt);
+            }
+
+            harness.restore(capped);
 
             // Merge what the document recorded as unreadable (C4). A thread that is
             // still a placeholder is the one case where the persisted raw value is
@@ -4347,7 +4485,9 @@ export class SessionStore {
     }
 
     // R1-R6 roster: every HOST thread (an agent's default conversation is internal
-    // plumbing and stays out of the wire shape). Each entry joins the runtime
+    // plumbing and stays out of the wire shape) that is NOT soft-deleted (R2 — an inactive
+    // row is retained in `core.threads` and hidden here; see `hostThreads` below).
+    // Each entry joins the runtime
     // record to the recorded turns:
     //   - originTurnId/originInvocationId: the first turn that ran in the thread and
     //     the invocation id its root run reported, so a client can anchor the
@@ -4364,7 +4504,19 @@ export class SessionStore {
         // roster is built (a pre-R8 document derives them here, in turn order).
         this.ensureThreadLabels(session);
 
-        const hostThreads = session.harness.threads().filter((record) => record.origin === 'host');
+        // R2/AC2: an INACTIVE (deleted-but-retained) conversation is hidden here, which is
+        // the single place every session-facing roster comes from — `snapshot()`, `viewOf()`
+        // and `viewSummaryOf()` all call this method, so the SSE frames, `GET /sessions/:id`
+        // and both compiled views inherit the filter and no client needs a new field to stop
+        // showing a deleted conversation. `shell`/`bash` still find the row, with its
+        // transcript, in `<databaseRoot>/harness/state.json`.
+        //
+        // The guard is written against the RECORD (../types `HarnessThreadRecord.inactive`),
+        // so it holds whether the runtime excludes inactive rows from `threads()` (then it is
+        // a no-op) or keeps handing them back (then this is what hides them).
+        const hostThreads = session.harness
+            .threads()
+            .filter((record) => record.origin === 'host' && record.inactive !== true);
 
         if (hostThreads.length === 0) return [];
 
@@ -4436,8 +4588,224 @@ export class SessionStore {
         });
     }
 
+    // C4 + R2: the unreadable-transcript CARDS a projection may show, in the stable order
+    // every surface uses (thread id, so a snapshot serialises the same way for SSE repaints
+    // and tests) and with the raw value copied — a snapshot consumer must not be able to
+    // mutate the stored broken JSON through the object it was handed. An EMPTY array means
+    // "omit the field", which is what keeps a healthy session's document byte-identical to
+    // its pre-C4 shape (and a session whose only broken thread was deleted identical to a
+    // healthy one).
+    //
+    // R2 hides, it never erases: an entry whose conversation was deleted is EXCLUDED because
+    // the transcript surface would otherwise offer a card for a conversation the roster no
+    // longer names, while `session.invalidThreads` keeps the user's raw value — it is the
+    // only copy of their broken JSON, and the retained row can still be repaired from it by
+    // hand. Both readers call this ONE method, so `snapshot()` and `viewOf()` cannot state
+    // different sets.
+    private invalidThreadViews(session: Session): SessionInvalidThread[] {
+        return [...session.invalidThreads]
+            .filter(([id]) => !this.isThreadInactive(session, id))
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([id, entry]): SessionInvalidThread => ({
+                id,
+                ...(entry.label === undefined ? {} : { label: entry.label }),
+                ...(entry.agent === undefined ? {} : { agent: entry.agent }),
+                error: entry.error,
+                // Verbatim, never normalised: this is the text the operator has to fix.
+                // C8-m7: copied, so a snapshot consumer (the SSE frame, `store.get()`)
+                // cannot mutate the stored raw value through the object it was handed.
+                messages: copyInvalidMessages(entry.messages)
+            }));
+    }
+
+    // True when the conversation `threadId` is soft-deleted (R2). Read from the DURABLE row,
+    // not the live handle: `harness.threads()`/`thread()` hand out detached copies and a
+    // runtime that hides inactive rows will not name the row at all, while `session.core`
+    // (the snapshot this store persists) always carries it. A thread with no row is not
+    // inactive — an absent row means "the runtime never persisted it", which is the shape of
+    // an agent's default conversation, not of a deletion.
+    private isThreadInactive(session: Session, threadId: string): boolean {
+        // The LEDGER answers first: it is the store's own knowledge of what it retired, and
+        // `session.core` is re-derived wholesale from `harness.snapshot()` at a dozen sites, so a
+        // projection reading only the row could report "active" in the window between a delete and
+        // the next write (the kernel DOES stamp the row it writes today — see
+        // `Session.inactiveThreads` for what the ledger is the floor under — and a projection can
+        // still predate the runtime's own boundary). The row check remains as the fallback for a
+        // session whose ledger was never hydrated — e.g. a document marked by a build that had no
+        // ledger, loaded into memory that has.
+        if (session.inactiveThreads.has(threadId)) return true;
+
+        return (session.core.threads ?? []).some(
+            (thread) => thread.id === threadId && thread.inactive === true
+        );
+    }
+
+    // R2 — stamp the retention ledger onto a core that is about to become a document (see
+    // `Session.inactiveThreads`, and the cap that follows in `sessionRecord`).
+    //
+    // WHY THE WRITE FUNNEL: `session.core` is re-derived wholesale from `harness.snapshot()` in a
+    // dozen places (every persist, stop, lane commit and rollback). That snapshot does emit the
+    // marker when the live record holds it (../harness.ts, the `hostThreads` projection), so this is
+    // a FLOOR rather than the only source — but the floor is what makes "deleted, retained, hidden"
+    // survive every re-derive that CANNOT carry it (a core whose thread rows came from the lane
+    // authority's canonical fold, a projection captured before the runtime marked anything, the row
+    // the kernel retires at the retention bound), instead of depending on which of those sites ran
+    // last.
+    //
+    // A marked conversation whose row the fresh snapshot no longer NAMES is re-appended from the
+    // store's own current core, transcript included — the same floor `reconcileMarkedThreads` gives at
+    // the deletion itself, now held across every later write. If NEITHER side holds the row there is
+    // no copy of that transcript left anywhere in the store to restore from, and the entry is dropped
+    // by the cap bookkeeping in `sessionRecord` rather than retried on every write (reported as a
+    // residual retention risk, not silently solved here).
+    //
+    // Returns the SAME object when nothing has to change, so a session with no retired conversation
+    // pays one map-size check on the hot persist path.
+    private applyInactiveLedger(session: Session, core: HarnessSnapshot): HarnessSnapshot {
+        if (session.inactiveThreads.size === 0) return core;
+
+        const threads = core.threads ?? [];
+        const present = new Set(threads.map((thread) => thread.id));
+
+        // The marker is re-written FROM THE LEDGER, never trusted from the row: a re-derived row may
+        // have lost it, and an existing `inactiveAt` the ledger does not carry is left alone (the
+        // document's own stamp is the older, truer fact).
+        const stamp = (thread: HarnessThreadSnapshot): HarnessThreadSnapshot => {
+            const inactiveAt = session.inactiveThreads.get(thread.id);
+
+            return {
+                ...thread,
+                inactive: true as const,
+                ...(thread.inactiveAt === undefined && inactiveAt !== undefined ? { inactiveAt } : {})
+            };
+        };
+
+        const rewritten = threads.map(
+            (thread) =>
+                session.inactiveThreads.has(thread.id) && thread.inactive !== true ? stamp(thread) : thread
+        );
+        const relabelled = rewritten.some((thread, index) => thread !== threads[index]);
+
+        // Rows the ledger remembers that this core no longer NAMES, taken from the store's last-known
+        // core and re-stamped, re-appended in `sequence` order (the order `readThreads` validates and
+        // the roster sorts by), so the document stays byte-stable instead of depending on when a row
+        // vanished. HONEST SCOPE: `sessionRecord` — the only caller today — passes `session.core`
+        // itself, so this branch can only fire once the runtime has dropped the row from the store's
+        // own core as well, and if BOTH sides have lost it there is no transcript left in the store to
+        // re-append (the entry then goes with the cap bookkeeping in `sessionRecord`). It is the floor
+        // for a caller that hands in a freshly re-derived snapshot, not a second source of truth.
+        const missing = [...session.inactiveThreads.keys()]
+            .filter((id) => !present.has(id))
+            .map((id) => (session.core.threads ?? []).find((thread) => thread.id === id))
+            .filter((thread): thread is HarnessThreadSnapshot => thread !== undefined)
+            .map((thread) => stamp(thread))
+            .sort((left, right) => left.sequence - right.sequence);
+
+        if (!relabelled && missing.length === 0) return core;
+
+        return { ...core, threads: missing.length === 0 ? rewritten : [...rewritten, ...missing] };
+    }
+
+    // R2/AC4: a host `sendThreadInput` into a soft-deleted conversation REACTIVATES it — the
+    // `inactive`/`inactiveAt` marker comes off the retained row, so the conversation is in
+    // every roster again from the next projection and its record no longer claims "deleted on
+    // <date>". Absent marker means active, so this is a no-op for the ordinary turn (the
+    // common case: one array scan, no write).
+    //
+    // WHY THE STORE WRITES ITS OWN ROW: `harness.thread()`/`threads()` hand out DETACHED
+    // copies (../harness.ts `threadRecordCopy`), so the store cannot lift the marker on the
+    // runtime's record from here — ../harness.ts `sendThreadInput` owns the live record's
+    // marker. `session.core` is the store's own copy of the persisted snapshot (what
+    // `sessionRecord` writes), so clearing it here makes the reactivation durable with this
+    // turn's checkpoint. The kernel clears its own live record in the SAME call (../harness.ts
+    // `sendThreadInput` lifts `inactive`/`inactiveAt` before it starts the turn), so the two writers
+    // converge on "active" and a later boundary snapshot cannot re-stamp the row: the cross-boundary
+    // caveat this method used to report is closed at the kernel door, and the ORDER is what keeps it
+    // closed — `executeTurn` calls this before `harness.sendThreadInput`, so no persist during the
+    // turn can re-mark a conversation that is already working again.
+    private reactivateThreadRow(session: Session, threadId: string): void {
+        const row = (session.core.threads ?? []).find((thread) => thread.id === threadId);
+
+        // Either half counts as "this conversation is retired": the row (what a document or a
+        // same-call projection shows) or the LEDGER (what the next document is stamped from). The
+        // row's marker is the one that can go missing on its own — `session.core` is re-derived from
+        // `harness.snapshot()`, which does not emit it — so a guard that required the row would return
+        // early here, leave the ledger entry in place, and the next write would retire the
+        // conversation AGAIN right after it was revived.
+        if (row?.inactive !== true && !session.inactiveThreads.has(threadId)) return;
+
+        // The marker pair is dropped, never written as `false`: ../types documents the
+        // additive-when-absent shape, and ./core/snapshot.ts normalises a `false` away on
+        // read, so a deleted key is the only spelling that keeps old documents comparable.
+        if (row !== undefined) {
+            delete row.inactive;
+            delete row.inactiveAt;
+        }
+
+        // THE LEDGER IS THE POINT: clearing only the in-memory row would be undone by the next
+        // document, which `sessionRecord` stamps from this map. Removing the entry here is what makes
+        // the reactivation survive every later re-derive — and because `executeTurn` calls this BEFORE
+        // `harness.sendThreadInput`, the run this call starts is never re-marked by a persist that
+        // happens during it.
+        session.inactiveThreads.delete(threadId);
+
+        // The reactivation is a state change an interrupted process must not lose, so it is
+        // persisted (best-effort, as every other live-state change here). Only the rare
+        // reactivation reaches this line, so ordinary turns pay nothing.
+        this.persistBestEffort();
+    }
+
+    // R2 retention bound — where a retained thread row is pruned on the SERVER side, and the
+    // reason is loadability, not deletion.
+    //
+    // THE WRITER PAIR: ../harness.ts `capRetiredThreadRecords` applies the IDENTICAL rule to the
+    // snapshot the kernel itself produces, and both halves are needed or the document flaps — an
+    // over-cap core, a prune, a re-append from the ledger, forever. Same eligibility (`inactive ===
+    // true` only), same ordering (`sequence`, never `inactiveAt`), same count (`length - MAX`). A
+    // row this method retires also loses its ledger entry in `sessionRecord`, so it cannot come back
+    // as a marker the kernel no longer has a transcript for.
+    //
+    // A deletion is a mark now, so `core.threads` only grows across the life of a session,
+    // and ./core/snapshot.ts `readThreads` REFUSES a snapshot holding more than
+    // MAX_THREAD_RECORDS rows (../core/thread.ts:46 — 256). One row over and
+    // `harness.restore()` throws for the whole document, and the load loop turns that into
+    // DROPPING THE ENTIRE SESSION — a far bigger destruction than the cap costs. So the
+    // DOCUMENT is held at the reader's bound, and only ever by retiring the OLDEST INACTIVE
+    // rows:
+    //
+    //   - an ACTIVE conversation is never dropped, so a cap hit costs a retained transcript
+    //     nobody can list, not a conversation the user is in;
+    //   - "oldest" is `sequence` (runtime creation order), never `inactiveAt`: the two agree
+    //     in the common case, and `sequence` is the value that stays deterministic across a
+    //     restore, which is what keeps the same rows dropped on every write;
+    //   - when NOTHING is inactive the document is left over the bound on purpose. Dropping
+    //     live conversations to fit would be the destruction this rule forbids, and restore
+    //     then refuses loudly instead of losing them silently.
+    //
+    // Returns the SAME object when nothing had to go, so the ordinary path (under the cap)
+    // allocates nothing and changes no document byte for byte.
+    private capThreadRecords(core: HarnessSnapshot): HarnessSnapshot {
+        const threads = core.threads;
+
+        if (threads === undefined || threads.length <= MAX_THREAD_RECORDS) return core;
+
+        const retired = threads
+            .filter((thread) => thread.inactive === true)
+            .sort((left, right) => left.sequence - right.sequence)
+            .slice(0, threads.length - MAX_THREAD_RECORDS)
+            .map((thread) => thread.id);
+
+        if (retired.length === 0) return core;
+
+        const doomed = new Set(retired);
+
+        return { ...core, threads: threads.filter((thread) => !doomed.has(thread.id)) };
+    }
+
     private snapshot(session: Session): SessionSnapshot {
         const threads = this.threadRoster(session);
+        // C4/R2: computed once so the gate and the value cannot disagree.
+        const invalidThreads = this.invalidThreadViews(session);
         // Pending backlog across every lane plus the legacy queue (F1). The active
         // turn is never counted.
         const pending = this.pendingCount(session);
@@ -4466,24 +4834,9 @@ export class SessionStore {
             // C4: conversations whose stored transcript could not be read. Omitted
             // when there are none, so a healthy session's snapshot is byte-identical
             // to its pre-C4 shape. Sorted by thread id so the same session always
-            // serialises the same way (deterministic tests and SSE repaints).
-            ...(session.invalidThreads.size === 0
-                ? {}
-                : {
-                      invalidThreads: [...session.invalidThreads]
-                          .sort(([left], [right]) => left.localeCompare(right))
-                          .map(([id, entry]): SessionInvalidThread => ({
-                              id,
-                              ...(entry.label === undefined ? {} : { label: entry.label }),
-                              ...(entry.agent === undefined ? {} : { agent: entry.agent }),
-                              error: entry.error,
-                              // Verbatim, never normalised: this is the text the
-                              // operator has to fix. C8-m7: copied, so a snapshot
-                              // consumer (the SSE frame, `store.get()`) cannot mutate
-                              // the stored raw value through the object it was handed.
-                              messages: copyInvalidMessages(entry.messages)
-                          }))
-                  }),
+            // serialises the same way (deterministic tests and SSE repaints), and
+            // WITHOUT any soft-deleted conversation (R2 — `invalidThreadViews`).
+            ...(invalidThreads.length === 0 ? {} : { invalidThreads }),
             // T1.5 last mile: the plugin-diagnostic journal (oldest first, capped), omitted when
             // the session has never reported one — the same additive rule as `invalidThreads`
             // immediately above, so a healthy session's snapshot stays byte-identical to the
@@ -4737,6 +5090,9 @@ export class SessionStore {
 
         const pending = this.pendingCount(session);
         const threads = this.threadRoster(session);
+        // C4/R2: the same filtered set `snapshot()` shows (deleted conversations are hidden,
+        // never erased) — one helper, so the two surfaces cannot state different sets.
+        const invalidThreads = this.invalidThreadViews(session);
 
         return {
             id: session.id,
@@ -4763,19 +5119,7 @@ export class SessionStore {
             ...(session.pluginDiagnostics.length === 0
                 ? {}
                 : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
-            ...(session.invalidThreads.size === 0
-                ? {}
-                : {
-                      invalidThreads: [...session.invalidThreads]
-                          .sort(([left], [right]) => left.localeCompare(right))
-                          .map(([id, entry]): SessionInvalidThread => ({
-                              id,
-                              ...(entry.label === undefined ? {} : { label: entry.label }),
-                              ...(entry.agent === undefined ? {} : { agent: entry.agent }),
-                              error: entry.error,
-                              messages: copyInvalidMessages(entry.messages)
-                          }))
-                  }),
+            ...(invalidThreads.length === 0 ? {} : { invalidThreads }),
             ...(session.labelSeeds.size === 0
                 ? {}
                 : {
@@ -5367,9 +5711,12 @@ export class SessionStore {
         }
     }
 
-    // Replace the log with exactly what the live records hold (compaction after a
-    // deletion or a reset). Without this, a deleted turn's events could be replayed
-    // onto a restart as ghost steps.
+    // Replace the log with exactly what the live records hold. RETIRED CALLERS (R2): a thread
+    // DELETION used to compact after its purge, and a reset used to; neither does any more, because
+    // neither removes a turn row — a deletion marks the conversation and keeps every turn, and a reset
+    // drops the records wholesale rather than event by event. The one caller left is
+    // `requeueTurnInPlace` (both its success path and its rollback), which compacts the ONE turn it is
+    // re-announcing so its stale steps cannot be replayed onto a restart as ghost steps.
     private compactJournal(session: Session, turnIds?: Iterable<string>): void {
         // D4: which thread holds the handle decides who writes. Inline needs the session's own
         // `HarnessJournal` (and does nothing without one); worker mode has no writer handle on
@@ -5970,10 +6317,18 @@ export class SessionStore {
      * Detach one member of THIS session (`DELETE /sessions/{id}/agents/{agent_id}`).
      *
      * R6: an agent that still owns a conversation is NOT removed — the call answers 409 naming
-     * the member, how many conversations it owns, which ids they are, and the remedy (delete
-     * those threads first). Removing an agent used to delete its host conversations as a silent
-     * side effect, which threw away transcripts the caller never named; a saved session owns its
-     * history, so the user decides what goes.
+     * the member, how many conversations it owns, which ids they are, and the remedy.
+     *
+     * IT19 R2 (2026-11-15) rewrote WHAT THAT REMEDY IS, because deletion changed shape: a thread
+     * delete MARKS the record `inactive` and RETAINS it (../harness.ts `deleteThread`, ../types
+     * `HarnessThreadRecord.inactive`). This gate reads the DISCOVERY roster (`harness.threads()`,
+     * which hides a marked row), so a delete does clear THIS check — and the runtime's own backstop
+     * behind it (../harness.ts `removeAgent`, which walks every thread state, retained rows
+     * included) still refuses, because the retained document would name a brain it can no longer
+     * restore. The remedy is therefore stated as what actually releases the block: the session
+     * being deleted, not a thread delete. Removing an agent used to delete its host conversations
+     * as a silent side effect, which threw away transcripts the caller never named; a saved
+     * session owns its history, so the user decides what goes.
      *
      * `detachedThreads` is therefore 0 on every accepted removal, and it stays in the receipt
      * because the contract declares `detached_threads` (its schema description now states the
@@ -6009,6 +6364,12 @@ export class SessionStore {
         // implicit default conversation that belongs to it by definition. Only the first blocks,
         // and NOTHING is deleted by a refusal: the roster, the threads, and the durable document
         // all stay exactly as they were.
+        //
+        // IT19 R2: the remedy names SESSION deletion rather than a thread delete. This roster hides
+        // a soft-deleted row, so a `threadDelete` does move this check out of the way — but the
+        // runtime's backstop below counts the RETAINED row and refuses anyway (a document naming a
+        // removed agent cannot restore), so promising "delete the threads first" here would send a
+        // caller around a loop that ends in the same 409.
         const owned = session.harness
             .threads()
             .filter((thread) => thread.origin === 'host' && thread.agent === agent);
@@ -6016,7 +6377,7 @@ export class SessionStore {
         if (owned.length > 0) {
             throw new SessionError(
                 409,
-                `Agent "${agent}" still owns ${owned.length} conversation${owned.length === 1 ? '' : 's'} in session "${id}": ${owned.map((thread) => `"${thread.id}"`).join(', ')}. Delete those threads before removing the agent.`
+                `Agent "${agent}" still owns ${owned.length} conversation${owned.length === 1 ? '' : 's'} in session "${id}": ${owned.map((thread) => `"${thread.id}"`).join(', ')}. A deleted thread is retained, so removing this agent needs the session deleted.`
             );
         }
 
@@ -6915,10 +7276,11 @@ export class SessionStore {
         prompt: string,
         references: readonly AgentResultReference[] | undefined,
         signal?: AbortSignal,
-        // Gap (c): labels this turn was submitted with that a DELETION stripped (the target
-        // row is gone; its id no longer exists to wait on). They contribute the same
-        // deleted-result note a mid-park deletion does, so a turn that was still QUEUED when
-        // its target's conversation was deleted never runs bare.
+        // Gap (c): labels this turn was submitted with that a DELETION stripped (the conversation
+        // left the roster; IT19 R2 keeps its turn row, but there is no RESULT to wait on when the
+        // deletion aborted it). They contribute the same deleted-result note a mid-park deletion
+        // does, so a turn that was still QUEUED when its target's conversation was deleted never
+        // runs bare.
         strippedLabels?: readonly string[]
     ): Promise<string> {
         const hasReferences = references !== undefined && references.length > 0;
@@ -6970,8 +7332,18 @@ export class SessionStore {
                 reference
             );
 
-            // No block left: the target's row was deleted while this turn waited
-            // (the prefix above no longer names it) or it never recorded one.
+            // IT19 R2: the target's ROW survives its conversation's deletion, so "the prefix no
+            // longer names it" is no longer how a deletion shows up here. What decides the note is
+            // the fact behind the old mechanism: the conversation this reference names was deleted
+            // and its run never produced a result. `inactive` is read from the DURABLE row
+            // (`isThreadInactive`) because the live roster hides a marked row entirely. A deleted
+            // conversation whose turn DID finish still falls through to the content branch below —
+            // reusing that retained result is the whole point of retention.
+            const deletedConversation =
+                target.threadId !== undefined && this.isThreadInactive(session, target.threadId);
+
+            // No block at all: the row left the record (a pre-retention document, or a label the
+            // deletion stripped) or the target never recorded one.
             if (block === undefined) {
                 entries.push({
                     label: reference.label,
@@ -6985,10 +7357,16 @@ export class SessionStore {
             // the waiter runs, and the model is told to report the missing input to
             // the user. Only the TARGET died — chaining its death onto every turn
             // that referenced it is what this branch replaces.
+            //
+            // IT19 R2: when the death was a DELETION the note stays the deleted one. "ended as
+            // cancelled" would describe the abort the deletion itself caused, while the user has
+            // to be told that the conversation they deleted is why the input is missing.
             if (block.status !== 'done' || block.content === undefined) {
                 entries.push({
                     label: block.label,
-                    note: referencedResultUnavailableNote(block.label, block.status)
+                    note: deletedConversation
+                        ? referencedResultDeletedNote(block.label)
+                        : referencedResultUnavailableNote(block.label, block.status)
                 });
                 continue;
             }
@@ -7655,8 +8033,13 @@ export class SessionStore {
     }
 
     // Validate the optional `threadId` submit field. A non-string or blank value is
-    // a 400 BEFORE any mutation; an unknown/deleted id is a 404 (an honest "no such
+    // a 400 BEFORE any mutation; an unknown id is a 404 (an honest "no such
     // conversation" rather than silently opening a new thread).
+    //
+    // A SOFT-DELETED id is NOT in that 404 set (F-A Defect 2, 2026-11-15): R2 retains the
+    // row, and a host that addresses it by id explicitly is reviving it, exactly as
+    // `resumeThread` and the harness's own `sendThreadInput` already did. See
+    // `steerIntoThread`, which resolves the retained row instead of refusing.
     private normalizeThreadId(value: unknown): string | undefined {
         if (value === undefined) return undefined;
 
@@ -7688,6 +8071,29 @@ export class SessionStore {
         const record = session.harness.thread(threadId);
 
         if (record === undefined) {
+            // F-A Defect 2 (2026-11-15) — THE OTHER HOST DOOR REVIVES WHAT THIS ONE REFUSED.
+            // `harness.thread()` names only ACTIVE conversations, so a soft-deleted (R2:
+            // `inactive`, hidden, RETAINED) thread used to answer 404 here, while the harness
+            // door `sendThreadInput` — the very call this submit becomes — revives the same id,
+            // and `resumeThread` (below) already resolves the retained row and reactivates it.
+            // Two host doors, two contracts for the same explicit address, and
+            // `reactivateThreadRow` was unreachable for an inactive thread through the submit
+            // route that needs it most. The ruling: a host that names a thread by id gets the
+            // SAME contract at both doors, so the retained row is resolved here and the submit
+            // proceeds; listings and rosters stay blind, because they never come through this
+            // lookup (they read `harness.threads()` / `isThreadInactive`, and both still hide it
+            // — pinned in ./threads.test.ts).
+            //
+            // WHY THE MARK IS LIFTED IN `executeTurn`, NOT HERE: the kernel owns the LIVE
+            // record's marker (this handle is a detached copy — ../harness.ts
+            // `threadRecordCopy`), and `session.core` is re-derived from `harness.snapshot()` at
+            // every persist. Clearing the store's row before the kernel clears its own would
+            // flap the document (clear, re-stamp from the still-marked snapshot, clear again).
+            // `executeTurn` calls `reactivateThreadRow` IMMEDIATELY BEFORE `sendThreadInput`
+            // lifts the kernel mark, which is the ordering that closes it (see that method, and
+            // the R2/AC4 note at the `sendThreadInput` call site in `executeTurn`).
+            if (this.isThreadInactive(session, threadId)) return undefined;
+
             throw new SessionError(404, `Unknown thread "${threadId}".`);
         }
 
@@ -8627,6 +9033,20 @@ export class SessionStore {
             // below is reached unchanged and states the same outcome.
             const stoppedBeforeRun = wasCancelled();
 
+            // THE RESUME DEDUP (IT19 R2). A row put back on its lane by `resumeThread` carries a
+            // lane-scoped claim that its root prompt is ALREADY the last committed entry of this
+            // conversation; the claim is consumed here, once, by the run that earns it, so neither a
+            // normal submit nor a second stop of this same row can trip the drop. It is skipped when
+            // the stop guard below is going to settle the turn without dispatching a run — then the
+            // recorded prompt stays where it is and a later resume claims it again.
+            if (lane !== undefined && lane.resumeRecordedInput === turn.id) {
+                delete lane.resumeRecordedInput;
+
+                if (!stoppedBeforeRun && threadId !== undefined) {
+                    this.releaseRecordedRootInput(session, threadId, runPrompt, turn);
+                }
+            }
+
             if (stoppedBeforeRun) {
                 failure = 'The run was cancelled.';
                 turn.status = 'cancelled';
@@ -8677,6 +9097,14 @@ export class SessionStore {
                     session.harness(runPrompt, options)
                 );
             } else {
+                // R2/AC4: an explicit host input IS the spec's reactivation. A conversation
+                // that was deleted (soft: `inactive`, hidden from every roster but retained
+                // with its transcript) comes back for exactly this act — the run about to
+                // start proves the conversation is live again, so the marker is lifted before
+                // the run is dispatched and the turn the run records cannot be read as work
+                // inside a deleted conversation.
+                this.reactivateThreadRow(session, threadId);
+
                 await this.runContexts.run({ session, turn, threadId, record }, () =>
                     session.harness.sendThreadInput(threadId, runPrompt, options)
                 );
@@ -9179,23 +9607,33 @@ export class SessionStore {
             throw new SessionError(404, `Unknown thread "${threadId}".`);
         }
 
-        const record = session.harness.thread(threadId);
-
-        if (record === undefined) {
-            throw new SessionError(404, `Unknown thread "${threadId}".`);
-        }
-
         // R1 (rev2): a HALTED conversation is resumable, and two roster statuses say that.
-        // `stopped` is this server's own stop, whatever opened the conversation (a host submit,
-        // the roster route, the runtime's delegation, or the default `agent:<name>` thread),
-        // because a stop reaches every one of them. `idle` joins it because it is what an
-        // INTERRUPTED run leaves behind: the runtime persists a thread record as `stopped` or
-        // `idle` only (../harness.ts:10071), so a run that was in flight when the process died
-        // comes back on an `idle` conversation whose newest turn the restore marked `error`
-        // (see `restoreSession`'s recovery policy below) — and a run that simply FAILED on the
-        // provider settles its turn `error` while its conversation returns to `idle`. In both
-        // cases the answer was never reached and the recorded row is the input, so this route
-        // is what puts it back to work; the newest-turn guards below are what decide.
+        //
+        // `stopped` (R4, widened): the conversation was HALTED BEFORE ITS CONCLUSION — by
+        // the host (`cancelThread`, a delete's forced stop) OR by an interruption. The
+        // record's `stopReason` (../types `HarnessThreadRecord.stopReason`, projected onto
+        // ./protocol.ts `SessionThread.stopReason`) is what names which: `user-stopped` is a
+        // host halt, `api-error`/`retries-exhausted`/`timeout`/`turn-cap`/
+        // `budget-exhausted`/`caller-released`/`parent-closed`/`plugin-parked` are not. A
+        // client that reads the status alone must not claim the user stopped it, and a
+        // `stopped` thread with a resummable reason is resumable by THIS route.
+        //
+        // `idle` joins it for two reasons. (1) It is what an INTERRUPTED run leaves behind:
+        // the runtime persists a thread record as `stopped` or `idle` only (../harness.ts:10071),
+        // so a run that was in flight when the process died comes back on an `idle`
+        // conversation whose newest turn the restore marked `error` (see `restoreSession`'s
+        // recovery policy below) — the transcript is RETAINED, and under R2 so is every turn
+        // row and every soft-deleted conversation. (2) A run that simply FAILED on the
+        // provider settles its turn `error` while its conversation returns to `idle`. In
+        // both cases the answer was never reached and the recorded row is the input, so this
+        // route is what puts it back to work; the newest-turn guards below are what decide.
+        //
+        // A SOFT-DELETED conversation is resumable too (R2/AC4). `harness.thread()` names
+        // only ACTIVE conversations (../types `HarnessThreadRecord.inactive` excludes a
+        // deleted one from the tooling's discovery) while its row is retained durably, so an
+        // explicit host resume addresses the RETAINED row and reactivates it — the marker is
+        // lifted by the run this call starts (see `reactivateThreadRow`), which is the spec's
+        // "the only way a thread is permanently gone is that the session was deleted".
         //
         // WHAT STILL REFUSES. `running` has a run in flight — the wording of that refusal is
         // unchanged, because it is the state the sentence still describes (two tests pin it and
@@ -9204,17 +9642,38 @@ export class SessionStore {
         // has no authority over it, so it states its own reason rather than hiding behind the
         // running sentence. Anything outside the roster's four statuses is refused with the
         // running wording as the general form.
-        if (record.status === 'paused') {
+        const record = session.harness.thread(threadId);
+
+        // The retained row, read from the store's own committed snapshot (`session.core` is
+        // what `sessionRecord` writes, and it carries soft-deleted rows), used only when the
+        // live handle does not name the conversation.
+        const retired =
+            record === undefined
+                ? (session.core.threads ?? []).find(
+                      (thread) => thread.id === threadId && thread.inactive === true
+                  )
+                : undefined;
+
+        if (record === undefined && retired === undefined) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        // One status to judge: the live handle's when it names the conversation, otherwise
+        // the retained row's (the runtime persists `idle`/`stopped` only, so a retained row
+        // never invents a state the live roster would contradict).
+        const haltedStatus = record?.status ?? retired?.status;
+
+        if (haltedStatus === 'paused') {
             throw new SessionError(
                 409,
                 `Thread "${threadId}" is paused; the plugin that parked it unpauses it, not this route.`
             );
         }
 
-        if (record.status !== 'stopped' && record.status !== 'idle') {
+        if (haltedStatus !== 'stopped' && haltedStatus !== 'idle') {
             throw new SessionError(
                 409,
-                `Thread "${threadId}" is ${record.status}; only a stopped thread can be resumed.`
+                `Thread "${threadId}" is ${haltedStatus}; only a stopped thread can be resumed.`
             );
         }
 
@@ -9237,6 +9696,13 @@ export class SessionStore {
 
         // "As long as the answer isn't reached": `done` means it was reached, so re-running
         // the same prompt would duplicate an answer the user already has.
+        //
+        // F-A Defect 2 (2026-11-15) ruled this 409 STAYS. It is not the soft-delete refusal the
+        // defect was about: this guard reads the TURN's status, and a `done` turn means the
+        // conversation reached its answer — deleted or not. A host that wants to keep talking to
+        // a finished (even soft-deleted) conversation uses the SUBMIT door (`enqueue` with this
+        // thread id), which now resolves the retained row and revives it like `resumeThread`
+        // does; re-RUNNING an answer that already exists is the case this sentence refuses.
         if (last.status === 'done') {
             throw new SessionError(
                 409,
@@ -9409,6 +9875,13 @@ export class SessionStore {
             if (session.status === 'error') session.status = 'idle';
         }
 
+        // THE "CONTINUE FROM THE RECORDED PROMPT" CLAIM (`ThreadLane.resumeRecordedInput`). Set here,
+        // with the other per-attempt mutations and BEFORE the durability fence, because the run this
+        // requeue starts is the one that must not re-append the prompt the retained transcript
+        // already holds. Released in the rollback below: a requeue that never became durable did not
+        // re-run anything, so the lane must not tell a later attempt to skip its root append.
+        lane.resumeRecordedInput = turn.id;
+
         // A FRESH settler under the SAME id: `settle` resolved and DELETED the interrupted
         // run's promise, so the caller of a resume needs its own handle on this row's next
         // terminal transition (./sessions.ts:7246-7253). One promise per turn id at a time —
@@ -9443,6 +9916,10 @@ export class SessionStore {
             // one again when this path is done.
             const at = lane.queue.indexOf(turn);
             if (at !== -1) lane.queue.splice(at, 1);
+
+            // The claim goes back with the row: nothing was re-run, so no run is owed the
+            // "prompt already recorded" treatment.
+            if (lane.resumeRecordedInput === turn.id) lane.resumeRecordedInput = undefined;
 
             session.settlers.delete(turn.id);
 
@@ -9496,6 +9973,97 @@ export class SessionStore {
         return { session: snapshot, turn: queuedTurn, settled };
     }
 
+    // CONTINUE A RESUMED TURN FROM THE PROMPT IT ALREADY RECORDED (IT19 R2 retention).
+    //
+    // THE DEFECT. A thread-bound run that ends without an answer keeps its whole tail (the
+    // retention boundary in ../harness.ts `runAgentCore`'s catch), so after a stop the conversation
+    // still holds the `user` message of the turn that was just halted. `resumeThread` re-runs THAT
+    // row in place, and `runAgentCore` opens every run by appending its root prompt
+    // (`brain.user(input)`, ../harness.ts). Retention plus in-place retry therefore asked the same
+    // question twice: the provider request after a resume carried `[..., 'question', 'question']`,
+    // the user paid for the prompt twice, and the duplicate stayed in the transcript for every later
+    // turn. The pre-retention runtime hid this by splicing the tail out on failure — a fix nobody
+    // wants back, because splicing is how retained turns were destroyed.
+    //
+    // THE RULE, stated narrowly: when the conversation's committed transcript ENDS with the very
+    // `user` message this run is about to send, the run CONTINUES from that recorded message instead
+    // of asking again. Nothing else moves: no truncation of the retained tail, no rewrite of an
+    // earlier row, and the crash-repair pairing (./persistence.ts `repairInterruptedToolCalls`)
+    // stays intact because the assistant→tool block sits BEHIND the tail entry this drops. When the
+    // last row is not that user message — a run that committed an assistant turn, or one whose
+    // transcript ends on a synthesized interrupted-tool result — the re-run legitimately asks again,
+    // exactly as before.
+    //
+    // WHY A DROP AND NOT AN OPTION ON THE RUN. The runtime offers no "input already appended" seam:
+    // the root append is unconditional, and threading one through `HarnessRunOptions` would have to
+    // reach the lane worker's request protocol too (./workers/protocol.ts), i.e. four files and a
+    // wire field for one server-side retry. `setThreadMessages` is the one sanctioned host door that
+    // removes a transcript entry (../types "the transcript editor's write primitive"), it works
+    // identically inline and in worker mode (the replica re-reads the canonical transcript, and the
+    // `transcript:sync` contract already answers a canonical that got SHORTER by rebasing the lane),
+    // and it replaces the array IN PLACE, so no live reader is left holding a stale reference.
+    //
+    // WHAT THE DROP COSTS, honestly: the re-run mints the root message under a fresh `messageId`
+    // (../core/message-id.ts derives it from the highest id already present). Content, attachments,
+    // position and count are identical; only the address of that one entry moves. The alternative —
+    // leaving both copies — is the defect.
+    //
+    // A REFUSAL IS NOT FATAL. The runtime refuses a transcript write on a conversation with live
+    // work; if one arrives between the lane opening this turn and this call, the run simply appends
+    // its prompt as it always did. Failing a resume because an optimisation could not be applied is
+    // worse than the duplicate it prevents.
+    private releaseRecordedRootInput(
+        session: Session,
+        threadId: string,
+        prompt: string,
+        turn: SessionTurn
+    ): void {
+        const harness = session.harness as Partial<Harness>;
+
+        if (typeof harness.threadMessages !== 'function' || typeof harness.setThreadMessages !== 'function') {
+            return;
+        }
+
+        let transcript: HarnessMessage[];
+
+        try {
+            // The HOST read (no caller id): an explicit host resume is the revival path for a
+            // soft-deleted conversation, and `threadMessages` answers for a retained row while the
+            // roster does not. The value is a detached copy, so this array is ours to slice.
+            transcript = harness.threadMessages(threadId);
+        } catch {
+            return;
+        }
+
+        const last = transcript[transcript.length - 1];
+
+        // Exactly the tail, and exactly this prompt. Reference expansion runs BEFORE this call
+        // (`expandReferences`), so `prompt` is the bytes the run is about to send — the same bytes
+        // the interrupted attempt appended, because the durable record re-expands the same
+        // references. A turn that references a still-changing answer can compose differently; then
+        // the texts differ and the run asks again, which is the honest outcome.
+        if (last === undefined || last.role !== 'user' || last.content !== prompt) return;
+
+        // Attachments are compared by PRESENCE, not by bytes: the run re-attaches what the durable
+        // turn record holds (./sessions.ts passes `turn.attachments` on every dispatch, and
+        // ./persistence.ts revalidates those exact bytes on load), so dropping a recorded row that
+        // carries them cannot lose them — but a recorded row WITH them beside a record WITHOUT them
+        // is a mismatch this drop must not paper over.
+        const recordedHasAttachments = Array.isArray(last.attachments) && last.attachments.length > 0;
+        const replayHasAttachments = Array.isArray(turn.attachments) && turn.attachments.length > 0;
+
+        if (recordedHasAttachments !== replayHasAttachments) return;
+
+        try {
+            harness.setThreadMessages(
+                threadId,
+                transcript.slice(0, transcript.length - 1)
+            );
+        } catch {
+            // See the header: the historical re-append is the fallback.
+        }
+    }
+
     // True when `candidate` is (transitively) owned by `ancestor` in the runtime
     // roster. Used to cascade a stop/drop over a deleted owner's children; a cyclic
     // hand-edited link terminates instead of looping.
@@ -9541,67 +10109,15 @@ export class SessionStore {
         }
     }
 
-    // Invocation ids whose persisted agent-result records belong to the doomed
-    // conversations (F6). Reconstructed from the server's own records because the
-    // persisted snapshot carries no thread id per result:
-    //   - each doomed thread's latest runtime invocation;
-    //   - every ROOT invocation recorded for a doomed thread's turn;
-    //   - every non-branch invocation that appeared in those turns' events (a
-    //     delegated child's runs are recorded inside its parent turn).
-    // `removedIds` scopes the turn scan to the turns this deletion actually removes
-    // (a survivor's invocation must keep its results), so it is load-bearing, not
-    // decorative.
-    private doomedInvocationIds(
-        session: Session,
-        doomed: ReadonlySet<string>,
-        removedIds: ReadonlySet<string>
-    ): Set<string> {
-        const ids = new Set<string>();
-
-        if (!this.threadsSupported(session)) return ids;
-
-        // Every invocation this server observed in a doomed conversation — including
-        // a child's EARLIER runs, which the roster's single slot no longer names.
-        for (const [invocationId, threadId] of session.invocationThreads) {
-            if (doomed.has(threadId)) ids.add(invocationId);
-        }
-
-        for (const record of session.harness.threads()) {
-            if (!doomed.has(record.id)) continue;
-            if (record.invocationId !== undefined) ids.add(record.invocationId);
-        }
-
-        for (const turn of session.turns) {
-            if (turn.threadId === undefined || !doomed.has(turn.threadId)) continue;
-            if (!removedIds.has(turn.id)) continue;
-
-            const rootInvocation = session.turnInvocations.get(turn.id);
-            if (rootInvocation !== undefined) ids.add(rootInvocation);
-
-            for (const event of turn.events) {
-                const thread = (event as { thread?: { id?: string; kind?: string; branchId?: string } })
-                    .thread;
-
-                // A branch run IS thread-scoped, and this scan used to claim the opposite.
-                // Its record's `threadId` is the requester's persistent conversation: a
-                // branch run has no `resolvedThread` of its own in `runAgent`, so `runThreadId`
-                // (src/harness.ts:11737, the "M2" comment) falls back to `parent.threadId`, and
-                // `registerInvocation` writes that id onto the record. `purgeThread` matches on
-                // exactly that field, so deleting the conversation removes the branch's result
-                // with it — the behaviour src/harness.thread-runtime.test.ts pins as "purges
-                // thread-owned branches AND THEIR RESULTS on delete (M2)". Skipping the branch
-                // ids here (the retired `thread.kind !== undefined` guard) asserted "the runtime
-                // keeps them" and left the durable registry holding a lookup the live session had
-                // already dropped; the F6 consistency guard below then hid the divergence by
-                // persisting the runtime's snapshot instead of this projection.
-                if (thread?.id === undefined) continue;
-
-                ids.add(thread.id);
-            }
-        }
-
-        return ids;
-    }
+    // RETIRED (R2): `doomedInvocationIds` used to sit here. A thread deletion used to purge
+    // the doomed conversations' `core.agentResults` rows, and this was the only way to NAME
+    // them: the persisted snapshot carries no thread per result, so the ids had to be
+    // reconstructed from the server's own joins — the invocation→conversation map, each
+    // doomed thread's latest invocation, every ROOT invocation of a doomed turn, and every
+    // invocation named in those turns' events (branch runs included: a branch record is
+    // owned by the conversation that forked it, see src/harness.ts `runThreadId` and the M2
+    // pin in src/server/threads.test.ts). A retention rule leaves every one of those rows
+    // in place, so the scan has no consumer and was removed with the filter that used it.
 
     // -----------------------------------------------------------------------
     // C4: the per-thread transcript editor
@@ -9706,7 +10222,7 @@ export class SessionStore {
         // a delete now STOPS the conversation first and only then purges it, so a
         // live row is the normal input to a delete; the purge's remaining 409s cover
         // only the live state a stop cannot release (a `threadSend` revival this
-        // server has no row for). See `deleteThread` / `purgeDeletedThread`.
+        // server has no row for). See `deleteThread` / `markDeletedThread`.
         if (record.status === 'running' || session.lanes.get(threadId)?.active !== undefined) {
             throw new SessionError(
                 409,
@@ -9851,17 +10367,21 @@ export class SessionStore {
     // R2 (Fix 2): a thread is deletable whatever is happening in it. Any live or
     // queued work — a run inside the harness, a turn parked in a reference wait, or an
     // accepted backlog — is stopped FIRST (the same cascade `cancelThread` performs,
-    // descendants included), the aborted rows are awaited, and only then does the
-    // purge run. A conversation that merely REFERENCEs one of these turns is never
+    // descendants included), the aborted rows are awaited, and only then does the MARK
+    // run. A conversation that merely REFERENCEs one of these turns is never
     // stopped by this call; its parked waiter is released with the "was deleted" note.
+    //
+    // What the mark leaves behind is everything: the conversation's row (with its
+    // transcript), its turn rows, its agent results and its journal frames. See
+    // `markDeletedThread` for the retention contract and what is hidden rather than gone.
     //
     // The refusals that survive the force are the ones a stop cannot answer for, and
     // they keep the historical 409 message: a conversation the RUNTIME reports running
     // with no server row to wait on (a tool-started `threadSend` run — the store has no
-    // settler to await, so purging it would be refused inside the runtime and surface
-    // as a 500), a descendant in that state, and a doomed row that refuses to settle
-    // within `DELETION_ABORT_SETTLE_MS` (the F4 atomicity rule: purging under a live
-    // run would drop the durable file while the runtime still writes the conversation).
+    // settler to await, so marking it mid-run would be refused inside the runtime and
+    // surface as a 500), a descendant in that state, and a doomed row that refuses to
+    // settle within `DELETION_ABORT_SETTLE_MS` (the F4 atomicity rule: marking under a
+    // live run would write the document while the runtime still writes the conversation).
     // D4 (worker IO): ASYNC because the write is durable BEFORE the response. Inline this
     // still returns after the synchronous rename; with an IO client it resolves on the
     // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
@@ -9909,15 +10429,101 @@ export class SessionStore {
                 await this.waitForTurnsSettled(session, marked, DELETION_ABORT_SETTLE_MS);
             }
 
-            return await this.purgeDeletedThread(id, threadId);
+            return await this.markDeletedThread(id, threadId);
         } finally {
             this.releaseDeletingTurnIds(session, marked);
         }
     }
 
-    // The purge: removes the thread, its descendants, every owning turn, every result
-    // reference that pointed at those turns, and their persisted copies. The default
-    // `agent:<name>` conversation is a 400 (use reset).
+    // R2 reconciliation of the marked rows: the runtime is the authority for every field of
+    // a conversation it still reports, so a live row is taken as-is; a doomed row it no
+    // longer reports is put back from `projected` — the marked durable row this call just
+    // wrote.
+    //
+    // WHY THE DOCUMENT OWNS RETENTION: `session.core` is re-captured from
+    // `harness.snapshot()` on every persist (see `noteStateChange`), so if the runtime still
+    // PHYSICALLY removed a conversation, its purge would be written back into `state.json`
+    // by the very next checkpoint and the transcript would be gone — the delete response
+    // would promise retention for one tick and then lose it. Restoring the projected row
+    // here keeps the retention promise in the one place the spec is about (the file a shell
+    // reads). A runtime that marks instead of purges (../harness.ts `deleteThread`) never
+    // takes this branch, so this is not a second source of truth in the normal case — it is
+    // the floor under it.
+    private reconcileMarkedThreads(
+        live: HarnessSnapshot,
+        projected: HarnessSnapshot,
+        doomed: ReadonlySet<string>
+    ): HarnessSnapshot {
+        const liveThreads = live.threads;
+        const projectedThreads = projected.threads;
+
+        // No thread section on either side means this harness never persisted a host thread,
+        // so the projection marked nothing and the live answer stands unchanged.
+        if (liveThreads === undefined || projectedThreads === undefined) return live;
+
+        const present = new Set(liveThreads.map((thread) => thread.id));
+        const missing = projectedThreads
+            .filter((thread) => doomed.has(thread.id) && !present.has(thread.id))
+            // `sequence` is the runtime's creation order, which is the order `readThreads`
+            // validates and the roster sorts by — re-appending in that order keeps a restored
+            // session byte-stable instead of depending on the order a purge happened to leave.
+            .sort((left, right) => left.sequence - right.sequence);
+
+        if (missing.length === 0) return live;
+
+        return { ...live, threads: [...liveThreads, ...missing] };
+    }
+
+    // The F6 guard's equality test, R2 edition. It answers the guard's original question —
+    // does the runtime disagree with the durable projection about the core state (threads,
+    // high-water counters, agent results)? — while ignoring the ONE difference this call
+    // creates by design: the soft-delete marker on the rows it just marked.
+    //
+    // `inactiveAt` is a wall-clock stamp of the transition and the runtime stamps its own copy
+    // a few milliseconds after the projection did, so a raw `JSON.stringify` compare would
+    // fire on every delete and answer it with a redundant extra write of the runtime's
+    // snapshot — which, worse, would be the copy WITHOUT the marker if the runtime had not
+    // written one. `inactive` is ignored for the same doomed rows for the same reason: the
+    // projection writes it, and `reconcileMarkedThreads` guarantees the row itself survives.
+    // Everything else still has to match, so the guard keeps catching a genuine divergence.
+    //
+    // Threads are keyed by id before the compare so a row that simply moved in the array is
+    // not read as a divergence; row ORDER is not core state (the roster re-sorts by
+    // `sequence` on every read).
+    private coresAgreeIgnoringMarker(
+        left: HarnessSnapshot,
+        right: HarnessSnapshot,
+        doomed: ReadonlySet<string>
+    ): boolean {
+        return JSON.stringify(normalizeCoreForCompare(left, doomed)) === JSON.stringify(normalizeCoreForCompare(right, doomed));
+    }
+
+    // THE MARK (R2, primary spec: "all turns must be recorded… even deleted marks the
+    // thread 'inactive'"). This used to be a PURGE; it is now a soft delete, and the ONLY
+    // durable thing it changes is the marker on the conversation's own row:
+    //
+    //   - the `core.threads` row SURVIVES with its full `messages` transcript and gains
+    //     `inactive: true` + `inactiveAt` (../types `HarnessThreadRecord.inactive`), so
+    //     `state.json` still holds the conversation a `shell` user can read;
+    //   - the conversation's TURN ROWS survive, in the document and in memory, and every
+    //     link that pointed at them keeps resolving (they were never removed);
+    //   - their `core.agentResults` rows survive (../types `HarnessAgentResultSnapshot` —
+    //     the kernel keeps its invocation records too, so the durable registry and the
+    //     live harness agree without a filter here);
+    //   - `events.jsonl` is NOT compacted. The append-only per-step log is the
+    //     shell-reachable truth about what the conversation did, and compaction is a
+    //     rewrite (`journal.rewrite`), i.e. destruction.
+    //
+    // What DOES change, and why it is not destruction: the lane is closed (a runtime
+    // worker, not a record), the conversation's DISPLAY name is retired into the
+    // per-code label high-water (R8 tombstone — the counter survives, only the text
+    // leaves the map), and every read projection HIDES the row (`threadRoster` here,
+    // `threadRowsOf` in ./api.ts), which is what "not discovered within the session
+    // tooling" means while `shell` still finds it.
+    //
+    // The only destructive path left is the SESSION's: `reset` and session removal, which
+    // do truncate/remove the journal. That is the spec's single spelling of "permanently
+    // gone". The default `agent:<name>` conversation is a 400 (use reset).
     //
     // ORDERING: the new document is written BEFORE the live harness is touched, so a
     // failed write rolls back cleanly with nothing lost (the in-memory state and the
@@ -9932,7 +10538,7 @@ export class SessionStore {
     // still returns after the synchronous rename; with an IO client it resolves on the
     // worker's receipt for THIS document (./workers/io-client.ts, contract 1). A caller that
     // drops the await cannot claim the mutation survived a restart.
-    private async purgeDeletedThread(id: string, threadId: string): Promise<SessionSnapshot> {
+    private async markDeletedThread(id: string, threadId: string): Promise<SessionSnapshot> {
         const session = this.require(id);
 
         if (!this.threadsSupported(session)) {
@@ -10050,106 +10656,103 @@ export class SessionStore {
             )
         );
 
-        // Persist the post-delete document FIRST. `sessionRecord` is projected as if
-        // the deletion had already happened, so a write failure changes nothing.
-        const survivors = session.turns.filter(
-            (turn) => turn.threadId === undefined || !doomed.has(turn.threadId)
-        );
-        const removedIds = new Set(
-            session.turns
-                .filter((turn) => turn.threadId !== undefined && doomed.has(turn.threadId))
-                .map((turn) => turn.id)
-        );
+        // R2: NO turn row leaves the record. The retired projection filtered the doomed
+        // conversations' turns out of the document and out of memory; under the retention
+        // rule the turn list is untouched, so `removedIds` is EMPTY BY CONSTRUCTION — and
+        // that is what makes every unlink below (references, label seeds, invocation
+        // joins, instruction snapshots) a no-op instead of a deletion, and what makes the
+        // journal compaction unnecessary: the document still lists every turn, so
+        // `mergeJournal` can never meet a journal record for a turn the document forgot
+        // (the ghost-step case the retired compaction existed for, see the note above
+        // `compactJournal`).
+        const survivors = session.turns;
+        const removedIds = new Set<string>();
 
-        // Gap (c): the `#LABEL`s each SURVIVING turn loses to this deletion, in the order it
-        // submitted them, merged with anything an earlier deletion already stripped. Both the
-        // persisted copy and the live row carry them as `strippedReferences` — the ids cannot
-        // (their rows are gone) but the labels can, and they are what the composer needs to
-        // tell the user which input vanished. Computed ONCE here so the durable projection and
-        // the live record cannot drift.
-        const strippedLabels = new Map<string, string[]>();
-        for (const turn of survivors) {
-            if (turn.references === undefined) continue;
+        // Gap (c) used to compute, here, the `#LABEL`s each surviving turn LOSES to this
+        // deletion and record them as `strippedReferences` so the composer could say which
+        // input vanished. Nothing is lost any more: the referenced rows are still in the
+        // document, so the link keeps resolving and no note is owed. Detached copies only.
+        const projectedTurns = survivors.map((turn) => copyTurn(turn));
 
-            const dropped = turn.references
-                .filter((reference) => removedIds.has(reference.turnId))
-                .map((reference) => reference.label);
+        // R2: ONE stamp for the whole cascade, declared out here so the durable projection below and
+        // the retention ledger cannot claim two conversations retired at two different instants.
+        const inactiveAt = Date.now();
 
-            if (dropped.length === 0) continue;
-
-            strippedLabels.set(turn.id, [...(turn.strippedReferences ?? []), ...dropped]);
+        // THE LEDGER WRITE (see `Session.inactiveThreads`): the doomed set is exactly what this
+        // deletion retires, so it is exactly what the ledger has to remember — and remembering it in
+        // the store, not only in the rows, is what keeps the marker in the next document whatever the
+        // runtime re-derives in between (`harness.snapshot()` rebuilds thread rows without the marker,
+        // ../harness.ts:13424-13451).
+        //
+        // An id already in the ledger KEEPS its original stamp: the kernel's own rule for a repeated
+        // delete is that the FIRST transition is the fact a host renders (../harness.ts `deleteThread`
+        // restates the receipt without re-marking), so a cascade that sweeps up an already-retired
+        // child must not quietly move its deletion date forward.
+        for (const retiredId of doomed) {
+            if (!session.inactiveThreads.has(retiredId)) session.inactiveThreads.set(retiredId, inactiveAt);
         }
-
-        const projectedTurns = survivors.map((turn) => {
-            const copy = copyTurn(turn);
-
-            if (turn.references === undefined) return copy;
-
-            const kept = turn.references.filter((reference) => !removedIds.has(reference.turnId));
-
-            // A link to a deleted turn is dropped from the persisted copy too: the
-            // record must not promise a target that no longer exists. What it named is
-            // kept by LABEL (gap (c)), which is what the composer later reports.
-            if (kept.length === 0) delete copy.references;
-            else copy.references = kept.map((reference) => ({ ...reference }));
-
-            const stripped = strippedLabels.get(turn.id);
-            if (stripped !== undefined) copy.strippedReferences = [...stripped];
-
-            return copy;
-        });
-
-        // F6: the durable agent-result registry must lose exactly what the runtime
-        // purge removes. The snapshot does not expose a result's thread, so the
-        // doomed invocation ids are reconstructed from what the server recorded:
-        // every root invocation of a doomed thread's turn, every invocation that
-        // appeared in its events (delegated children AND branch runs included — a
-        // branch's record is owned by the conversation that forked it, see
-        // `doomedInvocationIds`), and each doomed thread's latest invocation.
-        const doomedInvocations = this.doomedInvocationIds(session, doomed, removedIds);
 
         const projectedCore = ((): HarnessSnapshot => {
             // Project from the LIVE snapshot, not the cached one: the answer must be
-            // exactly what the runtime will return after the purge.
+            // exactly what the runtime will return after the mark.
             const core = JSON.parse(JSON.stringify(session.harness.snapshot())) as HarnessSnapshot;
 
+            // R2: the rows are MARKED, never filtered out. `inactive` is the only field a
+            // deletion writes, and `inactiveAt` is the transition stamp the type documents
+            // as pure metadata (../types `HarnessThreadRecord.inactiveAt`: ordering uses
+            // `sequence`, never this clock, so a restored session stays deterministic).
+            //
+            // A row that is ALREADY inactive keeps the stamp it had (the same first-transition rule
+            // the ledger above follows), so a repeated delete is idempotent on the document too; a
+            // row the runtime itself marked carries its own `inactiveAt`, which is the truer instant
+            // and is kept ahead of this call's clock.
             if (core.threads !== undefined) {
-                core.threads = core.threads.filter((thread) => !doomed.has(thread.id));
-                // F5: KEEP the id high-water even with zero records. The runtime
-                // persists `threads: []` + `threadSequence` once any host thread was
-                // ever minted; dropping them here would let a restart reuse
-                // `thread-1`.
+                core.threads = core.threads.map((thread): HarnessThreadSnapshot => {
+                    if (!doomed.has(thread.id)) return thread;
+
+                    // Spread-then-mark keeps every other field verbatim (the transcript
+                    // included), and the `inactive: true` literal matches the type's
+                    // additive-when-absent discipline (absent means active).
+                    return {
+                        ...thread,
+                        inactive: true,
+                        inactiveAt: thread.inactiveAt ?? inactiveAt
+                    };
+                });
             }
 
-            if (core.agentResults !== undefined) {
-                const kept = core.agentResults.filter(
-                    (result) => !doomedInvocations.has(result.invocationId)
-                );
-
-                if (kept.length === 0) delete core.agentResults;
-                else core.agentResults = kept;
-            }
-
+            // R2/decision 3: `core.agentResults` is RETIRED as a deletion target. The
+            // retired code rebuilt the doomed invocation ids here and filtered the registry
+            // to match the runtime's purge, because a lookup the live session had dropped
+            // must not come back on a restart. The runtime now keeps those records too
+            // (./harness.ts `deleteThread` is a mark, and the invocation records ride with
+            // it), so BOTH sides retain and no filter is needed — and `doomedInvocationIds`,
+            // which existed only to name the rows to drop, is gone with it.
             return core;
         })();
 
-        const seedEntries = [...session.labelSeeds].filter(([turnId]) => !removedIds.has(turnId));
-        const invocationEntries = [...session.turnInvocations].filter(
-            ([turnId]) => !removedIds.has(turnId)
-        );
+        // R2: every per-turn map keeps its entries, because no turn row left the record
+        // (`removedIds` is empty): a label seed, an invocation join and an instruction
+        // snapshot all still describe a turn the document lists, and dropping them would
+        // destroy the very evidence the retention rule protects. The durable-row entries
+        // keyed by TURN id are therefore copied whole.
+        const seedEntries = [...session.labelSeeds];
+        const invocationEntries = [...session.turnInvocations];
         const highWaterEntries = [...session.labelHighWater];
-        // R8: a deleted conversation's display name leaves the map; the per-code
-        // high-water STAYS, so the retired name is never minted again.
+        // R8 (unchanged by R2): a deleted conversation's DISPLAY NAME leaves the map, while
+        // the per-code high-water STAYS so the retired name is never minted again. A display
+        // name is not a record — the row is still addressable by id — and re-minting a taken
+        // ordinal would be the visible bug this tombstone exists to prevent.
         const threadLabelEntries = [...session.threadLabels].filter(([id]) => !doomed.has(id));
         const threadLabelHighWaterEntries = [...session.threadLabelHighWater];
-        // C4: an unreadable transcript belongs to a conversation, so the doomed
-        // conversations' raw values leave the durable record with them. (A stale
-        // entry would otherwise be re-offered for a thread that no longer exists.)
-        const invalidEntries = [...session.invalidThreads].filter(([id]) => !doomed.has(id));
-        // T10: an instruction snapshot belongs to a turn, so the doomed turns'
-        // snapshots leave the durable record with them (a stale key would otherwise
-        // keep re-feeding a fold for a turn the document no longer lists).
-        const instructionEntries = [...session.turnInstructionSources].filter(([turnId]) => !removedIds.has(turnId));
+        // C4: an unreadable transcript's RAW value belongs to a conversation that still
+        // exists durably, so the entry is RETAINED (hiding it from the read projections is
+        // `invalidThreadEntriesOf`'s job, not deleting the user's broken JSON).
+        const invalidEntries = [...session.invalidThreads];
+        // T10: an instruction snapshot belongs to a TURN, and every doomed turn's row is
+        // retained, so its snapshot is retained with it.
+        const instructionEntries = [...session.turnInstructionSources];
+
 
         const previous = this.sessionRecord(session);
 
@@ -10223,71 +10826,59 @@ export class SessionStore {
         // no-op instead of a write into a deleted conversation.
         this.host?.closeLane(id, { kind: 'thread', threadId }, 'thread deleted');
 
-        // Purge the owning turns and every link that pointed at them.
-        session.turns = survivors;
+        // R2: `session.turns` is deliberately NOT reassigned. The conversation's turn rows
+        // are the record the retention rule protects, and `survivors` above is the same
+        // array the store already holds, so reassigning it would only invite a drift.
+        //
+        // R1/R4: neither `forgetProjections` nor `compactJournal` runs any more, and both
+        // were pure destruction here:
+        //   - `compactJournal` rewrites the per-step log (./journal.ts:439
+        //     `journal.rewrite`) down to the surviving turns. The log is the append-only,
+        //     shell-reachable truth about what the conversation did, and the spec keeps it.
+        //   - the ghost-step hazard the compaction existed for cannot arise while the
+        //     document still lists every turn the journal names, which is exactly what the
+        //     retention above guarantees (`mergeJournal` replays records ONTO turns).
+        //   - `forgetProjections` only ever cleared the compiled trees of REMOVED turns;
+        //     with no removed turn it is a no-op, so the retained rows keep their warm
+        //     fold instead of being re-compiled from the journal on the next view read.
+        //
+        // Gap (c) and the per-turn cleanup that used to follow it are gone by construction
+        // too: no row left, so no reference was stripped, no label seed / invocation join /
+        // instruction snapshot was orphaned, and no parked waiter needs releasing (every
+        // turn it awaits is still recorded and will still settle).
 
-        // R1/R4: the compiled trees of the deleted turns go with them, and the durable
-        // per-step log is compacted to the SURVIVING turns. The compaction is what
-        // makes a deletion final across a restart: the restore merge would otherwise
-        // find journal records for turns the document no longer lists and recover them
-        // as orphan steps.
-        this.forgetProjections(session, removedIds);
-        this.compactJournal(session, survivors.map((turn) => turn.id));
-
-        // R8: forget the doomed conversations' names (their high-water stays).
+        // R8 (unchanged by R2): the doomed conversations' DISPLAY names leave the map; the
+        // per-code high-water stays, so a retired name is never minted for a new one.
         for (const id of doomed) session.threadLabels.delete(id);
-        for (const turn of survivors) {
-            if (turn.references === undefined) continue;
-
-            const kept = turn.references.filter((reference) => !removedIds.has(reference.turnId));
-            if (kept.length === turn.references.length) continue;
-
-            if (kept.length === 0) delete turn.references;
-            else turn.references = kept;
-
-            // Gap (c): the live row records the same labels the durable copy does, so the
-            // turn that eventually composes can inject the deleted-result note instead of
-            // running bare.
-            const stripped = strippedLabels.get(turn.id);
-            if (stripped !== undefined) turn.strippedReferences = [...stripped];
-        }
-
-        for (const removed of removedIds) {
-            session.labelSeeds.delete(removed);
-            session.turnInvocations.delete(removed);
-            session.turnInstructionSources.delete(removed);
-
-            // Release anyone awaiting a removed turn's completion (nothing else
-            // will settle it) and forget its cached settler.
-            const settle = session.settlers.get(removed);
-            if (settle !== undefined) {
-                session.settlers.delete(removed);
-                settle();
-            }
-        }
 
         // Forget every lane of the deleted conversations. Its queued turns were
-        // refused above (409), so the queue is empty by construction.
+        // refused above (409), so the queue is empty by construction. A lane is a live
+        // worker (and its epoch in the authority's journal), not a record, so closing it
+        // destroys nothing the spec protects.
         for (const targetId of doomed) session.lanes.delete(targetId);
 
-        // The invocation joins of a deleted conversation have no remaining target.
-        for (const [invocationId, threadId] of session.invocationThreads) {
-            if (doomed.has(threadId)) session.invocationThreads.delete(invocationId);
-        }
+        // R2: the invocation→conversation joins are RETAINED. They are how a historical
+        // result card names the conversation that produced it
+        // (`invocationThreadLabels`/`liveThreadLabel`), and the conversation still exists —
+        // only hidden — so dropping the join would break a retained row's own history.
 
-        // C4: same rule for an unreadable transcript — the durable projection above
-        // already dropped it, so the live map must match the file.
-        for (const targetId of doomed) session.invalidThreads.delete(targetId);
+        // C4: an unreadable transcript's raw value is retained with its conversation; the
+        // durable projection above kept the entry, so the live map matches the file.
 
-        session.queue = session.queue.filter((turn) => !removedIds.has(turn.id));
         session.updatedAt = Date.now();
-        session.core = session.harness.snapshot();
 
-        // F6 consistency guard: the durable projection and the runtime's post-purge
-        // snapshot must describe the same core state (threads, high-water, agent
-        // results). If they ever differ, persist the runtime's answer so a restart
-        // cannot resurrect a lookup the live session already lost.
-        if (JSON.stringify(session.core) !== JSON.stringify(projectedCore)) this.persistBestEffort();
+        // R2: what the runtime reports wins for every conversation it still reports, and a
+        // conversation it no longer reports is restored from the marked projection — see
+        // `reconcileMarkedThreads` for why the document, not the runtime, owns retention.
+        session.core = this.reconcileMarkedThreads(session.harness.snapshot(), projectedCore, doomed);
+
+        // F6 consistency guard: the durable projection and the runtime's post-mark snapshot
+        // must describe the same core state (threads, high-water, agent results). If they
+        // ever differ, persist the runtime's answer so a restart cannot resurrect a lookup
+        // the live session already lost. The comparison ignores ONLY the soft-delete marker
+        // this call wrote by design — see `coresAgreeIgnoringMarker`, because a
+        // millisecond-later `inactiveAt` on the runtime's own copy is not a divergence.
+        if (!this.coresAgreeIgnoringMarker(session.core, projectedCore, doomed)) this.persistBestEffort();
 
         // Nothing is executing for a deleted thread; wake parked waiters so a
         // `waitForIdle`/reset request can observe the new state.
@@ -10296,9 +10887,11 @@ export class SessionStore {
 
         this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
 
-        // T16: every deleted conversation and every deleted row is an invalidation the stream
-        // states by id - clients re-page the roster and the turns page rather than being handed
-        // a snapshot of what is left.
+        // T16: every deleted conversation is an invalidation the stream states by id -
+        // clients re-page the roster rather than being handed a snapshot of what is left.
+        // `turn.removed` is NOT signalled any more (R2): the loop below iterates an empty
+        // set by construction, and a client that dropped a turn row on this frame would be
+        // discarding a record the server still holds.
         for (const targetId of removedIds) {
             this.notifyStream({ kind: 'turn.removed', sessionId: session.id, turnId: targetId, at: Date.now() });
         }

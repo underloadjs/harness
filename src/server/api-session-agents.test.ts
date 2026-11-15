@@ -892,7 +892,7 @@ describe('session agent bindings', () => {
     // threw away transcripts the request never named.
     // -----------------------------------------------------------------------
 
-    it('refuses to detach an agent that still owns a conversation, then detaches it once the thread is gone', async () => {
+    it('refuses to detach an agent that still owns a conversation, and still refuses it once the thread is only marked deleted', async () => {
         const { api, store } = openInMemory();
         const sessionId = await createSession(api);
 
@@ -935,7 +935,9 @@ describe('session agent bindings', () => {
         expect(conflict.body.error.message).toContain(`Agent "${CUSTOM}"`);
         expect(conflict.body.error.message).toContain('1 conversation');
         expect(conflict.body.error.message).toContain(threadId);
-        expect(conflict.body.error.message).toContain('Delete those threads before removing the agent');
+        expect(conflict.body.error.message).toContain(
+            'A deleted thread is retained, so removing this agent needs the session deleted.'
+        );
 
         // Nothing moved: the conversation is still addressable, and the member is still a row.
         const threads = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/threads`));
@@ -949,38 +951,37 @@ describe('session agent bindings', () => {
         expect(rowOf(still.body).deletable).toBe(false);
         expect(store.liveSession(sessionId).preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
 
-        // Delete the conversation the caller DID name, and the removal is accepted — with no
-        // thread detached as a side effect.
+        // Delete the conversation the caller DID name. The roster says the member is deletable
+        // again, yet the removal is STILL refused: the delete only MARKED the thread, and its
+        // retained host row still names this agent. Only the session going away releases it.
         const dropped = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/threads/${threadId}`));
 
         expect(dropped.status).toBe(200);
 
         const afterThread = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
 
+        // The roster hides the marked row, so this flag is advisory after a delete; the write
+        // gate below is the authoritative answer.
         expect(rowOf(afterThread.body).deletable).toBe(true);
 
-        const removed = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}`));
-        const removedRevision = removed.body.revision;
+        const stillBlocked = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}`));
 
-        expect(removed.status).toBe(200);
-        expect(removed.body).toEqual({
-            deleted: true,
-            agent_id: CUSTOM,
-            session_id: sessionId,
-            // R6: an accepted removal never detaches anything, and the field stays because the
-            // contract declares it.
-            detached_threads: 0,
-            revision: removedRevision
-        });
+        expect(stillBlocked.status).toBe(409);
+        expect(stillBlocked.body.error.message).toContain(threadId);
+        // This refusal comes from the harness's own backstop (../harness.ts `removeAgent`): the
+        // store's guard reads the roster, which hides the marked row, so the kernel is what stops
+        // the removal when the only conversation left is a retained one.
+        expect(stillBlocked.body.error.message).toContain(
+            'Cannot remove agent "localizer" while it owns thread "thread-1"; a deleted thread is still retained, so only deleting the session releases it.'
+        );
 
-        const after = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+        // Nothing moved: the member is still registered and its stored base is intact.
+        expect(store.liveSession(sessionId).harness.agents[CUSTOM]).toBeDefined();
+        expect(Object.hasOwn(store.liveSession(sessionId).preset, 'customAgents')).toBe(true);
 
-        expect(after.body.total).toBe(1);
-        expect(after.body.agents.map((row: Record<string, any>) => row.agent_id)).toEqual(['instruct']);
-        expect(store.liveSession(sessionId).harness.agents[CUSTOM]).toBeUndefined();
-
-        // R7: detaching also deletes the stored base, so a restart has nothing left to rebuild.
-        expect(Object.hasOwn(store.liveSession(sessionId).preset, 'customAgents')).toBe(false);
+        // R7: the durable base belongs to the session, so deleting the session is the door
+        // that releases the retained rows and drops what a restart would rebuild.
+        expect(await store.remove(sessionId)).toBe(true);
     });
 
     it('refuses an unusable session-defined name and keeps an unknown DELETE a 404', async () => {

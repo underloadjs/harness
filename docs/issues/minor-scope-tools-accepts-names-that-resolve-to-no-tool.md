@@ -118,3 +118,16 @@ starved without the child having to volunteer it.
   more likely formatting slip.
 - **Test gap confirmed:** no test passes an unknown, mis-cased, or duplicate name in
   `scope.tools`.
+
+## Update — 2026-11-16 (review pass)
+
+- **Re-verified unchanged, with the two anchors above re-stated from the current tree** (`grep -rn
+  "scopeUnresolved\|unknownTools" src --include=*.ts` → 0 hits; the scope is still forwarded
+  unvalidated at `src/harness.ts:5010-5012` and consulted only as a membership test, `isToolInScope`
+  `:5275-5276` feeding the declaration filter `:5318` and the launch gate `:9821-9823`): the widened
+  rule this file's 2026-11-11 review already states — trim, reject duplicates, and refuse any name
+  still unresolved after trimming, because `["Read"]` and `[" read"]` starve the child exactly like
+  `"wri"` — belongs inside `delegateFor` (declared `src/harness.ts:4754`) immediately after its
+  agent-allowlist refusal, which is now `:4808-4812` (`Agent "…" is not a configured subagent.
+  Allowed: …` at `:4810`; the sibling `agentResult` refusal shape is `:4308`), and an empty array must
+  keep meaning "no tools at all" with `toolRequest` still available.

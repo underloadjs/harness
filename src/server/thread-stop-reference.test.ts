@@ -362,9 +362,9 @@ describe('stop/delete against a turn parked on a referenced block', () => {
         store.dispose();
     });
 
-    // R2: a parked turn is not "live work" that blocks a deletion — the delete stops it
-    // and purges the conversation, and the target keeps running.
-    it('deletes the conversation of a parked waiter (abort-then-purge)', async () => {
+    // R2: a parked turn is not "live work" that blocks a deletion — the delete stops it and
+    // MARKS its conversation, and the target keeps running.
+    it('deletes the conversation of a parked waiter (abort-then-mark)', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
         const created = await store.create('probe');
@@ -381,20 +381,26 @@ describe('stop/delete against a turn parked on a referenced block', () => {
         await awaitParked(store, created.id, fixture);
 
         const deleted = await store.deleteThread(created.id, waiterThread);
+
+        // IT19: the receipt's `turns` is the post-delete LEDGER, not what was purged. The
+        // waiter's own row stays — cancelled, because the delete aborted the run that was parked
+        // — right beside the target's still-live row.
         expect(deleted.turns.map((turn) => `${turn.index}:${turn.prompt}:${turn.status}`)).toEqual([
-            '0:hold rr4:running'
+            '0:hold rr4:running',
+            '1:ask it7:cancelled'
         ]);
+        // The ROSTER is the surface that drops the marked conversation.
         expect(deleted.threads!.map((thread) => thread.id)).toEqual(['thread-1']);
 
         await waiter.settled;
-        expect(store.get(created.id).turns.map((turn) => turn.prompt)).toEqual(['hold rr4']);
+        expect(store.get(created.id).turns.map((turn) => turn.prompt)).toEqual(['hold rr4', 'ask it7']);
 
         // The delete only touched ITS conversation: the target is still streaming, and
         // releasing it still answers normally.
         fixture.gate('hold rr4').resolve();
         await store.waitForIdle(created.id);
 
-        expect(turnRows(store, created.id)).toEqual(['0:hold rr4:done']);
+        expect(turnRows(store, created.id)).toEqual(['0:hold rr4:done', '1:ask it7:cancelled']);
         expect(store.liveSession(created.id).lanes.has(waiterThread)).toBe(false);
 
         store.dispose();
@@ -463,16 +469,20 @@ describe('stop/delete against a turn parked on a referenced block', () => {
         await awaitParked(store, created.id, fixture);
 
         const deleted = await store.deleteThread(created.id, target.turn.threadId!);
-        expect(deleted.turns.map((turn) => turn.prompt)).toEqual(['ask it7']);
+
+        // IT19: the deleted conversation's row is retained beside the waiter's, so the ledger
+        // still lists both prompts; only the roster drops the marked conversation.
+        expect(deleted.turns.map((turn) => turn.prompt)).toEqual(['hold rr4', 'ask it7']);
 
         fixture.gate('hold rr4').resolve();
         await waiter.settled;
         await store.waitForIdle(created.id);
 
-        expect(turnRows(store, created.id)).toEqual(['1:ask it7:done']);
+        expect(turnRows(store, created.id)).toEqual(['0:hold rr4:cancelled', '1:ask it7:done']);
 
-        // The row is gone from the record, so the note says DELETED, not "ended as
-        // cancelled": the waiter is told what actually happened to its input.
+        // The referenced CONVERSATION is deleted, and its run never produced a result, so the
+        // note says DELETED rather than "ended as cancelled": the waiter is told what actually
+        // happened to its input, and a retained row without a result cannot answer for it.
         const waiterRequest = fixture.requests[fixture.requests.length - 1]!;
         expect(lastUser(waiterRequest)).toBe(notePrompt('ask it7', 'PE1', referencedResultDeletedNote('PE1')));
 
@@ -652,10 +662,15 @@ describe('stop/delete against a turn parked on a referenced block', () => {
 
     // T14 gap (c): the QUEUED waiter — its lane had not claimed it, so it is not parked in
     // the reference wait yet — used to lose its `#LABEL` SILENTLY when the target's
-    // conversation was deleted. The link was stripped (correctly: no record may name a dead
-    // target) and the turn simply ran bare. The label now survives as `strippedReferences`,
-    // and the composer injects the same deleted-result note a mid-park deletion gets.
-    it('keeps a queued waiter stripped label and composes the deleted note when it runs', async () => {
+    // conversation was deleted: the link was stripped and the turn simply ran bare, the label
+    // surviving only as `strippedReferences` so the composer could describe the missing input.
+    //
+    // IT19 CHANGE (2026-11-15): nothing is stripped any more — the row the link names is
+    // retained, so the reference still resolves. What this case pins now is that the link
+    // survives verbatim in memory AND in the document, and that the composer still tells the
+    // model the referenced conversation is DELETED (its run never produced a result) rather
+    // than answering bare.
+    it("keeps a queued waiter's reference and composes the deleted note when it runs", async () => {
         const root = tempRoot('deleted-queued-waiter');
         const fixture = probeFixture();
         const store = createStore([fixture.preset], new HarnessPersistence(root));
@@ -695,26 +710,40 @@ describe('stop/delete against a turn parked on a referenced block', () => {
         fixture.gate('hold target').resolve();
 
         expect(deleted.turns.map((turn) => `${turn.index}:${turn.prompt}`)).toEqual([
+            '0:hold target',
             '1:hold blocker',
             '2:ask queued'
         ]);
 
-        // The surviving live row: no link to a row that no longer exists, and the label it
-        // was submitted with kept.
+        // The surviving live row: IT19 strips NOTHING. The row this link names is retained by the
+        // deletion, so the queued waiter still carries the reference it was submitted with, and
+        // the retired `strippedReferences` ledger stays absent.
         const rows = () => store.get(created.id).turns;
         const waiting = rows().find((turn) => turn.id === waiter.turn.id)!;
 
-        expect(waiting.references).toBeUndefined();
-        expect(waiting.strippedReferences).toEqual(['PE1']);
+        expect(waiting.references).toEqual([{ turnId: target.turn.id, label: 'PE1' }]);
+        expect(waiting.strippedReferences).toBeUndefined();
 
-        // The durable record agrees, and names NO turn id the document no longer lists.
+        // The durable record agrees: the link survives verbatim, and the deleted conversation's
+        // OWN row is still in the document (the retired assertion here was that the target's turn
+        // id appeared nowhere, i.e. that its row had been purged).
         const document = JSON.parse(fs.readFileSync(path.join(root, 'harness', 'state.json'), 'utf8')) as {
-            sessions: { id: string; turns: { id: string; strippedReferences?: string[] }[] }[];
+            sessions: {
+                id: string;
+                turns: {
+                    id: string;
+                    strippedReferences?: string[];
+                    references?: { turnId: string; label: string }[];
+                }[];
+            }[];
         };
         const persisted = document.sessions.find((candidate) => candidate.id === created.id)!;
 
-        expect(persisted.turns.find((turn) => turn.id === waiter.turn.id)?.strippedReferences).toEqual(['PE1']);
-        expect(JSON.stringify(document)).not.toContain(target.turn.id);
+        expect(persisted.turns.find((turn) => turn.id === waiter.turn.id)?.references).toEqual([
+            { turnId: target.turn.id, label: 'PE1' }
+        ]);
+        expect(persisted.turns.find((turn) => turn.id === waiter.turn.id)?.strippedReferences).toBeUndefined();
+        expect(JSON.stringify(document)).toContain(target.turn.id);
 
         // The blocker settles, the pump runs the waiter, and the note explains the missing
         // input instead of the turn answering bare.
@@ -722,6 +751,7 @@ describe('stop/delete against a turn parked on a referenced block', () => {
         await store.waitForIdle(created.id);
 
         expect(rows().map((turn) => `${turn.index}:${turn.prompt}:${turn.status}`)).toEqual([
+            '0:hold target:cancelled',
             '1:hold blocker:done',
             '2:ask queued:done'
         ]);

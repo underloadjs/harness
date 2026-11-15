@@ -1647,7 +1647,7 @@ describe('confirmed thread deletion', () => {
         expect(dialog.getAttribute('aria-modal')).toBe('true');
         expect(dialogTitleOf(dialog)).toBe('Delete thread');
         expect(confirmWarning(dialog)).toBe(
-            'Delete thread RR1 permanently? Its turns and transcript are removed.'
+            'Delete thread RR1? It leaves this session, and its transcript is kept until the session itself is deleted.'
         );
         expect(confirmActions(dialog)).toEqual(['Delete thread', 'Cancel']);
         expect(calls).toEqual([]);

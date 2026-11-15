@@ -1680,7 +1680,12 @@ const ACTION_LABELS = {
 // control can be in. R1: none of the Stop entries promises a confirmation — there is
 // none — and the unwired one states the missing transport instead of lying.
 const ACTION_TITLES = {
-    delete: 'Delete this thread permanently',
+    // R-FB: no "permanently" here. The DELETE marks the conversation (server
+    // `SessionStore.deleteThread`, src/server/sessions.ts:10389, writes `inactive`/
+    // `inactiveAt` and keeps the row), so the hover states the two facts a reader can act
+    // on: it leaves THIS session, and the transcript survives until the session itself is
+    // deleted.
+    delete: 'Delete this thread: it leaves this session, and its transcript is kept until the session is deleted',
     deletePending: 'Deleting this thread...',
     deleteUnwired: 'Thread deletion is not wired in this host.',
     threadDefault:
@@ -1869,8 +1874,15 @@ export const requiresDeleteConfirmation = (): boolean =>
 
 // The one warning sentence, shared by the confirmation dialog so the wording does not
 // drift per surface. `<name>` is the conversation code (`RR1`), never a raw id.
+// R-FB: it no longer says "permanently" or promises the transcript is "removed" — the
+// DELETE only marks the conversation (`SessionStore.deleteThread`,
+// src/server/sessions.ts:10389, writes `inactive`/`inactiveAt`), the roster projection then
+// drops the row (src/server/api.ts:4637-4648 filters `inactive !== true`), and the
+// transcript survives until the SESSION itself is deleted. So the sentence states the
+// visible effect (it leaves this session) plus the real retention boundary, and drops
+// nothing.
 const threadDeleteWarningOf = (name: string): string =>
-    `Delete thread ${name} permanently? Its turns and transcript are removed.`;
+    `Delete thread ${name}? It leaves this session, and its transcript is kept until the session itself is deleted.`;
 
 export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const element = el('div', 'turns');

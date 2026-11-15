@@ -24,7 +24,10 @@
 //     The same mechanism serves a key INSIDE one section: the two forensic fields of an
 //     unfinished agent result (`agentResults[].partialContent` / `.cancelledAtMessage`,
 //     issue 0033) are optional ROW fields, so a file written before them — and every
-//     fixture that has since pinned an agent-result row — keeps restoring unchanged.
+//     fixture that has since pinned an agent-result row — keeps restoring unchanged. The
+//     same is true of the run-stop and soft-delete keys added to both row types
+//     (`agentResults[].stopReason`, `threads[].stopReason` / `.inactive` / `.inactiveAt`):
+//     optional row keys, omitted when they say nothing, so `version` stays 2.
 //
 // Cross-references:
 //   - ../types            — HarnessSnapshot and its parts
@@ -48,6 +51,7 @@ import type {
     HarnessAgentSnapshot,
     HarnessDiscoveryOffsetSnapshot,
     HarnessMessage,
+    HarnessRunStopReason,
     HarnessSnapshot,
     HarnessThreadSnapshot,
     HarnessToolCall,
@@ -81,6 +85,34 @@ import { readRecordsStoreState } from './records';
 // refused with the version message below, and nobody has to lose data to a
 // half-migrated read.
 export const HARNESS_SNAPSHOT_VERSION = 2 as const;
+
+// The closed RUN-STOP vocabulary (../types `HarnessRunStopReason`) — the reader half of the
+// contract core/tool-outcome.ts sets for `TOOL_OUTCOMES`: ONE table so a refusal message and
+// the union cannot drift apart, plus ONE guard that narrows an untrusted value.
+//
+// Why the table lives HERE and not beside the union: ../types is re-exported to package
+// consumers type-only (src/harness.ts `export type * from './types'`), so a runtime value
+// next to the union would not reach them anyway — while this module is where an untrusted
+// document actually meets the vocabulary. Anything that validates a stop reason at another
+// boundary (src/harness.ts, src/server/**, src/tools/**) imports this table rather than
+// re-spelling the nine members.
+//
+// Order is the refusal message's order, so a rejection reads like the union declaration.
+export const HARNESS_RUN_STOP_REASONS: readonly HarnessRunStopReason[] = [
+    'caller-released',
+    'user-stopped',
+    'timeout',
+    'turn-cap',
+    'budget-exhausted',
+    'api-error',
+    'retries-exhausted',
+    'parent-closed',
+    'plugin-parked'
+];
+
+export const isHarnessRunStopReason = (value: unknown): value is HarnessRunStopReason =>
+    typeof value === 'string' &&
+    (HARNESS_RUN_STOP_REASONS as readonly string[]).includes(value);
 
 // The model-facing message union is small and closed. Validate every branch and
 // copy it, so a live array can never be shared with a saved object.
@@ -145,7 +177,12 @@ const readAgentResults = (
                 // row that carried it, so after one restart the archived results of a deleted
                 // conversation were unreachable to the cascade — the lane/inline divergence the
                 // stress report found, moved onto the durability path.
-                'threadId'
+                'threadId',
+                // C-A: WHY a non-completed run stopped, machine-readable (../types
+                // `HarnessRunStopReason`). Without it the only surviving answer is the English
+                // `error` text, which pushes every consumer back to string-matching a message
+                // the harness wrote for someone else.
+                'stopReason'
             ],
             entryLabel,
             // Issue 0033: the two forensic keys join `error` as MAY-BE-ABSENT, which is
@@ -156,7 +193,9 @@ const readAgentResults = (
             // reason: the writers spread it only when the invocation resolved no conversation
             // at all (src/harness.ts:12277 `runThreadId`), so absence is a fact about that row,
             // not a defect — while an old file that simply never carried the key stays valid.
-            ['error', 'partialContent', 'cancelledAtMessage', 'threadId']
+            // `stopReason` joins it for the same reason a COMPLETED row never carries one: it
+            // concluded, so there is nothing left to explain.
+            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason']
         );
 
         const invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
@@ -286,6 +325,42 @@ const readAgentResults = (
             result.threadId = readSnapshotString(record.threadId, `${entryLabel}.threadId`, {
                 min: 1
             });
+        }
+
+        // C-A — WHY the run stopped, the third forensic field of a run that did not finish.
+        //
+        // A value OUTSIDE the union is REFUSED, never dropped or coerced, for the same two
+        // reasons the neighbours give: this reader's whole rule is that a corrupt document
+        // fails loudly (file header, "no silent loss"), and a silently-dropped reason sends
+        // the consumer back to the string-matching this field exists to end. It is also the
+        // one mistake that LOOKS valid — `'cancelled'` is a STATUS here, not a reason — so
+        // quiet acceptance would be a trap a hand-edit walks straight into.
+        //
+        // `readSnapshotString` runs FIRST so a non-number/non-string reports the type message
+        // (as `role`/`kind`/`status` above do) and only a well-typed outsider reports the
+        // vocabulary message.
+        if (record.stopReason !== undefined) {
+            const stopReason = readSnapshotString(record.stopReason, `${entryLabel}.stopReason`, {
+                min: 1
+            });
+
+            if (!isHarnessRunStopReason(stopReason)) {
+                throw new HarnessError(
+                    `${entryLabel}.stopReason must be one of: ${HARNESS_RUN_STOP_REASONS.join(', ')} (or be absent).`
+                );
+            }
+
+            result.stopReason = stopReason;
+        }
+
+        // Same mutual exclusion as `error` and the forensic pair: a COMPLETED run concluded,
+        // so it has no stop reason, and a row that carried one would be re-written WITHOUT it
+        // by the next projection — `restore -> snapshot` would stop being idempotent, which is
+        // precisely why the two checks directly above refuse those keys on a completed row.
+        if (status === 'completed' && result.stopReason !== undefined) {
+            throw new HarnessError(
+                `${entryLabel}.stopReason must be absent on a completed result.`
+            );
         }
 
         if (
@@ -724,6 +799,12 @@ const readToolCreation = (value: unknown, label: string): ToolCreation => {
 // also present, and a transcript for every record. `threadSequence` must be a
 // high-water mark for the ids it accompanies, so a restore can never mint a
 // colliding id later.
+//
+// The three OPTIONAL run-stop / soft-delete keys (`stopReason`, `inactive`,
+// `inactiveAt`) join that shape without moving the version: an out-of-union reason is
+// refused, `inactive: false` is normalized to the absent form, and `inactiveAt` is read
+// as an integer >= 0 — while a row that carries NONE of them, which is every document
+// written before them, validates and restores byte-for-byte as it always did.
 const readThreads = (
     value: unknown,
     label: string,
@@ -755,10 +836,22 @@ const readThreads = (
                 'label',
                 'invocationId',
                 'contextLane',
+                // C-A: why the last run stopped short, and the soft-delete pair. A row that
+                // carries one of these WITHOUT a whitelist entry is refused outright
+                // (`readSnapshotKeys` is exact-key, ./snapshot-validation.ts), so adding the
+                // keys to the type without adding them here would have made every
+                // soft-deleted conversation unrestorable rather than merely invisible.
+                'stopReason',
+                'inactive',
+                'inactiveAt',
                 'messages'
             ],
             entryLabel,
-            ['ownerThreadId', 'label', 'invocationId', 'contextLane']
+            // All three are MAY-BE-ABSENT, which is the whole backwards-compatibility
+            // mechanism (file header): a document written before them — and every existing
+            // fixture — stays valid and restores with its exact prior meaning, while a current
+            // document that carries them is READ, not dropped. No version bump.
+            ['ownerThreadId', 'label', 'invocationId', 'contextLane', 'stopReason', 'inactive', 'inactiveAt']
         );
 
         const id = readSnapshotString(record.id, `${entryLabel}.id`, { min: 1 });
@@ -844,6 +937,65 @@ const readThreads = (
             });
 
             if (contextLane !== 0) thread.contextLane = contextLane;
+        }
+
+        // WHY the thread's LAST run ended short of its conclusion (../types
+        // `HarnessRunStopReason`; the live half is `HarnessThreadRecord.stopReason`).
+        //
+        // REFUSED when outside the union — the identical rule the agent-result row above
+        // applies, and the `applyOutcome` rule below: a mistyped reason must not be dropped,
+        // because the field exists precisely so a consumer never has to re-derive "why did it
+        // stop" from prose. Nothing here requires it of a `'stopped'` row either, so every
+        // pre-feature document (and a host stop that recorded no reason) keeps restoring.
+        if (record.stopReason !== undefined) {
+            const stopReason = readSnapshotString(record.stopReason, `${entryLabel}.stopReason`, {
+                min: 1
+            });
+
+            if (!isHarnessRunStopReason(stopReason)) {
+                throw new HarnessError(
+                    `${entryLabel}.stopReason must be one of: ${HARNESS_RUN_STOP_REASONS.join(', ')} (or be absent).`
+                );
+            }
+
+            thread.stopReason = stopReason;
+        }
+
+        // THE SOFT-DELETE MARKER. Only the literal `true` is the stored form; ABSENT means
+        // active. A `false` on disk (a host round-tripping its own JSON, or a hand edit) is
+        // ACCEPTED and normalized away — the `included: true` / `outcome: 'completed'` rule
+        // above (`applyIncluded`, `applyOutcome`), because writing `false` and writing nothing
+        // say the same thing and a reader that kept the key would make `restore -> snapshot`
+        // non-idempotent for a document this writer never produces. A non-boolean is refused
+        // like any mistyped field.
+        //
+        // What `inactive` MEANS is not decided here: the row is read and copied, so the
+        // conversation stays durable and restorable. Excluding it from the session tooling's
+        // discovery is the runtime's job (../harness.ts).
+        if (record.inactive !== undefined) {
+            if (readSnapshotBoolean(record.inactive, `${entryLabel}.inactive`) === true) {
+                thread.inactive = true;
+            }
+        }
+
+        // WHEN it was marked inactive, in epoch milliseconds. `readSnapshotInteger` with
+        // `min: 0` is the reader every neighbouring numeric field uses (`sequence`,
+        // `contextLane`, and `cancelledAtMessage` in the row above) and it is STRICTER than
+        // "a finite number": a snapshot must survive JSON round-tripping (file header), and
+        // every timestamp this package writes is `Date.now()` — an integer — so a fraction or
+        // a NaN is a hand edit, not a fact. A negative is refused for the same reason a
+        // negative lane is: no consumer can order by it.
+        //
+        // Validated INDEPENDENTLY of `inactive`, exactly as the forensic pair above ("NOT
+        // required to appear together"). Two documents are therefore both legal: `inactive:
+        // true` with no timestamp (a marker whose clock was lost), and `inactiveAt` with no
+        // marker (the history a reactivation kept). Which of them a writer emits is the
+        // writer's rule (../harness.ts), and a reader that demanded the pair would refuse a
+        // document the writer is entitled to produce.
+        if (record.inactiveAt !== undefined) {
+            thread.inactiveAt = readSnapshotInteger(record.inactiveAt, `${entryLabel}.inactiveAt`, {
+                min: 0
+            });
         }
 
         ids.add(id);

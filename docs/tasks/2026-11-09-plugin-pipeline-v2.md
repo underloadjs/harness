@@ -44,8 +44,7 @@ protocol (`src/server/workers/*`).
 
 **Out of scope (deliberately):** the *policy* of compaction —
 [2026-11-09-progressive-compaction.md](./2026-11-09-progressive-compaction.md); the token-budget
-and provider-overflow gaps —
-[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md);
+and provider-overflow gaps — issue 0004 (closed);
 and tool-registry lifecycle —
 [../issues/review-list-improvements-review-list.md](../issues/review-list-improvements-review-list.md).
 

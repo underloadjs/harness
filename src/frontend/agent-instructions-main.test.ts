@@ -761,7 +761,7 @@ it('surfaces a 409 when a conversation starts using the agent mid-save, and keep
     // closed modal. The 409 here is declared by the fixture, so the composed double cannot answer it.
     const frozen = descriptor({ agentModels: { instruct: 'm2' } });
     const refusal =
-        'Agent "summarizer" still owns 1 conversation in session "s9": "thread-7". Delete those threads before removing the agent.';
+        'Agent "summarizer" still owns 1 conversation in session "s9": "thread-7". A deleted thread is retained, so removing this agent needs the session deleted.';
     const server = stubSession(frozen, {
         extra: (url, method) =>
             url === '/api/sessions/s9/agents/summarizer' && method === 'DELETE'

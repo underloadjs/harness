@@ -7,8 +7,9 @@
 //   - a small result is still fed back byte-exact;
 //   - `signal` reaches the transport, a tool's `ToolContext.signal`, a delegated
 //     subagent's request, and a ctx.run agent's tools;
-//   - an aborted run starts no new tool call, rejects, and rolls its history
-//     back;
+//   - an aborted run starts no new tool call and rejects; a thread-bound run
+//     RETAINS the turns it committed (issue 0036 R1) and repairs each call left
+//     without an answer by one synthesized interrupted result;
 //   - a tool that observes the signal is a cancellation, NOT a "failed" tool
 //     result the model could retry.
 
@@ -187,10 +188,38 @@ describe('cancellation', () => {
             'This operation was aborted'
         );
 
-        // Only the call that was already running executed; the run rolled back, so
-        // the first tool's message is gone with the rest of the turn.
+        // Only the call that was already running executed; the run refused to start
+        // the second one. Issue 0036 R1: the run is RETAINED rather than spliced back,
+        // so the transcript is what the model was shown, plus one synthesized answer per
+        // unanswered call. BOTH calls are unanswered: the abort landed before the first
+        // tool's 'first done' result could be committed, so that real result is absent —
+        // the `stringContaining` match below is what proves it was not written. Pinned
+        // structurally (role/toolCallId/name) with the interrupted marker matched by
+        // substring, never by the exact sentence, so the wording can be rephrased.
         expect(executed).toEqual(['first']);
-        expect(entry.messages).toEqual([]);
+        expect(entry.messages).toMatchObject([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    { id: 'c1', name: 'first', arguments: '{}' },
+                    { id: 'c2', name: 'second', arguments: '{}' }
+                ]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'c1',
+                name: 'first',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            {
+                role: 'tool',
+                toolCallId: 'c2',
+                name: 'second',
+                content: expect.stringContaining('cancelled or interrupted')
+            }
+        ]);
     });
 
     it('forwards the signal into ToolContext and treats an observing tool as a cancellation', async () => {
@@ -221,7 +250,24 @@ describe('cancellation', () => {
         // recoverable tool result: a cancelled run must not invite a retry.
         expect(seen).toBeInstanceOf(AbortSignal);
         expect(seen?.aborted).toBe(true);
-        expect(entry.messages).toEqual([]);
+        // Issue 0036 R1: the cancelled run keeps its committed turns. The throwing
+        // tool produced no result, so the call it belongs to is answered by ONE
+        // synthesized interrupted marker — the transcript is well-formed for a replay
+        // instead of ending in an unanswered assistant turn.
+        expect(entry.messages).toMatchObject([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'stop', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'c1',
+                name: 'stop',
+                content: expect.stringContaining('cancelled or interrupted')
+            }
+        ]);
     });
 
     it('reaches a delegated subagent and its tools', async () => {

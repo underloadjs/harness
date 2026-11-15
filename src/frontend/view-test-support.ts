@@ -2785,7 +2785,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                             error: {
                                 message: `Agent "${agent}" still owns ${owned.length} conversation${
                                     owned.length === 1 ? '' : 's'
-                                } in session "${sessionId}": ${ids}. Delete those threads before removing the agent.`
+                                } in session "${sessionId}": ${ids}. A deleted thread is retained, so removing this agent needs the session deleted.`
                             }
                         },
                         409

@@ -1053,14 +1053,28 @@ describe('SessionStore persistent threads', () => {
         // A turn that carries no steer at all keeps its existing 404 wording.
         expect(() => legacy.blockDetail(created.id, 'no-such-turn', firstKey)).toThrow(/Unknown turn/);
 
-        // CLEANUP: the archive rides the TURN record, so removing the conversation that owns
-        // the steered run takes the archived bytes with it — no orphaned steer text is left in
-        // the document behind a deleted conversation (reset and session removal work the same
-        // way, because they drop the same turn records).
+        // CLEANUP USED TO MEAN PURGATORY. The archive rides the TURN record, and the old contract
+        // deleted turn records together with the conversation that owned the steered run, so no
+        // orphaned steer bytes survived a delete.
+        //
+        // IT19 R2 CHANGED THAT PROOF, not the archive. A thread delete now MARKS the conversation
+        // `inactive` and RETAINS every row it owned — the spec is explicit that nothing but a
+        // deleted SESSION destroys a turn — so the archived steer text is still addressable after
+        // the conversation is released, in the live ledger AND in the document. Old purpose: "the
+        // archive went with the thread". New proof: "the archive stayed with the retained turn, and
+        // the delete took nothing out of it".
         const deleted = await store.deleteThread(created.id, threadOf(store.get(created.id), turnId));
 
-        expect(deleted.turns).toHaveLength(0);
-        expect(persistence.load()?.sessions[0].turns.some((turn) => turn.steerTexts !== undefined)).toBe(false);
+        // The receipt names exactly the one turn it used to discard, and that row still carries the
+        // whole 520-entry archive it was built with (the ids are the same ones the ring names).
+        expect(deleted.turns.map((turn) => `${turn.id}:${turn.status}`)).toEqual([`${turnId}:done`]);
+        expect((deleted.turns[0]?.steerTexts ?? []).map((entry) => entry.prompt)).toEqual(prompts);
+
+        // And the document keeps it: the retained row is written back with its archive, so a restart
+        // after the delete still resolves every one of the 520 submits.
+        expect(
+            persistence.load()?.sessions[0].turns.map((turn) => turn.steerTexts?.map((entry) => entry.prompt) ?? [])
+        ).toEqual([prompts]);
 
         store.dispose();
         legacy.dispose();
@@ -1210,10 +1224,14 @@ const threadOf = (snapshot: SessionSnapshot, turnId: string): string => {
 
 describe('SessionStore thread deletion', () => {
     // T10 (R2): live work no longer blocks a deletion. The store STOPS the conversation
-    // first (runtime stop + the lane's own abort, backlog dropped) and only then purges,
+    // first (runtime stop + the lane's own abort, backlog dropped) and only then releases it,
     // so the reader never has to press Stop and Delete again. The refusals that remain
     // are the ones a stop cannot answer for: an id that does not exist, and the agent's
     // own conversation.
+    //
+    // IT19 R2 changed the SECOND half of that sentence: the release is a MARK, not a purge.
+    // `deleteThread` sets `inactive` on the conversation's record and keeps the row, and every
+    // turn row it owned stays in the ledger and in the document with it.
     it('stops running work and deletes it, refuses the default conversation (400) and unknown ids (404)', async () => {
         const fixture = createFixture();
         const store = createStore([fixture.preset]);
@@ -1227,18 +1245,38 @@ describe('SessionStore thread deletion', () => {
         const held = await store.enqueue(created.id, 'hold', undefined, undefined, 'thread-1');
         await fixture.started('hold').promise;
 
-        // The delete settles the aborted row before purging, so the row leaves with the
-        // conversation instead of surviving as an orphaned `cancelled` record.
+        // THE DELETE STILL SETTLES THE ABORTED ROW, and then RETAINS it. Old purpose: the row
+        // "left with the conversation" (the receipt proved the purge). New proof: the receipt
+        // names BOTH rows the conversation owned — the answered `seed` and the run the delete
+        // aborted — because a mark destroys nothing, and the aborted row keeps the error the
+        // delete itself caused.
         const deleted = await store.deleteThread(created.id, 'thread-1');
+
+        // `threads` stays undefined: the roster is the DISCOVERY surface, and a marked
+        // conversation is not discovered. The turns are the durable ledger, and they survive.
         expect(deleted.threads).toBeUndefined();
-        expect(deleted.turns).toEqual([]);
+        expect(deleted.turns.map((turn) => `${turn.index}:${turn.prompt}:${turn.status}`)).toEqual([
+            '0:seed:done',
+            '1:hold:cancelled'
+        ]);
+        expect(deleted.turns.map((turn) => turn.threadId)).toEqual(['thread-1', 'thread-1']);
+        expect(deleted.turns[1]?.events.map((event) => event.type)).toEqual(['start', 'error']);
+        expect((deleted.turns[1]?.events[1] as { error?: { message?: string } })?.error?.message).toBe(
+            'Thread "thread-1" was deleted.'
+        );
 
         // The released gate is never needed: the run was aborted, and the turn's own
         // completion resolved as part of the delete.
         await held.settled;
         await store.waitForIdle(created.id);
 
-        expect(store.get(created.id).turns).toEqual([]);
+        // The ledger is unchanged by the mark: both rows are still addressable, with the
+        // statuses the delete left them in.
+        expect(store.get(created.id).turns.map((turn) => `${turn.index}:${turn.status}`)).toEqual([
+            '0:done',
+            '1:cancelled'
+        ]);
+        expect(store.get(created.id).threads?.map((thread) => thread.id) ?? []).toEqual([]);
         expect(fixture.log.filter((entry) => entry === 'end:hold')).toHaveLength(1);
 
         await expect(store.deleteThread(created.id, 'thread-404')).rejects.toThrow(SessionError);
@@ -1278,12 +1316,20 @@ describe('SessionStore thread deletion', () => {
 
         await store.deleteThread(created.id, threadOf(before, one.turn.id));
 
+        // IT19 R2: a conversation delete marks the row and RETAINS its turns, so the ledger still
+        // names turn 0. Old purpose: "the deleted turn left the ledger, the survivors kept their
+        // indices". New proof: the whole ledger keeps its indices — the retained row included — and
+        // the deletion renumbers nothing.
         const after = store.get(created.id);
         expect(after.turns.map((turn) => `${turn.index}:${turn.prompt}`)).toEqual([
+            '0:one',
             '1:two',
             '2:three'
         ]);
-        // Seeds survive the deletion: the surviving blocks keep PE2/PE3.
+        // Seeds survive the deletion, and so does the released conversation's own block: the row is
+        // still in the ledger, so PE1 is still listed. What this case exists to pin is that the
+        // survivors keep the labels they were minted with — PE2 and PE3 did not shift down into
+        // PE1's slot when PE1's conversation was released.
         expect(
             listAgentResultBlocks(
                 after.turns.map((turn) => ({
@@ -1293,7 +1339,7 @@ describe('SessionStore thread deletion', () => {
                         : { labels: after.labelSeeds[turn.id] })
                 }))
             ).map((block) => block.label)
-        ).toEqual(['PE2', 'PE3']);
+        ).toEqual(['PE1', 'PE2', 'PE3']);
 
         // A typed reference to the surviving #PE2 still resolves to that turn.
         const reuse = await store.enqueue(created.id, 'reuse #PE2');
@@ -1316,16 +1362,44 @@ describe('SessionStore thread deletion', () => {
             ].join('\n')
         );
 
-        // A reference to the deleted turn is refused before anything mutates.
-        await expect(store.enqueue(created.id, 'gone', undefined, [{ turnId: one.turn.id, label: 'PE1' }])).rejects.toThrow(`Referenced turn "${one.turn.id}" does not exist in this session.`);
+        // A REFERENCE TO THE RELEASED CONVERSATION'S TURN NOW RESOLVES.
+        //
+        // Old purpose: refuse the submit before anything mutates, because the purge had taken the
+        // row and a reference to a turn that no longer exists is an error, not a fallback.
+        // New proof (IT19 R2): the row was RETAINED, so the reference is not dangling — it binds,
+        // and it expands to the answer the released conversation gave, byte for byte as it did
+        // before the delete. Discovery hid the conversation; the ledger, and therefore the reference
+        // door built on the ledger, did not.
+        const revived = await store.enqueue(created.id, 'gone', undefined, [
+            { turnId: one.turn.id, label: 'PE1' }
+        ]);
 
-        // The index high-water mark never reuses a deleted turn's index.
+        expect(revived.turn.references).toEqual([{ turnId: one.turn.id, label: 'PE1' }]);
+        await revived.settled;
+        await store.waitForIdle(created.id);
+        expect(store.get(created.id).turns.find((turn) => turn.id === revived.turn.id)?.status).toBe('done');
+        expect(fixture.requests).toHaveLength(5);
+        expect(lastUser(fixture.requests[4]!)).toBe(
+            [
+                'gone',
+                '',
+                REFERENCED_RESULTS_HEADER,
+                `--- #PE1 | agent probe | turn ${one.turn.id} ---`,
+                'answer:one',
+                '--- end #PE1 ---',
+                REFERENCED_RESULTS_FOOTER
+            ].join('\n')
+        );
+
+        // The index high-water mark never reuses a turn's index — whether the earlier rows are
+        // retained by a mark or purged by an old build. Three turns, the media-free `reuse`, and the
+        // reference submit that resolved make five, so the next submit is index 5.
         const next = await store.enqueue(created.id, 'next');
-        expect(next.turn.index).toBe(4);
+        expect(next.turn.index).toBe(5);
         await next.settled;
     });
 
-    it('removes the deleted thread and its turns from the persisted document', async () => {
+    it('keeps the deleted thread marked and its turns in the persisted document', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const fixture = createFixture();
         const persistence = new HarnessPersistence(root);
@@ -1338,12 +1412,124 @@ describe('SessionStore thread deletion', () => {
         await two.settled;
         await store.waitForIdle(created.id);
 
+        // Old purpose: prove the delete REACHED THE DISC — thread gone, its turn gone.
+        // New proof (IT19 R2): prove the delete reached the disc as a MARK. The receipt still
+        // lists only the surviving conversation, because the roster is discovery and a marked
+        // conversation is not discovered; what the document keeps is everything.
         const deleted = await store.deleteThread(created.id, threadOf(store.get(created.id), one.turn.id));
         expect(deleted.threads!.map((thread) => thread.id)).toEqual([threadOf(deleted, two.turn.id)]);
 
         const reloaded = createStore([fixture.preset], persistence, persistence.load()).get(created.id);
-        expect(reloaded.turns.map((turn) => turn.prompt)).toEqual(['two']);
+
+        // Both turns survive the restart, in submission order: "they must not be destroyed
+        // regardless whether the agent is cancelled or stopped" — a delete included.
+        expect(reloaded.turns.map((turn) => turn.prompt)).toEqual(['one', 'two']);
+        expect(reloaded.turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual(['one:done', 'two:done']);
+        // The roster after a restart is the same discovery surface it was before the process
+        // died: it names the surviving conversation and hides the marked one, while the retained
+        // row (with its transcript) is still in the document for a shell read.
         expect(reloaded.threads!.map((thread) => thread.id)).toEqual([threadOf(reloaded, two.turn.id)]);
+        expect(
+            (persistence.load()?.sessions[0].core.threads ?? []).map((thread) => `${thread.id}:${thread.inactive === true ? 'inactive' : 'active'}`)
+        ).toEqual(['thread-1:inactive', 'thread-2:active']);
+
+        store.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    // F-A Defect 2 (AC2, 2026-11-15) — TWO HOST DOORS, ONE CONTRACT.
+    //
+    // The harness door `sendThreadInput` has always revived a soft-deleted conversation, and
+    // `resumeThread` resolves the retained row the same way; the STORE's submit door was the
+    // odd one out. `enqueue(id, input, …, threadId)` read `harness.thread(id)`, got
+    // `undefined` for an `inactive` row, and answered 404 `Unknown thread "thread-1"` — so the
+    // conversation the spec calls merely INACTIVE ("…can still be discovered by 'shell'…")
+    // could not be reached by the one host action that names its id, and
+    // `reactivateThreadRow` was dead code for it. Pinned here end to end in ONE run, so the
+    // two halves of the ruling cannot be satisfied separately:
+    //   1. a delete hides the conversation from every LISTING while its row stays in the
+    //      document marked `inactive` — and a sibling conversation stays listed, which is what
+    //      makes "hidden" a scoping rule rather than an accident of an empty roster;
+    //   2. an explicit host submit by id is ACCEPTED (the 404 is gone) and REVIVES it: the
+    //      roster names it again and the durable row loses its mark;
+    //   3. the revived run continued the RETAINED transcript instead of starting a new one;
+    //   4. an id that was never a conversation still answers 404, so the fix resolves RETAINED
+    //      rows and does not swallow typos.
+    it('revives a soft-deleted conversation on an explicit host submit by id, and hides it from every listing until then', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
+        const fixture = createFixture();
+        const persistence = new HarnessPersistence(root);
+        const store = createStore([fixture.preset], persistence);
+        const created = await store.create('probe');
+
+        // TWO turns in ONE conversation ('thread-1') so the revived run has a transcript to
+        // continue, then an UNFOCUSED submit that opens `thread-2` — the untouched sibling that
+        // proves the listings below are scoped, not merely empty.
+        const one = await store.enqueue(created.id, 'one');
+        await one.settled;
+        const two = await store.enqueue(created.id, 'two', undefined, undefined, 'thread-1');
+        await two.settled;
+        const three = await store.enqueue(created.id, 'three');
+        await three.settled;
+        await store.waitForIdle(created.id);
+
+        const hidden = threadOf(store.get(created.id), one.turn.id);
+        const sibling = threadOf(store.get(created.id), three.turn.id);
+
+        expect({ hidden, sibling }).toEqual({ hidden: 'thread-1', sibling: 'thread-2' });
+
+        // (1) A MARK, VISIBLE TO THE DOCUMENT AND INVISIBLE TO THE ROSTER.
+        const deleted = await store.deleteThread(created.id, hidden);
+
+        expect(deleted.threads!.map((thread) => thread.id)).toEqual([sibling]);
+        expect(store.get(created.id).threads!.map((thread) => thread.id)).toEqual([sibling]);
+        expect(
+            (persistence.load()?.sessions[0].core.threads ?? []).map(
+                (thread) => `${thread.id}:${thread.inactive === true ? 'inactive' : 'active'}`
+            )
+        ).toEqual([`${hidden}:inactive`, `${sibling}:active`]);
+
+        // (2) THE STORE DOOR. This call used to reject with
+        // `SessionError(404, 'Unknown thread "thread-1".')`; the ruling is that a host naming a
+        // thread by explicit id gets the SAME contract the harness door already gave it, so the
+        // retained row is resolved, the submit is accepted, and the turn runs ON that
+        // conversation (`turn.threadId` is the address, not a fresh one).
+        const revived = await store.enqueue(created.id, 'revived', undefined, undefined, hidden);
+
+        expect(revived.turn.threadId).toBe(hidden);
+        await revived.settled;
+        await store.waitForIdle(created.id);
+
+        // THE MARK IS OFF AT EVERY SURFACE. The roster names the conversation again — in
+        // `sequence` order, the order `readThreads` validates — and the retained row no longer
+        // claims a deletion: the ledger entry is REMOVED, not written as `inactive: false`,
+        // which is the spelling ./core/snapshot.ts normalises away on read anyway.
+        expect(store.get(created.id).threads!.map((thread) => thread.id)).toEqual([hidden, sibling]);
+        expect(
+            (persistence.load()?.sessions[0].core.threads ?? []).map(
+                (thread) => `${thread.id}:${thread.inactive === true ? 'inactive' : 'active'}`
+            )
+        ).toEqual([`${hidden}:active`, `${sibling}:active`]);
+
+        // (3) RETAINED, NOT RESTARTED. The revived run's OWN request is the whole conversation:
+        // the two answer rounds the deleted conversation had committed are still between the
+        // system block and this submit. Exact on purpose — "it continued" is only an honest
+        // claim if the intermediate turns are actually in the prompt the model was sent.
+        expect(transcript(fixture.requests.at(-1)!)).toEqual([
+            { role: 'system', content: 'sys' },
+            { role: 'user', content: 'one' },
+            { role: 'assistant', content: 'answer:one' },
+            { role: 'user', content: 'two' },
+            { role: 'assistant', content: 'answer:two' },
+            { role: 'user', content: 'revived' }
+        ]);
+
+        // (4) THE 404 STILL MEANS "NEVER EXISTED": an unretained id has no row to resolve, so
+        // the submit door refuses it exactly as it did before — the revival is keyed on the
+        // soft-delete marker, not on any lookup miss.
+        await expect(
+            store.enqueue(created.id, 'typo', undefined, undefined, 'thread-404')
+        ).rejects.toThrow('Unknown thread "thread-404".');
 
         store.dispose();
         fs.rmSync(root, { recursive: true, force: true });
@@ -1651,8 +1837,8 @@ describe('thread HTTP contract', () => {
         fixture.gate('third').resolve();
         await runtime.store.waitForIdle(id);
 
-        // A stopped thread deletes; the cascade is reported by the receipt, and the
-        // roster/turn pages prove the removal.
+        // A stopped thread is RELEASED, not erased: the receipt reports the mark, the roster stops
+        // naming the conversation, and the turn page keeps every row it owned.
         const deleted = await jsonOf<DeleteThreadResult>(
             await callApi(runtime, 'DELETE', `/v1/harness/sessions/${id}/threads/thread-1`)
         );
@@ -1662,8 +1848,17 @@ describe('thread HTTP contract', () => {
             thread_id: 'thread-1',
             session_id: id
         });
+        // THE ROSTER IS DISCOVERY, THE TURN PAGE IS THE LEDGER (IT19 R2). Old purpose: the delete took
+        // the conversation's rows out of the turn page as well, so neither surface named `thread-1`.
+        // New proof: only discovery stops naming it. The three rows are still served, in order, and
+        // each one still says which conversation produced it — a shell/`turnRead` client can walk
+        // them, which is the whole point of retaining them.
         expect((await threadRosterOf(runtime, id)).map((row) => row.id)).not.toContain('thread-1');
-        expect((await turnRowsOf(runtime, id)).map((row) => row.threadId)).not.toContain('thread-1');
+        expect((await turnRowsOf(runtime, id)).map((row) => `${row.index}:${row.threadId}:${row.status}`)).toEqual([
+            '0:thread-1:done',
+            '1:thread-1:done',
+            '2:thread-1:cancelled'
+        ]);
 
         const missing = await jsonOf<{ error: { message: string } }>(
             await callApi(runtime, 'DELETE', `/v1/harness/sessions/${id}/threads/thread-1`)
@@ -3031,16 +3226,33 @@ describe('delegated child threads', () => {
             { role: 'assistant', content: 'helper answer' }
         ]);
 
-        // Deleting the owner removes the linked child with it.
+        // Deleting the OWNER releases the linked child with it — and under IT19 R2 a release is a
+        // MARK on both records, not a purge of their history.
+        //
+        // Old purpose: prove the cascade took the parent's turn record out with the conversation.
+        // New proof: prove the cascade took NOTHING out. The roster goes empty because discovery
+        // hides two marked rows, and the ledger still holds the one turn the owner ran, with its
+        // thread routing intact.
         const deleted = await store.deleteThread(created.id, 'thread-1');
         expect(deleted.threads).toBeUndefined();
-        expect(deleted.turns).toEqual([]);
+        expect(deleted.turns.map((turn) => `${turn.index}:${turn.prompt}:${turn.status}:${turn.threadId}`)).toEqual([
+            '0:delegate please:done:thread-1'
+        ]);
 
         store.dispose();
         fs.rmSync(root, { recursive: true, force: true });
     });
 
-    it('purges the deleted child result from the persisted agent-result registry (F6)', async () => {
+    // F6's PURGE BECAME A MARK (IT19 R2). This case used to prove the opposite: that deleting the
+    // child conversation took its archived result row out of the document with it, so a restart
+    // could no longer answer `agentResult` for that invocationId.
+    //
+    // What it proves now is the retained half of the same door: releasing a conversation removes the
+    // DISCOVERY of what ran in it (the roster stops naming `thread-2`, and `harness.thread()` stops
+    // answering for it) while the run's ANSWER stays durable — the row keeps its `threadId`, the
+    // document keeps it, and both the live session and a restarted one still resolve it. The only
+    // thing that ever destroys it is the session going away.
+    it('keeps the released child result in the persisted agent-result registry (F6, retained)', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegationPreset()], persistence);
@@ -3065,8 +3277,9 @@ describe('delegated child threads', () => {
 
         await store.deleteThread(created.id, 'thread-2');
 
-        // The saved registry loses EXACTLY the child's result; the root survives.
-        expect(persistedIds()).toEqual(['1']);
+        // NOTHING left the registry: the child's conversation was marked, not its history. The
+        // parent's single turn row is untouched too — the child's run is recorded INSIDE it.
+        expect(persistedIds()).toEqual(['1', '2']);
         expect(store.get(created.id).turns).toHaveLength(1);
         // History is not rewritten: the parent turn still records the child's frames.
         expect(
@@ -3077,11 +3290,18 @@ describe('delegated child threads', () => {
 
         store.dispose();
 
-        // Restart: the purged invocation is not addressable, the survivor is.
+        // Restart: BOTH invocations answer. The released conversation is still absent from the
+        // roster, and that is the only door that closed — the retired row, keyed by the id it was
+        // written with, resolves on both sides of the restart. This asymmetry (a row that can
+        // outlive the thread row that names it, even after the 256-record cap retires the thread
+        // row) is the decision this case now pins rather than prunes. Note the SHAPE of the answer:
+        // `agentResult`'s envelope never carried `threadId` — the owner lives on the durable row,
+        // which the issue-0033 case below pins key for key.
         const reloaded = createStore([delegationPreset()], persistence, persistence.load());
-        await expect(
-            reloaded.callTool(created.id, 'agentResult', { agent: 'helper', invocationId: '2' })
-        ).rejects.toThrow('No result "2" is available for agent "helper".');
+
+        expect(
+            await reloaded.callTool(created.id, 'agentResult', { agent: 'helper', invocationId: '2' })
+        ).toMatchObject({ agent: 'helper', invocationId: '2', status: 'completed' });
         expect(
             await reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: '1' })
         ).toMatchObject({ agent: 'lead', invocationId: '1', status: 'completed' });
@@ -3230,7 +3450,13 @@ describe('delegated child threads', () => {
             limit: 4000,
             offset: 0,
             partialContent: 'half an answer',
-            status: 'cancelled'
+            status: 'cancelled',
+            // F-A Defect 1 (2026-11-15): this door now projects the record's CAUSE, so the
+            // live envelope and the durable row below agree on why the child halted
+            // (`user-stopped` — the parent's `cancelThread` is an external halt). The row
+            // always carried it; only this door was silent, which is what made a caller
+            // string-match `error` prose.
+            stopReason: 'user-stopped'
         });
 
         // SURFACE 2 — the bytes the server wrote. `content` stays EMPTY, because that field
@@ -3254,9 +3480,17 @@ describe('delegated child threads', () => {
             role: 'subagent',
             sequence: 2,
             status: 'cancelled',
+            // IT19 R3: the durable row states WHY it halted. The stop here is a child released by
+            // its parent's cancellation, and the runtime classifies that cause rather than leaving
+            // the reader to infer one. F-A Defect 1 (2026-11-15) corrected the sentence this line
+            // used to carry ("travels on the record, not on the tool's wire projection"): the
+            // `agentResult` door projects it too, so the live envelope above and the restart below
+            // all state the SAME cause — one fact, three doors.
+            stopReason: 'user-stopped',
             // The OWNER is on the row too (0033/0024): the child's one-shot conversation is
-            // `thread-2`, and `purgeThread`'s cascade matches `record.threadId` — so deleting
-            // that conversation after a reload still takes this result with it.
+            // `thread-2`. IT19 R2 note — this used to be the key `purgeThread`'s cascade matched to
+            // DROP the row when the conversation was deleted; a delete is a mark now, so the key is
+            // simply provenance: it says which conversation ran the turn that produced this answer.
             threadId: 'thread-2'
         });
 
@@ -3297,7 +3531,13 @@ describe('delegated child threads', () => {
             limit: 4000,
             offset: 0,
             partialContent: 'half an answer',
-            status: 'cancelled'
+            status: 'cancelled',
+            // F-A Defect 1 (2026-11-15): the cause survives the JSON round trip — the reader
+            // in `core/snapshot.ts` validates it and `restore()` re-projects it, so a caller
+            // that asks "why did that child stop" after a restart gets the machine-readable
+            // answer, not only the prose `error`. This key is what proves the durable half
+            // of R4 instead of assuming it.
+            stopReason: 'user-stopped'
         });
 
         // The reloaded store re-projects the row it was given, byte for byte — the round trip
@@ -3387,7 +3627,16 @@ describe('delegated child threads', () => {
     // conversation that forked left that entry on disk with an address nothing resolves
     // any more, and a restart rehydrated it. This test pins both halves: the branch id is
     // still a refusal on its own, and the branch frame goes with its source conversation.
-    it('prunes the durable branch child frame with the conversation that forked it (AC5)', async () => {
+    // AC5 USED TO MEAN "AND THEN IT IS GONE". A fork's durable child frame was pruned together
+    // with the conversation that forked it, so the document stopped handing out an id whose thread
+    // had been deleted.
+    //
+    // IT19 R2 rewrote the second half: the delete MARKS `thread-1` and RETAINS what ran in it — the
+    // root answer, the branch frame recorded under `branch-1`, and the turn row. What the AC5 half
+    // still owns, and what this case keeps pinning exactly, is that the pruning machinery never
+    // writes a document with a half-pruned registry: the transactional save happens ONCE, and it
+    // carries the same two rows the previous write did.
+    it('retains the durable branch child frame when the conversation that forked it is released (AC5)', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([forkPreset()], persistence);
@@ -3421,7 +3670,8 @@ describe('delegated child threads', () => {
         // be correct. `persistOrThrow` runs first, and the F6 consistency guard afterwards
         // re-saves the runtime's snapshot whenever the two disagree — so a stale projection
         // still ends on the right file, one silent best-effort write later. Pinning the save
-        // calls separates the two: exactly one write, with both results already gone.
+        // calls separates the two: exactly one write, and under retention it still carries BOTH
+        // rows, because a mark prunes nothing.
         const save = vi.spyOn(persistence, 'save');
 
         const deleted = await store.deleteThread(created.id, 'thread-1');
@@ -3434,23 +3684,29 @@ describe('delegated child threads', () => {
 
         save.mockRestore();
 
-        expect(savedAgentResults).toEqual([[]]);
-        expect([deleted.turns, deleted.threads]).toEqual([[], undefined]);
-        expect(persistedIds()).toEqual([]);
+        expect(savedAgentResults).toEqual([['1', 'branch-1']]);
+        // The roster goes empty (discovery hides the marked conversation) and the turn row stays.
+        expect(deleted.threads).toBeUndefined();
+        expect(deleted.turns.map((turn) => `${turn.index}:${turn.prompt}:${turn.status}:${turn.threadId}`)).toEqual([
+            '0:fork please:done:thread-1'
+        ]);
+        expect(persistedIds()).toEqual(['1', 'branch-1']);
         expect(store.get(created.id).threads).toBeUndefined();
 
         store.dispose();
 
-        // Restart: neither the root answer nor the branch frame is addressable, so the
-        // document no longer hands out an id whose conversation is gone.
+        // Restart: BOTH ids still answer. The released conversation is off the roster, but the
+        // document does not hand out a lie either — every row it kept belongs to a run that really
+        // finished, which is why an id that survives the delete keeps resolving on the other side
+        // of the restart.
         const reloaded = createStore([forkPreset()], persistence, persistence.load());
 
-        await expect(
-            reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: '1' })
-        ).rejects.toThrow('No result "1" is available for agent "lead".');
-        await expect(
-            reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: 'branch-1' })
-        ).rejects.toThrow('No result "branch-1" is available for agent "lead".');
+        expect(
+            await reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: '1' })
+        ).toMatchObject({ agent: 'lead', invocationId: '1', status: 'completed' });
+        expect(
+            await reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: 'branch-1' })
+        ).toMatchObject({ agent: 'lead', invocationId: 'branch-1', status: 'completed' });
 
         reloaded.dispose();
         fs.rmSync(root, { recursive: true, force: true });
@@ -3867,11 +4123,21 @@ describe('thread persistence rollback', () => {
         expect(snapshot.turns).toHaveLength(1);
         expect(snapshot.threads!.map((thread) => thread.id)).toEqual(['thread-1']);
 
-        // Once writes work again the same delete succeeds and is durable.
+        // Once writes work again the same delete succeeds. Old purpose: prove it was DURABLE by
+        // showing the thread AND its turns were gone from the reloaded document. New proof
+        // (IT19 R2): the delete lands as a mark — the roster stops naming the conversation on both
+        // sides of the restart, while the turn row and its bytes stay in the ledger and in the file.
         save.mockRestore();
-        expect((await store.deleteThread(created.id, 'thread-1')).turns).toEqual([]);
+
+        const deleted = await store.deleteThread(created.id, 'thread-1');
+
+        expect(deleted.turns.map((turn) => `${turn.index}:${turn.prompt}:${turn.status}:${turn.threadId}`)).toEqual([
+            '0:one:done:thread-1'
+        ]);
+        expect(deleted.threads).toBeUndefined();
+
         const reloaded = createStore([fixture.preset], persistence, persistence.load()).get(created.id);
-        expect(reloaded.turns).toEqual([]);
+        expect(reloaded.turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual(['one:done']);
         expect(reloaded.threads).toBeUndefined();
 
         store.dispose();
@@ -3923,14 +4189,27 @@ describe('thread reference edges', () => {
             'idle'
         );
 
-        // Deleting the source strips the dangling LINK but keeps the conversation,
-        // its turn, and its transcript.
+        // Deleting the source releases it WITHOUT touching the connected conversation: the survivor
+        // keeps its turn, its transcript, and — now that the referenced row is retained — the link
+        // itself.
+        //
+        // Old purpose: the receipt's turn list proved the source's row had been purged, so only the
+        // connected conversation's row was left, and the delete stripped the survivor's now-dangling
+        // reference and graph edge. New proof (IT19 R2): the receipt lists the whole retained
+        // ledger — the released source row and the survivor, in index order — the roster shows the
+        // asymmetry that defines a mark (one conversation is still discovered, the other is not),
+        // and the link is NOT stripped, because a reference to a retained row is not dangling.
         const deleted = await store.deleteThread(created.id, source.turn.threadId!);
-        expect(deleted.turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual(['connected:done']);
+        expect(deleted.turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual([
+            'source:done',
+            'connected:done'
+        ]);
+        expect(deleted.threads!.map((thread) => thread.id)).toEqual([linked.turn.threadId]);
         const survivor = deleted.threads!.find((thread) => thread.id === linked.turn.threadId)!;
         expect(survivor.status).toBe('idle');
-        expect(survivor.references).toBeUndefined();
-        expect(survivor.connectedThreadIds).toBeUndefined();
+        // The typed reference and the edge derived from it both survive the release of their target.
+        expect(survivor.references).toEqual([{ turnId: source.turn.id, label: 'PE1' }]);
+        expect(survivor.connectedThreadIds).toEqual([source.turn.threadId]);
         // The conversation (and its transcript, including the composed reference
         // context it was run with) survives untouched.
         const composed = [
@@ -4077,11 +4356,17 @@ describe('thread deletion atomicity', () => {
 
     // T10 (R2): the forced stop is what makes this case work. The store aborts the
     // signal the RUNTIME call itself holds, so even a transport that never looks at
-    // its abort stops owning the conversation: the row settles `cancelled`, the purge
-    // proceeds, and the late answer is discarded with the conversation. The durable
-    // file is written BEFORE the runtime purge, so it only ever names a state the
-    // runtime actually reached — the F4 ordering rule is intact, only the refusal is
-    // gone now that the store can honestly free the conversation first.
+    // its abort stops owning the conversation: the row settles `cancelled`, the release
+    // proceeds, and the late answer cannot claim the conversation back. The durable file
+    // is written BEFORE the release, so it only ever names a state the runtime actually
+    // reached — the F4 ordering rule is intact, only the refusal is gone now that the
+    // store can honestly free the conversation first.
+    //
+    // IT19 R2 rewrote the word "purge" and everything that hung off it. The release MARKS the
+    // conversation, so the cancelled row is retained — in the receipt, in the ledger and in the
+    // file — and what "discarding its late answer" now has to prove is narrower and sharper than
+    // before: the abandoned transport may finish, but it cannot edit the retained row, cannot
+    // re-activate the marked conversation, and cannot resurrect a thread in the roster.
     it('stops the unwinding run and deletes the conversation, discarding its late answer', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
         const fixture = stubbornPreset();
@@ -4099,27 +4384,50 @@ describe('thread deletion atomicity', () => {
         const diskBefore = fs.readFileSync(persistence.file, 'utf8');
 
         const deleted = await store.deleteThread(created.id, 'thread-1');
-        expect(deleted.turns).toEqual([]);
+
+        // Old purpose: the receipt proved the row was purged with its conversation. New proof: the
+        // receipt names the RETAINED row, and it states the stop the delete was forced through —
+        // the run's own account of being aborted, not a placeholder invented afterwards.
+        expect(deleted.turns.map((turn) => `${turn.index}:${turn.prompt}:${turn.status}:${turn.threadId}`)).toEqual([
+            '0:work:cancelled:thread-1'
+        ]);
+        expect(deleted.turns[0]?.events.map((event) => event.type)).toEqual(['start', 'error']);
+        expect((deleted.turns[0]?.events[1] as { error?: { message?: string } })?.error?.message).toBe(
+            'Thread "thread-1" was stopped.'
+        );
         expect(deleted.threads).toBeUndefined();
 
-        // The delete is durable, and memory agrees with the file: no orphan row, no
-        // phantom conversation.
+        // The delete is durable, and memory agrees with the file: the conversation left the roster,
+        // the turn row and its account did not.
         const durable = persistence.load();
         if (durable === undefined) throw new Error('the delete did not persist');
 
         expect(fs.readFileSync(persistence.file, 'utf8')).not.toBe(diskBefore);
-        expect(durable.sessions.find((candidate) => candidate.id === created.id)?.turns).toEqual([]);
-        expect(store.get(created.id).turns).toEqual([]);
+        expect(
+            durable.sessions.find((candidate) => candidate.id === created.id)?.turns?.map((turn) => `${turn.prompt}:${turn.status}`)
+        ).toEqual(['work:cancelled']);
+        expect(store.get(created.id).turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual([
+            'work:cancelled'
+        ]);
 
-        // The abandoned transport answers after its conversation is gone; nothing it
-        // emits can bring the row or the thread back.
+        // The abandoned transport answers after its conversation is released; nothing it emits can
+        // rewrite the retained row or bring the thread back into discovery. The row keeps the
+        // exactly-two-event account of the aborted attempt — no late `done`, no resurrected status —
+        // and the roster is still empty, so the mark held.
         fixture.release.resolve();
         await task.settled;
         await store.waitForIdle(created.id);
 
-        expect(store.get(created.id).turns).toEqual([]);
+        expect(store.get(created.id).turns.map((turn) => `${turn.prompt}:${turn.status}`)).toEqual([
+            'work:cancelled'
+        ]);
+        expect(store.get(created.id).turns[0]?.events.map((event) => event.type)).toEqual(['start', 'error']);
         expect(store.get(created.id).threads).toBeUndefined();
-        expect(persistence.load()?.sessions.find((candidate) => candidate.id === created.id)?.turns).toEqual([]);
+        expect(
+            persistence.load()?.sessions.find((candidate) => candidate.id === created.id)?.turns?.map(
+                (turn) => `${turn.prompt}:${turn.status}`
+            )
+        ).toEqual(['work:cancelled']);
 
         store.dispose();
         fs.rmSync(root, { recursive: true, force: true });

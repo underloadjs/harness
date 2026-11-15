@@ -226,7 +226,7 @@ const accountsFor = (messages: readonly unknown[], marker: string): number =>
     messages.filter((message) => JSON.stringify(message).includes(marker)).length;
 
 // ---------------------------------------------------------------------------
-// issues 0019 + 0020 (docs/issues/*.md) — every terminal child is reported, and a
+// issues 0019 + 0020 (both closed) — every terminal child is reported, and a
 // cancelled child reports what it actually said
 // ---------------------------------------------------------------------------
 //
@@ -321,10 +321,33 @@ describe('a settled delegation is never silently stranded (issue 0019)', () => {
             /requested tools on its single model turn without answering/
         );
 
-        // An exhausted run ROLLS BACK its turns, so the transcript does not even hold
-        // the `delegate` call any more: an account CANNOT be a tool result for `c1`,
-        // and the runtime must not invent one there.
-        expect(withoutIds(writerAgent.messages)).toEqual([]);
+        // Issue 0036 R1: an exhausted run no longer rolls back, so the `delegate` call IS
+        // on the record — answered by exactly ONE synthesized interrupted placeholder, the
+        // repair that keeps a retained tail pairable by a provider. The claim this test
+        // exists for is untouched and now lives where it actually belongs: that placeholder
+        // records NO outcome, so the child's account still has to arrive exactly once —
+        // below, as the owed-delivery upgrade of this very row (same call id, no second
+        // account, no orphan result). Asserted structurally; the marker by substring only.
+        expect(writerAgent.messages).toMatchObject([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    {
+                        id: 'c1',
+                        name: 'delegate',
+                        arguments: '{"agent":"researcher","input":"review src/a.ts"}'
+                    }
+                ]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'c1',
+                name: 'delegate',
+                content: expect.stringContaining('cancelled or interrupted')
+            }
+        ]);
 
         gate.resolve();
         await realSettle();
@@ -609,9 +632,10 @@ describe('a cancelled child reports the answer it was streaming (issue 0020 AC1)
         childGate.resolve();
         await realSettle();
 
-        // The parent's run was aborted, so its own turn is rolled back and the
-        // envelope may not survive in the transcript — the durable record is the
-        // surface AC1 names, and it must carry the in-flight sentence alone.
+        // The parent's run was aborted, and issue 0036 R1 RETAINS its turn — so the
+        // envelope's presence in the transcript is no longer the thing to assert. The
+        // durable record is the surface AC1 names, and it must carry the in-flight
+        // sentence alone.
         const child = childOf(writer);
         const record = await recordOf(writer, child.invocationId);
         expect(record.status).toBe('cancelled');
@@ -1321,9 +1345,10 @@ describe('delegation result contract (T28)', () => {
 
         await expect(running).rejects.toThrow('operator stop');
 
-        // The child's own record survives the rollback: how far it got, and what it had
-        // already said. This is the forensic half of the fix — the transcript is gone,
-        // but the account of the run is not.
+        // The child's own record survives the cancellation: how far it got, and what it had
+        // already said. This is the forensic half of the fix — before issue 0036 R1 the
+        // transcript was spliced away and this row was the ONLY trace; retention now keeps
+        // the conversation too, but the row remains the account that outlives it.
         const stored = (await writer.executeTool('agentResult', { agent: 'researcher' })) as {
             status: string;
             content: string;
@@ -1849,8 +1874,10 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
 
         // ONE tool message for `c1`, classified as the control outcome it was, and it carries
         // the child's terminal record instead of the "no result is available" sentence: the
-        // answer the child managed to finish (here, none — its text was rolled back with the
-        // run), the partial text it had said, how far it got, and the identity of the exact
+        // answer the child was cut off before finishing (here its unfinished text,
+        // 'half an answer' — issue 0036 R1 no longer splices the child's committed turn
+        // away, and the account travels on this door either way), the partial text it had
+        // said, how far it got, and the identity of the exact
         // invocation that produced them.
         expect(envelopeOf(toolMessageOf(writerAgent, 'c1'))).toEqual({
             agent: 'researcher',
@@ -3116,13 +3143,21 @@ describe('per-delegation turn cap (I5)', () => {
         // This is the whole point of the cap: bounded work, counted.
         expect(seenChild).toHaveLength(2);
 
-        // A run that runs out of turns ROLLS BACK its own turns, exactly like the
-        // harness-wide `maxIterations` guard does, so the child's readable transcript is
-        // empty afterwards and the envelope's `partialContent` below is the only
-        // surviving evidence of the two turns it did spend. The thread record itself
-        // stays addressable (idle, at sequence 2, owned by the requesting thread — that
-        // contract belongs to `src/harness.thread-runtime.test.ts`).
-        expect(writer.threadMessages('agent:researcher')).toEqual([]);
+        // A run that runs out of turns is BOUNDED, not erased: the cap stops the child
+        // after EXACTLY two model turns (counted above), and issue 0036 R1 keeps the turns
+        // it spent. Re-captured from an actual run: the delegation prompt, then one
+        // assistant round per model turn with its real `peek` result — both calls answered,
+        // so the repair pass added nothing. The envelope's `partialContent` below is now
+        // corroborating evidence beside a readable transcript, not the only evidence. The
+        // thread record stays addressable (idle, at sequence 2, owned by the requesting
+        // thread — that contract belongs to `src/harness.thread-runtime.test.ts`).
+        expect(withoutIds(writer.threadMessages('agent:researcher'))).toEqual([
+            { role: 'user', content: 'find facts' },
+            { role: 'assistant', content: 'pass 1', toolCalls: [{ id: 'p1', name: 'peek', arguments: '{}' }] },
+            { role: 'tool', content: 'a fact', name: 'peek', toolCallId: 'p1' },
+            { role: 'assistant', content: 'pass 2', toolCalls: [{ id: 'p2', name: 'peek', arguments: '{}' }] },
+            { role: 'tool', content: 'a fact', name: 'peek', toolCallId: 'p2' }
+        ]);
         expect(writer.thread('agent:researcher')?.sequence).toBe(2);
 
         // Out of turns means NOT ANSWERED: the unfinished-run envelope, with the

@@ -551,7 +551,7 @@ describe('restart reconstruction (R4)', () => {
         expect(errors).toContain('line 3');
     });
 
-    it('a reset cannot replay stale steps, and a delete cannot resurrect them', async () => {
+    it('a reset cannot replay stale steps, and a thread delete keeps the rows it marks', async () => {
         const root = tempRoot('stale');
         const first = storeOf([singlePreset()], root);
         const created = await first.create('one');
@@ -569,7 +569,7 @@ describe('restart reconstruction (R4)', () => {
 
         expect(restarted.getView(created.id).turns).toEqual([]);
 
-        // A thread deletion compacts the log to the SURVIVING turns only.
+        // A thread deletion never touches the log: what it marks, it keeps.
         const threaded = storeOf([singlePreset()], root);
         const made = await threaded.create('one');
         const firstSubmit = await threaded.dispatch(made.id, 'thread one');
@@ -583,22 +583,40 @@ describe('restart reconstruction (R4)', () => {
 
         expect(kept.turns).toHaveLength(2);
 
+        const threadJournal = journalFileOf(root, made.id);
+        const eventLinesOf = (file: string) =>
+            fs
+                .readFileSync(file, 'utf8')
+                .split('\n')
+                .filter((line) => line.length > 0 && line.includes('"event"'));
+
+        // The append-only journal holds one line per recorded event, which is what makes the
+        // comparison below exact rather than "some lines were kept".
+        const rawEvents = threaded
+            .get(made.id)
+            .turns.reduce((total, turn) => total + turn.events.length, 0);
+
+        expect(rawEvents).toBe(8);
+        expect(eventLinesOf(threadJournal)).toHaveLength(rawEvents);
+
+        const keptIds = kept.turns.map((turn) => turn.id);
+        const beforeDelete = eventLinesOf(threadJournal);
+
         await threaded.deleteThread(made.id, threadId);
 
+        // IT19: deleting the conversation MARKS those two turns. The view still exposes the same
+        // two rows, the journal is not compacted (byte-for-byte the same lines as before the
+        // delete), and a restart replays both of them.
         const afterDelete = threaded.getView(made.id);
 
-        expect(afterDelete.turns).toHaveLength(0);
-
-        const survivorLines = fs
-            .readFileSync(journalFileOf(root, made.id), 'utf8')
-            .split('\n')
-            .filter((line) => line.length > 0 && line.includes('"event"'));
-
-        expect(survivorLines).toHaveLength(0);
+        expect(afterDelete.turns).toHaveLength(2);
+        expect(afterDelete.turns.map((turn) => turn.id)).toEqual(keptIds);
+        expect(eventLinesOf(threadJournal)).toEqual(beforeDelete);
 
         const revived = storeOf([singlePreset()], root);
 
-        expect(revived.getView(made.id).turns).toHaveLength(0);
+        expect(revived.getView(made.id).turns).toHaveLength(2);
+        expect(revived.getView(made.id).turns.map((turn) => turn.id)).toEqual(keptIds);
     });
 
     it('removing a session deletes its durable footprint', async () => {

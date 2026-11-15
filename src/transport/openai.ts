@@ -359,9 +359,8 @@ const wireMessage = (message: HarnessMessage, policy: AttachmentPolicy): Record<
             // strict provider that demands the echo back — DeepSeek thinking mode,
             // Kimi/Moonshot, GLM/Z.ai, Qwen-with-`preserve_thinking` (task brief
             // Part E, E2) — speaks this dialect, the transport has no per-model
-            // capability flag to pick a dialect with (F6; issue 0001,
-            // `docs/issues/blocking-provider-request-body-extension.md`, owns that
-            // surface), and dual-emitting a second non-standard field is exactly the
+            // capability flag to pick a dialect with (F6; issue 0001, now closed, owns
+            // that surface), and dual-emitting a second non-standard field is exactly the
             // unknown-field rejection this site's previous "drop reasoning entirely"
             // posture existed to avoid. A backend that wants the other spelling is
             // deferred to that capability surface rather than guessed at here.

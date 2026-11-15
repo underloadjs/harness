@@ -41,7 +41,11 @@ import {
     CHAPTERS_COLLECTION,
     LOCATIONS_COLLECTION,
     PROFILES_COLLECTION,
-    TASKS_COLLECTION
+    TASKS_COLLECTION,
+    // The PURE snapshot reader (./core/snapshot.ts). The run-stop block at the end of this
+    // file drives it directly: the keys under test are validated there, while the write side
+    // that emits them lives in ../harness.ts and is not part of that change.
+    readHarnessSnapshot
 } from './core';
 // The read rule for the persisted tool outcome (compaction T1). Imported from the module,
 // like ./core/task above, so the round-trip assertions below pin the SAME helper a policy
@@ -58,6 +62,15 @@ import type {
     HarnessStream,
     HarnessStreamEvent,
     HarnessStreamRequest,
+    // The run-stop vocabulary (../types `HarnessRunStopReason`). Imported from the PACKAGE
+    // ROOT by the pin below, which is also the evidence that the new union reaches a consumer:
+    // src/harness.ts:14912 re-exports ./types type-only, and that is the only path a host has.
+    HarnessRunStopReason,
+    // The `threadSend` receipt (../types `HarnessThreadMessageResult`). The type-only pin at
+    // the end of the run-stop block below needs it: the third delivery value has no runtime
+    // producer until the thread runtime emits it, so the schema half is asserted at compile
+    // time.
+    HarnessThreadMessageResult,
     TaskChange,
     TaskChangeOp,
     TaskItem,
@@ -2266,5 +2279,292 @@ describe('snapshot persistence of the conversation tool switches', () => {
             (discovery) => (discovery.switches = ['tasks']),
             'snapshot.discovery has an unknown field "switches".'
         );
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE RUN-STOP AND SOFT-DELETE KEYS — the durable schema groundwork for the
+// cancelled-delegate issue ("a cancelled delegate loses its committed work, and
+// thread/invocation status disagree about what 'cancelled' means").
+//
+// What the schema now carries:
+//   - `threads[].stopReason`   — WHY the conversation's last run ended short (../types
+//     `HarnessRunStopReason`, a closed nine-member vocabulary, NOT the model-level
+//     `HarnessStopReason` of one provider request);
+//   - `threads[].inactive` + `threads[].inactiveAt` — the SOFT DELETE: the row and its
+//     transcript survive a delete, excluded from the session tooling's discovery but never
+//     destroyed, because the only thing that ever destroys a thread is the SESSION going
+//     away with its snapshot;
+//   - `agentResults[].stopReason` — the same reason on the run's own ledger row, next to the
+//     forensic pair that already records what it SAID and how far it got;
+//   - `HarnessThreadMessageResult.delivered` gains `'resumed'`, the third named operation
+//     (steering 'queued' / continue 'started' / resume 'resumed').
+//
+// `HARNESS_SNAPSHOT_VERSION` stayed 2: every key above is OPTIONAL, so a document written
+// before them — and every fixture in this file — validates and restores with its exact prior
+// meaning (the mechanism ./core/snapshot.ts's header documents).
+//
+// WHY THESE TESTS DRIVE THE READER, NOT `restore()`: the write side is a different change.
+// `snapshot()` emits these keys only once the runtime sets them on a live record, and
+// `restore()` re-seats them only once the projection carries them (both in ./harness.ts,
+// which this schema change must not touch). Asserting a live round trip here would pin
+// behaviour that does not exist yet. What IS pinned is the contract that behaviour codes
+// against: which documents ./core/snapshot.ts accepts, which it refuses with which exact
+// message, and that a key it is handed is never quietly dropped.
+// ---------------------------------------------------------------------------
+describe('snapshot reader validation of the run-stop and soft-delete keys', () => {
+    // A one-thread harness, so `snapshot().threads[0]` is the row the reader walks
+    // (./core/snapshot.ts `readThreads` labels entries exactly that way) — the same fixture
+    // shape the display-lane block above uses, for the same reason.
+    const stopSession = (): Harness => {
+        const session = harness({
+            agents: {
+                writer: agent({ model: 'merge/ds4-flash', stream: scripted([answer('idle')]) })
+            },
+            primary: 'writer',
+            presets: false
+        });
+
+        session.createThread('writer', { label: 'Cancelled' });
+
+        return session;
+    };
+
+    // The baseline document: one never-run host thread, no terminal results, and NONE of the
+    // new keys — which is exactly what every snapshot this build wrote before them looks like.
+    const baseline = (): Record<string, any> =>
+        clone(stopSession().snapshot()) as unknown as Record<string, any>;
+
+    const threadRow = (document: Record<string, any>): Record<string, any> => document.threads[0];
+
+    // The refusal wording, spelled out rather than rebuilt from the implementation's table,
+    // so a change to the vocabulary has to be a deliberate edit HERE as well.
+    const stopReasonRefusal = (label: string): string =>
+        `${label}.stopReason must be one of: caller-released, user-stopped, timeout, turn-cap,` +
+        ` budget-exhausted, api-error, retries-exhausted, parent-closed, plugin-parked` +
+        ` (or be absent).`;
+
+    // One terminal row the reader accepts verbatim: a CANCELLED root run of the only
+    // configured agent, with the `error` a non-completed row requires (./core/snapshot.ts
+    // `readAgentResults`). `stopReason` is the key under test, so everything else here is the
+    // minimum that is legal without it.
+    const cancelledRow = (stopReason?: unknown): Record<string, unknown> => ({
+        invocationId: '7',
+        sequence: 7,
+        completedOrder: 7,
+        agent: 'writer',
+        role: 'primary',
+        kind: 'root',
+        status: 'cancelled',
+        content: '',
+        error: 'Stopped by the host.',
+        ...(stopReason === undefined ? {} : { stopReason })
+    });
+
+    it('reads all three thread keys, and never drops one it was handed', () => {
+        const document = baseline();
+        const row = threadRow(document);
+
+        row.stopReason = 'turn-cap';
+        row.inactive = true;
+        row.inactiveAt = EPOCH_MS;
+
+        const read = readHarnessSnapshot(document);
+
+        // Exact row, exact values. `thread-1` is the first host id (core/thread.ts
+        // `THREAD_HOST_PREFIX` + the id counter) and `sequence: 2` is the SECOND number of the
+        // shared creation counter: every configured agent's DEFAULT conversation takes one at
+        // construction (./harness.ts `++threadSequence`, src/harness.ts:5596-5608), so the
+        // first HOST thread of a one-agent harness is number 2 — and the reader's `min: 1`
+        // bound pins it positive either way. `status` stays the narrow `idle`: the stop reason
+        // is the machine-readable WHY, never a widened status.
+        expect(read.threads![0]).toEqual({
+            id: 'thread-1',
+            agent: 'writer',
+            status: 'idle',
+            sequence: 2,
+            label: 'Cancelled',
+            messages: [],
+            stopReason: 'turn-cap',
+            inactive: true,
+            inactiveAt: EPOCH_MS
+        });
+
+        // The version did not move for an additive optional key, and the copy is detached —
+        // a restored harness never aliases the caller's document.
+        expect(read.version).toBe(2);
+        expect(read.threads).not.toBe(document.threads);
+    });
+
+    it('keeps a document that carries none of the new keys exactly as it was', () => {
+        const document = baseline();
+        const read = readHarnessSnapshot(document);
+
+        // Absence is a first-class shape, not a normalized-to-default one: the row comes back
+        // with the same keys it went in with, so a session that never stopped early cannot
+        // accumulate these fields through save/restore cycles.
+        expect(read.threads![0]).toEqual(threadRow(document));
+        expect(Object.hasOwn(read.threads![0], 'stopReason')).toBe(false);
+        expect(Object.hasOwn(read.threads![0], 'inactive')).toBe(false);
+        expect(Object.hasOwn(read.threads![0], 'inactiveAt')).toBe(false);
+    });
+
+    it('normalizes a hand-written `inactive: false` to the absent form, and keeps `inactiveAt`', () => {
+        const document = baseline();
+        const row = threadRow(document);
+
+        row.inactive = false;
+        row.inactiveAt = EPOCH_MS;
+
+        const read = readHarnessSnapshot(document);
+
+        // `inactive: false` and "no key" say the same thing (active), so the reader normalizes
+        // it away the way `applyIncluded` and `applyOutcome` do — otherwise `restore ->
+        // snapshot` would re-add a key this writer never emits.
+        expect(Object.hasOwn(read.threads![0], 'inactive')).toBe(false);
+
+        // `inactiveAt` is validated INDEPENDENTLY of the marker (the forensic pair's rule), so
+        // a timestamp survives on its own: a document may legitimately keep it as the history
+        // of a reactivation.
+        expect(read.threads![0].inactiveAt).toBe(EPOCH_MS);
+    });
+
+    it('refuses a malformed run-stop or soft-delete value with the reader\'s own message', () => {
+        const document = baseline();
+
+        const rejections: { value: (row: Record<string, any>) => void; message: string }[] = [
+            // A STATUS used as a REASON — the mistake this reader must not swallow, because a
+            // dropped reason sends the caller back to string-matching the `error` prose.
+            { value: (row) => (row.stopReason = 'cancelled'), message: stopReasonRefusal('snapshot.threads[0]') },
+            { value: (row) => (row.stopReason = 'stopped'), message: stopReasonRefusal('snapshot.threads[0]') },
+            {
+                value: (row) => (row.stopReason = ''),
+                message: 'snapshot.threads[0].stopReason must be at least 1 character.'
+            },
+            { value: (row) => (row.stopReason = 7), message: 'snapshot.threads[0].stopReason must be a string.' },
+            { value: (row) => (row.inactive = 'yes'), message: 'snapshot.threads[0].inactive must be a boolean.' },
+            {
+                value: (row) => (row.inactiveAt = 'now'),
+                message: 'snapshot.threads[0].inactiveAt must be a safe integer.'
+            },
+            {
+                value: (row) => (row.inactiveAt = 1.5),
+                message: 'snapshot.threads[0].inactiveAt must be a safe integer.'
+            },
+            {
+                value: (row) => (row.inactiveAt = -1),
+                message: 'snapshot.threads[0].inactiveAt must be between 0 and Infinity.'
+            },
+            // The key list stays EXACT: joining three names to it did not make it permissive,
+            // so an unknown sibling is still reported instead of vanishing on the next save.
+            {
+                value: (row) => (row.stopReasons = ['turn-cap']),
+                message: 'snapshot.threads[0] has an unknown field "stopReasons".'
+            }
+        ];
+
+        for (const { value, message } of rejections) {
+            const invalid = baseline();
+            value(invalid.threads[0]);
+
+            expect(() => readHarnessSnapshot(invalid)).toThrow(message);
+        }
+
+        // The untouched baseline still reads, so nothing above is a fixture artefact.
+        expect(() => readHarnessSnapshot(document)).not.toThrow();
+    });
+
+    it('reads `stopReason` on an archived result, and refuses it on a completed one', () => {
+        const document = baseline();
+        document.agentResults = [cancelledRow('user-stopped')];
+
+        expect(readHarnessSnapshot(document).agentResults![0]).toEqual({
+            invocationId: '7',
+            sequence: 7,
+            completedOrder: 7,
+            agent: 'writer',
+            role: 'primary',
+            kind: 'root',
+            status: 'cancelled',
+            content: '',
+            error: 'Stopped by the host.',
+            stopReason: 'user-stopped'
+        });
+
+        // A row that carries no reason (every row written before the field, and every host stop
+        // that recorded none) stays valid and comes back without the key.
+        const withoutReason = baseline();
+        withoutReason.agentResults = [cancelledRow()];
+
+        const read = readHarnessSnapshot(withoutReason);
+        expect(Object.hasOwn(read.agentResults![0], 'stopReason')).toBe(false);
+
+        // Refusals: an out-of-union value, and a reason on a run that CONCLUDED — the same
+        // mutual exclusion `error` and the forensic pair already enforce, kept so
+        // `restore -> snapshot` cannot re-drop a key the projection refuses.
+        const badReason = baseline();
+        badReason.agentResults = [cancelledRow('caller released')];
+        expect(() => readHarnessSnapshot(badReason)).toThrow(stopReasonRefusal('snapshot.agentResults[0]'));
+
+        const completed = baseline();
+        completed.agentResults = [
+            {
+                invocationId: '8',
+                sequence: 8,
+                completedOrder: 8,
+                agent: 'writer',
+                role: 'primary',
+                kind: 'root',
+                status: 'completed',
+                content: 'Done.',
+                stopReason: 'user-stopped'
+            }
+        ];
+        expect(() => readHarnessSnapshot(completed)).toThrow(
+            'snapshot.agentResults[0].stopReason must be absent on a completed result.'
+        );
+    });
+
+    // A COMPILE-TIME pin, the only honest form for a change with no runtime producer yet:
+    // `threadSend` names THREE operations, and a receipt value that is not one of them stops
+    // the build. The runtime that emits `'resumed'` is ./harness.ts, not this change.
+    it('types the threadSend receipt with its third operation', () => {
+        const operations: HarnessThreadMessageResult['delivered'][] = ['queued', 'started', 'resumed'];
+
+        expect(operations).toEqual(['queued', 'started', 'resumed']);
+    });
+
+    // The same compile-time form for the vocabulary the two durable rows carry. A
+    // `Record<Union, string>` demands EVERY member and permits no extra one, so renaming,
+    // removing or inventing a reason fails the build instead of drifting quietly out of the
+    // reader's refusal message — which is what keeps ./core/snapshot.ts's table and ../types
+    // honest with each other while neither can import the other's shape at runtime.
+    it('keeps the run-stop vocabulary closed, and reachable from the package root', () => {
+        const vocabulary: Record<HarnessRunStopReason, string> = {
+            'caller-released': 'the caller released its own tool call',
+            'user-stopped': 'an operator or host stopped the thread',
+            timeout: 'the run outlived its wall-clock bound',
+            'turn-cap': 'the run hit its maximum number of turns',
+            'budget-exhausted': 'the run spent its budget',
+            'api-error': 'the provider failed the request terminally',
+            'retries-exhausted': 'every retry attempt failed',
+            'parent-closed': 'the conversation that started the run went away',
+            'plugin-parked': 'a plugin parked the conversation and the run ended'
+        };
+
+        // Nine members, in the order the reader's refusal lists them. `oom` and `context` are
+        // deliberately absent: a `Record` refuses a key the union does not admit, so this
+        // assertion is also the statement that the set stays closed.
+        expect(Object.keys(vocabulary)).toEqual([
+            'caller-released',
+            'user-stopped',
+            'timeout',
+            'turn-cap',
+            'budget-exhausted',
+            'api-error',
+            'retries-exhausted',
+            'parent-closed',
+            'plugin-parked'
+        ]);
     });
 });

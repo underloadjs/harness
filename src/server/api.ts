@@ -1641,6 +1641,11 @@ export const createHarnessApi = ({
      *  identically-thinking entry, in the wrong conversation. */
     const threadCandidatesOf = (record: SessionRecord, turn: SessionTurn): string[] => [
         ...(turn.threadId === undefined ? [] : [turn.threadId]),
+        // R2: a soft-deleted conversation is hidden from the ROSTER but its transcript is
+        // retained, so it stays a legitimate candidate for this join — a recorded segment
+        // whose turn belongs to a retired conversation still has to resolve to the entry it
+        // came from, or the chip would point at nothing. Hiding is a listing rule, not a
+        // lookup rule.
         ...record.harness.threads()
             .map((thread) => thread.id)
             .filter((id) => id !== turn.threadId)
@@ -3426,6 +3431,12 @@ export const createHarnessApi = ({
         // Counts read off the live record BEFORE the reset (a reset discards them), which is
         // the whole receipt: what went, and the new revision. The store's 409 for a running
         // conversation is its own honest answer.
+        //
+        // R2: this is the roster the client could SEE (active host threads). A reset also
+        // clears every RETIRED row the session retained — a soft-deleted conversation and its
+        // turns go with the conversation, which is the spec's one destructive path — but those
+        // rows are deliberately not counted here, because the number has always been "the
+        // conversations this session was listing", not "every row in the document".
         const discardedTurns = record.turns.length;
         const discardedThreads = record.harness.threads().filter((thread) => thread.origin === 'host').length;
         const droppedQueued = record.queue.length;
@@ -4622,7 +4633,19 @@ export const createHarnessApi = ({
     // ---- threads (conversations) ------------------------------------------------
 
     const threadRowsOf = (record: SessionRecord, opts: { withPreview?: boolean } = {}) => {
-        const threads = record.harness.threads().filter((thread) => thread.origin === 'host');
+        // R2/AC2: a soft-deleted conversation is RETAINED (../types
+        // `HarnessThreadRecord.inactive`) but not DISCOVERABLE, and this is the row source
+        // for every thread route — `GET /sessions/:id/threads` (including the `status`
+        // filter below, which therefore cannot be pointed at a deleted conversation), the
+        // single-thread read, and the 201 read-back of a create. Filtering HERE is what makes
+        // "the tooling does not find it" true over HTTP without a new client-visible field;
+        // the row itself stays in `state.json` for a shell to read.
+        //
+        // Written against the record, so the filter is correct whether or not the runtime
+        // excludes inactive rows from `threads()` (then it is a no-op).
+        const threads = record.harness
+            .threads()
+            .filter((thread) => thread.origin === 'host' && thread.inactive !== true);
 
         // `sequence` order is the roster's stable order (creation order per session).
         return [...threads]
@@ -4652,6 +4675,13 @@ export const createHarnessApi = ({
         let rows = threadRowsOf(record);
 
         if (agent !== undefined) rows = rows.filter((row) => row.agent === agent);
+        // R2: `rows` already excludes inactive conversations (`threadRowsOf` above), so a
+        // `status=idle|running|stopped` query can no longer surface a deleted conversation
+        // as if it were merely idle. R4: the status alone never says WHO halted a run — the
+        // cause is `stopReason` on the WS thread views (./protocol.ts). The REST row is the
+        // generated `ThreadSummary` shape and has no `stop_reason` field yet, so a REST-only
+        // client still reads a bare `status: 'stopped'`; widening that row is a contract
+        // change for the generated surface, not this one.
         if (status !== undefined) rows = rows.filter((row) => row.status === status);
 
         const page = slicePage(rows, cursor, limit, rows.length);
@@ -4742,10 +4772,24 @@ export const createHarnessApi = ({
         requireThread(record, threadId);
 
         // The cascade is the part a client must report: descendants and owning turns are
-        // counted from the roster BEFORE the removal, then stated in the receipt.
+        // counted from the roster BEFORE the mark, then stated in the receipt.
+        //
+        // R2: a deletion no longer REMOVES either of them — the conversations and their turns
+        // are retained and merely hidden — so these two numbers now state the SIZE of the
+        // retired set, not a count of destroyed records (`removed_turns` was never a claim
+        // about records being destroyed, and the wire shape is swagger-generated, so the
+        // meaning moves here rather than into a renamed field).
         const descendants = record.harness
             .threads()
-            .filter((thread) => thread.origin === 'host' && isDescendant(record, thread.id, threadId)).length;
+            .filter(
+                (thread) =>
+                    thread.origin === 'host' &&
+                    // A conversation that is ALREADY retired is not part of this cascade, and
+                    // counting it would overstate the mark (R2: its row was inactive before
+                    // this call, and a repeat delete of it is refused with a 404 above).
+                    thread.inactive !== true &&
+                    isDescendant(record, thread.id, threadId)
+            ).length;
         const removedTurns = record.turns.filter((turn) => turn.threadId === threadId).length;
 
         await store.deleteThread(record.id, threadId);

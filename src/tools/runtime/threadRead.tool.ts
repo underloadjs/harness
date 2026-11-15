@@ -17,6 +17,15 @@ export const THREAD_READ_NAME = 'threadRead';
 // by the runtime (`context.threadId`), never by the model, so omitting `thread`
 // reads the conversation the model is actually in.
 //
+// WHICH ERROR, SINCE 2026-11-15 (IT19 R2 soft delete): "unknown" and "deleted" are two
+// different facts, and `threadMessages` says so. A SOFT-DELETED (`inactive`) conversation
+// answers a conversation caller with its own sentence — "is inactive (deleted); its
+// transcript is retained, but it is no longer part of this session's roster ... A host can
+// still read it by id" — because answering with the retained bytes would read as live. An id
+// nothing has keeps the canonical not-found sentence (issue 0034's one sentence, three
+// doors). Both are still ERRORS to the model, which is what the description states; the
+// host view (no caller thread) is the door that still reads a released transcript.
+//
 // SCOPE (2026-11-15): the read is SESSION-WIDE. It used to be narrowed to the
 // caller's thread family, which was consistent while all three thread doors refused
 // everything outside it - but a prompt quotes a conversation by NAME, and the

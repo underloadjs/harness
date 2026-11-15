@@ -238,7 +238,7 @@ describe('one canonical conversation/legacy label sequence', () => {
         store.dispose();
     });
 
-    it('adopts a surviving turn label when the label maps are missing (RR3 stays RR3)', async () => {
+    it('adopts every retained turn label when the label maps are missing (RR1-RR3 keep their numbers)', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't14-labels-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore(researcherPreset(), persistence);
@@ -250,7 +250,8 @@ describe('one canonical conversation/legacy label sequence', () => {
 
         expect([one.label, two.label, three.label]).toEqual(['RR1', 'RR2', 'RR3']);
 
-        // Retire RR1/RR2 so only RR3 survives.
+        // Mark RR1/RR2's conversations deleted. IT19 retains their turn rows, so a restore has
+        // to adopt all three labels, not just the one the old purge left behind.
         await store.deleteThread(id, one.threadId as string);
         await store.deleteThread(id, two.threadId as string);
         store.dispose();
@@ -269,14 +270,18 @@ describe('one canonical conversation/legacy label sequence', () => {
         const restored = createStore(researcherPreset(), persistence, persistence.load());
         const snapshot = restored.get(id);
 
-        // The recorded turn label is the strongest evidence: it is adopted BEFORE
-        // anything is allocated, so the survivor keeps RR3 instead of being renamed
-        // RR1 (and the counter is already at 3).
-        expect(snapshot.turns.map((turn) => turn.threadLabel)).toEqual(['RR3']);
+        // The recorded turn labels are the strongest evidence: they are adopted BEFORE anything
+        // is allocated, so every retained row keeps the number the user saw — RR1 and RR2 are not
+        // re-minted and the survivor is not renamed RR1 (and the counter is already at 3).
+        expect(snapshot.turns.map((turn) => turn.threadLabel)).toEqual(['RR1', 'RR2', 'RR3']);
         expect(rosterLabels(snapshot)).toEqual(['RR3']);
         expect(snapshot.labelHighWater).toEqual({ RR: 3 });
-        // Seeds survive the deletion, so the surviving block keeps its number.
+        // Every RETAINED row keeps its seed, so a resumed conversation keeps its number: RR2's
+        // block still seeds RR2 and RR3's still seeds RR3. RR1's seed is `{RR: 0}` — an empty
+        // value, so it is pruned from the map by the pre-existing additive rule, not by the
+        // deletion.
         expect(snapshot.labelSeeds).toEqual({
+            [two.turnId]: { RR: 1 },
             [three.turnId]: { RR: 2 }
         });
 

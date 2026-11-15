@@ -1680,6 +1680,26 @@ const repairAgentMessages = (messages: readonly HarnessMessage[]): readonly Harn
     const output: HarnessMessage[] = [];
     let changed = false;
 
+    // RETENTION FIX: which calls are already answered is decided across the WHOLE transcript,
+    // not only the `role:'tool'` block that follows an assistant message. An answer can legitimately
+    // sit elsewhere — the kernel synthesizes its own interrupted-call result (../harness.ts), a
+    // thread SPLIT moves the tail rows of a conversation into the child thread, and a merged
+    // subagent transcript appends the rows it adopted — and in every one of those cases the
+    // adjacency walk below never sees the existing result and writes a SECOND one for the same
+    // `toolCallId`. Two results for one call is exactly what a provider request schema rejects, so
+    // an "orphan" repair can manufacture the failure it exists to prevent, and the repair is not
+    // idempotent across a restore. Collecting the ids first makes a message that already has an
+    // answer anywhere in the transcript invisible to the repair, however it got there.
+    const answeredIds = new Set<string>();
+
+    for (const message of messages) {
+        if (message.role !== 'tool') continue;
+
+        const callId = message.toolCallId;
+
+        if (typeof callId === 'string' && callId.length > 0) answeredIds.add(callId);
+    }
+
     for (let index = 0; index < messages.length; index++) {
         const message = messages[index];
         output.push(message);
@@ -1691,9 +1711,6 @@ const repairAgentMessages = (messages: readonly HarnessMessage[]): readonly Harn
 
         if (calls === undefined || calls.length === 0) continue;
 
-        const wanted = new Set(calls.map((call) => call.id));
-        const answered = new Set<string>();
-
         // Consume the contiguous tool-result block that follows this message.
         // Unknown/extra tool messages are preserved verbatim: they are evidence,
         // not something to discard while repairing.
@@ -1704,14 +1721,14 @@ const repairAgentMessages = (messages: readonly HarnessMessage[]): readonly Harn
             if (result.role !== 'tool') break;
 
             output.push(result);
-            if (wanted.has(result.toolCallId)) answered.add(result.toolCallId);
             cursor++;
         }
 
         // Append missing results in call order, immediately after the existing
-        // block so the provider sees one coherent assistant→tool(s) exchange.
+        // block so the provider sees one coherent assistant→tool(s) exchange. A call
+        // answered further down the transcript is skipped — see `answeredIds` above.
         for (const call of calls) {
-            if (answered.has(call.id)) continue;
+            if (answeredIds.has(call.id)) continue;
 
             changed = true;
             output.push({

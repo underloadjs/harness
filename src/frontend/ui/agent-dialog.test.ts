@@ -1654,7 +1654,7 @@ describe('an agent a conversation already runs (R6)', () => {
 
         expect(removeButton().disabled).toBe(true);
         expect(removeButton().title).toBe(
-            'This agent is used by a conversation in this session; delete that conversation before removing the agent.'
+            'This agent is used by a conversation in this session; deleting that conversation does not release it, so removing the agent needs the session deleted.'
         );
         expect(fieldNotes()).toEqual([
             'This agent is in use by a conversation and cannot be removed.'

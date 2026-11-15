@@ -509,7 +509,9 @@ describe('stop in flight, and delete after it', () => {
         expect(labelText(button)).toBe('Delete');
         expect(glyphText(button)).toBe('X');
         expect(button.getAttribute('aria-label')).toBe('Delete thread RR1');
-        expect(button.title).toBe('Delete this thread permanently');
+        expect(button.title).toBe(
+            'Delete this thread: it leaves this session, and its transcript is kept until the session is deleted'
+        );
         expect(button.disabled).toBe(false);
 
         // The delete flow is UNCHANGED: one press on a proven desktop, no dialog, and it
@@ -554,7 +556,9 @@ describe('stop in flight, and delete after it', () => {
         expect(button.classList.contains('thread-stop')).toBe(false);
         expect(labelText(button)).toBe('Delete');
         expect(button.getAttribute('aria-label')).toBe('Delete thread RR1');
-        expect(button.title).toBe('Delete this thread permanently');
+        expect(button.title).toBe(
+            'Delete this thread: it leaves this session, and its transcript is kept until the session is deleted'
+        );
     });
 
     it('keeps the mobile delete confirmation for the stopped conversation', async () => {
@@ -582,7 +586,9 @@ describe('stop in flight, and delete after it', () => {
         expect(
             deleteDialogs()[0]?.querySelector<HTMLElement>('.thread-delete-confirm-body')
                 ?.textContent
-        ).toBe('Delete thread RR1 permanently? Its turns and transcript are removed.');
+        ).toBe(
+            'Delete thread RR1? It leaves this session, and its transcript is kept until the session itself is deleted.'
+        );
 
         actionButton(deleteDialogs()[0], '.thread-delete-confirm-delete').click();
         await flush();

@@ -1338,11 +1338,28 @@ describe('turn decision pipeline (T2)', () => {
         // ONE provider request: the decision lands before the second request is built,
         // and the run never claimed an answer.
         expect(seen.map((request) => transcriptOf(request.messages))).toEqual([['user:go']]);
-        // THE orphan check: the assistant message and the tool result the first turn
-        // committed are rolled back with the run, exactly like the `maxIterations`
-        // guard's rollback, so a stopped conversation shows nothing but what it had
-        // before the run.
-        expect(transcriptOf(writer.agent.messages)).toEqual([]);
+        // THE orphan check, in its retention form: the stopped run keeps what it
+        // committed, and what it committed is still PAIRABLE — the prompt, the assistant
+        // turn that asked for `c1`, and that call's REAL result ('noon' from the clock
+        // tool), so no assistant call is left dangling and nothing was synthesized here.
+        // Emptiness used to prove "no orphan" by removing the whole turn; asserting the
+        // committed shape proves the same property directly, and pins more.
+        expect(transcriptOf(writer.agent.messages)).toEqual([
+            'user:go',
+            'assistant:',
+            'tool:noon'
+        ]);
+        // The pairing itself, structurally: one call id requested, one result answering it.
+        expect(
+            writer.agent.messages.flatMap((message) =>
+                message.role === 'assistant' ? (message.toolCalls ?? []).map((entry) => entry.id) : []
+            )
+        ).toEqual(['c1']);
+        expect(
+            writer.agent.messages.flatMap((message) =>
+                message.role === 'tool' ? [`${message.toolCallId}:${message.name}`] : []
+            )
+        ).toEqual(['c1:clock']);
         expect(writer.thread('agent:writer')?.status).toBe('stopped');
     });
 

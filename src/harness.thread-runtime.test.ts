@@ -16,9 +16,25 @@
 //   R5  Steering never interrupts an in-flight request: queued text becomes a
 //       user message at the loop boundary, in receipt order.
 //   R6  stopThread aborts one conversation (and owner-linked children) and marks
-//       it stopped; stopAllThreads aborts every active run; deleteThread purges a
-//       terminal host conversation plus its invocation and branch lookups, and the
-//       receipt NAMES what it purged (see the stress-report group below).
+//       it stopped; stopAllThreads aborts every active run; deleteThread RELEASES a
+//       terminal host conversation — it marks the row `inactive`, and the row, its
+//       transcript and its agent-result rows are retained (only a session deletion
+//       destroys them). The receipt still NAMES what it released
+//       (see the stress-report group below), and IT19 R1 keeps the committed turns of
+//       a stopped/cancelled/failed run on the record instead of rolling them back.
+//   IT19 (2026-11-15, issue 0036 R1/R2/R3/R5) Two rules were reversed and this file is
+//       where they are pinned. (1) RETENTION: a run that stops, gets cancelled, fails, times
+//       out or hits its turn cap KEEPS its committed turns — the transcript rollback is gone
+//       for a conversation run (only a branch/ephemeral run still rolls back), and a committed
+//       tool call left without an answer gets exactly one synthesized `role:'tool'` result
+//       saying the call was interrupted (`src/core/transcript-repair.ts`). (2) SOFT DELETE:
+//       `threadDelete`/`deleteThread` MARK (`inactive` + `inactiveAt`) instead of destroying,
+//       so the conversation disappears from `threadList`/`actOn`/`thread()`/`threads()`/
+//       `agentManage` and stays durable: the row rides `snapshot().threads`, a HOST
+//       `threadMessages` still answers it, an agent-facing `threadRead` still refuses it, and a
+//       host `sendThreadInput` revives it. `stopReason` (the closed `HarnessRunStopReason`
+//       union) says WHY a run halted and is cleared by the next fresh turn; `delivered` names
+//       which operation a send performed (`queued` / `started` / `resumed`).
 //   B3/B4/B5 (2026-11-13, thread-tools wave) The THREAD FAMILY is the WRITE unit: a caller
 //       that names a thread (`callerThreadId` on `harness.thread` /
 //       `harness.threadMessages`, the tool context of `threadRead`/`threadSend`/
@@ -725,9 +741,17 @@ describe('selective cancellation (R6)', () => {
         await flush();
         expect(runningA.status).toBe('rejected');
         expect((runningA.error as Error).message).toBe('stop it');
-        // A stopped run rolls its prompt back: the conversation keeps no partial turn.
-        expect(writer.threadMessages(a.id)).toEqual([]);
+        // IT19 R1: the stopped run KEEPS its committed tail. The prompt is the one thing
+        // a host inspecting a halted conversation needs to see, and rolling it back made a
+        // thread that had worked look like a thread that never had. Nothing else was
+        // committed here — the answer never arrived — so the retained transcript is exactly
+        // the one user turn the run had taken.
+        expect(withoutIds(writer.threadMessages(a.id))).toEqual([{ role: 'user', content: 'left task' }]);
         expect(writer.thread(a.id)?.status).toBe('stopped');
+        // R3: the halt carries its CAUSE, and the cause of a host `stopThread` is
+        // `user-stopped` — deliberately OUTSIDE the resumable set (`sendThreadInput` is the
+        // documented revival), which is why the status stays 'stopped' below.
+        expect(writer.thread(a.id)?.stopReason).toBe('user-stopped');
 
         // The sibling is untouched and completes normally.
         expect(runningB.status).toBe('pending');
@@ -1213,8 +1237,13 @@ describe('host-parent delegation (R4)', () => {
         await flush();
 
         expect(writer.thread(alphaChildRecord.id)?.status).toBe('stopped');
-        // A stopped child rolls its in-flight prompt back.
-        expect(writer.threadMessages(alphaChildRecord.id)).toEqual([]);
+        // IT19 R1: the stopped CHILD keeps the turn it had committed — the delegated prompt
+        // is the record of what the parent asked and never got an answer to. Its cause is the
+        // host stop that halted it.
+        expect(withoutIds(writer.threadMessages(alphaChildRecord.id))).toEqual([
+            { role: 'user', content: 'child alpha' }
+        ]);
+        expect(writer.thread(alphaChildRecord.id)?.stopReason).toBe('user-stopped');
         // The sibling is still executing and unaffected.
         expect(writer.thread(betaChildRecord.id)?.status).toBe('running');
 
@@ -1259,7 +1288,7 @@ describe('host-parent delegation (R4)', () => {
         expect(writer.thread(betaChildRecord.id)?.status).toBe('idle');
     });
 
-    it('lists live conversations for agents and hides deleted threads and results', async () => {
+    it('lists live conversations for agents and hides a deleted thread from the session doors', async () => {
         // A model that reads the roster, then answers.
         const rosterStream: HarnessStream = async function* (request) {
             const seenTool = request.messages.some((message) => message.role === 'tool');
@@ -1331,7 +1360,11 @@ describe('host-parent delegation (R4)', () => {
             second.id
         ]);
 
-        // Deletion removes the record, the roster entry, and the result lookup.
+        // SOFT DELETE (IT19 R2) — HALF OF THE CONTRACT: the conversation is no longer
+        // discoverable by the SESSION TOOLING. The record seam answers nothing, the host roster
+        // omits it, and the model-facing `threadList` omits it (both scoped and unscoped). What
+        // it does NOT do is destroy anything: the row, its transcript and its result rows stay,
+        // which the snapshot assertions below pin.
         writer.deleteThread(second.id);
         expect(writer.thread(second.id)).toBeUndefined();
         expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer', first.id]);
@@ -1347,14 +1380,42 @@ describe('host-parent delegation (R4)', () => {
         ]);
 
         const snapshot = writer.snapshot();
-        expect((snapshot.threads ?? []).map((record) => record.id)).toEqual([first.id]);
+        // THE OTHER HALF: the released row is still in the durable document, in creation order
+        // beside the live one — a snapshot keeps what a delete released.
+        expect((snapshot.threads ?? []).map((record) => record.id)).toEqual([first.id, second.id]);
+        // `second`'s row, exactly: still labelled, never-run transcript, and the soft-delete
+        // mark. `inactiveAt` is `Date.now()` at the mark, and the frozen clock of this file makes
+        // it one exact value rather than a wall-clock range.
+        expect(withoutIds((snapshot.threads ?? [])[1])).toEqual({
+            id: second.id,
+            agent: 'writer',
+            status: 'idle',
+            sequence: 3,
+            label: 'later',
+            inactive: true,
+            inactiveAt: EPOCH_MS,
+            messages: []
+        });
         expect(snapshot.threadSequence).toBe(2);
 
+        // The released conversation is hidden from the roster, and its result row is RETAINED:
+        // `agentManage` no longer previews it (pinned in the M2 group below), while an id the
+        // caller still holds keeps answering until the session itself is deleted.
         writer.deleteThread(first.id);
         expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer']);
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
-        ).rejects.toThrow('No result "1" is available for agent "writer".');
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'roster read',
+            contentLength: 11,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
     });
 });
 
@@ -1577,8 +1638,8 @@ describe('cross-thread chat and delegation links (R4)', () => {
     });
 });
 
-describe('delete purge and snapshot durability', () => {
-    it('purges a terminal host thread, its transcript, and its invocation lookup', async () => {
+describe('delete release and snapshot durability', () => {
+    it('releases a terminal host thread: hidden from the session doors, retained for the host', async () => {
         let requests = 0;
         const stream: HarnessStream = async function* () {
             requests += 1;
@@ -1602,25 +1663,104 @@ describe('delete purge and snapshot durability', () => {
         );
         await running;
 
-        writer.deleteThread(thread.id);
+        // IT19 R2 — THE RECEIPT STILL NAMES WHAT WAS RELEASED, but the words changed meaning:
+        // `removedThreadIds`/`removedInvocationIds` are the ids that stop being LISTED, and
+        // `removedBranchIds` is the one genuinely removed set (a branch row is a throwaway clone).
+        expect(writer.deleteThread(thread.id)).toEqual({
+            deleted: thread.id,
+            removedThreadIds: [thread.id],
+            removedInvocationIds: ['1', '2'],
+            removedBranchIds: []
+        });
 
+        // WHAT THE DELETE TAKES AWAY: the record seam and the roster, i.e. the session tooling
+        // that a model or a host uses to find a conversation at all.
         expect(writer.thread(thread.id)).toBeUndefined();
         expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer']);
-        expect(() => writer.threadMessages(thread.id)).toThrow(
-            `Thread "${thread.id}" is not available in this harness; it was never created, or it was deleted.`
-        );
+
+        // WHAT IT KEEPS: the transcript, and it is still readable through the HOST door — the
+        // server's transcript reader and every route that passes no caller thread. The released
+        // conversation worked, and those turns are the durable state the host owns.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'hello' },
+            { role: 'assistant', content: 'answer 1' },
+            { role: 'user', content: 'again' },
+            { role: 'assistant', content: 'answer 2' }
+        ]);
+
+        // The agent-result row is retained on the same rule: the answer the released
+        // conversation gave is still addressable by id (the roster that LISTS it is what shrank).
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
-        ).rejects.toThrow('No result "1" is available for agent "writer".');
-        // A deleted thread cannot receive chat either (registered by createThread).
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'answer 1',
+            contentLength: 8,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // And a conversation can no longer WRITE there. An agent-facing `threadSend` refuses with
+        // the inactive sentence rather than the canonical not-found one, because "it was never
+        // created, or it was deleted" is the one answer that is false for a retained record.
         await expect(
             writer.executeTool('threadSend', { thread: thread.id, message: 'ping' })
         ).rejects.toThrow(
-            `Thread "${thread.id}" is not available in this harness; it was never created, or it was deleted.`
+            `Thread "${thread.id}" is inactive: it was deleted, so threadSend cannot run in it. ` +
+                'Its record and transcript are retained and stay readable by id; start a new thread, ' +
+                'or have a host restore it.'
         );
 
-        // The id high-water mark survives deletion, and no host thread is persisted.
-        expect(writer.snapshot().threads).toEqual([]);
+        // The released ROW is still in the durable document, mark and all — a restore re-seats
+        // it, and only a session deletion drops it. `inactiveAt` is `Date.now()` at the mark, so
+        // the frozen clock of this file pins it to one value.
+        const released = (writer.snapshot().threads ?? [])[0];
+        expect({
+            id: released?.id,
+            status: released?.status,
+            sequence: released?.sequence,
+            invocationId: released?.invocationId,
+            inactive: released?.inactive,
+            inactiveAt: released?.inactiveAt
+        }).toEqual({
+            id: thread.id,
+            status: 'idle',
+            sequence: 2,
+            invocationId: '2',
+            inactive: true,
+            inactiveAt: EPOCH_MS
+        });
+
+        // A host send is the documented revival (IT19 R2): it clears the mark, and the retained
+        // transcript is the base it continues from — which is what makes "retained" more than a
+        // word for "still in the file".
+        const revived = await writer.sendThreadInput(thread.id, 'restored');
+        expect(revived.content).toBe('answer 3');
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+        expect(textOf(writer.threadMessages(thread.id))).toEqual([
+            'hello',
+            'answer 1',
+            'again',
+            'answer 2',
+            'restored',
+            'answer 3'
+        ]);
+
+        // The revival cleared the mark, so no reader of the document can mistake this
+        // conversation for a released one.
+        const revivedRow = (writer.snapshot().threads ?? [])[0];
+        expect({
+            status: revivedRow?.status,
+            inactive: revivedRow?.inactive,
+            inactiveAt: revivedRow?.inactiveAt
+        }).toEqual({ status: 'idle', inactive: undefined, inactiveAt: undefined });
+
+        // The id high-water mark survives the release, and a RELEASED thread is not re-minted:
+        // the row still occupies its id, so the next host thread is `thread-2`.
         expect(writer.snapshot().threadSequence).toBe(1);
         expect(writer.createThread('writer').id).toBe('thread-2');
     });
@@ -1755,17 +1895,23 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
             `Thread "${thread.id}" was stopped while this turn was queued; the turn was not started.`
         );
 
-        // The queued turn never reached the model, the status stayed stopped, and
-        // the aborted prompt rolled back.
+        // The queued turn never reached the model, the status stayed stopped, and (IT19 R1) the
+        // aborted prompt is RETAINED rather than rolled back — the one turn the halted run took is
+        // exactly what a host needs to see to know what was lost.
         expect(requests).toBe(1);
         expect(writer.thread(thread.id)?.status).toBe('stopped');
-        expect(writer.threadMessages(thread.id)).toEqual([]);
+        expect(textOf(writer.threadMessages(thread.id))).toEqual(['one']);
+        expect(writer.thread(thread.id)?.stopReason).toBe('user-stopped');
 
-        // A NEW host send after the stop is the one legal revival path.
+        // A NEW host send after the stop is the one legal revival path, and it continues the
+        // RETAINED conversation instead of starting a blank one.
         const revived = await writer.sendThreadInput(thread.id, 'three');
         expect(revived.content).toBe('after stop');
         expect(writer.thread(thread.id)?.status).toBe('idle');
-        expect(textOf(writer.threadMessages(thread.id))).toEqual(['three', 'after stop']);
+        expect(textOf(writer.threadMessages(thread.id))).toEqual(['one', 'three', 'after stop']);
+        // R3: the cause of the halted run is cleared by the fresh turn — the reason belonged to
+        // the run that ended, not to the conversation.
+        expect(writer.thread(thread.id)?.stopReason).toBeUndefined();
         expect(requests).toBe(2);
     });
 
@@ -1803,9 +1949,14 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         );
         expect(requests).toBe(1);
         expect(writer.thread(thread.id)?.status).toBe('stopped');
+        // IT19 R1/R3: the halted run keeps the prompt it had committed, and the cause a
+        // `stopAllThreads` halt records is the same host-owned `user-stopped` a single stop
+        // writes — the cascade is an actor difference, not a cause difference.
+        expect(textOf(writer.threadMessages(thread.id))).toEqual(['one']);
+        expect(writer.thread(thread.id)?.stopReason).toBe('user-stopped');
     });
 
-    it('purges thread-owned branches and their results on delete (M2)', async () => {
+    it('releases thread-owned branches on delete and keeps their result rows (M2)', async () => {
         let requests = 0;
 
         const stream: HarnessStream = async function* () {
@@ -1840,24 +1991,48 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
 
         writer.deleteThread(thread.id);
 
+        // THE BRANCH LEDGER IS THE ONE THING THIS DELETE REALLY REMOVES: a branch is a throwaway
+        // clone of its parent, the parent owns the answer, and with the conversation released
+        // there is nothing left to resolve a `branch-N` address against.
         expect(writer.branches()).toEqual([]);
         expect(writer.branch('branch-1')).toBeUndefined();
+
+        // The branch's RESULT ROW is retained, like every other row: IT19 R2 marks the thread and
+        // nothing else destroys, so the finished branch answer is still addressable by id until
+        // the session itself goes. (A completed row carries no `stopReason` — that key belongs to
+        // a run that did not conclude.)
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: 'branch-1' })
-        ).rejects.toThrow('No result "branch-1" is available for agent "writer".');
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: 'branch-1',
+            kind: 'fork',
+            status: 'completed',
+            content: 'ok',
+            contentLength: 2,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
     });
 
-    // STRESS REPORT #6 (2026-11-14) — THE PURGE IS NO LONGER SILENT.
+    // STRESS REPORT #6 (2026-11-14) — THE RELEASE IS NO LONGER SILENT.
     //
-    // Deleting a conversation drops its agent-result records and its branch lookups, which the
-    // caller otherwise experienced as `agentManage` shrinking and `agentResult(id)` starting to
-    // throw with no stated reason. `purgeThread` always computed those exact sets and threw them
-    // away; `deleteThread` now folds them into the receipt (owner first, then cascade children),
-    // so the state the caller caused is the state it can report.
+    // Deleting a conversation took its agent-result records out of `agentManage` and its branch
+    // lookups out of the branch ledger, which the caller otherwise experienced as `agentManage`
+    // shrinking and `agentResult(id)` changing behaviour with no stated reason. `purgeThread`
+    // always computed those exact sets and threw them away; `deleteThread` now folds them into
+    // the receipt (owner first, then cascade children), so the state the caller caused is the
+    // state it can report.
+    //
+    // IT19 R2 changed what the fields MEAN without changing the wire shape: `threadDelete` marks
+    // its target inactive, so `removedThreadIds` and `removedInvocationIds` name what stopped
+    // being LISTED (the roster and `agentManage`), while `removedBranchIds` is the one set that
+    // is genuinely dropped. The field names stay for wire compatibility.
     //
     // The branch id is taken from the ledger rather than written out: the branch counter is not
     // per-harness, and this file's M2 case already pinned `branch-1` for ITS harness.
-    it('reports on the receipt which invocations and branches the delete purged (M2 + stress report #6)', async () => {
+    it('reports on the receipt which invocations and branches the delete released (M2 + stress report #6)', async () => {
         let requests = 0;
 
         const stream: HarnessStream = async function* () {
@@ -1900,13 +2075,56 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
             removedBranchIds: [branchId]
         });
 
-        // The receipt is the truth: both lookups are gone on the next call.
+        // The receipt is the truth about the LISTING: neither invocation of the released
+        // conversation is previewed by `agentManage` any more — that is the state change the
+        // caller caused and can report. `totalResults` still counts both rows, which is the
+        // retention half of the same page.
+        //
+        // A wart this page now exposes, pinned by the values rather than disputed in code: with
+        // every row hidden, `agentManage` answers `invocationCount: 0` and an empty `results`
+        // beside `truncated: true`, and the tool's own description defines that flag as "some
+        // agent has more retained invocations than the 5 shown here". The sentence is now true for
+        // a reason it does not describe (retention, not the 5-row cap), and there is no cursor to
+        // act on it — the ids are still reachable, only by id. REPORTED, not asserted: a fix here
+        // is a production change, and production is frozen for this pass.
+        const listing = (await writer.executeTool('agentManage', {})) as {
+            agents: { invocationCount: number; name: string; results: unknown[] }[];
+            totalResults: number;
+        };
+        expect(listing.agents.map((entry) => [entry.name, entry.invocationCount, entry.results])).toEqual([
+            ['writer', 0, []]
+        ]);
+        expect(listing.totalResults).toBe(2);
+
+        // Both lookups still ANSWER by id. IT19 R2 destroys nothing on a thread delete, so the
+        // rows the receipt names are retired from the listing, not deleted: only a session
+        // deletion takes them, and an id a caller still holds keeps working.
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
-        ).rejects.toThrow('No result "1" is available for agent "writer".');
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'ok',
+            contentLength: 2,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: branchId })
-        ).rejects.toThrow(`No result "${branchId}" is available for agent "writer".`);
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: branchId,
+            kind: 'fork',
+            status: 'completed',
+            content: 'ok',
+            contentLength: 2,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
     });
 
     it('clears the runtime-only default owner link on reset and restore (L2)', async () => {
@@ -1959,6 +2177,9 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
     it('preserves steering for the next host turn when a run fails without a stop', async () => {
         const hold = gate();
         let requests = 0;
+        // Every provider request, in order, so "the retry must not be handed the steer twice"
+        // is a fact about what the model was SENT, not an inference from the transcript.
+        const seen: HarnessStreamRequest[] = [];
 
         const holdTool = tool({
             description: 'Hold until released.',
@@ -1970,7 +2191,7 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
             execute: () => hold.promise
         });
 
-        const stream: HarnessStream = async function* () {
+        const stream: HarnessStream = async function* (request) {
             requests += 1;
 
             if (requests === 1) {
@@ -1992,6 +2213,9 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
                 return;
             }
 
+            // The retry request is the one this test must be able to read: the model's prompt
+            // list is what proves the steer was not handed over twice.
+            seen.push(request);
             yield { type: 'text', delta: 'recovered' };
             yield { type: 'done', stopReason: 'stop', toolCalls: [] };
         };
@@ -2015,12 +2239,66 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         expect(running.status).toBe('rejected');
         expect((running.error as Error).message).toBe('boom');
         expect(writer.thread(thread.id)?.status).toBe('idle');
-        expect(writer.threadMessages(thread.id)).toEqual([]);
 
-        // The next host turn retries the preserved steering, in order.
+        // IT19 R1 — the failed run's committed turns are RETAINED, and this is the shape that
+        // makes retention safe to ship: the tail ends in an assistant turn whose `hold` call was
+        // committed but never answered, so `repairInterruptedToolCalls` gives that one call exactly
+        // one synthesized result saying it has no recorded outcome. A completed call is left alone,
+        // and the text is deliberately not pinned past its honest core — the provider-error wording
+        // a crashed lane writes is a different sentence and a sibling pass owns it.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'start' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'h1', name: 'hold', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'h1',
+                name: 'hold',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            { role: 'assistant', content: 'paused' },
+            { role: 'user', content: 'focus' }
+        ]);
+
+        // R3: the cause is on the record, and presence is keyed to the EXIT, not to the status —
+        // an interrupted run comes to rest at 'idle' and the cause still has to be readable.
+        expect(writer.thread(thread.id)?.stopReason).toBe('api-error');
+
+        // The next host turn continues from that retained record, in order.
         const retried = await writer.sendThreadInput(thread.id, 'retry');
         expect(retried.content).toBe('recovered');
-        expect(textOf(writer.threadMessages(thread.id))).toEqual(['retry', 'focus', 'recovered']);
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'start' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'h1', name: 'hold', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'h1',
+                name: 'hold',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            { role: 'assistant', content: 'paused' },
+            { role: 'user', content: 'focus' },
+            { role: 'user', content: 'retry' },
+            { role: 'assistant', content: 'recovered' }
+        ]);
+        // THE PRESERVATION IS THE RETAINED TURN, NOT A RE-SEND. The steer was drained into the
+        // transcript during the failed run, so the queue that carried it is empty and the retry
+        // request must hold `focus` exactly once — a second copy would mean the run was handed the
+        // guidance twice, which the old rollback used to hide.
+        expect(
+            (seen[0]?.messages ?? []).filter(
+                (message) => message.role === 'user' && message.content === 'focus'
+            )
+        ).toHaveLength(1);
+        // The fresh turn cleared the cause of the failed one (R3: it belonged to the run that ended).
+        expect(writer.thread(thread.id)?.stopReason).toBeUndefined();
         expect(requests).toBe(4);
     });
 });
@@ -2280,6 +2558,10 @@ describe('a stopped thread is revived by a host only (policy 2026-11-09 T6)', ()
         // registers `threadSend`, so the agent-facing door under test exists here.
         expect(writer.tools.threadSend).toBeDefined();
 
+        // Real work on the record BEFORE the stop, so the assertion below that "the refusal moved
+        // nothing" is a statement about RETAINED turns (IT19 R1) rather than about emptiness.
+        expect((await writer.sendThreadInput(thread.id, 'a turn')).content).toBe('host resumed');
+
         writer.stopThread(thread.id, 'operator stop');
         expect(writer.thread(thread.id)?.status).toBe('stopped');
 
@@ -2294,17 +2576,139 @@ describe('a stopped thread is revived by a host only (policy 2026-11-09 T6)', ()
             `Thread "${thread.id}" is stopped; it cannot receive messages until a host resumes or deletes it.`
         );
 
-        // The refusal changes nothing: no revival, and no text parked in the
-        // transcript to be read by some later turn.
+        // The refusal changes nothing: no revival, and no text appended on top of the turns the
+        // stopped conversation already owns. A `stopThread` with no run in flight also records no
+        // CAUSE, because there was no run to classify — the cause belongs to a run, not to a status.
         expect(writer.thread(thread.id)?.status).toBe('stopped');
-        expect(writer.threadMessages(thread.id)).toEqual([]);
+        expect(writer.thread(thread.id)?.stopReason).toBeUndefined();
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'a turn' },
+            { role: 'assistant', content: 'host resumed' }
+        ]);
 
         // THE OWNER. R3 ("a stopped thread can always be restarted by sending it a
-        // new prompt") is the HOST path, and this is the surface that implements it.
+        // new prompt") is the HOST path, and this is the surface that implements it —
+        // and since IT19 R1 it continues the retained conversation rather than replacing it.
         const message = await writer.sendThreadInput(thread.id, 'host resumes');
 
         expect(message.content).toBe('host resumed');
         expect(writer.thread(thread.id)?.status).toBe('idle');
+        expect(textOf(writer.threadMessages(thread.id))).toEqual([
+            'a turn',
+            'host resumed',
+            'host resumes',
+            'host resumed'
+        ]);
+    });
+
+    // IT19 R5 — THE THIRD RECEIPT, AND THE LINE BETWEEN THE TWO KINDS OF STOP.
+    //
+    // R1 made a cut-short run keep its turns, so a `stopped` conversation can now have work in
+    // hand, and a peer's message is the thing that continues it. `postThreadMessage` reads the
+    // CAUSE on the record (`stopReason`, R3) and answers `delivered: 'resumed'` for a cause that
+    // was never an instruction (`src/harness.ts` `RESUMMABLE_RUN_STOP_REASONS`), while
+    // `user-stopped` keeps the refusal of the test above — stopping is the host's intent — and so
+    // does `plugin-parked` and an absent cause.
+    //
+    // WHY THE TWO RECORDS ARRIVE THROUGH A DOCUMENT: every LIVE producer of `status: 'stopped'`
+    // writes a NON-resummable cause (the stop family stamps `user-stopped`, a plugin's
+    // `turn.before` stop stamps `plugin-parked`), so an interrupted run normally comes to rest at
+    // `idle` with its cause beside it. `stopped` PLUS a resummable cause is the DURABLE shape —
+    // the row a session carries after a run was cut short by a released call, an expired clock or
+    // an exhausted turn cap — and `HarnessThreadSnapshot.stopReason` is the field that carries it
+    // across the restart (`src/harness.ts:13904` writes exactly that pair). It is also the shape a
+    // consumer branches on, so pinning it here is the honest form; inventing a live race would pin
+    // a coincidence instead.
+    it('resumes a stopped thread whose cause was not an instruction, and refuses one the host stopped (R5)', async () => {
+        const source = quiet(brain(scripted([answer('carried on')])));
+        const interrupted = source.createThread('writer', { label: 'Cut short' });
+        const halted = source.createThread('writer', { label: 'Host stopped' });
+
+        // Both conversations have real work on the record before either is stopped, so the
+        // difference the send has to respect is the CAUSE, not whether anything is there.
+        await source.sendThreadInput(interrupted.id, 'work in hand');
+        await source.sendThreadInput(halted.id, 'other work');
+
+        const document = source.snapshot();
+        const rows = document.threads ?? [];
+        rows[0].status = 'stopped';
+        rows[0].stopReason = 'turn-cap';
+        rows[1].status = 'stopped';
+        rows[1].stopReason = 'user-stopped';
+
+        const writer = quiet(brain(scripted([answer('carried on')])));
+        writer.restore(document);
+
+        // Both are `stopped`, and from the roster alone they are indistinguishable — which is the
+        // whole point of R3: the cause is what decides, and it is durable.
+        expect(
+            writer.threads().map((record) => [record.id, record.status, record.stopReason])
+        ).toEqual([
+            ['agent:writer', 'idle', undefined],
+            [interrupted.id, 'stopped', 'turn-cap'],
+            [halted.id, 'stopped', 'user-stopped']
+        ]);
+
+        // RESUMABLE: the message continues the retained conversation, and the receipt says so —
+        // `resumed`, never `started`, so a caller is never told an interruption went unnoticed.
+        await expect(
+            writer.executeTool('threadSend', { thread: interrupted.id, message: 'continue' })
+        ).resolves.toEqual({
+            threadId: interrupted.id,
+            delivered: 'resumed',
+            sender: 'writer'
+        });
+
+        await settleThread(writer, interrupted.id);
+
+        // THE STOP WAS LIFTED AND THE CAUSE CLEARED with the turn that replaced it, and the run
+        // appended to the RETAINED transcript instead of starting a blank conversation.
+        expect(withoutIds(writer.thread(interrupted.id))).toEqual({
+            id: interrupted.id,
+            agent: 'writer',
+            origin: 'host',
+            status: 'idle',
+            sequence: 2,
+            label: 'Cut short',
+            invocationId: '3'
+        });
+        expect(withoutIds(writer.threadMessages(interrupted.id))).toEqual([
+            { role: 'user', content: 'work in hand' },
+            { role: 'assistant', content: 'carried on' },
+            { role: 'user', content: 'from agent "writer":\ncontinue' },
+            { role: 'assistant', content: 'carried on' }
+        ]);
+
+        // NOT RESUMABLE: a host stop is an instruction, and only the host lifts it. Same door, same
+        // target status, opposite answer — and the refusal mutates nothing: no queue entry, no
+        // append, no run, and the cause stays on the record for the next reader.
+        await expect(
+            writer.executeTool('threadSend', { thread: halted.id, message: 'continue' })
+        ).rejects.toThrow(
+            `Thread "${halted.id}" is stopped; it cannot receive messages until a host resumes or deletes it.`
+        );
+
+        expect(withoutIds(writer.thread(halted.id))).toEqual({
+            id: halted.id,
+            agent: 'writer',
+            origin: 'host',
+            status: 'stopped',
+            sequence: 3,
+            label: 'Host stopped',
+            invocationId: '2',
+            stopReason: 'user-stopped'
+        });
+        expect(withoutIds(writer.threadMessages(halted.id))).toEqual([
+            { role: 'user', content: 'other work' },
+            { role: 'assistant', content: 'carried on' }
+        ]);
+
+        // The host door is still the way back into a host-stopped conversation, and it answers
+        // `'started'` (a fresh turn), never `'resumed'`.
+        const revived = await writer.sendThreadInput(halted.id, 'host resumes');
+        expect(revived.content).toBe('carried on');
+        expect(writer.thread(halted.id)?.status).toBe('idle');
+        expect(writer.thread(halted.id)?.stopReason).toBeUndefined();
     });
 });
 
@@ -2318,7 +2722,12 @@ describe('a stopped thread is revived by a host only (policy 2026-11-09 T6)', ()
 //   idle    → START  (`delivered: 'started'`) — the message is the new prompt
 //   paused  → QUEUE  (`delivered: 'queued'`)  — the park SURVIVES the message (T8: the
 //             holder owns `resume`; only a host `sendThreadInput` lifts a park)
-//   stopped → the same throw (T3.3 — the host owns stopping and reviving)
+//   stopped → the same throw (T3.3 — the host owns stopping and reviving), with ONE
+//             exception since IT19 R5: a stop whose recorded CAUSE was never an instruction
+//             (a released call, an expired clock, an exhausted provider — see
+//             `RESUMMABLE_RUN_STOP_REASONS`) is continued instead, and answers
+//             `delivered: 'resumed'`. `user-stopped`, `plugin-parked` and an absent cause
+//             stay in the throw, and the pair is pinned in the T6 group above.
 //
 // The rest of the finding's checks are pinned where they already live:
 //   T3.4 — src/server/workers/capability.test.ts, unchanged: `threadSend` stays in
@@ -2328,9 +2737,9 @@ describe('a stopped thread is revived by a host only (policy 2026-11-09 T6)', ()
 //   T3.5 — the `steerThread`/`sendThreadInput` tests above, whose signatures and
 //          return types (`HarnessThreadSteerReceipt`, `HarnessAssistantMessage`) the
 //          merge deliberately did not touch;
-//   T3.6 — `delivered` is now `'queued' | 'started'`, and every value below is the
-//          reachability proof for one of them. `'appended'` is retired: with a
-//          dormant target now started, nothing is ever parked unread.
+//   T3.6 — `delivered` is now `'queued' | 'started' | 'resumed'` (IT19 R5 added the third),
+//          and every value below is the reachability proof for one of them. `'appended'` is
+//          retired: with a dormant target now started, nothing is ever parked unread.
 // ---------------------------------------------------------------------------
 
 describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
@@ -2566,14 +2975,24 @@ describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
         const writer = harness({
             agents: {
                 writer: brain(
-                    scripted([
-                        callTool(
-                            'c1',
-                            'threadSend',
-                            JSON.stringify({ thread: 'thread-2', message: 'agent ping' })
-                        ),
-                        answer('alpha read the refusal')
-                    ])
+                    routed(
+                        {
+                            // The target's own turn: it answers, so the transcript the refusal
+                            // below must leave alone is REAL retained content.
+                            'beta work': scripted([answer('beta was here')]),
+                            // The sender is a model in a run of its own, so the call goes through
+                            // the real tool path and the refusal comes back as a tool result.
+                            'ping the stopped one': scripted([
+                                callTool(
+                                    'c1',
+                                    'threadSend',
+                                    JSON.stringify({ thread: 'thread-2', message: 'agent ping' })
+                                ),
+                                answer('alpha read the refusal')
+                            ])
+                        },
+                        scripted([answer('unexpected')])
+                    )
                 )
             },
             presets: false
@@ -2581,6 +3000,10 @@ describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
 
         const alpha = writer.createThread('writer');
         const beta = writer.createThread('writer');
+
+        // IT19 R1: `beta` ran and answered BEFORE the operator stopped it, and those turns are
+        // retained — which is what makes "the refusal moved nothing" an assertion with a subject.
+        await writer.sendThreadInput(beta.id, 'beta work');
 
         writer.stopThread(beta.id, 'operator stop');
 
@@ -2591,15 +3014,22 @@ describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
             `Tool "threadSend" failed: Thread "${beta.id}" is stopped; it cannot receive messages until a host resumes or deletes it.`
         ]);
 
-        // Nothing moved: no revival, no queued guidance, no text in the transcript.
+        // Nothing moved: no revival, no queued guidance, and no line added to the retained
+        // transcript. A stop with no run in flight also carries no `stopReason` — the record pair
+        // `status: 'stopped'` without a cause is the shape of "the host halted this, and there was
+        // no run to classify", and `postThreadMessage` refuses that combination on purpose.
         expect(writer.thread(beta.id)).toEqual({
             id: beta.id,
             agent: 'writer',
             origin: 'host',
             status: 'stopped',
-            sequence: 3
+            sequence: 3,
+            invocationId: '1'
         });
-        expect(writer.threadMessages(beta.id)).toEqual([]);
+        expect(withoutIds(writer.threadMessages(beta.id))).toEqual([
+            { role: 'user', content: 'beta work' },
+            { role: 'assistant', content: 'beta was here' }
+        ]);
     });
 });
 // ---------------------------------------------------------------------------
@@ -2853,13 +3283,24 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
     // rejected: a default is the agent's standing transcript and would leak other callers'
     // content across families). What changed is the sentence, for a default target only.
     //
-    // WHAT CHANGED SINCE (2026-11-15): the READ half of this case no longer refuses. A read is
-    // session-wide, so the scout's standing transcript is readable from any lineage — which is
-    // exactly the remedy the clause recommends, minus the re-delegation. The clause stays for
-    // the SEND door, where re-delegating really is the only way back, and its wording is pinned
+    // WHAT CHANGED SINCE (2026-11-15, IT19 R2): the READ half of this case no longer refuses. A
+    // read is session-wide, so the scout's standing transcript is readable from any lineage —
+    // which is exactly the remedy the clause recommends, minus the re-delegation. The clause stays
+    // for the SEND door, where re-delegating really is the only way back, and its wording is pinned
     // byte for byte below.
-    it('a default conversation that left the family names the cause and the remedy (stress report #5)', async () => {
-        const { writer, child, sibling, borrowed } = lineage({
+    //
+    // AND SINCE THE SOFT DELETE (same wave): A RELEASE CAN NO LONGER EJECT A DEFAULT. `deleteThread`
+    // marks the scout row `inactive` and the ROW STAYS IN THE FAMILY, so the child's send into
+    // `agent:scout` now LANDS — the lineage the clause told the caller how to rebuild was never
+    // broken. The "it left when the last of your conversations running X was deleted" branch is
+    // therefore unreachable through any door a model can walk (only a session deletion destroys the
+    // row, and that ends the session it would address). That is a real narrowing of this case, so it
+    // is stated here rather than left to the diff — and the clause is NOT quietly dropped: the hedge
+    // it carries has a second branch, "it was never in your lineage", and that one is still live.
+    // It is pinned by the sibling door at the end of this test, which is the same fixture with a
+    // caller whose family never held a scout conversation. The case was re-homed, not deleted.
+    it('a default outside the family names the cause and the remedy, and a released row keeps its family (stress report #5)', async () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({
             'ask my family': modelDoors(
                 [
                     // The read now LANDS (session-wide), so this door answers a page rather
@@ -2871,6 +3312,13 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
                     { name: 'threadSend', args: () => ({ thread: sibling.id, message: 'unsolicited' }) }
                 ],
                 'all refused'
+            ),
+            // THE LIVE BRANCH OF THE CLAUSE. `sibling` is a top-level writer thread: no scout
+            // conversation has ever been in its family, so `agent:scout` is out of its lineage on
+            // the "never in your lineage" branch, which is the branch a soft delete cannot fake.
+            'ask the scout from outside?': modelDoors(
+                [{ name: 'threadSend', args: () => ({ thread: 'agent:scout', message: 'outside?' }) }],
+                'outside answered'
             )
         });
 
@@ -2880,7 +3328,7 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
         expect(writer.thread('agent:scout', child.id)?.id).toBe('agent:scout');
         expect(writer.threadMessages('agent:scout', child.id)).toEqual([]);
 
-        // Releasing the last scout conversation of the family. This delete purged nothing else,
+        // Releasing the last scout conversation of the family. This delete released nothing else,
         // which is the other half of the receipt contract (stress report #6): empty arrays, not
         // missing fields.
         expect(writer.deleteThread(borrowed.id)).toEqual({
@@ -2900,18 +3348,24 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
             'deleted. Delegate to "scout" again — the conversation it mints re-admits this address, and ' +
             'threadRead/threadSend reach it from then on.';
 
-        // OUT OF THE FAMILY, AND STILL READABLE (2026-11-15): the record is not in this caller's
-        // family, and a read no longer cares — the transcript comes back empty rather than the
-        // lineage sentence. The WRITE door still refuses, and its refusal says why and how to get
-        // it back; that half is pinned through the model door below, which is the door that
-        // carries a caller identity.
+        // THE RELEASE IS INVISIBLE TO THE FAMILY AND VISIBLE TO THE ROSTER (IT19 R2): the scout row
+        // is gone from the host record seam and the roster — hidden from the session tooling — while
+        // the family that admits `agent:scout` is computed from the RETAINED row, so the default
+        // stays in this caller's lineage.
+        expect(writer.thread(borrowed.id)).toBeUndefined();
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            parent.id,
+            child.id,
+            sibling.id
+        ]);
         expect(writer.thread('agent:scout', child.id)?.id).toBe('agent:scout');
         expect(writer.threadMessages('agent:scout', child.id)).toEqual([]);
 
-        // THE MODEL FEELS BOTH DOORS. One run of `child`, three calls: the read that now LANDS,
-        // the send refusal for the same default (the send sentence is a different base, and it
-        // carries the same clause), and the send refusal for a sibling — which keeps the old text
-        // byte for byte, with no clause appended.
+        // THE MODEL FEELS THREE DOORS. One run of `child`, three calls: the read that LANDS, the
+        // send that now LANDS too (the retained row kept the default in the family), and the send
+        // refusal for a sibling — which keeps the old text byte for byte, with no clause appended.
         await writer.sendThreadInput(child.id, 'ask my family');
 
         const results = doorResults(writer, child.id);
@@ -2919,15 +3373,38 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
 
         expect({ thread: readPage.thread.id }).toEqual({ thread: 'agent:scout' });
         expect(results.slice(1)).toEqual([
-            `Tool "threadSend" failed: Thread "agent:scout" is not one thread "${child.id}" can address: ` +
-                "threadSend reaches your own thread, an ancestor, one of your descendants, or a default " +
-                'conversation (agent:<name>) your roster lists (see threadList). The id exists — it is simply ' +
-                'outside your lineage.' +
-                defaultClause,
+            // `started`, not `resumed`: the scout default was idle, and the message is its prompt.
+            `{"threadId":"agent:scout","delivered":"started","sender":"writer","senderThreadId":"${child.id}"}`,
             `Tool "threadSend" failed: Thread "${sibling.id}" is not one thread "${child.id}" can address: ` +
                 "threadSend reaches your own thread, an ancestor, one of your descendants, or a default " +
                 'conversation (agent:<name>) your roster lists (see threadList). The id exists — it is simply ' +
                 'outside your lineage.'
+        ]);
+
+        // THE SEND REALLY LANDED, AND THE TURNS ARE THE SCOUT'S OWN: the message reached the
+        // standing default conversation of the agent whose released row kept the address in this
+        // family, and it answered there. The attribution names the sender thread, which is what a
+        // runtime-derived identity looks like on this door.
+        await settleThread(writer, 'agent:scout');
+        expect(withoutIds(writer.threadMessages('agent:scout'))).toEqual([
+            {
+                role: 'user',
+                content: `from agent "writer" (thread ${child.id}):\nstill there?`
+            },
+            { role: 'assistant', content: 'scout answers' }
+        ]);
+
+        // THE CLAUSE, STILL BYTE FOR BYTE, FROM THE BRANCH THAT IS STILL REACHABLE. `sibling`'s
+        // family never spanned `scout`, so its send is refused with the base sentence plus the
+        // cause-and-remedy clause — the same text the pre-soft-delete case produced, which is the
+        // statement that the message contract survived the retention change.
+        await writer.sendThreadInput(sibling.id, 'ask the scout from outside?');
+        expect(doorResults(writer, sibling.id)).toEqual([
+            `Tool "threadSend" failed: Thread "agent:scout" is not one thread "${sibling.id}" can address: ` +
+                "threadSend reaches your own thread, an ancestor, one of your descendants, or a default " +
+                'conversation (agent:<name>) your roster lists (see threadList). The id exists — it is simply ' +
+                'outside your lineage.' +
+                defaultClause
         ]);
     });
 
@@ -3179,8 +3656,9 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
         expect(writer.deleteThread(parent.id)).toEqual({
             deleted: parent.id,
             removedThreadIds: [parent.id, child.id, borrowed.id],
-            // Nothing ran in this lineage, so the purge took no lookups — and the receipt says
-            // so with EMPTY arrays rather than omitting the fields (stress report #6).
+            // Nothing ran in this lineage, so the release took no lookups out of the listing —
+            // and the receipt says so with EMPTY arrays rather than omitting the fields (stress
+            // report #6).
             removedInvocationIds: [],
             removedBranchIds: []
         });
@@ -3244,9 +3722,9 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
         // makes a reaping loop auditable instead of a guess.
         await writer.sendThreadInput(parent.id, 'reap what is mine');
         expect(doorResults(writer, parent.id).map((content) => JSON.parse(content))).toEqual([
-            // The grandchild never ran a turn, so its release purges no lookup; the child DID
-            // (it ran 'reap what is not mine', invocation `1`), and the receipt names the id the
-            // caller would otherwise only find missing from `agentManage` afterwards.
+            // The grandchild never ran a turn, so its release leaves no lookup unlisted; the child
+            // DID (it ran 'reap what is not mine', invocation `1`), and the receipt names the id
+            // the caller would otherwise only find missing from `agentManage` afterwards.
             {
                 deleted: borrowed.id,
                 removedThreadIds: [borrowed.id],
@@ -3269,10 +3747,10 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
         ]);
     });
 
-    it('a running descendant still refuses the delete, and a released one is unknown afterwards (B5)', async () => {
+    it('a running descendant still refuses the delete, and a released one restates its receipt (B5)', async () => {
         const held = gatedAnswer('child at work');
 
-        const { writer, parent, child, borrowed } = lineage({
+        const { writer, parent, child, sibling, borrowed } = lineage({
             'start work': held.stream,
             // One door per HOST TURN (see `modelTurns`): the state under test changes
             // between turns, so all three calls must land in three separate runs of the
@@ -3320,14 +3798,45 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
             removedBranchIds: []
         });
 
-        // TURN 3: a SECOND delete of the same id is the canonical unknown-thread refusal.
-        // A released conversation is indistinguishable from one that never existed, which is
-        // what makes a reaping retry safe rather than destructive.
+        // TURN 3: A SECOND DELETE OF THE SAME id RESTATES the first receipt instead of refusing
+        // (IT19 R2). It used to be the canonical unknown-thread refusal — "a released conversation
+        // is indistinguishable from one that never existed, which is what makes a reaping retry
+        // safe". A soft delete keeps the row, so the retry is now safe because it is IDEMPOTENT:
+        // no second mark and no second `thread.deleted` hook.
+        //
+        // F-A Defect 3 (2026-11-15): THIS RECEIPT IS NOW BYTE-IDENTICAL TO TURN 2's. It used to
+        // carry three fields with three rules (`removedThreadIds` = newly marked, so `borrowed`
+        // was missing; `removedInvocationIds` = still hidden; `removedBranchIds` = newly
+        // unlisted), which made the two receipts a reaping loop compares disagree about the very
+        // fact the retry is reporting. The restated sets are the HIDDEN ones: `borrowed` is still
+        // marked inactive, so it is still in `removedThreadIds`, exactly as the first release
+        // named it. `removedBranchIds` stays the exception and stays empty — that ledger row
+        // really was dropped by the first release, and the entry text says so.
         await writer.sendThreadInput(parent.id, 'reap the worker again');
-        expect(doorResults(writer, parent.id)[2]).toBe(
-            `Tool "threadDelete" failed: Thread "${child.id}" is not available in this harness; it was never created, or it was deleted.`
-        );
+        expect(JSON.parse(doorResults(writer, parent.id)[2] ?? '{}')).toEqual({
+            deleted: child.id,
+            removedThreadIds: [child.id, borrowed.id],
+            removedInvocationIds: ['1'],
+            removedBranchIds: []
+        });
         expect(doorResults(writer, parent.id)).toHaveLength(3);
+
+        // The retry mutated nothing: both released rows are still marked, the untouched ones still
+        // are not, and every row is still in the document. Hidden from the roster, durable underneath.
+        expect(
+            (writer.snapshot().threads ?? []).map((row) => [row.id, row.inactive ?? false])
+        ).toEqual([
+            [parent.id, false],
+            [child.id, true],
+            [sibling.id, false],
+            [borrowed.id, true]
+        ]);
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            parent.id,
+            sibling.id
+        ]);
     });
 
     // ---------------------------------------------------------------------------
@@ -3948,27 +4457,67 @@ describe('the missing-thread refusal is one sentence, not three (issue 0034, F2)
         expect(writer.thread(missing)).toBeUndefined();
     });
 
-    it('refuses an id that stopped existing, and an id from another harness, with the same words', async () => {
+    it('refuses an id that stopped existing, and an id from another harness, with the same words at every door that refuses', async () => {
         const writer = quiet(brain(scripted([answer('unused')])));
         const other = quiet(brain(scripted([answer('unused')])));
         const deleted = writer.createThread('writer');
+        // Every harness mints its host ids from its own counter, so the FIRST thread of a second
+        // harness has the same id as the first thread of this one — `foreign.id` and `deleted.id`
+        // are the same string. `unknown.id` is the second thread of the other harness, an id this
+        // harness has never had.
         const foreign = other.createThread('writer');
+        const unknown = other.createThread('writer');
 
-        // "Never created", "deleted", and "created in a DIFFERENT harness" are three facts the
-        // caller can tell apart from its own history — and one record-shaped absence to the
-        // harness. The foreign id is the realistic one: a host restoring a session and passing
-        // an id from the generation before.
+        // Give the doomed conversation real work, so the door below that KEEPS answering has a
+        // transcript worth reading (IT19 R1 retention) rather than an empty array that would prove
+        // nothing about durability.
+        await writer.sendThreadInput(deleted.id, 'a turn');
+
+        // "Never created" and "created in a DIFFERENT harness" are facts the caller tells apart
+        // from its own history, and one record-shaped absence to the harness. The foreign id is the
+        // realistic one: a host restoring a session and passing an id from the generation before.
+        // A DELETED id is the third fact, and since IT19 R2 it is no longer shaped like the other
+        // two: the record is retained, so it is `inactive`, not missing.
         expect(() => other.threadMessages(foreign.id)).not.toThrow();
         writer.deleteThread(deleted.id);
         expect(writer.thread(deleted.id)).toBeUndefined();
 
-        expect(await refusal(() => writer.threadMessages(deleted.id))).toBe(missingThread(deleted.id));
-        expect(await refusal(() => writer.threadMessages(foreign.id))).toBe(missingThread(foreign.id));
-        expect(await refusal(() => writer.setThreadMessages(foreign.id, []))).toBe(missingThread(foreign.id));
+        // THE HOST DOOR STILL ANSWERS. `threadMessages` with no caller thread is the server's
+        // transcript reader, and the retained turns are the readability half of a soft delete —
+        // "deleted" no longer means "the bytes are gone".
+        expect(withoutIds(writer.threadMessages(deleted.id))).toEqual([
+            { role: 'user', content: 'a turn' },
+            { role: 'assistant', content: 'unused' }
+        ]);
+
+        // THE MODEL-FACING DOOR STILL REFUSES, with the same words it has always used: the tool
+        // resolves its address through the record seam, and a released conversation is not one a
+        // model can be handed. What the retained row changed is which doors still walk that path,
+        // not what the sentence says.
+        expect(await refusal(() => writer.executeTool('threadRead', { thread: deleted.id }))).toBe(
+            missingThread(deleted.id)
+        );
+
+        // THE COLLISION NOW RESOLVES. Because the released row keeps its id, an address that the
+        // other harness ALSO uses stops being "unknown here" and answers this harness's retained
+        // conversation — the durability promise seen from the other direction: an id a host hands
+        // back from the generation before is still the same conversation in this one. The answer is
+        // `writer`'s retained transcript, never the other harness's bytes: two harnesses have never
+        // shared a transcript, and retention does not change that.
+        expect(withoutIds(writer.threadMessages(foreign.id))).toEqual([
+            { role: 'user', content: 'a turn' },
+            { role: 'assistant', content: 'unused' }
+        ]);
+
+        // An id this harness has NEVER had is still refused, at both seams, in the canonical words.
+        expect(await refusal(() => writer.threadMessages(unknown.id))).toBe(missingThread(unknown.id));
+        expect(await refusal(() => writer.setThreadMessages(unknown.id, []))).toBe(missingThread(unknown.id));
 
         // The two sentences differ only in the id: no door adds a clause about WHY the id is
         // gone, which is what would make a grep for one case miss the other.
-        expect(missingThread(deleted.id).replace(deleted.id, 'X')).toBe(missingThread(foreign.id).replace(foreign.id, 'X'));
+        expect(missingThread(deleted.id).replace(deleted.id, 'X')).toBe(
+            missingThread(unknown.id).replace(unknown.id, 'X')
+        );
     });
 
     it('raises that sentence from the routed door too, where the message is the whole record', async () => {

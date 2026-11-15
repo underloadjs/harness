@@ -2795,7 +2795,7 @@ it('blocks removing an agent a conversation in the session runs, with the reason
     selectConfigured('summarizer');
     expect(memberToggle().disabled).toBe(true);
     expect(memberToggle().title).toBe(
-        'This agent is used by a conversation in this session; delete that conversation before removing the agent.'
+        'This agent is used by a conversation in this session; deleting that conversation does not release it, so removing the agent needs the session deleted.'
     );
     expect(byClass('.agent-dialog-inuse', 'p').textContent).toBe(
         'This agent is in use by a conversation and cannot be removed.'

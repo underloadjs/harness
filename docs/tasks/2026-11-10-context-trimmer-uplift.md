@@ -23,9 +23,8 @@ context pass and the stricter version of the same rule),
 [2026-11-09-context-inclusion-followups.md](./2026-11-09-context-inclusion-followups.md) (the
 `included` flag this plugin writes, and the missing UI marker),
 [2026-11-09-plugin-pipeline-v2.md](./2026-11-09-plugin-pipeline-v2.md) (hook ordering, settings
-writes, worker-lane commit). Related issue:
-[../issues/blocking-provider-request-body-extension.md](../issues/blocking-provider-request-body-extension.md)
-(issue 0001 — the transport cannot send a non-numeric request field, which is what blocks the
+writes, worker-lane commit). Related issue: issue 0001 (closed —
+the transport cannot send a non-numeric request field, which is what blocks the
 provider half of the thoughts switch; see F6).
 
 ---
@@ -318,8 +317,7 @@ Nothing in the shipped surface can tell a provider what to do with historical th
 `thinking: {type:'enabled'}`, `thinking.keep`, `clear_thinking`,
 `chat_template_kwargs: {preserve_thinking:true}` and `reasoning_effort: 'high'` are all dropped
 silently. There is no capability flag equivalent to OpenCode's
-`interleaved: {field: 'reasoning_content'}` either. Issue 0001
-([../issues/blocking-provider-request-body-extension.md](../issues/blocking-provider-request-body-extension.md))
+`interleaved: {field: 'reasoning_content'}` either. Issue 0001 (closed)
 owns the request-body extension point; issue 0001's own text says the only escape is a full
 custom `HarnessStream`.
 
@@ -902,7 +900,7 @@ not re-decide them:
   other spelling, `reasoning`" is **deferred to issue 0001's capability surface**: there is no
   per-model dialect flag, and dual-emitting a second non-standard field is precisely the
   unknown-field rejection the site's previous drop-everything posture guarded against
-  (`src/transport/openai.ts` ~318-331, `docs/issues/blocking-provider-request-body-extension.md`).
+  (`src/transport/openai.ts` ~318-331).
 - **T5 → T6 reassignment.** `minThoughtChars` enforcement, and the test proving a `minTokens > 0`
   never suppresses a thoughts write, landed with **T6** rather than T5: the floor has nothing to
   measure until the thinking axis exists, and T5's own gates run on the combined TOOL candidate

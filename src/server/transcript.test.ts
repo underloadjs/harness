@@ -1290,7 +1290,7 @@ describe('thread transcript read/write (C4)', () => {
         runtime.store.dispose();
     });
 
-    it('drops the unreadable record of a deleted thread from the durable document', async () => {
+    it('hides the unreadable record of a deleted thread from the projections and keeps it in the durable document', async () => {
         const { root, runtime, sessionId } = await seeded('delete-invalid');
 
         await callApi(runtime, 'PUT', transcriptPath(sessionId), { messages: 'broken' });
@@ -1299,14 +1299,51 @@ describe('thread transcript read/write (C4)', () => {
         const deleted = await callApi(runtime, 'DELETE', `/v1/harness/sessions/${sessionId}/threads/thread-1`);
         expect(deleted.status).toBe(200);
 
+        // R2 HIDES, it never erases: the read projections drop the card for a conversation the
+        // roster no longer names, so both snapshot fields are absent.
         const snapshot = runtime.store.get(sessionId);
         expect(snapshot.threads).toBeUndefined();
         expect(snapshot.invalidThreads).toBeUndefined();
 
-        // The file matches memory: no orphaned raw value for a vanished thread.
-        expect(storedSession(root, sessionId).invalidThreads).toBeUndefined();
+        // The DURABLE document keeps the entry verbatim (../sessions.ts:10696-10699): that raw
+        // value is the only copy of the operator's broken JSON, and the retained row is still
+        // repairable from it. Dropping it here is the silent data loss IT19 removes, so this is
+        // the assertion that replaces the old "no orphaned raw value for a vanished thread".
+        expect(storedSession(root, sessionId).invalidThreads).toEqual({
+            'thread-1': {
+                agent: 'one',
+                error: NOT_AN_ARRAY,
+                label: 'OE1',
+                messages: 'broken'
+            }
+        });
 
+        // A restart cannot undo the retention, and cannot un-hide it either: a fresh runtime loads
+        // the raw value, still names no card and no roster row, and the read route still serves
+        // the value verbatim for repair.
         runtime.store.dispose();
+
+        const second = runtimeOf(root, scriptedPreset('one').preset);
+        const secondSnapshot = second.store.get(sessionId);
+
+        expect(second.store.restoreErrors).toEqual([]);
+        expect(secondSnapshot.threads).toBeUndefined();
+        expect(secondSnapshot.invalidThreads).toBeUndefined();
+        expect(storedSession(root, sessionId).invalidThreads).toEqual({
+            'thread-1': {
+                agent: 'one',
+                error: NOT_AN_ARRAY,
+                label: 'OE1',
+                messages: 'broken'
+            }
+        });
+
+        const document = await readTranscriptDocument(callOf(second), sessionId, 'thread-1');
+
+        expect(document.transcript_state).toBe('unreadable');
+        expect(document.document).toBe('"broken"');
+
+        second.store.dispose();
     });
 });
 

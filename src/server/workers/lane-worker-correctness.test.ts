@@ -441,10 +441,14 @@ describe('worker mode: the lane worker bound and shutdown (T10 M8/M9)', () => {
 // and `agentResult` / `agentManage` went on answering for a conversation that had left the
 // roster. The lane now names the conversation it writes (./lane-worker-loop.ts
 // `deriveOperations`), and this is the end-to-end proof of the whole chain: the worker sends the
-// field, the authority stores the join, and deleting the conversation takes EVERY turn of it —
-// not just whatever the roster's single invocation slot happens to name.
-describe('worker mode: a deleted conversation purges its lane-archived results (stress report #6)', () => {
-    it('purges every lane turn of the conversation, exactly as the inline path does', async () => {
+// field, the authority stores the join.
+//
+// IT19 CHANGE (2026-11-15): the rule both modes share is now RETENTION, not purge. A thread
+// delete MARKS the conversation, so the archived rows of a lane conversation survive it EXACTLY
+// as they survive an inline one, and the join the whole chain exists for — `record.threadId` —
+// is what keeps those retained rows addressable.
+describe('worker mode: a deleted conversation keeps its lane-archived results (stress report #6)', () => {
+    it('retains every lane turn of the conversation, exactly as the inline path does', async () => {
         const store = storeOf();
         const session = await store.create('general');
 
@@ -467,10 +471,47 @@ describe('worker mode: a deleted conversation purges its lane-archived results (
 
         await store.deleteThread(session.id, threadId);
 
-        // The conversation is gone, and its results went WITH it: the registry the inline path
-        // would have produced after the same delete.
+        // The conversation left the roster, and its rows stayed where they were.
         expect(store.get(session.id).threads).toBeUndefined();
-        expect(archivedRecords(store, session.id)).toEqual([]);
+
+        // The scripted provider's answer embeds the live wall clock in the tool payload, so only
+        // that half is normalized; everything else below is asserted exactly.
+        const withoutClock = (records: ArchivedRow[]) =>
+            records.map((record) => ({
+                ...record,
+                content: record.content.replace(/\{"timezone":.*\}$/, '{"timezone":…}')
+            }));
+
+        // Mirrors the scripted provider's stream: one `answer<N>` token per streamed chunk, then
+        // the tool result.
+        const ANSWER = `${Array.from({ length: 24 }, (_, index) => `answer${index}`).join(' ')} the tool returned {"timezone":…}`;
+
+        // Retention keeps the join: both rows still name the deleted conversation, which is how
+        // `agentResult`/`agentManage` reach a resumed conversation's newest answer.
+        expect(withoutClock(archivedRecords(store, session.id))).toEqual([
+            {
+                invocationId: '513',
+                sequence: 513,
+                completedOrder: 1,
+                agent: 'general',
+                role: 'primary',
+                kind: 'root',
+                status: 'completed',
+                content: ANSWER,
+                threadId: 'thread-1'
+            },
+            {
+                invocationId: '514',
+                sequence: 514,
+                completedOrder: 2,
+                agent: 'general',
+                role: 'primary',
+                kind: 'root',
+                status: 'completed',
+                content: ANSWER,
+                threadId: 'thread-1'
+            }
+        ]);
     }, 300_000);
 });
 

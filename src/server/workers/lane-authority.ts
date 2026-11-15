@@ -1177,7 +1177,15 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         // so an omission here is the lane/inline divergence the stress report
                         // found — the same `threadDelete` released an inline conversation's
                         // results and left a lane conversation's behind.
-                        ...(mutation.threadId === undefined ? {} : { threadId: mutation.threadId })
+                        ...(mutation.threadId === undefined ? {} : { threadId: mutation.threadId }),
+                        // IT19 R4: the cause, forwarded verbatim like the pair above. Without this
+                        // line the lane's stop reason died at the authority: the op carried it, the
+                        // canonical VIEW carried it (./lane-commit.ts folds it into the record), but
+                        // the kernel's own ledger row — the one the NEXT snapshot projects — had no
+                        // key at all, so a lane conversation's `agentResult` lost its machine-readable
+                        // cause as soon as the session re-snapshotted. Same completed-drop as the
+                        // kernel's archive (`harness.archiveInvocation` validates and applies it).
+                        ...(mutation.stopReason === undefined ? {} : { stopReason: mutation.stopReason })
                     });
 
                     // The digest the lane compares against is `archiveDigestOf`, the projection

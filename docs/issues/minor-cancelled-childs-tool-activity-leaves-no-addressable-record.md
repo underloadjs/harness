@@ -30,9 +30,14 @@ Three consumers are each stopped by the same missing byte:
 - **The parent agent**, deciding whether to re-delegate, narrow the brief or fix the tools, has
   no signal that distinguishes "did fifty useful lookups" from "retried one doomed call fifty
   times". Both report the same envelope.
-- **A host or plugin** doing post-mortems on a stopped child cannot enumerate the calls it made:
-  `threadRead` on the child answers with the conversation from BEFORE the run, because the run's
-  own messages are spliced out.
+- **A host or plugin** doing post-mortems on a stopped child cannot enumerate the calls it made: the
+  ledger row has no tally, and (for a branch run) `threadRead` on the child answers with the
+  conversation from BEFORE the run because the run's own messages are spliced out. The transcript
+  half of that sentence is **retired for thread-bound runs** — corrected in place, see the 2026-11-16
+  update: a cut conversation run now keeps its committed messages and closes every dangling tool call
+  with one synthesized interrupted result (`src/harness.ts:12953-12977`), so only
+  `run.threadState === undefined` (branch/ephemeral, `:12953`) still splices. The **ledger** half is
+  untouched either way.
 - **An operator** budgeting a fleet of long-running children cannot see which tool a runaway
   child was hammering, so `maxTurns`/`timeoutMs` are set blind.
 
@@ -125,10 +130,16 @@ calls, so the field is a convenience rather than the only account.
 
 **Alternatives considered.**
 
-- *Retain the rolled-back messages on the child thread.* Rejected: it breaks (1) — a resumed
-  conversation would show calls with no results, the exact shape the persistence repair exists to
-  avoid — and it would make `threadRead` on a stopped child show work that the harness itself
-  declared never happened.
+- *Retain the rolled-back messages on the child thread.* **Marked 2026-11-16: this has since SHIPPED
+  for thread-bound runs** (IT19 R1, 2026-11-15 — `src/harness.ts:12955-12975` keeps the committed
+  tail and calls `repairInterruptedToolCalls`, `src/core/transcript-repair.ts:79`), and it did so
+  without the consequence the rejection predicted, because objection (1) was answered by the
+  synthesized interrupted result instead of by deletion. It stays rejected for branch runs, which
+  still splice (`:12953-12954`); and it does not close this entry, because retained prose and tool
+  blocks are not a bounded, addressable tally. The rejection as filed, kept verbatim below:
+  it breaks (1) — a resumed conversation would show calls with no results, the exact shape the
+  persistence repair exists to avoid — and it would make `threadRead` on a stopped child show work
+  that the harness itself declared never happened.
 - *Widen `partialContent` to hold the tool blocks.* Rejected: 0020's **AC3** forbids it, the
   field is text, and tool result bodies are the thing the leak boundary keeps out.
 - *Tell callers to read the server's event journal.* Rejected as the whole answer: it does not
@@ -147,9 +158,14 @@ calls, so the field is a convenience rather than the only account.
 3. The leak boundary holds: the field carries no tool RESULT body and no system-instruction text,
    and its values come from the run's own state at the capture point.
 4. `agentResult` for the same invocation reports the same value the `delegate` envelope reported.
-5. Nothing about the transcript changes: the splice stays, `threadRead` on a stopped child answers
-   with the pre-run conversation, a restored transcript needs no new repair, and the provider
-   pairing pins do not move.
+5. Nothing about the transcript changes **because of this field**: a branch run still splices to its
+   fork baseline, a thread-bound run still keeps its committed tail and is repaired in place
+   (`src/harness.ts:12953-12977`, `src/core/transcript-repair.ts:79`), `threadRead` on a stopped child
+   answers exactly as it does today, a restored transcript needs no new repair, and the provider
+   pairing pins do not move. *(Re-phased 2026-11-16: the original "the splice stays / answers with
+   the pre-run conversation" wording predates IT19 R1 and is now true of branch runs only — the
+   substance this criterion guards, that the tally field changes no transcript behaviour, is
+   unchanged.)*
 6. A run that registered no invocation (refused before it started) reports NO field rather than a
    zero-shaped one, so "did nothing" and "reported nothing" stay distinguishable — the same
    no-invented-identity rule as 0029.
@@ -184,8 +200,8 @@ calls, so the field is a convenience rather than the only account.
 
 This entry's premise — "the only thing that survives is the run's last committed ASSISTANT TEXT" —
 is unchanged, and so is the proposal. What moved is where that survivor lives: as of
-`docs/issues/significant-cancelled-childs-partial-content-is-lost-across-a-restart.md` (0033),
-`partialContent` and `cancelledAtMessage` are part of the PERSISTED agent-result row
+issue 0033, closed 2026-11-16, `partialContent` and `cancelledAtMessage` are
+part of the PERSISTED agent-result row
 (`src/types/index.ts:3368`, `:3374`; projection `src/harness.ts:12341-12344`; restore
 `:12691-12696`; reader `src/core/snapshot.ts:139-148`, `:251-273`). Three consequences for the work
 this entry proposes:
@@ -272,3 +288,89 @@ part of each citation and the bare line numbers are a snapshot.
 Status stays **Open**, severity **Minor**. Nothing was removed from the nine sections by this pass — the
 gap itself is untouched — because what changed is one sentence inside an earlier Update, contradicted by
 another entry's fix the same day.
+
+## Update (2026-11-15, IT19 R1) — the transcript half of this entry's premise is retired
+
+The Gap's central sentence ("`threadRead` on the child answers with the pre-run conversation") is
+no longer true of a CONVERSATION run. A cut run bound to a thread now keeps its committed tail
+(`src/harness.ts:12891`, the boundary argued at `:12862-12889`), and every tool call left without
+an answer is closed by one synthesized interrupted result (`:12900-12910`, wording at
+`src/core/transcript-repair.ts:79`) — the provider-pairing objection in **Why it is the way it
+is** is satisfied by that placeholder instead of by deletion. What this entry still asks for is
+therefore narrower and sits on the LEDGER side: the terminal RESULT ROW remains TEXT-only
+(`partialContent` never carries a call or a result — 0020's leak boundary), so a post-mortem that
+reads only the agent-result ledger still cannot say what a stopped child DID. Two cases keep the
+transcript-side interest alive: a forked BRANCH run still splices to its fork baseline, and a
+`threadRead` of a released (now `inactive`-marked) conversation is a host read, not an agent one.
+`grep -rn toolActivity src/` still returns nothing, so the gap stays open; the transcript-side half
+of the original complaint was closed by IT19 R1 (2026-11-15, issue 0036, closed).
+
+Status stays **Open**, severity **Minor**.
+
+## Update — 2026-11-16 (review pass) — re-verified, three body sentences corrected, and 0022 absorbed
+
+Read and grepped only; **no test was executed by this pass** (documentation-only). Package:
+`packages/underload/harness`, working tree as of today.
+
+- **The gap is confirmed live.** `grep -rn "toolActivity" src/` → **no matches**. The persisted
+  agent-result row still has no activity key: `src/core/snapshot.ts:160-198` validates an exact key
+  list whose may-be-absent group is `['error', 'partialContent', 'cancelledAtMessage', 'threadId',
+  'stopReason']` (`:198`) — no `calls`/`settled`/`byName` anywhere — and the model-facing envelope
+  (`HarnessDelegationResult`, `src/types/index.ts:1368-1434`) is text-only
+  (`content`/`partialContent`/`cancelledAtMessage`/`error`/`callCancelled`). AC1-AC7 are therefore all
+  still unmet, and the bounded tally in **Proposal** remains the only proposal for it.
+- **Three sentences this file still carried were contradicted by IT19 R1 and are corrected in place**
+  (the 2026-11-15 update above already half-said this; the body had not caught up):
+  1. *Gap* — "`threadRead` on the child answers with the conversation from BEFORE the run" is now true
+     of **branch/ephemeral runs only**. For a thread-bound run `src/harness.ts:12953-12977` keeps the
+     committed messages (`run.threadState !== undefined`, `:12955`) and closes every dangling call
+     with one synthesized result (`repairInterruptedToolCalls`, `:12966`; wording
+     `src/core/transcript-repair.ts:79`). The branch case is `run.threadState === undefined` →
+     `brain.messages.splice(commitIndex)` (`:12953-12954`).
+  2. *AC5* — "Nothing about the transcript changes: the splice stays" is re-phased to the two-case
+     rule above; what AC5 actually guards (this field changes no transcript behaviour) is unchanged.
+  3. *Alternatives* — "Retain the rolled-back messages on the child thread. Rejected: it breaks (1)"
+     is marked **shipped for thread-bound runs**, with the original rejection kept verbatim.
+- **0022 (`cancelledAtMessage` is a message count, not a progress signal) is absorbed here and its
+  file is deleted.** Its AC1 is now satisfied: `cancelledAtMessage` **does** scale with committed
+  rounds, pinned exactly at `src/harness.it19-retention.test.ts:528` —
+  `.toEqual({ total: 9, cancelledAtMessage: 8 })` inside the AC1.1 test at `:506`, over the
+  `stoppedChild` fixture whose comment states the child "committed all four rounds and is parked
+  inside `hang`" (a pin in the tree; not re-run by this pass). The only progress signal still missing
+  is what happened **inside an uncommitted model request** — which is precisely this entry's `calls`
+  vs `settled` tally, so 0022's residual concern lives here now and nowhere else.
+- **0022's test debt is inherited here.** There is still no pin tying the model-facing forensic
+  wording to the emitted keys: `src/core/metadata.ownership.test.ts` has **zero**
+  `partialContent`/`cancelledAtMessage`/`stopReason` assertions (grep → 0 matches), and the closest
+  thing in the tree is `src/harness.metadata.test.ts:710`, a bare
+  `expect(team.tools.delegate.description).toContain('partialContent')`. Whoever ships `toolActivity`
+  ships into that same hole: the description says "its tool calls and tool results are rolled back and
+  never retained" (`src/tools/runtime/delegate.tool.ts:138`, `:252`) with nothing asserting that
+  sentence matches the keys the envelope actually emits.
+- **One neighbouring asymmetry the tally must not inherit:** the `delegate` unfinished envelope
+  (`unfinishedDelegateEnvelopeOf`, `src/harness.ts:4563-4600`) carries **no** `stopReason`, while the
+  `agentResult` door projects it (`:4451-4453`). A new forensic field has to be placed deliberately
+  on one side of that split or fixed on both, or it joins the drift instead of the contract.
+- **The use cases that keep this gap live, re-checked:** (a) the ledger side is text-only, so a
+  post-mortem that reads only agent results still cannot say what a stopped child DID; (b) branch
+  (`threadFork`) runs still splice, so a cancelled fork leaves no activity trace in either place;
+  (c) after `threadDelete` an agent-facing `threadRead` refuses the released transcript — IT19 AC6.2,
+  pinned at `src/harness.it19-retention.test.ts:1207` ("an agent-facing `threadRead` refuses the
+  released transcript while a host read still resolves it") — which leaves the ledger as the only
+  remaining account exactly when the caller most wants one.
+- **Line numbers relocated by this pass** (identifiers are the durable part of each cite; the
+  addresses in the 2026-11-14 tables above are stale at these seven points):
+
+  | Statement | Was | Is now |
+  |---|---|---|
+  | the forensics capture block | `src/harness.ts:11995-12011` | `:12903-12913` — comment `:12903-12907`, `run.messagesProduced` at `:12908`, the in-flight-buffer precedence block after it |
+  | `AgentInvocationRecord` and its forensic fields | `src/harness.ts:3764` | type declared `:3933`, `partialContent`/`cancelledAtMessage` at `:3958-3959`, `stopReason` at `:3990`, type closes `:3991` |
+  | the durable row's key list and may-be-absent group | `src/core/snapshot.ts:139-140`, `:159` | `:160-198`, optional group at `:198` (now five keys: `error`, `partialContent`, `cancelledAtMessage`, `threadId`, `stopReason`) |
+  | the server-side interrupted text | `src/server/persistence.ts:1655-1675` | `INTERRUPTED_TOOL_RESULT_TEXT` at `src/server/persistence.ts:1674` |
+  | the server-side repair | `repairAgentMessages` `:1679` | `repairInterruptedToolCalls` exported at `src/server/persistence.ts:1752`; the in-run sibling is `src/core/transcript-repair.ts:181` with its wording at `:79` |
+  | the roadmap entry | `knowledge.md:5833` (heading), item 9 `:5901-5912` | the "Not built yet" heading is `knowledge.md:6291` and this issue is named at `:6373` ("now a ledger-side concern, not a transcript-side one"); the loop-section citation is `:1815` |
+  | the model-facing envelope | `src/types/index.ts:1401-1434` | `HarnessDelegationResult` is `:1368-1434`; `partialContent` `:1418`, `cancelledAtMessage` `:1421` |
+
+Status stays **Open**, severity **Minor**. Nothing was removed from the nine sections: the two
+transcript-side corrections and the 0022 absorption all narrow what is left to build (the bounded
+tally on the ledger side), they do not close it.

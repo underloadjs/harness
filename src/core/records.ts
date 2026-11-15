@@ -1459,15 +1459,20 @@ type Plan = {
 // WHY THE DECLARATION LIVES HERE AND NOT IN ../types
 // -------------------------------------------------
 // `RecordsResult`, `RecordStoreView` and `RecordStoreDelta` are published from
-// ../types/index.ts, which a concurrent pass owns right now (its own issue edits that
-// file), so this pass widens the engine's OWN view of its result instead of editing
-// under the other worker. The widening is additive and optional-only, so every existing
-// consumer that types the result as `RecordsResult` keeps compiling — a wider object is
-// still assignable to it, and `Harness.recordsChanges`/`Harness.records` (../types)
-// simply do not expose the new key yet. Follow-up for the types owner: declare
-// `addedIds?`, `changedIds?` and `oldestAvailableRev?` on `RecordsResult`,
-// `oldestAvailableRev?` on `RecordStoreDelta`/`RecordStoreView`, and `addedIds?` /
-// `changedIds?` on `TaskResult` (which already declares `removedIds?`).
+// ../types/index.ts, which a concurrent pass owned when this type was written (its own
+// issue edits that file), so this pass widened the engine's OWN view of its result
+// instead of editing under the other worker. The widening is additive and optional-only,
+// so every existing consumer that types the result as `RecordsResult` keeps compiling —
+// a wider object is still assignable to it.
+//
+// THE TYPES FOLLOW-UP IS DONE: the published types declare the keys themselves, so the
+// harness doors expose them — `RecordsResult.addedIds?` / `changedIds?` (:2009-2010) and
+// `RecordsResult.oldestAvailableRev?` (:2016), `RecordStoreView.oldestAvailableRev?`
+// (:1938) and `RecordStoreDelta.oldestAvailableRev?` (:1955), which is what
+// `Harness.records` (:4364) and `Harness.recordsChanges` (:4365) return; `TaskResult`
+// (:2190) inherits all three through
+// `Omit<RecordsResult, 'entries' | 'counts' | 'removed'>`. Line numbers are snapshots of a
+// dirty worktree — re-derive them by grepping the key names in ../types/index.ts.
 // ---------------------------------------------------------------------------
 export type RecordsResultAdditions = {
     // 0008 — the ids a batch MINTED, in mint order, when it minted more than one.

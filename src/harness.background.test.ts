@@ -25,14 +25,17 @@
 //       removes the wake entirely. Because the plugin arms from the `async.pending`
 //       hook, EVERY schedule site has to emit it — an ordinary async tool call, a
 //       `threadFork` branch and an `actionRequest` owner answer — or that board loses
-//       the heartbeat the old board-wide timer used to give it. Whole-run cancel rolls
-//       back every actor, aborts children, and leaves the harness reusable. The
-//       rollback erases the cancelled turn, and issue 0019 adds the other half: a
-//       delegated call that the rollback released without ever delivering is reprinted
-//       ONCE as a labelled account on the conversation's next turn (see the
-//       whole-run-cancel test for the exact entry).
+//       the heartbeat the old board-wide timer used to give it. Whole-run cancel aborts
+//       children, clears timers, and leaves the harness reusable. Since issue 0036 R1 the
+//       cancelled run's committed turns are RETAINED (each unanswered call answered by one
+//       synthesized interrupted marker) instead of erased, and issue 0019 adds the other
+//       half: a delegated call that the abandoned scope released without ever delivering is
+//       accounted for ONCE — and because issue 0036 R1 keeps that call's slot, the
+//       interrupted placeholder answering it is UPGRADED in place into the child's account
+//       rather than reprinted on a second channel (see the whole-run-cancel test for the
+//       exact entry).
 //       A thrown/rejected tool is recoverable data; `maxIterations` still bounds a
-//       run and its pending state is cleaned up on the rollback path.
+//       run and its pending state is cleaned up when the bound fires.
 //
 // Clock policy: fake timers own the clock in every test. Tool promises are settled
 // explicitly, so each `durationMs`/`elapsedMs` below is an exact number rather than
@@ -2423,7 +2426,7 @@ describe('toolCancel', () => {
 // ---------------------------------------------------------------------------
 
 describe('whole-run cancel', () => {
-    it('rolls back every actor, aborts the child, clears timers, and leaves the harness reusable', async () => {
+    it('keeps every actor\'s committed turns, aborts the child, clears timers, and leaves the harness reusable', async () => {
         const controller = new AbortController();
         const parentLog: string[] = [];
         const childLog: string[] = [];
@@ -2485,9 +2488,58 @@ describe('whole-run cancel', () => {
         expect(childWork.observedSignal()?.aborted).toBe(true);
         expect(vi.getTimerCount()).toBe(0);
 
-        // Both histories rolled back to before the cancelled call.
-        expect(writer.agent.messages).toEqual([]);
-        expect(writer.agents.researcher.messages).toEqual([]);
+        // Issue 0036 R1: neither history is spliced back. The PARENT keeps the prompt,
+        // both tool-call turns it committed and one synthesized answer per call that never
+        // delivered (neither the delegated child nor the local `work` tool ever reported),
+        // and the answer turn it reached before the terminal landed. Re-captured from an
+        // actual run, asserted structurally with the interrupted marker matched by
+        // substring only. The researcher's retained tail is pinned next.
+        expect(writer.agent.messages).toMatchObject([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    { id: 'd1', name: 'delegate', arguments: '{"agent":"researcher","input":"dig"}' }
+                ]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'd1',
+                name: 'delegate',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'w1', name: 'work', arguments: '{"value":"parent"}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'w1',
+                name: 'work',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            { role: 'assistant', content: 'parent-waiting' }
+        ]);
+        // The researcher keeps its own cut-off exchange: the delegated prompt, the turn
+        // that asked for `g1` (its `dig` tool was aborted mid-flight and never delivered),
+        // ONE synthesized answer for that call, and the answer its late provider committed.
+        expect(writer.agents.researcher.messages).toMatchObject([
+            { role: 'user', content: 'dig' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'g1', name: 'dig', arguments: '{"value":"deep"}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'g1',
+                name: 'dig',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            { role: 'assistant', content: 'child-waiting' }
+        ]);
 
         // Reusable afterwards: the same harness answers a fresh call.
         const next = probe(writer('again'));
@@ -2495,28 +2547,48 @@ describe('whole-run cancel', () => {
 
         expect(next.status).toBe('resolved');
         expect(next.value?.content).toBe('recovered');
-        // Issue 0019 (2026-11-14) changed this shape, and the change is the point. The delegate
-        // call `d1` was released by `scheduler.abandonScope` when the cancel rolled the run back,
-        // and `abandonScope` NEVER notifies (`src/core/scheduler.ts:300-311`) — so `deliverTask`
-        // never ran and the child's answer died on the board while the caller was left with a
-        // call that never answered. The rollback still erases the cancelled TURN (the two empty
-        // transcripts asserted above), but the conversation's next turn now opens with exactly
-        // ONE labelled account of that child, before the model's reply, because the child had
-        // produced text worth reporting (`child-waiting`) and that partial exists nowhere else in
-        // this transcript. The cancelled call's slot is gone with the rolled-back turn, so the
-        // account cannot be an orphan tool result — it rides the system channel, names the
-        // invocation and conversation it describes, and carries the same envelope `agentResult`
-        // answers with for that id. Fake timers own the clock in this file, so `durationMs` is
-        // exact and the whole entry is pinned rather than approximated.
+        // Issue 0019's account, in its retention form — and the change is the point. The
+        // delegate call `d1` was released by `scheduler.abandonScope` when the cancel ended
+        // the run, and `abandonScope` NEVER notifies (`src/core/scheduler.ts:300-311`), so
+        // `deliverTask` never ran and the child's answer died on the board while the caller
+        // was left with a call that never answered. Issue 0036 R1 keeps that call's SLOT
+        // (the retained assistant turn still names `d1`, and the repair left an interrupted
+        // placeholder answering it), so when the owed account is finally paid it UPGRADES
+        // THE PLACEHOLDER IN PLACE: same call id, same position, one entry, no system-channel
+        // reprint beside it and no second contradictory account. That is what this pins —
+        // exactly ONE account of the child, and it is the slot's own tool result, carrying
+        // the same envelope `agentResult` answers with for that id. Fake timers own the clock
+        // in this file, so `durationMs` is exact and the whole entry is pinned. The `w1`
+        // row keeps its synthesized marker (nothing was ever owed for it), matched by
+        // substring so the wording stays re-wordable.
         expect(shape(writer.agent.messages)).toEqual([
-            'user:again',
-            'system:A delegated run (invocation "2" in conversation "agent:researcher") finished after its parent turn ended, ' +
-                'so its result could not be attached to the original call. This is the account that run produced, reported once here: ' +
+            'user:go',
+            'assistant::d1',
+            'tool:d1:' +
                 '{"agent":"researcher","content":"child-waiting","contentLength":13,"offset":0,"limit":8000,"truncated":false,' +
                 '"invocationId":"2","threadId":"agent:researcher","status":"cancelled","durationMs":0,"error":"run aborted",' +
                 '"partialContent":"child-waiting","cancelledAtMessage":3}',
+            'assistant::w1',
+            expect.stringMatching(/^tool:w1:.*cancelled or interrupted/),
+            'assistant:parent-waiting:',
+            'user:again',
             'assistant:recovered:'
         ]);
+        // The account really is the call's own answer: one row for `d1`, and it is no
+        // longer the interrupted placeholder.
+        expect(
+            writer.agent.messages.flatMap((message) =>
+                message.role === 'tool' && message.toolCallId === 'd1' ? [message.content] : []
+            )
+        ).toHaveLength(1);
+        expect(
+            writer.agent.messages.flatMap((message) =>
+                message.role === 'tool' && message.toolCallId === 'd1' &&
+                String(message.content).includes('cancelled or interrupted')
+                    ? [1]
+                    : []
+            )
+        ).toEqual([]);
         expect(vi.getTimerCount()).toBe(0);
     });
 });
@@ -2600,7 +2672,7 @@ describe('failure paths', () => {
         expect(vi.getTimerCount()).toBe(0);
     });
 
-    it('rolls back and abandons pending work when maxIterations is exhausted', async () => {
+    it('keeps the committed turns and abandons pending work when maxIterations is exhausted', async () => {
         const firstGate = deferred<string>();
         const secondGate = deferred<string>();
         const seen: SeenRequest[] = [];
@@ -2642,10 +2714,37 @@ describe('failure paths', () => {
             'Agent "writer" requested tools on all 2 model turns without answering.'
         );
 
-        // R5: the rollback path abandons the pending calls — no timer, no result,
-        // and no transcript to mutate when they finally settle.
+        // R5 + issue 0036 R1: exhausting the bound still ABANDONS the pending calls (no
+        // timer left armed, no result ever delivered), but it no longer erases the record:
+        // the run keeps the prompt and both committed tool rounds, and each call that never
+        // settled is answered by ONE synthesized interrupted marker so the retained tail
+        // stays pairable. Re-captured from an actual run; marker matched by substring only.
         expect(vi.getTimerCount()).toBe(0);
-        expect(writer.agent.messages).toEqual([]);
+        expect(writer.agent.messages).toMatchObject([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'p1', name: 'first', arguments: '{"value":"1"}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'p1',
+                name: 'first',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'p2', name: 'second', arguments: '{"value":"2"}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'p2',
+                name: 'second',
+                content: expect.stringContaining('cancelled or interrupted')
+            }
+        ]);
         const beforeLateSettle = copyMessages(writer.agent.messages);
         const resultsBefore = events.filter((event) => event.type === 'tool_result').length;
 
@@ -2653,6 +2752,8 @@ describe('failure paths', () => {
         secondGate.resolve('late-second');
         await flush();
 
+        // The abandoned calls settling late still change NOTHING: no late result is
+        // inserted into the retained transcript, and no result event fires.
         expect(writer.agent.messages).toEqual(beforeLateSettle);
         expect(events.filter((event) => event.type === 'tool_result')).toHaveLength(resultsBefore);
         expect(vi.getTimerCount()).toBe(0);

@@ -1114,6 +1114,19 @@ export const deriveOperations = (lane: LaneWorkerState, replica: ReplicaReadView
             // extra travels on the ordinary path.
             ...(record.partialContent === undefined ? {} : { partialContent: record.partialContent }),
             ...(record.cancelledAtMessage === undefined ? {} : { cancelledAtMessage: record.cancelledAtMessage }),
+            // IT19 R4: WHY the run stopped, on identical terms to the pair above. The replica holds
+            // the cause (its own `classifyRunStopReason` stamped it, and the snapshot projection
+            // writes it at src/harness.ts the `agentResults` map) and the archive input accepts it
+            // (../types `HarnessInvocationArchiveInput.stopReason`), but this payload named neither
+            // the field nor its absence — so a lane-archived cancellation reached the canonical
+            // ledger as a sentence in `error` only, which is the string-matching R4 exists to end.
+            //
+            // Kept OUT of `archiveDigestOf` on purpose (./lane-commit.ts:246-279 documents why): the
+            // skip test below and the receipt digest on the authority side are both taken over that
+            // projection, so a half-change here (payload without the digest, or digest without the
+            // payload) desynchronizes the two and every stop row re-archives on every boundary
+            // forever. Spread only when present, exactly like `error` and the pair.
+            ...(record.stopReason === undefined ? {} : { stopReason: record.stopReason }),
             // Stress report #6 (2026-11-14): the conversation this result belongs to. The
             // canonical record's `threadId` is what `purgeThread` matches when a conversation
             // is DELETED, and the lane states it from the one fact it knows: this replica runs

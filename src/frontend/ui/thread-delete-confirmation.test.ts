@@ -372,7 +372,7 @@ describe('mobile thread Delete', () => {
         expect(panel.getAttribute('aria-modal')).toBe('true');
         expect(dialogTitle(panel)).toBe('Delete thread');
         expect(dialogWarning(panel)).toBe(
-            'Delete thread RR1 permanently? Its turns and transcript are removed.'
+            'Delete thread RR1? It leaves this session, and its transcript is kept until the session itself is deleted.'
         );
         expect(dialogActions(panel)).toEqual(['Delete thread', 'Cancel']);
         expect(
@@ -489,7 +489,7 @@ describe('mobile thread Delete', () => {
 
         deleteOf(first).click();
         expect(dialogWarning(deleteDialog())).toBe(
-            'Delete thread RR1 permanently? Its turns and transcript are removed.'
+            'Delete thread RR1? It leaves this session, and its transcript is kept until the session itself is deleted.'
         );
 
         // The second conversation replaces the confirmation instead of stacking an
@@ -499,7 +499,7 @@ describe('mobile thread Delete', () => {
         expect(deleteDialogs()).toHaveLength(1);
         expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(1);
         expect(dialogWarning(deleteDialog())).toBe(
-            'Delete thread RR2 permanently? Its turns and transcript are removed.'
+            'Delete thread RR2? It leaves this session, and its transcript is kept until the session itself is deleted.'
         );
 
         actionButton(deleteDialog(), '.thread-delete-confirm-delete').click();

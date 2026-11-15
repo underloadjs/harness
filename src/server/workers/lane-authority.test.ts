@@ -519,7 +519,11 @@ describe('commit: a lane terminal invocation is central', () => {
     // same delete inline removed all of them. The op now carries the conversation, and these
     // two cases pin both halves: what the field buys, and that an omitted field is still the
     // documented weaker behaviour rather than a guess.
-    it('archives the owning conversation, so deleting it purges the lane result (F6 parity with inline)', () => {
+    //
+    // IT19 CHANGE (2026-11-15): the release no longer destroys rows, so what these two cases
+    // now pin is the UNLISTING half of the receipt — the join decides which ids stop being
+    // reported with the conversation — plus the fact that both rows survive the delete.
+    it('archives the owning conversation, so deleting it unlists the lane result (F6 parity with inline)', () => {
         const core = coreOf();
         const authority = authorityFor(core);
         const thread = core.createThread('primary');
@@ -547,17 +551,34 @@ describe('commit: a lane terminal invocation is central', () => {
         expect(outcome.complete).toBe(true);
         expect((core.snapshot().agentResults ?? []).map((record) => record.invocationId)).toEqual(['513']);
 
-        // The receipt states the purge, exactly as it does for an inline conversation.
+        // The receipt states what stopped being LISTED with the conversation, exactly as it does
+        // for an inline conversation. IT19 R2: that is not "destroyed" — see the row below.
         expect(core.deleteThread(thread.id)).toEqual({
             deleted: thread.id,
             removedThreadIds: [thread.id],
             removedInvocationIds: ['513'],
             removedBranchIds: []
         });
-        expect(core.snapshot().agentResults ?? []).toEqual([]);
+
+        // The lane-archived row SURVIVES its conversation's release with the join intact, which is
+        // what lets `agentResult('513')` answer for a resumed conversation. The order values are
+        // the authority's, not the lane's (`completedOrder: 999` on the op became 1).
+        expect(core.snapshot().agentResults ?? []).toEqual([
+            {
+                invocationId: '513',
+                sequence: 7,
+                completedOrder: 1,
+                agent: 'primary',
+                role: 'primary',
+                kind: 'root',
+                status: 'completed',
+                content: 'the lane answered',
+                threadId: 'thread-1'
+            }
+        ]);
     });
 
-    it('without the conversation on the op the result survives the delete (the retired weaker lane rule)', () => {
+    it('without the conversation on the op the delete reports nothing unlisted (the retired weaker lane rule)', () => {
         const core = coreOf();
         const authority = authorityFor(core);
         const thread = core.createThread('primary');

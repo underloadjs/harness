@@ -832,9 +832,15 @@ const createMembershipActions = (
         : isPrimary
           ? 'The primary agent is always part of the team.'
           : blockedByThread
-            ? // The action the reader has to take lives outside this dialog (delete the
-              // conversation), so the reason names it instead of just refusing.
-              'This agent is used by a conversation in this session; delete that conversation before removing the agent.'
+            ? // The action the reader has to take lives outside this dialog, and it is NOT
+              // "delete the conversation": a delete is only a MARK (server
+              // `SessionStore.deleteThread`, src/server/sessions.ts:10389 — the row keeps its
+              // full transcript and gains `inactive`/`inactiveAt`), so the conversation can
+              // never be un-owned that way. The reason names the one action that does release
+              // it — deleting the session, which is what the server's own refusal says
+              // ("A deleted thread is retained, so removing this agent needs the session
+              // deleted.", src/server/sessions.ts:6380).
+              'This agent is used by a conversation in this session; deleting that conversation does not release it, so removing the agent needs the session deleted.'
             : isMember
               ? `Take ${label} off the team when you save.`
               : `Cancel the add, so ${label} never joins this team.`;

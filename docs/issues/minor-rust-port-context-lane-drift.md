@@ -32,15 +32,28 @@ What a reader of the Rust crate cannot today do:
 
 - **raise a lane.** Every other half of the feature is ported (the second-pass update below
   records what landed and where), but a summarize compaction still cannot bump its conversation's
-  lane in the port, because no plugin hook executes there. A Rust session can only ever paint the
-  one row its durable `core.threads[].contextLane` already carries; it can never move to the next
-  one.
+  lane in the port. The cause is **no longer "no plugin hook executes there"** (corrected in place
+  by the 2026-11-16 review pass): the plugin host **is** ported (`src/plugin/host.rs` —
+  `on`/`on_sync`/`on_async` at `:272`/`:310`/`:320`, `run` at `:491`; the bus is
+  `src/plugin/hooks.rs` `HookBus`). It is **unintegrated**: the only `impl PluginRuntime` in the
+  crate is `NullRuntime` (`src/plugin/context.rs:391`), whose `set_context_lane` is a no-op
+  (`:404`); `set_context_lane` itself (declared `:337-340`) has **zero callers**, and no
+  `context-compaction` policy module exists to register on the host. A Rust session can only ever
+  paint the one row its durable `core.threads[].contextLane` already carries; it can never move to
+  the next one.
 
 ## Why it is the way it is
 
 The port is staged (`packages/typecrate/harness/knowledge.md:7-66`, "Stage map"). This field
-postdates every stage that has shipped: T1-T7b, T9 and T10 are done, and the still-unported work
-is the module host, the worker backends and the plugin host (`:61-66`). When this was filed the
+postdates every stage that has shipped: T1-T7b, T9 and T10 are done. The stage map's list of what
+is left — "the module host, the worker backends and the plugin host" (`knowledge.md:61-66`) — is
+**stale on its third item as of this file's 2026-11-16 review pass**, which corrects that premise
+here rather than relying on it: the plugin host has landed (`src/plugin/host.rs`,
+`src/plugin/hooks.rs`), so the unported work is the module host and the worker backends, plus the
+**integration** of the host that does exist. The crate's own prose still says the opposite in two
+places (`knowledge.md:63-66` "The plugin HOST is the third unported half … no hook executes" and
+`:1774` "There is no plugin host in this crate"), and the lane follow-up at `:1994-1997` repeats
+it; all three sentences need the same correction the update below records. When this was filed the
 crate had no lane anywhere. Nothing in the port decides independently what a lane means: the
 TypeScript side is the source of truth, and the swagger spec is the source of truth for the
 contract. So the drift was expected and bounded — a pending resync, not a design disagreement —
@@ -87,7 +100,8 @@ earlier updates still resolve:
    instruction commit (`src/plugins/context-compaction.plugin.ts:1203`, inside `beginSummarize`)
    and revert on every abandon path (`:1225`, `:1248`, `:1329`, `:1578`, `:1628`), and it has to
    write through the same per-conversation accessor the port's recorder already reads
-   (`packages/typecrate/harness/src/store/mod.rs:1677` `context_lane_of`), so live and replay keep
+   (`packages/typecrate/harness/src/store/mod.rs:1678` `context_lane_of`, re-anchored from `:1677`
+   by the 2026-11-16 pass), so live and replay keep
    exactly one source for the number.
 
 Alternatives considered: port only the contract field (rejected — a decoder that accepts
@@ -288,3 +302,59 @@ vendored at `packages/typecrate/harness/tests/fixtures/lane-compaction/`.
   RAISE a lane — it can now carry, stamp, persist, fold and publish one. Status stays **Open** for
   that reason. No lane REST route appeared, and `SessionTurn.lane` / `contextLane` are still not
   published by the Rust API.
+
+## Update — 2026-11-16 (review pass)
+
+Review pass over the surviving issue set. **Read from source (symbol reads and greps only) — `cargo`
+was NOT run** this pass, because a cold rebuild of this crate costs more than the check is worth for
+a documentation pass; every Rust claim below is therefore symbol/grep evidence, and the "414 passed,
+16 failed" figure two sections up remains the last executed state of this crate.
+
+- **The gap is confirmed still live.** Nothing in the Rust port can raise a lane:
+  `grep -rnE "lane.*(\+ 1|saturating_add)" src tests` in `packages/typecrate/harness` → **0 hits**,
+  and `grep -rn set_context_lane src tests` returns only the trait declaration
+  (`src/plugin/context.rs:340`) and the no-op impl (`:404`) — **no caller anywhere**. Proposal step 5
+  is therefore still the only open step, and acceptance criterion 1 (a compaction raises its
+  conversation's lane once, at the instruction commit) is still unmet.
+- **Correction to the cause, applied in place above: the plugin host is no longer unported.**
+  `packages/typecrate/harness/src/plugin/host.rs` is the host (`on` `:272`, `on_sync` `:310`,
+  `on_async` `:320`, `run` `:491`) and `src/plugin/hooks.rs` is the bus (`HookBus`, its dispatch
+  rules documented at `:28-38`). So the sentence this file carried since 2026-11-10 — "no plugin
+  hook executes there" — names a condition that has partly closed: hooks **can** execute; nothing
+  registers one that would raise a lane.
+- **What is actually missing is the integration, in three named pieces:**
+  1. **a store-backed `impl PluginRuntime`.** The trait declares `set_context_lane`
+     (`src/plugin/context.rs:337-340`), and the only implementor in the crate is `NullRuntime`
+     (`:391`), whose `set_context_lane` discards both arguments (`:404`). Until a runtime backed by
+     the store exists, a plugin that *did* fire would bump nothing.
+  2. **a `context-compaction` policy module registered on `PluginHost`.**
+     `src/plugin/mod.rs:52` declares exactly one policy module, `async_ping`; the line right below
+     it (`:53-54`) says the context policies "are declared here once their modules compile
+     (`context_trimmer`, `context_compaction`)" — neither module exists. The module header is worse
+     than missing: `src/plugin/mod.rs:20` advertises "the shipped policies - async-ping,
+     context-trimmer, context-compaction" as if all three were ported, so a reader of the header
+     alone over-states the port. Fix the header with the modules, not after them.
+  3. **bump at the instruction commit + revert on abandon**, mirroring
+     `src/plugins/context-compaction.plugin.ts` (`bumpLane` `:1062-1083`, the commit call `:1203`,
+     `revertLaneBump` `:1091-1113` and the abandon paths `:1225`, `:1248`, `:1329`, `:1578`,
+     `:1628`). It must write through `context_lane_of` (`src/store/mod.rs:1678`), which is already
+     the single read source for BOTH the live recorder and replay
+     (`src/store/actions.rs:1096-1111`; replay re-applies each event's own stamp at
+     `src/store/mod.rs:541-543`), so the remedy adds a writer to one reader rather than minting a
+     second authority.
+- **Cite correction: the crate-knowledge passage this file leans on has moved and its premise is
+  now false.** This file's 2026-11-11 update cites "`knowledge.md:60` — 'NO plugin hook executes' —
+  and `:61-66`, 'The plugin HOST is the third unported half … no hook executes'". Read today, that
+  text is at `packages/typecrate/harness/knowledge.md:59-66` ("NO plugin hook executes", `:59-60`;
+  "The plugin HOST is the third unported half: T10 shipped the catalogue, the settings contract and
+  the durability, and no hook executes", `:64-66`) — i.e. it shifted by roughly three lines rather
+  than out of the file, and the same claim is repeated twice more: `:1774` ("**No hook executes
+  here.** There is no plugin host in this crate") and the lane follow-up at `:1994-1997`
+  ("Proposal step 5, blocked not skipped … no plugin hook executes in this build (T10, 'NO plugin
+  hook executes')"). All three are now contradicted by `src/plugin/host.rs`; the conclusion they
+  support (step 5 is blocked) survives, the reason given does not. A crate-knowledge pass should
+  rewrite all three to "the host is ported and unintegrated — `NullRuntime` is the only runtime, and
+  no context policy module is registered".
+- **Status stays Open**, and the "Tests to add" list is unchanged: the four TypeScript lane cases
+  still have no Rust mirror, and `tests/context_lane.rs` (11 tests) still covers carry/stamp/fold/
+  publish only, never a bump.

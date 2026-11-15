@@ -415,6 +415,22 @@ import { isErrorOutcome, storedOutcomeEntry } from './core/tool-outcome';
 // is what reads `partialContent`/`cancelledAtMessage` back off disk, and an archive that accepted
 // a looser value would mint a live record the next snapshot cannot persist and reload.
 import { readSnapshotInteger, readSnapshotString } from './core/snapshot-validation';
+// The run-stop vocabulary (IT19 R3): the SAME table `core/snapshot.ts` enforces when it READS
+// `stopReason` off disk (:101-115) is reused at the live archive seam, so an accepted value can
+// never mint a row the next snapshot refuses. core/snapshot.ts:96-98 states this rule explicitly:
+// every other validating boundary imports the table instead of re-spelling the nine members.
+import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from './core/snapshot';
+// IT19 R1 — the RETENTION repair. A run that ends without concluding now keeps its committed
+// turns, so the tail can end on an assistant turn whose tool calls were never answered; this is
+// the pass that makes such a tail pairable again, plus the marker naming a synthesized result so
+// the owed-account door can tell a placeholder from a real account. The in-run sibling of
+// `server/persistence.ts`'s crash repair, with deliberately different wording (that one is
+// byte-pinned by restart tests and only ever names a crash; this one names cancellation too).
+import {
+    isInterruptedToolResult,
+    repairInterruptedToolCalls,
+    SYNTHESIZED_INTERRUPTED_TOOL_RESULT_TEXT
+} from './core/transcript-repair';
 import { validateAttachments } from './shared/attachments';
 import type {
     Agent,
@@ -469,6 +485,10 @@ import type {
     HarnessProgress,
     HarnessRunIdentity,
     HarnessRunOptions,
+    // IT19 R3: WHY a run ended without concluding (the closed vocabulary declared at
+    // types/index.ts:2911). Carried by the thread record, the invocation record, both snapshot
+    // projections, and the lane archive payload.
+    HarnessRunStopReason,
     HarnessSnapshot,
     HarnessStateChangeReason,
     HarnessStopReason,
@@ -627,6 +647,140 @@ const resolveForkTimeoutMs = (value: unknown, fallback: number): number =>
 // (`vi.getTimerCount()` stays 0 for it), and the returned disarms exactly once. The abort
 // carries a HarnessError naming `label`, so the reason a run or branch stopped is readable
 // from the tool result, the branch record and `agentResult` without guessing.
+// IT19 R3 — THE CAUSE RIDES ON THE ABORT REASON.
+//
+// A run ends without concluding for nine different reasons (the closed `HarnessRunStopReason`
+// vocabulary), and the catch in `runAgentCore` is the ONE place that terminalizes the run — but
+// by the time it runs, every specific cause has collapsed into "the signal aborted". A caller's
+// `toolCancel`, a wall-clock expiry, a host `stopThread`, and a plugin `turn.before` stop all
+// look identical from there, which is exactly the ambiguity IT19 removes.
+//
+// So whichever site CAUSES the abort stamps its reason on the reason OBJECT itself:
+//   - it travels through `linkSignals` for free (that helper forwards `source.reason` verbatim,
+//     harness.ts:4280), so a delegation's timeout reaches the child's run and a parent's stop
+//     reaches its children, with the parent's own cause intact;
+//   - `throwIfAborted` throws `signal.reason` (harness.ts:7958), so the caught value in
+//     `runAgentCore` carries it — no extra channel, no per-run bookkeeping to race;
+//   - it is a SYMBOL, so it survives without joining the error's enumerable shape: `toErrorInfo`
+//     and every snapshot/JSON projection of the reason stay byte-identical, and the stamp can
+//     never leak into a persisted document.
+const RUN_STOP_CAUSE = Symbol('underload.harness.runStopCause');
+
+/** Attach the machine-readable cause to an abort reason (see the block above). Total: a reason
+ *  the runtime cannot write to (a frozen or primitive value) is returned unchanged. */
+const withRunStopCause = <T>(cause: T, reason: HarnessRunStopReason): T => {
+    if (cause === null || (typeof cause !== 'object' && typeof cause !== 'function')) return cause;
+
+    try {
+        (cause as { [RUN_STOP_CAUSE]?: HarnessRunStopReason })[RUN_STOP_CAUSE] = reason;
+    } catch {
+        // A non-extensible reason object keeps its old shape; classification then falls back to
+        // the status/marker rules in `classifyRunStopReason`, which is what it did before.
+    }
+
+    return cause;
+};
+
+/** The cause stamped on an abort reason, if any (see `withRunStopCause`). */
+const runStopCauseOf = (cause: unknown): HarnessRunStopReason | undefined => {
+    if (cause === null || (typeof cause !== 'object' && typeof cause !== 'function')) return undefined;
+
+    return (cause as { [RUN_STOP_CAUSE]?: HarnessRunStopReason })[RUN_STOP_CAUSE];
+};
+
+// IT19 R5 — WHICH STOPS MAY BE RESUMED BY AN AGENT.
+//
+// `HarnessThreadStatus` documents `stopped` as "no new run is started for it and AGENTS may not
+// post into it until a HOST resumes it", and that refusal is what a thread whose run was CUT SHORT
+// by intent deserves: the user said stop, so a peer agent cannot talk it back into motion. But
+// IT19 R1 now RETAINS the turns of such a run, which means a thread stopped by a cause that was
+// never an instruction to halt — the caller released the call, the clock expired, the turn cap was
+// reached, the provider gave up — is a conversation with real work still in hand and nobody
+// willing to continue it. Refusing a peer's message there strands the transcript behind a host
+// round trip for no benefit, so those stops accept a send and report it as `delivered: 'resumed'`.
+//
+// The set is deliberately closed and mirrors `HarnessRunStopReason`:
+//   - `user-stopped` stays EXCLUDED — stopping is the host's intent, and `sendThreadInput` is the
+//     revival path that documents it;
+//   - `plugin-parked` stays EXCLUDED — the park is owned by the plugin that took it (the ownership
+//     rule in `resumeThreadState`), and a message is not the work it parked for;
+//   - an ABSENT `stopReason` stays EXCLUDED. A stopped record with no reason is either a
+//     pre-feature document or a lane-set status, i.e. a stop whose cause is unknown, and unknown
+//     is not evidence that resuming is safe.
+const RESUMMABLE_RUN_STOP_REASONS: readonly HarnessRunStopReason[] = [
+    'caller-released',
+    'timeout',
+    'turn-cap',
+    'budget-exhausted',
+    'api-error',
+    'retries-exhausted',
+    'parent-closed'
+];
+
+/** Whether a `stopped` conversation may be continued by a peer's message (see the block above). */
+const isResumableStopReason = (reason: HarnessRunStopReason | undefined): boolean =>
+    reason !== undefined && RESUMMABLE_RUN_STOP_REASONS.includes(reason);
+
+// IT19 R2 — the one sentence every AGENT-FACING write door gives a soft-deleted conversation
+// (`threadSend`, `steerThread`). It names the state honestly rather than reusing the canonical
+// not-found error: the record and transcript DO still exist (that is the whole point of a soft
+// delete), so "it was never created, or it was deleted" would be the one answer that is false, and
+// the caller's real options are to create a new conversation or have a host revive this one.
+//
+// `sendThreadInput` is NOT in that set, and must not be added back to it: a host send is the
+// documented revival (see its body, and `HarnessThreadRecord.inactive`), while an agent cannot
+// address a conversation its roster no longer names.
+const inactiveThreadError = (threadId: string, attempt: string): HarnessError =>
+    new HarnessError(
+        `Thread "${threadId}" is inactive: it was deleted, so ${attempt} cannot run in it. Its record and ` +
+            'transcript are retained and stay readable by id; start a new thread, or have a host restore it.'
+    );
+
+// IT19 R2/R3 — the retention bound, applied on the KERNEL side of the writer pair.
+//
+// A soft delete marks, so `threadStates` only GROWS across the life of a session, and
+// `readThreads` (./core/snapshot.ts:815) REFUSES a snapshot with more host rows than
+// `MAX_THREAD_RECORDS`: one row over and `restore()` throws for the whole document, which is a far
+// bigger destruction than the bound was ever meant to cost. So the bound has to be held where a
+// document is PRODUCED, and there are two producers of the same rows:
+//
+//   - this kernel, through `snapshot()` (harness.ts, the `hostThreads` projection) — what a host
+//     that persists the snapshot itself writes, and what the server re-captures into `session.core`;
+//   - the server store, through ./server/sessions.ts `capThreadRecords` — what the session document
+//     is finally written from, after the retention ledger has re-stamped the rows.
+//
+// They must retire the SAME rows or the document flaps: an over-cap document, a prune, a re-add,
+// forever. Hence one rule, spelled identically in both places — only `inactive === true` rows are
+// eligible (an ACTIVE conversation is never dropped: that would be the destruction this whole
+// feature forbids), "oldest" is `sequence` (runtime creation order, deterministic across a restore)
+// and never `inactiveAt` (wall clock), and the count dropped is exactly `length - MAX`. Input is
+// already in `sequence` order at both call sites.
+//
+// When NOTHING is inactive the rows are returned untouched, so an over-cap all-active document
+// survives to fail LOUDLY at `readThreads` instead of silently losing transcripts. Same-object
+// return when nothing retires, so the ordinary path (under the bound) allocates nothing.
+const capRetiredThreadRecords = <T extends { id: string; sequence: number; inactive?: true }>(
+    rows: T[]
+): T[] => {
+    if (rows.length <= MAX_THREAD_RECORDS) return rows;
+
+    let excess = rows.length - MAX_THREAD_RECORDS;
+    const doomed = new Set<string>();
+
+    for (const row of rows) {
+        if (row.inactive !== true) continue;
+
+        doomed.add(row.id);
+        excess -= 1;
+
+        if (excess === 0) break;
+    }
+
+    if (doomed.size === 0) return rows;
+
+    return rows.filter((row) => !doomed.has(row.id));
+};
+
 const armWallClock = (
     controller: AbortController,
     label: string,
@@ -636,8 +790,15 @@ const armWallClock = (
 
     if (Number.isFinite(timeoutMs)) {
         timeoutTimer = setTimeout(() => {
+            // IT19 R3: this is the ONLY wall-clock expiry in the runtime (both opt-in clocks arm
+            // through here), so stamping here is what makes `timeout` a reported cause rather
+            // than a sentence a caller has to string-match. The reason stays the same
+            // HarnessError with the same message; only the symbol key is added.
             controller.abort(
-                new HarnessError(`${label} exceeded its ${timeoutMs}ms timeout and was stopped.`)
+                withRunStopCause(
+                    new HarnessError(`${label} exceeded its ${timeoutMs}ms timeout and was stopped.`),
+                    'timeout'
+                )
             );
         }, timeoutMs);
 
@@ -1637,8 +1798,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         addCommand: (name, definition) =>
             installCommand({ ...definition, name }, 'a plugin', true),
         threads: {
-            // Detached copies, exactly like the handle's `threads()`.
-            list: () => [...threadStates.values()].map((state) => threadRecordCopy(state.record)),
+            // Detached copies, exactly like the handle's `threads()` — which since IT19 R2 means
+            // the SAME discovery rule: a soft-deleted (`inactive`) conversation is off the roster,
+            // so a plugin must not see it here either (its record and transcript stay durable, and
+            // `api.threads.messages` still answers them for a host-shaped read).
+            list: () =>
+                [...threadStates.values()]
+                    .filter((state) => state.record.inactive !== true)
+                    .map((state) => threadRecordCopy(state.record)),
             create: (agent, options) => createThreadState(agent, options).record,
             // `delete` is the contract name; `remove` is an alias for the same
             // operation (see HarnessPluginApi.threads in ./types).
@@ -3810,6 +3977,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // and read back by `readAgentResults`), because a purge after a reload used to
         // match nothing and silently keep the deleted conversation's archived results.
         threadId?: string;
+        // IT19 R3: WHY this run reached a NON-concluded terminal state (the closed
+        // `HarnessRunStopReason` vocabulary, types/index.ts:2911). It is the machine-readable
+        // half of the sentence `error` carries as prose, and it is what lets a caller tell
+        // "the parent released the call" from "the provider ran out of retries".
+        //
+        // WRITTEN ONLY ON A NON-SUCCESS TERMINAL TRANSITION, exactly like `error` and the
+        // forensic pair above: `core/snapshot.ts:342-362` refuses a `completed` row that carries
+        // the key, so a completed record must not have one — that is why `finishInvocation`
+        // writes it inside its `else` branch and both snapshot projections omit it there.
+        // Absent on a non-concluded row means "this row was written before the field existed".
+        stopReason?: HarnessRunStopReason;
     };
 
     const invocationRecords = new Map<string, AgentInvocationRecord>();
@@ -3899,6 +4077,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             if (typeof partial === 'string' && partial.trim().length > 0) {
                 record.partialContent = partial;
             }
+
+            // IT19 R3: the machine-readable WHY, classified once by `runAgentCore`'s catch (or
+            // by an explicit stamp at the site that ended the run — the turn-cap guard). It
+            // rides beside `error` and the forensic pair, and ONLY here: a `completed` row must
+            // not carry the key (core/snapshot.ts refuses it), so a run that concluded — including
+            // one that had been cancelled earlier and then completed — records none.
+            // The key is DELETED rather than set to `undefined` when absent, so a record that
+            // transitions cancelled → completed restores with its exact pre-field shape.
+            if (run.stopReason === undefined) delete record.stopReason;
+            else record.stopReason = run.stopReason;
         }
 
         pruneInvocationRecords();
@@ -3931,10 +4119,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         };
     };
 
+    // IT19 R2 — a SOFT-deleted conversation is out of the DISCOVERY surfaces, and its archived
+    // results go with it: `agentManage`'s per-agent list and `agentResult`'s "newest result of
+    // this agent" both answer from this function, so a conversation the user deleted must stop
+    // competing there even though its rows survive (they are readable by id, and they ride the
+    // snapshot). A record whose owning conversation is gone from the live map entirely — a
+    // pre-soft-delete hard purge, or a row restored for a thread the snapshot dropped — stays
+    // visible, which is what keeps every pre-existing listing byte-identical.
+    const recordIsInactiveOwned = (record: AgentInvocationRecord): boolean =>
+        record.threadId !== undefined &&
+        threadStates.get(record.threadId)?.record.inactive === true;
+
     // Newest first within one agent. `sequence` is unique, so the order is total.
     const recordsForAgent = (name: string): AgentInvocationRecord[] =>
         [...invocationRecords.values()]
-            .filter((record) => record.agent === name)
+            .filter((record) => record.agent === name && !recordIsInactiveOwned(record))
             .sort((left, right) => right.sequence - left.sequence);
 
     // T28: the record a delegation reports. The newest STARTED invocation of that
@@ -4236,7 +4435,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         : { cancelledAtMessage: record.cancelledAtMessage }),
                     ...(record.durationMs === undefined
                         ? {}
-                        : { durationMs: record.durationMs })
+                        : { durationMs: record.durationMs }),
+                    // IT19 R4 / F-A Defect 1 (2026-11-15): THE CAUSE AT THIS DOOR. The record
+                    // has carried `stopReason` since the retention fix (`finishInvocation`
+                    // ~:4085, `finishInvocationRecord` ~:8013), and `harness.thread(id)`
+                    // (~:13880) plus `snapshot().agentResults[]` (~:14279) both projected it —
+                    // only THIS door answered `undefined` for all nine causes, so a caller of
+                    // `agentResult` still had to string-match `error` prose to tell
+                    // "the parent released the call" from "the provider ran out of retries".
+                    // Absence-conditional like the three keys above: a pre-feature row and a
+                    // row whose cause was never observed keep their exact old byte shape, and
+                    // a `completed` row can never reach this branch (`record.status` is
+                    // checked above), which is what keeps the `core/snapshot.ts:342-362` rule —
+                    // no `stopReason` on a completed row — true at every door.
+                    ...(record.stopReason === undefined
+                        ? {}
+                        : { stopReason: record.stopReason })
                 };
             }
 
@@ -4297,10 +4511,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //   1. `delegateFor` itself, when the child rejects and the CALLING call is still
     //      live (a timeout, a stopped child thread, an exhausted turn cap);
     //   2. `deliverTask`'s cancelled branch, for the one door where the scheduler has
-    //      ALREADY released the call — `toolCancel` (docs/issues/minor-toolcancel-
-    //      acknowledges-rather-than-reporting-the-envelope.md, 0021, and the delivery
-    //      half of docs/issues/significant-delegation-result-can-be-stranded-without-
-    //      delivery.md, 0019). That door used to answer "no result is available" while
+    //      ALREADY released the call — `toolCancel` (issue 0021, closed, and the delivery
+    //      half of issue 0019, closed). That door used to answer "no result is available" while
     //      the child's terminal record — status, error, partialContent,
     //      cancelledAtMessage, identity — sat in the ledger one call away; and
     //   3. the owed-account register (`owedAccountOf`), which reprints the SAME envelope
@@ -4431,8 +4643,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // thread of that agent running alongside them cannot cross-report. `undefined` means the
     // child registered no record (it was refused before it started) or lost it (a thread purge,
     // a ledger eviction): the caller then gets the historical cancel sentence, which is what
-    // "no invented identity" requires (docs/issues/minor-success-envelope-can-fabricate-identity-
-    // and-status.md, 0029).
+    // "no invented identity" requires (issue 0029, closed).
     //
     // `content` prefers the child's FINAL answer: the release races the child, and a child that
     // answered anyway is the case the 0021 review calls "the result was still useful". Falling
@@ -5310,6 +5521,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // this marker is what makes a plugin stop record as `cancelled` rather than
         // `failed` on every run shape.
         pluginStopped: boolean;
+        // IT19 R3 — WHY this run reached a non-concluded terminal state. It is written at the
+        // boundary that KNOWS the cause and read once, by `finishInvocation` (the durable row) and
+        // by `applyNonConcludedTerminal` (the thread record):
+        //   - the turn-cap guard stamps `turn-cap` on the run itself, because that exit throws
+        //     without an abort and has no other carrier;
+        //   - every abort-shaped cause travels on the abort REASON instead (see `withRunStopCause`
+        //     at module scope) and is folded into this field by `classifyRunStopReason` in the catch,
+        //     which is also where a provider failure and the unattributed remainder land.
+        // A stamp written before the catch always WINS over classification, so a cause observed at
+        // its source can never be overwritten by a guess made further downstream.
+        stopReason?: HarnessRunStopReason;
+        // IT19 R3: did the model request that ended this run get RETRIED at all? Set from the
+        // agent's `retry` frame (the transport re-sent this same request after a failed attempt) and
+        // cleared at the start of every request, so at failure time it states whether the retry
+        // policy had attempts and every one of them failed — the exact difference between
+        // `retries-exhausted` and `api-error`, and not observable anywhere else: retry ownership is
+        // the agent's (core/agent.ts R1), and the harness only forwards the frames.
+        sawRetryFrame: boolean;
         // `abortError` may legitimately BE `undefined` (a tool that rejected with
         // undefined). This sentinel distinguishes "recorded undefined" from "no
         // tool error was recorded"; without it throwIfAborted would wrongly
@@ -5325,10 +5554,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // last substantive tool-free response below and may resolve to it instead
         // of a whitespace-only terminal turn.
         delegateAnswer: boolean;
-        // Steering drained from the thread queue INTO this run. A successful run
-        // consumes it; a failed run rolls the appended messages back with the
-        // transcript, so the text is re-queued for the next host turn (a stop
-        // discards it by contract). Order is preserved either way.
+        // Steering drained from the thread queue INTO this run (the ledger of what this run has
+        // already consumed). It used to be a rollback compensation: a failed run spliced the
+        // appended messages out of the transcript, so the catch re-queued this array for the next
+        // host turn, and a stop discarded it by contract. IT19 (R1) RETAINS a thread run's tail,
+        // so the drained text survives in the transcript itself and the re-queue is gone — keeping
+        // it would have replayed the same steer twice. The "a stop discards guidance" contract
+        // still holds at the queue level (`stopThreadState` clears the queue); retention only
+        // means the guidance a run had already consumed is no longer destroyed with the turn.
         steering: string[];
         // The latest substantive response THIS run produced: no tool calls, a
         // normal stop, and non-blank text. Captured on the run itself so the
@@ -5633,8 +5866,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ...(currentThreadId === undefined ? {} : { currentThreadId }),
             // The family is what the WRITE doors use; it is reported so a caller can tell
             // "readable" from "mine to send into / release" without re-deriving the rule.
-            ...(family === undefined ? {} : { actOn: [...family].sort() }),
+            //
+            // IT19 R2: a soft-deleted conversation is dropped from BOTH sets. `actOn` advertises
+            // doors a caller may walk, and `threadSend`/`threadDelete` refuse an inactive target,
+            // so a row listed there would promise a write the next call refuses.
+            ...(family === undefined
+                ? {}
+                : {
+                      actOn: [...family]
+                          .filter((id) => threadStates.get(id)?.record.inactive !== true)
+                          .sort()
+                  }),
+            // IT19 R2 — DISCOVERY, not readability. A deleted conversation stops being LISTED
+            // (`threadList`, and the handle's `threads()`, share this function) so the model can
+            // no longer address it, while its record and transcript survive and stay readable by
+            // id for a host (see `threadMessages` and `HarnessThreadRecord.inactive`).
             threads: [...threadStates.values()]
+                .filter((state) => state.record.inactive !== true)
                 .sort((left, right) => left.record.sequence - right.record.sequence)
                 .map((state) => threadRecordCopy(state.record))
         };
@@ -5783,13 +6031,60 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const target = threadStateOf(targetThreadId);
 
+        // IT19 R2 — a soft-deleted conversation takes no messages. This is FIRST, ahead of every
+        // status branch, because `inactive` and `status` are orthogonal: a deleted thread keeps
+        // whatever status it had, and a caller that wrote into it would queue text behind a run
+        // that can never be started again.
+        if (target.record.inactive === true) {
+            throw inactiveThreadError(targetThreadId, 'threadSend');
+        }
+
+        // IT19 R5 — A CUT-SHORT STOP IS RESUMABLE, an intended stop is not.
+        //
+        // The refusal below is what a conversation the HOST stopped must keep: "stopped" is an
+        // instruction, and only the host that issued it may lift it. But R1 now retains the turns
+        // of a run that was cut short by a cause that was never an instruction (a released call,
+        // an expired clock, an exhausted provider), so that conversation has work in hand and the
+        // message the caller is posting IS the thing that continues it. Falling through starts a
+        // run whose root user message is this content, on the RETAINED transcript.
+        //
+        // WHAT THE RECEIPT ACTUALLY KEYS ON (corrected 2026-11-15, independent review): the value
+        // below is `resumableStop`, so `'resumed'` is reserved for a record that is `stopped` AND
+        // carries a resummable cause. An interruption that left the record at `idle` — the ordinary
+        // rest state of a timeout, an exhausted provider, or a child abandoned by its parent's
+        // `toolCancel` — is dormant by this test and answers `'started'`. That is not the sender
+        // being told an interruption went unnoticed: the cause stays on the row as `stopReason`, so
+        // the interruption is still readable where a reader looks for it, and the two receipts
+        // distinguish the OPERATION performed (a resumed stop vs a fresh run) rather than whether a
+        // transcript was ever cut short. Widening `'resumed'` to every interrupted row was weighed
+        // and REJECTED: it moves a documented receipt for no extra information.
+        const resumableStop =
+            target.record.status === 'stopped' && isResumableStopReason(target.record.stopReason);
+
         // The refusal is FIRST and mutates nothing: a stopped conversation gets no
         // queue entry, no transcript append, and no run (the sibling test in
         // src/harness.thread-runtime.test.ts pins all three).
-        if (target.record.status === 'stopped') {
+        if (target.record.status === 'stopped' && !resumableStop) {
             throw new HarnessError(
                 `Thread "${targetThreadId}" is stopped; it cannot receive messages until a host resumes or deletes it.`
             );
+        }
+
+        // IT19 R5: the resumable stop IS lifted HERE, and only after the refusal above has had its
+        // chance to mutate nothing. `sendThreadInput` performs the identical lift for a host turn
+        // (the documented way back into a stopped conversation); a peer's message that continues an
+        // interrupted conversation is the same lift performed by a different actor.
+        //
+        // Lifting it BEFORE the start is not cosmetic. `runAgent` refuses a model-driven run in a
+        // 'stopped' conversation (its own gate, further down this file), and this call arrives as a
+        // thread-bound run — so a stop left in place would kill the run inside its fire-and-forget
+        // catch while the sender was handed a `delivered: 'resumed'` receipt for nothing. The
+        // record's `stopReason` is not cleared here: the run's own `status = 'running'` flip drops
+        // it, and if no run ever starts, the marker beside an 'idle' status is the shape
+        // `HarnessThreadSnapshot.stopReason` documents (the cause of a past interruption).
+        if (resumableStop) {
+            target.record.status = 'idle';
+            notifyStateChange('thread');
         }
 
         // T8: a plugin park used to be lifted HERE (delegate-stress T3.2). It is not
@@ -5831,7 +6126,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }:\n${message}`;
 
         // Every field of a receipt is the target plus the SENDER's own identity; only
-        // `delivered` varies by state, and it has exactly two values (T3.6).
+        // `delivered` varies by state. CORRECTED 2026-11-15 (independent review of IT19): it now
+        // has THREE live values, not the two T3.6 documented. `queued` steers a run that is
+        // already in flight, `started` begins one on a conversation with no run in hand, and
+        // `resumed` continues a run that was cut short with its turns RETAINED; `appended` is
+        // retired. What keys each value is spelled out on `HarnessThreadMessageResult.delivered`
+        // (src/types/index.ts:3153) and in the block above - the point of the third value is that
+        // a cut-short stop is reported differently from a fresh start, never that the interruption
+        // went unnoticed (the cause stays on the row as `stopReason`).
         //
         // B4/C1: `note` is the one optional field, and it exists for exactly one
         // confusion — `agent:<name>` looks like "the conversation this agent is having",
@@ -5967,8 +6269,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
         }
 
-        // Dormant: `idle` and nothing else. `stopped` threw at the top, `paused`
-        // queued above without lifting the park (T8), and a live run steered above. A
+        // Dormant: `idle`, or a `stopped` conversation whose stop is RESUMMABLE (R5 — the only
+        // stopped target that reaches here; an intended stop threw at the top). `paused` queued
+        // above without lifting the park (T8), and a live run steered above. A
         // `running` record with NO run attached would land here too; the pair is
         // written and cleared together in `runAgent` (`resolvedThread.run = run` beside
         // `status = 'running'`, both released in its `finally`), so that combination is
@@ -6027,7 +6330,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             target
         ).catch(() => undefined);
 
-        return receipt('started', liveSiblingNoteFor());
+        // IT19 R5: `'resumed'` vs `'started'` is the difference between "I continued the
+        // conversation that was interrupted" and "I opened a fresh one", and the caller has to be
+        // able to tell them apart without re-reading the transcript. The spelling is the
+        // `resumableStop` decision captured ABOVE — the status has already been lifted to 'idle'
+        // by then, so reading the record here would report 'started' for the very case this key
+        // exists to name.
+        return receipt(
+            resumableStop ? 'resumed' : 'started',
+            liveSiblingNoteFor()
+        );
     };
 
     // Create one host thread and return its LIVE state. Shared by the public
@@ -6050,13 +6362,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // MAX_THREAD_RECORDS host threads, and a harness must never emit a
         // snapshot its own restore rejects. Deleting a terminal thread frees a
         // slot; the id high-water mark does not move.
-        const hostThreadCount = [...threadStates.values()].filter(
-            (state) => state.record.origin === 'host'
+        //
+        // IT19 R2 (and the cap half of it, R3): the refusal counts ACTIVE host rows only, so a soft
+        // delete frees its slot again — "delete a terminal one" stays actionable, which is the whole
+        // point of a delete that marks instead of destroys. A retired conversation still occupies a
+        // row of the document, so the bound itself is enforced where the document is BUILT rather
+        // than at the creation door: `capHostThreads` below retires the oldest inactive rows exactly
+        // the way ./server/sessions.ts `capThreadRecords` does, and because both use the same rule
+        // (filter `inactive === true`, order by `sequence`, drop the oldest `n - 256`) neither writer
+        // can leave a document over `readThreads`' bound (./core/snapshot.ts:815) while anything
+        // inactive is left to retire.
+        //
+        // The consequence worth stating: a session whose 256 rows are ALL active is over the bound
+        // only if something external produced it (a hand-edited document, a document from a build
+        // with a larger cap), and then nothing is silently dropped — `readThreads` REFUSES the whole
+        // session. The guard below is what makes that state unreachable through this kernel: it
+        // refuses at 256 ACTIVE rows, so a creation can never take the count past the bound.
+        const activeHostThreadCount = [...threadStates.values()].filter(
+            (state) => state.record.origin === 'host' && state.record.inactive !== true
         ).length;
 
-        if (hostThreadCount >= MAX_THREAD_RECORDS) {
+        if (activeHostThreadCount >= MAX_THREAD_RECORDS) {
             throw new HarnessError(
-                `This session already has ${hostThreadCount} independent threads; delete a terminal one before creating another (maximum ${MAX_THREAD_RECORDS}).`
+                `This session already has ${activeHostThreadCount} independent threads; delete a terminal one before creating another (maximum ${MAX_THREAD_RECORDS}).`
             );
         }
 
@@ -6079,6 +6407,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     `Thread "${ownerThreadId}" is an agent's default conversation; only an independent host thread can own another thread.`
                 );
             }
+            // IT19 R2: an INACTIVE owner is accepted, and the child it owns is ACTIVE. The owner
+            // link is a fact about lineage — who started this work — and releasing a conversation
+            // does not rewrite history or orphan what it already spawned (its descendants were
+            // released with it, while a thread created AFTERwards is a new conversation that nobody
+            // has deleted). The consequence worth stating: the child's family still reaches the
+            // released parent, and `threadRoster`'s `actOn` filter is what keeps that parent out of
+            // the set of conversations the child may write into.
         }
 
         const id = `${THREAD_HOST_PREFIX}${++threadIdSequence}`;
@@ -6328,6 +6663,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         origin: 'host',
         status: branch.status === 'running' ? 'running' : 'idle',
         sequence: branchRecords.indexOf(branch) + 1,
+        // IT19 R2: NO `inactive` key, and it is not an oversight. A branch is released by having
+        // its ledger entry REMOVED (`purgeThread`'s cascade), so a branch that still resolves here
+        // has not been released by anything — there is no soft-delete state a branch record can be
+        // in, and inventing one would advertise a distinction nothing can produce.
         ...(branch.threadId === undefined ? {} : { ownerThreadId: branch.threadId }),
         invocationId: branch.branchId
     });
@@ -6474,12 +6813,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // stop would otherwise stop the one conversation and silently skip everything it owns.
         threadId = threadAddressOf(threadId);
         const state = threadStateOf(threadId);
-        const error = new HarnessError(reason ?? `Thread "${threadId}" was stopped.`);
+        // IT19 R3: the CAUSE rides on the reason object (see `withRunStopCause`), so the run this
+        // stop aborts classifies itself as `user-stopped` instead of the generic "someone aborted
+        // me". A caller-supplied `reason` string is still the visible text; the stamp is additive.
+        const error = withRunStopCause(
+            new HarnessError(reason ?? `Thread "${threadId}" was stopped.`),
+            'user-stopped'
+        );
+
+        // IT19 R2: a soft-deleted conversation is not stopped, and re-stopping it would be a
+        // mutation the caller cannot see (the record keeps its status, only `inactive` changed)
+        // plus a `thread.stopped` hook for a conversation the roster no longer lists. It can never
+        // own a live run either: `deleteThread` refuses a running thread and every running
+        // descendant, so "was a run aborted" is honestly `false` here.
+        if (state.record.inactive === true) return false;
 
         let aborted = stopThreadState(state, error);
 
         for (const other of threadStates.values()) {
             if (other === state) continue;
+            if (other.record.inactive === true) continue;
             if (!ownersOf(other).some((owner) => owner.record.id === threadId)) continue;
             if (stopThreadState(other, error)) aborted = true;
         }
@@ -6489,10 +6842,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     const stopAllThreads = (reason?: string): number => {
-        const error = new HarnessError(reason ?? 'All threads were stopped.');
+        const error = withRunStopCause(
+            new HarnessError(reason ?? 'All threads were stopped.'),
+            'user-stopped'
+        );
         let aborted = 0;
 
         for (const state of threadStates.values()) {
+            // IT19 R2: deleted conversations are skipped, for the same reason `stopThread` skips
+            // them — no status to rewrite, no hook to re-fire, no run to abort.
+            if (state.record.inactive === true) continue;
             if (stopThreadState(state, error)) aborted++;
         }
 
@@ -6500,39 +6859,65 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return aborted;
     };
 
-    // What one purge released, beyond the conversation itself: the invocation ids whose
-    // agent-result records went with the conversation, and the branch ids whose ledger
-    // entries went with it. `deleteThread` folds these into the `threadDelete` receipt
-    // (stress report #6, 2026-11-14) so "agentManage got shorter" is a reportable fact
+    // What one release took out of the DISCOVERY surfaces, beyond the conversation itself: the
+    // invocation ids whose agent-result rows stopped being listed with it, and the branch ids
+    // whose ledger entries went with it. `deleteThread` folds these into the `threadDelete`
+    // receipt (stress report #6, 2026-11-14) so "agentManage got shorter" is a reportable fact
     // instead of a silent side effect.
+    //
+    // IT19 R2 CHANGED WHAT THE NAMES MEAN, not the names themselves: a release is now a SOFT
+    // delete, so both sets report ids that are "no longer listed" rather than "destroyed". The
+    // invocation rows survive (readable by id, and still persisted); only the branch records are
+    // actually removed, because a branch is an ephemeral side transcript in a bounded audit
+    // ledger (core/branch.ts `MAX_BRANCH_RECORDS`), not a durable conversation.
     type ThreadPurgeOutcome = {
         removedInvocationIds: string[];
         removedBranchIds: string[];
     };
 
-    // Drop one thread state and every LOOKUP that pointed at it. Shared by
-    // deleteThread (invocation/branch purge) and restore (replacing the persisted
-    // set), so both paths cannot drift. It never touches an agent transcript the
-    // thread shares with anyone else: the caller's content purge is the thread's
-    // own Agent, which becomes unreachable here.
+    // IT19 R2 — SOFT-DELETE one conversation.
     //
-    // Returns what it removed (a caller that wants the sets; `restore` ignores them).
+    // The record and its transcript SURVIVE: the row stays in `threadStates` (so `threadStateOf`,
+    // the transcript editor, and `agentResult` keep resolving the id), the conversation's Agent
+    // keeps its messages, and its invocation records stay in the ledger. What changes is DISCOVERY
+    // and MUTABILITY — `threadRoster`/`threads()`/`thread()` stop naming it (`HarnessThreadRecord
+    // .inactive` is the marker), and the write doors refuse it. The session tooling forgets it;
+    // `shell`/`bash`, the persistence directory, and a restore do not.
+    //
+    // Two invalidations come along with the mark, both copied from `stopThreadState` because they
+    // solve the same race for the same reason:
+    //   - `generation` bumps, so a `sendThreadInput` that captured the epoch BEFORE the delete
+    //     refuses to start a turn against a conversation the user has just released (M1's rule —
+    //     without it, "deleted" could be rewritten to running by work already in flight);
+    //   - the queue is cleared, because guidance queued for a released conversation has no next
+    //     turn to be applied to, and a restored session must not resurrect a message nobody can
+    //     any longer see the target of.
+    //
+    // `restore` is the other caller of this shape: it replaces the persisted set wholesale and
+    // ignores the returned ids.
     const purgeThread = (state: ThreadState): ThreadPurgeOutcome => {
         const threadId = state.record.id;
-        threadStates.delete(threadId);
+
+        state.record.inactive = true;
+        // Wall-clock, and metadata only: ordering of inactive rows uses `sequence`, so a restored
+        // session stays deterministic (`HarnessThreadRecord.inactiveAt`).
+        state.record.inactiveAt = Date.now();
+        state.generation += 1;
+        state.queue.length = 0;
 
         // Decision P (round 2 of the note): a delete used to have to lift this
         // conversation's claims. Records are not lockable any more, so there is
         // nothing to lift and the purge below is unchanged.
 
-        // Invocation lookups owned by THIS conversation. Branch runs inherit the
-        // persistent owner, so a fork's/autoanswer's result is scoped here too.
+        // IT19 R2: the invocation rows are NOT removed any more — they are hidden from the
+        // per-agent listings by `recordIsInactiveOwned`, and an explicit `agentResult(id)` still
+        // answers. The scan is kept because the ids are the receipt's content AND because the
+        // branch predicate below needs this conversation's invocation ids.
         const ownedInvocations = new Set<string>();
 
-        for (const [key, record] of invocationRecords) {
+        for (const record of invocationRecords.values()) {
             if (record.threadId === threadId || record.invocationId === state.record.invocationId) {
                 ownedInvocations.add(record.invocationId);
-                invocationRecords.delete(key);
             }
         }
 
@@ -6568,10 +6953,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return { removedInvocationIds: [...ownedInvocations], removedBranchIds };
     };
 
-    // Remove a terminal host thread and every lookup scoped to it. Content that
-    // was already copied into another transcript (a delegated answer, a delivered
-    // chat message) is NOT recalled: deletion is a purge of THIS conversation, not
-    // a promise of forgetting what other histories learned from it.
+    // Release a terminal host thread — SOFTLY (IT19 R2). Every lookup scoped to it stops being
+    // discovered, and the conversation is marked `inactive`, but the record, its transcript, and
+    // its archived results SURVIVE: nothing here destroys a conversation a user might still want
+    // to read, and the only spelling of "permanently gone" stays deleting the session itself.
+    // Content that was already copied into another transcript (a delegated answer, a delivered
+    // chat message) is NOT recalled: release is a purge of THIS conversation's discoverability,
+    // not a promise of forgetting what other histories learned from it.
     const deleteThread = (threadId: string): HarnessThreadDeleteResult => {
         // #4 (2026-11-14, stress report) — resolve a BRANCH address before the thread
         // table. `threadStateOf` below throws the canonical not-found sentence, and for a
@@ -6607,6 +6995,92 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             throw new HarnessError(`Thread "${threadId}" is running; stop it before deleting it.`);
         }
 
+        // IT19 R2 — RELEASING AN ALREADY-RELEASED CONVERSATION IS IDEMPOTENT. It used to be the
+        // canonical not-found refusal, because the first delete destroyed the lookup; the row
+        // survives now, so a second call restates the first receipt instead of claiming the id
+        // never existed. Nothing mutates: no re-mark, no refreshed `inactiveAt` (the FIRST
+        // transition is the fact a host renders), no generation bump, and no second
+        // `thread.deleted` hook for a conversation that was released once.
+        //
+        // F-A Defect 3 (2026-11-15) — THE THREE SETS NOW MEAN THE SAME THING. The first version
+        // of this branch answered a retry with three fields carrying three different rules:
+        // `removedThreadIds` = "what THIS call newly marked" (so a cascade child that the first
+        // release had already hidden was missing), `removedInvocationIds` = "what is STILL hidden"
+        // (the same set the first receipt named), `removedBranchIds` = empty. A reaping loop that
+        // compares two receipts therefore saw the child's conversations disappear from one array
+        // and stay in the other, and the tool text an agent reads promises "it restates the same
+        // receipt and changes nothing". The ruling is that the CODE follows that promise: the two
+        // id sets that describe RETAINED-but-hidden state (threads, invocations) are restated in
+        // full — a hidden conversation is still hidden, which is the fact a retry reports. The
+        // one field that stays "newly by this call" is `removedBranchIds`: a branch row lives in
+        // the bounded ephemeral ledger and really WAS dropped by the first release, so an empty
+        // array here is a true statement, and the entry's prose says so explicitly instead of
+        // smoothing the three fields into one rule.
+        if (state.record.inactive === true) {
+            // The family this conversation released: the walk is the same descendant sweep the
+            // first release performed, WITHOUT its running-refusal. A child created after the
+            // release is legal (see `createThreadState`) and may even be running, and a retry has
+            // nothing to refuse — it is reporting what is already hidden, not causing it.
+            //
+            // The loop shape is `deleteThread`'s own descendant collection BELOW copied
+            // deliberately: `pending` is a STACK (`pop`) and candidates are scanned in
+            // `threadStates` creation order, so `family` comes out in exactly the order the first
+            // receipt stated its `removedThreadIds` — owner first, then each cascade child in the
+            // order it was minted. A restated set in a DIFFERENT order is still a different
+            // receipt to a caller comparing arrays, so the traversal is not free to differ.
+            const releasedIds = new Set<string>([threadId]);
+            const family: ThreadState[] = [state];
+            const pending: ThreadState[] = [state];
+
+            while (pending.length > 0) {
+                const current = pending.pop()!;
+
+                for (const candidate of threadStates.values()) {
+                    if (candidate.record.ownerThreadId !== current.record.id) continue;
+                    if (releasedIds.has(candidate.record.id)) continue;
+
+                    releasedIds.add(candidate.record.id);
+                    family.push(candidate);
+                    pending.push(candidate);
+                }
+            }
+
+            const stillHidden = new Set<string>();
+
+            for (const record of invocationRecords.values()) {
+                if (record.threadId === undefined) {
+                    // The owner's most recent run can predate the `threadId` field; it is matched
+                    // by the record's own back-pointer, exactly like the first release did.
+                    if (record.invocationId === state.record.invocationId) {
+                        stillHidden.add(record.invocationId);
+                    }
+                    continue;
+                }
+                if (!releasedIds.has(record.threadId)) continue;
+                // Only a row whose OWNING conversation is released is hidden — the shared
+                // predicate `agentManage` uses. A child created after the release is active, so
+                // its rows are still listed and must not be claimed by this receipt.
+                if (!recordIsInactiveOwned(record)) continue;
+                stillHidden.add(record.invocationId);
+            }
+
+            // The thread set is the family that is ACTUALLY hidden, in the first receipt's order.
+            // `family[0]` is the conversation this call names and it is hidden by the branch
+            // predicate above, so the array leads with the addressed id exactly like the first
+            // receipt did; a descendant created AFTER the release is still listed and is honestly
+            // left out (it was never in the first receipt either, so the two still agree).
+            const removedThreadIds = family
+                .filter((entry) => entry.record.inactive === true)
+                .map((entry) => entry.record.id);
+
+            return {
+                deleted: threadId,
+                removedThreadIds,
+                removedInvocationIds: [...stillHidden],
+                removedBranchIds: []
+            };
+        }
+
         // A linked child cannot outlive the conversation that owns it. Collect
         // EVERY descendant first and refuse the whole delete if any of them is
         // running, so a partial removal is impossible (recursive deletion could
@@ -6636,16 +7110,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
         }
 
-        // Capture the identities BEFORE the purge: a hook that receives the payload must
-        // not be able to observe (or be confused by) half-removed lookups, and
-        // `purgeThread` drops the record from every index the id appears in. The id list is
+        // Capture the identities BEFORE the release: a hook that receives the payload must
+        // not be able to observe (or be confused by) half-removed lookups. The id list is
         // built unconditionally now (B5): `threadDelete` reports it to the CALLER, whose
         // whole question is "what did I just release" — a cascade that silently took three
         // settled children is worth one allocation. The hook payload stays lazy.
+        //
+        // IT19 R2: a conversation the caller had ALREADY released is excluded from every set
+        // below. Each receipt field means "newly taken out of discovery by THIS call", so a child
+        // that was deleted on its own earlier is not reported twice, is not re-marked (its original
+        // `inactiveAt` survives), and does not fire a second `thread.deleted`.
         const purged = [state, ...descendants];
-        const removedThreadIds = purged.map((entry) => entry.record.id);
+        const releasing = purged.filter((entry) => entry.record.inactive !== true);
+        const removedThreadIds = releasing.map((entry) => entry.record.id);
         const removed = hookBus.has('thread.deleted')
-            ? purged.map((entry) => ({
+            ? releasing.map((entry) => ({
                   threadId: entry.record.id,
                   agent: entry.record.agent
               }))
@@ -6658,10 +7137,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // no indication why. Owner first, then cascade children in creation order — the same
         // order `removedThreadIds` states — and an EMPTY array means "nothing else went", not
         // "this build does not say".
+        //
+        // IT19 R2 softened what "went" is (see the receipt note below): `agentManage`'s count
+        // still drops and `removedInvocationIds` still names why, but `agentResult(id)` no longer
+        // throws — the row survives the release and an explicit id still resolves it.
         const removedInvocationIds = new Set<string>();
         const removedBranchIds = new Set<string>();
 
-        for (const entry of purged) {
+        for (const entry of releasing) {
             const outcome = purgeThread(entry);
 
             for (const invocationId of outcome.removedInvocationIds) removedInvocationIds.add(invocationId);
@@ -6670,7 +7153,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         notifyStateChange('thread');
 
-        // R2 plugin hook: one event per purged conversation, cascade children last
+        // R2 plugin hook: one event per released conversation, cascade children last
         // (creation order), so a listener sees the owner before what it owned.
         if (removed !== undefined) {
             for (const payload of removed) hookBus.fire('thread.deleted', payload);
@@ -6679,6 +7162,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // B5 (2026-11-13): the receipt is the state the caller caused. `deleted` is the id
         // it named (a refusal throws, so a return is always a removal); `removedThreadIds`
         // is every conversation that actually went, the cascade included.
+        //
+        // IT19 R2 restates what "went" means: it LEFT THE DISCOVERY SURFACES. The record, its
+        // transcript, and its archived invocation results are all still there — readable by id for
+        // a host, listed in the snapshot, and restored exactly as released. `removedInvocationIds`
+        // is therefore "the rows that stopped being listed with this conversation" (an explicit
+        // `agentResult(id)` still answers), and `removedBranchIds` is the one genuinely removed
+        // set, because a branch is an ephemeral entry in a bounded ledger rather than a
+        // conversation. A caller that treated these ids as destroyed must now treat them as
+        // hidden; nothing in this shape changed type.
         return {
             deleted: threadId,
             removedThreadIds,
@@ -6878,6 +7370,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         threadId = threadAddressOf(threadId);
         const state = threadStateOf(threadId);
 
+        // IT19 R2: a released conversation has no next safe boundary to steer into. This is
+        // reported as a REFUSAL sentence of its own (not the `{ queued: false, reason }` receipt the
+        // stopped and idle cases use) because `inactive` is not a status the caller can act on by
+        // waiting or by calling `sendThreadInput` — the conversation is out of the roster, and the
+        // only next turn it can ever have is one a host starts after restoring it.
+        if (state.record.inactive === true) {
+            throw inactiveThreadError(threadId, 'steering');
+        }
+
         if (typeof input !== 'string' || input.trim().length === 0) {
             throw new HarnessError('Steering requires non-empty text.');
         }
@@ -6929,6 +7430,28 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // reply route — is keyed by id, never by a display name.
         threadId = threadAddressOf(threadId);
         const state = threadStateOf(threadId);
+
+        // IT19 R2 / R3 revival rule — a HOST send is the way back IN. A `stopped` record and an
+        // `inactive` one are different in kind but share one revival door: the host stopped the
+        // conversation, and the host deleted it, and in both cases only the host may undo it. An
+        // agent-facing door (`threadSend`, `steerThread`) still refuses an inactive target, because a
+        // model cannot address what its roster no longer names — but a caller that already holds the
+        // id and is typing INTO the conversation is exactly the actor the soft delete reserves the
+        // revival to. Clearing the pair here is what makes "deleted" reversible (R2: nothing but a
+        // deleted SESSION destroys a turn), and the server's own ledger is cleared alongside it
+        // (./server/sessions.ts `reactivateThreadRow`, which runs BEFORE this call) so the row cannot
+        // be re-marked by the next projection.
+        if (state.record.inactive === true) {
+            // Deleted keys, never `false`: `HarnessThreadRecord.inactive` documents the
+            // additive-when-absent shape, and only this spelling round-trips byte-for-byte through
+            // `snapshot()` / `readThreads` (./core/snapshot.ts normalizes a `false` away on read).
+            delete state.record.inactive;
+            delete state.record.inactiveAt;
+            // The revival has to reach the persistence layer: `stateChange` is the signal the server
+            // re-captures its core from, and a revived row that stayed hidden behind a stale document
+            // would be re-marked by the next restore.
+            notifyStateChange('thread');
+        }
 
         if (typeof input !== 'string' || input.trim().length === 0) {
             throw new HarnessError('Thread input must be non-empty text.');
@@ -6995,12 +7518,31 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // `agent:<name>`, `branch-N`) and the conversation's label (`IT14`) are the same
     // address here. An address nothing answers keeps the canonical not-found sentence, and
     // it names the address the caller typed.
+    //
+    // THE ONE EXCEPTION TO "SESSION-WIDE" (IT19 R2): a SOFT-DELETED conversation. It is out of
+    // the roster by design, so a model that asks for its transcript is asking for something this
+    // session has released — and answering with the full transcript would be worse than refusing,
+    // because nothing in those bytes says the conversation is inactive, so the caller concludes it
+    // is live and posts into it (only to be refused there). `callerThreadId` is the discriminator
+    // the session-wide change left in place for exactly this: a conversation asking through
+    // `threadRead` names itself, and gets the honest sentence; the HOST view (the server's
+    // transcript reader, the sessions surface, and every route that passes no caller) still
+    // resolves the retained transcript, which is the readability half of the soft delete.
     const threadMessages = (threadId: string, callerThreadId?: string): HarnessMessage[] => {
-        void callerThreadId;
-
         const address = threadAddressOf(threadId);
         const state = threadStates.get(address);
-        if (state !== undefined) return cloneMessages(state.agent.messages);
+
+        if (state !== undefined) {
+            if (state.record.inactive === true && callerThreadId !== undefined) {
+                throw new HarnessError(
+                    `Thread "${state.record.id}" is inactive (deleted); its transcript is retained, but it is no ` +
+                        'longer part of this session\'s roster, so no conversation can read it (see threadList). A host ' +
+                        'can still read it by id.'
+                );
+            }
+
+            return cloneMessages(state.agent.messages);
+        }
 
         // B1: the branch fallback, before the not-found error.
         const branch = branchRecordOf(address);
@@ -7475,6 +8017,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                       min: 0,
                   });
 
+        // IT19 R3: the third member of the forensic trio, and it is validated against the SNAPSHOT
+        // READER'S OWN table (`core/snapshot.ts:113` `isHarnessRunStopReason`, the one place the
+        // nine members are spelled) rather than a local list. A value outside the union is REFUSED,
+        // not dropped, for the same reason the pair above is: the lane COMMITS the object this call
+        // returns, so a reason neither side can name becomes a row the next snapshot cannot persist
+        // — and the worker would re-derive its archive forever.
+        if (input.stopReason !== undefined && !isHarnessRunStopReason(input.stopReason)) {
+            throw new HarnessError(
+                `Invocation "${invocationId}".stopReason must be one of: ${HARNESS_RUN_STOP_REASONS.join(
+                    ', '
+                )} (or be absent).`
+            );
+        }
+
+        const stopReason = isHarnessRunStopReason(input.stopReason) ? input.stopReason : undefined;
+
         const replaced = invocationRecords.has(invocationId);
         const completedOrder =
             input.completedOrder === undefined
@@ -7504,6 +8062,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // cancellation it described.
             ...(status === 'completed' || partialContent === undefined ? {} : { partialContent }),
             ...(status === 'completed' || cancelledAtMessage === undefined ? {} : { cancelledAtMessage }),
+            // IT19 R3: same mutual exclusion as the pair above, and the reader enforces it the same
+            // way (`core/snapshot.ts:342-362` refuses a `completed` row carrying the key). A lane
+            // child that was cancelled and later COMPLETES has its row replaced wholesale here, so
+            // dropping the reason on `completed` is what stops a stale cause outliving the run it
+            // described — exactly the rule `finishInvocation` applies to a locally-terminal run.
+            ...(status === 'completed' || stopReason === undefined ? {} : { stopReason }),
             ...(input.threadId === undefined ? {} : { threadId: input.threadId })
         };
 
@@ -7532,7 +8096,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(archived.partialContent === undefined ? {} : { partialContent: archived.partialContent }),
                 ...(archived.cancelledAtMessage === undefined
                     ? {}
-                    : { cancelledAtMessage: archived.cancelledAtMessage })
+                    : { cancelledAtMessage: archived.cancelledAtMessage }),
+                // IT19 R3: carried exactly as stored, for the digest reason stated above — once the
+                // archive digest covers `stopReason`, a returned object that omitted it would put
+                // the coordinator and the lane permanently out of agreement.
+                ...(archived.stopReason === undefined ? {} : { stopReason: archived.stopReason })
             },
             replaced
         };
@@ -9015,7 +9583,36 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // Already answered (a live delivery won, or a sibling insert covered the call): the
             // account exists, so the debt is paid. This is AC3, and it is why a reprinted account
             // can never turn into a duplicate.
-            if (hasToolResult(run.agent, debt.callId)) continue;
+            //
+            // IT19 RB — UNLESS WHAT ANSWERED IT WAS A PLACEHOLDER. A retained run (R1) that was cut
+            // off mid-call now ends with a synthesized result saying "this call has no recorded
+            // outcome; re-issue it if you need the result". When the debt below is the account of
+            // THAT call — a delegation whose child kept working and finished after the parent's run
+            // ended — the placeholder is the wrong thing on the record, and appending the real
+            // account beside it would tell the model two contradictory facts about one call id.
+            // So the placeholder is upgraded IN PLACE: the real account as `content`, same call id,
+            // same position, same `messageId`, and no `outcome` key (a completed result carries
+            // none, and a placeholder never wrote one — core/tool-outcome.ts rule 2 puts both
+            // families in the "reads healthy" spelling, and this upgrade keeps that true).
+            const existing = toolResultOf(run.agent, debt.callId);
+
+            if (existing !== undefined) {
+                if (isInterruptedToolResult(existing)) {
+                    // `owedAccountOf` returns `undefined` for a debt it cannot describe (a child
+                    // whose ledger row is gone). Then the placeholder stays exactly as it was: an
+                    // honest "no outcome was recorded" beats a rewrite into an empty account.
+                    const account = owedAccountOf(run, debt);
+
+                    if (account !== undefined) {
+                        existing.content = account;
+                        if (run.branch === undefined) {
+                            notifyStateChange('agent_message', { agent: run.agent.name });
+                        }
+                    }
+                }
+
+                continue;
+            }
 
             const content = owedAccountOf(run, debt);
 
@@ -11494,8 +12091,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         if (decision.action !== 'stop') return;
 
-        const reason = new HarnessError(
-            decision.reason ?? `A plugin stopped this run at turn ${String(run.iteration)}.`
+        // IT19 R3: the cause of the abort this decision performs is stamped on the reason object,
+        // which is BOTH the value `stopThreadState` aborts the conversation's controller with (so a
+        // conversation run classifies from it, via `throwIfAborted`) and the value a branch run
+        // throws directly (so the same classification works with no signal at all).
+        //
+        // The member is `plugin-parked`, and it is a deliberate EXTENSION of that member's documented
+        // cause ("a plugin parked the conversation at a turn boundary and the run ended while it was
+        // parked", types/index.ts:2935). A `turn.before` `stop` is the same actor, the same boundary,
+        // and the same non-failure — only narrower: it ends the RUN instead of parking the
+        // conversation — and the union is closed, with no member for "a plugin ended this run". The
+        // alternatives were worse: `user-stopped` would attribute plugin intent to a host, and
+        // `api-error` would claim a provider that never failed. Both this spelling and the reuse are
+        // reported rather than hidden, because a consumer branching on `plugin-parked` is asking
+        // exactly the right question either way: "a plugin stopped this, and it can be started again".
+        const reason = withRunStopCause(
+            new HarnessError(
+                decision.reason ?? `A plugin stopped this run at turn ${String(run.iteration)}.`
+            ),
+            'plugin-parked'
         );
 
         // Set BEFORE the abort fires: `runAgentCore`'s catch recomputes `run.aborted`
@@ -11591,6 +12205,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // this run streamed on EARLIER turns is already committed to the
             // transcript, which `partialContent` reads separately.
             run.streamedText = '';
+            // IT19 R3: the same per-request boundary owns the retry observation. Clearing it here is
+            // what makes the flag answer the question "were there attempts, for THIS request, that
+            // failed?" instead of "did anything ever retry in this run?" — a run whose first three
+            // turns retried and recovered must not report `retries-exhausted` when its fourth turn
+            // died on the first attempt.
+            run.sawRetryFrame = false;
 
             const iterator = brain
                 .turn({
@@ -11646,6 +12266,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                             // (no commit happened), so the in-flight buffer restarts with
                             // the re-sent request.
                             run.streamedText = '';
+                            // IT19 R3: this frame IS the evidence that the retry policy had an
+                            // attempt left and spent it. A run that dies with this flag set reports
+                            // `retries-exhausted`; one that dies without it never got a retry, which
+                            // is `api-error`. Only the agent knows the difference (retry ownership,
+                            // core/agent.ts R1), and this is the one place the harness sees it.
+                            run.sawRetryFrame = true;
 
                             await emit(run, {
                                 type: 'retry',
@@ -11816,8 +12442,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const queued = state.queue.splice(0);
         for (const content of queued) run.agent.user(content);
-        // Track what this run consumed so a NON-STOP failure can preserve it for
-        // the next host turn (the rollback below removes the appended messages).
+        // Ledger of what THIS run consumed from the queue. It used to exist for one reason: the
+        // failure rollback below spliced these appended messages out of the transcript, so the
+        // catch re-queued them for the next host turn. IT19 (R1) removed that rollback for a
+        // thread run — and this function only ever runs for a thread run — so the text now
+        // survives in the retained transcript and nothing re-queues it. The array is kept as the
+        // drain ledger (and cleared on failure) because it is what makes that change reviewable:
+        // a reader can see exactly which steers this run had already consumed when it died.
         run.steering.push(...queued);
         notifyRunStateChange(run, 'agent_message', { agent: run.agent.name });
         notifyStateChange('thread');
@@ -11828,14 +12459,120 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // running. `maxIterations` optionally bounds model turns (unset means no
     // bound); exhaustion cancels the pending work before throwing so no orphan
     // task survives a rolled-back run.
+    // IT19 R3 — ONE CLASSIFICATION, AT THE ONE EXIT THAT TERMINALIZES A RUN.
+    //
+    // `runAgentCore`'s catch is where every non-concluded end of a run converges, and by then the
+    // specific cause is usually gone: an abort is an abort. So the rules below are ordered by how
+    // well each one is KNOWN, from a fact stamped at the site that caused it to a last-resort guess,
+    // and the first match wins. The table, in that order:
+    //
+    //   stamp on the run      → that value. Today only the turn-cap guard, which throws without
+    //                           touching a signal, so no downstream observer could name it.
+    //   stamp on the reason   → that value. `armWallClock` stamps `timeout`; `stopThread`/
+    //                           `stopAllThreads` stamp `user-stopped`; a plugin's `turn.before` stop
+    //                           stamps `plugin-parked`. The reason object reaches here through
+    //                           `throwIfAborted` (it throws `signal.reason`) and survives
+    //                           `linkSignals`, so a delegated child reports the cause that killed it.
+    //   a plugin stopped it   → `plugin-parked` (a branch run has no signal, so its marker is the
+    //                           only evidence — that is why `pluginStopped` exists at all).
+    //   the record is 'paused' → `plugin-parked`: a park that OUTLIVED the run. The conversation is
+    //                           parked and this run ended inside the park, which is the documented
+    //                           cause of that member, stated by the record rather than by a stamp.
+    //   the record is 'stopped' → `user-stopped` for an abort whose reason carried no stamp: the
+    //                           stop family wrote that status, so the status is the evidence.
+    //   the parent is gone     → `parent-closed`: an abort with no stamped cause while the run that
+    //                           started this one is already dead or aborted means the child was
+    //                           abandoned by a parent that moved on.
+    //   otherwise aborted      → `caller-released`: the caller of this run released its own signal
+    //                           (a `toolCancel`, a host abort), which is the only actor left.
+    //   a retry was spent      → `retries-exhausted` (the request that failed had been re-sent at
+    //                           least once — see `RunState.sawRetryFrame`).
+    //   anything else          → `api-error`.
+    //
+    // The two ORDER-SENSITIVE choices, stated because they are the ones a reader will question:
+    //   - a stamp on the reason outranks the record's status. A host that stops a thread AND a
+    //     wall clock that expires in the same tick cannot both be right, and the reason that actually
+    //     aborted the controller is the one that happened first (`linkSignals` forwards the first
+    //     reason), so it wins over the status the other actor wrote;
+    //   - the fallback for a NON-abort failure is `api-error`, and that is an OVER-CLAIM this harness
+    //     accepts rather than a fact: a run can also die from a reporter that threw, a malformed
+    //     tool-call id set, or a defect inside the loop, and the closed union has no member for
+    //     "the runtime itself failed" (types/index.ts:2906-2910 forbids adding one without a
+    //     producer). `error` keeps the real sentence either way; the machine-readable field only
+    //     ever says the most specific thing the evidence supports, which here is "this run did not
+    //     conclude and the provider is the only named suspect".
+    const classifyRunStopReason = (run: RunState, error: unknown): HarnessRunStopReason => {
+        if (run.stopReason !== undefined) return run.stopReason;
+
+        // The reason that aborted this run's signal, and the caught value — usually the SAME object
+        // (`throwIfAborted` throws `signal.reason`), but a tool that rejected with its own error, or
+        // a branch run that threw the plugin's reason directly, puts them apart. Checking both keeps
+        // the stamp reachable on every exit shape.
+        const stamped = runStopCauseOf(error) ?? runStopCauseOf(run.signal?.reason);
+
+        if (stamped !== undefined) return stamped;
+
+        const status = run.threadState?.record.status;
+
+        if (run.aborted || run.signal?.aborted === true) {
+            if (run.pluginStopped) return 'plugin-parked';
+            if (status === 'paused') return 'plugin-parked';
+            if (status === 'stopped') return 'user-stopped';
+            // A run whose ANCESTOR is already finished was not cancelled by its own caller; it was
+            // left behind when that caller moved on. `parent` is the direct ancestor, which is the
+            // one whose release actually aborts this run (the signal bridge is per-run).
+            if (run.parent !== undefined && (run.parent.active === false || run.parent.aborted)) {
+                return 'parent-closed';
+            }
+
+            return 'caller-released';
+        }
+
+        return run.sawRetryFrame ? 'retries-exhausted' : 'api-error';
+    };
+
+    // IT19 R1 — A RETAINED TAIL HAS TO BE REPLAY-SAFE, and one committed turn is not: the guard
+    // below rejects an assistant turn whose tool-call ids collide with the transcript
+    // (`assertToolCallIds`), and a provider rejects a transcript in that shape outright. Retaining
+    // it would therefore poison EVERY later request on this conversation, not just the failed one,
+    // so the rejected turn is dropped before the catch decides what to keep.
+    //
+    // It matches the LAST entry by call identity, not object identity: core/agent.ts commits a
+    // separate object (`assignMessageId`'s copy) from the `done` payload the harness holds, so the
+    // two share the `toolCalls` array (or, failing that, the exact ids in the exact order) rather
+    // than being one object. Anything else at the tail is left exactly where it is.
+    const discardRejectedTurn = (brain: Agent, message: HarnessAssistantMessage): void => {
+        const messages = brain.messages;
+        if (messages.length === 0) return;
+
+        const last = messages[messages.length - 1];
+
+        if (last === undefined || last.role !== 'assistant') return;
+
+        const lastCalls = last.toolCalls;
+
+        const sameTurn =
+            lastCalls === message.toolCalls ||
+            (lastCalls !== undefined &&
+                lastCalls.length === message.toolCalls.length &&
+                message.toolCalls.every(
+                    (call, index) => call?.id === lastCalls[index]?.id
+                ));
+
+        if (sameTurn) messages.pop();
+    };
+
     const runAgentCore = async (
         run: RunState,
         input: string
     ): Promise<HarnessAssistantMessage> => {
         const brain = run.agent;
 
-        // Everything past this index belongs to this run. A failure truncates
-        // back to it, so a failed call is never replayed on the next attempt.
+        // Everything past this index belongs to this run. IT19 (R1) split what a failure does
+        // with it: a BRANCH or ephemeral run still truncates back to here, so a failed call is
+        // never replayed on the next attempt, while a THREAD-bound run KEEPS the tail (the
+        // transcript is durable host state — see the retention boundary in this function's catch).
+        // Both sides still use this index the same way: it is the run's own window.
         const commitIndex = brain.messages.length;
 
         await emit(run, { type: 'start', agent: brain.name, model: brain.model() });
@@ -11875,6 +12612,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     recordOwedAbandonments(run);
                     scheduler.abandonScope(run.scope);
                     const limit = turnLimit;
+                    // IT19 R3: the ONE cause this exit has to stamp on the RUN rather than on an
+                    // abort reason — exhaustion throws a plain HarnessError and never touches a
+                    // signal, so nothing downstream could tell `turn-cap` apart from a provider
+                    // failure except the site that raised it. An explicit stamp also outranks every
+                    // other rule in `classifyRunStopReason`, which is what keeps a run that hit the
+                    // cap WHILE being stopped from reporting the stop instead.
+                    //
+                    // It covers both bounds the guard takes the minimum of: the harness-wide
+                    // `maxIterations` and a delegation's per-child `maxTurns` (I5) — one cause,
+                    // because the observable fact ("this run was not allowed another model turn") is
+                    // the same whichever bound bit, and the error text already names which.
+                    run.stopReason = 'turn-cap';
                     throw new HarnessError(
                         run.autoAnswer
                             ? 'The owner fork did not answer in one tool-free response; actionRequest accepts no tools.'
@@ -11944,7 +12693,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // The agent already committed it in memory; the throw below rolls
                 // it back and only the post-rollback state is persisted.
                 if (message.toolCalls.length > 0) {
-                    assertToolCallIds(brain, message.toolCalls);
+                    try {
+                        assertToolCallIds(brain, message.toolCalls);
+                    } catch (error) {
+                        // IT19 R1: only a run whose tail is going to be RETAINED has to clean up
+                        // (a conversation keeps its transcript, so an unpairable turn in it outlives
+                        // this failure). A branch/ephemeral run splices the whole tail away in its
+                        // catch anyway, so it keeps its exact prior forensic shape — including the
+                        // `messagesProduced` count that still includes the rejected turn.
+                        if (run.threadState !== undefined) discardRejectedTurn(brain, message);
+
+                        throw error;
+                    }
                 }
 
                 // Autoanswer branches are tool-free by contract: a tool call is
@@ -12157,20 +12917,61 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     : lastSubstantiveText(brain.messages, commitIndex);
             run.streamedText = '';
 
-            // R5 preservation: steering this run drained is rolled back with the
-            // transcript, so hand it to the NEXT host turn in its original order.
-            // A stop is different by contract: the host stopped the conversation,
-            // and stopThread already cleared the queue (and bumped the epoch), so
-            // the guidance is discarded instead of resurrected.
-            if (run.threadState !== undefined && run.steering.length > 0) {
-                if (!run.aborted && run.threadState.record.status !== 'stopped') {
-                    run.threadState.queue.unshift(...run.steering);
-                    notifyStateChange('thread');
-                }
-                run.steering = [];
-            }
+            // IT19 (R1/R3/R4) — the cause is classified HERE, at the one exit every non-concluded
+            // run converges through, and BEFORE the transcript decision below: the rules that read
+            // the record's `failed`/`paused`/`stopped` status must see the transcript as the model
+            // last saw it, and a run that keeps its tail (below) changes that shape for good.
+            run.stopReason = classifyRunStopReason(run, error);
 
-            brain.messages.splice(commitIndex);
+            // IT19 (R1) — THE RETENTION BOUNDARY.
+            //
+            //   Thread-bound run (`run.threadState !== undefined`)  → the whole tail is KEPT.
+            //   Branch / ephemeral run                               → spliced, as before.
+            //
+            // A thread transcript is durable state the host owns: `save()` persists it and the next
+            // `load()` restores it, so a stop, a parked plugin, a timeout or an API error must not
+            // silently erase the turns the model was actually shown — that is the diff that made a
+            // stopped thread unreadable and unreproducible. A branch is a throwaway conversation
+            // cloned out of its parent's transcript, and its parent takes the answer, not the
+            // transcript; keeping a half-finished branch tail would leak branch bytes into a thread
+            // that never asked for them, so its rollback stays exactly as it was.
+            //
+            // PAIRING IS REPAIRED, NOT SPLICED. The retained tail can end in an assistant turn
+            // whose `toolCalls` never got results — the model rejects that shape outright, and
+            // `hasToolResult` would keep reporting the call as pending, so the NEXT request could
+            // not even be built. Every dangling call therefore gets one synthesized tool result
+            // (`core/transcript-repair.ts`, the in-run sibling of the server's crash repair, with
+            // its own wording because this is not always a crash). A call that DID complete in this
+            // window already has its result and is left alone; a second request to this thread then
+            // reads the interrupted turn as history rather than as a 400.
+            //
+            // `run.messagesProduced` and `run.partialContent` above are captured before either
+            // branch, so the forensic counts report the same thing on both sides of the boundary.
+            if (run.threadState === undefined) {
+                brain.messages.splice(commitIndex);
+            } else {
+                // The steering text this run drained was appended as user messages inside the
+                // retained window, so the queue no longer has to be handed back. The old
+                // compensation — re-queue `run.steering` for the next host turn, and discard it
+                // when the run was stopped — existed only because the splice below deleted the
+                // messages it had just appended (see `drainThreadQueue`); keeping the tail keeps
+                // the guidance, and re-queueing it would replay the same steer twice. A stopped
+                // run gains too: what used to be discarded outright now survives in the
+                // transcript the host keeps.
+                run.steering = [];
+
+                repairInterruptedToolCalls(brain.messages, commitIndex, (entry) =>
+                    assignMessageId(
+                        {
+                            role: 'tool',
+                            content: SYNTHESIZED_INTERRUPTED_TOOL_RESULT_TEXT,
+                            toolCallId: entry.callId,
+                            name: entry.callName
+                        },
+                        brain.messages
+                    )
+                );
+            }
             notifyRunStateChange(run, 'agent_message', { agent: brain.name });
 
             const info = toErrorInfo(error);
@@ -12344,6 +13145,42 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
+    // IT19 (R5) — the one place a NON-CONCLUDED exit touches the thread record, so the primary
+    // commit and the `runAgent` backstop cannot drift apart. The STATUS rule is unchanged and
+    // deliberately minimal: only a record still reading 'running' is rewritten, and it goes to
+    // 'idle'. A record the run left at 'stopped' (the stop family wrote it) or 'paused' (a plugin
+    // parked it) keeps what the actor wrote — that is the actor's intent, not this commit's.
+    //
+    // THE MARKER (R4) rides on EVERY non-concluded exit and is KEPT, whatever status the record ends
+    // at. It used to be deleted when the record came to rest at 'idle' — "a marker on an idle thread
+    // would claim someone stopped it" — and that erased the whole point of the field for the common
+    // interruption: a run that timed out, exhausted its provider, or hit its turn cap normally ends
+    // at 'idle', so the machine-readable cause existed only inside the invocation row and on the
+    // 'stopped' carriers. R4 asks for the cause on the record, so presence is now keyed to the EXIT,
+    // not to the status, and `HarnessThreadSnapshot.stopReason` already documented that reading
+    // ("an idle row can carry a stop reason"; ../types/index.ts:3625-3634).
+    //
+    // Why that does not confuse a reader: `status` says what the conversation may do next and
+    // `stopReason` says why the last run stopped — they were always orthogonal. Nothing decides a
+    // refusal from the marker alone: the `threadSend` resumption gate (see `resumableStop` in
+    // `postThreadMessage`) requires `status === 'stopped'` FIRST, so an idle record carrying a cause
+    // still answers `delivered: 'started'`, and `user-stopped` / `plugin-parked` stay outside
+    // `RESUMMABLE_RUN_STOP_REASONS` and keep being refused.
+    //
+    // The key is dropped only where a fresh fact replaces it: a start (`status = 'running'`,
+    // :13450-ish), a concluded run (`commitRunTerminal`), `restore()` of a default conversation, and
+    // `reset()`.
+    const applyNonConcludedTerminal = (run: RunState): void => {
+        const record = run.threadState?.record;
+        if (record === undefined) return;
+        if (record.status === 'running') record.status = 'idle';
+        // `run.stopReason` is undefined for a run that concluded, and this function also runs from
+        // the `finally` backstop after a clean `commitRunTerminal` — writing nothing there is what
+        // keeps a completed conversation marker-free instead of re-seating a cause the commit just
+        // removed.
+        if (run.stopReason !== undefined) record.stopReason = run.stopReason;
+    };
+
     const commitRunTerminal = (
         run: RunState,
         outcome: { message?: HarnessAssistantMessage; error?: unknown }
@@ -12361,9 +13198,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             threadState.controller = undefined;
         }
 
+        if (outcome.message === undefined) {
+            // IT19: a non-concluded exit — stopped, parked, timed out, failed — carries its
+            // cause with it. `thread.idle` below keeps checking for an `idle` status, so a
+            // parked or stopped thread still refuses an ordinary send until something resumes it.
+            applyNonConcludedTerminal(run);
+            return;
+        }
+
         if (threadState.record.status === 'running') {
             threadState.record.status = 'idle';
         }
+        // IT19: a concluded run leaves no stop marker behind, whatever status the run ended in.
+        delete threadState.record.stopReason;
     };
 
     // The one entry point every path uses: the harness call, ctx.run, and
@@ -12641,6 +13488,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 abortErrorSet: false,
                 // T2.3: a run starts un-stopped; only a `stop` decision sets it.
                 pluginStopped: false,
+                // IT19 R3: no cause yet — the site that ends the run supplies one, and the catch
+                // classifies whatever no earlier site claimed.
+                sawRetryFrame: false,
                 iteration: 0,
                 // I5: the caller-supplied turn bound, normalised the same way
                 // `delegateFor` normalises `timeoutMs` — a missing, non-number,
@@ -12717,6 +13567,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // is the whole state machine.
             if (resolvedThread !== undefined) {
                 resolvedThread.record.status = 'running';
+                // IT19 (R5): a start ends the previous interruption — the marker describes the
+                // exit this conversation is now moving past, so it must not outlive the start
+                // (a stale key would make the NEXT non-concluded exit report the PREVIOUS
+                // cause, and would decide a later `threadSend` refusal wrongly). The clear is
+                // unconditional because this flip is: a thread that arrives here was either
+                // dormant-stopped and RESUMED (a resumable cause) or idle.
+                delete resolvedThread.record.stopReason;
                 resolvedThread.record.invocationId = String(id);
                 resolvedThread.controller = threadController;
                 resolvedThread.run = run;
@@ -12886,6 +13743,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // B2: same commit on the failure path, so a `run.failed` handler can
                 // delete the conversation too (a ledger entry that survives its
                 // conversation is the state this makes unrepresentable).
+                //
+                // IT19 (R3/R4) — `runAgentCore`'s own catch classifies with the interrupted
+                // transcript in hand, which is the better answer, so this is a backstop for the
+                // exits that never reach it: refused after acquiring the actor, an abort outside
+                // the inner try, a throw from the terminal commit itself. Without this line
+                // those runs would terminalize with no cause at all.
+                run.stopReason ??= classifyRunStopReason(run, error);
+
                 commitRunTerminal(run, { error });
 
                 // D1: the failure path stamps the carrier too — a child that threw, timed out,
@@ -12941,9 +13806,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     if (resolvedThread.controller === threadController) {
                         resolvedThread.controller = undefined;
                     }
-                    if (resolvedThread.record.status === 'running') {
-                        resolvedThread.record.status = 'idle';
-                    }
+                    // IT19 (R5): the backstop goes through the SAME terminal application as the
+                    // primary commit, so a run that died before `commitRunTerminal` could run
+                    // (refused after owning the actor, an abort outside the inner try) still gets
+                    // its status resolved and its cause recorded — and a run that did use the
+                    // commit changes nothing here, because every statement is guarded.
+                    applyNonConcludedTerminal(run);
 
                     // R2 plugin hook: the conversation stopped working. Emitted ONLY for
                     // a real transition to idle — a record left 'stopped' already had
@@ -13061,6 +13929,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(record.cancelledAtMessage === undefined
                     ? {}
                     : { cancelledAtMessage: record.cancelledAtMessage }),
+                // IT19 (R3/R5): the machine-readable CAUSE, written exactly when the live record
+                // holds one — which is only ever a non-completed status, because
+                // `finishInvocation` drops it on a completed one. Absent for every row written
+                // before the field existed, and `core/snapshot.ts` accepts that absence, so the
+                // schema version stays 2.
+                ...(record.stopReason === undefined ? {} : { stopReason: record.stopReason }),
                 // Issue 0033/0024: the OWNER travels too. `purgeThread`'s delete cascade matches
                 // `record.threadId`, and this projection is the only thing that rebuilds those
                 // records after a reload — so writing the key here (only when the invocation has
@@ -13102,6 +13976,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(state.record.contextLane === undefined || state.record.contextLane === 0
                     ? {}
                     : { contextLane: state.record.contextLane }),
+                // IT19 (R3/R5): the cause of the interruption, written only when the live record
+                // holds one. `status` alone could not say whether a 'stopped' conversation was
+                // stopped by a host, parked by a plugin, or timed out — and after a restart that
+                // distinction used to be gone for good, which is what made a resumed thread's next
+                // send unpredictable (the refusal vs resume decision reads this key).
+                ...(state.record.stopReason === undefined
+                    ? {}
+                    : { stopReason: state.record.stopReason }),
+                // IT19 (R2): the SOFT-DELETE marker, and it is durable on purpose — a deleted
+                // conversation that vanished from the document would be destroyed by the very next
+                // save, which is the outcome the soft delete exists to prevent. Only `true` is ever
+                // written: an active row simply omits the key, so every document this build has
+                // already written round-trips byte-for-byte (`restore -> snapshot` on an active
+                // thread adds nothing).
+                ...(state.record.inactive === true ? { inactive: true as const } : {}),
+                ...(state.record.inactiveAt === undefined
+                    ? {}
+                    : { inactiveAt: state.record.inactiveAt }),
                 messages: readHarnessMessages(
                     state.agent.messages,
                     `thread "${state.record.id}" messages`
@@ -13112,9 +14004,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // exist, so every pre-thread snapshot (and fixture) keeps its shape. The
         // high-water mark travels with the (possibly empty) list, so a deleted
         // thread's id is never minted again after a restore.
+        //
+        // IT19 R3: the list is capped HERE, at the one place the kernel's document is built, by the
+        // same rule the server store applies (`./server/sessions.ts capThreadRecords`) — see
+        // `capRetiredThreadRecords` for why the pair has to retire the same rows and why an ACTIVE
+        // conversation is never one of them. Soft-deleting no longer frees a creation slot (the
+        // `activeHostThreadCount` guard in `createThreadState` counts active rows only), so retiring
+        // the oldest retired rows is what keeps `restore()`/`readThreads` from refusing a session
+        // that simply accumulated deleted conversations.
+        const retainedHostThreads = capRetiredThreadRecords(hostThreads);
+
         const threadFields =
-            hostThreads.length > 0 || threadIdSequence > 0
-                ? { threads: hostThreads, threadSequence: threadIdSequence }
+            retainedHostThreads.length > 0 || threadIdSequence > 0
+                ? { threads: retainedHostThreads, threadSequence: threadIdSequence }
                 : {};
 
         return {
@@ -13428,6 +14330,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(result.cancelledAtMessage === undefined
                     ? {}
                     : { cancelledAtMessage: result.cancelledAtMessage }),
+                // IT19 (R3/R5): the cause is rebuilt with the row, keyed only when the document
+                // has it — a restored record therefore has exactly the shape a live one has, with
+                // no `stopReason: undefined` sitting where absence used to mean "pre-feature row".
+                ...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
                 // Issue 0033/0024: the owner is rebuilt with the row, so `purgeThread`'s
                 // delete-cascade predicate (`record.threadId`) still matches after a reload. The
                 // key is optional on disk and spread only when present, which restores a record
@@ -13496,6 +14402,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // a default conversation would state a lane the document cannot justify.
                 delete state.record.ownerThreadId;
                 delete state.record.contextLane;
+                // IT19 (R3/R5): same rule for the cause. A default conversation's status is
+                // rewritten to 'idle' here, so a stop marker left on it would name an exit this
+                // document cannot justify — and, worse, a stale marker would decide whether the
+                // first `threadSend` after the restart is refused or resumes the conversation.
+                delete state.record.stopReason;
             }
         }
 
@@ -13522,7 +14433,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // restart, and its NEXT compaction bumps 2 -> 3 rather than restarting
                     // at 0. `readThreads` normalized away a `0`, so a present value here is
                     // always a real lane >= 1.
-                    ...(entry.contextLane === undefined ? {} : { contextLane: entry.contextLane })
+                    ...(entry.contextLane === undefined ? {} : { contextLane: entry.contextLane }),
+                    // IT19 (R3/R5): the cause comes back with the row, so a thread that a
+                    // restart found interrupted still says WHY — and a `stopped` conversation the
+                    // document says was interrupted by something the host can move past (a
+                    // timeout, an API failure) can still be resumed by a peer's message after the
+                    // reload instead of degrading into the permanent refusal.
+                    ...(entry.stopReason === undefined ? {} : { stopReason: entry.stopReason }),
+                    // IT19 (R2): an inactive row stays inactive across a restart. The reader
+                    // normalizes a `false` to absence, so this only ever re-seats a real `true`,
+                    // and the record keeps its exact live shape (an active thread has neither
+                    // key, exactly like a freshly created one).
+                    ...(entry.inactive === true ? { inactive: true as const } : {}),
+                    ...(entry.inactiveAt === undefined ? {} : { inactiveAt: entry.inactiveAt })
                 },
                 agent: threadAgent,
                 queue: [],
@@ -14259,14 +15182,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         // Thread ownership: a HOST thread is an independent conversation backed by its own
-        // Agent clone, but its record names the owning agent, and `threadSend`/`threadList`
-        // still address it. Removing the agent under those conditions would leave a live
-        // conversation with no roster entry, so it is refused; the host stops/deletes its
-        // threads first.
+        // Agent clone, but its record NAMES the owning agent. Removing the agent behind such a row
+        // would leave the durable document naming a brain this harness can no longer rebuild, so
+        // the restore of that very document would fail — that, not a missing roster entry, is why
+        // the removal is refused.
+        //
+        // IT19 R2 (2026-11-15) changed the REMEDY this sentence offers, NOT the refusal. Deleting a
+        // thread now MARKS it `inactive` and RETAINS the row (../types `HarnessThreadRecord.inactive`
+        // — the roster stops naming it, the snapshot and the persistence directory keep it), and
+        // this loop walks `threadStates` with retained rows INCLUDED, because the block is about the
+        // retained record rather than the discovery surface. So "delete the thread first" is no
+        // longer a door: a `threadDelete` cannot lift this refusal. The one thing that releases a
+        // retained conversation is the session's own deletion — the rule the spec states and the
+        // thread tools now repeat.
         for (const state of threadStates.values()) {
             if (state.record.origin === 'host' && state.record.agent === key) {
                 throw new HarnessError(
-                    `Cannot remove agent "${key}" while it owns thread "${state.record.id}"; delete the thread first.`
+                    `Cannot remove agent "${key}" while it owns thread "${state.record.id}"; a deleted thread is still retained, so only deleting the session releases it.`
                 );
             }
         }
@@ -14500,8 +15432,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // transcript), writes are the explicit lifecycle calls below. The default
         // conversation of every configured agent is always present as
         // `agent:<name>`; `createThread` adds independent conversations.
+        //
+        // IT19 R2 — DISCOVERY excludes a soft-deleted conversation: `threads()` and `thread()` stop
+        // naming it, exactly like `threadList` (they share `threadRoster`'s rule), which is what
+        // `HarnessThreadRecord.inactive` promises. `threadMessages` is the readability half and
+        // still answers for a host, and every durable surface (the snapshot, the persistence
+        // directory, a restore) keeps the row. A host that needs the released record itself reads
+        // the snapshot rather than this roster.
         threads: () =>
             [...threadStates.values()]
+                .filter((state) => state.record.inactive !== true)
                 .sort((left, right) => left.record.sequence - right.record.sequence)
                 .map((state) => threadRecordCopy(state.record)),
         // B1/B4: both reads accept the CALLER's thread id as an optional second argument
@@ -14515,7 +15455,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             const address = threadAddressOf(id);
             const state = threadStates.get(address);
-            if (state !== undefined) return threadRecordCopy(state.record);
+            // IT19 R2: an inactive conversation is not DISCOVERABLE through this door either, so it
+            // answers `undefined` like an unknown id — the record's own `inactive` flag is the fact
+            // that distinguishes them, and it is readable on the snapshot row.
+            if (state !== undefined) {
+                return state.record.inactive === true
+                    ? undefined
+                    : threadRecordCopy(state.record);
+            }
 
             // B1: `branch-N` resolves through the branch ledger, so the id `threadFork`
             // returned is the id `thread()` and `threadRead` answer with.
@@ -14617,6 +15564,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // leave a stale `ownerThreadId` (which a restart would not
                     // reproduce anyway).
                     delete state.record.ownerThreadId;
+                    // IT19 (R5): same reasoning for the stop marker. The status is rewritten to
+                    // 'idle' above, so a cause left behind would describe an exit of a
+                    // conversation that no longer exists — and it would decide whether the first
+                    // `threadSend` after the reset is refused. A host conversation's marker needs
+                    // no clearing: its whole row goes with the session.
+                    delete state.record.stopReason;
                 }
             }
             // A reset is a snapshot-managed mutation too: a server must persist

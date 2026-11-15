@@ -7,8 +7,7 @@ and its shipped shape differs from the design text below — see the note on the
 What is left is the remaining work plus the decisions that gate it: **T5.3** — tool-result
 elision for superseded LARGE results (the `annotate` writer), blocked on Open decisions 2 and
 on nothing else; and **T7's residue** — real-corpus and live-provider observations only.
-**T5.5** (provider overflow recovery) belongs to
-[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)
+**T5.5** (provider overflow recovery) belongs to issue 0004 (closed)
 and stays here as a pointer, not a task. The roadmap anchor is `knowledge.md:4345`
 ("Not built yet"), item 2 at `:4350-4369`, which now names the THIRD writer and the storage
 question that blocks T5.3 (the T5.3 clause itself at `:4363-4366`) — no longer the checkpoint,
@@ -26,9 +25,8 @@ Companion entries:
 [2026-11-09-plugin-pipeline-v2.md](./2026-11-09-plugin-pipeline-v2.md) (what a plugin **may
 do**; this entry is the first policy that should do it),
 [2026-11-09-context-inclusion-followups.md](./2026-11-09-context-inclusion-followups.md) (the
-exclusion primitive's own edges), and the budget/overflow gaps tracked once in
-[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)
-— linked, never duplicated here.
+exclusion primitive's own edges), and the budget/overflow gaps tracked once in issue 0004
+(closed) — linked, never duplicated here.
 
 ## Date / Method / Scope
 
@@ -123,8 +121,7 @@ the decision was.
 
 ### T5.5 — Provider overflow recovery (pointer, not a task)
 
-Recognizing "input too long", compacting, and retrying is
-[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)'s.
+Recognizing "input too long", compacting, and retrying is issue 0004 (closed)'s.
 It was not touched by this stage and is not work this file owns; the only thing this stage
 contributed to it is a more honest estimate to guard against.
 

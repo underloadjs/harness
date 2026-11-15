@@ -36,7 +36,7 @@
 //      answer is the compaction, everything before the instruction (and the intermediate
 //      turns) stops being sent, the thread is un-parked, and a continuation nudge restarts
 //      the conversation on the compacted head — plus both finalize paths, the disobedient
-//      model, the failed-run rollback, the flag that survives the commit, the phase guard,
+//      model, the failed-run park lift, the flag that survives the commit, the phase guard,
 //      and the restart persistence of everything the pass wrote.
 //
 // Two levels of test, deliberately: the guard factory is exercised with fakes, where the
@@ -2862,7 +2862,7 @@ describe('context-compaction summarize flow (T9)', () => {
         });
     });
 
-    it('lifts the park and rolls the pass back when the compaction request fails', async () => {
+    it('lifts the park when the compaction request fails and keeps the failed pass\'s turns', async () => {
         const seen: HarnessStreamRequest[] = [];
         const events: string[] = [];
         const estimates: number[] = [];
@@ -2894,12 +2894,21 @@ describe('context-compaction summarize flow (T9)', () => {
         await expect(writer.sendThreadInput(thread.id, PROMPT)).rejects.toThrow('provider down');
 
         // THE CONTRACT OF THE FAILURE PATH: a failed compaction costs the conversation
-        // nothing. The run's own rollback (`brain.messages.splice(commitIndex)`) removed the
-        // instruction it committed, `run.failed` lifted the park, and the thread is usable.
+        // its WORK but never its RECORD. `run.failed` lifts the park and the thread is
+        // usable; issue 0036 R1 removed the run's `brain.messages.splice(commitIndex)`,
+        // so the turns the failed pass committed stay on the record — the send's prompt
+        // and the compaction instruction the model was actually shown. Re-captured from an
+        // actual run: SEED, the prompt, the instruction, and nothing else. SEED itself is
+        // untouched (the pass died before it withheld any turn), there is no assistant turn
+        // to repair, and no summary was ever produced.
         expect(events).toEqual(['paused', 'resumed']);
         expect(writer.thread(thread.id)?.status).toBe('idle');
         expect(seen).toHaveLength(1);
-        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([{ role: 'user', content: SEED }]);
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: SEED },
+            { role: 'user', content: PROMPT },
+            { role: 'user', content: COMPACTION_INSTRUCTION }
+        ]);
 
         expect(diagnostics).toHaveLength(2);
         expect(diagnostics[1].message).toContain('lifted its park on thread');
@@ -2911,16 +2920,26 @@ describe('context-compaction summarize flow (T9)', () => {
             hook: 'run.failed'
         });
 
-        // Usable means USABLE: the next turn runs on the untouched transcript. It does not
-        // re-fire the pass, because the cooldown still holds the size the failed pass recorded
-        // — the same re-trigger protection the `exclude` lifecycle pins, from the other side.
+        // Usable means USABLE: the next submission runs, answers, and leaves the thread
+        // idle. The pass now RE-FIRES once, and that is a consequence of retention rather
+        // than a broken cooldown: Rule 3 re-arms when the projection has grown by the
+        // regrowth margin since the last fire, and the retained prompt + instruction rows
+        // ARE that growth (the old "it does not re-fire" claim assumed the failed pass had
+        // spliced them out, so the retry measured the same size and stayed cooled).
+        // Re-captured from an actual run: the second instruction is in flight (still
+        // included — it is what the model was just shown), and the block that pass compacted
+        // (SEED, both prompts, the first instruction) is switched off by it. The answer is
+        // the scripted 'later' either way, which is what keeps "usable" the contract here.
         const next = await writer.sendThreadInput(thread.id, 'retry now');
 
         expect(next.content).toBe('later');
         expect(writer.thread(thread.id)?.status).toBe('idle');
         expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
-            { role: 'user', content: SEED },
-            { role: 'user', content: 'retry now' },
+            { role: 'user', content: SEED, included: false },
+            { role: 'user', content: PROMPT, included: false },
+            { role: 'user', content: COMPACTION_INSTRUCTION, included: false },
+            { role: 'user', content: 'retry now', included: false },
+            { role: 'user', content: COMPACTION_INSTRUCTION },
             { role: 'assistant', content: 'later' }
         ]);
     });
@@ -3990,8 +4009,9 @@ describe('context-compaction display lane (C1)', () => {
         );
         expect(fake.lanes.get('thread-1')).toBe(1);
 
-        // The run's own rollback removed the instruction and any answer, so no compaction
-        // happened: the lane goes back to where it was (absent = 0), not one row too low.
+        // The failed pass produced no compaction: its injected instruction may be RETAINED
+        // in the conversation (issue 0036 R1) but no summary ever landed, so the lane goes
+        // back to where it was (absent = 0), not one row too low.
         passes.runFailed({
             ...runLifecycle,
             error: { message: 'provider exploded' } as never

@@ -14,8 +14,9 @@
 // What is pinned here:
 //   - the metadata literal: name, tags, visibility, and the FULL parameter schema
 //     with its exact description text (a model's only view of the contract);
-//   - the description's behavioural promises: the issue-0027 reason, permanence,
-//     the descendant scope, the five refusals, the cascade, and both receipt fields;
+//   - the description's behavioural promises: the issue-0027 reason, release-is-a-MARK
+//     (what survives, what stops being listed, and the idempotent re-delete), the
+//     descendant scope, the six refusals, the cascade, and both receipt fields;
 //   - the registration literal, exactly, including `order: 255` — the descending
 //     `threads`-group rule at src/harness.ts ~1157-1168 makes that number the
 //     guarantee that the roster is still declared before the tool that names it;
@@ -51,11 +52,13 @@ const sourceOf = (file: string): string =>
     readFileSync(fileURLToPath(new URL(file, import.meta.url)), 'utf8');
 
 // The `thread` row, restated in full so a wording change has to be a deliberate one.
+// IT19 R2: the last sentence changed with the soft-delete rule — a released id is not
+// part of the failure list any more, because re-deleting one restates its receipt.
 const THREAD_PARAMETER = {
     type: 'string',
     minLength: 1,
     description:
-        'Id of the finished thread to release, as reported by threadList - one of YOUR descendants. A running thread, a finished target with a running descendant, this agent\'s default conversation (agent:<name>), a thread outside your lineage, a fork\'s branch-N id, and a deleted or unknown id all fail. There is no default: your own current thread is never the target.'
+        'Id of the finished thread to release, as reported by threadList - one of YOUR descendants. A running thread, a finished target with a running descendant, this agent\'s default conversation (agent:<name>), a thread outside your lineage, a fork\'s branch-N id, and an unknown id all fail; re-deleting a descendant you have already released instead restates its receipt, because a released thread is inactive rather than destroyed. There is no default: your own current thread is never the target.'
 };
 
 // The two errors the entry can raise itself. The runtime owns every other refusal
@@ -137,15 +140,33 @@ describe('threadDelete metadata literal', () => {
         expect(description).toContain('A delegation FROM A CONVERSATION mints its own thread');
         expect(description).toContain("reuses that subagent's default conversation");
         expect(description).toContain('issue 0027');
-        // Read first: deletion is not a close, it is a purge.
+        // Read first: releasing closes the doors, so the answer has to be in hand already.
         expect(description).toContain('read what you still need with threadRead or agentResult first');
-        expect(description).toContain('Deletion is PERMANENT');
+        // WHAT DELETION DOES NOW (IT19 R2). The shipped promise was "Deletion is PERMANENT
+        // — the transcript, its invocation record and its branch lookups all go with it",
+        // and R2 changed the runtime behind that sentence: `purgeThread` marks the record
+        // `inactive`, and the transcript plus the invocation rows SURVIVE. So the
+        // description says MARK, names what survives, and states the one real destruction.
+        expect(description).toContain('Releasing is a MARK, not an erasure');
+        expect(description).toContain('while its transcript and its result records are RETAINED');
+        // Re-deleting a released descendant restates the receipt instead of throwing, and
+        // only the session itself destroys a conversation — the two claims that replace the
+        // old "a deleted id becomes unknown everywhere" sentence.
         expect(description).toContain(
-            'the transcript, its invocation record and its branch lookups all go with it'
+            're-deleting a descendant you have already released is not an error - it restates the same receipt and changes nothing'
         );
-        // A deleted id is an error everywhere, which is the promise 0027's review pinned.
         expect(description).toContain(
-            'a deleted id becomes unknown to threadList, threadRead, threadSend and this tool'
+            'the only thing that destroys one is deleting the session itself'
+        );
+        // THE BOUND, stated inside the SAME sentence (honesty pass, 2026-11-15). "Nothing an agent
+        // does destroys a conversation" is only true of the agent-facing doors: the session document
+        // holds `MAX_THREAD_RECORDS` (256, src/core/thread.ts:46) rows, and past that bound
+        // `capThreadRecords` (src/server/sessions.ts:4787) retires the OLDEST inactive rows with
+        // their transcripts. The caveat is APPENDED to the pinned sentence rather than rewritten
+        // over it, so the two pins above stay byte-exact.
+        expect(description).toContain('which keeps a bounded roster of 256 thread records');
+        expect(description).toContain(
+            'past that bound the OLDEST released rows are retired with their transcripts'
         );
         // Scope and refusals — ALL SIX, in the order the runtime reaches them
         // (`threadDeleteFor` lineage gate, then `deleteThread`: default conversation,
@@ -179,9 +200,25 @@ describe('threadDelete metadata literal', () => {
         expect(description).toContain('the cascaded ones included');
         expect(description).toContain('`removedInvocationIds`');
         expect(description).toContain('`removedBranchIds`');
-        // Deleting a conversation releases its RESULT records, which is the symptom that
-        // used to be silent: `agentResult` stops resolving those ids afterwards.
-        expect(description).toContain('`agentResult` can no longer read that `invocationId`');
+        // Deleting a conversation stops LISTING its RESULT records. Under the old permanent
+        // purge this was the silent symptom (`agentResult` could no longer read the id);
+        // after IT19 R2 the rows are retained, so the honest claim is that an id you already
+        // hold still answers and `removedInvocationIds` means "no longer listed".
+        expect(description).toContain(
+            '`agentResult` still answers an `invocationId` you already hold by that id'
+        );
+        // F-A Defect 3 (2026-11-15): the receipt prose now states ONE rule per field instead of
+        // one rule for three fields. `removedThreadIds`/`removedInvocationIds` describe RETAINED
+        // state that is hidden, so a re-delete restates them (that is what "it restates the same
+        // receipt" promised); `removedBranchIds` alone means "newly unlisted by this call",
+        // because a branch row lives in the bounded ledger and really does go. Pinned so the
+        // sentence cannot drift back over the code in `src/harness.ts`'s idempotent branch.
+        expect(description).toContain(
+            'Those two id sets mean HID BEHIND the conversation you named, not destroyed'
+        );
+        expect(description).toContain(
+            '`removedBranchIds` is the one set that means NEWLY UNLISTED BY THIS CALL'
+        );
     });
 });
 

@@ -1215,6 +1215,16 @@ export const sessionToolSourceOf = (
  * condition (./sessions.ts `removeSessionAgent`). Stating it here is what lets a client disable
  * the button instead of discovering the rule with a failing call.
  *
+ * IT19 R2 ASYMMETRY, stated because the flag and the write are no longer the same predicate: this
+ * read keys off `harness.threads()`, which hides a SOFT-DELETED (retained) conversation, while the
+ * write behind it also refuses on a retained row — the runtime's backstop (../harness.ts
+ * `removeAgent`) counts every thread state, because a retained document naming a removed agent
+ * cannot restore. So `deletable: true` next to a deleted-but-retained thread is "the roster no
+ * longer names a conversation", NOT a promise the DELETE succeeds; the refusal then states the
+ * remedy that does release it (the session being deleted). Surfaced rather than hidden: a flag
+ * computed from the discovery roster and a guard computed from the durable rows disagree, and the
+ * client is better off meeting the 409 than a read model that pretends otherwise.
+ *
  * R7 adds the session-defined members: a name in `preset.customAgents` was invented by THIS
  * conversation, so its text has no catalogue provenance — the row reports
  * `instruction_source: 'session'` for it and never asks the profile ladder about it.
@@ -1226,9 +1236,13 @@ export const sessionAgentRowsOf = (record: SessionRecord, context: ReadContext):
     const overrides = record.preset.agentInstructions ?? {};
 
     // R6: the agents that own at least one independent conversation. One pass over the thread
-    // records for the whole roster (the runtime's own `removeAgent` backstop checks the same
-    // predicate per member, ./harness.ts), and `origin === 'host'` is the whole distinction: a
-    // member's DEFAULT conversation (`agent:<name>`) travels with it and never blocks a removal.
+    // records for the whole roster, and `origin === 'host'` is the whole distinction: a member's
+    // DEFAULT conversation (`agent:<name>`) travels with it and never blocks a removal.
+    //
+    // NOT "the same predicate the runtime enforces" (it was, before IT19 R2): this roster skips a
+    // soft-deleted row, ../harness.ts `removeAgent` does not — see the asymmetry note on this
+    // function's header. The two deliberately stay different reads of the same fact, and the 409
+    // from the stricter one is the honest answer.
     const threadUsers = new Set(
         record.harness
             .threads()
@@ -1282,7 +1296,9 @@ export const sessionAgentRowsOf = (record: SessionRecord, context: ReadContext):
             ...(brain === undefined ? {} : { guidelines_count: brain.instructions.length }),
             editable: true,
             // The entry agent cannot be detached: every session needs an entry point. R6: neither
-            // can a member that still owns a conversation — its history would go with it.
+            // can a member that still owns a DISCOVERABLE conversation — its history would go with
+            // it. A soft-deleted conversation is not counted here (the roster hides it) yet still
+            // blocks the write; see the asymmetry note on this function's header.
             deletable: name !== definition.primary && !threadUsers.has(name),
             // A custom member always has a stated undo (`null` restores its stored base), and an
             // inherited member has one as soon as its text is not the plain shipped profile.

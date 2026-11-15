@@ -2249,7 +2249,7 @@ export type TaskResult = Omit<RecordsResult, 'entries' | 'counts' | 'removed'> &
 // limitation entries).
 export type NestedRunPolicy = 'allow' | 'refuse';
 
-// D1 (2026-11-14, docs/issues/minor-success-envelope-can-fabricate-identity-and-status.md)
+// D1 (2026-11-14, issue 0029, closed)
 // -----------------------------------------------------------------------------------------
 // An OUT-carrier the caller of `context.run` hands down with the call and the runtime fills
 // IN from the child run itself: the invocation identity, and the terminal status, of exactly
@@ -2892,6 +2892,52 @@ export type HarnessThread = {
 // life (including across snapshot/restore) and never derived from model input.
 export type HarnessThreadOrigin = 'agent' | 'host';
 
+// WHY A RUN reached a terminal state WITHOUT concluding — the machine-readable answer to
+// "why did this stop early", carried by the two records that outlive the run:
+// `HarnessThreadRecord.stopReason` (the conversation's last run) and
+// `HarnessAgentResultSnapshot.stopReason` (that run's own durable ledger row).
+//
+// NOT the model-level `HarnessStopReason` ('stop' | 'length' | 'tool_calls', :344 above),
+// which says why ONE provider request generated no more tokens. The two vocabularies are
+// orthogonal and never substitute for each other: a provider `length` inside a run that
+// then completed normally produces NO run-stop reason, and a run killed before its first
+// request has a run-stop reason with no provider stop reason at all.
+//
+// The set is CLOSED: every member names a cause this harness can actually reach, so a
+// consumer can branch on it without a fallback arm. Two tempting members are deliberately
+// NOT here — an out-of-memory kill (a process-level event no run observes) and a context
+// overflow (the compactor handles that INSIDE the run; if it cannot, the provider reports
+// `api-error`). Add a member only with a producer that emits it.
+export type HarnessRunStopReason =
+    // The CALLER of a delegated conversation released its own tool call (`toolCancel`):
+    // the child was abandoned mid-run while the parent moved on. `callCancelled: true`
+    // marks the same event on the delegate's tool envelope, so the release never reads as
+    // the child finishing on its own.
+    | 'caller-released'
+    // An operator or host stopped the thread (the stop family on the harness facade, and
+    // the server's stop route): the run ended by external intent, not by failure.
+    | 'user-stopped'
+    // The run outlived the wall-clock bound its host set for it.
+    | 'timeout'
+    // The run reached the maximum number of model turns one invocation may take.
+    | 'turn-cap'
+    // The run's budget (tokens / cost / steps) was spent before it concluded.
+    | 'budget-exhausted'
+    // The provider failed a request and that failure was terminal for the run.
+    | 'api-error'
+    // The provider kept failing and the retry policy ran out of attempts. Distinct from
+    // `api-error` because retries WERE available and every one of them failed, which is a
+    // fact a caller can act on (retry elsewhere) that a first-attempt failure is not.
+    | 'retries-exhausted'
+    // The conversation that started this run went away (its thread was deleted or its own
+    // run ended first), so the child had nobody left to answer.
+    | 'parent-closed'
+    // A plugin parked the conversation at a turn boundary (`turn.before`, the 'paused'
+    // status documented on `HarnessThreadStatus` just below) and the run ended while it was
+    // parked — the run-stop half of the park, which is why `parked` is NOT itself a thread
+    // status (the status note below says where that prose came from).
+    | 'plugin-parked';
+
 // 'running' means a run is active in this thread. 'stopped' means the host
 // halted it: no new run is started for it and AGENTS may not post into it until a
 // host resumes it through sendThreadInput (or deletes it).
@@ -2925,6 +2971,29 @@ export type HarnessThreadRecord = {
     // with `createThread`.
     origin: HarnessThreadOrigin;
     status: HarnessThreadStatus;
+    // WHY this thread's LAST run ended short of its conclusion; see
+    // `HarnessRunStopReason` above for the closed vocabulary and each member's cause.
+    //
+    // PRESENT EXACTLY WHEN that run stopped early, and the thread MUST clear it when it
+    // starts a fresh turn: the reason belongs to the run that ended, not to the
+    // conversation, so a stale one tells every later reader (the session tooling, the
+    // server, a restored host) that current work is still doomed by the previous run.
+    //
+    // PRESENCE IS KEYED TO THE EXIT, NOT TO THE STATUS. An interrupted run normally comes to
+    // rest at 'idle' — a timeout, an exhausted provider, an exhausted turn cap all do — and the
+    // cause still has to be readable afterwards, so `status: 'idle'` with a `stopReason` is the
+    // NORMAL shape of "this conversation was cut short and is waiting for its next turn", not a
+    // contradiction. Nothing may infer a halt from the marker alone: the readers that refuse a
+    // conversation gate on `status` first (the `threadSend` resumption rule additionally requires
+    // 'stopped' and a cause outside the host-owned set). The two fields were always orthogonal,
+    // and `HarnessThreadSnapshot.stopReason` below documents that for the durable half.
+    //
+    // Absent means "this thread has never run" or "its last run concluded" — the two are
+    // told apart by `invocationId` and `status`, never by a second marker here. It is
+    // DURABLE (it rides `HarnessThreadSnapshot.stopReason` below): the one fact a cancelled
+    // run must not lose across a restart is WHY it stopped, because the alternative is a
+    // consumer string-matching the cancellation text.
+    stopReason?: HarnessRunStopReason;
     // Monotonic per harness (creation order). Deliberately not a wall-clock time,
     // so ordering is deterministic in tests and after a restore.
     sequence: number;
@@ -2957,6 +3026,42 @@ export type HarnessThreadRecord = {
     // (`ThreadLane`, `laneOf`, `pumpLane`, `max_lane_workers`, `src/server/workers/lane-*`)
     // means worker concurrency and is a different thing entirely.
     contextLane?: number;
+    // SOFT DELETE — the conversation was deleted by its user and is INACTIVE: its record
+    // and its transcript survive instead of being destroyed. An inactive thread is
+    // EXCLUDED from the session tooling's discovery (`threadList`/`threads()`/`thread()`
+    // stop naming it, so the model can no longer address it) while it stays READABLE by id
+    // and stays a durable row of the snapshot. `shell`/`bash` — or any host that reads the
+    // persistence directory directly — still finds it, and a restore brings it back exactly
+    // as it was left.
+    //
+    // Nothing here destroys it. The only spelling of "permanently gone" stays what it has
+    // always been: the SESSION itself is deleted, and its snapshot goes with it.
+    //
+    // REACTIVATION is a HOST act, and there is exactly one door: `sendThreadInput`. A caller that
+    // already holds the id and is typing INTO the conversation is the actor the soft delete
+    // reserves the revival to, so that call clears the pair and starts a turn in the retained
+    // transcript (the server's `executeTurn` clears its own retention ledger alongside it, in the
+    // same turn). Agent-facing doors keep refusing an inactive target — `threadSend` and
+    // `steerThread` — because a model cannot address a conversation its roster no longer names,
+    // and an answer that quietly un-deleted a conversation would be the one surprise a soft
+    // delete must not produce.
+    //
+    // Only the literal `true` is ever stored, so ABSENT means active. That is the same
+    // additive-when-absent discipline as `contextLane` above and `discovery.withheld` in
+    // `HarnessSnapshot`: a thread created before this field, and every snapshot written
+    // before it, keeps its exact prior shape, which is why `HARNESS_SNAPSHOT_VERSION` did
+    // not move. A reactivation DELETES the key rather than writing `false` (the reader
+    // tolerates a `false` by normalizing it away — ./core/snapshot.ts `readThreads`).
+    inactive?: true;
+    // When the thread was marked inactive, in epoch milliseconds (`Date.now()` at the
+    // transition), so a host can render "deleted 3 days ago" and an operator can audit a
+    // restore. Purely metadata: ordering of inactive rows uses `sequence`, never this
+    // wall-clock value, so a restored session stays deterministic.
+    //
+    // The reader validates it INDEPENDENTLY of `inactive` (a document may keep it as
+    // history after a reactivation — ./core/snapshot.ts documents why nothing is required to
+    // pair here); the writer owns when the key is omitted.
+    inactiveAt?: number;
 };
 
 export type HarnessThreadCreateOptions = {
@@ -3006,21 +3111,46 @@ export type HarnessThreadMessageResult = {
     // STATE-AWARE delivery (delegate-stress T3.2/T3.6). `threadSend` used to report
     // the same bare word for a message that changed a live run and one that only
     // sat in a transcript, and that ambiguity is what the finding was built on; each
-    // value below names one outcome, and each is reachable in
-    // src/harness.thread-runtime.test.ts. A `stopped` target is neither: it throws.
+    // value below names ONE operation, and each is reachable in
+    // src/harness.thread-runtime.test.ts.
     //
-    // 'queued'  — the target was RUNNING. The message joins the live run's queue and
-    //   is applied as a user message at its next safe model boundary (never inside
+    // THREE operations, and the target's state is the only thing that decides which one
+    // happened. A caller must never have to guess between them from the receipt's other
+    // fields, and the runtime must never report one while performing another:
+    //
+    // 'queued'  — STEERING. The target was RUNNING. The message joins the live run's queue
+    //   and is applied as a user message at its next safe model boundary (never inside
     //   the request already in flight). No new run was started.
-    // 'started' — the target was DORMANT: `idle`, or `paused` by a plugin and resumed
-    //   here. A run has been STARTED with the attributed message as its prompt. The
-    //   receipt is non-blocking: it reports the start, not the answer, and the run
+    // 'started' — CONTINUE. The target was DORMANT: `idle`. A run has been STARTED with the
+    //   attributed message as its prompt. (A `paused` target never reaches this value: the
+    //   `paused` branch of `postThreadMessage` queues the text and leaves the park in place, so
+    //   that send reports 'queued' — only a HOST `sendThreadInput` lifts a park.)
+    //   WHAT THIS VALUE DOES NOT CLAIM (corrected 2026-11-15, independent review of IT19): it is
+    //   NOT a statement that the transcript was never interrupted. `resumableStop` reads the
+    //   RECORD's status, and an interrupted run normally comes to rest at `idle` with its turns
+    //   retained — the ordinary end of a `timeout`, an exhausted provider, or a child abandoned by
+    //   its parent's `toolCancel`. A send that continues such a conversation is dormant by this
+    //   door's test and therefore answers `started`. Nothing is lost by that: the cause stays
+    //   readable on the row as `stopReason` (`HarnessThreadSnapshot.stopReason`), so a `started`
+    //   send over an interrupted transcript is not a lost signal — `delivered` names the operation
+    //   this door performed, and the record is where the interruption is read.
+    //   The receipt is non-blocking: it reports the start, not the answer, and the run
     //   may still fail afterwards (its failure is reported to the harness listeners
     //   and archived for `agentResult`, not to this sender).
+    // 'resumed' — RESUME. The target was `stopped` WITH ITS WORK STILL IN HAND: its run had been
+    //   interrupted (cancelled, stopped, or abandoned) and its transcript was RETAINED, so the
+    //   message continues that conversation instead of opening a new one. The key is exactly that
+    //   pair and nothing else — `status === 'stopped'` AND a resummable `stopReason`
+    //   (`isResumableStopReason`, src/harness.ts:721, over the set at `:710-718`); an `idle` row carrying the same cause
+    //   answers `started`, not `resumed`. Distinguishing the two is the whole point of the third
+    //   value: a cancelled thread that answers as if nothing had happened hides the interruption
+    //   from the sender, while a fresh conversation on an idle thread must not look like a rescue.
+    //   The retained transcript is the precondition — a stopped target with nothing to continue
+    //   keeps refusing the send, as it always has.
     //
     // 'appended' is RETIRED: nothing is ever parked in a transcript without a run to
     // read it, which was the inert delivery this finding reported.
-    delivered: 'queued' | 'started';
+    delivered: 'queued' | 'started' | 'resumed';
     // The agent name the runtime attributed the message to.
     sender: string;
     // The sender's persistent thread id, when the sender ran inside one.
@@ -3393,6 +3523,22 @@ export type HarnessAgentResultSnapshot = {
     // so the pair travels together (issue 0033). Counts committed messages; it is NOT a
     // measure of progress (0022).
     cancelledAtMessage?: number;
+    // WHY the run reached a non-concluded terminal state (../core/snapshot.ts refuses a
+    // value outside `HarnessRunStopReason`; the live half is
+    // `HarnessThreadRecord.stopReason`). The forensic trio's last member:
+    // `partialContent` says what it SAID, `cancelledAtMessage` says HOW FAR it got, and this
+    // says WHY it stopped — which until now survived only as English prose in `error`, so a
+    // caller could not tell "the parent released the call" from "the provider ran out of
+    // retries" without string-matching a message it did not write.
+    //
+    // OPTIONAL and additive: a pre-feature row has no key and restores with its exact prior
+    // meaning, so the schema version did not move (this file's header, and the
+    // `partialContent`/`cancelledAtMessage` note on `HarnessSnapshot.agentResults`).
+    //
+    // It is meaningful only for a NON-completed status, exactly like `error` and the
+    // forensic pair: a completed run concluded, so it has no stop reason to record, and the
+    // writer omits the key there for the same reason it drops `error` on a completed row.
+    stopReason?: HarnessRunStopReason;
     // Issue 0033 / 0024 (2026-11-14): the PERSISTENT conversation this invocation ran in, when
     // one owns it. The field has always existed on the in-memory record (harness.ts
     // `AgentInvocationRecord.threadId`), on the lane archive payload, and on
@@ -3457,6 +3603,19 @@ export type HarnessInvocationArchiveInput = {
     // How many messages that run had COMMITTED when it stopped (an integer >= 0; NOT a measure of
     // progress — issue 0022). Travels with `partialContent`.
     cancelledAtMessage?: number;
+    // IT19 (R3/R5): WHY a non-concluded lane run stopped, in the machine-readable vocabulary
+    // (the closed `HarnessRunStopReason` union; the row it produces is
+    // `HarnessAgentResultSnapshot.stopReason`). A lane child is interrupted by causes the
+    // coordinator never sees — its lease was revoked, its parent released the call, its provider
+    // ran out of retries — and until now the archive carried only the English sentence in
+    // `error`, so the canonical ledger could not tell those apart without string-matching.
+    //
+    // OPTIONAL and additive, and REFUSED (not dropped) when it is outside the union: this call's
+    // return value is what the lane commits, so a name neither side recognises would become a row
+    // the next snapshot cannot persist. Like `error` and the pair above, it is DROPPED on a
+    // `completed` status — mutual exclusion, so a row that later completes never keeps a cause
+    // that no longer describes it (src/harness.ts validates and applies both rules).
+    stopReason?: HarnessRunStopReason;
 };
 
 // T5 lane-worker seam: reserve identity high-water marks in one harness (see
@@ -3495,6 +3654,31 @@ export type HarnessThreadSnapshot = {
     // Only a HOST thread carries it — a default `agent:<name>` conversation is implicit
     // and is not persisted at all, exactly like its owner link (L2).
     contextLane?: number;
+    // Why the thread's LAST run stopped short of its conclusion (the union declared above
+    // in this file; the live half is `HarnessThreadRecord.stopReason`). OPTIONAL
+    // and additive, so a document written before this field — and every existing fixture —
+    // validates and restores with its exact prior meaning, and `version` stays 2 (the
+    // discipline documented in this file's header and on `HarnessSnapshot.agentResults`).
+    //
+    // It says NOTHING about `status`: the two are orthogonal. A thread restored as 'idle'
+    // can carry a stop reason (its run was interrupted, then a restart left it idle), and a
+    // 'stopped' one can carry none (a pre-feature document, or a host stop that recorded no
+    // reason). `status` stays the narrow 'idle' | 'stopped' pair — the machine-readable WHY
+    // lives here, not in a widened status.
+    stopReason?: HarnessRunStopReason;
+    // The SOFT-DELETE marker (see `HarnessThreadRecord.inactive`). Durable on purpose: a
+    // deleted conversation that vanished from the document would be destroyed by the next
+    // save, which is exactly what the soft delete exists to prevent — the row stays, the
+    // session tooling just stops discovering it.
+    //
+    // Only `true` is ever written; a `false` on disk is accepted and normalized to the
+    // absent form by the reader (the `HarnessMessage.included` rule), so a host that
+    // round-trips its own JSON stays byte-stable across `restore -> snapshot`.
+    inactive?: true;
+    // When it was marked inactive, epoch milliseconds (see
+    // `HarnessThreadRecord.inactiveAt`). Validated as an integer >= 0 by
+    // ./core/snapshot.ts `readThreads`, and NOT required to travel with `inactive`.
+    inactiveAt?: number;
     // The thread's committed transcript. Required (a host thread's history lives
     // nowhere else), and restored into a fresh Agent seeded from the owner's
     // configuration.
@@ -3569,6 +3753,12 @@ export type HarnessSnapshot = {
     // Present (possibly empty, after every host thread was deleted) once the
     // harness has minted at least one host thread id, so `threadSequence` remains
     // a high-water mark and a restart cannot reuse a deleted thread's id.
+    //
+    // Additive and OPTIONAL in the same way are the three keys of a thread that stopped
+    // early or was soft-deleted (`stopReason`, `inactive`, `inactiveAt` — see
+    // HarnessThreadSnapshot): written only when the row actually carries them, read as
+    // "nothing recorded" when absent, so every pre-feature file keeps its exact prior
+    // meaning and the version stays 2.
     threads?: HarnessThreadSnapshot[];
     // High-water mark for generated host thread ids. Present together with
     // `threads`; restore validates it against the persisted records.
@@ -4348,8 +4538,12 @@ export type Harness = {
     // Run one turn (including tool execution) in `threadId` and resolve to its
     // answer. Concurrent calls on the SAME thread queue in order — there is never
     // simultaneous execution inside one thread — while different threads run
-    // concurrently. A stopped thread is revived by this explicit host action; a
-    // deleted thread is an error.
+    // concurrently. This explicit host action is the ONE revival door: it lifts a
+    // `stopped` conversation, a park a plugin never resumed, AND the soft-delete
+    // marker of a conversation the user deleted (`inactive`/`inactiveAt` come off the
+    // record, the roster names it again, and the turn runs on the retained transcript).
+    // An AGENT cannot do any of that — `threadSend`/`steerThread` refuse a stopped,
+    // parked-into, or inactive target.
     sendThreadInput: (
         threadId: string,
         input: string,

@@ -1,7 +1,6 @@
 // threadDelete — standalone source entry for releasing one terminal thread.
 //
-// WHY THIS ENTRY EXISTS (issue 0027 —
-// docs/issues/minor-one-shot-child-threads-stay-on-the-roster.md)
+// WHY THIS ENTRY EXISTS (issue 0027, closed)
 // ----------------------------------------------------------------
 // Every delegation from a host-thread parent mints its OWN host conversation
 // (src/harness.ts ~10263-10267, `createThreadState(brain.name, { ownerThreadId },
@@ -17,10 +16,39 @@
 // model-facing close, scoped to the caller's own descendants.
 //
 // The issue deliberately rejects AUTO-DELETE on completion (a settled child must stay
-// readable with `threadRead`, and the evidence a post-mortem needs must survive), so
-// this tool is EXPLICIT and PERMANENT: nothing here is automatic, and nothing here is
-// recoverable. The description carries both facts because a model reads the
-// description, not this file.
+// readable with `threadRead`, and the evidence a post-mortem needs must survive), so this
+// tool is EXPLICIT and MANUAL: nothing here is automatic.
+//
+// WHAT "PERMANENT" MEANT CHANGED (IT19 R2, 2026-11-15 — issue 0036, closed). This entry
+// shipped promising "Deletion is PERMANENT — the transcript, its invocation record and
+// its branch lookups all go with it", and the runtime answered that by destroying the
+// lookups. `deleteThread` is a SOFT delete now: `purgeThread` marks the record `inactive`
+// (+ `inactiveAt`), the row stays in the thread table, its transcript and its invocation
+// rows survive, and the doors change shape accordingly — the roster and `actOn` stop
+// naming it, `threadSend`/`steerThread`/`sendThreadInput` refuse it with their own
+// sentence, `threadRead` refuses it for a CALLER that is itself a conversation (a host
+// read still resolves the retained transcript), and `deleteThread` on an already-released
+// descendant is IDEMPOTENT — it restates the first receipt without re-marking, without a
+// fresh `inactiveAt`, and without a second `thread.deleted` hook. So the description says
+// MARK, names what survives, and states the one deletion that is real: deleting the
+// session — QUALIFIED BY THE SAME-DAY HONESTY PASS, because "the only thing that destroys one" is
+// true of what an AGENT can do, not of the document. The session holds a bounded number of thread
+// records (`MAX_THREAD_RECORDS`, 256 — src/core/thread.ts:46), and past that bound
+// `capThreadRecords` (src/server/sessions.ts:4787, mirrored kernel-side by
+// `capRetiredThreadRecords`, src/harness.ts:762) retires the OLDEST `inactive` rows, transcripts
+// included. That retirement is the one remaining case in which a retained conversation really is
+// dropped, and the description now says so instead of implying unbounded retention.
+// `removedInvocationIds` kept its name and changed meaning ("no longer listed",
+// not "destroyed"); `removedBranchIds` is the one set genuinely removed.
+//
+// THE RUNNING REFUSAL IS ACTIONABLE NOW (independent review, 2026-11-15). "stop it
+// first" on its own named no door: there is NO thread-stop tool, and the only stop an
+// agent can perform is `toolCancel` on a call ITS OWN run started — which does end a
+// delegated child's run, because that child's signal is linked to the call's controller
+// (`scheduler.cancel` → the per-call AbortController → the child's linked signal), and the
+// child then lands `stopped` + `stopReason: 'caller-released'` with its turns retained. An
+// arbitrary running thread owned by somebody else cannot be stopped from a tool call, and
+// the description says so instead of implying a door that does not exist.
 //
 // PURE LITERAL (T19 / R9). No computation, no interpolation, no call, and no
 // value-import of `../../core` — that would close a cycle through core/metadata.ts,
@@ -41,7 +69,7 @@ export const THREAD_DELETE_NAME = 'threadDelete';
 export const THREAD_DELETE_METADATA: CoreToolMetadata = {
     name: THREAD_DELETE_NAME,
     description:
-        'Release one FINISHED conversation for good, from the conversation that owns it. A delegation FROM A CONVERSATION mints its own thread, and a session holds only a bounded number of them, so a one-shot child is work you reclaim yourself (issue 0027): read what you still need with threadRead or agentResult first, then delete it. (A delegation that comes from the host rather than a conversation reuses that subagent\'s default conversation instead of minting one - and this tool will not release a default, so that child has no slot for you to free.) Deletion is PERMANENT - the transcript, its invocation record and its branch lookups all go with it, and a deleted id becomes unknown to threadList, threadRead, threadSend and this tool. That includes the RESULT records: once a conversation is deleted, `agentManage` no longer counts its run and `agentResult` can no longer read that `invocationId`, so read the answer BEFORE you release the thread. Pass `thread` for one of YOUR DESCENDANTS that is no longer running: a thread you created, or one created underneath you. Six things are refused: a thread that is RUNNING (stop it first), a finished target that still has a RUNNING descendant (the refusal names the running child, and nothing is half-deleted), this agent\'s default conversation (agent:<name>), a thread outside your lineage (an ancestor, a sibling, or another agent\'s conversation is not yours to delete), a fork\'s `branch-N` id (a branch is an address, not a conversation: it holds no thread slot, so there is nothing to release - it goes when the conversation that forked it is deleted, and the branch ledger keeps only its newest 64 records by default), and any id this session does not have. Deleting cascades, so the finished threads that thread created are removed with it. The receipt reports `deleted` (the id you named), `removedThreadIds` (every id that actually went, the cascaded ones included), `removedInvocationIds` (the result records that went with them, which `agentResult` can no longer read) and `removedBranchIds` (the fork branches released the same way) - an empty array means none went, not that the receipt is silent.',
+        'Release one FINISHED conversation from this session\'s roster, from the conversation that owns it. A delegation FROM A CONVERSATION mints its own thread, and a session holds only a bounded number of them, so a one-shot child is work you reclaim yourself (issue 0027): read what you still need with threadRead or agentResult first, then delete it. (A delegation that comes from the host rather than a conversation reuses that subagent\'s default conversation instead of minting one - and this tool will not release a default, so that child has no slot for you to free.) Releasing is a MARK, not an erasure: the conversation leaves threadList and every agent-facing door, while its transcript and its result records are RETAINED - `removedInvocationIds` names the result rows that stopped being LISTED with it, and `agentResult` still answers an `invocationId` you already hold by that id. `agentManage` no longer counts its run, so read the answer BEFORE you release the thread. Nothing an agent does destroys a conversation: re-deleting a descendant you have already released is not an error - it restates the same receipt and changes nothing - and the only thing that destroys one is deleting the session itself - which keeps a bounded roster of 256 thread records, and past that bound the OLDEST released rows are retired with their transcripts. Pass `thread` for one of YOUR DESCENDANTS that is no longer running: a thread you created, or one created underneath you. Six things are refused: a thread that is RUNNING (stop it first) - the only stop an agent has is `toolCancel` on the call that started that work, a call that must be one YOUR run started, because no thread tool stops a conversation somebody else owns, a finished target that still has a RUNNING descendant (the refusal names the running child, and nothing is half-deleted), this agent\'s default conversation (agent:<name>), a thread outside your lineage (an ancestor, a sibling, or another agent\'s conversation is not yours to delete), a fork\'s `branch-N` id (a branch is an address, not a conversation: it holds no thread slot, so there is nothing to release - it goes when the conversation that forked it is deleted, and the branch ledger keeps only its newest 64 records by default), and any id this session does not have. Deleting cascades, so the finished threads that thread created are removed with it. The receipt reports `deleted` (the id you named), `removedThreadIds` (every id that actually went, the cascaded ones included), `removedInvocationIds` (the result records that went with them, which `agentManage` no longer lists) and `removedBranchIds` (the fork branches released the same way) - an empty array means none went, not that the receipt is silent. Those two id sets mean HID BEHIND the conversation you named, not destroyed: on the first release that is exactly what this call took out of discovery, and a re-delete restates the same two sets, because those conversations and result rows are still hidden. `removedBranchIds` is the one set that means NEWLY UNLISTED BY THIS CALL - a branch lives in a bounded ledger rather than in a conversation, its rows really do go with the first release, so a re-delete honestly reports an empty one.',
     tags: ['thread', 'threads', 'delete', 'remove', 'release', 'cleanup', 'roster'],
     // Same visibility as the rest of the thread group: registered with the first
     // independent thread, then declared for every agent in the session (not
@@ -55,7 +83,7 @@ export const THREAD_DELETE_METADATA: CoreToolMetadata = {
                 type: 'string',
                 minLength: 1,
                 description:
-                    'Id of the finished thread to release, as reported by threadList - one of YOUR descendants. A running thread, a finished target with a running descendant, this agent\'s default conversation (agent:<name>), a thread outside your lineage, a fork\'s branch-N id, and a deleted or unknown id all fail. There is no default: your own current thread is never the target.'
+                    'Id of the finished thread to release, as reported by threadList - one of YOUR descendants. A running thread, a finished target with a running descendant, this agent\'s default conversation (agent:<name>), a thread outside your lineage, a fork\'s branch-N id, and an unknown id all fail; re-deleting a descendant you have already released instead restates its receipt, because a released thread is inactive rather than destroyed. There is no default: your own current thread is never the target.'
             }
         },
         required: ['thread'],

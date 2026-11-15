@@ -299,7 +299,9 @@ it('turns the same control back into Delete once the stopped roster lands, and t
     expect(button.querySelector('.action-label')?.textContent).toBe('Delete');
     expect(button.querySelector('.action-glyph')?.textContent).toBe('X');
     expect(button.getAttribute('aria-label')).toBe('Delete thread IN1');
-    expect(button.title).toBe('Delete this thread permanently');
+    expect(button.title).toBe(
+        'Delete this thread: it leaves this session, and its transcript is kept until the session is deleted'
+    );
     expect(button.disabled).toBe(false);
 
     // And the delete behaves exactly as it did before R1 on this surface: the shared
@@ -308,7 +310,9 @@ it('turns the same control back into Delete once the stopped roster lands, and t
     expect(deleteDialogs()).toHaveLength(1);
     expect(
         deleteDialogs()[0]?.querySelector<HTMLElement>('.thread-delete-confirm-body')?.textContent
-    ).toBe('Delete thread IN1 permanently? Its turns and transcript are removed.');
+    ).toBe(
+        'Delete thread IN1? It leaves this session, and its transcript is kept until the session itself is deleted.'
+    );
 
     const confirm = deleteDialogs()[0]?.querySelector<HTMLButtonElement>(
         '.thread-delete-confirm-delete'

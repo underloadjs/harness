@@ -991,8 +991,9 @@ describe('task concurrency across harness callers', () => {
 
         const feed = (await writer.executeTool('tasks', { since: 0 })) as TaskResult & {
             changes: TaskChange[];
-            // 0011 — the window floor. `TaskResult` (src/types, owned by another pass) does
-            // not declare the key yet, so the test narrows the result it reads.
+            // 0011 — the window floor. `TaskResult` DOES carry the key now (src/types:2190
+            // inherits `oldestAvailableRev?` from `RecordsResult`, :2016), so this narrowing
+            // is redundant; it stays so the read below is typed as a plain `number`.
             oldestAvailableRev: number;
         };
 

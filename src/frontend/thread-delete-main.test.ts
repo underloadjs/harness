@@ -288,7 +288,9 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(shellDelete.hidden).toBe(false);
     expect(shellDelete.disabled).toBe(false);
     expect(shellDelete.getAttribute('aria-label')).toBe('Delete thread IN1');
-    expect(shellDelete.title).toBe('Delete this thread permanently');
+    expect(shellDelete.title).toBe(
+        'Delete this thread: it leaves this session, and its transcript is kept until the session is deleted'
+    );
     expect(shellDelete.querySelector('.action-label')?.textContent).toBe('Delete');
     const shellTranscript = bar.querySelector<HTMLButtonElement>('.transcript-open');
     if (shellTranscript === null) throw new Error('missing toolbar transcript button');
@@ -348,7 +350,9 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     );
     expect(
         confirmation.querySelector<HTMLElement>('.thread-delete-confirm-body')?.textContent
-    ).toBe('Delete thread IN1 permanently? Its turns and transcript are removed.');
+    ).toBe(
+        'Delete thread IN1? It leaves this session, and its transcript is kept until the session itself is deleted.'
+    );
     expect(
         [...confirmation.querySelectorAll<HTMLButtonElement>('.dialog-body button')].map(
             (button) => button.textContent

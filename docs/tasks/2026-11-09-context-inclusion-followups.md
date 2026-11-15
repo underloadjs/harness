@@ -26,8 +26,7 @@ and is marked `corrected` in T7.1 with its original text kept.
 Companion entries:
 [2026-11-09-plugin-pipeline-v2.md](./2026-11-09-plugin-pipeline-v2.md) (the framework work
 this feeds) and [2026-11-09-progressive-compaction.md](./2026-11-09-progressive-compaction.md)
-(the consumer that writes the flag). Related issues:
-[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md),
+(the consumer that writes the flag). Related issues: issue 0004 (closed),
 [../issues/review-list-improvements-review-list.md](../issues/review-list-improvements-review-list.md).
 
 ## Date / Method / Scope
@@ -46,9 +45,7 @@ this is a documentation-only change.
 (`src/server/workers/*`), and the frontend/contract surfaces.
 
 **Out of scope:** compaction policy (the compaction entry), the decision/pipeline questions
-(the pipeline entry), and the token-budget gaps that
-[../issues/minor-context-window-and-token-budget.md](../issues/minor-context-window-and-token-budget.md)
-owns.
+(the pipeline entry), and the token-budget gaps that issue 0004 (closed) owns.
 
 ## The substrate the remaining work stands on
 

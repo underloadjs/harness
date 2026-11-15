@@ -9,11 +9,11 @@
 //         further turn. The run never returns with a run-owned delivery queued or
 //         a stale final answer.
 //   P2-A  a delegated child whose transport ignores its abort signal cannot leak
-//         text/error frames into a later root run; its transcript rolls back, and
-//         a follow-up queued behind it is aborted with the tree.
-//   P2-B  duplicate/reused tool-call ids are rejected before any call executes,
-//         the turn rolls back, and the scheduler refuses to overwrite a running
-//         task under the same id.
+//         text/error frames into a later root run; its committed turns are RETAINED
+//         (issue 0036 R1), and a follow-up queued behind it is aborted with the tree.
+//   P2-B  duplicate/reused tool-call ids are rejected before any call executes, so
+//         only the prompt of the rejected turn is on the record (issue 0036 R1), and
+//         the scheduler refuses to overwrite a running task under the same id.
 //   Every executed call reports durationMs (including inline calls).
 //
 // Timing policy: promise gates, never arbitrary tolerance windows. Polling is
@@ -62,9 +62,10 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
     throw new Error(`Timed out waiting for: ${label}`);
 };
 
-// restore() throws while ANY run slot is reserved. A cancelled child's transcript
-// is rolled back a microtask before its finally decrements that slot, so poll the
-// public operation instead of assuming the two land in the same tick. Applying the
+// restore() throws while ANY run slot is reserved. A cancelled child's final
+// transcript work (the retained tail plus its synthesized answers) lands a microtask
+// before its finally decrements that slot, so poll the public operation instead of
+// assuming the two land in the same tick. Applying the
 // same snapshot repeatedly is idempotent.
 const restoreWhenIdle = async (writer: Harness): Promise<void> => {
     for (let attempt = 0; attempt < 1_000; attempt++) {
@@ -450,7 +451,7 @@ describe('completions during the final request (P1-A)', () => {
 // ---------------------------------------------------------------------------
 
 describe('delegated child ownership after abort (P2-A)', () => {
-    it('suppresses late child events, rolls the child back, and aborts a queued followup', async () => {
+    it('suppresses late child events, keeps the cut-off child prompt, and aborts a queued followup', async () => {
         const childGate = deferred<void>();
         const events: HarnessEvent[] = [];
         let childRequests = 0;
@@ -534,12 +535,47 @@ describe('delegated child ownership after abort (P2-A)', () => {
         expect(late.filter((event) => event.agent === 'child')).toEqual([]);
         expect(late.filter((event) => event.type === 'error')).toEqual([]);
 
-        // The child rolled back; only the aborted first request ever reached it.
+        // Only the aborted first request ever reached the child. Issue 0036 R1 RETAINS
+        // the prompt that request carried: a delegated child run is a thread-bound run,
+        // so the parent's abort no longer splices its committed turns away. The scripted
+        // provider never returned, so no assistant turn was committed and the repair pass
+        // had nothing to answer — the child holds EXACTLY that one prompt, no late answer.
         expect(childRequests).toBe(1);
-        expect(writer.agents.child.messages).toEqual([]);
-        expect(shape(writer.agent.messages)).toEqual([
-            'user:next',
-            'assistant:second-root-answer:'
+        expect(writer.agents.child.messages).toMatchObject([{ role: 'user', content: 'one' }]);
+        // Issue 0036 R1 turns this into a growth check, and the intent survives exactly:
+        // the frames recorded after the abort still belong to the child NOWHERE, and the
+        // primary's transcript is the retained cut-off work plus the clean second run —
+        // nothing from the late child. Re-captured from an actual run: the prompt, the
+        // delegation turn whose two calls were never answered (so each carries ONE
+        // synthesized interrupted marker, which is what keeps the tail replayable), the
+        // follow-up run's committed answer, then the second root run's own two rows.
+        // `shape` embeds tool CONTENT, so it would pin the interrupted wording; the rows
+        // are asserted structurally instead, with the markers matched by substring only.
+        expect(writer.agent.messages).toMatchObject([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [
+                    { id: 'd1', name: 'delegate', arguments: '{"agent":"child","input":"one"}' },
+                    { id: 'd2', name: 'delegate', arguments: '{"agent":"child","input":"two"}' }
+                ]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'd1',
+                name: 'delegate',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            {
+                role: 'tool',
+                toolCallId: 'd2',
+                name: 'delegate',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            { role: 'assistant', content: 'primary-paused' },
+            { role: 'user', content: 'next' },
+            { role: 'assistant', content: 'second-root-answer' }
         ]);
     });
 });
@@ -621,16 +657,23 @@ describe('tool-call id integrity (P2-B)', () => {
             'requested tool call id "dup" more than once in one turn'
         );
 
-        // Nothing executed, no tool_call event, and the malformed turn rolled back.
+        // Nothing executed and no tool_call event fired, so the malformed turn is the
+        // only thing the rejected run committed: issue 0036 R1 retains the prompt it was
+        // built from (the assistant turn was rejected before it was written, so there is
+        // no dangling call to repair here either).
         expect(executed).toEqual([]);
         expect(events.filter((event) => event.type === 'tool_call')).toEqual([]);
-        expect(writer.agent.messages).toEqual([]);
+        expect(writer.agent.messages).toMatchObject([{ role: 'user', content: 'go' }]);
 
         // The same harness succeeds on a clean turn.
         const clean = await writer('go');
         expect(clean.content).toBe('clean answer');
         expect(executed).toEqual(['alpha:C']);
+        // The clean run's own three rows now sit BEHIND the retained prompt of the
+        // rejected turn — re-captured from an actual run, and the successful exchange
+        // itself is byte-for-byte what it was.
         expect(shape(writer.agent.messages)).toEqual([
+            'user:go',
             'user:go',
             'assistant::ok1',
             'tool:ok1:alpha:C',
@@ -638,16 +681,19 @@ describe('tool-call id integrity (P2-B)', () => {
         ]);
 
         // Cross-turn reuse of a committed id is rejected too, and leaves the
-        // previous successful transcript untouched.
+        // previous successful transcript untouched: the rejected call adds no
+        // assistant turn and no tool row, only the prompt its run committed.
         await expect(writer('go')).rejects.toThrow(
             'reused tool call id "ok1" from an earlier turn'
         );
         expect(executed).toEqual(['alpha:C']);
         expect(shape(writer.agent.messages)).toEqual([
             'user:go',
+            'user:go',
             'assistant::ok1',
             'tool:ok1:alpha:C',
-            'assistant:clean answer:'
+            'assistant:clean answer:',
+            'user:go'
         ]);
         expect(wiringIssues(seen)).toEqual([]);
     });
@@ -759,13 +805,21 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
         firstController.abort(new Error('root abort'));
         expect(await first).toBe('rejected');
 
-        // The child run rolled back its prompt and released the slot: the harness
-        // is no longer "running" from restore()'s perspective. Cancellation is
-        // synchronous on the signal; the child's rollback lands on the microtask
-        // queue just after the root rejection.
-        await waitFor(() => writer.agents.child.messages.length === 0, 'child rollback');
+        // The child released its run slot. `restoreWhenIdle` polls restore(), which
+        // throws while ANY slot is reserved, so it is the barrier for "no run attached" —
+        // and the only honest one now: with retention (issue 0036 R1) the child's
+        // transcript never returns to length 0, so the old "child rollback" wait on
+        // `messages.length === 0` could never fire. Cancellation is synchronous on the
+        // signal; the child's final transcript work lands on the microtask queue just
+        // after the root rejection.
         await restoreWhenIdle(writer);
-        expect(writer.snapshot().agents.child.messages).toEqual([]);
+        // The aborted prompt SURVIVES into the snapshot: that is the point of retention —
+        // a host restoring this harness can see the work the child was cut off on. The
+        // child never produced an assistant turn (its provider never returned), so the
+        // repair pass had nothing to answer and the retained tail is this one prompt.
+        expect(writer.snapshot().agents.child.messages).toMatchObject([
+            { role: 'user', content: 'work' }
+        ]);
 
         // An unrelated root run of the primary proceeds.
         const second = await writer('next');
@@ -782,10 +836,14 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
         thirdController.abort(new Error('second abort'));
         expect(await third).toBe('rejected');
 
-        // Cleanup is prompt every time: no dangling prompt, restore allowed.
-        await waitFor(() => writer.agents.child.messages.length === 0, 'second child rollback');
+        // The slot is released just as promptly the second time, and restore is allowed.
+        // "No dangling prompt" becomes "the SECOND cut-off prompt is retained beside the
+        // first": retention is per run, so nothing is lost and nothing is rewritten.
         await restoreWhenIdle(writer);
-        expect(writer.snapshot().agents.child.messages).toEqual([]);
+        expect(writer.snapshot().agents.child.messages).toMatchObject([
+            { role: 'user', content: 'work' },
+            { role: 'user', content: 'work' }
+        ]);
     });
 
     it('discards a late provider completion without touching the later child run', async () => {
@@ -859,7 +917,10 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
         await waitFor(() => childStarts === 1, 'the first child request');
         firstController.abort(new Error('root abort'));
         expect(await first).toBe('rejected');
-        await waitFor(() => writer.agents.child.messages.length === 0, 'child rollback');
+        // No "child rollback" wait here any more: retention (issue 0036 R1) keeps the
+        // first prompt, so `messages.length === 0` could never fire. The slot release is
+        // what this test waits on, and `restoreWhenIdle` below is exactly that barrier
+        // (restore throws while any run slot is reserved).
         abortIndex = events.length;
 
         // Restore is possible right away even though the first provider is parked.
@@ -884,15 +945,20 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
         const message = await second;
         expect(message.content).toBe('PRIMARY-DONE');
 
-        // The child transcript holds ONLY the second run: the first prompt was
-        // rolled back at cancellation and the late commit was refused.
+        // The child transcript now holds BOTH runs: the RETAINED prompt of the cancelled
+        // first delegation (issue 0036 R1) and the second run's own exchange. What this
+        // test actually pins is unchanged — the late provider's 'LATE-FIRST-TEXT' never
+        // committed, so the first prompt stands alone with no answer beside it, while the
+        // second run completed normally.
         expect(shape(writer.agents.child.messages)).toEqual([
+            'user:one',
             'user:two',
             'assistant:SECOND-CHILD-ANSWER:'
         ]);
 
-        // No stale prompt in the persisted view either.
+        // And the persisted view matches it, late commit suppressed there too.
         expect(shape(writer.snapshot().agents.child.messages)).toEqual([
+            'user:one',
             'user:two',
             'assistant:SECOND-CHILD-ANSWER:'
         ]);
@@ -911,7 +977,7 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
 // ---------------------------------------------------------------------------
 
 describe('abort during terminal done (T18)', () => {
-    it('rolls back and rejects when the done reporter aborts the run', async () => {
+    it('keeps the committed turns and rejects when the done reporter aborts the run', async () => {
         const events: HarnessEvent[] = [];
         const controller = new AbortController();
         let abortOnDone = true;
@@ -944,8 +1010,14 @@ describe('abort during terminal done (T18)', () => {
             'abort-during-final-done'
         );
 
-        // The cancelled run rolled back its user + assistant turn.
-        expect(writer.agent.messages).toEqual([]);
+        // Issue 0036 R1: the run that was aborted from inside the terminal `done`
+        // reporter KEEPS the turns it committed — the prompt and the answer that had
+        // already been written. The rejection below is still the caller's signal; what
+        // changed is that the committed work is no longer destroyed alongside the run.
+        expect(writer.agent.messages).toMatchObject([
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'FIRST-FINAL' }
+        ]);
         expect(events.map((event) => event.type)).toEqual(['start', 'text', 'done', 'error']);
         expect(events.at(-1)).toEqual({
             type: 'error',
@@ -953,10 +1025,13 @@ describe('abort during terminal done (T18)', () => {
             error: { message: 'abort-during-final-done' }
         });
 
-        // Safe immediate reuse: the same harness answers the next call.
+        // Safe immediate reuse: the same harness answers the next call, appending to
+        // the retained first exchange — re-captured from an actual run.
         const reused = await writer('next');
         expect(reused.content).toBe('REUSED-ANSWER');
         expect(shape(writer.agent.messages)).toEqual([
+            'user:go',
+            'assistant:FIRST-FINAL:',
             'user:next',
             'assistant:REUSED-ANSWER:'
         ]);

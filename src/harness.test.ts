@@ -16,7 +16,9 @@
 //   - every failure mode (unknown tool, undiscovered tool, bad JSON, throwing
 //     tool) becomes a tool result the model can recover from — not a crash;
 //   - report.progress is awaited for every step;
-//   - transport failure or a runaway loop truncates history and throws.
+//   - transport failure or a runaway loop RETAINS the turns it committed and
+//     throws (issue 0036 R1: a thread-bound run is never spliced back to its
+//     pre-run index; only a branch/ephemeral run rolls back).
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness, read, shell, syntax, tool, toolUi } from '@underload/harness';
@@ -966,7 +968,7 @@ describe('harness', () => {
         expect(entry.messages.filter((m) => m.role === 'tool')).toHaveLength(2);
     });
 
-    it('truncates history and throws when the transport fails', async () => {
+    it('keeps the committed turns and throws when the transport fails', async () => {
         const events: HarnessEvent[] = [];
 
         // R1: this pins the terminal FAILURE path, so it runs one attempt only; the
@@ -983,7 +985,12 @@ describe('harness', () => {
 
         await expect(writer('go')).rejects.toThrow('upstream exploded');
 
-        expect(writer.agent.messages).toEqual([]);
+        // Issue 0036 R1: the failed run keeps what it committed — the prompt the
+        // provider was shown — instead of being spliced back to an empty history.
+        // Nothing else was committed (the stream died before any assistant turn),
+        // so the retained transcript is EXACTLY this one message: retention is not
+        // a licence to fabricate turns the model never produced.
+        expect(withoutIds(writer.agent.messages)).toEqual([{ role: 'user', content: 'go' }]);
         expect(events.at(-1)).toEqual({
             type: 'error',
             agent: 'writer',
@@ -1013,8 +1020,23 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: brain(loop) }, tools: { again }, maxIterations: 16 });
 
         await expect(writer('go')).rejects.toThrow('requested tools on all 16 model turns');
-        // The failed run leaves no partial history behind.
-        expect(writer.agent.messages).toEqual([]);
+        // Issue 0036 R1: the capped run keeps every turn it committed — the prompt,
+        // then one assistant/tool-call pair plus its real result for EACH of the 16
+        // turns the model spent asking for a tool. Re-captured from an actual run:
+        // all 33 messages, and note there is no synthesized row anywhere, because
+        // the guard fires only after the 16th call was executed and answered, so the
+        // retained tail is already well-formed (nothing for the repair pass to add).
+        expect(withoutIds(writer.agent.messages)).toEqual([
+            { role: 'user', content: 'go' },
+            ...Array.from({ length: 16 }, (_, index) => [
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: `c${index}`, name: 'again', arguments: '{}' }]
+                },
+                { role: 'tool', content: 'ok', name: 'again', toolCallId: `c${index}` }
+            ]).flat()
+        ]);
     });
 
     it('runs unbounded by default — the iteration safeguard is opt-in', async () => {
@@ -1106,7 +1128,18 @@ describe('harness', () => {
         });
 
         await expect(writer('go')).rejects.toThrow('requested tools on all 2 model turns');
-        expect(writer.agent.messages).toEqual([]);
+        // Issue 0036 R1: the two-turn budget bounds the WORK, not the record. The
+        // retained transcript is re-captured from an actual run: the prompt, and both
+        // committed assistant turns with their real tool results (ids `c0`/`c1` are the
+        // sequence the scripted loop mints). Neither call was left dangling, so the
+        // repair pass wrote nothing — the history is exactly what the model was shown.
+        expect(withoutIds(writer.agent.messages)).toEqual([
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c0', name: 'again', arguments: '{}' }] },
+            { role: 'tool', content: 'ok', name: 'again', toolCallId: 'c0' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'again', arguments: '{}' }] },
+            { role: 'tool', content: 'ok', name: 'again', toolCallId: 'c1' }
+        ]);
     });
 
     it('allows one tool round at maxIterations: 2 and answers on the next turn', async () => {

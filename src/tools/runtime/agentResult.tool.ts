@@ -33,7 +33,14 @@ export const AGENT_RESULT_NAME = 'agentResult';
 //   - an explicitly addressed RUNNING invocation -> status "running" with empty
 //     content: no partial text is ever passed off as a finished answer.
 //   - CANCELLED / FAILED -> the error plus paged `partialContent` and
-//     `cancelledAtMessage` (that is the surviving account of a rolled-back run).
+//     `cancelledAtMessage`. The wording here used to call that pair "the surviving account of a
+//     rolled-back run", which stopped being true on 2026-11-15: a thread-bound run that ends
+//     without concluding KEEPS its turns (`runAgentCore`'s retention boundary in
+//     `../../harness.ts`, repaired by `core/transcript-repair.ts`), so the transcript is a second
+//     account and `threadRead` is the door that reads it. Only a BRANCH run still rolls back, and
+//     the description now names that exception instead of implying a rollback everywhere. What did
+//     NOT move is this door's own contract: `agentResult` answers with answer TEXT and nothing
+//     else — never a call, never a tool body (0020's leak boundary).
 //     B3 (2026-11-13) made the prose literal: `content` carries one page of the
 //     partial and `partialContent` now exists as its own field holding the WHOLE
 //     text, mirroring the unfinished-run envelope `delegate` has always returned
@@ -49,6 +56,25 @@ export const AGENT_RESULT_NAME = 'agentResult';
 //     ledger took back an answer this door had already shown the caller. Nothing about the
 //     shape the model reads changed — only whether it survives a boot — so the pinned
 //     fragments below are untouched.
+// IT19 R4 (2026-11-15): the description now NAMES `stopReason` — the machine-readable cause
+//     this door has been returning since the retention fix. `agentResultFor` projects
+//     `record.stopReason` on a `failed`/`cancelled` envelope (src/harness.ts ~4448-4452), the
+//     same field `harness.thread(id)` (~13880) and `snapshot().agentResults[]` (~14279) already
+//     carried. Prose only — the envelope shape is untouched, and the clause sits in the
+//     "cancelled or failed" status run, AFTER the `(durationMs ...)` aside, which keeps the
+//     pinned `at most 8000 characters (default 4000)` fragment below byte-identical.
+//     WHY THE NINE VALUES ARE NOT LISTED HERE (verified while gating, not guessed): this entry
+//     is `visibility: 'searchable'`, and `core/discovery.ts:135-137` scores a hit worth 1 when a
+//     query needle is a >=3-char substring of the DESCRIPTION. The closed `HarnessRunStopReason`
+//     union (src/types/index.ts ~2911) contains `timeout`, whose first four letters are the tag
+//     `time` — so an enumerated clause newly ranked `agentResult` for `toolRequest(["time"])` and
+//     appended it to the `enabled` array that src/server/api.test.ts:2722 pins VERBATIM (the
+//     scripted discovery round). The values stay documented in `src/types/index.ts` and in the
+//     `threadList` row, which cannot cause that drift because it is `visibility: 'core'`
+//     (src/tools/runtime/threadList.tool.ts:39) and `core/discovery.ts:264` admits only
+//     `searchable` tools to the match set (`listed: false` is a separate LISTING flag and does
+//     not exclude a tool from search). Any future edit to THIS description must keep the
+//     substring `time` out, or that recorded-event pin has to move with it.
 // The two pinned fragments below — "latest completed result" (the parameter
 // description, pinned by src/harness.agent-results.test.ts:169) and "at most 8000
 // characters (default 4000)" (pinned by core/metadata.ownership.test.ts:424) — are
@@ -56,7 +82,7 @@ export const AGENT_RESULT_NAME = 'agentResult';
 export const AGENT_RESULT_METADATA: CoreToolMetadata = {
     name: AGENT_RESULT_NAME,
     description:
-        `Read the completed result of one agent invocation. Pass "agent"; optionally pass "invocationId" from agentManage (omit it for that agent's latest FINISHED result - the newest COMPLETED one, or the newest failed or cancelled one when nothing has completed, and an explicitly addressed id always answers whatever that run did). Only an agent with NOTHING finished at all - no completed, failed or cancelled run - gets status "empty" with empty content; that is never somebody else's run and never one that is still in flight. The result contains content, contentLength, offset, limit, hasMore, and nextOffset when more remains; page through by passing nextOffset back as offset. Each page is at most 8000 characters (default 4000), so a long answer is returned in full across pages instead of being silently truncated. A delegation's "nextOffset" is directly usable as "offset" here - the cursor is the same index into the same answer - but pass "limit" if you want the page you already had, because this tool's own default is 4000 where a delegation pages at 8000. What each status means: "empty" - nothing has finished for that agent at all, so there is no answer to read yet; "running" - an invocation you addressed by id is still running, and it reports empty content because a partial answer is never presented as a finished one; "cancelled" or "failed" - the run did not complete, and it reports its error together with the partialContent it had committed and the cancelledAtMessage, which counts the messages that run had committed and is NOT a measure of how far it got (durationMs is the field that scales); partialContent is only the LAST assistant text that run committed, so the tool calls and tool results it made are rolled back and are not recoverable from here, and when the run was stopped before committing any assistant text both keys are ABSENT rather than empty. An unfinished answer is paged exactly like a completed one (content is ONE page of that partial, partialContent is the whole text in one field, so a short unfinished answer needs no second call); an unknown invocationId, or one that belongs to another agent, is an error. Only answer text is exposed - a finished answer in content, an unfinished one in partialContent - never system instructions, transcripts, tool arguments, or tool bodies.`,
+        `Read the completed result of one agent invocation. Pass "agent"; optionally pass "invocationId" from agentManage (omit it for that agent's latest FINISHED result - the newest COMPLETED one, or the newest failed or cancelled one when nothing has completed, and an explicitly addressed id always answers whatever that run did). Only an agent with NOTHING finished at all - no completed, failed or cancelled run - gets status "empty" with empty content; that is never somebody else's run and never one that is still in flight. The result contains content, contentLength, offset, limit, hasMore, and nextOffset when more remains; page through by passing nextOffset back as offset. Each page is at most 8000 characters (default 4000), so a long answer is returned in full across pages instead of being silently truncated. A delegation's "nextOffset" is directly usable as "offset" here - the cursor is the same index into the same answer - but pass "limit" if you want the page you already had, because this tool's own default is 4000 where a delegation pages at 8000. What each status means: "empty" - nothing has finished for that agent at all, so there is no answer to read yet; "running" - an invocation you addressed by id is still running, and it reports empty content because a partial answer is never presented as a finished one; "cancelled" or "failed" - the run did not complete, and it reports its error together with the partialContent it had committed and the cancelledAtMessage, which counts the messages that run had committed and is NOT a measure of how far it got (durationMs is the field that scales), and stopReason, the machine-readable cause of that early end, which is the field to branch on instead of matching the error prose - it is absent only when no cause was recorded; partialContent is only the LAST assistant text that run committed, so this answer never carries the tool calls and tool results it made: a run that wrote a conversation keeps those turns in that transcript, where threadRead can read them (a fork branch is the exception - its unfinished tail is rolled back, so agentResult is the only account of a branch), and when the run was stopped before committing any assistant text both keys are ABSENT rather than empty. An unfinished answer is paged exactly like a completed one (content is ONE page of that partial, partialContent is the whole text in one field, so a short unfinished answer needs no second call); an unknown invocationId, or one that belongs to another agent, is an error. Only answer text is exposed - a finished answer in content, an unfinished one in partialContent - never system instructions, transcripts, tool arguments, or tool bodies.`,
     tags: ['agents', 'result', 'answer', 'output', 'subagent', 'inspect'],
     // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
     // and enables it for this session instead of seeing it declared on every request.

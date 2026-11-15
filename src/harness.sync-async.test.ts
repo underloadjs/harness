@@ -672,18 +672,39 @@ describe('batch gate races (T4 verification)', () => {
         expect(running.status).toBe('rejected');
         expect(String((running.error as Error).message)).toContain('gate aborted');
 
-        // Rolled back like every other cancelled run: no committed turn, and the
-        // recurring-wakeup timer is cleared rather than left armed behind the park.
+        // Issue 0036 R1: an aborted run no longer rolls back. It RETAINS the prompt and
+        // the assistant turn that asked for the gated call, and that call — parked, then
+        // abandoned by the abort — is answered by exactly ONE synthesized interrupted
+        // result, which is what keeps the retained tail replayable by a provider. The
+        // recurring-wakeup timer is still cleared rather than left armed behind the park.
+        // The marker is matched by substring so the sentence itself stays re-wordable.
         expect(world.seen.length).toBe(1);
-        expect(world.brain.messages).toEqual([]);
+        const retained: unknown[] = JSON.parse(JSON.stringify(world.brain.messages));
+        expect(world.brain.messages).toMatchObject([
+            { role: 'user', content: 'go' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'solo', arguments: '{"value":"x"}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'c1',
+                name: 'solo',
+                content: expect.stringContaining('cancelled or interrupted')
+            }
+        ]);
         expect(vi.getTimerCount()).toBe(0);
 
         // The abandoned sync member is released by abandonScope, so its late result
-        // cannot resurrect the dead run or spend a turn.
+        // cannot resurrect the dead run or spend a turn. Retention means the transcript
+        // is no longer empty here, so the surviving proof of "nothing happened" is that
+        // the run stays at ONE request and the retained rows are byte-for-byte what the
+        // abort left behind — the late 'late-value' payload was never appended.
         gate.resolve('late-value');
         await flush();
         expect(world.seen.length).toBe(1);
-        expect(world.brain.messages).toEqual([]);
+        expect(world.brain.messages).toEqual(retained);
     });
 
     it('spends no extra turn when a sync call settles inside its own launch round', async () => {
