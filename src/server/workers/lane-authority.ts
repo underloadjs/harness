@@ -168,9 +168,13 @@ export type LaneRuntimeCall =
     // state read crosses.
     //
     // R2-F14 (2026-11-13, independent review): `identity.threadId` is the CALLER's thread, and it
-    // is not decorative — both seams below take it as `callerThreadId`, which is what switches on
-    // the core's thread-family gate (`isAddressVisible` in src/harness.ts) and the branch-address
-    // fallback. A read that arrives with an EMPTY identity stays unscoped, exactly like a host read.
+    // is not decorative — both seams below take it as `callerThreadId`. It USED to be what switched
+    // on the core's thread-family gate (`isAddressVisible` in src/harness.ts), which refused a
+    // foreign-lineage read; since 2026-11-15 a READ is SESSION-WIDE, so the gate answers true for
+    // every live conversation and the identity is what keeps the two execution modes stating the
+    // SAME answer rather than opposite ones. It still rides because the routed `threadDelete` is
+    // genuinely caller-scoped, and one wire shape that carries the caller cannot be dropped in
+    // silence. A read that arrives with an EMPTY identity stays unscoped, exactly like a host read.
     | { op: 'thread:read'; threadId: string; identity: LaneCallIdentity };
 
 // Everything else the authority answers for a lane.

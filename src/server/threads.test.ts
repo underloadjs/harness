@@ -154,6 +154,10 @@ type Fixture = {
     preset: HarnessPreset;
     requests: HarnessMessage[][];
     log: string[];
+    // Every harness this fixture's preset BUILT, in creation order. The store owns the
+    // runtime, so a test that wants to ask the harness a question — does `PE1` resolve as an
+    // address? — has to reach the object the preset returned rather than a projection of it.
+    built: Harness[];
     peak: () => number;
     gate: (prompt: string) => Deferred;
     started: (prompt: string) => Deferred;
@@ -185,8 +189,10 @@ const createFixture = (): Fixture => {
         return created;
     };
 
-    const preset = presetOf('probe', (settings, progress) =>
-        harness({
+    const built: Harness[] = [];
+
+    const preset = presetOf('probe', (settings, progress) => {
+        const instance = harness({
             agents: {
                 probe: agent({
                     model: settings.model,
@@ -234,10 +240,13 @@ const createFixture = (): Fixture => {
             primary: 'probe',
             presets: false,
             report: { progress }
-        })
-    );
+        });
 
-    return { preset, requests, log, peak: () => highest, gate, started };
+        built.push(instance);
+        return instance;
+    });
+
+    return { preset, requests, log, built, peak: () => highest, gate, started };
 };
 
 const createStore = (
@@ -601,6 +610,53 @@ describe('SessionStore persistent threads', () => {
             [third.turn.threadId, 'PE3'],
             [fourth.turn.threadId, 'PE4']
         ]);
+    });
+
+    // A LABEL IS AN ADDRESS — the server half. `PE1` is minted HERE (the map plus its
+    // monotonic high-water is what makes it unique), but a MODEL reaches a conversation through
+    // the harness, and the harness only knows what its own records carry. So the store mirrors
+    // the name onto the runtime record (`mirrorThreadLabel` → `harness.setThreadLabel`), which
+    // is what lets `threadRead`/`threadList`/`threadSend` resolve `PE1` instead of forcing the
+    // caller to know the `thread-1` it was minted beside — the dead end that made a "review the
+    // PE1 thread" prompt unanswerable.
+    it('mirrors the minted label onto the runtime record, so a model can address it', async () => {
+        pinClock(1_500);
+        const fixture = createFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        const task = await store.enqueue(created.id, 'one');
+        await task.settled;
+        await store.waitForIdle(created.id);
+
+        const runtime = fixture.built[0]!;
+        expect(task.turn.threadLabel).toBe('PE1');
+
+        // THE NAME RESOLVES IN THE RUNTIME, not just in the store's projection: the record and
+        // the transcript both answer `PE1`, and they answer the SAME conversation the store
+        // named. Before the mirror, `thread('PE1')` was undefined here even though the roster
+        // row and the turn both said `PE1`.
+        expect(runtime.thread('PE1')?.id).toBe(task.turn.threadId);
+        expect(runtime.threadMessages('PE1').map((message) => message.role)).toEqual([
+            'system',
+            'user',
+            'assistant'
+        ]);
+
+        // THE MODEL ROSTER CARRIES IT. `threadList` is built from the runtime records, so the
+        // row a model reads states the name it was given — `actOn` holds its id, because the
+        // write doors are stated in ids and a label is only an alias for one.
+        const roster = runtime.threads().find((record) => record.id === task.turn.threadId);
+
+        expect(roster?.label).toBe('PE1');
+
+        // A SECOND conversation gets its own name, and neither resolves to the other: the
+        // per-agent ordinal is what makes the address unique within the session.
+        const other = await store.enqueue(created.id, 'two');
+        await other.settled;
+        expect(other.turn.threadLabel).toBe('PE2');
+        expect(runtime.thread('PE1')?.id).toBe(task.turn.threadId);
+        expect(runtime.thread('PE2')?.id).toBe(other.turn.threadId);
     });
 
     it('continues an idle thread, preserving its transcript and index order', async () => {

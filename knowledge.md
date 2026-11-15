@@ -5331,7 +5331,12 @@ Retired SSE frames (history only — these routes answer `404` now):
   the thread badge left and `elapsed | tokens` flush right on the same line, and the
   meta line wraps below. A nested card was already that shape (`.thread-top`
   `order: 2; margin-left: auto`), which is why the two headers now agree without
-  absolute positioning or reserved padding.
+  absolute positioning or reserved padding. T4 changed WHICH bar is on screen and added
+  a third control, not this anatomy: the destructive slot is one button with two meanings
+  (`Stop` while the thread/subtree is live, `Delete` otherwise), `Resume` is inserted
+  immediately BEFORE `Transcript` and the flush-right auto margin moves onto whichever of
+  the two is visible, and the bar belongs to the CONVERSATION rather than to the expanded
+  entry — see the two bullets on this in `### Persistent threads in the UI`.
 - **Background work (R6).** Concurrent tools mean a turn is `running` until the
   harness promise drains, while an agent `done` can be interim. The UI reconciles
   the same way (by turn id, never rebuilding) and, for the additive frames:
@@ -5562,7 +5567,58 @@ handler and the `@underload/service` route, one `/v1/harness` mount on each — 
 value as a 200, the 400/404/405/409 matrix, restart round-trips, tolerant restore and
 stale-entry dropping, and document corruption that still aborts startup),
 `ui/thread-transcript.test.ts` + `ui/thread-transcript-edit.test.ts` (the lossless
-read-only document, the editor, and the unreadable-thread open).
+read-only document, the editor, and the unreadable-thread open),
+`ui/thread-action-bar-placement.test.ts` (T4/R2: exactly ONE visible bar per expanded
+conversation, in its head exchange, stable while other entries are pressed, targeting the
+conversation's thread; no second bar for a delegated card or a continuation routed inside
+one; the child's own bar when the CHILD is the focused surface), and
+`ui/turns-navigation.test.ts` (T4/R1 with R3a/R3c: which press reveals which entry, and
+which re-render is silent).
+
+- **One action bar per conversation SURFACE, anchored at its top (T4/R2).** The bar
+  belongs to the CONVERSATION, not to the expanded entry: `ui/turns.ts`
+  `showsThreadActionBar(card)` shows a tile's `.tile-transcript-action` only while the
+  enclosing `.conversation` (or the standalone row, for a legacy/unthreaded turn) is
+  expanded AND the card is that surface's FIRST exchange — the head prompt that carries
+  the thread badge — so the Stop/Delete + Resume + Transcript row sits directly under the
+  thread header and above every entry body. `coveredByExpandedSurface(row)` hides a
+  delegated child card's own `.thread-transcript-action` while an expanded conversation
+  (or owner tile) already shows the bar for everything rendered inside it; the child's
+  actions stay reachable because pressing the child's header focuses THAT conversation
+  (`focusThread` path 2 → `focusChildThread`), which closes the covering surface first,
+  and a roster-only child keeps its own focus-panel bar. The bar is deliberately IN-FLOW
+  and NOT viewport-sticky: the transcript is one scroll list holding several conversation
+  cards, so the bar anchors to the top of ITS conversation and scrolls with it. Because
+  visibility no longer follows the expanded entry, every expansion change repaints ALL
+  bars — `refreshActionBars()` at the end of `expand`, in `detachTileExpansion`, in
+  `dropFocusState`, and in `reorderBoard` when a card's head exchange actually changed (an
+  unconditional repaint there re-renders bars on every projection reorder for no
+  behavioral gain). A per-tile repaint cannot do this job: it can neither hide the bar of
+  the conversation the focus left nor show the head exchange's bar when the reader pressed
+  a LATER exchange of the same card.
+- **Pressing an entry reveals THAT entry (T4/R1).** `expand(turn, scroll)` calls
+  `turn.element.scrollIntoView?.({ block: 'nearest' })` AFTER the class toggles, the
+  conversation-host toggles and the bar repaint: opening a conversation grows content
+  ABOVE the pressed row (every earlier exchange's body becomes visible, and the in-flow
+  bar adds height) while the transcript keeps its numeric scroll offset, so a reveal that
+  ran earlier in the sequence would land on the head entry — the reported bug. `nearest`
+  is the same minimal reveal `focusChildThread` already used: it scrolls the least amount
+  that brings the pressed entry into the viewport — nothing while the whole entry is on
+  screen, and for an entry TALLER than the viewport whichever of its two edges is nearest,
+  so a taller-than-viewport entry is re-landed rather than left mid-content. The flag is set ONLY by a real gesture (the
+  entry's `.tile-select` press, and the header press that reaches `focusThread(id, true)`),
+  and `focusThread` path 1 forwards it (`expand(candidate, scroll)`); hydration,
+  reconciliation, a collapse press and every background/re-render focus stay silent, which
+  is the R3c contract the same suite pins. `main.ts` arms `revealEntry` for the click and
+  re-applies the same minimal reveal from `repaintPlane` (`revalidateReveal`) when a
+  lazily-loaded display tree lands and grows the conversation AFTER that frame; the arm is
+  RECOMPUTED on every press — the newly opened surface when the press changed which surface
+  is open, else the pressed persistent child row when nothing is open (a delegated child
+  focus has no tile), else nothing, so a button or a chip pressed INSIDE the conversation the
+  reader is already reading leaves no request behind. The arm
+  dies on any reader gesture (wheel / pointerdown / keydown / touchstart on the log), on
+  `clear()`, or as soon as the expansion or the attachment changed, so a late paint can
+  never drag the viewport under a reader who has already scrolled away.
 
 ### Live shell panels (`harness.tasks`, `harness.records`)
 

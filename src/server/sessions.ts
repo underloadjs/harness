@@ -6444,13 +6444,55 @@ export class SessionStore {
         const known = session.threadLabels.get(threadId);
         if (known !== undefined) {
             this.raiseThreadLabelHighWater(session, known);
+            this.mirrorThreadLabel(session, threadId, known);
+
             return known;
         }
 
         const record = this.threadsSupported(session) ? session.harness.thread(threadId) : undefined;
         const agent = record?.agent ?? agentHint ?? session.preset.primary;
+        const label = this.mintThreadLabel(session, threadId, agentCodeOf(agent));
 
-        return this.mintThreadLabel(session, threadId, agentCodeOf(agent));
+        this.mirrorThreadLabel(session, threadId, label);
+
+        return label;
+    }
+
+    // Mirror one conversation's session label onto its RUNTIME record.
+    //
+    // WHY THE RUNTIME NEEDS THE NAME: `IT14` is minted HERE (the map plus its monotonic
+    // high-water are what make it unique), but a model reaches a conversation through the
+    // harness, and the harness only knows what its own records carry. With the label on the
+    // record, `threadRead`/`threadList`/`threadSend` can resolve `IT14` as an ADDRESS
+    // (core/thread.ts `resolveThreadAddressOf`) instead of forcing the caller to know the
+    // opaque `thread-32` it was minted beside — which is exactly the dead end that made a
+    // "review the IT14 thread" prompt unanswerable.
+    //
+    // ONE-WAY MIRROR: the store's map stays the authority for minting and for every display
+    // surface (`threadRoster` below overrides `label` from the map, so the UI cannot see this
+    // copy disagree). The record only ever receives the value the map already holds, and only
+    // when it differs, so a steady session writes nothing.
+    //
+    // DURABILITY comes free: `snapshot()` writes `label` and `restore()` re-creates it
+    // (../core/snapshot.ts already whitelists the key), so after a restart the name is back on
+    // the record with no minting and no re-write.
+    private mirrorThreadLabel(session: Session, threadId: string, label: string): void {
+        if (!this.threadsSupported(session)) return;
+
+        const harness = session.harness as Partial<Harness>;
+
+        // A handle built before this seam has no setter; the map keeps working exactly as it
+        // did, and the tools keep refusing the label with their own named sentence.
+        if (typeof harness.setThreadLabel !== 'function' || typeof harness.thread !== 'function') return;
+
+        const record = harness.thread(threadId);
+
+        // A conversation this harness does not have (already deleted, or a branch id, which
+        // owns no session label) gets nothing: the map entry is the record of the name, and a
+        // display read must not fail because a conversation went away.
+        if (record === undefined || record.label === label) return;
+
+        harness.setThreadLabel(threadId, label);
     }
 
     // Mint the next ordinal of `code` for one conversation and record it.

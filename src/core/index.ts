@@ -434,5 +434,7 @@ export {
     createThreadAgent,
     defaultThreadIdOf,
     normalizeThreadLabel,
-    registerAgentThreader
+    registerAgentThreader,
+    resolveThreadAddressOf
 } from './thread';
+export type { ThreadAddressCandidate } from './thread';

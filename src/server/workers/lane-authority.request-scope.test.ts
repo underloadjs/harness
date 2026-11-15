@@ -18,12 +18,14 @@
 //
 // 2026-11-13 (independent review, finding 2): the same PAYLOAD-then-CONSEQUENCE discipline,
 // applied to the two CONVERSATION-level routed operations that carry a caller —
-// `thread:read` and the routed `threadDelete`. Both are caller-scoped at the canonical
-// harness (`isAddressVisible` / `threadDeleteFor` in ../../harness.ts), and the read used to
-// travel with `identity: {}`, so the coordinator answered it UNSCOPED: a lane's `threadRead`
-// of a foreign-lineage thread returned the whole transcript where the identical call INLINE
-// answers "not visible to thread …". The new block below pins the request body a lane raises
-// AND what the authority does with it, so the caller id cannot be dropped again in silence.
+// `thread:read` and the routed `threadDelete`. The read used to travel with `identity: {}`, so
+// the coordinator answered it UNSCOPED while the inline door gated it by lineage (`isAddressVisible`);
+// the caller id was made to ride so the two modes agreed. THEY STILL AGREE, in the other
+// direction: a READ is session-wide in the core since 2026-11-15, so both answer the transcript,
+// and the identity keeps riding because the routed `threadDelete` is genuinely caller-scoped
+// (`threadDeleteFor` in ../../harness.ts) and a wire shape that carries the caller once is the
+// one that cannot be dropped in silence. The block below pins the request body a lane raises AND
+// what the authority does with it.
 //
 // Cross-references:
 //   - ./lane-authority.ts:111            - the optional `scope` on the routed request
@@ -33,9 +35,10 @@
 //   - ./lane-authority.ts ~751           - the routed `threadDelete` (caller from `identity`)
 //   - ./lane-worker-loop.ts ~360         - the replica routing `context.toolScope`
 //   - ./lane-worker-loop.ts:361          - `threadReadRoutePayload`, pinned at payload level below
-//   - ../../harness.ts ~5576 / ~6062     - `isAddressVisible` and
-//                                          `threadMessages(threadId, callerThreadId?)`, the two
-//                                          seams the routed read answers through
+//   - ../../harness.ts ~5576 / ~6062     - `isAddressVisible` (now read by nothing: reads
+//                                          are session-wide) and
+//                                          `threadMessages(threadId, callerThreadId?)`, the
+//                                          seam the routed read answers through
 //   - ../../harness.ts `requestToolsFor` - the single scope-aware implementation
 //   - ../harness.delegation.test.ts      - the inline halves of the same contract
 
@@ -253,19 +256,20 @@ describe('routed toolRequest: the run scope reaches the canonical harness (T11 l
 // this lane did not create by raising `thread:read`, and the authority reads through the SAME
 // two core seams the inline tool path uses — `src/harness.ts` `thread(id, callerThreadId?)`
 // (the handle member, ~12667) and `threadMessages(threadId, callerThreadId?)` (~6062). Both
-// switch on the caller: `isAddressVisible` (~5576) admits the caller's own conversation, its
-// ancestors, its descendants and the default conversations its family spans, and refuses
-// anything else that still exists. With `identity: {}` the gate stayed OFF at the coordinator,
-// so a lane's `threadRead` of a foreign-lineage thread returned the whole canonical transcript
-// where the identical call INLINE answers "not visible to thread …" — the two execution modes
-// gave opposite answers to the same request, while src/tools/runtime/threadRead.tool.ts states
-// the inline rule as the contract.
+// take the caller as `callerThreadId`. They USED to switch on it — `isAddressVisible` withheld
+// everything outside the caller's family — so with `identity: {}` at the coordinator a lane's
+// `threadRead` of a foreign-lineage thread returned the whole canonical transcript where the
+// identical call INLINE answered "not visible to thread …", and the caller id was made to ride
+// to make the two modes agree.
 //
-// The same discipline covers the routed `threadDelete`: `identity.threadId` is the CALLER and
-// `threadId` the TARGET, and the authority scopes the release to that caller's own descendants
-// (`src/harness.ts` `threadDeleteFor`, ~5824). Every case below is pinned at PAYLOAD level
-// where a builder exists and at CONSEQUENCE level always, so a caller id that stops riding
-// fails here rather than silently in production.
+// SINCE 2026-11-15 THE TWO MODES AGREE THE OTHER WAY: a READ is session-wide in the core, so
+// both answer the transcript. The caller id still travels, because the authority answers other
+// routed calls from the same identity and because a read that becomes caller-sensitive again
+// must not need a wire change. What the lineage rule still owns is the WRITE door: the routed
+// `threadDelete` below, where `identity.threadId` is the CALLER and `threadId` the TARGET, and
+// the release is scoped to that caller's own descendants (`src/harness.ts` `threadDeleteFor`).
+// Every case below is pinned at PAYLOAD level where a builder exists and at CONSEQUENCE level
+// always, so a caller id that stops riding fails here rather than silently in production.
 // ---------------------------------------------------------------------------
 
 describe('routed conversation read and delete: the caller travels with the request (independent review 2026-11-13)', () => {
@@ -324,30 +328,34 @@ describe('routed conversation read and delete: the caller travels with the reque
         });
     });
 
-    it('refuses a routed read of a conversation outside the caller lineage with the INLINE refusal sentence', async () => {
+    it('answers a routed read of a conversation outside the caller lineage, as the inline door now does', async () => {
         const caller = core.createThread('primary', { label: 'lane conversation' });
         const stranger = core.createThread('primary', { label: 'someone else' });
 
         core.appendThreadMessages(stranger.id, [{ role: 'user', content: 'not yours' }], 0);
 
-        // The exact message `threadNotVisibleError` (src/harness.ts ~5606) produces, so a lane
-        // tells the model what an inline run tells it — a roster problem, not a typo — instead of
-        // handing back the transcript the gate exists to withhold. Asserted as the full sentence:
-        // the previous behaviour was a SILENT success, so only an exact pin on the refusal text
-        // distinguishes the two.
-        await expect(
-            authority.answer(EPOCH_A, {
-                op: 'thread:read',
-                ...threadReadRoutePayload(stranger.id, caller.id)
-            } as LaneAuthorityRequest)
-        ).rejects.toThrow(
-            `Thread "${stranger.id}" is not visible to thread "${caller.id}": a read reaches your own thread, an ` +
-                'ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists (see ' +
-                'threadList). The id exists — it is simply outside your lineage.'
-        );
+        // A READ IS SESSION-WIDE (2026-11-15). This case used to pin the exact
+        // `threadNotVisibleError` sentence, because the pre-fix behaviour was a SILENT success
+        // and only an exact pin on the refusal told them apart. Now both execution modes answer
+        // the transcript — the lane and the inline path still give the SAME answer for the same
+        // address, which is the invariant this file exists for; only its direction moved. The
+        // caller id is still sent (pinned at payload level above), and the WRITE door still
+        // refuses a stranger (pinned below).
+        const answer = await authority.answer(EPOCH_A, {
+            op: 'thread:read',
+            ...threadReadRoutePayload(stranger.id, caller.id)
+        } as LaneAuthorityRequest);
 
-        // The caller's own conversation stays reachable — the gate withholds the stranger, not
-        // the lane's own state.
+        expect((answer.value as { messages: unknown[] }).messages).toEqual([
+            { role: 'user', content: 'not yours', messageId: 'msg-1' }
+        ]);
+        expect(answer.value).toMatchObject({
+            threadId: stranger.id,
+            length: 1,
+            record: { id: stranger.id, agent: 'primary', label: 'someone else' }
+        });
+
+        // The caller's own conversation stays reachable too.
         core.appendThreadMessages(caller.id, [{ role: 'user', content: 'mine' }], 0);
 
         expect(

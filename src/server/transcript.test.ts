@@ -843,13 +843,31 @@ describe('thread transcript read/write (C4)', () => {
 
         // The snapshot projection still reports the unreadable thread, keyed and sorted by id
         // (store oracle — an accepted internal read, not a network compatibility shape).
+        //
+        // WHY THE LABEL IS HERE (2026-11-15): the unreadable record copies the conversation's
+        // label (`sessions.ts` ~9743), and the store now mirrors its minted name onto the RUNTIME
+        // record so a model can address the conversation by it — so the operator-facing diagnostic
+        // names the conversation the way the UI does (`OE1`), not only the opaque `thread-1`. A
+        // DEFAULT conversation (`agent:one`) keeps its label-free shape, because a default has no
+        // thread record to stamp.
         expect(runtime.store.get(sessionId).invalidThreads).toEqual([
-            { id: 'thread-1', agent: 'one', error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }] }
+            {
+                id: 'thread-1',
+                agent: 'one',
+                label: 'OE1',
+                error: BAD_ROLE,
+                messages: [{ role: 'bogus', content: 'x' }]
+            }
         ]);
 
         // And this is the durable record, not only the response.
         expect(storedSession(root, sessionId).invalidThreads).toEqual({
-            'thread-1': { error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }], agent: 'one' }
+            'thread-1': {
+                error: BAD_ROLE,
+                messages: [{ role: 'bogus', content: 'x' }],
+                label: 'OE1',
+                agent: 'one'
+            }
         });
         expect(withoutIds(storedThreadMessages(root, sessionId, 'thread-1'))).toEqual(placeholder(BAD_ROLE));
 
@@ -884,7 +902,13 @@ describe('thread transcript read/write (C4)', () => {
 
         // The snapshot projection carries the unreadable record (store oracle).
         expect(runtime.store.get(sessionId).invalidThreads).toEqual([
-            { id: 'thread-1', agent: 'one', error: NOT_AN_ARRAY, messages: { not: 'an array' } }
+            {
+                id: 'thread-1',
+                agent: 'one',
+                label: 'OE1',
+                error: NOT_AN_ARRAY,
+                messages: { not: 'an array' }
+            }
         ]);
 
         // An empty array is a VALID transcript (it is what the editor clears to).
@@ -935,7 +959,13 @@ describe('thread transcript read/write (C4)', () => {
         expect(second.store.restoreErrors).toEqual([]);
         expect(withoutIds(threadOf(snapshot).messages)).toEqual(placeholder(NOT_AN_ARRAY));
         expect(snapshot.invalidThreads).toEqual([
-            { id: 'thread-1', agent: 'one', error: NOT_AN_ARRAY, messages: 'broken' }
+            {
+                id: 'thread-1',
+                agent: 'one',
+                label: 'OE1',
+                error: NOT_AN_ARRAY,
+                messages: 'broken'
+            }
         ]);
 
         // The metadata head names the failure; the document route serves the RAW value the
@@ -998,7 +1028,13 @@ describe('thread transcript read/write (C4)', () => {
         expect(threadOf(restored).id).toBe('thread-1');
         expect(withoutIds(threadOf(restored).messages)).toEqual(placeholder(BAD_ROLE));
         expect(restored.invalidThreads).toEqual([
-            { id: 'thread-1', agent: 'one', error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }] }
+            {
+                id: 'thread-1',
+                agent: 'one',
+                label: 'OE1',
+                error: BAD_ROLE,
+                messages: [{ role: 'bogus', content: 'x' }]
+            }
         ]);
 
         // A fix submitted after the restart clears the record for good — including
@@ -1042,7 +1078,13 @@ describe('thread transcript read/write (C4)', () => {
         const restored = second.store.get(sessionId);
         expect(withoutIds(threadOf(restored).messages)).toEqual(placeholder(BAD_ROLE));
         expect(restored.invalidThreads).toEqual([
-            { id: 'thread-1', agent: 'one', error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }] }
+            {
+                id: 'thread-1',
+                agent: 'one',
+                label: 'OE1',
+                error: BAD_ROLE,
+                messages: [{ role: 'bogus', content: 'x' }]
+            }
         ]);
         expect(restored.turns.map((turn) => turn.prompt)).toEqual(['hello']);
 
@@ -1198,7 +1240,12 @@ describe('thread transcript read/write (C4)', () => {
             pretty([{ role: 'bogus', content: 'x' }])
         );
         expect(storedSession(root, sessionId).invalidThreads).toEqual({
-            'thread-1': { error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }], agent: 'one' }
+            'thread-1': {
+                error: BAD_ROLE,
+                messages: [{ role: 'bogus', content: 'x' }],
+                label: 'OE1',
+                agent: 'one'
+            }
         });
 
         // Reading the transcript hands out a COPY, so writing through the value a reader
@@ -1232,7 +1279,12 @@ describe('thread transcript read/write (C4)', () => {
             { role: 'bogus', content: 'x' }
         ]);
         expect(storedSession(root, sessionId).invalidThreads).toEqual({
-            'thread-1': { error: BAD_ROLE, messages: [{ role: 'bogus', content: 'x' }], agent: 'one' }
+            'thread-1': {
+                error: BAD_ROLE,
+                messages: [{ role: 'bogus', content: 'x' }],
+                label: 'OE1',
+                agent: 'one'
+            }
         });
 
         runtime.store.dispose();

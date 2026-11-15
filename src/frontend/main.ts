@@ -919,6 +919,12 @@ type View = {
     // repaints the "load older" affordance. Called on a document landing, on scroll,
     // and whenever an expansion changes — never once per row of loaded history.
     reveal: () => void;
+    // R1: re-apply the entry reveal a transcript click asked for. The board reveals the
+    // pressed entry synchronously, so the ONLY thing that can undo it is a display tree
+    // the lazy plane adopts afterwards (T24) growing the rows above it; that repaint is
+    // this view's one caller. No-op unless a click armed the request, and the reader's
+    // own wheel/drag/keyboard gesture retires it.
+    revalidateReveal: () => void;
     // The rows currently inside this pane's viewport, plus the expanded tile's id.
     // This is what `DisplayPlane.ensureVisible` is allowed to ask trees for.
     visibleTurnIds: () => string[];
@@ -1186,13 +1192,114 @@ const createView = (
     // Scrolling INTO unloaded history is the request for it (T24 item 2).
     logWrap.addEventListener('scroll', () => reveal(), { passive: true });
 
+    // R1: the entry a transcript click asked to see, and the one place that can move it
+    // out of view again AFTER the board revealed it. `ui/turns.ts expand` reveals the
+    // pressed entry synchronously; a display tree adopted from the lazy plane (T24) then
+    // grows the rows ABOVE it, so the viewport slides off the very row the reader clicked
+    // — the reported bug ("clicking on them does not navigate to the correct position")
+    // in its lazy form. Nothing polls this: only `revalidateReveal` (the plane's repaint)
+    // re-applies it, and only while this stays armed.
+    let revealEntry: HTMLElement | undefined;
+
+    // Deliberate movement by the reader (wheel, drag, keyboard, touch) retires the click's
+    // request: from then on THEIR position is the one to keep. These are user-input events,
+    // never the `scroll` a programmatic `scrollIntoView` itself fires, which is why the
+    // reveal is not disarmed by its own viewport change. The events are exactly the ones a
+    // reader can move this pane with (a scrollbar drag starts with a pointerdown).
+    for (const gesture of ['wheel', 'pointerdown', 'keydown', 'touchstart'] as const) {
+        logWrap.addEventListener(gesture, () => (revealEntry = undefined), { passive: true });
+    }
+
+    // The plane adopting a tree is the asynchronous completion of the click, so it is the
+    // re-reveal point. `block: 'nearest'` reveals the MINIMAL rectangle that contains the
+    // element: nothing moves while the whole row is on screen, and a row TALLER than the
+    // viewport is re-landed at whichever of its edges is nearest (so a tree that grew the
+    // opened tile re-lands its top edge instead of leaving it mid-content). Optional call:
+    // jsdom has no `scrollIntoView`.
+    const revalidateReveal = (): void => {
+        const target = revealEntry;
+        if (target === undefined) return;
+
+        // The expansion moved on, or the row is gone (a reconcile dropped it): the
+        // click's request is spent. Two shapes get armed below, so two shapes stay
+        // valid: the expanded TILE (`board.expanded()` is its open look, and exactly one
+        // tile can be expanded) and a focused PERSISTENT CHILD ROW, whose open look is
+        // that card's own `is-expanded` — a child focus has no expanded tile to name it.
+        const stillOpenSurface =
+            board.expanded()?.element === target || target.classList.contains('is-expanded');
+
+        if (!stillOpenSurface || !target.isConnected) {
+            revealEntry = undefined;
+            return;
+        }
+
+        target.scrollIntoView?.({ block: 'nearest' });
+    };
+
+    // F3/F7: the expanded surface as of the PREVIOUS press, which is the only way this
+    // listener can tell "this press changed what the reader is looking at" from "this press
+    // touched something inside the surface that is already open". The handler below sits on
+    // `board.element`, so the board's own `.tile-select`/`.thread-select` handlers (on
+    // descendants) run FIRST and the expansion it reads is already the post-press one.
+    // `pointerdown` and `keydown` both precede the `click` they produce, so capturing here
+    // sees the pre-press surface; re-recording at the end of each click keeps the same value
+    // correct for a press that arrives without either (a synthetic click).
+    let pressedSurface: HTMLElement | undefined = board.expanded()?.element;
+
+    for (const press of ['pointerdown', 'keydown'] as const) {
+        board.element.addEventListener(
+            press,
+            () => {
+                pressedSurface = board.expanded()?.element;
+            },
+            { passive: true }
+        );
+    }
+
+    // F3/F7: the row a press on a NESTED persistent card asked to see. Such a press focuses
+    // THAT conversation (`ui/turns.ts`, the delegated `.thread-select` handler), which
+    // detaches the tile expansion — there is then no expanded tile to follow, and the node
+    // the board reveals is the child's own row (`focusChildThread`). Arming it is what lets
+    // the same lazy-growth re-reveal cover the delegated shape.
+    const pressedChildRow = (event: MouseEvent): HTMLElement | undefined => {
+        const row =
+            event.target instanceof Element
+                ? event.target.closest<HTMLElement>('.thread-row[data-persistent-thread]')
+                : null;
+
+        return row ?? undefined;
+    };
+
     // A click anywhere in the transcript is the reader changing WHAT THEY ARE LOOKING
     // AT, and it is not always a focus change: two tiles of the SAME conversation
     // switch the expanded tile without moving the steering target, so `onFocusChange`
     // stays silent. Without this the flow subscription would follow the thread and not
     // the tile, and the newly opened tile would stream nothing. `followTurnFlow` is
     // idempotent for the same turn, so a click that changed nothing costs no request.
-    board.element.addEventListener('click', () => {
+    board.element.addEventListener('click', (event) => {
+        // R1: this runs AFTER the board's own `.tile-select`/`.thread-select` handlers
+        // (they are inside `board.element`, so they fire first), which makes the
+        // conversation that is open now exactly the one the reader just pressed.
+        const surface = board.expanded()?.element;
+
+        // R1/F3: the reveal request is RECOMPUTED on every press, never just refreshed.
+        //   - the press opened a surface that was not open before -> THAT is the position
+        //     the reader asked for;
+        //   - nothing is open (a collapse, or a delegated child focus, which has no tile)
+        //     -> the persistent child row that was pressed, when the press was on one;
+        //   - otherwise (a copy button, a chip, a bar action inside the surface that is
+        //     already open) -> nothing. Keeping the old arm here was the reported jump: a
+        //     later background tree landing re-revealed a tile taller than the viewport and
+        //     pulled the reader out of the middle of it.
+        revealEntry =
+            surface !== undefined && surface !== pressedSurface
+                ? surface
+                : surface === undefined
+                  ? pressedChildRow(event)
+                  : undefined;
+
+        pressedSurface = surface;
+
         if (lazy === undefined) return;
 
         lazy.focusTurn?.(board.expanded()?.id());
@@ -1307,6 +1414,8 @@ const createView = (
         },
         clear: () => {
             board.clear();
+            // R1: the rows are gone, so the click's reveal request goes with them.
+            revealEntry = undefined;
             logWrap.scrollTop = 0;
         },
         notice: (text, tone) => {
@@ -1378,6 +1487,7 @@ const createView = (
             paintOlder();
         },
         reveal: () => reveal(),
+        revalidateReveal: () => revalidateReveal(),
         visibleTurnIds: () => visibleTurnIds(),
         expandedTurnId: () => board.expanded()?.id(),
         paintOlder: () => paintOlder()
@@ -12049,6 +12159,11 @@ const repaintPlane = (instance: Instance): void => {
     if (current === instance) configureAgentColorsFor(agentViewOf(instance));
 
     instance.view.reconcileView(view, instance.sessionModel);
+    // R1: this is the paint that adopts a lazily read display tree, i.e. the part of a
+    // transcript click that finishes AFTER the board revealed the pressed entry. The view
+    // decides whether a click is still waiting on it (and never scrolls on a background
+    // tree arrival, which is the R3c rule this pane already follows for polls).
+    instance.view.revalidateReveal();
 
     if (current === instance) paintPanels();
     instance.view.paintOlder();

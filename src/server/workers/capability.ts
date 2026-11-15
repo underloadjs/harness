@@ -269,6 +269,9 @@ export const LANE_FORBIDDEN_HANDLE_CALLS = [
     // CANONICAL transcript; a lane's tool body may only influence it by committing operations.
     'patchThreadMessages',
     'setThreadStatus',
+    // The session label is canonical roster state too: a lane that stamped `IT14` onto its own
+    // copy would publish a name the coordinator never minted and the next snapshot would drop.
+    'setThreadLabel',
     'archiveInvocation',
     'deleteThread',
     'sendThreadInput',

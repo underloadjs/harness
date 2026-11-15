@@ -2987,6 +2987,14 @@ export type HarnessThreadSteerReceipt = {
 // executeTool call).
 export type HarnessThreadRoster = {
     currentThreadId?: string;
+    // THE ROWS THE CALLER MAY ACT ON — the ids `threadSend` and `threadDelete` accept from
+    // this caller (its thread family: own thread, ancestors, descendants, the defaults of
+    // the agents it spans, and a default's transient reply target while a run is attached).
+    // Present for a caller WITH a thread, ABSENT for a threadless one (a host, a manual
+    // `executeTool`), for which every row is actable and the list would only restate `threads`.
+    // `threads` itself is SESSION-WIDE: a read reaches any conversation in the session, so a
+    // row absent from `actOn` is still readable with `threadRead`.
+    actOn?: string[];
     threads: HarnessThreadRecord[];
 };
 
@@ -4206,12 +4214,20 @@ export type Harness = {
     // applies to every live thread of that agent on its next run. A request in
     // flight keeps the model it started with.
     // B1/B4 (2026-11-13): both reads accept the CALLER's persistent thread id as an
-    // optional second argument (`threadRead.tool.ts` passes `context.threadId`). With a
-    // caller present, an address outside that caller's THREAD FAMILY is refused with its
-    // own sentence — "someone else's conversation" is never reported as "never created" —
-    // and a finished fork's `branch-N` resolves through the caller's branch ledger instead
-    // of throwing. Omitted, both are the unscoped host view, exactly as before: no gate,
-    // `undefined` for an id nobody has.
+    // optional second argument (`threadRead.tool.ts` passes `context.threadId`), and a
+    // finished fork's `branch-N` resolves through the branch ledger instead of throwing.
+    //
+    // SINCE 2026-11-15 THE CALLER NO LONGER GATES A READ. Both seams answer any
+    // conversation in the session, because `agentManage`/`agentResult` were never
+    // lineage-gated: a caller could already read a sibling's finished RESULT but not the
+    // transcript that produced it, which made a "review the IT14 thread" brief
+    // unanswerable. The lineage rule still owns the WRITE doors (`threadSend`,
+    // `threadDelete`), and `threadList` states that set as `actOn`.
+    //
+    // Both also accept an ADDRESS, id or label alike (see `threadAddressOf`), and the
+    // second argument still names the caller for branch resolution and for any future
+    // per-conversation rule. Omitted, both behave exactly as they always did — the host
+    // view, and `undefined` for an address nobody has.
     threads: () => HarnessThreadRecord[];
     thread: (id: string, callerThreadId?: string) => HarnessThreadRecord | undefined;
     // The thread's committed transcript, as a detached copy.
@@ -4294,6 +4310,11 @@ export type Harness = {
         status: HarnessThreadStatus,
         invocationId?: string
     ) => HarnessThreadRecord;
+    // The session label (`IT14`) stamped onto the canonical record, so the roster row and a
+    // snapshot carry the name the server minted and a thread tool can resolve it as an ADDRESS
+    // (see core/thread.ts `resolveThreadAddressOf`). `undefined` clears it. Refused for a
+    // conversation this harness does not have; NOTIFIES `thread`, like the write above.
+    setThreadLabel: (threadId: string, label: string | undefined) => HarnessThreadRecord;
     // T5 lane-worker seam: archive ONE terminal invocation for a run that happened on a
     // lane worker, so `agentResult` / `agentManage` / the results view can address work the
     // session really did. Identity is the caller's (authority-leased); the completion and

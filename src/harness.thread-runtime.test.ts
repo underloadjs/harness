@@ -19,20 +19,28 @@
 //       it stopped; stopAllThreads aborts every active run; deleteThread purges a
 //       terminal host conversation plus its invocation and branch lookups, and the
 //       receipt NAMES what it purged (see the stress-report group below).
-//   B3/B4/B5 (2026-11-13, thread-tools wave) The THREAD FAMILY is the visibility
-//       unit: a caller that names a thread (`callerThreadId` on `harness.thread` /
+//   B3/B4/B5 (2026-11-13, thread-tools wave) The THREAD FAMILY is the WRITE unit: a caller
+//       that names a thread (`callerThreadId` on `harness.thread` /
 //       `harness.threadMessages`, the tool context of `threadRead`/`threadSend`/
-//       `threadDelete`) sees itself, its ancestors, its descendants, and the
+//       `threadDelete`) may `threadSend` into itself, its ancestors, its descendants, and the
 //       DEFAULT conversations of exactly those agents — siblings are refused with
 //       `threadNotVisibleError`, and `deleteThread` narrows that to strict
 //       descendants only. A threadless caller (the host, `api.threads.*`, a
 //       context-less `executeTool`) stays UNSCOPED: the full roster, no send
-//       guards, no read gate. `threadSend` into another agent's DEFAULT
+//       guards, no read gate. SINCE 2026-11-15 A READ IS SESSION-WIDE: both read seams
+//       (`harness.thread`, `harness.threadMessages`) answer any conversation in the session,
+//       because `agentManage`/`agentResult` were never lineage-gated and `threadList` now lists
+//       every row with the writable set stated as `actOn`. `threadSend` into another agent's DEFAULT
 //       conversation still lands, but answers with a `note` naming the live thread
 //       to address instead, and `deleteThread` returns a
 //       `HarnessThreadDeleteResult` receipt (`deleted` + `removedThreadIds` +
 //       `removedInvocationIds` + `removedBranchIds`) so a cascade is observable —
 //       see the group of the same name at the end of this file.
+//   LABELS AS ADDRESSES (2026-11-15) A conversation's `label` — the session-unique name the
+//       server mints (`IT14`) — resolves as an address at every thread door: an ID wins
+//       verbatim first, a label matches exactly after trimming, a label held by two
+//       conversations is REFUSED rather than resolved to the first, and an address that matches
+//       nothing passes through so the caller's own not-found sentence names what was typed.
 //   STRESS REPORT #4/#5 (2026-11-14) The family rules and the visible/invisible
 //       VERDICTS are frozen; three refusals were given truthful, actionable text:
 //       a BRANCH id on a delete door (`branch-N` is a fork record, not an unknown
@@ -1274,14 +1282,14 @@ describe('host-parent delegation (R4)', () => {
         const toolMessage = writer
             .threadMessages(first.id)
             .find((message) => message.role === 'tool') as { content: string };
-        // THE ROSTER IS A FAMILY (2026-11-13, B3). From inside `first` the caller sees its
-        // own thread, its ancestors/descendants, and the DEFAULT conversations of the
-        // agents in that family — NOT a sibling host thread it did not create. `second`
-        // is exactly such a sibling, so it is absent here while the threadless host view
-        // below still lists it: the roster is the address book for threadSend/threadRead/
-        // threadDelete, and those refuse everything a scoped caller cannot see.
+        // THE ROSTER IS SESSION-WIDE (2026-11-15), THE WRITE SCOPE IS NOT. From inside `first`
+        // the caller is shown every live conversation — including `second`, a sibling host thread
+        // it did not create — because a READ reaches the whole session and a prompt that names a
+        // thread must be findable. What the family still decides is stated on the page as
+        // `actOn`: the ids this caller may also `threadSend` into or `threadDelete`.
         expect(JSON.parse(toolMessage.content)).toEqual({
             currentThreadId: first.id,
+            actOn: ['agent:writer', first.id],
             threads: [
                 {
                     id: 'agent:writer',
@@ -1297,12 +1305,21 @@ describe('host-parent delegation (R4)', () => {
                     status: 'running',
                     sequence: 2,
                     invocationId: '1'
+                },
+                {
+                    id: second.id,
+                    agent: 'writer',
+                    origin: 'host',
+                    label: 'later',
+                    status: 'idle',
+                    sequence: 3
                 }
             ]
         });
 
-        // A CALLER WITH NO THREAD IS UNSCOPED: the host (here, the manual executeTool with
-        // no thread) still gets every live conversation, including the sibling.
+        // A CALLER WITH NO THREAD IS UNSCOPED IN BOTH SENSES: the host (here, the manual
+        // executeTool with no thread) gets every live conversation AND no `actOn`, because for a
+        // host the readable set and the writable set are the same set.
         const scopedOutRoster = (await writer.executeTool('threadList', {})) as {
             currentThreadId?: string;
             threads: { id: string }[];
@@ -2717,7 +2734,7 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
         ids.borrowed
     ];
 
-    it('a scoped roster is the family of the caller, and the host roster stays session-wide (B3)', async () => {
+    it('a scoped roster is session-wide, and names the family it may act on (B3)', async () => {
         const { writer, parent, child, sibling, borrowed } = lineage({
             'who can I see?': modelDoor('threadList', () => ({}), 'roster read')
         });
@@ -2726,15 +2743,20 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
 
         const roster = JSON.parse(firstResult(writer, child.id)) as {
             currentThreadId?: string;
+            actOn?: string[];
             threads: Record<string, unknown>[];
         };
 
-        // The caller is named, and the rows are ITS family: the ancestor, the conversation
-        // two levels down (a scout thread, because the family spans agents), and the
-        // default conversations of the agents in that family. `sibling` is absent — the
-        // roster is the address book for the doors below, and this caller cannot walk
-        // through that row.
+        // SESSION-WIDE ROWS, FAMILY-SCOPED ACT (2026-11-15). Every live conversation is listed —
+        // the ancestor, the conversation two levels down (a scout thread, because the family spans
+        // agents), BOTH defaults, AND `sibling`, a host thread this caller never created. A READ
+        // reaches the whole session, so a prompt that names a sibling must be able to FIND it.
+        // What the lineage rule still owns is stated as `actOn`: the ids `threadSend` and
+        // `threadDelete` will accept, and that set excludes `sibling`.
         expect(roster.currentThreadId).toBe(child.id);
+        expect(roster.actOn).toEqual(
+            childFamily({ parent: parent.id, child: child.id, borrowed: borrowed.id }).sort()
+        );
         expect(roster.threads).toEqual([
             { id: 'agent:writer', agent: 'writer', origin: 'agent', status: 'idle', sequence: 1 },
             { id: 'agent:scout', agent: 'scout', origin: 'agent', status: 'idle', sequence: 2 },
@@ -2748,6 +2770,7 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
                 ownerThreadId: parent.id,
                 invocationId: '1'
             },
+            { id: sibling.id, agent: 'writer', origin: 'host', status: 'idle', sequence: 5 },
             {
                 id: borrowed.id,
                 agent: 'scout',
@@ -2758,17 +2781,20 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
             }
         ]);
 
-        expect(roster.threads.map((record) => record.id)).not.toContain(sibling.id);
+        expect(roster.actOn).not.toContain(sibling.id);
 
         // UNSCOPED stays UNSCOPED: the same tool with no caller thread (a manual
         // executeTool is an operator action) is the session-wide host view — sibling
-        // included, `currentThreadId` absent, the pre-B3 shape unchanged.
+        // included, `currentThreadId` absent, and NO `actOn`, because for a host the
+        // readable set and the writable set are the same set.
         const hostRoster = (await writer.executeTool('threadList', {})) as {
             currentThreadId?: string;
+            actOn?: string[];
             threads: { id: string }[];
         };
 
         expect(hostRoster.currentThreadId).toBeUndefined();
+        expect(hostRoster.actOn).toBeUndefined();
         expect(hostRoster.threads.map((record) => record.id)).toEqual([
             'agent:writer',
             'agent:scout',
@@ -2779,12 +2805,8 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
         ]);
     });
 
-    it('the two host read seams reach the family and refuse a sibling by name (B3)', () => {
+    it('the two host read seams reach the whole session, and only the write doors refuse a sibling (B3)', () => {
         const { writer, parent, child, sibling, borrowed } = lineage({});
-        const notVisible = (target: string): string =>
-            `Thread "${target}" is not visible to thread "${child.id}": a read reaches your own thread, an ` +
-            'ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists (see ' +
-            'threadList). The id exists — it is simply outside your lineage.';
 
         // Every family member reads with `child` as the caller — the ancestor, its own
         // thread, a descendant two levels down, and BOTH defaults (including the scout's,
@@ -2794,12 +2816,15 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
             expect(writer.threadMessages(id, child.id)).toEqual([]);
         }
 
-        // A SIBLING exists, so the answer is the lineage sentence rather than the
-        // not-found sentence: "re-read your roster" and "typo or released conversation" are
-        // different facts for a caller choosing its next call. The check sits in front of
-        // the branch-ledger fallback so a live thread is never mistaken for an unknown id.
-        expect(() => writer.thread(sibling.id, child.id)).toThrow(notVisible(sibling.id));
-        expect(() => writer.threadMessages(sibling.id, child.id)).toThrow(notVisible(sibling.id));
+        // A SIBLING READS TOO (2026-11-15). The read seams used to answer the lineage
+        // sentence here; a read is now session-wide, because `agentManage`/`agentResult` were
+        // never lineage-gated and a caller told to review a named conversation could read its
+        // finished RESULT but not the transcript that produced it. The id resolves, the record
+        // and the transcript come back, and the caller never has to guess whether the id was a
+        // typo. What still refuses a sibling is the WRITE doors — pinned in the send and delete
+        // cases below.
+        expect(writer.thread(sibling.id, child.id)?.id).toBe(sibling.id);
+        expect(writer.threadMessages(sibling.id, child.id)).toEqual([]);
 
         // An id that resolves for NOBODY keeps `threadStateOf`'s canonical sentence, and the
         // two seams differ in their honest way of saying it: `thread` answers `undefined`
@@ -2812,8 +2837,7 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
         expect(() => writer.threadMessages('thread-99', child.id)).toThrow(unknown);
         expect(() => writer.threadMessages('thread-99')).toThrow(unknown);
 
-        // Without a caller both seams are the host view, so the sibling reads fine: this is
-        // what keeps the server and every host surface behaving exactly as before B3.
+        // Without a caller both seams are the host view, exactly as before.
         expect(writer.thread(sibling.id)?.id).toBe(sibling.id);
         expect(writer.threadMessages(sibling.id)).toEqual([]);
     });
@@ -2821,17 +2845,25 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
     // STRESS REPORT #5 (2026-11-14) — A REFUSAL THAT IS TRUE BUT USELESS.
     //
     // A default conversation is in a family through the conversations of that agent the family
-    // spans (`threadFamilyOf` step 4), so releasing the last one of them quietly drops
-    // `agent:<name>` out of the roster — and both doors then answered only "the id exists, it is
-    // outside your lineage", which names no cause and no way back. The FAMILY RULE AND THE
-    // VERDICT ARE UNCHANGED here (issue 0027's narrowing stands, and widening the family to all
-    // configured agents was reviewed and rejected: a default is the agent's standing transcript
-    // and would leak other callers' content across families). What changed is the sentence, for
-    // a default target only.
+    // spans (`threadFamilyOf` step 4), so releasing the last one of them quietly dropped
+    // `agent:<name>` out of the roster — and the door then answered only "the id exists, it is
+    // outside your lineage", which named no cause and no way back. The FAMILY RULE AND THE
+    // WRITE VERDICT ARE UNCHANGED here (issue 0027's narrowing stands for `threadSend` and
+    // `threadDelete`, and widening the family to all configured agents was reviewed and
+    // rejected: a default is the agent's standing transcript and would leak other callers'
+    // content across families). What changed is the sentence, for a default target only.
+    //
+    // WHAT CHANGED SINCE (2026-11-15): the READ half of this case no longer refuses. A read is
+    // session-wide, so the scout's standing transcript is readable from any lineage — which is
+    // exactly the remedy the clause recommends, minus the re-delegation. The clause stays for
+    // the SEND door, where re-delegating really is the only way back, and its wording is pinned
+    // byte for byte below.
     it('a default conversation that left the family names the cause and the remedy (stress report #5)', async () => {
         const { writer, child, sibling, borrowed } = lineage({
             'ask my family': modelDoors(
                 [
+                    // The read now LANDS (session-wide), so this door answers a page rather
+                    // than a refusal.
                     { name: 'threadRead', args: () => ({ thread: 'agent:scout' }) },
                     { name: 'threadSend', args: () => ({ thread: 'agent:scout', message: 'still there?' }) },
                     // The control: a NON-default address outside the family (a sibling) has no
@@ -2858,11 +2890,6 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
             removedBranchIds: []
         });
 
-        const base = (target: string): string =>
-            `Thread "${target}" is not visible to thread "${child.id}": a read reaches your own thread, an ` +
-            'ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists (see ' +
-            'threadList). The id exists — it is simply outside your lineage.';
-
         // C2 (2026-11-14, independent review): the CAUSE is hedged — this clause fires for any
         // out-of-family `agent:<name>`, and a caller that never delegated to `scout` never had
         // its default in its lineage. It must not assert a delete the caller did not perform.
@@ -2873,21 +2900,25 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
             'deleted. Delegate to "scout" again — the conversation it mints re-admits this address, and ' +
             'threadRead/threadSend reach it from then on.';
 
-        // STILL INVISIBLE — the verdict is untouched (AC6): the record simply is not in this
-        // caller's family, and now the refusal says why and how to get it back.
-        expect(() => writer.thread('agent:scout', child.id)).toThrow(base('agent:scout') + defaultClause);
-        expect(() => writer.threadMessages('agent:scout', child.id)).toThrow(
-            base('agent:scout') + defaultClause
-        );
+        // OUT OF THE FAMILY, AND STILL READABLE (2026-11-15): the record is not in this caller's
+        // family, and a read no longer cares — the transcript comes back empty rather than the
+        // lineage sentence. The WRITE door still refuses, and its refusal says why and how to get
+        // it back; that half is pinned through the model door below, which is the door that
+        // carries a caller identity.
+        expect(writer.thread('agent:scout', child.id)?.id).toBe('agent:scout');
+        expect(writer.threadMessages('agent:scout', child.id)).toEqual([]);
 
-        // THE MODEL FEELS BOTH DOORS. One run of `child`, three calls: the read refusal, the
-        // send refusal for the same default (the send sentence is a different base, and it carries
-        // the same clause), and the send refusal for a sibling — which keeps the old text byte for
-        // byte, with no clause appended.
+        // THE MODEL FEELS BOTH DOORS. One run of `child`, three calls: the read that now LANDS,
+        // the send refusal for the same default (the send sentence is a different base, and it
+        // carries the same clause), and the send refusal for a sibling — which keeps the old text
+        // byte for byte, with no clause appended.
         await writer.sendThreadInput(child.id, 'ask my family');
 
-        expect(doorResults(writer, child.id)).toEqual([
-            `Tool "threadRead" failed: ${base('agent:scout')}${defaultClause}`,
+        const results = doorResults(writer, child.id);
+        const readPage = JSON.parse(results[0] ?? '{}') as { thread: { id: string } };
+
+        expect({ thread: readPage.thread.id }).toEqual({ thread: 'agent:scout' });
+        expect(results.slice(1)).toEqual([
             `Tool "threadSend" failed: Thread "agent:scout" is not one thread "${child.id}" can address: ` +
                 "threadSend reaches your own thread, an ancestor, one of your descendants, or a default " +
                 'conversation (agent:<name>) your roster lists (see threadList). The id exists — it is simply ' +
@@ -3391,7 +3422,7 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
 
         it('the woken turn lists, reads and answers its sender, and the route reverts (T5 AC1-AC4)', async () => {
             const ready = gate();
-            const { writer, parent } = replyFixture(ready);
+            const { writer, parent, scouted } = replyFixture(ready);
 
             // AC1 — the writer turn wakes the scout DEFAULT conversation. The receipt is
             // 'started' (a dormant conversation is started, never queued and never
@@ -3415,19 +3446,29 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
 
             const results = doorResults(writer, 'agent:scout');
 
-            // AC2, part 1 — THE ROSTER. Exactly two entries in sequence order: the scout's
-            // own (default) conversation and the sender's thread. `agent:writer` is absent
-            // even though it is in scope for a send: step 4 computes the spanned AGENTS
-            // before step 5 folds the sender in, so the fold adds one id and nothing else —
-            // no pull of the sender's subtree (a `child` of the parent would have leaked in
-            // had the fold run earlier), and no other agent's standing transcript.
+            // AC2, part 1 — THE ROSTER. SESSION-WIDE ROWS (2026-11-15): the scout's own
+            // (default) conversation, the sender's thread, AND the two rows the old family rule
+            // kept out — `agent:writer` and `scouted`, the scout thread the sender created. What
+            // the transient reply route still decides alone is `actOn`: exactly the scout's own
+            // conversation plus the sender's id, for the life of this run. Step 4 computes the
+            // spanned AGENTS before step 5 folds the sender in, so the fold adds one id and
+            // nothing else — no pull of the sender's subtree.
             const roster = pageOf(results[0] ?? '') as {
                 currentThreadId?: string;
+                actOn?: string[];
                 threads: unknown[];
             };
 
             expect(roster.currentThreadId).toBe('agent:scout');
+            expect(roster.actOn).toEqual(['agent:scout', parent.id]);
             expect(roster.threads).toEqual([
+                {
+                    id: 'agent:writer',
+                    agent: 'writer',
+                    origin: 'agent',
+                    status: 'idle',
+                    sequence: 1
+                },
                 {
                     id: 'agent:scout',
                     agent: 'scout',
@@ -3443,6 +3484,14 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
                     status: 'idle',
                     sequence: 3,
                     invocationId: '1'
+                },
+                {
+                    id: scouted.id,
+                    agent: 'scout',
+                    origin: 'host',
+                    status: 'idle',
+                    sequence: 4,
+                    ownerThreadId: parent.id
                 }
             ]);
 
@@ -3484,16 +3533,15 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
                 'writer done'
             ]);
 
-            // AC3 — the route is TRANSIENT. Once the scout's run has released, its family
-            // is the singleton again, so the same read that succeeded inside the run is now
-            // the ordinary out-of-family refusal.
-            const notVisible =
-                `Thread "${parent.id}" is not visible to thread "agent:scout": a read reaches your own thread, an ` +
-                'ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists (see ' +
-                'threadList). The id exists — it is simply outside your lineage.';
-
-            expect(() => writer.threadMessages(parent.id, 'agent:scout')).toThrow(notVisible);
-            expect(() => writer.thread(parent.id, 'agent:scout')).toThrow(notVisible);
+            // AC3 — the route is TRANSIENT for the WRITE scope. Once the scout's run has
+            // released, its family is the singleton again, so `actOn` — the set `threadSend` and
+            // `threadDelete` will accept — shrinks back to the scout's own conversation, and the
+            // sender's id is gone from it. The READ, session-wide since 2026-11-15, keeps
+            // answering the same id it answered inside the run: the route exists to make the
+            // REPLY legal, not to make the transcript findable.
+            expect(writer.threadMessages(parent.id, 'agent:scout').length).toBeGreaterThan(0);
+            expect(writer.thread(parent.id, 'agent:scout')?.id).toBe(parent.id);
+            expect(writer.runtime.threadList('agent:scout').actOn).toEqual(['agent:scout']);
 
             // AC4 — nothing was PERSISTED to buy the route. The default conversation never
             // adopted the sender as its owner (the first-wins `ownerThreadId` link stays
@@ -3610,6 +3658,195 @@ describe('thread family visibility, send policy, and release (B3/B4/B5)', () => 
     });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// A LABEL IS AN ADDRESS (2026-11-15)
+//
+// The server mints a session-unique name for every conversation — `IT14`, the owning
+// agent's code plus a monotonic per-agent ordinal — and a human quotes THAT name, because
+// it is the one in the UI. Until now the name lived only in `SessionRecord.threadLabels`
+// while `HarnessThreadRecord.label` was written by a single caller (`createThread({ label })`),
+// so a prompt saying "review the IT14 thread" was unanswerable: every thread door took an id,
+// and the id (`thread-32`) was nowhere the caller could see it.
+//
+// The rule, declared in `core/thread.ts` (`resolveThreadAddressOf`) and applied inside
+// `threadStateOf` so EVERY door inherits it:
+//   - an ID wins, matched verbatim first, so a label can never shadow an id;
+//   - a LABEL matches exactly after trimming — no case folding, no prefix, no fuzzy tier,
+//     because parameter values are never fuzzy-matched anywhere else in this system;
+//   - a label held by TWO conversations is REFUSED, not resolved to the first one;
+//   - an address that matches NOTHING passes through unchanged, so the caller's own
+//     not-found sentence names what was actually typed.
+//
+// The doors that REPORT an id (`threadSend`'s receipt, `deleteThread`'s receipt, the steer
+// receipt, `stopThread`'s owner cascade) canonicalize up front, so a label-addressed write
+// states its result in the id the caller can compare against its roster.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('a conversation label addresses it at every thread door', () => {
+    // One writer-brain harness, no presets, one idle answer — the label rule is about
+    // addressing, so no run needs to do anything interesting.
+    const session = () => quiet(brain(scripted([answer('labeled thread'), answer('late turn')])));
+
+    it('resolves a label for a read, a record, and a roster row', () => {
+        const writer = session();
+        const mine = writer.createThread('writer', { label: 'IT14' });
+
+        expect(writer.thread('IT14')?.id).toBe(mine.id);
+        expect(writer.threadMessages('IT14')).toEqual([]);
+
+        // Surrounding whitespace is trimmed, because every other string parameter of these
+        // tools is too — a model that pads the value gets the same conversation.
+        expect(writer.thread('  IT14  ')?.id).toBe(mine.id);
+
+        // The roster carries the label, which is what makes the name FINDABLE before it is
+        // usable: a caller that is handed `IT14` in a prompt can confirm it against a row.
+        const roster = writer.runtime.threadList(mine.id);
+
+        expect(roster.threads.find((record) => record.id === mine.id)?.label).toBe('IT14');
+        expect(roster.currentThreadId).toBe(mine.id);
+    });
+
+    it('prefers an id over a label that collides with one', () => {
+        const writer = session();
+        // A conversation LABELED with the shape of another's id. The id must win: labels are
+        // minted `CODE + ordinal` and ids are `thread-N`, so the shapes do not collide today,
+        // but the order is the contract — a label may never shadow an id.
+        const owner = writer.createThread('writer', { label: 'thread-2' });
+        const other = writer.createThread('writer', { label: 'named' });
+
+        expect(writer.thread('thread-2')?.id).toBe(other.id);
+        expect(writer.thread(owner.id)?.id).toBe(owner.id);
+    });
+
+    it('refuses a label held by two conversations instead of picking one', () => {
+        const writer = session();
+        const first = writer.createThread('writer', { label: 'IT14' });
+        const second = writer.createThread('writer', { label: 'IT14' });
+
+        // Nothing in the harness enforces label uniqueness — the SERVER does, through its
+        // monotonic per-agent high-water — so a duplicate can only arrive from a host that
+        // stamped labels itself (or from a restored document). Resolving it to the first match
+        // would silently read one conversation and write another, so the address is refused and
+        // the sentence names both ids.
+        const ambiguous =
+            `Thread label "IT14" is held by 2 conversations in this harness (${first.id}, ${second.id}); ` +
+            'address one by its id instead.';
+
+        expect(() => writer.threadMessages('IT14')).toThrow(ambiguous);
+        expect(() => writer.thread('IT14')).toThrow(ambiguous);
+        // The id of either one still works.
+        expect(writer.thread(first.id)?.id).toBe(first.id);
+        expect(writer.thread(second.id)?.id).toBe(second.id);
+    });
+
+    it('answers an unknown label with the canonical missing-thread sentence', () => {
+        const writer = session();
+        writer.createThread('writer', { label: 'IT14' });
+
+        // "No such id" and "no such label" are ONE fact to the harness — nothing carries that
+        // address — and the door that has the better claim to the sentence is the caller, which
+        // now states the label the caller actually typed rather than an id it never wrote.
+        expect(() => writer.threadMessages('IT15')).toThrow(
+            'Thread "IT15" is not available in this harness; it was never created, or it was deleted.'
+        );
+        expect(writer.thread('IT15')).toBeUndefined();
+    });
+
+    it('states a label-addressed write in the id it names', async () => {
+        const writer = session();
+        const parent = writer.createThread('writer', { label: 'PARENT' });
+        const child = writer.createThread('writer', { label: 'CHILD', ownerThreadId: parent.id });
+
+        // `threadSend` from inside `parent`, addressed by LABEL. The receipt's `threadId` is the
+        // conversation's id, not the name the caller typed: a receipt is a record of which
+        // conversation received the message, and every other fact in the transcript (the roster,
+        // a later `threadDelete`) is stated in ids.
+        const receipt = writer.runtime.threadSend(undefined, parent.id, {
+            thread: 'CHILD',
+            message: 'do the work'
+        });
+
+        expect(receipt).toEqual({
+            threadId: child.id,
+            delivered: 'started',
+            sender: 'writer',
+            senderThreadId: parent.id
+        });
+
+        await settleThread(writer, child.id);
+        expect(textOf(writer.threadMessages(child.id))).toEqual([
+            `from agent "writer" (thread ${parent.id}):\ndo the work`,
+            'labeled thread'
+        ]);
+
+        // A host release addressed by label reports the id, and the cascade it caused — the
+        // descendant walk matches on `record.id`, so a label-addressed delete must canonicalize
+        // before it walks or it would release one conversation and orphan the rest.
+        expect(writer.deleteThread('PARENT')).toEqual({
+            deleted: parent.id,
+            removedThreadIds: [parent.id, child.id],
+            removedInvocationIds: ['1'],
+            removedBranchIds: []
+        });
+    });
+
+    it('keeps the lineage rule on the write doors when the target arrives by label', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('unused')])), scout: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+        const parent = writer.createThread('writer');
+        const child = writer.createThread('writer', { ownerThreadId: parent.id, label: 'MINE' });
+        // A scout thread with NO owner: a sibling of `parent`, so outside its family by design.
+        const stranger = writer.createThread('scout', { label: 'STRANGER' });
+
+        // READABLE (session-wide), NOT WRITABLE. The read resolves the label; the send refuses
+        // the conversation it names — and the refusal is stated in the ID, because that is the
+        // address the caller can act on next (its roster row, a later delete). A label widens
+        // NOTHING: it names a conversation, and the door's own rule then decides.
+        expect(writer.threadMessages('STRANGER', child.id)).toEqual([]);
+        expect(() => writer.runtime.threadSend(undefined, child.id, { thread: 'STRANGER', message: 'unsolicited' })).toThrow(
+            `Thread "${stranger.id}" is not one thread "${child.id}" can address: threadSend reaches your own `
+        );
+
+        // A label the caller DOES own resolves on the send door: the lineage check sees the
+        // family member the label names rather than failing on the string it was handed.
+        expect(
+            writer.runtime.threadSend(undefined, parent.id, { thread: 'MINE', message: 'do the work' }).delivered
+        ).toBe('started');
+    });
+
+    it('stamps and clears a label through setThreadLabel, and a snapshot keeps it', () => {
+        const writer = session();
+        const mine = writer.createThread('writer');
+
+        // The server's mirror seam (../server/sessions.ts `mirrorThreadLabel`): the record gains
+        // the name the store minted, and from then on the name is an address.
+        expect(writer.setThreadLabel(mine.id, 'IT14').label).toBe('IT14');
+        expect(writer.thread('IT14')?.id).toBe(mine.id);
+
+        // Durable: `snapshot()` writes `label` (core/snapshot.ts whitelists it), so a restart
+        // restores the name with no re-minting and no re-write.
+        const snapshot = writer.snapshot();
+
+        expect((snapshot.threads ?? []).find((record) => record.id === mine.id)?.label).toBe('IT14');
+
+        // `undefined` CLEARS the key rather than storing an empty string, so a session that
+        // never labels a conversation keeps its exact pre-label document. An explicit BLANK
+        // string is a caller mistake and is refused by the shared normalizer — it does not
+        // silently clear — and the refusal mutates nothing.
+        expect(() => writer.setThreadLabel(mine.id, '  ')).toThrow('A thread label must not be blank.');
+        expect(writer.thread(mine.id)?.label).toBe('IT14');
+        expect(writer.setThreadLabel(mine.id, undefined).label).toBeUndefined();
+        expect(writer.thread(mine.id)?.label).toBeUndefined();
+        expect(writer.threads().find((record) => record.id === mine.id)).not.toHaveProperty('label');
+
+        // And the address stops resolving, with the canonical sentence — not a stale hit.
+        expect(() => writer.threadMessages('IT14')).toThrow(
+            'Thread "IT14" is not available in this harness; it was never created, or it was deleted.'
+        );
+    });
+});
+//
 // ─────────────────────────────────────────────────────────────────────────────
 // ONE FACT, ONE SENTENCE (issue 0034, F2)
 //

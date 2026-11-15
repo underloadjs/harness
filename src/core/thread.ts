@@ -69,6 +69,74 @@ export const normalizeThreadLabel = (value: unknown): string | undefined => {
 };
 
 // ---------------------------------------------------------------------------
+// Thread ADDRESSES (session-wide read/lookup)
+// ---------------------------------------------------------------------------
+//
+// WHY A LABEL IS AN ADDRESS
+// -------------------------
+// A conversation has two names. `thread-32` is the machine id the runtime mints;
+// `IT14` is the label the SERVER mints for it (a per-agent two-letter code plus a
+// per-agent conversation ordinal — see `server/sessions.ts` `mintThreadLabel`), and
+// it is the name a human — and therefore a prompt — actually uses. Until now only
+// the id was addressable: a model told to "review the IT14 thread" had no door to
+// IT14 through, because the label lived in the server's `SessionRecord.threadLabels`
+// map, which no harness read consulted, and the roster it was pointed at did not
+// even list the conversation (a sibling is outside its lineage by design).
+//
+// THE RULE, stated exactly:
+//   - an address is an id (`thread-N`, `agent:<name>`, `branch-N`) or a label;
+//   - an ID WINS. It is matched first and verbatim, so a label that happens to
+//     equal another conversation's id can never shadow it;
+//   - a label is matched EXACTLY after trimming — no case folding, no prefix, no
+//     fuzzy match. `it14` does not find `IT14`, and `IT1` does not find `IT14`.
+//     Parameter values are never fuzzy-matched anywhere else in this system
+//     (discovery fuzziness applies to tool NAMES only), and a prefix rule would
+//     silently pick one of two labels a caller cannot see apart;
+//   - a label that matches NOTHING is reported as an unknown address, not as a
+//     bad label: "no such conversation" and "no such label" are the same fact to a
+//     caller holding a name it was given.
+//
+// UNIQUENESS is a property of the label SPACE, not of this function: the server
+// mints `<code><ordinal>` from a monotonic per-code high-water that deletion never
+// lowers (`threadLabelHighWater`), so two live conversations cannot share a label.
+// A hand-set label is NOT guaranteed unique, so a lookup that finds more than one
+// candidate refuses rather than guessing — the same "never pick one arbitrarily"
+// rule the record store applies to an ambiguous id.
+export type ThreadAddressCandidate = { id: string; label?: string };
+
+// Resolve one address to a thread id, or `undefined` when nothing matches.
+// `ambiguous` is reported through the callback rather than as a throw so the
+// caller can phrase its own refusal with the ids it actually holds.
+export const resolveThreadAddressOf = (
+    address: string,
+    candidates: Iterable<ThreadAddressCandidate>,
+    onAmbiguous?: (address: string, ids: string[]) => void
+): string | undefined => {
+    const wanted = address.trim();
+    if (wanted.length === 0) return undefined;
+
+    // (1) An id, verbatim. First, so a label can never shadow an id.
+    for (const candidate of candidates) {
+        if (candidate.id === wanted) return candidate.id;
+    }
+
+    // (2) A label, exact after trimming. Collect every match before deciding, so a
+    // duplicate label is refused instead of resolved to whichever record came first.
+    const matches: string[] = [];
+    for (const candidate of candidates) {
+        if (candidate.label !== undefined && candidate.label.trim() === wanted) matches.push(candidate.id);
+    }
+
+    if (matches.length === 0) return undefined;
+    if (matches.length === 1) return matches[0];
+
+    onAmbiguous?.(wanted, matches);
+    // Ambiguous is NOT a resolution: the caller's callback throws. Returning the
+    // first id keeps this function total for a caller that passed no callback.
+    return matches[0];
+};
+
+// ---------------------------------------------------------------------------
 // Thread-agent factory
 // ---------------------------------------------------------------------------
 

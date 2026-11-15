@@ -4006,7 +4006,12 @@ body.is-resizing-rail {
    the slot Delete used to be painted in above the header). The inline Delete confirmation
    still wraps onto its own full-width row so nothing moves. ui/turns.ts toggles `hidden`
    with expansion, so a collapsed row never shows a permanent second row. The header's
-   right edge is no longer a control slot at all: the measurement line lives there. */
+   right edge is no longer a control slot at all: the measurement line lives there.
+   R2: WHICH one of these is visible is the board's `showsThreadActionBar` rule — one bar
+   per conversation SURFACE, on that surface's first exchange, i.e. directly under the
+   thread header and above every entry body. It is deliberately in-flow (NOT sticky): the
+   transcript is one scroll list of several conversation cards, so the bar anchors to the
+   top of ITS conversation and scrolls with it. */
 :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) {
     display: flex;
     flex-wrap: wrap;
@@ -4069,7 +4074,7 @@ body.is-resizing-rail {
 }
 
 /* The common case is a thread that is NOT stopped, where ui/turns.ts hides Resume with the
-   `hidden` attribute (`[hidden] { display: none !important }`, styles.css:101) — and a box
+   `hidden` attribute (`[hidden] { display: none !important }`, styles.css:124) — and a box
    that paints nothing contributes no auto margin. Transcript takes the flush-right slot back
    in exactly that case, so an undeletable default conversation (Delete hidden too) still
    pins Transcript to the right edge instead of sliding it into the destructive action's

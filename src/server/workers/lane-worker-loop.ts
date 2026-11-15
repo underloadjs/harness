@@ -482,8 +482,11 @@ export const installAuthorityRuntime = (replica: Harness): void => {
     // `isAddressVisible`). Both routed reads now carry the caller in `identity.threadId`, the same
     // carrier `threadList`/`threadDelete` use, and ./lane-authority.ts hands it to both seams as
     // `callerThreadId`, so the lane and the inline path give the same answer for the same address.
-    // The lane's own conversation stays local AND unscoped: reading the conversation you are
-    // standing in is never a lineage question.
+    // THE ANSWER MOVED, THE INVARIANT DID NOT (2026-11-15): a READ is now session-wide in the core,
+    // so both modes serve a foreign transcript instead of both refusing it — the requirement this
+    // route exists for is that they never DISAGREE. The caller still rides for the routed
+    // `threadDelete`, which really is caller-scoped. The lane's own conversation stays local AND
+    // unscoped: reading the conversation you are standing in is never a lineage question.
     const handle = replica as unknown as {
         threadMessages: (threadId: string, callerThreadId?: string) => unknown;
         thread: (threadId: string, callerThreadId?: string) => unknown;

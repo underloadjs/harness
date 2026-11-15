@@ -653,7 +653,13 @@ export type TurnBoard = {
     ) => TurnHandle;
     notice: (text: string, tone?: 'info' | 'error') => HTMLElement;
     clear: () => void;
-    expand: (turn: TurnHandle) => void;
+    // Open one exchange and its whole conversation. R1: `scroll` (default FALSE) is the
+    // CALLER's statement that this expansion IS a user gesture, exactly like
+    // `focusThread`'s flag below — only then is the PRESSED entry revealed in the
+    // transcript. Every background caller (hydrate/reconcile/`begin`) leaves it off,
+    // because expanding a conversation opens every exchange and moving the viewport
+    // there drags the reader away from what they were reading.
+    expand: (turn: TurnHandle, scroll?: boolean) => void;
     collapse: () => void;
     expanded: () => TurnHandle | undefined;
     turns: () => readonly TurnHandle[];
@@ -2417,6 +2423,86 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
     };
 
+    // --- R2: WHERE a thread's one action bar lives ------------------------------
+    //
+    // A bar belongs to the CONVERSATION, never to whichever entry was pressed. An
+    // expanded conversation shows EVERY one of its exchanges (styles.css
+    // `.conversation.is-expanded .tile-body`), so a bar keyed to the pressed entry
+    // jumped between the head prompt, a steering prompt and a nested child row as the
+    // reader clicked — the user report "[Stop] and [Transcript] are floating all over
+    // the place … it should be at the top". The rule every surface below implements:
+    //
+    //   ONE visible bar per visible conversation SURFACE, hanging off the header of
+    //   that surface's FIRST exchange (the head prompt that carries the thread badge).
+    //   A surface is a persistent thread's `.conversation` card (`conversationHost`,
+    //   filled by `placeTurn`), a delegated child's nested `.thread-tile`, or the
+    //   roster-only focus panel; a legacy/optimistic row sitting directly in `.turns`
+    //   is its own surface.
+    //
+    // The bar is NOT viewport-sticky: the transcript is one scroll list holding several
+    // conversation cards, so the bar simply stays the first thing under its card's
+    // header — above every entry body — and scrolls with the conversation.
+    // The conversation CARD a tile's row sits in, from the CARD's point of view (the
+    // same test `hostOfTurn` runs from a handle's): undefined for a legacy standalone
+    // row, for a row routed into a nested child card's flow, and for a tile that has not
+    // been placed yet. It is the authority for "which thread does this entry's bar act
+    // on", so a bar never acts on an id the card does not show.
+    const conversationOf = (card: HTMLElement): HTMLElement | undefined => {
+        const host = card.parentElement?.parentElement;
+
+        return host instanceof HTMLElement && host.classList.contains('conversation')
+            ? host
+            : undefined;
+    };
+
+    const showsThreadActionBar = (card: HTMLElement): boolean => {
+        const row = card.parentElement;
+        const host = row === null ? null : row.parentElement;
+
+        // A continuation routed INSIDE a delegated card (see `childExchangeHost`): that
+        // card's own `.thread-transcript-action`, appended directly after its
+        // `.thread-select`, already IS the bar of this conversation, so the exchange
+        // inside the card adds no second one.
+        if (host instanceof HTMLElement && host.classList.contains('thread-flow')) return false;
+
+        const conversation = conversationOf(card);
+        if (conversation !== undefined) {
+            // The card's bar hangs off its FIRST exchange, and only while the
+            // CONVERSATION is open — which entry is first is the projection's answer
+            // (`placeTurn`/`reorderBoard` keep recorded order and mark every later row
+            // `is-continuation`), never the click's. Clicking any other exchange of the
+            // same conversation therefore leaves the bar exactly where it was.
+            const head = [...conversation.children].find(
+                (node) => node instanceof HTMLElement && node.classList.contains('turn-row')
+            );
+
+            return conversation.classList.contains('is-expanded') && head === row;
+        }
+
+        // A legacy/unthreaded row and a not-yet-placed optimistic tile sit directly in
+        // `.turns`: that row IS the whole card, so its header owns its bar.
+        return card.classList.contains('is-expanded');
+    };
+
+    // Is this nested card COVERED by an expanded surface above it? While a conversation
+    // (or a bare parent tile) is open, that surface's bar is the one action bar of
+    // everything rendered inside it, so a delegated card that `openEnclosingCards`
+    // reveals implicitly must not float another bar beside it. Child-specific actions
+    // stay reachable: pressing the child's own header focuses THAT conversation
+    // (`focusThread` path 2 -> `focusChildThread`), which closes the parent surface
+    // first, and the child's bar reappears at the top of its card. A roster-only child
+    // with no invocation at all keeps the focus-panel surface (`showFocusPanel`).
+    const coveredByExpandedSurface = (row: HTMLElement): boolean => {
+        const host = row.closest('.conversation');
+        if (host !== null && host.classList.contains('is-expanded')) return true;
+
+        // A delegated card under a LEGACY/standalone turn has no `.conversation`
+        // container; the owner tile is the surface that covers it.
+        const ownerRow = row.closest('.turn-row');
+
+        return ownerRow !== null && ownerRow.querySelector(':scope > .tile.is-expanded') !== null;
+    };
+
     // One action bar shared by the expanded tile, every nested child card and the
     // roster-only focus panel. T26: the two controls SWAPPED homes — Delete now leads the
     // bar (left, where Transcript used to be) and Transcript closes it (right, where
@@ -2959,6 +3045,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // reads exactly like its hydrated twin.
         const threadId = placementThreadIdOf(turn);
 
+        // F5: the conversation card this row sits in BEFORE this pass moves it (undefined
+        // for a board-direct row). Only the EXPANDED row's card is a surface, so only that
+        // one has an open look to carry or to lose; every other row moving in or out is
+        // none of this pass's business.
+        const previousHost = expandedTurn === turn ? hostOfTurn(turn) : undefined;
+
         // 1. A continuation of a CHILD conversation lands inside that child's own
         //    nested card (see `childExchangeHost`), so a resumed child keeps ONE card
         //    with sequential exchanges instead of gaining a sibling tile under its
@@ -2971,6 +3063,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             row.dataset.threadExchange = threadId;
             orderRows(exchange);
             reorderBoard();
+            // F5 deliberately NOT applied here: a routed exchange stays inside the SAME
+            // conversation card (its card hangs off a tile of that card), so the card the
+            // reader has open did not change and its head bar is still the one bar.
             return;
         }
 
@@ -3007,12 +3102,44 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
 
         reorderBoard();
+
+        // F4/F5: an open CONVERSATION is the card the expanded row sits in, so the
+        // `is-expanded` marker has to travel WITH the row.
+        const open = expandedTurn === turn;
+        // Whether this pass flipped a card's open look, which is the only part of a
+        // placement change the bar rule reads (`showsThreadActionBar` asks the host for
+        // `is-expanded`) and therefore the only part `reorderBoard`'s head-keyed repaint
+        // cannot see.
+        let surfaceChanged = false;
+
+        if (open && previousHost !== undefined && previousHost !== host) {
+            // F5: the expanded row LEFT that card — its placement thread became ANOTHER
+            // conversation, or no thread at all (a thread-less record, C8-M1). Nothing else
+            // ever cleared this class (`detachTileExpansion`/`dropFocusState` only run when the
+            // reader unfocuses), so the abandoned card kept an open look and painted a SECOND
+            // head bar next to the new card's: one focused conversation, two bars.
+            previousHost.classList.remove('is-expanded');
+            surfaceChanged = true;
+        }
+
         // A tile that was already the focused surface when it learned its thread
         // must take its newly created group with it (otherwise the later exchanges
-        // would stay collapsed under an open conversation).
-        if (expandedTurn === turn && hostId !== undefined) {
-            conversationHost(hostId).classList.add('is-expanded');
+        // would stay collapsed under an open conversation). `host` is that card: this
+        // pass just moved the row into it (`conversationHost` creates and returns the
+        // same node it returns here).
+        if (open && host !== undefined) {
+            if (!host.classList.contains('is-expanded')) {
+                host.classList.add('is-expanded');
+                surfaceChanged = true;
+            }
         }
+
+        // F4: `reorderBoard` repaints the bars ONLY when a card gained, lost or replaced
+        // its head exchange (the steady-state cost rule), and a tile learning or dropping
+        // its thread flips this one class without necessarily touching any head. Without
+        // this the newly opened conversation could show ZERO visible bars until the next
+        // roster/snapshot refresh.
+        if (surfaceChanged) refreshActionBars();
     };
 
     // The board-direct ancestor of a row: the top-level unit this pass may move.
@@ -3030,12 +3157,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         return cursor === element ? undefined : cursor;
     };
 
+    // R2: which exchange row headed each conversation card the LAST time the projection
+    // ran. `reorderBoard` is the only pass that can change it (a row arriving, leaving or
+    // moving into a child card) and the visible action bar hangs off that row, so the bar
+    // repaint is keyed to exactly this change. It is NOT a plain "repaint on every call":
+    // a streamed frame re-places every row, and a full bar repaint per row made a loaded
+    // board measurably slower.
+    const cardHeads = new WeakMap<HTMLElement, HTMLElement>();
+
     // Restore deterministic top-level order: first appearance of each conversation
     // in recorded turn order, then legacy standalone rows, then notices. The focus
     // panel stays first because it is prepended and never moved by this pass.
     const reorderBoard = (): void => {
         const seen = new Set<HTMLElement>();
         const containers: HTMLElement[] = [];
+        // Set when a card gained, lost or replaced its head exchange.
+        let headChanged = false;
 
         for (const turn of turns) {
             const row = turn.element.parentElement;
@@ -3067,9 +3204,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             );
 
             if (grouped.length === 0) {
+                // The card is going away with its head row: whoever held the bar loses it.
+                if (cardHeads.delete(host)) headChanged = true;
                 host.remove();
                 conversationHosts.delete(threadId);
                 continue;
+            }
+
+            // R2: remember the head exchange, and repaint the bars when it is not the
+            // one the last projection left behind.
+            const head = grouped[0];
+            if (cardHeads.get(host) !== head) {
+                cardHeads.set(host, head);
+                headChanged = true;
             }
 
             grouped.forEach((node, index) => node.classList.toggle('is-continuation', index > 0));
@@ -3085,6 +3232,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             element,
             [...element.querySelectorAll<HTMLElement>(':scope > .notice')]
         );
+
+        // R2: this pass is the ONE thing that can change which exchange heads a
+        // conversation card (a row arriving, leaving or moving into a child card), and the
+        // visible action bar hangs off that head exchange — a deletion is exactly the case
+        // the `sequenceInPlace` short-circuit above cannot see, because nothing moved.
+        if (headChanged) refreshActionBars();
     };
 
     // Re-run the projection for EVERY turn. A nested child card only becomes
@@ -3331,17 +3484,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
         }
 
-        if (expandedTurn === undefined) return;
+        if (expandedTurn !== undefined) {
+            expandedTurn.element.classList.remove('is-expanded');
+            expandedTurn.element
+                .querySelector<HTMLButtonElement>('.tile-select')
+                ?.setAttribute('aria-expanded', 'false');
+            // The whole CONVERSATION was open (all its exchanges), not just this tile.
+            hostOfTurn(expandedTurn)?.classList.remove('is-expanded');
+            expandedTurn = undefined;
+        }
 
-        expandedTurn.element.classList.remove('is-expanded');
-        expandedTurn.element
-            .querySelector<HTMLButtonElement>('.tile-select')
-            ?.setAttribute('aria-expanded', 'false');
-        // R4: the action belongs to the expanded surface only.
-        expandedTurn.syncTranscriptAction();
-        // The whole CONVERSATION was open (all its exchanges), not just this tile.
-        hostOfTurn(expandedTurn)?.classList.remove('is-expanded');
-        expandedTurn = undefined;
+        // R4/R2: repaint EVERY bar, not only the tile that was open. The action belongs to
+        // a SURFACE, and the surface this focus just left is no longer open — while its
+        // head exchange, which is the row that carries its bar, is often not the tile
+        // being detached at all.
+        refreshActionBars();
     };
 
     // The roster-only/child conversation panel. Rendering from `SessionThread.messages`
@@ -3532,6 +3689,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
         hideFocusPanel();
         focusedThreadId = undefined;
+        // R2: `detachTileExpansion` already repainted, but that was BEFORE the loops above
+        // stripped `is-expanded` from every card and every nested child focus. Nothing may
+        // still look like an open conversation's action bar.
+        refreshActionBars();
     };
     // Live cards across every tile, with the session they were rendered under. Used
     // by `bindSession` to expire a question the reader has navigated away from
@@ -3551,7 +3712,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const empty = options.empty;
     if (empty !== undefined) element.append(empty);
 
-    const expand = (turn: TurnHandle): void => {
+    // R1: `scroll` follows the board's R3c convention (see `focusThread`): it is the
+    // caller's statement that this expansion IS a deliberate gesture, and only a gesture
+    // may move the reader's viewport. Every background caller (hydrate/reconcile/`begin`/
+    // a repaint) leaves it off, exactly as before.
+    const expand = (turn: TurnHandle, scroll = false): void => {
         // Open exactly ONE persistent conversation: a tile and a roster-only panel
         // never coexist, and focusing a tile ends any child-conversation focus.
         hideFocusPanel();
@@ -3565,10 +3730,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
         turn.element.classList.add('is-expanded');
         turn.element.querySelector<HTMLButtonElement>('.tile-select')?.setAttribute('aria-expanded', 'true');
-        // R4: the newly expanded tile is the one surface that offers its complete
-        // thread transcript. The previous expansion hid its action in
-        // `detachTileExpansion`.
-        turn.syncTranscriptAction();
         // R3: a continuation routed into a nested child card lives inside that card's
         // body, so the card has to be open for the expanded exchange to be visible.
         openEnclosingCards(turn);
@@ -3579,6 +3740,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         for (const host of conversationHosts.values()) {
             host.classList.toggle('is-expanded', host === ownHost);
         }
+        // R4/R2: repaint EVERY bar once the expansion is final. R4 kept this to the newly
+        // expanded tile, but a bar no longer belongs to the expanded entry — it belongs to
+        // the conversation, hanging off the card's FIRST exchange. Only a board-wide
+        // repaint can both hide the conversation this focus left and show the head
+        // exchange's bar when the reader pressed a LATER exchange of the same card.
+        refreshActionBars();
+        // R1 (user report: clicking an entry "does not navigate to the correct position").
+        // Opening a conversation grows content ABOVE the pressed row — every earlier
+        // exchange's body becomes visible, and the transcript keeps its numeric scroll
+        // offset — so the viewport used to land on the head entry. `block: 'nearest'` is
+        // the same minimal reveal a focused child row already uses (`focusChildThread`):
+        // it moves the viewport only when the pressed entry is off screen, and it runs
+        // after every class toggle and after the bar repaint (the bar is in-flow, so it
+        // changes the card's height). The call is optional because jsdom ships no
+        // `scrollIntoView`; the tests spy on the prototype.
+        if (scroll) turn.element.scrollIntoView?.({ block: 'nearest' });
         // The tile's PERSISTENT thread is the steering target (or undefined for a
         // legacy turn / an unbound new-thread tile, which becomes known on merge).
         focusedThreadId = threadId;
@@ -3600,7 +3777,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     //
     // R3c: `scroll` defaults to FALSE — every reconcile/resync path calls this to
     // re-assert a focus the reader already has, and that must not move their viewport.
-    // Only a caller acting on a click or a submit passes `true`.
+    // Only a caller acting on a click or a submit passes `true`. R1: BOTH the turn path
+    // and the child path honour it — the nested row used to be the only surface that
+    // revealed itself, which is why clicking an entry of a multi-exchange conversation
+    // left the viewport somewhere else.
     const focusThread = (threadId: string, scroll = false): boolean => {
         // 1. A turn of this conversation: the normal case, including a child thread
         //    that was continued (the continuation creates a host turn with its id).
@@ -3608,7 +3788,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const candidate = turns[position];
             if (candidate.threadId() !== threadId) continue;
 
-            expand(candidate);
+            // R1: forward the gesture flag. Path 2 below already carries it to
+            // `focusChildThread`; without this a header press on a turn of THIS
+            // conversation expanded it without revealing the pressed entry.
+            expand(candidate, scroll);
             return true;
         }
 
@@ -3835,16 +4018,25 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         body.append(promptBlock, contextBarHost, flow);
 
-        // R7/R8/T26: the expanded tile's toolbar. Delete leads (left), Transcript closes
+        // R7/R8/T26: the thread's toolbar. Delete leads (left), Transcript closes
         // it (right), and those are its ONLY children: T6/R5 moved the Delete confirmation
         // out of the bar and into the shared dialog (`openThreadDeleteConfirmation`), where
         // a stray tap cannot confirm it. Both actions live between the header and body so
         // they are visible without scrolling and disappear with expansion. The header's
         // right edge is no longer a control slot — it now carries the measurement line
         // (styles.css).
+        //
+        // R2: the bar is the CONVERSATION's, so it shows on the surface's FIRST exchange
+        // while that surface is open (`showsThreadActionBar`) — pressing any other entry
+        // of the same conversation leaves it exactly where it was, directly under the
+        // thread header and above every entry body, instead of jumping to the pressed
+        // entry. The target stays this tile's persistent id: the head exchange of a
+        // conversation card IS the conversation (`placeTurn` groups a thread's turns under
+        // one card and never puts a thread-less record at its head), so every entry of
+        // IT15 resolves to IT15.
         const actionBar = createThreadActionBar({
             className: 'tile-transcript-action',
-            visible: () => expandedTurn?.element === card && card.classList.contains('is-expanded'),
+            visible: () => showsThreadActionBar(card),
             target: () => runtimeThreadId,
             open: () => openTranscriptOf(runtimeThreadId)
         });
@@ -5009,9 +5201,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // invocation. The toolbar is hidden until the entry is expanded; a pure
             // invocation detail (no persistent thread) never shows an action. Delete
             // leads the bar and Transcript closes it, exactly like the main tile.
+            //
+            // R2: while this card is shown INSIDE an expanded conversation (or under an
+            // expanded bare tile), that surface's single bar covers it — `openEnclosingCards`
+            // reveals delegated cards for every expanded exchange, and a bar per card was
+            // half of the "buttons floating all over the place" report. The child's OWN bar
+            // is back the moment its conversation becomes the focused surface: pressing this
+            // card's header focuses the child (`focusThread` path 2), which closes the
+            // parent surface first.
             const actionBar = createThreadActionBar({
                 className: 'thread-transcript-action',
-                visible: () => entry.expanded && entry.row !== undefined,
+                visible: () =>
+                    entry.expanded && entry.row !== undefined && !coveredByExpandedSurface(entry.row),
                 target: () => persistentIdOf(entry),
                 open: () => openTranscriptOf(persistentIdOf(entry))
             });
@@ -5117,6 +5318,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // contract intact: that button closes the card WITHOUT moving focus (T7),
             // so a closed card whose thread is still focused must re-open on a header
             // press, not collapse the focus a second time.
+            //
+            // R1/F6 (deliberate, pinned in ui/turns-navigation.test.ts): the two branches
+            // reveal DIFFERENT things. A PERSISTENT child's press routes through
+            // `focusThread(id, true)`, which opens that conversation and reveals its
+            // SURFACE — the conversation's newest continuation turn when it has one
+            // (path 1 -> `expand(turn, true)`) or this card when it does not
+            // (path 2 -> `focusChildThread`), because THAT is the node the reader asked
+            // to see. A NON-persistent row press is the other branch: `setThreadExpanded`
+            // toggles invocation detail only, moves no focus and scrolls NOTHING —
+            // BY DESIGN, an ephemeral detail card is not a position in the transcript.
             select.addEventListener('click', () => {
                 const persistent = persistentIdOf(entry);
                 if (persistent !== undefined) {
@@ -9442,8 +9653,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // visible at once). Only one persistent conversation is ever expanded; a
         // collapse is a deliberate unfocus.
         select.addEventListener('click', () => {
+            // R1: this press IS the gesture (same rule as the nested card's header
+            // handler below), so `expand` reveals the entry that was clicked instead of
+            // leaving the viewport on whatever the grown conversation now shows. The
+            // collapse branch stays silent: closing a conversation removes content, it
+            // asks for no position.
             if (expandedTurn === turn) collapse();
-            else expand(turn);
+            else expand(turn, true);
         });
 
         // Stop every timer this tile owns. Tool cards hold their own live label;
@@ -9479,6 +9695,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // and keep the page locked, so they go exactly like a tool card's dialog does.
             for (const entry of threads.values()) entry.disposeContextBar();
             tileContextBar.destroy();
+            // F9: this tile's OWN action bar registered its `sync` in the board's
+            // `actionBarSyncs` set when the card was built, and only the per-entry (nested
+            // card) bars had ever owned a dispose. `clear()` drops the whole set, but a
+            // tile that leaves the board on its own — a deleted turn's row, a discarded
+            // optimistic row — left its callback repainting a detached element until the
+            // next clear, and re-registering a bar for the same conversation grew the set.
+            // Same release the entries use through `disposeActionBar`; no other lifecycle
+            // changes.
+            actionBar.dispose();
         };
 
         // Shared descriptor status: the tile's transport-facing states collapse to

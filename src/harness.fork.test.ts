@@ -1535,7 +1535,7 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
             )
             .map((entry) => entry.content);
 
-    it('answers thread(), threadMessages() and a lineage threadRead() by the branch id', async () => {
+    it('answers thread(), threadMessages() and a sibling threadRead() by the branch id', async () => {
         // The branch id only exists after the first run, and the SECOND conversation asks for
         // it by name, so the route reads it from a mutable cell — the convention
         // `src/plugin/context-compaction.test.ts` uses for an id it cannot know at build time.
@@ -1545,9 +1545,13 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
             const user = latestUser(request);
 
             // The sibling's own turn: one `threadRead` of the branch it was never part of.
+            // SESSION-WIDE READ (2026-11-15): a branch transcript belongs to the session, not
+            // to the lineage that forked it, so the read LANDS and the sibling answers with
+            // what it saw. `branch summary` is text only the branch committed, so finding it in
+            // this transcript is the proof the read returned the branch's own messages.
             if (user === 'read the branch') {
-                if (toolContents(request).some((content) => content.includes('is not visible to thread'))) {
-                    return answer('sibling heard the refusal');
+                if (toolContents(request).some((content) => content.includes('branch summary'))) {
+                    return answer('sibling read the branch');
                 }
 
                 return call('r1', 'threadRead', JSON.stringify({ thread: branchAddress }));
@@ -1665,32 +1669,36 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
         ]);
         expect(writer.thread(branchId, home.id)?.invocationId).toBe(branchId);
 
-        // A SIBLING does not inherit the lineage of the conversation that forked. The seam
-        // `threadRead` reads through refuses it with the sentence for an id that EXISTS but is
-        // not its to read — never the not-found sentence.
-        const notVisible =
-            `Thread "${branchId}" is not visible to thread "${sibling.id}": a read reaches your own thread, ` +
-            'an ancestor, one of your descendants, or a default conversation (agent:<name>) your roster lists ' +
-            '(see threadList). The id exists — it is simply outside your lineage.';
+        // A SIBLING does not inherit the lineage of the conversation that forked, but a READ is
+        // SESSION-WIDE (2026-11-15): both read seams answer the branch id for it, with the same
+        // transcript and the same record the owner is handed. The lineage rule still governs the
+        // WRITE doors, and the `threadDelete` pins below keep refusing this sibling.
+        expect(writer.threadMessages(branchId, sibling.id).map((entry) => entry.content)).toEqual([
+            'go',
+            '',
+            BRANCH_PENDING_PLACEHOLDER.threadFork,
+            'inspect',
+            'branch summary'
+        ]);
+        expect(writer.thread(branchId, sibling.id)?.invocationId).toBe(branchId);
 
-        expect(() => writer.threadMessages(branchId, sibling.id)).toThrow(notVisible);
-        expect(() => writer.thread(branchId, sibling.id)).toThrow(notVisible);
-
-        // AND THE MODEL FEELS IT TOO. The sibling's own run calls `threadRead` with the id;
-        // what lands in ITS transcript is the refusal, so a conversation cannot borrow a
-        // neighbour's branch address by guessing it.
+        // AND THE MODEL FEELS IT TOO. The sibling's own run calls `threadRead` with the id, and
+        // what lands in ITS transcript is the branch's page — the same five messages the host
+        // read above served — so a conversation can read a neighbour's branch address.
         branchAddress = branchId;
         const second = runThread(writer, sibling.id, 'read the branch');
         await second.pump(() => second.state.settled);
 
         expect(second.state.failure).toBeUndefined();
-        expect(second.state.content).toBe('sibling heard the refusal');
-        // What the model is handed is the tool-call failure envelope around that sentence —
-        // the same wrapper every other refused call gets, and it still names the id and the
-        // reason.
-        expect(toolResultsOf(writer, sibling.id)).toEqual([
-            `Tool "threadRead" failed: ${notVisible}`
-        ]);
+        expect(second.state.content).toBe('sibling read the branch');
+        const siblingPage = JSON.parse(toolResultsOf(writer, sibling.id)[0] ?? '{}') as {
+            thread: { id: string };
+            total: number;
+        };
+        expect({ thread: siblingPage.thread.id, total: siblingPage.total }).toEqual({
+            thread: branchId,
+            total: 5
+        });
 
         // AN UNKNOWN BRANCH ID IS THE CANONICAL UNKNOWN THREAD: one sentence for "gone" and
         // "never existed", on both read seams.

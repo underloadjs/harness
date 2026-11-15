@@ -330,6 +330,7 @@ import {
     createThreadAgent,
     defaultThreadIdOf,
     normalizeThreadLabel,
+    resolveThreadAddressOf,
     // N6 runtime: branch identity/creation, action-request parsing, and fork
     // bounds. The branch tools' metadata is the descriptor's own literal.
     MAX_FORK_CONCURRENT,
@@ -359,6 +360,7 @@ import {
 } from './core';
 import type { AgentBranchMetadata } from './core';
 import type { DiscoveredTool } from './core';
+import type { ThreadAddressCandidate } from './core';
 // Only the two provider FACTORIES are imported here. The preset table and the web
 // wire names are no longer needed for registration: every baseline row comes from
 // descriptor discovery, so this module holds no inventory of tool names.
@@ -5511,8 +5513,67 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // byte-for-byte, so an id that does not exist reads the same inline, on a lane, and
     // through the tool. Keep the three in step — the divergence this fixed was exactly a
     // second head appearing for the same condition.
+    // Resolve one thread ADDRESS to the id the runtime tables are keyed by.
+    //
+    // WHY A CONVERSATION NEEDS TWO NAMES ADDRESSED
+    // -------------------------------------------
+    // `thread-32` is the id the runtime mints. `IT14` is the label the SERVER mints for
+    // the same conversation (`server/sessions.ts` `mintThreadLabel`: the agent's
+    // two-letter code plus a per-agent ordinal from a high-water that deletion never
+    // lowers, so it is unique among live conversations and never re-minted). The label is
+    // the name a human uses, so it is the name a prompt uses — and until now it addressed
+    // nothing: a model told to "review the IT14 thread" could only guess an id, and the
+    // roster it was told to re-read did not even list the conversation.
+    //
+    // THE RULE (declared in core/thread.ts, applied HERE):
+    //   - an ID WINS, matched verbatim first, so a label can never shadow an id;
+    //   - a LABEL is matched exactly after trimming — no case folding, no prefix, no
+    //     fuzzy match, because parameter values are never fuzzy-matched anywhere else in
+    //     this system (discovery fuzziness is a tool-NAME rule) and a prefix rule would
+    //     silently pick one of two labels the caller cannot see apart;
+    //   - a label held by TWO conversations is refused, not resolved to the first one;
+    //   - an address that matches NOTHING is returned unchanged, so the caller falls
+    //     through to its own honest not-found sentence — which now names the address the
+    //     caller actually typed, id or label alike.
+    //
+    // Applied inside `threadStateOf`, so EVERY door that resolves a conversation —
+    // `threadRead`, `threadSend`, `threadDelete`, `steerThread`, `stopThread`,
+    // `sendThreadInput`, the transcript editor, the lane seams — accepts a label with no
+    // per-door branch. Reads are session-wide (see `threadMessages`), so a label resolves
+    // for a caller in any lineage; the WRITE doors still narrow by lineage afterwards.
+    // A re-iterable view of the addressable pairs, not a generator OBJECT: the resolver
+    // walks the candidates twice (once for ids, once for labels), and a spent generator
+    // would answer the second pass with nothing. Built lazily so the common case — an id,
+    // which is the fast path below — allocates nothing at all.
+    const threadAddressCandidates = (): Iterable<ThreadAddressCandidate> => ({
+        [Symbol.iterator]: function* () {
+            for (const state of threadStates.values()) {
+                yield { id: state.record.id, label: state.record.label };
+            }
+        }
+    });
+
+    const threadAddressOf = (address: string): string => {
+        const wanted = address.trim();
+
+        // (1) An id, one map hit, no scan: the overwhelmingly common address.
+        if (threadStates.has(wanted)) return wanted;
+
+        // (2) A label, resolved over the live records; anything else passes through
+        // unchanged so the caller's own not-found sentence names what was typed.
+        return (
+            resolveThreadAddressOf(wanted, threadAddressCandidates(), (held, ids) => {
+                throw new HarnessError(
+                    `Thread label "${held}" is held by ${ids.length} conversations in this harness (${ids
+                        .sort()
+                        .join(', ')}); address one by its id instead.`
+                );
+            }) ?? address
+        );
+    };
+
     const threadStateOf = (threadId: string): ThreadState => {
-        const state = threadStates.get(threadId);
+        const state = threadStates.get(threadAddressOf(threadId));
 
         if (state === undefined) {
             throw new HarnessError(
@@ -5554,20 +5615,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // absent from the map). `currentThreadId` comes from the RUN, never from a
     // tool argument.
     //
-    // B3 (2026-11-13): when that caller thread exists, the roster is the caller's THREAD
-    // FAMILY, not the whole session (see `threadFamilyOf`). This is not a privacy nicety:
-    // the roster is the address book for `threadSend`/`threadRead`/`threadDelete`, and
-    // those refuse everything outside the family, so a session-wide list advertised doors
-    // the caller could not walk through — and in a fan-out run it buried the caller's own
-    // children under siblings it could not act on. A caller with no thread stays
-    // session-wide: that is the host view, and the host may address any conversation.
+    // SESSION-WIDE (2026-11-15). The list used to be the caller's THREAD FAMILY, because
+    // the roster was the address book for all three thread doors and all three refused
+    // everything outside the family (issue 0027). That premise is now only half true: a
+    // READ is session-wide (see `threadMessages`), so a caller told to "review the IT14
+    // thread" must be able to FIND a conversation outside its lineage — the sibling that
+    // was excluded is exactly the one a prompt names. The two doors that still narrow by
+    // lineage (`threadSend`, `threadDelete`) are therefore stated on the roster itself as
+    // `actOn`, so the list never advertises a door the caller cannot walk through: every
+    // row is readable, and `actOn` names the rows it may also write into. A caller with no
+    // thread is the host view and omits the field, because for a host the two sets are the
+    // same set.
     const threadRoster = (currentThreadId?: string): HarnessThreadRoster => {
         const family = familyOfCaller(currentThreadId);
 
         return {
             ...(currentThreadId === undefined ? {} : { currentThreadId }),
+            // The family is what the WRITE doors use; it is reported so a caller can tell
+            // "readable" from "mine to send into / release" without re-deriving the rule.
+            ...(family === undefined ? {} : { actOn: [...family].sort() }),
             threads: [...threadStates.values()]
-                .filter((state) => family === undefined || family.has(state.record.id))
                 .sort((left, right) => left.record.sequence - right.record.sequence)
                 .map((state) => threadRecordCopy(state.record))
         };
@@ -5706,6 +5773,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         targetThreadId: string,
         message: string
     ): HarnessThreadMessageResult => {
+        // CANONICALIZE FIRST. Every fact below — the lineage gate's `family.has(...)`, the
+        // receipt's `threadId`, the `note`'s advice to "address that id" — is stated in IDS, so
+        // an address that arrives as a LABEL (`IT14`) must become its id before any of them runs.
+        // A label that resolved to a family member would otherwise be refused as "outside your
+        // lineage" by a set that holds ids, and a receipt that echoed the label would hand back a
+        // name the caller cannot compare against its roster.
+        targetThreadId = threadAddressOf(targetThreadId);
+
         const target = threadStateOf(targetThreadId);
 
         // The refusal is FIRST and mutates nothing: a stopped conversation gets no
@@ -6266,6 +6341,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // An id that resolves for NOBODY returns `true` on purpose: "unknown/deleted" and "not
     // yours" are different sentences, and the caller with the better claim to the first one
     // is the read that is about to throw `threadStateOf`'s canonical not-found error.
+    //
+    // NO CALLERS SINCE 2026-11-15. Both read doors (`threadMessages`, the handle's `thread`)
+    // are now SESSION-WIDE, so nothing gates a read by lineage any more; the sentence this
+    // gate existed to raise survives in `threadSendFor`, which still narrows. Kept because it
+    // is the exact rule the WRITE doors use, and `threadFamilyOf` is the shared source.
     const isAddressVisible = (threadId: string, callerThreadId: string | undefined): boolean => {
         if (callerThreadId === undefined) return true;
 
@@ -6337,6 +6417,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // so naming only "this agent's" default describes a narrower set than the gate enforces and
     // sends a model to re-read a roster that actually listed the thread. The same wording is used
     // by the `threadSend` refusal above, so the two doors state one rule.
+    //
+    // NO CALLERS SINCE 2026-11-15: the READ doors are session-wide, so a read no longer raises
+    // it. `threadSend` builds its own refusal with the same base and the same
+    // `defaultFamilyClauseOf` tail, which is why that helper stays.
     const threadNotVisibleError = (threadId: string, callerThreadId: string): HarnessError =>
         new HarnessError(
             `Thread "${threadId}" is not visible to thread "${callerThreadId}": a read reaches your own thread, an ` +
@@ -6386,6 +6470,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     const stopThread = (threadId: string, reason?: string): boolean => {
+        // Canonicalize: the cascade below matches on `owner.record.id`, so a label-addressed
+        // stop would otherwise stop the one conversation and silently skip everything it owns.
+        threadId = threadAddressOf(threadId);
         const state = threadStateOf(threadId);
         const error = new HarnessError(reason ?? `Thread "${threadId}" was stopped.`);
 
@@ -6502,6 +6589,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const branch = branchRecordOf(threadId);
 
         if (branch !== undefined) throw branchDeleteRefusal(branch);
+
+        // Canonicalized once, before anything is stated in an id: the descendant walk, the
+        // running-refusal sentence and the `removedThreadIds` receipt all work in `record.id`, so
+        // a label-addressed release cascades and reports exactly like the id it names.
+        threadId = threadAddressOf(threadId);
 
         const state = threadStateOf(threadId);
 
@@ -6651,6 +6743,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     ): HarnessThreadDeleteResult => {
         if (callerThreadId === undefined) return deleteThread(threadId);
 
+        // Canonicalize once, up front: the branch ledger, the owner-chain walk and every
+        // sentence below work in ids, so a label-addressed release is judged by the conversation
+        // it names rather than by the name.
+        threadId = threadAddressOf(threadId);
+
         // #4 (2026-11-14) — the branch check comes BEFORE `threadStateOf(threadId)`, because
         // that is the call producing the false "never created, or it was deleted" answer for
         // an id `threadRead` serves fine. The door still refuses; what changes is which
@@ -6776,6 +6873,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // reviving) and `idle` (nothing is running, so guidance has no next boundary —
     // `sendThreadInput` is the call that starts a turn).
     const steerThread = (threadId: string, input: string): HarnessThreadSteerReceipt => {
+        // The receipt names the conversation, so it names its id even when the caller typed a
+        // label.
+        threadId = threadAddressOf(threadId);
         const state = threadStateOf(threadId);
 
         if (typeof input !== 'string' || input.trim().length === 0) {
@@ -6825,6 +6925,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         input: string,
         options?: HarnessRunOptions
     ): Promise<HarnessAssistantMessage> => {
+        // Canonicalize: everything this turn records — the run's thread id, the events, the
+        // reply route — is keyed by id, never by a display name.
+        threadId = threadAddressOf(threadId);
         const state = threadStateOf(threadId);
 
         if (typeof input !== 'string' || input.trim().length === 0) {
@@ -6869,32 +6972,38 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // The committed transcript of one conversation, as a detached copy.
     //
-    // `callerThreadId` (B1/B4, 2026-11-13) is the CALLER's persistent thread, supplied by
-    // the runtime — `threadRead.tool.ts` passes `context.threadId`, and a lane replica's routed
-    // read carries the same id in its request `identity` (./server/workers/lane-worker-loop.ts
-    // `threadReadRoutePayload`, answered by ./server/workers/lane-authority.ts
-    // `case 'thread:read'`), so a scoped lane read and the identical inline call agree. Two
-    // things hang off it:
+    // SESSION-WIDE (2026-11-15). A conversation in this session is readable from any
+    // conversation in this session. The read door used to refuse anything outside the
+    // caller's thread family, and that made a task as ordinary as "review what thread IT14
+    // did" impossible to start: the roster that names the ids is itself family-scoped, so
+    // the refusal "the id exists — it is simply outside your lineage, see threadList" sent
+    // the caller back to the list that had just omitted the conversation. It was also
+    // inconsistent with the shipped result doors: `agentManage`/`agentResult` are NOT
+    // lineage-gated, so one could read a sibling's finished ANSWER but not the transcript
+    // that produced it. Issue 0027's narrowing stands where it was actually earned — the
+    // WRITE doors (`threadSend`, `threadDelete`, and the roster's act-on-it set) still
+    // refuse a sibling, because 0027's complaint was a caller posting into and reaping
+    // subtrees it never spoke to, not a caller looking at one.
     //
-    //   - VISIBILITY: with a caller present, an address outside that caller's thread family
-    //     is refused with its own sentence, so "someone else's conversation" is never
-    //     reported as "never created" (and a model cannot brute-force a sibling's
-    //     transcript);
-    //   - BRANCH RESOLUTION: a finished fork's `branch-N` is not in the thread table at
-    //     all, and the caller's own branch ledger is the only place that still holds it
-    //     (see `threadRecordOfBranch`). Omitting the caller leaves both rules off, which is
-    //     what every host-side caller (the server, a plugin, the tests written before this)
-    //     expects: the same transcript, unscoped.
+    // `callerThreadId` therefore no longer gates the read. It is still passed by every
+    // caller (`threadRead.tool.ts` sends `context.threadId`; the lane's routed read carries
+    // it in its request `identity`) and it still means what its name says — WHO IS ASKING —
+    // which is what a future per-conversation visibility rule would read. Omitting it stays
+    // the host view, and the answer is the same either way.
+    //
+    // ADDRESS: `threadId` is resolved through `threadAddressOf`, so an id (`thread-N`,
+    // `agent:<name>`, `branch-N`) and the conversation's label (`IT14`) are the same
+    // address here. An address nothing answers keeps the canonical not-found sentence, and
+    // it names the address the caller typed.
     const threadMessages = (threadId: string, callerThreadId?: string): HarnessMessage[] => {
-        if (callerThreadId !== undefined && !isAddressVisible(threadId, callerThreadId)) {
-            throw threadNotVisibleError(threadId, callerThreadId);
-        }
+        void callerThreadId;
 
-        const state = threadStates.get(threadId);
+        const address = threadAddressOf(threadId);
+        const state = threadStates.get(address);
         if (state !== undefined) return cloneMessages(state.agent.messages);
 
         // B1: the branch fallback, before the not-found error.
-        const branch = branchRecordOf(threadId);
+        const branch = branchRecordOf(address);
         if (branch !== undefined) return cloneMessages(branch.messages);
 
         // An id nobody has: the SAME error every other thread operation throws, so a
@@ -7191,6 +7300,44 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         target.record.status = status;
 
+        notifyStateChange('thread', { agent: target.agent.name });
+
+        return threadRecordCopy(target.record);
+    };
+
+    // Stamp a SESSION label onto a conversation record (the server's `IT14` name).
+    //
+    // WHY THE SERVER WRITES IT: the label is MINTED in ../server/sessions.ts
+    // (`mintThreadLabel` — a per-agent code plus a monotonic per-agent ordinal) and until now
+    // lived only in `SessionRecord.threadLabels`, while `HarnessThreadRecord.label` was filled
+    // by exactly one caller (`createThread({ label })`). So the name a human reads in the UI —
+    // and the name a prompt quotes, "review the IT14 thread" — was the one name no thread tool
+    // could resolve, and a restored snapshot came back with no label at all.
+    //
+    // WHY IT BELONGS ON THE RECORD: the record IS the runtime mirror. `snapshot()` writes it and
+    // `restore()` re-creates it (`core/snapshot.ts` already validates `label`), and the roster
+    // row is built from it, so a stamped label is durable and reaches `threadList` with no second
+    // store to keep in step. The server's own map stays the AUTHORITY for minting — its
+    // high-water is what makes a label unique — and this is a one-way mirror of it.
+    //
+    // `undefined` CLEARS the key: `label` is optional on the record and `snapshot()` omits
+    // absent keys, so a session that never labels a conversation keeps its exact pre-label
+    // document. An explicit BLANK string is refused by the shared `normalizeThreadLabel` (the
+    // same sentence `createThread({ label: '' })` gives) rather than silently clearing, and the
+    // normalization runs BEFORE the lookup so a refused write mutates nothing. The address is
+    // resolved like every other (`IT14` names the same conversation as `thread-32`), so the
+    // server can stamp by whichever name it holds.
+    const setThreadLabel = (threadId: string, label: string | undefined): HarnessThreadRecord => {
+        // Normalized BEFORE the lookup, so a refused write mutates nothing — the order
+        // `setThreadContextLane` keeps for its lane bound.
+        const next = normalizeThreadLabel(label);
+        const target = threadStateOf(threadId);
+
+        if (next === undefined) delete target.record.label;
+        else target.record.label = next;
+
+        // The durability mechanism, identical to the two writes above: this notification is what
+        // reaches the store's persistence observer.
         notifyStateChange('thread', { agent: target.agent.name });
 
         return threadRecordCopy(target.record);
@@ -14358,20 +14505,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 .sort((left, right) => left.record.sequence - right.record.sequence)
                 .map((state) => threadRecordCopy(state.record)),
         // B1/B4: both reads accept the CALLER's thread id as an optional second argument
-        // (`threadRead.tool.ts` passes `context.threadId`). It switches on the visibility
-        // gate and, for `thread`, the branch-address fallback; omitted, both behave exactly
-        // as they always did — the host view, unscoped, and `undefined` for an id nobody has.
+        // (`threadRead.tool.ts` passes `context.threadId`). Since 2026-11-15 the read is
+        // SESSION-WIDE, so that argument no longer gates visibility — it names the caller for
+        // branch resolution and for any future per-conversation rule. Both accept an ADDRESS,
+        // id or label alike (see `threadAddressOf`); omitted, both behave exactly as they
+        // always did — the host view, and `undefined` for an address nobody has.
         thread: (id: string, callerThreadId?: string) => {
-            if (callerThreadId !== undefined && !isAddressVisible(id, callerThreadId)) {
-                throw threadNotVisibleError(id, callerThreadId);
-            }
+            void callerThreadId;
 
-            const state = threadStates.get(id);
+            const address = threadAddressOf(id);
+            const state = threadStates.get(address);
             if (state !== undefined) return threadRecordCopy(state.record);
 
             // B1: `branch-N` resolves through the branch ledger, so the id `threadFork`
             // returned is the id `thread()` and `threadRead` answer with.
-            const branch = branchRecordOf(id);
+            const branch = branchRecordOf(address);
             return branch === undefined ? undefined : threadRecordCopy(threadRecordOfBranch(branch));
         },
         threadMessages,
@@ -14383,6 +14531,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // T4.1: the in-place companion of the append above (a committed prefix rewrite).
         patchThreadMessages,
         setThreadStatus,
+        setThreadLabel,
         archiveInvocation,
         reserveIdentity,
         createThread,
