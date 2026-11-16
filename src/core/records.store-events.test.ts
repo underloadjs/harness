@@ -266,8 +266,9 @@ describe('the store-wide notification — exactly one per committed call', () =>
         const added = await run(engine, 'tasks', { tasks: [{ text: 'Commit anyway' }] }, 'writer');
 
         // The tool result is the caller's truth; a broken observer is not its problem. The
-        // envelope below is the ordinary `tasks` add result (list page + counts + storeRev)
-        // pinned in ../harness.task.test.ts — the observer changes none of it.
+        // envelope below is the ordinary `tasks` add result (list page + counts + storeRev +
+        // the R1 receipts for the one record this call created) pinned in
+        // ../harness.task.test.ts — the observer changes none of it.
         expect(added).toEqual({
             tasks: [
                 {
@@ -289,7 +290,10 @@ describe('the store-wide notification — exactly one per committed call', () =>
                 updatedAt: EPOCH_ISO
             },
             page: { offset: 0, limit: 20, hasMore: false },
-            storeRev: 1
+            storeRev: 1,
+            // R1: the add receipt names the id it created, and a throwing listener cannot
+            // suppress it — the write committed before the observer ran.
+            addedIds: ['1']
         });
         expect(engine.view().storeRev).toBe(1);
     });

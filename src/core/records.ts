@@ -1465,14 +1465,30 @@ type Plan = {
 // so every existing consumer that types the result as `RecordsResult` keeps compiling —
 // a wider object is still assignable to it.
 //
-// THE TYPES FOLLOW-UP IS DONE: the published types declare the keys themselves, so the
-// harness doors expose them — `RecordsResult.addedIds?` / `changedIds?` (:2009-2010) and
-// `RecordsResult.oldestAvailableRev?` (:2016), `RecordStoreView.oldestAvailableRev?`
-// (:1938) and `RecordStoreDelta.oldestAvailableRev?` (:1955), which is what
-// `Harness.records` (:4364) and `Harness.recordsChanges` (:4365) return; `TaskResult`
-// (:2190) inherits all three through
-// `Omit<RecordsResult, 'entries' | 'counts' | 'removed'>`. Line numbers are snapshots of a
-// dirty worktree — re-derive them by grepping the key names in ../types/index.ts.
+// THE TYPES FOLLOW-UP IS DONE: the published types declare the keys themselves —
+// `RecordsResult.addedIds?` / `RecordsResult.changedIds?` / `RecordsResult.oldestAvailableRev?`,
+// plus `RecordStoreDelta.oldestAvailableRev?` and `RecordStoreView.oldestAvailableRev?`, all in
+// ../types/index.ts — and `TaskResult` inherits the three `RecordsResult` keys through
+// `Omit<RecordsResult, 'entries' | 'counts' | 'removed'>`. They are cited HERE by symbol, never
+// by line number: both files move, and a numeric cite in this block has already drifted once and
+// been re-anchored (see the re-anchoring note beside `toWrapperResult` below).
+//
+// DECLARED IS NOT EMITTED — which door actually fills the floor in (checked against the code,
+// not against the declarations):
+//   - `Harness.recordsChanges` returns `RecordStoreDelta`, and `changesSince()` (below) DOES
+//     emit `oldestAvailableRev` on every delta.
+//   - `Harness.records` returns `RecordStoreView`, whose floor is DECLARED but NEVER emitted:
+//     `view()` (below) answers with `storeRev` / `collectionsRev` / `collections` / `changes`
+//     only, and src/harness.ts `records` is a pass-through of that call.
+//   - On the RECORD plane the key IS emitted: `project()` (below) sets it on every
+//     per-collection result, and `toWrapperResult()` re-spells it onto a wrapper envelope ONLY
+//     beside `changes`.
+//
+// 0012 (R1-R6) ADDED NOTHING HERE ON PURPOSE: the four keys that pass emits — `noopIds?`
+// and `droppedEvents?` on the result, plus `define`'s `definition` echo and `drop`'s
+// `dropped` marker — are declared in ../types' `RecordsResult` directly. This type is now a
+// pure legacy alias of the published shape (`RecordsEngineResult` is unchanged in
+// consequence); do not add a key here that ../types already owns.
 // ---------------------------------------------------------------------------
 export type RecordsResultAdditions = {
     // 0008 — the ids a batch MINTED, in mint order, when it minted more than one.
@@ -2011,9 +2027,21 @@ const readPlan = (
     const resulting = store.length() - removals.length + additions.length;
 
     if (resulting > definition.maxRecords) {
+        // 0012 (R7) — the advice has to size the job. It used to say "Remove one before
+        // adding another." whatever the batch, so a 5-addition batch over a `maxRecords: 3`
+        // collection told a caller to delete one record and retry, which fails again four
+        // times. `over` is exactly how many records have to go for THIS call to fit: the
+        // cap is already netted against the removals the same call sends (the line above),
+        // so `over` is the count still missing after those. Singular for one, plural for
+        // more; the `store-full:` code prefix and the two facts before the advice are
+        // unchanged, because harness.records.test.ts and the docs quote them.
+        const over = resulting - definition.maxRecords;
+
         throw recordError(
             RECORD_ERROR_CODES.storeFull,
-            `${label} would hold ${resulting} ${definition.name}; the maximum is ${definition.maxRecords}. Remove one before adding another.`
+            `${label} would hold ${resulting} ${definition.name}; the maximum is ${definition.maxRecords}. Remove ${
+                over === 1 ? 'one' : `${over} more`
+            } before adding.`
         );
     }
 
@@ -2477,10 +2505,21 @@ export type RecordEngine = {
      *
      * 0011 — and plus `oldestAvailableRev`, the floor of that same window: the store
      * revision the OLDEST retained event carries (`storeFeed[0].seq`). `reset` says a gap
-     * happened; this says where the reader can pick it back up. ../types'
-     * `RecordStoreView`/`RecordStoreDelta` (a file another pass owns) do not carry the key
-     * yet, so the harness facade still projects the narrower type — the engine's own view
-     * is the wide one, and the field is in the returned object.
+     * happened; this says where the reader can pick it back up.
+     *
+     * WHAT THE SHARED DECLARATION DOES AND DOES NOT PROMISE. ../types/index.ts declares the
+     * key as OPTIONAL on both published store surfaces — `RecordStoreDelta.oldestAvailableRev?`
+     * and `RecordStoreView.oldestAvailableRev?` — but a declaration is not an emission, and on
+     * the store-wide plane ONLY this method emits it: the return type below
+     * (`RecordStoreDelta & RecordStoreWindow`) is the engine's own widening, which makes the
+     * field REQUIRED on what `changesSince()` hands back, while `view()` answers with the
+     * narrower `RecordStoreView` and carries NO floor (and neither does the
+     * `RecordStoreNotification` from `onStoreChange`). Read "carries the key" here as "this
+     * call returns it", never as "the store snapshot does too" — the sibling note
+     * "WHY `view()` DOES NOT CARRY IT" sits directly above the `changesSince` implementation
+     * further down this file and says the same thing, and ./records.test.ts pins it with the
+     * `0012: droppedEvents never reaches the store-wide plane` case, whose expected view keys
+     * are exactly `changes` / `collections` / `collectionsRev` / `storeRev`.
      */
     changesSince: (since: number) => RecordStoreDelta & RecordStoreWindow;
 };
@@ -2831,7 +2870,13 @@ export const createRecordEngine = (): RecordEngine => {
         // rule `removed`/`removedIds` follow. Through a batch wrapper the key rides only
         // beside `changes` (see `toWrapperResult`), because the wrappers' historical
         // envelopes are pinned byte-for-byte and a plain wrapper read carries no feed.
-        result.oldestAvailableRev = windowFloor(state.changes[0], state.storeRev);
+        //
+        // Held in a local, because 0012's `droppedEvents` below needs the same number and
+        // recomputing it from `result` (a widening the compiler cannot see through) would
+        // only invite the two to drift apart.
+        const floor = windowFloor(state.changes[0], state.storeRev);
+
+        result.oldestAvailableRev = floor;
 
         // Copy the watermark into a const so the narrowing survives into the filter
         // callback (a property access is not narrowed inside a closure).
@@ -2866,9 +2911,37 @@ export const createRecordEngine = (): RecordEngine => {
         }
 
         result.changes = kept;
-        // Covers BOTH ways the feed gets cut: the entry cap and the byte budget.
+        // 0012 (R2) — comment rescoped: this sentence belongs to `changesHasMore` and to
+        // nothing above it. `changesHasMore` is the "the feed I got is SHORTER than the
+        // feed that exists" flag, and it covers BOTH ways the feed gets cut — the
+        // RECORD_MAX_CHANGES_IN_RESULT entry cap and the `responseBudgetBytes` byte budget
+        // — because both are measured against `feed.length`, the whole post-`since` set.
         result.changesHasMore = kept.length < feed.length;
+        // `changesTruncated` is a DIFFERENT signal, and the two must not be read as one: it
+        // is the RETENTION-FLOOR flag, true only when the FIFO window no longer holds the
+        // event after `since` at all (`state.changes[0].rev > since + 1`, computed above). A
+        // feed can be `changesHasMore: true` with `changesTruncated: false` — cut by the cap
+        // or the budget while every event since `since` is still retained — and that reader
+        // has lost nothing, it just has more to read.
         result.changesTruncated = truncated;
+        // 0012 (R2/R8) — the SIZE of the retention gap, so a poller does not have to know
+        // RECORD_MAX_CHANGES out of band to report how far behind it is. Everything at or
+        // below `floor` that is above `since` is gone for good: `floor - since - 1`. The
+        // boundary is exact — `since === floor - 1` loses nothing (the reader resumes AT the
+        // floor, which is what records.test.ts's at-floor case pins) — and an empty window
+        // makes `floor` `storeRev + 1` (see `windowFloor`), so the count is then every event
+        // after `since`. `since` can never be ahead of the store (refused at the `since`
+        // guard), but a watermark inside the window makes the raw difference negative —
+        // nothing was lost — hence the clamp rather than a negative receipt.
+        //
+        // Emitted ONLY inside the `since` block, i.e. exactly when `changes` is present:
+        // outside a feed there is no gap to size. The store-wide observation plane keeps its
+        // boolean `reset` on the delta `changesSince()` hands back (`RecordStoreDelta.reset`,
+        // src/types/index.ts:2036) and does NOT grow this key; `RecordStoreView` is the
+        // `records()` envelope (src/types/index.ts:2004) and has no `reset` of its own, so it
+        // is named here only as the same plane's other surface — deliberately, so the REST
+        // delta contract and the swagger stay as published.
+        result.droppedEvents = Math.max(0, floor - since - 1);
 
         return result;
     };
@@ -3135,20 +3208,27 @@ export const createRecordEngine = (): RecordEngine => {
         // batch answers with the page like any other success.
         const affected: RecordEntry[] = [];
 
-        // 0008 (issue 0008, proposal step 1) — the two id lists `affected` cannot express,
+        // 0008 (issue 0008, proposal step 1) — the three id lists `affected` cannot express,
         // because it mixes the two kinds of write: `minted` takes an id per ADDITION, in
         // mint order (the order the caller sent them, which is the order the global counter
-        // handed them out), and `changed` takes an id per PATCH THAT ACTUALLY WROTE. A no-op
-        // patch is skipped by the loop above — no rev bump, no event — so it belongs in
-        // neither list, exactly as it belongs in no `entry` and no `changes` row.
+        // handed them out), and `changed` takes an id per PATCH THAT ACTUALLY WROTE.
+        //
+        // 0012 (R4) — `nooped` is the third list, and it is the half of the batch the other
+        // two could only imply. A patch that lands in neither `changed` nor `minted` used to
+        // be indistinguishable from a call that never mentioned it: `{ tasks: [{ id, text }] }`
+        // re-sending the stored text, or `{ tasks: [{ id }] }` naming no field at all, is a
+        // SUCCESS that writes nothing, and the caller had no way to learn that its own patch
+        // was a no-op short of re-reading `rev`. Every such id is named here — and only here,
+        // because it belongs in no `entry`, no `changes` row and no other list.
         const minted: string[] = [];
         const changed: string[] = [];
+        const nooped: string[] = [];
 
         // 1. PATCHES. An existing entry keeps its position and its id, and only the
         //    fields the caller named change. A patch whose named fields already hold
         //    those values is a SUCCESS with no event — no rev bump, no attribution, no
         //    log entry — so re-sending the same list cannot flood the change window or
-        //    knock every reader off its revision.
+        //    knock every reader off its revision. Such an id is named in `noopIds` (0012).
         for (const patch of plan.patches) {
             const entry = findEntry(patch.id as string);
             const fields: string[] = [];
@@ -3174,7 +3254,20 @@ export const createRecordEngine = (): RecordEngine => {
                 written.set(spec.key, next);
             }
 
-            if (fields.length === 0) continue;
+            if (fields.length === 0) {
+                // 0012 (R4) — the ONE gate both no-op shapes fall through to, so one push
+                // covers both and can never double-count an id:
+                //   - every field the caller NAMED already held that value, so the `same`
+                //     test above skipped each one and `fields` stayed empty;
+                //   - the entry named no declared field at all (`{ id }`), so the field loop
+                //     never ran.
+                // The call is still a SUCCESS; it just wrote nothing, and this is the only
+                // place that fact is recorded. `storeRev` does not move, because `pushChange`
+                // below is the sole writer of it and this branch skipped it — which is what
+                // keeps the receipt and the change feed telling the same story.
+                nooped.push(patch.id as string);
+                continue;
+            }
 
             entry.rev += 1;
 
@@ -3252,28 +3345,43 @@ export const createRecordEngine = (): RecordEngine => {
 
         if (removed.length > 0) result.removed = removed;
 
-        // 0008 (issue 0008, proposal steps 1 and 2) — M3's remedy, extended to the two
-        // writes it never reached. A batch that minted or changed MORE THAN ONE record used
-        // to answer with the page only: `entry` is singular-only (the rule below), so the
-        // caller of `{ entries: [a, b], limit: 1 }` — the recipe `records.tool.ts` tells
-        // every caller to use — got one unrelated survivor row and NOTHING naming its own
-        // write, exactly the gap `removedIds` closed for removals. `addedIds` is the ids
-        // this call minted, `changedIds` the ids it really patched.
+        // 0008 (issue 0008, proposal steps 1 and 2), re-shaped by 0012 (R1) — M3's remedy,
+        // extended to the two writes it never reached. The defect 0008 fixed was real: the
+        // caller of `{ entries: [a, b], limit: 1 }` — the recipe `records.tool.ts` tells every
+        // caller to use — got one unrelated survivor row and NOTHING naming its own write.
+        // What 0008 got wrong was the gate. It emitted a list only when its count was
+        // GREATER THAN ONE, so a batch of one addition PLUS one patch answered with no key at
+        // all: `entry` needs `affected.length === 1` (below), two records rules it out, and
+        // each list was still under its own bar. That is the exact case AC1 names — a mixed
+        // batch could not be confirmed at all.
         //
-        // WHY ONE, NOT ONE OR MORE, AND WHY A SEPARATE KEY
-        // ------------------------------------------------
-        // Mirrors `removedIds` for the reason that key states (the one-stable-type rule in
-        // the batch wrapper below): at exactly one affected record `entry` already says
-        // everything, so the list would restate it, and widening `entry` to
-        // `RecordEntry | RecordEntry[]` is what that rule forbids — the action wrappers
-        // unpack `entry` as ONE typed record. Each key keeps one stable type, and a caller
-        // branches on which KEY is present, never on a count.
+        // THE RULE, NOW STATED HONESTLY
+        // ----------------------------
+        // One key per kind of write, emitted WHENEVER THAT KIND HAPPENED AT ALL: an empty list
+        // means the key is absent, a non-empty list means the key is present, at any count. A
+        // caller branches on which KEY is present, never on a count, and each key keeps one
+        // stable type (an array of ids) — the same rule `removed`/`removedIds` follow, minus
+        // the count-dependence that made 0008's keys unreadable at low counts.
+        //   - `addedIds`   — every id this call minted, in mint order;
+        //   - `changedIds` — every id this call really patched, in caller order;
+        //   - `noopIds`    — every id whose patch wrote nothing (0012, see above).
+        // The three are independent: `entry` is not one and does not suppress another.
+        //
+        // `entry` below stays singular-only, and it is a CONVENIENCE, not a suppression
+        // condition: it is what lets an action wrapper answer `add`/`update` with its singular
+        // domain shape (and lets a one-record write return the full body without paying for a
+        // page). A caller that wants ids uses the lists; at one affected record both describe
+        // the same write, and restating it in two keys is cheaper than making a consumer guess
+        // which key is missing.
         //
         // Emitted whatever `limit` says: the page is a plain projection (`project` above
         // runs no matter what the batch touched), so the page can never be the answer, and
         // shrinking it is the documented cheap-write recipe this has to keep working.
-        if (minted.length > 1) result.addedIds = minted;
-        if (changed.length > 1) result.changedIds = changed;
+        if (minted.length > 0) result.addedIds = minted;
+        if (changed.length > 0) result.changedIds = changed;
+        // 0012 (R4) — emitted on the same never-count-dependent rule, so a batch of exactly
+        // one no-op patch still names the id it declined to write.
+        if (nooped.length > 0) result.noopIds = nooped;
 
         // One affected record → `entry`, which is what lets an action wrapper answer
         // `add`/`update` with its singular domain shape.
@@ -3344,7 +3452,16 @@ export const createRecordEngine = (): RecordEngine => {
             // R3: echo the state's real revision — this literal was `storeRev: 0`, which
             // after a drop + re-`define` would report a revision the store does not have.
             storeRev: state.storeRev,
-            collection: definition.name
+            collection: definition.name,
+            // 0012 (R5) — echo the spec the engine ACCEPTED, not the one the caller typed:
+            // `definition` is the validated result of `readCollectionDefinition`, so it
+            // carries the engine defaults the caller omitted (`maxRecords`,
+            // `responseBudgetBytes`). `define` used to answer with a page and a name, which
+            // left the caps a live session was about to hit undiscoverable until it tripped
+            // them — the same gap `describe` (R6) closed for an EXISTING collection. Copied
+            // through `cloneDefinition` for the reason that helper states: a result must not
+            // hand out the live definition object the collection runs on.
+            definition: cloneDefinition(definition)
         };
     };
 
@@ -3421,7 +3538,14 @@ export const createRecordEngine = (): RecordEngine => {
             counts: { total: 0 },
             page: { offset: 0, limit: RECORD_LIST_DEFAULT_LIMIT, hasMore: false },
             storeRev: state.storeRev,
-            collection: state.definition.name
+            collection: state.definition.name,
+            // 0012 (R6) — a success marker. `drop` used to answer with an empty page and the
+            // name, which is byte-identical to what a READ of an empty collection answers, so
+            // a caller could not tell "dropped" from "still there, and empty" from the result
+            // alone (it had to make a second call that then failed `unknown-collection`). One
+            // constant, always `true`, only on this path; the refusals throw, so the key is
+            // never a maybe.
+            dropped: true
         };
     };
 
@@ -3713,14 +3837,23 @@ export const createRecordEngine = (): RecordEngine => {
                 ...(result.removed && result.removed.length > 1
                     ? { removedIds: result.removed.map((entry) => entry.id) }
                     : {}),
-                // 0008 — the two sibling lists the engine emits for a batch that minted or
-                // changed more than one record (see `executeCollection`). They ride the
-                // wrapper unchanged: no `entry` and no `removed` is ever an ARRAY, and at
-                // exactly one affected record the engine leaves both keys OUT, because
-                // `entry` already names the record. So `tasks {"tasks":[a,b], "limit":1}`
-                // now answers with the ids it created instead of a survivor page.
+                // 0008 — the sibling id lists the engine emits for a batch that minted or
+                // changed records (see `executeCollection`). 0012 (R1) relaxed the engine's
+                // gate from "more than one" to "non-empty", so a batch of one add PLUS one
+                // patch — the case that used to answer with no key at all — now names both
+                // ids, and they ride the wrapper UNCHANGED: no `entry` and no `removed` is
+                // ever an ARRAY, and every key keeps one stable type. So
+                // `tasks {"tasks":[a,b], "limit":1}` answers with the ids it created instead
+                // of a survivor page, and a one-record batch answers with a one-element list
+                // beside `entry` rather than inventing a second shape.
                 ...(result.addedIds === undefined ? {} : { addedIds: result.addedIds }),
-                ...(result.changedIds === undefined ? {} : { changedIds: result.changedIds })
+                ...(result.changedIds === undefined ? {} : { changedIds: result.changedIds }),
+                // 0012 (R4) — the no-op receipts MUST be re-spelled here or `tasks` swallows
+                // them: this branch rebuilds the envelope key by key and passes nothing
+                // through by accident. Without this line `noopIds` would be a
+                // `records`-only key, and a `tasks` caller could not tell a patch that wrote
+                // from a patch that was refused silently.
+                ...(result.noopIds === undefined ? {} : { noopIds: result.noopIds })
             };
 
             if (result.changes !== undefined) shaped.changes = result.changes;
@@ -3737,6 +3870,13 @@ export const createRecordEngine = (): RecordEngine => {
             // it can resume.
             if (result.changes !== undefined && result.oldestAvailableRev !== undefined) {
                 shaped.oldestAvailableRev = result.oldestAvailableRev;
+            }
+            // 0012 (R2) — the gap SIZE rides exactly where its floor rides, for the same
+            // reason and with the same gate: `droppedEvents` is a statement about the feed the
+            // response carries, and the engine emits it only inside its own `since` block. A
+            // plain wrapper read has no feed, so the key must not leak onto it.
+            if (result.changes !== undefined && result.droppedEvents !== undefined) {
+                shaped.droppedEvents = result.droppedEvents;
             }
 
             return shaped;
@@ -4032,9 +4172,10 @@ export const createRecordEngine = (): RecordEngine => {
         // WHY `view()` DOES NOT CARRY IT: the snapshot hands over the WHOLE retained feed,
         // so its own `changes[0].seq` is the floor and there is nothing to disambiguate;
         // the delta is the envelope that can come back with a gap or an empty list, which is
-        // where the number is actually needed. `RecordStoreDelta` in ../types (a file
-        // another pass owns) does not declare the key yet, so the engine widens its own
-        // return type; `Harness.recordsChanges` keeps projecting the narrower one.
+        // where the number is actually needed. `RecordStoreDelta` in ../types DOES declare
+        // the key (`oldestAvailableRev?`, src/types/index.ts) — the engine additionally
+        // widens its own return type with `RecordStoreWindow` so the field is REQUIRED on
+        // what `changesSince()` hands back, never an optional a caller has to re-narrow.
         changesSince: (since: number): RecordStoreDelta & RecordStoreWindow => {
             const changes = storeFeed.filter((change) => change.seq > since).map((change) => ({ ...change }));
 

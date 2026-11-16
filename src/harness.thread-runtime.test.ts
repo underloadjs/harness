@@ -564,12 +564,20 @@ describe('persistent agent threads (R2)', () => {
         // R9-R11: every successful task call answers with the same bounded list, so
         // both conversations recorded the SAME page (one store, one revision).
         //
-        // R1/T1.1 — the two answers now differ by exactly ONE per-CALL key: the
-        // planner's ADD affected a single record and answers with that record as
-        // `entry`, while the lister's plain read affected none. Naming the difference
-        // here keeps the comparison exact instead of loosening it into a subset check.
+        // R1/T1.1 — the two answers differ by per-CALL keys only: the planner's ADD affected a
+        // single record and answers with that record as `entry`, while the lister's plain read
+        // affected none. Naming the difference here keeps the comparison exact instead of
+        // loosening it into a subset check.
+        //
+        // RE-PINNED 2026-11-17 (task C1's accepted receipt-key change, src/core/records.ts
+        // `result.addedIds = minted` at `minted.length > 0`): the id lists now appear AT ANY
+        // COUNT, so a one-task ADD names its minted id in `addedIds` too. This is the same
+        // envelope the pinned `tasks` description now promises ("those three id lists appear
+        // whenever the call did that kind of write, AT ANY COUNT"), and the plain read above
+        // still carries neither key, which is what the spread below still proves.
         expect(pageOf(toolResultsOf(writer.threadMessages(planner.id))[0])).toEqual({
             ...(pageOf(toolMessage.content) as Record<string, unknown>),
+            addedIds: ['1'],
             entry: task('1', 'Shared plan', { by: 'writer', threadId: planner.id })
         });
         expect(textOf(writer.threadMessages(planner.id))).toEqual([

@@ -44,7 +44,7 @@ describe('stress: define / dispatch short-circuits', () => {
         expect(listed.entries).toEqual([]);
     });
 
-    it('D3b: `define` beside `remove`/`ids`/`where`/`drop`/`describe` ignores them', async () => {
+    it('D3b: `define` beside `remove`/`ids`/`where`/`drop`/`describe` ignores them (it now echoes its own definition)', async () => {
         const engine = createRecordEngine();
 
         const dropped = await run(engine, 'records', {
@@ -53,19 +53,50 @@ describe('stress: define / dispatch short-circuits', () => {
         });
         expect(dropped.collection).toBe('notes');
 
-        const described = await run(engine, 'records', {
+        const describeOnly = await run(engine, 'records', {
             collection: 'tasks',
             describe: true
         });
-        expect(described.definition).toBeDefined();
+        expect(describeOnly.definition).toBeDefined();
 
         const both = await run(engine, 'records', {
             define: { name: 'notes2', fields: [{ key: 'q', type: 'text' }] },
             describe: true
         });
-        // `describe` never answered: no definition key, and the collection was created.
-        expect(both.definition).toBeUndefined();
+        // R5 CHANGED this pin: `define` now answers with the definition it stored, so the
+        // key that used to be absent is here. What did NOT change is the short-circuit —
+        // the `describe: true` beside it never answered on its own terms.
+        expect(both.definition).toEqual({
+            name: 'notes2',
+            fields: [{ key: 'q', type: 'text' }],
+            maxRecords: 200,
+            responseBudgetBytes: 65536
+        });
         expect(both.collection).toBe('notes2');
+        // A define answer and a describe answer now share a shape (both carry `definition`
+        // and `entries`), so the ignore is pinned by COMPARISON: the same define without
+        // the extra control answers byte-identically, and the described collection holds
+        // what define created - i.e. `describe` added nothing of its own.
+        const bare = await run(engine, 'records', {
+            define: { name: 'notes3', fields: [{ key: 'q', type: 'text' }] }
+        });
+        expect(Object.keys(bare)).toEqual(Object.keys(both));
+        expect({ ...both, definition: null, collection: null }).toEqual({
+            ...bare,
+            definition: null,
+            collection: null
+        });
+        // The echo is a CLONE, not the live definition (the defect D40 pins for
+        // snapshot()): writing through the returned object must not reach the store.
+        both.definition.name = 'mutated';
+        both.definition.fields.push({ key: 'ghost', type: 'text' });
+        const echoedBack = await run(engine, 'records', { collection: 'notes2', describe: true });
+        expect(echoedBack.definition).toEqual({
+            name: 'notes2',
+            fields: [{ key: 'q', type: 'text' }],
+            maxRecords: 200,
+            responseBudgetBytes: 65536
+        });
     });
 
     it('D73: a write with NO `collection` returns the collection list and drops the write', async () => {

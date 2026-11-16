@@ -549,7 +549,13 @@ describe('harness snapshot/restore', () => {
             // also answers with that record as `entry` beside the page. Reads and
             // multi-record calls in this file keep the page-only shape, which is the
             // assertion that the key is conditional rather than always present.
-            entry: taskItem('7', 'Next', { by: 'writer', at: EPOCH_ISO })
+            entry: taskItem('7', 'Next', { by: 'writer', at: EPOCH_ISO }),
+            // 0012 (R1) — the add receipt is now UNCONDITIONAL at any count: the engine
+            // (src/core/records.ts) emits `addedIds` whenever the list is non-empty, so a
+            // one-record add names its minted id beside `entry`. Restoring the id counter
+            // does not change that: the id the restored store minted is the one named.
+            // Same rule pinned in src/harness.records.test.ts.
+            addedIds: ['7']
         });
 
         // Record bodies and trait arrays survived the copy.
@@ -872,7 +878,12 @@ describe('harness snapshot/restore', () => {
             {
                 role: 'tool',
                 content:
-                    '{"tasks":[{"id":"1","text":"Durable","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"2026-01-01T00:00:00.000Z"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1,"entry":{"id":"1","text":"Durable","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"2026-01-01T00:00:00.000Z"}}',
+                    // 0012 (R1) — the add receipt key is now part of this byte-exact tool
+                    // message: the engine (src/core/records.ts) emits `addedIds` whenever
+                    // the list is non-empty, so the committed add names its minted id after
+                    // `entry` in the serialized result (key order is emission order).
+                    // Same rule pinned in src/harness.records.test.ts.
+                    '{"tasks":[{"id":"1","text":"Durable","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"2026-01-01T00:00:00.000Z"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1,"entry":{"id":"1","text":"Durable","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"2026-01-01T00:00:00.000Z"},"addedIds":["1"]}',
                 toolCallId: 'c1',
                 name: 'tasks'
             }
@@ -1761,7 +1772,12 @@ describe('harness restore validation', () => {
             storeRev: 1,
             // R1/T1.1 — the resumed write patched exactly ONE record, so it also
             // answers with `entry`: a restored pre-T1 store behaves like any other.
-            entry: taskItem('1', 'Legacy open', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })
+            entry: taskItem('1', 'Legacy open', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO }),
+            // 0012 (R1) — and the patch receipt is unconditional at any count: the engine
+            // (src/core/records.ts) emits `changedIds` whenever the list is non-empty, so
+            // the write that really bumped a rev names that id. A legacy store with no
+            // history is not special here. Same rule pinned in src/harness.records.test.ts.
+            changedIds: ['1']
         });
     });
 

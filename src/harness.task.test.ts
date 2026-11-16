@@ -135,20 +135,30 @@ const empty = {
 // T1.1 EXTENSION — the batch branch also carries `removed`, and with the same rule: one
 // deleted record answers as that record (singular, src/core/records.ts:3224), while a
 // multi-record call answers with the page only, exactly as `entry` behaves.
+//
+// 0012 (R1/R4) — the third conditional group: the ID RECEIPTS (`addedIds`, `changedIds`,
+// `noopIds`). One per KIND of write, present whenever that kind happened at any count, so
+// the single add at `:285` now also answers `addedIds: ['1']` beside `entry`. A receipts
+// object is passed ONLY at the sites whose call did that kind of write — every read pin
+// still omits all three, which is the assertion that they are conditional.
 const taskPage = (
     tasks: TaskItem[],
     total: number,
     completed: number,
     storeRev: number,
     entry?: TaskItem,
-    removed?: TaskItem
+    removed?: TaskItem,
+    receipts?: { addedIds?: string[]; changedIds?: string[]; noopIds?: string[] }
 ) => ({
     tasks,
     counts: { total, completed, pending: total - completed },
     page: page(),
     storeRev,
     ...(entry === undefined ? {} : { entry }),
-    ...(removed === undefined ? {} : { removed })
+    ...(removed === undefined ? {} : { removed }),
+    ...(receipts?.addedIds === undefined ? {} : { addedIds: receipts.addedIds }),
+    ...(receipts?.changedIds === undefined ? {} : { changedIds: receipts.changedIds }),
+    ...(receipts?.noopIds === undefined ? {} : { noopIds: receipts.noopIds })
 });
 
 type RecordShape = {
@@ -260,8 +270,13 @@ describe('tasks', () => {
         // src/tools/runtime/tasks.tool.ts:70 ("One id answers with entry") that the
         // batch reshape used to break, and which was left true rather than edited down
         // to the bug.
+        //
+        // 0012 (R1) — `addedIds` now rides a one-record add too, and the rule the wrapper
+        // documents is "whenever that kind of write happened, at any count". Key ORDER is
+        // part of this pin: the receipt follows `entry`, because `toWrapperResult`'s batch
+        // branch builds the envelope in that order.
         expect((entry.messages[2] as { content: string }).content).toBe(
-            `{"tasks":[{"id":"1","text":"Draft plan","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"${EPOCH_ISO}"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1,"entry":{"id":"1","text":"Draft plan","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"${EPOCH_ISO}"}}`
+            `{"tasks":[{"id":"1","text":"Draft plan","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"${EPOCH_ISO}"}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false},"storeRev":1,"entry":{"id":"1","text":"Draft plan","completed":false,"rev":1,"updatedBy":"writer","updatedThreadId":"agent:writer","updatedAt":"${EPOCH_ISO}"},"addedIds":["1"]}`
         );
     });
 
@@ -289,13 +304,17 @@ describe('tasks', () => {
                 0,
                 1,
                 // R1: one record was created, so the same record also answers as `entry`.
-                task('1', 'Draft plan', { by: 'writer', threadId: 'agent:writer', at: EPOCH_ISO })
+                task('1', 'Draft plan', { by: 'writer', threadId: 'agent:writer', at: EPOCH_ISO }),
+                // 0012: and the add is named in `addedIds` at a count of one — the receipt
+                // is per KIND of write, not per count.
+                undefined,
+                { addedIds: ['1'] }
             )
         );
 
         // Second call: an argument-less read of the same store, byte-identical. A
         // read is not a write, so the attribution and `storeRev` stay exactly where
-        // the add left them.
+        // the add left them — and it carries NO receipt key, because nothing was written.
         expect(JSON.parse((toolMessages[1] as { content: string }).content)).toEqual(
             taskPage([task('1', 'Draft plan', { by: 'writer', threadId: 'agent:writer', at: EPOCH_ISO })], 1, 0, 1)
         );
@@ -332,7 +351,10 @@ describe('tasks', () => {
                 // R1: exactly one record was patched, so it is also the `entry` — the
                 // projection a mutation result uses (no `updatedThreadId`: the host call
                 // that made this patch had no conversation).
-                task('1', 'One', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })
+                task('1', 'One', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO }),
+                // 0012: the patch is named in `changedIds` even at a count of one.
+                undefined,
+                { changedIds: ['1'] }
             )
         );
 
@@ -363,6 +385,82 @@ describe('tasks', () => {
         expect(await writer.executeTool('tasks', {})).toEqual(
             taskPage([task('2', 'Two', { by: 'writer', at: EPOCH_ISO })], 1, 0, 4)
         );
+    });
+
+    // 0012 (AC1/AC2/AC3) at the door a MODEL actually reads. The wrapper rebuilds the
+    // envelope key by key (`toWrapperResult`), so every key the engine emits has to be
+    // re-spelled here or `tasks` swallows it — which is exactly how a one-add-plus-one-patch
+    // batch ended up naming nothing: `entry` needs exactly one affected record, and the two
+    // id lists each had their own "more than one" bar.
+    it('names every id a mixed batch wrote, and flags the patch that wrote nothing (0012)', async () => {
+        const writer = quiet(brain(scripted([answer('hi')])));
+
+        await writer.executeTool('tasks', { tasks: [{ text: 'One' }, { text: 'Two' }] });
+
+        // 1 ADD + 1 PATCH, one call, the documented cheap `limit: 1` recipe. BOTH ids are
+        // named, the page is still the single row `limit` allowed, and `entry` stays out
+        // because TWO records were affected.
+        const mixed = (await writer.executeTool('tasks', {
+            tasks: [{ text: 'Three' }, { id: '1', completed: true }],
+            expects: [{ id: '1', rev: 1 }],
+            limit: 1
+        })) as TaskResult;
+
+        expect(mixed).toEqual({
+            tasks: [task('1', 'One', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })],
+            counts: { total: 3, completed: 1, pending: 2 },
+            page: { offset: 0, limit: 1, hasMore: true, nextOffset: 1 },
+            // 2 adds, then this call's patch and mint — four recorded events.
+            storeRev: 4,
+            addedIds: ['3'],
+            changedIds: ['1']
+        });
+
+        // THE NO-OP, at the same door: re-sending the stored text is a success that writes
+        // nothing, so it is named in `noopIds` alone, moves no `rev`, records no event and
+        // leaves `storeRev` where the last call left it.
+        const noop = (await writer.executeTool('tasks', {
+            tasks: [{ id: '2', text: 'Two' }],
+            expects: [{ id: '2', rev: 1 }],
+            limit: 1
+        })) as TaskResult;
+
+        expect(noop).toEqual({
+            tasks: [task('1', 'One', { completed: true, rev: 2, by: 'writer', at: EPOCH_ISO })],
+            counts: { total: 3, completed: 1, pending: 2 },
+            page: { offset: 0, limit: 1, hasMore: true, nextOffset: 1 },
+            storeRev: 4,
+            noopIds: ['2']
+        });
+
+        // A plain read carries neither a receipt nor a feed key — and its key ORDER is part
+        // of the pin, because the wrapper assembles the envelope in this order.
+        const read = (await writer.executeTool('tasks', { limit: 1 })) as TaskResult;
+
+        expect(Object.keys(read)).toEqual(['tasks', 'counts', 'page', 'storeRev']);
+
+        // The feed read: every event since 0, nothing dropped, and no receipt key beside it
+        // (a read writes nothing, whatever the window says).
+        const feed = (await writer.executeTool('tasks', {
+            since: 0,
+            limit: 1
+        })) as TaskResult & { changes: TaskChange[] };
+
+        expect(feed.changes).toEqual([
+            event(1, '1', 'add', { by: 'writer', itemRev: 1 }),
+            event(2, '2', 'add', { by: 'writer', itemRev: 1 }),
+            // The patch is logged BEFORE the mint: the apply order is
+            // patches → removals → additions, whatever the caller's order was.
+            event(3, '1', 'update', { by: 'writer', fields: ['completed'], itemRev: 2 }),
+            event(4, '3', 'add', { by: 'writer', itemRev: 1 })
+        ]);
+        expect(feed.changesHasMore).toBe(false);
+        expect(feed.changesTruncated).toBe(false);
+        expect(feed.oldestAvailableRev).toBe(1);
+        expect(feed.droppedEvents).toBe(0);
+        expect('addedIds' in feed).toBe(false);
+        expect('changedIds' in feed).toBe(false);
+        expect('noopIds' in feed).toBe(false);
     });
 
     it('shares one list with every agent in the same harness', async () => {
@@ -468,8 +566,11 @@ describe('tasks', () => {
                 1,
                 0,
                 1,
-                // R1: the single add answers with `entry` as well as the page.
-                task('1', 'After reset', { by: 'writer', at: EPOCH_ISO })
+                // R1: the single add answers with `entry` as well as the page, and 0012
+                // names the minted id in `addedIds` from a count of one up.
+                task('1', 'After reset', { by: 'writer', at: EPOCH_ISO }),
+                undefined,
+                { addedIds: ['1'] }
             )
         );
     });
@@ -611,7 +712,10 @@ describe('tasks', () => {
                     by: 'writer',
                     threadId: 'agent:writer',
                     at: EPOCH_ISO
-                })
+                }),
+                // 0012: and the retry names the id it wrote in `changedIds`, at a count of one.
+                undefined,
+                { changedIds: ['1'] }
             )
         );
 
@@ -696,6 +800,10 @@ describe('task concurrency across harness callers', () => {
         // the retained window still starts at, which is what makes `changesTruncated`
         // actionable. The wrapper carries the key ONLY with a feed — the plain-envelope
         // pins in this file stay byte-identical.
+        //
+        // 0012 (R2) — `droppedEvents` rides the same gate and reports the gap's SIZE: 0
+        // here, because `since: 0` is covered by a window that still holds rev 1. It is the
+        // disclosure paired with `oldestAvailableRev`; there is no separate truncation field.
         expect(await callAs(writer, editor, 'thread-editor', { since: 0 })).toEqual({
             tasks: [task('1', 'Shared', { by: 'writer', at: EPOCH_ISO })],
             counts: { total: 1, completed: 0, pending: 1 },
@@ -704,7 +812,8 @@ describe('task concurrency across harness callers', () => {
             changes: [event(1, '1', 'add', { by: 'writer', itemRev: 1 })],
             changesHasMore: false,
             changesTruncated: false,
-            oldestAvailableRev: 1
+            oldestAvailableRev: 1,
+            droppedEvents: 0
         });
     });
 
@@ -864,7 +973,11 @@ describe('task concurrency across harness callers', () => {
                     by: 'writer',
                     threadId: 'thread-author',
                     at: EPOCH_ISO
-                })
+                }),
+                // 0012: `changedIds` names that same write as a list, so the confirmation
+                // does not depend on the singular key being present.
+                undefined,
+                { changedIds: ['1'] }
             )
         );
     });

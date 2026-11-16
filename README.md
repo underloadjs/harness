@@ -871,7 +871,7 @@ a single counter, so the first profile of a session that already holds one task 
 | `ids: ["4"]` | read named records instead of a page — one id answers in `entry`, several in `entries` |
 | `where: { completed: true }` | equality filter for a list read (`{ field: value }`, AND across the keys), applied BEFORE ordering and paging, so the page and its cursors move over the matching records and `counts` describes the filtered set; it cannot combine with `since` or `ids` |
 | `expects: [{ id, rev }]` | the revisions you READ, one per id this call patches or removes; required for every such write whenever the runtime knows the caller — the lock and its ownership verbs are gone, so this is the only conflict control |
-| `since: <storeRev>` | also return the store events after that revision (`changes`) |
+| `since: <storeRev>` | also return the store events after that revision: `changes`, plus `changesHasMore` / `changesTruncated` / `oldestAvailableRev` / `droppedEvents` (see the change-feed bullet) |
 | `offset` / `limit` | index-page the returned list (limit 1-100, default 20) |
 | `afterId: "12"` | keyset-page it: the records with an id above `"12"`; cannot be combined with `offset` |
 | `mergeDisjoint: true` | opt-in: apply a stale content patch when the concurrent change touched only fields this patch leaves out |
@@ -883,29 +883,57 @@ tasks({ "tasks": [{ "text": "Draft the plan" }] })
                 updatedAt: "2026-11-08T09:15:32.772Z" }],
        counts: { total: 1, completed: 0, pending: 1 },
        page: { offset: 0, limit: 20, hasMore: false },
-       storeRev: 1 }
+       storeRev: 1,
+       entry: { … the new record, repeated … },
+       addedIds: ["1"] }
 
 tasks({ "tasks": [{ "id": "1", "completed": true }],
         "expects": [{ "id": "1", "rev": 1 }], "offset": 20, "limit": 20 })
   -> { tasks: [...], counts: { total: 42, completed: 3, pending: 39 },
        page: { offset: 20, limit: 20, hasMore: true, nextOffset: 40 },
-       storeRev: 22 }
+       storeRev: 22, changedIds: ["1"] }
+
+tasks({ "tasks": [{ "id": "1", "completed": true }],
+        "expects": [{ "id": "1", "rev": 2 }] })          // `completed` is ALREADY true
+  -> { tasks: [...], counts: { total: 42, completed: 3, pending: 39 },
+       page: { offset: 20, limit: 20, hasMore: true, nextOffset: 40 },
+       storeRev: 22, noopIds: ["1"] }                    // nothing moved: no rev, no event
 ```
 
 - **Every successful call answers the same envelope** — `{ tasks, counts, page,
   storeRev }` with no per-action wrapper, plus `entry` when exactly one record answers
   (a single patch, or an `ids` read of one id), `entries` when `ids` names several, and
-  `removed` / `removedIds` when the call deleted one record / two or more. `counts` reports `total`, `completed`, and
+  `removed` / `removedIds` when the call deleted one record / two or more. Beside those ride
+  **one key per KIND of write**: `addedIds` names every id the call minted (in mint order),
+  `changedIds` every id it really patched (in the order you named them), and `noopIds` every id
+  whose patch wrote nothing. Those three follow a different presence rule from
+  `removed` / `removedIds`, and that is the whole contract: each appears whenever the call did
+  that kind of write — **at any count, and independently of the others** — so a batch of one add
+  plus one patch names BOTH ids while `entry` stays out; an empty list means the key is absent;
+  and each key keeps one stable type (an array of ids). A caller branches on which KEY is
+  present, never on a count, and an id is in `changedIds` or in `noopIds`, never both. `entry` is
+  the one-record convenience and never suppresses a list, and the three lists ride whatever
+  `limit` you sent — the page is a plain projection, so `limit: 1` stays the cheap write and the
+  ids of your own write still arrive. A read answers with none of them. `counts` reports `total`, `completed`, and
   `pending` (`pending` is the count of unfinished tasks; the store itself keeps
   `completed: boolean` per task) and is always derived from the WHOLE list, never
   from the page. `page.nextOffset` (offset mode) or `page.nextAfterId` (`afterId`
   mode) is omitted when `hasMore` is false; loop on it to read the rest. The page is
-  bounded by 100 items and a 64 KiB serialized budget. Caps: 200 tasks, 4000
-  characters of text each.
+  bounded by 100 items and a 64 KiB budget charged on the task records themselves — the JSON
+  around them is never counted, and the first record of a page always lands. Caps: 200 tasks, 4000
+  characters of text each, and going over is a refusal that sizes the job — `tasks would hold
+  201 tasks; the maximum is 200. Remove one before adding.`, or `Remove 2 more before adding.`
+  when you are two over, because the number already nets off the `remove` list the same call
+  sends.
 - **Each record carries `rev`**, its CONTENT revision: 1 when it is added, +1 only
   when `text` (after trimming) or `completed` actually changes. The PATCH itself is
-  event-free when the values you send already match — no `rev` bump, no attribution,
-  no store event — so a model that restates the list cannot flood the log. Nothing
+  event-free when the values you send already match — no `rev` bump, no attribution, no
+  store event — so a model that restates the list cannot flood the log, and the answer says so
+  instead of leaving you to re-read: that id appears in `noopIds`, and nowhere else (no `entry`,
+  no `changes` row, no `changedIds`). An entry that names an `id` and NO field at all is refused
+  rather than counted as a no-op (`tasks "tasks[0]" names id "1" but sets no field; read it with
+  "ids" instead.`), so through this tool `noopIds` has exactly one producer: a patch whose named
+  fields already hold those values. Nothing
   else can move `rev` either: with the lock deleted there is no ownership action left
   to knock another agent off its compare-and-swap token. `updatedBy` /
   `updatedThreadId` / `updatedAt` attribute the
@@ -925,12 +953,31 @@ tasks({ "tasks": [{ "id": "1", "completed": true }],
   per id per call.`), a repeated id in `remove`, the 201st
   task, a 4001-character text, and a stale `expects` all produce
   readable, recoverable tool results.
-- **The change feed is bounded.** The store keeps a FIFO log of 200 recorded events
-  (`add` / `update` / `remove`); `since` returns the events after
-  the revision you pass, at most 50 and inside the same 64 KiB budget, with
-  `changesHasMore` when the feed was cut and `changesTruncated` when the retained
-  window no longer covers the gap. A `since` ahead of the store is an error, not an
-  empty answer.
+- **The change feed is bounded, and it sizes the gap.** The store keeps a FIFO log of 200
+  recorded events per collection (`add` / `update` / `remove`); `since` returns the events after
+  the revision you pass, at most 50 of them, trimmed against the same 64 KiB number the page was
+  cut by but charged from the serialized page rather than from zero — and because the feed's own
+  five keys are written after that trim and never charged, and its first event always lands, a
+  feed-bearing answer can come back a little over the declared budget by a small fixed amount that
+  does not grow with `droppedEvents`. A feed is FIVE keys, and
+  nothing else adds any of them: `changes` (oldest first); `changesHasMore` — **this answer was
+  cut short**, more events exist above your `since` than the 50-entry cap or the byte budget let
+  through, and nothing was lost, so read on from the last `rev` you got; `changesTruncated` —
+  **the retention floor moved past `since`**, so part of the gap is gone for good and no further
+  read can show it; `oldestAvailableRev` — that floor, the oldest revision this collection's
+  window can still show; and `droppedEvents` — the floor's SIZE,
+  `max(0, oldestAvailableRev - since - 1)`, the events strictly below it that are gone, which is
+  how a poller says "100 behind, resume at 101" without knowing the 200-event window out of band.
+  The two booleans are not one signal and neither is the number: `changesHasMore: true` with
+  `changesTruncated: false` and `droppedEvents: 0` is a reader that simply has more to read. The
+  floor is read off the retained events, never derived from `storeRev`: a collection that has
+  never written reports `1` (the revision its first event will carry), and a window trimmed to
+  nothing reports `storeRev + 1`, so that reader is current only at `since === storeRev`. Through
+  this tool both low-water keys ride ONLY beside a `changes` array — a plain `tasks` read has no
+  feed to bound, so it carries neither (the un-wrapped `records` surface answers a plain read of
+  one collection WITH `oldestAvailableRev`, and still never `droppedEvents`). The window is per
+  collection, so a task reader is never woken by chapter edits. A `since` ahead of the store is an
+  error, not an empty answer.
 - Every result is a defensive copy, never a live reference.
 - The list is **per harness**, shared by the primary and its subagents, kept across
   turns, and cleared by `reset()` (ids restart at `"1"`, `storeRev` restarts at 0, the
@@ -1046,13 +1093,29 @@ stable decimal-string ids from `"1"`, and cleared by `reset()` (ids restart at
 | `update` | `id` plus at least one mutable field | the patched record plus `counts`; fields you omit are unchanged |
 | `remove` | `id` | `{ removed, counts }` |
 
-Pages default to 20 records (max 100) with a 64 KiB serialized page budget; caps are
-200 records, 200-character names/titles, 4000-character text, and at most 32 profile
-traits of 200 characters. Every result is a defensive snapshot (arrays and records
+Pages default to 20 records (max 100) with a 64 KiB budget charged on the serialized records
+themselves and not on the `counts`/`page` JSON around them (the first record of a page always
+lands); caps are 200 records, 200-character names/titles, 4000-character text, and at most 32
+profile traits of 200 characters. Every result is a defensive snapshot (arrays and records
 are copies). A rejected
 call changes nothing: unknown action, missing/blank `id`, unknown id, wrong field
 type, an update that names no field, and every tool-specific rule below are
 readable errors naming the tool and field.
+
+These three wrappers answer with their own domain shape and nothing beside it: an
+`add` / `update` / `remove` here carries NO `addedIds` / `changedIds` / `noopIds`, no
+`storeRev`, and no change-feed keys — the id receipts and the `since` window belong to
+`tasks` and to the un-wrapped `records` surface, which return the engine's own envelope.
+Their schemas are closed (`additionalProperties: false`) over the actions above, so a
+`define`, a `drop` or a `since` sent to `profiles` is refused by the schema before the
+engine sees it; `define` and `drop` are `records` verbs, and `records` refuses `define`
+beside a `collection` (`records "define" registers a NEW collection, so it takes no
+"collection" beside it.`) because `define` names the collection it creates. `define`
+answers with the spec it ACCEPTED — `definition`, with the engine defaults the caller
+omitted (`maxRecords`, `responseBudgetBytes`) filled in, so the caps you are about to hit
+are discoverable before you trip them — and `drop` answers with `dropped: true` beside the
+name, because an empty page plus the name is byte-identical to what a READ of an empty
+collection answers.
 
 | Tool | Required on `add` | Optional | `counts` |
 |---|---|---|---|
@@ -1087,7 +1150,13 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 newest first. Each invocation preview carries `invocationId`, `kind` (`root`,
 `delegation`, `fork`, or `autoanswer`), `status`, `contentLength`, a
 200-character `preview`, and a `truncated` flag. A running invocation has status
-`running` and no content — a streamed partial is never presented as a result.
+`running` and no content — a streamed partial is never presented as a result — and it is the
+ONE row that gains two more keys: `startedAt` (the epoch milliseconds the run began, stamped
+when the run registered) and `ageMs` (`max(0, now - startedAt)`, computed when you READ it, so
+the same row ages between polls). That pair is the whole answer to "is this still going?", and it
+is an age rather than a heartbeat: `delegate` has no wall-clock bound by default, retention never
+evicts a running row, and nothing proves a run is alive — you decide whether to poll again or move
+on. No other row carries it.
 
 `agentResult` returns one completed answer. Omit `invocationId` for that agent's
 latest **finished** result (completion order, so a fork that finished earlier does
@@ -1098,7 +1167,14 @@ truncated by the harness's 64 KiB tool-result bound. Offsets are UTF-16 code-uni
 indices; page edges snap to surrogate-pair boundaries, so a non-BMP glyph is never
 split (the returned `offset` is the one actually used). A failed/cancelled invocation
 reports `error` and no content; an unknown id or agent is an error; an agent that
-has not run returns `status: 'empty'`.
+has not run returns `status: 'empty'`. A run that is still in flight, addressed by
+`invocationId`, answers `status: 'running'` with `content: ''` plus the same
+`startedAt` / `ageMs` pair; every other answer — `completed`, `failed`, `cancelled`,
+`status: 'empty'`, and anything read back after a snapshot/restore — carries NEITHER key: a failed
+or cancelled answer already reports its span as `durationMs`, and an archived or restored row has no
+start stamp at all, so absence reads as "unknown", never as an age of 0. The pair is absent from
+the `delegate` envelope too — a released or abandoned `delegate` describes a child that already
+settled and answers with that child's `status`, `invocationId` and `durationMs`.
 
 Both tools expose ONLY the completed assistant answer value. They never return
 system instructions, transcript messages, tool arguments, or tool bodies. Results
@@ -3253,7 +3329,7 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/sessions/:id/definition` | The harness definition this session froze, plus `frozen_at`, `source_revision` / `current_revision` / `current`, and `discovered_tools` — the enabled set, omitted while it is empty and therefore already populated on a session the server created (`enableAllTools`) |
 | `GET /v1/harness/sessions/:id/usage` | The session's token accounting (server-summed from the recorded `usage` events) |
 | `GET /v1/harness/sessions/:id/commands` | The slash commands this session can run (discovery only — execution is a task submit) |
-| `GET /v1/harness/sessions/:id/records` | The session record store, whole or as a `?since=` delta; read-only, so polling it moves no revision |
+| `GET /v1/harness/sessions/:id/records` | The session record store, whole or as a `?since=` delta; read-only, so polling it moves no revision. A delta is a CLOSED object — `{ session_id, revision, store_rev, collections_rev, changes, reset }` — and `reset: true` says your `since` is no longer answerable: the store rewound under that watermark (a session `reset()` takes `store_rev` to 0), or the retained window trimmed past it, or a restore/restart cleared the feed. It is a `200`, not an error, and `changes` still carries what IS retained; the recovery is the snapshot read of this same path, and only that. The per-collection window keys (`oldestAvailableRev` / `droppedEvents`) are not published on either form of this route |
 | `GET /v1/harness/sessions/:id/queue` | The tasks waiting in this session's queue |
 | `POST /v1/harness/sessions/:id/tasks` | Submit a task (`{ input, attachments?, references?, thread_id? }`) or steer a running conversation → `202` **`TaskReceipt`** (see above). Each thread runs its own lane FIFO (cap 100 pending across all lanes, `429`) and continues after a task fails. Omitting `thread_id` opens a new thread; a running `thread_id` steers, or queues a continuation when attachments/an unfinished reference prevent it |
 | `POST /v1/harness/sessions/:id/reset` | Discard a session's conversation state — `{ reset: true, session_id, discarded_turns, discarded_threads, dropped_queued_tasks, revision }`; `409` while a run or queued work is pending. The cleared toolbox is immediately re-seeded (`SessionStore.reset`), so the next `GET .../tools` shows the same rows a brand-new session shows — unlike a restart, which keeps the set the conversation committed |
@@ -4207,7 +4283,12 @@ but is not would be a lie.
   `records.updated` wake carries the store's watermarks and no records at all, so it
   is a nudge, never a payload; the two panels share ONE registration on that topic
   (`extensions/records-wake.ts`), held only while a card is open on a shown board, and
-  a burst costs one delta read, not one per frame. There is no polling anywhere.
+  a burst costs one delta read, not one per frame. There is no polling anywhere. A delta
+  answering `reset: true` — or a `collections_rev` that moved out from under the card — throws
+  its local state away and re-bootstraps from the snapshot read, because that boolean is the
+  store-wide plane's ONLY gap signal: the window keys a `tasks` reader sees
+  (`oldestAvailableRev` / `droppedEvents`) stop at the per-collection feed and never cross this
+  route, so the panel has one honest recovery and takes it.
 - **Five states, and the panel says which one it is in.** `loading`, `empty`, `error`
   with a Retry, `stale` (rows on screen that may be behind), and `ready`. The state is
   published as `data-phase` on the panel root, so the stylesheet and assistive tech read

@@ -21,7 +21,7 @@
 //   - no system prompt, transcript message, tool argument, or tool body is ever
 //     exposed: only the completed assistant answer value is recorded.
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { agent, harness, tool } from '@underload/harness';
@@ -2494,5 +2494,421 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             error: 'The run was cancelled.',
             threadId: 'thread-9'
         });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// DEFECT M1 (2026-11-17) — A RUNNING INVOCATION SAYS HOW LONG IT HAS BEEN RUNNING
+// ---------------------------------------------------------------------------
+//
+// THE DEFECT. Both liveness doors answered `status: 'running'` with NO time fact at all. The
+// ledger had no start stamp — `durationMs` is computed only on the TERMINAL transition
+// (src/harness.ts `finishInvocation`) — `delegate` has no wall-clock bound by default
+// (`DELEGATE_TIMEOUT_MS === +Infinity`, src/core/agent-limits.ts), and `pruneInvocationRecords`
+// never evicts a running row. A run that started a second ago and a run parked for an hour were
+// therefore the SAME bytes, so a caller polling a stalled child had nothing to decide on.
+//
+// THE REMEDY, AND ITS FENCE. `registerInvocation` now stamps `startedAt` on the in-memory record
+// from `RunState.startedAt`, and BOTH doors project `startedAt` (epoch ms) plus `ageMs` (elapsed
+// at READ time) on RUNNING rows only. `status` and every transition are untouched, and there is
+// NO liveness/"stalled" key: a read-time liveness check would race the run's `finally` cleanup
+// and has no cross-boundary source in lane/worker mode, where the canonical harness never sees
+// the worker's live runs. Age alone is the observable fact at every boundary.
+//
+// WHY THE CLOCK IS FAKED AS `Date` ONLY. Every value below is then a pinned constant instead of
+// a wall-clock approximation: the run starts at EPOCH_MS, the clock is moved by exactly AGED_MS,
+// and the assertions demand exactly that delta. `toFake: ['Date']` leaves the macrotask queue
+// REAL, which is what lets `pump` drain the run into the parked state. It also pins the terminal
+// `durationMs` to the same delta, which is the proof that the live age and the terminal span
+// measure from ONE stamp (`run.startedAt`) rather than from two clock reads.
+describe('a running invocation reports when it started and how old it is (M1)', () => {
+    // A fixed, arbitrary epoch. Nothing in the harness derives anything from its value.
+    const EPOCH_MS = 1_760_000_000_000;
+    // The one clock delta this block applies before reading an aged row.
+    const AGED_MS = 45_000;
+
+    // Parks a run inside a tool so its row stays `running` while both doors are read.
+    const deferred = <T,>(): { promise: Promise<T>; resolve: (value: T) => void } => {
+        let resolve!: (value: T) => void;
+        const promise = new Promise<T>((accept) => {
+            resolve = accept;
+        });
+        return { promise, resolve };
+    };
+
+    // Real timers plus an explicit pump: the run is driven by draining the queue until the
+    // roster says `running`, and the pump asserts its own condition, so a run that never starts
+    // fails HERE instead of in an unrelated envelope assertion below.
+    const pump = async (predicate: () => boolean, passes = 120): Promise<void> => {
+        for (let index = 0; index < passes && !predicate(); index++) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+
+        expect(predicate()).toBe(true);
+    };
+
+    // A tool that never resolves on its own; the test opens it.
+    const hangTool = (gate: { promise: Promise<string> }) =>
+        tool({
+            description: 'Hold until the test releases it.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: () => gate.promise
+        });
+
+    // The ONE agent shape this block needs: first turn calls `hold`, second turn answers.
+    const holder = () =>
+        brain(
+            routed((request) =>
+                request.messages.some((message) => message.name === 'hold')
+                    ? answer('quiet answer')
+                    : callTool('h1', 'hold', '{}')
+            )
+        );
+
+    // AC2 as a POSITIVE assertion. An exact `toEqual` would already fail if a key appeared, but
+    // the claim under test is specifically "no non-running envelope gained THIS pair", so the
+    // absence is demanded by name at every door.
+    const expectNoAgeKeys = (envelope: unknown): void => {
+        expect(envelope).not.toHaveProperty('startedAt');
+        expect(envelope).not.toHaveProperty('ageMs');
+    };
+
+    beforeEach(() => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(EPOCH_MS);
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('reports startedAt and ageMs on a running result addressed by id, and on the agentManage row for the same run', async () => {
+        const gate = deferred<string>();
+        const writer = harness({ agents: { quiet: holder() }, tools: { hold: hangTool(gate) }, presets: false });
+
+        const thread = writer.createThread('quiet');
+        const running = writer.sendThreadInput(thread.id, 'hush');
+
+        await pump(() => writer.thread(thread.id)?.status === 'running');
+
+        // The clock moves by a KNOWN amount; every number below is that delta, never an approximation.
+        vi.setSystemTime(new Date(EPOCH_MS + AGED_MS));
+
+        // DOOR 1 — `agentResult` addressed by id. The pair joins the existing keys; every other
+        // key, and `status: 'running'` itself, is byte-for-byte what it was.
+        expect(await writer.executeTool('agentResult', { agent: 'quiet', invocationId: '1' })).toEqual({
+            agent: 'quiet',
+            invocationId: '1',
+            kind: 'root',
+            status: 'running',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            startedAt: EPOCH_MS,
+            ageMs: AGED_MS
+        });
+
+        // DOOR 2 — `agentManage` at the same instant, from the same record. One map and one
+        // derivation helper back both doors, so the two cannot name different ages for one run.
+        const listed = (await writer.executeTool('agentManage', {})) as {
+            agents: { name: string; results: unknown[] }[];
+            totalResults: number;
+            activeResults: number;
+            truncated: boolean;
+        };
+
+        expect(listed.agents.find((entry) => entry.name === 'quiet')?.results).toEqual([
+            {
+                invocationId: '1',
+                kind: 'root',
+                status: 'running',
+                contentLength: 0,
+                preview: '',
+                truncated: false,
+                startedAt: EPOCH_MS,
+                ageMs: AGED_MS
+            }
+        ]);
+        expect([listed.totalResults, listed.activeResults]).toEqual([1, 1]);
+
+        // `ageMs` is computed AT READ TIME, not stored: another 30_000 ms on the same frozen
+        // clock moves the age and leaves the start stamp alone. A stored age would sit still and
+        // tell every later poller the run froze at the moment it was first observed.
+        vi.setSystemTime(new Date(EPOCH_MS + AGED_MS + 30_000));
+
+        expect(await writer.executeTool('agentResult', { agent: 'quiet', invocationId: '1' })).toEqual({
+            agent: 'quiet',
+            invocationId: '1',
+            kind: 'root',
+            status: 'running',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            startedAt: EPOCH_MS,
+            ageMs: AGED_MS + 30_000
+        });
+
+        gate.resolve('released');
+        expect((await running).content).toBe('quiet answer');
+
+        // AC3 + AC2 at the terminal end: the transition is unchanged, and the row is back to its
+        // EXACT pre-M1 key set the moment it is no longer running — at BOTH doors.
+        const completed = await writer.executeTool('agentResult', { agent: 'quiet' });
+
+        expect(completed).toEqual({
+            agent: 'quiet',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'quiet answer',
+            contentLength: 12,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+        expectNoAgeKeys(completed);
+
+        const settled = (await writer.executeTool('agentManage', {})) as {
+            agents: { name: string; results: unknown[] }[];
+            totalResults: number;
+            activeResults: number;
+        };
+
+        expect(settled.agents.find((entry) => entry.name === 'quiet')?.results).toEqual([
+            {
+                invocationId: '1',
+                kind: 'root',
+                status: 'completed',
+                contentLength: 12,
+                preview: 'quiet answer',
+                truncated: false
+            }
+        ]);
+        expect([settled.totalResults, settled.activeResults]).toEqual([1, 0]);
+    });
+
+    it('leaves a failed, cancelled, and empty envelope at its exact pre-M1 key set', async () => {
+        // FAILED. A transport error with retries off, so the run is ONE record and the envelope
+        // below is the whole answer.
+        const failing = harness({
+            agents: {
+                writer: brain(scripted([[{ type: 'error', message: 'transport exploded' }]]), { retry: false })
+            },
+            presets: false
+        });
+
+        await expect(failing('go')).rejects.toThrow('transport exploded');
+
+        const failed = await failing.executeTool('agentResult', { agent: 'writer' });
+
+        // `durationMs` is exact (not `expect.any(Number)`) because the clock is frozen and the
+        // terminal span is measured FROM the same start stamp the live age used.
+        //
+        // `cancelledAtMessage` and `stopReason` on a FAILED (not cancelled) row are pre-existing:
+        // `finishInvocation` writes the forensic pair on EVERY non-success transition, and
+        // `HarnessDelegationResult.cancelledAtMessage` documents it as "when it was
+        // cancelled/failed". Neither is an M1 key — the point of this assertion is that the pair
+        // M1 added is absent here while the keys that were already here stay exactly as they were.
+        expect(failed).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'failed',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'transport exploded',
+            stopReason: 'api-error',
+            cancelledAtMessage: 1,
+            durationMs: 0
+        });
+        expectNoAgeKeys(failed);
+
+        // CANCELLED by the host, after a KNOWN span. This is the pairing that matters for AC2:
+        // the row had an age while it ran, and the terminal envelope reports the SAME elapsed
+        // number under its terminal key (`durationMs`) — never both.
+        const gate = deferred<string>();
+        const stopped = harness({ agents: { writer: holder() }, tools: { hold: hangTool(gate) }, presets: false });
+
+        const thread = stopped.createThread('writer');
+        const running = stopped.sendThreadInput(thread.id, 'go');
+
+        await pump(() => stopped.thread(thread.id)?.status === 'running');
+        vi.setSystemTime(new Date(EPOCH_MS + AGED_MS));
+
+        expect(stopped.stopThread(thread.id, 'the host stopped it')).toBe(true);
+        await expect(running).rejects.toThrow();
+
+        const cancelled = await stopped.executeTool('agentResult', { agent: 'writer' });
+
+        expect(cancelled).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'cancelled',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'the host stopped it',
+            stopReason: 'user-stopped',
+            cancelledAtMessage: 1,
+            durationMs: AGED_MS
+        });
+        expectNoAgeKeys(cancelled);
+
+        // The listing row for that same cancelled run: terminal rows never carry the pair, which
+        // is also the rule that keeps an ARCHIVED or RESTORED row (both terminal by construction,
+        // and neither has a start stamp) at its historical shape.
+        const listed = (await stopped.executeTool('agentManage', {})) as {
+            agents: { name: string; results: unknown[] }[];
+        };
+        const [cancelledRow] = listed.agents.find((entry) => entry.name === 'writer')?.results ?? [];
+
+        expect(cancelledRow).toEqual({
+            invocationId: '1',
+            kind: 'root',
+            status: 'cancelled',
+            contentLength: 0,
+            preview: '',
+            truncated: false
+        });
+        expectNoAgeKeys(cancelledRow);
+
+        // EMPTY. `agentResult` with nothing finished at all is its own envelope shape, and it is
+        // reached without an address at all — so it must not grow identity-free age keys either.
+        const untouched = harness({
+            agents: {
+                writer: brain(scripted([answer('unused')])),
+                fresh: brain(scripted([answer('unused')]))
+            },
+            presets: false
+        });
+
+        const empty = await untouched.executeTool('agentResult', { agent: 'fresh' });
+
+        expect(empty).toEqual({
+            agent: 'fresh',
+            status: 'empty',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+        expectNoAgeKeys(empty);
+    });
+
+    it('reports the pair on the parked run while the default door still answers the older completed run with none', async () => {
+        // TWO runs of ONE agent: the first CONCLUDES, the second parks inside `hold`. This is the
+        // shape a polling caller actually lives in, and it pins the two halves of the change
+        // against each other: the by-id door reports the parked run's age, while the DEFAULT
+        // selector (no `invocationId`) keeps handing back the older completed answer with its
+        // exact pre-M1 key set — a running row in the same ledger adds nothing to it.
+        const gate = deferred<string>();
+
+        const agent = brain(
+            routed((request) => {
+                // Route on the BRIEF, so the parked run and the finished one are distinguishable
+                // without a global call counter (the same trick the B2 block above uses).
+                if (latestUser(request).includes('second')) {
+                    return request.messages.some((message) => message.name === 'hold')
+                        ? answer('second answer')
+                        : callTool('h1', 'hold', '{}');
+                }
+
+                return answer('first answer');
+            })
+        );
+
+        const writer = harness({ agents: { writer: agent }, tools: { hold: hangTool(gate) }, presets: false });
+
+        const first = writer.createThread('writer');
+        expect((await writer.sendThreadInput(first.id, 'first')).content).toBe('first answer');
+
+        const settled = await writer.executeTool('agentResult', { agent: 'writer' });
+
+        expect(settled).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'first answer',
+            contentLength: 12,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+        expectNoAgeKeys(settled);
+
+        const second = writer.createThread('writer');
+        const running = writer.sendThreadInput(second.id, 'second');
+
+        await pump(() => writer.thread(second.id)?.status === 'running');
+        vi.setSystemTime(new Date(EPOCH_MS + AGED_MS));
+
+        // The parked run, addressed: the pair, and nothing else changed.
+        const parked = await writer.executeTool('agentResult', { agent: 'writer', invocationId: '2' });
+
+        expect(parked).toEqual({
+            agent: 'writer',
+            invocationId: '2',
+            kind: 'root',
+            status: 'running',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            startedAt: EPOCH_MS,
+            ageMs: AGED_MS
+        });
+
+        // The default door, with a running row in the same ledger: still the finished answer,
+        // still no age keys, still the same selector the B2 block pins.
+        const defaultAgain = await writer.executeTool('agentResult', { agent: 'writer' });
+
+        expect(defaultAgain).toEqual(settled);
+        expectNoAgeKeys(defaultAgain);
+
+        // One listing, two rows, two different shapes — and the difference is exactly `status`.
+        const listed = (await writer.executeTool('agentManage', {})) as {
+            agents: { name: string; results: unknown[] }[];
+            totalResults: number;
+            activeResults: number;
+        };
+
+        expect(listed.agents.find((entry) => entry.name === 'writer')?.results).toEqual([
+            {
+                invocationId: '2',
+                kind: 'root',
+                status: 'running',
+                contentLength: 0,
+                preview: '',
+                truncated: false,
+                startedAt: EPOCH_MS,
+                ageMs: AGED_MS
+            },
+            {
+                invocationId: '1',
+                kind: 'root',
+                status: 'completed',
+                contentLength: 12,
+                preview: 'first answer',
+                truncated: false
+            }
+        ]);
+        expect([listed.totalResults, listed.activeResults]).toEqual([2, 1]);
+
+        gate.resolve('released');
+        expect((await running).content).toBe('second answer');
     });
 });

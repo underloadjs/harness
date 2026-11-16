@@ -2,7 +2,24 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-14 for the delegated-threads documentation pass — the
+> **Last verified:** 2026-11-17 for the records-receipt, change-window and running-row-age
+> documentation pass — the three id receipts `addedIds` / `changedIds` / `noopIds` (one per kind
+> of write, present at ANY count and independently of each other, with `noopIds`' single producer
+> at a tool door being the patch whose named fields already held those values), the change-feed
+> keys `oldestAvailableRev` / `droppedEvents` and the planes that project them differently (the
+> per-collection feed, the `tasks` batch wrapper, the store-wide `records()` /
+> `recordsChanges()` pair and the closed REST delta object), `define`'s `definition` echo and
+> `drop`'s `dropped: true` marker with the schema gates that keep both verbs out of `tasks`, the
+> count-aware store-full advice, and the `startedAt` / `ageMs` pair a RUNNING agent-results row
+> carries — plus the `delegate` unfinished-child envelope that reports `durationMs` instead; every
+> statement was cross-checked at source level against `src/core/records.ts`, `src/harness.ts`,
+> `src/types/index.ts`, `src/core/agent-limits.ts`, `src/shared/harness-api.ts`,
+> `src/server/api-reads.ts`, `src/frontend/extensions/records-client.ts`,
+> `src/tools/runtime/{tasks,records}.tool.ts` and the pins in `src/core/records.test.ts`,
+> `src/harness.{task,records,metadata,agent-results}.test.ts` — no line anchor is restated into a
+> file this work rewrote (those are cited by symbol), NO test was executed for this pass (it is
+> docs-only and the drift it repairs is prose, not contract), and no code was touched — and
+> 2026-11-14 for the delegated-threads documentation pass — the
 > `threadDelete` receipt growing `removedInvocationIds`/`removedBranchIds`, the branch-id
 > refusal and the left-the-family sentence a default conversation now answers, the
 > `threadSend` TRANSIENT REPLY ROUTE (a conversation started on an agent's default
@@ -1447,9 +1464,10 @@ const engine = createRecordEngine();   // collections + the single id counter + 
 - **Every record carries concurrency state** (T1), on top of `id`/`text`/`completed`:
   `rev` (its CONTENT revision — 1 on add, `+1` only when trimmed `text` or
   `completed` actually changes, so a restated value is a silent no-op FOR THE PATCH
-  ITSELF) plus the write attribution `updatedBy`/`updatedThreadId`/`updatedAt`. Those
+  ITSELF, and the answer names that id in `noopIds` instead of leaving the caller to
+  re-read `rev`) plus the write attribution `updatedBy`/`updatedThreadId`/`updatedAt`. Those
   five are the RESERVED entry keys — `id, rev, updatedBy, updatedThreadId, updatedAt`
-  (`src/core/records.ts:279`) — so no collection may define a field that claims one.
+  (`src/core/records.ts:288`) — so no collection may define a field that claims one.
   Attribution comes from the
   `ToolContext` (`agent?.name`, `threadId`), never from arguments, so a model cannot
   forge it. Optional fields stay ABSENT rather than `undefined`-valued. (CORRECTED IN
@@ -1458,25 +1476,50 @@ const engine = createRecordEngine();   // collections + the single id counter + 
 - **Every recorded event also bumps the store**: one `RecordChange` per accepted change
   goes into THAT collection's FIFO window capped at `RECORD_MAX_CHANGES` (200,
   `src/core/records.ts:165`) and that collection's `storeRev` advances by one; the op is
-  `add` | `update` | `remove` ONLY (`src/types/index.ts:1827` — `claim`/`release` are
+  `add` | `update` | `remove` ONLY (`src/types/index.ts:1904` — `claim`/`release` are
   gone, so there is no ownership event to log and nothing to sweep when a thread dies).
   A no-op patch records nothing, which is why a heartbeat cannot knock a reader off its
-  revision.
+  revision — and the key that says so is `noopIds` (the envelope bullet below): present
+  whenever such a patch happened, at any count, and disjoint from `changedIds`, because an
+  id is either in one or in the other (`src/core/records.ts:3235-3247` is the single branch
+  that classifies it, `:3362` emits it). Its ONE producer at a tool door today is a patch
+  whose NAMED fields already hold those values: an entry that names an `id` and sets no
+  field at all is refused outright by `readEntryInput` — `tasks "tasks[0]" names id "1" but
+  sets no field; read it with "ids" instead.` (`src/core/records.ts:1676-1681`, pinned at
+  `src/core/records.test.ts:2861-2872`) — so the "names no field" shape `noopIds` also
+  covers in principle has no door that can produce it.
 - Every success answers the SAME bounded envelope, with no action wrapper:
   `{ tasks, counts: { total, completed, pending }, page: { offset, limit, hasMore,
   nextOffset? | afterId? + nextAfterId?, budgetTruncated? }, storeRev, entry?,
-  removed? | removedIds? }` (20 items by default, hard
-  maximum 100, and a 64 KiB serialized page budget that stops BEFORE an item which
-  would cross it). `tasks` is the current page — including right after an add, a
+  removed? | removedIds?, addedIds? | changedIds? | noopIds? }` (20 items by default, hard
+  maximum 100, and a 64 KiB page budget charged against the serialized items themselves and not
+  the JSON around them — `src/core/records.ts:2758-2769` — which stops at the first item that
+  would cross it, while the first item of a non-empty page always lands). `tasks` is the current
+  page — including right after an add, a
   patch or a removal — and is a defensive copy, so mutating a
   result can never mutate the session list. `entry` is present when ONE record answers
   (an `ids` read or a single patch), `removed` when exactly one record was deleted and
   `removedIds` when two or more were; `budgetTruncated` appears only when the byte
-  budget cut the page short of `limit`. `counts` always describes the WHOLE
+  budget cut the page short of `limit`. **The three id receipts follow a DIFFERENT
+  presence rule from `removed`/`removedIds`, and that is the whole contract**: `addedIds`
+  (every id the call minted, in mint order), `changedIds` (every id it REALLY patched, in
+  caller order) and `noopIds` (every id whose patch wrote nothing) are each emitted
+  **whenever that kind of write happened at all — at any count, and independently of each
+  other**, so a batch of one add plus one patch names BOTH ids while `entry` stays out
+  (`src/core/records.ts:3336-3362`, mirrored key-for-key by the wrapper at
+  `toWrapperResult`, `:3827-3834`; pinned at `src/core/records.test.ts:2531-2558` and
+  `src/harness.task.test.ts:399-417`). A caller branches on which KEY is present, never on
+  a count: an empty list means the key is absent, each key keeps one stable type (an array
+  of ids), and an id is in `changedIds` or in `noopIds`, never both. `entry` is
+  singular-only and is a CONVENIENCE, not a suppression condition — a one-record add
+  answers with `entry` AND `addedIds: ["1"]` (`src/harness.task.test.ts:278-280`) — and the
+  receipts are emitted whatever `limit` says, because the page is a plain projection and
+  `{ limit: 1 }` is the documented cheap-write recipe. A read answers with NONE of the three
+  (`src/harness.task.test.ts:438-440`). `counts` always describes the WHOLE
   collection, never the page. Caps: 200 tasks and 4000 characters of text each
   (`TASK_MAX_RECORDS`/`TASK_MAX_TEXT`, `src/core/task.ts:35-36`). The whole description —
   this key set included — is pinned byte-for-byte by `src/harness.metadata.test.ts:307-309`
-  against `src/tools/runtime/tasks.tool.ts:37`.
+  against `src/tools/runtime/tasks.tool.ts:47`.
 - **Two cursors, deliberately different.** `offset` is an index; `afterId` is a
   keyset cursor over the numeric ids ("everything after id 7"), which cannot skip or
   repeat a record when another agent deletes one mid-walk. The walk runs in **id
@@ -1485,14 +1528,71 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   `offset` alongside `afterId` is a rejection, and a keyset page reports `afterId`
   plus `nextAfterId` while `hasMore` — never `nextOffset`.
 - **The change feed** is the cheap alternative to re-reading: `since: <storeRev>`
-  adds `changes` (the events after that revision, oldest first, at most
-  `RECORD_MAX_CHANGES_IN_RESULT` = 50 entries — `src/core/records.ts:166`, added to the
-  result only when the byte
-  budget allows), `changesHasMore` (the feed was cut, by count or by bytes) and
-  `changesTruncated` (the retained window no longer covers `since + 1`, so the reader
-  never saw part of the gap). The window is PER COLLECTION (Decision B), so a task
-  reader is never woken by chapter edits. A `since` ahead of `storeRev` is an error, and those
-  three keys are absent from every other result.
+  adds FIVE keys, and nothing else adds any of them — `changes` (the events after that
+  revision, oldest first, at most `RECORD_MAX_CHANGES_IN_RESULT` = 50 entries — `src/core/records.ts:166` —
+  and no further than `responseBudgetBytes` allows once the WHOLE serialized page has been
+  charged against it, `:2880-2891`), `changesHasMore` (**the page was cut**: this answer carries
+  fewer events than exist above `since`, measured against the whole post-`since` set, by the
+  50-entry cap OR by the byte budget — `:2899` — which withholds later events and loses
+  nothing the reader was owed), `changesTruncated` (**the retention floor**: the retained
+  window no longer covers `since + 1`, so the reader never saw part of the gap —
+  `:2900-2906`), `oldestAvailableRev` (the floor itself: the oldest revision this
+  collection's window can still show) and `droppedEvents` (its SIZE —
+  `max(0, oldestAvailableRev - since - 1)`, the events strictly BELOW the floor that are gone
+  for good, `:2907-2922`). **What `responseBudgetBytes` bounds is the PAGE, not the answer, and
+  the feed is appended after it on purpose.** The page loop charges `JSON.stringify(entry)` plus one
+  separator per record against the budget, stops at the first record that would cross it, and
+  always admits the first record of a non-empty page (`:2758-2769`). The feed is the LAST thing
+  added, because the page the caller asked for is authoritative and "a feed that only reported
+  'more exist' after every 4 KiB page would be useless" (`:2709-2710`, `:2877-2879`); its trim loop
+  seeds `used` with `JSON.stringify(result)` — the page answer so far, `counts`, `page`, `storeRev`
+  and `oldestAvailableRev` included — and then charges only the event payloads, so the feed's own
+  keys (`"changes":[…]`, `changesHasMore`, `changesTruncated`, `droppedEvents`) are written AFTER
+  the loop and never charged at all, and the first retained event lands whatever it weighs
+  (`:2880-2922`). A feed-bearing answer therefore ends up a small FIXED amount over the declared
+  budget — roughly 80 bytes of key names and brackets, plus at most one whole event past where the
+  trim stopped — and that overshoot does not depend on how many events were dropped, because
+  `droppedEvents` sizes what the retention WINDOW lost while the byte budget only withholds events
+  that are still retained (the `changesHasMore: true` / `changesTruncated: false` case just below).
+  Next to the one real whole-answer cap — `boundToolResult` in `core/result-budget.ts`,
+  `MODEL_TOOL_RESULT_BUDGET_BYTES` = 256 KiB, which bounds the serialized text of every model-facing
+  result and every tool error — the overshoot is noise at the default 65536; it is a `define`d 1024
+  budget where a caller that reads the number as an exact response ceiling gets bitten. No records
+  or tasks test measures bytes, so nothing in the suite pins the total size of a feed-bearing
+  response. The two booleans are not one signal and neither is the number:
+  `changesHasMore: true` with `changesTruncated: false` and `droppedEvents: 0` is a reader
+  that simply has more to read (`src/core/records.test.ts:3196-3230`), and a reader parked at
+  `since = floor − 1` loses nothing even though the window has trimmed behind it
+  (`src/core/records.test.ts:3256-3260`). `windowFloor` (`:1517-1525`) is the only source of
+  the floor and has two branches a consumer cannot derive from the messages: an EMPTY window
+  reports `storeRev + 1` — nothing at or below `storeRev` survives, whether the window was
+  trimmed to nothing or this is the epoch floor a re-`define` inherits — while a non-empty one
+  reports the revision its own oldest entry carries (`rev` in a per-collection window, `seq` in
+  the store-wide feed). A collection that has NEVER written therefore answers `1` — the revision
+  its first event will carry — and an empty-window reader is current only AT
+  `since === storeRev` (`src/core/records.test.ts:3145-3163` pins the `1`; `:3292-3337` pins the
+  idle store at 1 and a re-`define`d collection at `storeRev 3` answering 4). The floor is
+  never arithmetic on `storeRev`, because a no-op patch records nothing and does not advance
+  it. `droppedEvents` exists precisely so a poller does not have to know
+  `RECORD_MAX_CHANGES` out of band to report how far behind it is, and it stands in for a
+  separate truncation field: `oldestAvailableRev` says where to resume, `droppedEvents` says
+  how much was lost. Outside a feed there is no gap to size, so `droppedEvents` appears ONLY
+  beside `changes`; `oldestAvailableRev` also rides EVERY projected result of one collection
+  on the un-wrapped `records` surface — reads and mutations alike, `:2841-2859` — while the
+  `define`/`drop`/`describe`/bare-name answers are separate literals that carry neither key
+  (`src/core/records.test.ts:3166-3181` for the plain read, `src/harness.records.test.ts:639-655`
+  for `describe`, `:722-727` for the bare name, and the `define` key set at
+  `src/core/records.test.ts:2926-2933`). Through the `tasks` wrapper BOTH feed
+  keys ride ONLY beside `changes`, because the batch projection rebuilds the envelope key by
+  key and the wrapper's page envelope is pinned byte-for-byte (`:3837-3857`,
+  `src/core/records.test.ts:3185-3189`); a `since` read whose feed came back empty still
+  carries both (`src/core/records.test.ts:3295-3299`). The window is PER COLLECTION
+  (Decision B), so a task reader is never woken by chapter edits. A `since` ahead of
+  `storeRev` is an error, and those five keys are absent from every other result — including
+  the store-wide observation plane, which publishes the same floor beside its own BOOLEAN
+  `reset` and never grows `droppedEvents` (`:4143-4172`,
+  `src/core/records.test.ts:3349-3365`, and see
+  [Session records](#session-records)).
 - Validation names the offending field with a quoted, balanced path, labelled by the
   TOOL name (the engine's `callLabelOf`, `src/core/records.ts:279-280`):
   `tasks "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`
@@ -1580,15 +1680,28 @@ explicit instead of letting the last write win:
   moved, and CARRIES THE CURRENT RECORD (R9 — one round trip, not two):
   `tasks "1" changed since revision 1 (now 2, last edited by "writer" at <ISO>); changed fields: text; retry with "expects" [{ id: "1", rev: 2 }] or pass "mergeDisjoint": true. current: {"id":"1",…}`
   (`src/core/records.ts:1301-1317`, pinned byte-for-byte at
-  `src/harness.task.test.ts:589`). A token naming a record the log says was removed
-  answers `tasks "1" was removed since revision 1 — re-read the list and add or retry.`
-  (`src/core/records.ts:1704`), and one naming an id the log holds no removal for answers
-  the two-case sentence at `:1713-1715` ("never in "tasks", or its removal aged out of
-  the 200-event window").
+  `src/harness.task.test.ts:589`). A token for an id this collection does NOT hold answers
+  ONE provable cause, never a choice between two (step 3, `:1802-1879`): an id that is
+  **live in another collection** gets `tasks id "1" belongs to "chapters" — re-read that
+  collection.` (`:1814-1829`); an id this collection's own window still logs a `remove` for
+  gets the only sentence allowed to say "was removed" — `tasks "1" was removed since
+  revision 1 — re-read the list and add or retry.` (`:1832-1841`); an id the global counter
+  never minted, or one in a collection whose window still reaches revision 1 (where "no
+  removal logged" IS evidence), gets `tasks has no task with id "9999" — "tasks" never held
+  it, and this collection's change log holds no removal for it either. Re-read the list.`
+  (`:1862-1871`); and an id whose removal has aged out gets the sentence that names the
+  boundary instead of guessing — `… its removal is older than this collection's retained
+  change window, which now starts at revision 400 (200 events), so the log can no longer
+  show it.` — with `oldestAvailableRev` in the structured `details` (`:1873-1879`). Both are
+  pinned byte-for-byte, floor included: `src/core/records.test.ts:796-806` (AGED OUT) and
+  `:810-821` (NEVER EXISTED, which deliberately carries NO `oldestAvailableRev` key). The
+  blind spot that stays **disclosed rather than argued**: `ownerOf` only reports a record
+  that is still live, so an id minted and removed in ANOTHER collection is invisible to this
+  one and lands on the never-held / aged-out wording (`:1859-1861`).
   The tokens are compared (step 3) BEFORE the existence lookups
   (step 4), so a `tasks` patch, a `remove` or a token alone all
   name the removal the caller actually hit. The generic
-  `tasks has no task with id "1".` (`:1725`) is only what a call that sent NO token for
+  `tasks has no task with id "1".` (`:1885-1888`) is only what a call that sent NO token for
   that id hears, and a token for a live id the call does not touch is still rejected as
   a token for nothing (step 5, coverage).
 - `rev` is content-only and per-collection `storeRev` counts every event. CORRECTED IN
@@ -1713,8 +1826,10 @@ feed per collection. The `*Manage` names are gone (Decision J).
 | `locations` | `name`, `description` | `notes` (`''`) | name, description, notes | `list` → `{ locations, counts: { total }, page }`; `get` → `{ location, counts }`; writes → `{ location \| removed, counts }` |
 
 `page` is `{ offset, limit, hasMore, nextOffset? }`: 20 records by default, hard
-maximum 100 per call, and a 64 KiB serialized page budget, so a model reads a long
-cast one bounded page at a time (`nextOffset` is omitted when `hasMore` is false).
+maximum 100 per call, and a 64 KiB budget charged on the serialized records themselves — the first
+record always lands and the `counts`/`page` envelope around them is not counted
+(`src/core/records.ts:2758-2769`) — so a model reads a long cast one bounded page at a time
+(`nextOffset` is omitted when `hasMore` is false).
 Caps: 200 records per tool, 200-character names/titles, 4000-character descriptions,
 summaries, chapter bodies and notes, and at most 32 profile traits of 200 characters.
 The paged result types are re-exported from `types/index.ts`; the SHAPES are declared by
@@ -1722,6 +1837,57 @@ the collection specs in `core/{task,profile,chapter,location}.ts` (field keys, c
 facets, the `getOnly` projection) and rendered by `core/records.ts`, so a wrapper cannot
 drift from what the engine returns and adding a collection adds no validator.
 
+- **The receipts and the feed keys stop at the engine envelope; the three story wrappers
+  strip them.** `records` answers with the engine's own result —
+  `{ entries | entry, counts, page, storeRev, removed?, oldestAvailableRev, addedIds? |
+  changedIds? | noopIds?, changes? (+ changesHasMore / changesTruncated / droppedEvents) }`
+  — because a call that names its own collection returns
+  `executeCollection(...)` verbatim (`src/core/records.ts:3965-3971`), and that is the key set
+  [Session tasks](#session-tasks) documents. `profiles` / `chapters` / `locations` go through
+  `toWrapperResult`'s ACTION branch, which rebuilds a domain shape key by key —
+  `{ profiles, counts, page }` for a list, `{ profile | chapter | location, counts }` (plus
+  `content` beside it for a chapter `get`), `{ removed, counts }` for a removal
+  (`:3863-3913`) — so a story-tool write carries **no** `addedIds`/`changedIds`/`noopIds`, no
+  `storeRev`, no `oldestAvailableRev` and no feed keys at all. Confirming a write by id is a
+  `records` or `tasks` job, not a story-tool job, and the batch branch above that one
+  (`:3795-3860`) is why `tasks` keeps the receipts but drops the low-water keys unless a
+  `changes` array is present.
+- **`define` echoes the spec it accepted; `drop` answers with a marker.** `records
+  { define: {…} }` returns `{ entries: [], counts: { total: 0 }, page, storeRev, collection,
+  definition }` — `definition` is the VALIDATED spec, i.e. `readCollectionDefinition`'s result
+  with the engine defaults the caller omitted (`maxRecords`, `responseBudgetBytes`) filled in,
+  copied by `cloneDefinition` so a result never hands out the live definition object the
+  collection runs on (`src/core/records.ts:3426-3443`, key set and order pinned at
+  `src/core/records.test.ts:2926-2933`); `describe: true` returns the same `definition` beside
+  the collection's real `counts` and `storeRev` (`:3453-3461`). `records { collection,
+  drop: true }` returns `{ entries: [], counts: { total: 0 }, page, storeRev, collection,
+  dropped: true }` — one constant, always `true`, only on the success path, because an empty
+  page plus the name is byte-identical to what a READ of an empty collection answers and the
+  caller had to make a second call that then failed `unknown-collection` (`:3505-3527`, key set,
+  marker and counts pinned at `src/core/records.test.ts:2972-2982`). `dropped` is a success
+  marker, never a maybe: every
+  other outcome throws, and a second `drop` of the same name is the named refusal rather than a
+  second `true` (`src/core/records.test.ts:2984-2996`). Neither verb carries `oldestAvailableRev` or
+  `droppedEvents` — those literals are written out separately from the projected results
+  (`src/core/records.test.ts:3166-3181` covers the read, `src/harness.records.test.ts:639-655`
+  the `describe` answer, `:722-727` the bare-name `collections` list, whose `storeRev` is `0`
+  because no single collection is addressed).
+  Neither verb is reachable through `tasks`: its schema is `additionalProperties: false`
+  (`src/tools/runtime/tasks.tool.ts:180`), so a `define` beside `tasks`/`ids`/`remove` is
+  refused by the SCHEMA before the engine sees it (`must not include the additional property
+  "define".`, `src/harness.records.test.ts:739-746`), and `records` refuses `define` BESIDE a
+  `collection` — `records "define" registers a NEW collection, so it takes no "collection"
+  beside it.` (`src/core/records.ts:3946-3948`, pinned at `src/harness.records.test.ts:689-699`)
+  — while `{ define }` on its own stays the documented call, because `undefined` is absence,
+  not a sent collection.
+- **The store-full refusal sizes the job.** An over-cap call is refused BEFORE any id is
+  consumed, with the advice computed for THIS call: `tasks would hold 201 tasks; the maximum
+  is 200. Remove one before adding.`, and `Remove 2 more before adding.` at two over — the
+  count is `resulting - maxRecords` after the call's own `remove` list is netted off, so a
+  5-addition batch over `maxRecords: 3` is told the number that actually fits instead of being
+  told to delete one record and retry into the same wall four more times
+  (`src/core/records.ts:2013-2036`, pinned at `src/core/records.test.ts:867`, `:3034`, `:3047`,
+  `:3057`). The `store-full:` prefix and the two facts before the advice are unchanged.
 - **Partial update is atomic.** The tool validates into a patch object and then
   assigns; a later invalid field cannot leave earlier ones applied. An update that
   names no mutable field is an error, not a no-op. Blank `name`/`description`
@@ -1753,7 +1919,29 @@ drift from what the engine returns and adding a collection adds no validator.
   collection set — and `GET /sessions/{id}/records` answers both. A change row names the
   fields it touched (`fields: string[]`) and carries no values, so a consumer that wants
   the values re-reads; the `records.updated` stream event says only that one of those two
-  counters moved. The two live shell panels are the only consumers of that surface today,
+  counters moved. On that store-wide plane the gap signal stays a BOOLEAN:
+  `harness.recordsChanges(since)` answers `{ storeRev, collectionsRev, changes, reset,
+  oldestAvailableRev }` and `harness.records()` answers
+  `{ storeRev, collectionsRev, collections, changes }` — the snapshot has no gap to size,
+  because it hands over the WHOLE retained feed and its own `changes[0].seq` IS the floor
+  (`oldestAvailableRev` is declared optional on `RecordStoreView` precisely so an older host may
+  omit it, and this engine omits it — the answer's key set is exactly those four, pinned at
+  `src/core/records.test.ts:3366-3373`; the delta's
+  five keys — `droppedEvents` among them absent — are pinned at `:3349-3365`,
+  `src/types/index.ts:2004-2036`). `reset` answers one of three provable cases: `since >
+  storeRev` (the store rewound under this watermark — a `reset()` to 0), `since === storeRev`
+  (current, nothing to apply, NOT a reset), or `since < storeRev` with an empty window or a
+  window whose oldest event sits above `since + 1` (a real gap: trimmed, or a restore/restart
+  that cleared the feed) — `changesSince`, `src/core/records.ts:4143-4172`. The resume number is
+  `oldestAvailableRev`; how many events were lost is NOT published here, because
+  `droppedEvents` is a per-collection feed key and this plane kept its boolean (`Session
+  tasks`' change-feed bullet). Over REST the delta is a CLOSED object —
+  `{ session_id, revision, store_rev, collections_rev, changes, reset }` — and neither low-water
+  key crosses the wire in either form (`src/shared/harness-api.ts:2553-2607`, projection
+  `src/server/api-reads.ts:1040-1076`), so a browser that lost its position has exactly one
+  recovery: the snapshot read, which the live panel takes on `reset: true` and on a moved
+  `collections_rev` (`src/frontend/extensions/records-client.ts:865-876`).
+  The two live shell panels are the only consumers of that surface today,
   and only while their cards are open and the board is showing —
   see [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords).
 
@@ -1770,8 +1958,8 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 
 | Tool | Input | Result |
 |---|---|---|
-| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` — top-level `truncated` is the LISTING flag (some agent has more retained invocations than this view shows), NOT a text cut; see the listing bullet below |
-| `agentResult` | `{ agent, invocationId?, offset?, limit? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` — for a failed/cancelled run `content` is the paged partial answer and `error` (plus `cancelledAtMessage` when the run appended anything) comes with it; `status: 'empty'` with empty `content` only when NOTHING has finished for that agent to select (no completed AND no failed/cancelled record — an agent whose only finished runs failed selects the newest of those, per the selector bullet below) |
+| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` — plus `startedAt`/`ageMs` on a RUNNING row and nowhere else (see the age bullet below) — top-level `truncated` is the LISTING flag (some agent has more retained invocations than this view shows), NOT a text cut; see the listing bullet below |
+| `agentResult` | `{ agent, invocationId?, offset?, limit? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` — for a failed/cancelled run `content` is the paged partial answer and `error` (plus `cancelledAtMessage` when the run appended anything) comes with it; a RUNNING row answers `{ agent, invocationId, kind, status, content: '', contentLength: 0, offset: 0, limit, hasMore: false }` plus `startedAt`/`ageMs`, never a streamed partial; `status: 'empty'` with empty `content` only when NOTHING has finished for that agent to select (no completed AND no failed/cancelled record — an agent whose only finished runs failed selects the newest of those, per the selector bullet below) |
 
 - **Identity.** `invocationId` is the run id for a root run and the thread id for
   a delegated/ctx.run child; a fork/autoanswer uses its `branchId`. The harness
@@ -1835,6 +2023,46 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   record, which made a finished-earlier child look like it had said nothing).
   Live invocations are still reported by `agentManage`, and an explicit
   `invocationId` still reaches a running record.
+- **A RUNNING row says how long it has claimed to be running (DEFECT M1, 2026-11-17).** Both
+  doors project ONE absence-conditional pair, and only beside `status: 'running'`: `startedAt`
+  (epoch milliseconds, stamped on the ledger by `registerInvocation`, `src/harness.ts:4034-4060`,
+  REUSED from `RunState.startedAt` instead of re-reading the clock, so the live `ageMs` and the
+  terminal `durationMs` measure from one instant and can never disagree by the gap between two
+  clock reads) and `ageMs` (`max(0, Date.now() - startedAt)` computed at READ time by
+  `invocationAgeOf`, `:4126-4138` — which is what tells a poller a run that just started from one
+  that has claimed `running` for an hour). `agentManage` adds the pair to that row's preview
+  (`invocationPreviewOf`, `:4141-4160`) and `agentResult` adds it to the running envelope an
+  explicit `invocationId` reaches (`:4434-4458`), where `content: ''` / `contentLength: 0` stay
+  byte-for-byte as they were — the pair is age, not content, and a streamed partial is still
+  never presented as a result. Everywhere else the pair is ABSENT, and the absence is asserted BY
+  NAME at every door: a `completed`, `failed` or `cancelled` row and `agentResult`'s
+  `status: 'empty'` keep their exact pre-M1 key sets — the preview's own comment gives the reason
+  (`:4143-4147`: a failed or cancelled preview already reports a terminal row whose span is
+  `durationMs` on the full envelope, and adding the pair there would change a key set every listing
+  pin asserts byte-for-byte; a `completed` answer is simply over, and its envelope has no span key
+  at all) — and a row written by `archiveInvocation` (`:8114`) or by snapshot restore carries no
+  start stamp at all (`:14021-14023` projects TERMINAL records only, and the restore literal
+  rebuilds each row key by key with no `startedAt` among them, `:14422-14449`), so the pair is
+  absent there rather than `0` and absence reads as "unknown",
+  never as an age of zero. It is an AGE, not a heartbeat or a lease: nothing proves the run is
+  alive, `delegate` has no wall-clock bound by default (`DELEGATE_TIMEOUT_MS =
+  Number.POSITIVE_INFINITY`, `src/core/agent-limits.ts:62`) and retention never evicts a running
+  record — which is exactly why elapsed time is the fact these doors publish, and why the caller
+  decides whether to poll again or move on. `src/types/index.ts:1496-1512` states the same rule
+  beside `HarnessInvocationStatus`, because neither door publishes a typed envelope
+  (`agentManage: () => unknown`, `agentResult: (parameters) => unknown`), and it also fixes the
+  one place the pair cannot help: in lane/worker mode the canonical harness never sees a worker's
+  live runs, so age is the only liveness-adjacent fact at that boundary. The `delegate` door is
+  NOT that pair's door — `unfinishedDelegateEnvelopeOf` (`:4627-4665`) answers a released or
+  abandoned child with `status`, `invocationId` and `durationMs`
+  (`record.durationMs ?? max(0, Date.now() - startedAt)`, and that `startedAt` is the CALL's, not
+  a row's) beside `content` / `error` / `partialContent` / `cancelledAtMessage`, and grows
+  `startedAt`/`ageMs` nowhere: a released `delegate` describes a child that already settled, a
+  `running` agent-results row describes one that has not. Pinned: the pair on BOTH doors for one
+  run and recomputed when the clock moves (`src/harness.agent-results.test.ts:2586-2653`), the
+  exact running row of a parked run beside a key-free completed row of the SAME agent in one
+  listing (`:2810-2900`, where "the difference is exactly `status`"), and the absence demanded by
+  name on the failed, cancelled and empty envelopes (`:2695-2807`, via `expectNoAgeKeys`).
 - **A registered invocation always settles (2026-11-14, stress report #9).**
   `registerInvocation` files the record as `running`, and the ONLY code that makes it
   terminal is `commitRunTerminal` — on the success path and on the failure path of the

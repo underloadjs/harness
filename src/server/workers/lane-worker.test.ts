@@ -583,6 +583,11 @@ describe('worker mode: shared state is central, not local', () => {
         storeRev?: number;
         // R1/T1.1 — the one record a single-record call affected, when there is one.
         entry?: Record<string, unknown>;
+        // 0012 (R1) — and the per-CALL id receipt the `tasks` wrapper passes through for
+        // every id the call minted (src/core/records.ts:3358 → :3827). Like `entry` it is
+        // a property of the CALL, not of the stored page, so the re-read comparison below
+        // strips it the same way.
+        addedIds?: string[];
     };
 
     // `updatedAt` (and the change-feed `at`) is the coordinator's wall-clock instant,
@@ -634,7 +639,13 @@ describe('worker mode: shared state is central, not local', () => {
                 rev: 1,
                 updatedBy: 'general',
                 updatedAt: stampOf(added?.tasks?.[0])
-            }
+            },
+            // 0012 (R1) — the add receipt crosses the lane boundary with the rest of the
+            // answer: the write happens at the authority (../../lane-authority.ts
+            // `executeRecords`), which emits `addedIds` whenever the list is non-empty
+            // (src/core/records.ts:3358), so the lane caller names the minted id exactly
+            // as an in-process caller would. Same rule pinned in src/harness.records.test.ts.
+            addedIds: ['1']
         });
 
         const stamp = stampOf(added?.tasks?.[0]);
@@ -651,12 +662,17 @@ describe('worker mode: shared state is central, not local', () => {
         // the canonical store rather than restamping or re-adding anything.
         //
         // R1/T1.1 adds the ONE per-CALL key: `entry` names the record the ADD affected,
-        // and a plain read affects none, so the re-read carries no `entry`. Dropping that
-        // one key from the first answer keeps this an exact comparison of everything the
-        // STORE holds — record, counts, page and stamp — without hiding a difference.
+        // and a plain read affects none, so the re-read carries no `entry`.
+        //
+        // 0012 (R1) adds a second one: `addedIds` names the id the ADD minted, and it is
+        // just as much a property of the CALL — a plain read mints nothing, so the re-read
+        // carries no `addedIds` either. Dropping exactly those two per-call keys keeps this
+        // an exact comparison of everything the STORE holds — record, counts, page and
+        // stamp — without hiding a difference. Any other extra key still fails it.
         const addedPage: TaskPageShape = { ...added };
 
         delete addedPage.entry;
+        delete addedPage.addedIds;
         expect(reread).toEqual(addedPage);
 
         // A new worker really was created for the read (nothing survived the reclaim).

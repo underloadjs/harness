@@ -3940,6 +3940,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // when a fork started later but completed earlier. 0 while running; set
         // once on the terminal transition and persisted in snapshot v1.
         completedOrder: number;
+        // DEFECT M1 (2026-11-17): WHEN this invocation began, in epoch milliseconds.
+        //
+        // WHY IT EXISTS. The ledger had no start stamp at all: `durationMs` is computed only
+        // on the TERMINAL transition (below, from `run.startedAt`), so while a run is in
+        // flight every door answers `status: 'running'` with NO age fact. A `delegate` has no
+        // wall-clock bound by default (`DELEGATE_TIMEOUT_MS` is `+Infinity`, core/agent-limits.ts)
+        // and `pruneInvocationRecords` never evicts a running row, so a run that never settles
+        // keeps a `running` row forever and a caller cannot tell "started two seconds ago" from
+        // "stalled for an hour" — the symptom class the defect report described.
+        //
+        // OPTIONAL ON PURPOSE. Only `registerInvocation` writes it, so ONLY a live row can
+        // carry it: `archiveInvocation` refuses `running` (~:8049) and the snapshot restore
+        // (~:14423) rebuilds terminal rows only, so a row from either path has no start stamp
+        // and keeps its exact pre-M1 shape. Every reader therefore treats absence as "not
+        // observable" and omits the derived keys rather than inventing an age of 0.
+        startedAt?: number;
         agent: string;
         role: 'primary' | 'subagent';
         kind: AgentInvocationKind;
@@ -4027,6 +4043,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             status: 'running',
             content: '',
             completedOrder: 0,
+            // DEFECT M1: the start stamp, REUSED from the run instead of re-reading the clock.
+            // `RunState.startedAt` is stamped once when the run object is built (~:13624), so
+            // the live `ageMs` and the terminal `durationMs` measure from the SAME instant and
+            // can never disagree by the gap between these two lines. It also keeps a frozen or
+            // faked `Date` working: the value is whatever the clock read when the run started,
+            // which is exactly what a test that pins `vi.setSystemTime(EPOCH)` asserts.
+            startedAt: run.startedAt,
             ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
             // T28: the spawning tool call, so a delegation can find ITS child even
             // while a sibling delegation to the same agent is in flight.
@@ -4092,17 +4115,47 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         pruneInvocationRecords();
     };
 
+    // DEFECT M1 (2026-11-17) — THE TWO AGE FACTS A `running` ROW REPORTS.
+    //
+    // ONE function on purpose: `agentManage`'s preview row and `agentResult`'s envelope come
+    // from the SAME record in the SAME map, so the age has to be derived identically or the two
+    // doors could name different ages for one run. It is computed AT READ TIME (not stored),
+    // because a stored age would go stale the moment a caller polled again.
+    //
+    // WHY AGE AND NOT A LIVENESS FLAG. A read-time "is it still alive?" check would race the
+    // `finally` cleanup at the end of `runAgent`, and in lane/worker mode the canonical harness
+    // never sees the worker's `runs` at all, so there is no cross-boundary source for it. Age is
+    // the honest, boundary-free fact: it says how long this row has claimed to be running.
+    //
+    // Absent (`undefined`) when the record carries no start stamp — see the note on
+    // `AgentInvocationRecord.startedAt`: archived and restored rows are terminal by
+    // construction, and absence must read as "unknown", never as an age of 0.
+    const invocationAgeOf = (
+        record: AgentInvocationRecord
+    ): { startedAt: number; ageMs: number } | undefined =>
+        record.startedAt === undefined
+            ? undefined
+            : { startedAt: record.startedAt, ageMs: Math.max(0, Date.now() - record.startedAt) };
+
     // A preview is whitespace-trimmed answer text, capped at the declared size.
     // The ellipsis marks truncation explicitly; `truncated` is the machine flag.
     const invocationPreviewOf = (record: AgentInvocationRecord) => {
         if (record.status !== 'completed') {
+            // DEFECT M1: only a RUNNING row gains `startedAt`/`ageMs`. A failed or cancelled
+            // preview already reports a terminal row whose span is `durationMs` on the full
+            // envelope, and adding the pair there would change a key set every listing pin
+            // asserts byte-for-byte. Absence-conditional, like `durationMs`/`stopReason` on the
+            // `agentResult` failed branch.
+            const age = record.status === 'running' ? invocationAgeOf(record) : undefined;
+
             return {
                 invocationId: record.invocationId,
                 kind: record.kind,
                 status: record.status,
                 contentLength: 0,
                 preview: '',
-                truncated: false
+                truncated: false,
+                ...(age === undefined ? {} : age)
             };
         }
 
@@ -4381,13 +4434,27 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             if (record.status === 'running') {
                 // A run in flight has NO answer yet. Never return a streamed
                 // partial as if it were a completed result.
+                //
+                // DEFECT M1 (2026-11-17): it does however report HOW LONG it has been in
+                // flight. `startedAt` (epoch ms, from `registerInvocation`) and `ageMs`
+                // (read-time elapsed) are the ONLY additive keys here, and they are the only
+                // pair the door has — `durationMs` cannot exist on a row that has no end. That
+                // is the whole remedy for a row that stays `running` for a long time: `delegate`
+                // is unbounded by default (`DELEGATE_TIMEOUT_MS === +Infinity`) and retention
+                // never evicts a running row, so age is the fact that tells a caller whether to
+                // poll again or move on. `status` is unchanged verbatim (AC3), and the pair is
+                // absence-conditional like `durationMs`/`stopReason` on the failed branch below,
+                // so a record without a start stamp keeps its exact pre-M1 shape.
+                const age = invocationAgeOf(record);
+
                 return {
                     ...base,
                     content: '',
                     contentLength: 0,
                     offset: 0,
                     limit,
-                    hasMore: false
+                    hasMore: false,
+                    ...(age === undefined ? {} : age)
                 };
             }
 

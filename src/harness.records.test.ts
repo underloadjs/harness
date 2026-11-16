@@ -915,8 +915,12 @@ describe('a multi-record mutation names the ids it wrote (issue 0008)', () => {
             changedIds: ['1', '2']
         });
 
-        // One record still answers with `entry` alone — the M3 rule that keeps every
-        // affected-record key one stable type, now enforced for adds and patches too.
+        // One record still answers with `entry` — that half of the M3 rule is unchanged,
+        // because it is what lets an action wrapper answer `add`/`update` with one typed
+        // record. What 0012 (R1) reversed is the SUPPRESSION half: `entry` is a convenience
+        // for the single-record case, not a reason to withhold a list, so this patch names
+        // its id in `changedIds` too. Whole envelope, because the fix must not disturb
+        // anything beside the keys it added.
         const single = (await writer.executeTool('records', {
             collection: 'tasks',
             entries: [{ id: '1', text: 'Renamed' }],
@@ -924,12 +928,72 @@ describe('a multi-record mutation names the ids it wrote (issue 0008)', () => {
             limit: 1
         })) as Record<string, unknown>;
 
-        expect(single.changedIds).toBeUndefined();
-        expect(single.addedIds).toBeUndefined();
-        expect(single.entry).toEqual(taskRow('1', 'Renamed', 3, true));
+        expect(single).toEqual({
+            entries: [taskRow('1', 'Renamed', 3, true)],
+            counts: { total: 2, completed: 2, pending: 0 },
+            page: { offset: 0, limit: 1, hasMore: true, nextOffset: 1 },
+            storeRev: 5,
+            oldestAvailableRev: 1,
+            entry: taskRow('1', 'Renamed', 3, true),
+            changedIds: ['1']
+        });
     });
 
-    it('names the ids a `tasks` batch added or changed, and stays silent for one record', async () => {
+    // 0012 (AC1) at the un-wrapped door: ONE add plus ONE patch. This is the batch the old
+    // per-key "more than one" gate left with no id at all — `entry` needs exactly one
+    // affected record, and each list was still under its own bar — so the whole envelope is
+    // pinned, including the absence of `noopIds` (nothing here was a no-op).
+    it('0012: a `records` batch of one add plus one patch names both ids in the envelope', async () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+
+        await writer.executeTool('records', { collection: 'tasks', entries: [{ text: 'One' }] });
+
+        const mixed = (await writer.executeTool('records', {
+            collection: 'tasks',
+            entries: [{ text: 'Two' }, { id: '1', completed: true }],
+            expects: [{ id: '1', rev: 1 }],
+            limit: 1
+        })) as Record<string, unknown>;
+
+        expect(mixed).toEqual({
+            // The page is still the one row `limit` allowed, and that row cannot be the
+            // minted record — which is precisely why the receipts exist.
+            entries: [taskRow('1', 'One', 2, true)],
+            counts: { total: 2, completed: 1, pending: 1 },
+            page: { offset: 0, limit: 1, hasMore: true, nextOffset: 1 },
+            storeRev: 3,
+            oldestAvailableRev: 1,
+            changedIds: ['1'],
+            addedIds: ['2']
+        });
+    });
+
+    // 0012 (AC2) at the un-wrapped door: a patch that re-sends the stored value is a
+    // success that wrote nothing, and `noopIds` is the only place that fact appears.
+    it('0012: a `records` patch that re-sends the stored value names the id in `noopIds` only', async () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+
+        await writer.executeTool('records', { collection: 'tasks', entries: [{ text: 'One' }] });
+
+        const noop = (await writer.executeTool('records', {
+            collection: 'tasks',
+            entries: [{ id: '1', text: 'One' }],
+            expects: [{ id: '1', rev: 1 }],
+            limit: 1
+        })) as Record<string, unknown>;
+
+        expect(noop).toEqual({
+            entries: [taskRow('1', 'One', 1)],
+            counts: { total: 1, completed: 0, pending: 1 },
+            page: { offset: 0, limit: 1, hasMore: false },
+            // No event was recorded, so the store revision is exactly where the add left it.
+            storeRev: 1,
+            oldestAvailableRev: 1,
+            noopIds: ['1']
+        });
+    });
+
+    it('names the ids a `tasks` batch added or changed, and names a one-record batch too', async () => {
         const writer = quiet(brain(scripted([answer('unused')])));
 
         const twoAdds = (await writer.executeTool('tasks', {
@@ -972,9 +1036,12 @@ describe('a multi-record mutation names the ids it wrote (issue 0008)', () => {
             unknown
         >;
 
-        // Key ORDER included: the wrapper's envelope is pinned byte-for-byte elsewhere, and a
-        // one-record batch must not grow a list beside `entry`.
-        expect(Object.keys(oneAdd)).toEqual(['tasks', 'counts', 'page', 'storeRev', 'entry']);
+        // Key ORDER included: the wrapper's envelope is pinned byte-for-byte elsewhere, and
+        // 0012 (R1) appends the receipt AFTER `entry` — `toWrapperResult` assembles the batch
+        // envelope in this order, and a one-record batch now carries a one-element list
+        // beside the singular key instead of naming nothing.
+        expect(Object.keys(oneAdd)).toEqual(['tasks', 'counts', 'page', 'storeRev', 'entry', 'addedIds']);
+        expect(oneAdd.addedIds).toEqual(['3']);
         expect(oneAdd.entry).toEqual(taskRow('3', 'Three', 1));
     });
 });

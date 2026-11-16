@@ -107,6 +107,16 @@ const EPOCH_MS = Date.parse(EPOCH_ISO);
 // passed ONLY at the call sites whose command touched a single record; a plain read,
 // a multi-record call and a multi-record removal all omit them, which is what keeps
 // those pins the exact historical shape.
+//
+// 0012 (R1/R4) — the third conditional group: the ID RECEIPTS (`addedIds`, `changedIds`,
+// `noopIds`). The engine (src/core/records.ts:3358-3362) now emits each one whenever that
+// kind of write happened, AT ANY COUNT, and `toWrapperResult` passes them through
+// unchanged (:3827-3834), so a command that added one task answers `addedIds: ["1"]`
+// beside `entry` instead of nothing. A receipts object is passed ONLY at the sites whose
+// command did that kind of write — the read pins at `:476`/`:543` still omit all three,
+// which is the assertion that they are conditional. `removedIds` keeps its OWN rule
+// (two or more deletions, :3815), so the single `/task remove` at `:524` stays key-free.
+// Same rule pinned in src/harness.records.test.ts and src/harness.task.test.ts.
 const taskPage = (
     tasks: unknown[],
     total: number,
@@ -114,14 +124,18 @@ const taskPage = (
     pending: number,
     storeRev: number,
     entry?: unknown,
-    removed?: unknown
+    removed?: unknown,
+    receipts?: { addedIds?: string[]; changedIds?: string[]; noopIds?: string[] }
 ) => ({
     tasks,
     counts: { total, completed, pending },
     page: { offset: 0, limit: 20, hasMore: false },
     storeRev,
     ...(entry === undefined ? {} : { entry }),
-    ...(removed === undefined ? {} : { removed })
+    ...(removed === undefined ? {} : { removed }),
+    ...(receipts?.addedIds === undefined ? {} : { addedIds: receipts.addedIds }),
+    ...(receipts?.changedIds === undefined ? {} : { changedIds: receipts.changedIds }),
+    ...(receipts?.noopIds === undefined ? {} : { noopIds: receipts.noopIds })
 });
 
 // One stored record as the COMMAND door writes it. Attribution comes from the
@@ -482,9 +496,21 @@ describe('/task', () => {
         //
         // R1: exactly one record was created, so the same record also answers as
         // `entry` beside the page.
+        //
+        // 0012 (R1) — and the add receipt is unconditional at any count: the engine
+        // names every id it minted in `addedIds`, so this add names `1` as well.
         expect(await writer.executeCommand('/task add "testing"')).toEqual({
             content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
-            data: taskPage([record('1', 'testing', false, 1)], 1, 0, 1, 1, record('1', 'testing', false, 1))
+            data: taskPage(
+                [record('1', 'testing', false, 1)],
+                1,
+                0,
+                1,
+                1,
+                record('1', 'testing', false, 1),
+                undefined,
+                { addedIds: ['1'] }
+            )
         });
 
         // A later add joins the remaining tokens, and `/task` re-reads the list.
@@ -500,25 +526,33 @@ describe('/task', () => {
             // exactly one because one content field changed.
             //
             // R1: the flip affected exactly one record, so it is also `entry`.
+            //
+            // 0012 (R1) — the flip really wrote a field, so the patch receipt names that
+            // id in `changedIds` at any count (engine :3359; wrapper pass-through :3828).
             data: taskPage(
                 [record('1', 'testing', true, 2), record('2', 'fix the build', false, 1)],
                 2,
                 1,
                 1,
                 3,
-                record('1', 'testing', true, 2)
+                record('1', 'testing', true, 2),
+                undefined,
+                { changedIds: ['1'] }
             )
         });
         expect(await writer.executeCommand('/task reopen 1')).toEqual({
             content: '#1 [ ] testing\n#2 [ ] fix the build\n2 total, 0 completed, 2 pending\npage: offset 0, limit 20, showing 2',
             // R1: the reopen affected exactly one record, so it is also `entry`.
+            // 0012 (R1) — reopening wrote `completed`, so `changedIds` names it too.
             data: taskPage(
                 [record('1', 'testing', false, 3), record('2', 'fix the build', false, 1)],
                 2,
                 0,
                 2,
                 4,
-                record('1', 'testing', false, 3)
+                record('1', 'testing', false, 3),
+                undefined,
+                { changedIds: ['1'] }
             )
         });
         expect(await writer.executeCommand('/task remove 2')).toEqual({
@@ -526,6 +560,10 @@ describe('/task', () => {
             // T1.1 extension: the removal deleted exactly ONE record, so the deleted
             // body answers as `removed` (`entry` stays absent — a deletion affects no
             // record in `affected`).
+            // 0012 (R1) adds nothing here: `removedIds` fires only at TWO OR MORE
+            // deletions (engine :3815), and a deletion mints and patches nothing, so
+            // `addedIds`/`changedIds`/`noopIds` stay absent. This pin staying key-free
+            // is the counter-assertion to the receipt keys above.
             data: taskPage(
                 [record('1', 'testing', false, 3)],
                 1,

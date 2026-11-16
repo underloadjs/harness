@@ -860,8 +860,11 @@ describe('records engine — coded rejections (Decision O)', () => {
             RECORD_ERROR_CODES.storeFull
         );
 
+        // 0012 (R7) — the advice is count-aware now (see the new batch case below). At
+        // exactly one over the cap it stays singular and keeps the code prefix, so this
+        // single-add refusal is still told apart byte-for-byte.
         expect(full.message).toBe(
-            'store-full: tasks would hold 201 tasks; the maximum is 200. Remove one before adding another.'
+            'store-full: tasks would hold 201 tasks; the maximum is 200. Remove one before adding.'
         );
 
         // A rejected add never consumes an id (the profile store's stance, kept engine-wide).
@@ -2469,16 +2472,25 @@ describe('records engine — page-budget marker, bulk-removal ids, and the mutat
         expect(patched.counts).toEqual({ total: 3, completed: 2, pending: 1 });
     });
 
-    it('0008: one affected record answers with `entry`, and both lists stay absent', async () => {
+    // 0012 (R1) re-opened this case and reversed its second half. The old rule suppressed
+    // each list at a count of one, on the theory that `entry` already said everything; the
+    // consequence was that a batch of ONE ADD PLUS ONE PATCH named nothing at all (two
+    // affected records rule `entry` out, and each list was still under its own bar). The
+    // rule now is one key per kind of write, present whenever that kind happened, so a
+    // single-record batch carries a one-element list beside `entry` and a caller branches
+    // on which KEY is present rather than on a count. `entry` itself is unchanged: it is the
+    // one-record convenience the action wrappers depend on, not a suppression condition.
+    it('0012: one affected record answers with `entry` AND names that id in its list', async () => {
         const engine = createRecordEngine();
 
         const added = await tasks(engine, { tasks: [{ text: 'Solo' }], limit: 1 }, 'author');
 
         expect((added.entry as RecordEntry).id).toBe('1');
-        // The M3 rule: at exactly one affected record the singular key already says
-        // everything, so a list beside it would only restate it.
-        expect(added.addedIds).toBeUndefined();
+        // The list is present at one, naming exactly the id `entry` carries — and the
+        // sibling keys stay out because that kind of write did not happen at all.
+        expect(added.addedIds).toEqual(['1']);
         expect(added.changedIds).toBeUndefined();
+        expect(added.noopIds).toBeUndefined();
 
         const patched = await tasks(
             engine,
@@ -2487,7 +2499,9 @@ describe('records engine — page-budget marker, bulk-removal ids, and the mutat
         );
 
         expect((patched.entry as RecordEntry).rev).toBe(2);
-        expect(patched.changedIds).toBeUndefined();
+        expect(patched.changedIds).toEqual(['1']);
+        expect(patched.addedIds).toBeUndefined();
+        expect(patched.noopIds).toBeUndefined();
     });
 
     it('0008: a no-op patch batch is not a change, so it names no `changedIds`', async () => {
@@ -2514,17 +2528,15 @@ describe('records engine — page-budget marker, bulk-removal ids, and the mutat
         expect(untouched.storeRev).toBe(2);
     });
 
-    it('0008: the un-wrapped `records` surface answers with both lists, each on its own count', async () => {
+    it('0008: the un-wrapped `records` surface answers with each list on its own kind', async () => {
         const engine = createRecordEngine();
 
         await addTasks(engine, 3);
 
-        // Two patches AND one add in one call. `changedIds` names the two patches;
-        // `addedIds` stays ABSENT because one addition is under the rule's bar — each key
-        // follows the `removedIds` rule on its own count, which is what keeps every key one
-        // stable type. (The consequence for a one-add-plus-one-patch batch — no key at all,
-        // because `entry` needs the TOTAL to be one — is recorded in the issue's Update note
-        // rather than widened here.)
+        // Two patches AND one add in one call. 0012: each key follows ITS OWN KIND, not a
+        // count shared with the others, so `changedIds` names the two patches while
+        // `addedIds` names the single minted id — the case the old "more than one" gate left
+        // with no key at all (see the mixed-batch case below).
         const mixed = await run(
             engine,
             'records',
@@ -2541,7 +2553,8 @@ describe('records engine — page-budget marker, bulk-removal ids, and the mutat
         );
 
         expect(mixed.changedIds).toEqual(['1', '2']);
-        expect(mixed.addedIds).toBeUndefined();
+        expect(mixed.addedIds).toEqual(['4']);
+        expect(mixed.noopIds).toBeUndefined();
         expect(mixed.entry).toBeUndefined();
         // The `limit: 1` page cannot name the new record — the row it shows is id 1 — which
         // is exactly the shape a caller used to have to re-read for.
@@ -2639,6 +2652,435 @@ describe('records engine — page-budget marker, bulk-removal ids, and the mutat
 });
 
 // ---------------------------------------------------------------------------
+// 0012 (R1, R4-R7) — every id a batch touched, whatever the counts.
+//
+// The rule each case pins: ONE key per KIND of write, present whenever that kind happened,
+// at any count, independently of the others (`entry` included). The old gate was
+// "more than one per key", and its worst case is the first test below: one add plus one
+// patch has two affected records, so `entry` was out, and both lists were still under
+// their own bar — a batch that wrote two records named neither.
+//
+// Every expectation is derived from the documented apply order (patches, then removals,
+// then additions — the batch header in `executeCollection`) and from the ids the global
+// counter hands out (`addTasks` above mints 1..n in call order). Nothing here is a value
+// read back off the implementation.
+// ---------------------------------------------------------------------------
+describe('records engine — a batch names every id it touched, whatever the counts (0012)', () => {
+    // T12.1 (AC1) — the case the old rule could not express, on BOTH surfaces: the engine
+    // answers the caller that sent `collection`, and the `tasks` wrapper answers the caller
+    // that sent `tasks[]`. A batch of one add plus one patch must name BOTH ids.
+    it('T12.1: a batch of one add plus one patch names both ids, on the engine and on `tasks`', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 1);
+
+        const mixed = await run(
+            engine,
+            'records',
+            {
+                collection: 'tasks',
+                // Caller order: the ADD first, the PATCH second. The apply order is
+                // patches-then-additions, and each list keeps ITS OWN order (caller order
+                // for a patch, mint order for an addition), so the two never have to agree.
+                entries: [{ text: 'minted' }, { id: '1', completed: true }],
+                expects: [{ id: '1', rev: 1 }],
+                limit: 1
+            },
+            'author'
+        );
+
+        expect(mixed.addedIds).toEqual(['2']);
+        expect(mixed.changedIds).toEqual(['1']);
+        // Nothing else happened, so nothing else is named.
+        expect(mixed.noopIds).toBeUndefined();
+        expect(mixed.removed).toBeUndefined();
+        // Two affected records → no singular `entry`, exactly as before; the page is still
+        // the one row `limit` allowed, which cannot name the minted id.
+        expect(mixed.entry).toBeUndefined();
+        expect((mixed.entries as RecordEntry[]).map((entry) => entry.id)).toEqual(['1']);
+        expect(mixed.counts).toEqual({ total: 2, completed: 1, pending: 1 });
+        // One event for the patch, one for the mint, on top of the one `addTasks` wrote.
+        expect(mixed.storeRev).toBe(3);
+
+        // The wrapper half of AC1: the same shape through `tasks` rebuilds the envelope
+        // (`toWrapperResult`), so the lists have to ride it explicitly.
+        const wrapped = await tasks(
+            engine,
+            {
+                tasks: [{ text: 'minted again' }, { id: '2', completed: true }],
+                expects: [{ id: '2', rev: 1 }],
+                limit: 1
+            },
+            'author'
+        );
+
+        expect(wrapped.addedIds).toEqual(['3']);
+        expect(wrapped.changedIds).toEqual(['2']);
+        expect(wrapped.noopIds).toBeUndefined();
+        expect(wrapped.entry).toBeUndefined();
+        expect((wrapped.tasks as RecordEntry[]).map((entry) => entry.id)).toEqual(['1']);
+        expect(wrapped.counts).toEqual({ total: 3, completed: 2, pending: 1 });
+        expect(wrapped.storeRev).toBe(5);
+    });
+
+    // T12.2 — the lists are independent: two mints and one patch carry BOTH, each in its
+    // own order, and neither suppresses the other.
+    it('T12.2: two adds and one patch carry both lists, each in its own order', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 2);
+
+        const result = await run(
+            engine,
+            'records',
+            {
+                collection: 'tasks',
+                entries: [{ text: 'c' }, { text: 'd' }, { id: '2', completed: true }],
+                expects: [{ id: '2', rev: 1 }],
+                limit: 1
+            },
+            'author'
+        );
+
+        // Mint order = caller order (the global counter hands ids out in the order the
+        // batch named them, F3).
+        expect(result.addedIds).toEqual(['3', '4']);
+        expect(result.changedIds).toEqual(['2']);
+        expect(result.noopIds).toBeUndefined();
+        expect(result.entry).toBeUndefined();
+        expect(result.counts).toEqual({ total: 4, completed: 1, pending: 3 });
+        // 2 events from `addTasks`, then the patch and the two mints.
+        expect(result.storeRev).toBe(5);
+    });
+
+    // T12.3 — all three kinds in one call. The engine names a removal with the full copies
+    // in `removed` (`removedIds` is the wrapper's key, and it stays absent here); the
+    // wrapper names them with `removedIds` because its `removed` is singular-only.
+    it('T12.3: a batch that adds, patches and removes names all three kinds', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 4);
+
+        const result = await run(
+            engine,
+            'records',
+            {
+                collection: 'tasks',
+                entries: [{ text: 'minted' }, { id: '1', completed: true }],
+                remove: ['3', '4'],
+                expects: [
+                    { id: '1', rev: 1 },
+                    { id: '3', rev: 1 },
+                    { id: '4', rev: 1 }
+                ],
+                limit: 1
+            },
+            'author'
+        );
+
+        expect(result.addedIds).toEqual(['5']);
+        expect(result.changedIds).toEqual(['1']);
+        expect((result.removed as RecordEntry[]).map((entry) => entry.id)).toEqual(['3', '4']);
+        expect(result.removedIds).toBeUndefined();
+        expect(result.noopIds).toBeUndefined();
+        expect(result.entry).toBeUndefined();
+        // Removals apply BEFORE additions, and the new id continues the global counter —
+        // 3 and 4 are never re-used (F3).
+        expect((result.entries as RecordEntry[]).map((entry) => entry.id)).toEqual(['1']);
+        expect(result.counts).toEqual({ total: 3, completed: 1, pending: 2 });
+        // 4 events from `addTasks`, then this call's patch, two removals and mint.
+        expect(result.storeRev).toBe(8);
+
+        // The same call through the wrapper, on its own store so the ids are the same.
+        const second = createRecordEngine();
+
+        await addTasks(second, 4);
+
+        const wrapped = await tasks(
+            second,
+            {
+                tasks: [{ text: 'minted' }, { id: '1', completed: true }],
+                remove: ['3', '4'],
+                expects: [
+                    { id: '1', rev: 1 },
+                    { id: '3', rev: 1 },
+                    { id: '4', rev: 1 }
+                ],
+                limit: 1
+            },
+            'author'
+        );
+
+        expect(wrapped.addedIds).toEqual(['5']);
+        expect(wrapped.changedIds).toEqual(['1']);
+        expect(wrapped.removedIds).toEqual(['3', '4']);
+        // Two deletions: the singular `removed` stays out (its one-record rule is unchanged).
+        expect(wrapped.removed).toBeUndefined();
+        expect(wrapped.counts).toEqual({ total: 3, completed: 1, pending: 2 });
+    });
+
+    // T12.4 (AC2) — a patch that names a field and sends the stored value writes nothing:
+    // it is a SUCCESS, it moves no `rev`, it records no event, and it is named in `noopIds`
+    // and nowhere else. This is the `same → continue` route (`records.ts:3171` before this
+    // change) landing on the one gate that decides "wrote nothing".
+    it('T12.4: a patch that re-sends the stored value names its id in `noopIds` and moves nothing', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 2);
+
+        const untouched = await tasks(
+            engine,
+            { tasks: [{ id: '1', text: 'task 1' }], expects: [{ id: '1', rev: 1 }] },
+            'author'
+        );
+
+        expect(untouched.noopIds).toEqual(['1']);
+        // It is not in the other lists: `noopIds` and `changedIds` are disjoint by
+        // construction, so a caller never has to reconcile two answers about one id.
+        expect(untouched.changedIds).toBeUndefined();
+        expect(untouched.addedIds).toBeUndefined();
+        expect(untouched.entry).toBeUndefined();
+        // No `pushChange` ran, and it is the only writer of `storeRev`.
+        expect(untouched.storeRev).toBe(2);
+        expect((untouched.tasks as RecordEntry[]).map((task) => task.rev)).toEqual([1, 1]);
+        expect(untouched.counts).toEqual({ total: 2, completed: 0, pending: 2 });
+
+        // The feed says the same thing: nothing was recorded, so a poll from the watermark
+        // this call returned is empty and reports no loss.
+        const feed = await tasks(engine, { since: 2, limit: 1 });
+
+        expect(feed.changes).toEqual([]);
+        expect(feed.changesHasMore).toBe(false);
+        expect(feed.changesTruncated).toBe(false);
+        expect(feed.droppedEvents).toBe(0);
+    });
+
+    // T12.5 — the OTHER no-op shape the issue named (an entry that names an id and no
+    // field) never reaches the apply loop at all: `readEntryInput` refuses it, so
+    // `noopIds` can never be produced by a patch the caller did not actually write.
+    it('T12.5: an entry naming an id and no field is a refusal, so it cannot dilute `noopIds`', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 1);
+
+        const refusal = await expectCode(
+            tasks(engine, { tasks: [{ id: '1' }], expects: [{ id: '1', rev: 1 }] }, 'author'),
+            RECORD_ERROR_CODES.invalidField
+        );
+
+        expect(refusal.message).toBe(
+            'invalid-field: tasks "tasks[0]" names id "1" but sets no field; read it with "ids" instead.'
+        );
+        expect((await tasks(engine, { limit: 1 })).storeRev).toBe(1);
+    });
+
+    // T12.6 — one call, one real write and one no-op: each id appears in exactly one list,
+    // and the single REAL write still gets `entry` (the no-op is not an affected record, so
+    // `affected.length` is 1).
+    it('T12.6: a batch with one write and one no-op keeps the lists disjoint and `entry` on the write', async () => {
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 2);
+
+        const mixed = await tasks(
+            engine,
+            {
+                tasks: [{ id: '1', completed: true }, { id: '2', text: 'task 2' }],
+                expects: [
+                    { id: '1', rev: 1 },
+                    { id: '2', rev: 1 }
+                ],
+                limit: 1
+            },
+            'author'
+        );
+
+        expect(mixed.changedIds).toEqual(['1']);
+        expect(mixed.noopIds).toEqual(['2']);
+        expect(mixed.addedIds).toBeUndefined();
+        expect((mixed.entry as RecordEntry).id).toBe('1');
+        expect((mixed.entry as RecordEntry).rev).toBe(2);
+        expect(mixed.storeRev).toBe(3);
+        expect(mixed.counts).toEqual({ total: 2, completed: 1, pending: 1 });
+    });
+
+    // T12.7 (R5, AC4) — `define` answers with the spec it ACCEPTED, so the caps the
+    // collection was born with are readable without a `describe` round trip.
+    it('T12.7: `define` echoes the accepted definition, engine defaults included', async () => {
+        const engine = createRecordEngine();
+
+        const defined = await run(
+            engine,
+            'records',
+            {
+                define: {
+                    name: 'probeg12',
+                    fields: [{ key: 'body', type: 'text', required: true, maxLength: 500 }]
+                }
+            },
+            'author'
+        );
+
+        // Key set and order pinned: the echo is an addition to the existing envelope, not a
+        // reshaping of it.
+        expect(Object.keys(defined)).toEqual([
+            'entries',
+            'counts',
+            'page',
+            'storeRev',
+            'collection',
+            'definition'
+        ]);
+        // What the caller omitted is filled in here, and only here — this is the number the
+        // collection actually enforces.
+        expect(defined.definition).toEqual({
+            name: 'probeg12',
+            fields: [{ key: 'body', type: 'text', required: true, maxLength: 500 }],
+            maxRecords: 200,
+            responseBudgetBytes: 65536
+        });
+
+        // It is the SAME spec `describe` answers with, and it is a detached copy: widening a
+        // cap on the answer must not widen the live collection.
+        const described = await run(engine, 'records', { collection: 'probeg12', describe: true }, 'author');
+
+        expect(described.definition).toEqual(defined.definition);
+
+        ((defined.definition as Record<string, unknown>).fields as Record<string, unknown>[])[0].maxLength = 1;
+
+        const reread = await run(engine, 'records', { collection: 'probeg12', describe: true }, 'author');
+
+        expect(((reread.definition as Record<string, unknown>).fields as Record<string, unknown>[])[0].maxLength).toBe(
+            500
+        );
+    });
+
+    // T12.8 (R6, AC4) — the success marker. Without it a `drop` answer is byte-equal to a
+    // read of an empty collection, so the caller cannot tell the two apart from the result.
+    it('T12.8: `drop` echoes `dropped: true`, and the collection stays gone', async () => {
+        const engine = createRecordEngine();
+
+        await run(
+            engine,
+            'records',
+            { define: { name: 'probeg12', fields: [{ key: 'body', type: 'text' }] } },
+            'author'
+        );
+
+        const dropped = await run(engine, 'records', { collection: 'probeg12', drop: true }, 'author');
+
+        expect(Object.keys(dropped)).toEqual([
+            'entries',
+            'counts',
+            'page',
+            'storeRev',
+            'collection',
+            'dropped'
+        ]);
+        expect(dropped.dropped).toBe(true);
+        expect(dropped.collection).toBe('probeg12');
+        expect(dropped.counts).toEqual({ total: 0 });
+
+        // The marker is not a promise the engine can break: the name really is gone, and a
+        // second `drop` is the same named refusal rather than a second `dropped: true`.
+        const gone = await expectCode(
+            run(engine, 'records', { collection: 'probeg12' }, 'author'),
+            RECORD_ERROR_CODES.unknownCollection
+        );
+
+        expect(gone.message).toContain('records has no collection "probeg12"');
+
+        await expectCode(
+            run(engine, 'records', { collection: 'probeg12', drop: true }, 'author'),
+            RECORD_ERROR_CODES.unknownCollection
+        );
+
+        // And the name is re-`define`able, which is the state `dropped: true` describes.
+        const again = await run(
+            engine,
+            'records',
+            { define: { name: 'probeg12', fields: [{ key: 'body', type: 'text' }] } },
+            'author'
+        );
+
+        expect(again.collection).toBe('probeg12');
+        expect(again.dropped).toBeUndefined();
+    });
+
+    // T12.9 (R7, AC5) — the capacity advice counts the batch. The old sentence said
+    // "Remove one before adding another." for every over-cap call, so the documented fix
+    // failed again on each retry; `over = resulting - maxRecords` is the count that has to
+    // go, and the removals the same call sends are already netted off `resulting`.
+    it('T12.9: the store-full advice counts the batch, singular and plural', async () => {
+        const engine = createRecordEngine();
+        const body = (count: number) =>
+            Array.from({ length: count }, (_, index) => ({ body: `b${index + 1}` }));
+
+        await run(
+            engine,
+            'records',
+            { define: { name: 'tiny12', fields: [{ key: 'body', type: 'text' }], maxRecords: 3 } },
+            'author'
+        );
+
+        // The issue's case: FIVE adds onto a 3-record cap. Five cannot fit, and the advice
+        // says how many must go — 2, because 5 - 3 is the overhang.
+        const fiveOntoEmpty = await expectCode(
+            run(engine, 'records', { collection: 'tiny12', entries: body(5) }, 'author'),
+            RECORD_ERROR_CODES.storeFull
+        );
+
+        expect(fiveOntoEmpty.message).toBe(
+            'store-full: tiny12 would hold 5 tiny12; the maximum is 3. Remove 2 more before adding.'
+        );
+
+        // At the cap already, five more adds means five have to go — the count the issue
+        // names, and never "one".
+        await run(engine, 'records', { collection: 'tiny12', entries: body(3) }, 'author');
+
+        const fiveOntoCap = await expectCode(
+            run(engine, 'records', { collection: 'tiny12', entries: body(5) }, 'author'),
+            RECORD_ERROR_CODES.storeFull
+        );
+
+        expect(fiveOntoCap.message).toBe(
+            'store-full: tiny12 would hold 8 tiny12; the maximum is 3. Remove 5 more before adding.'
+        );
+
+        // Singular stays singular, and keeps the wording the single-add refusal is pinned to.
+        const single = await expectCode(
+            run(engine, 'records', { collection: 'tiny12', entries: body(1) }, 'author'),
+            RECORD_ERROR_CODES.storeFull
+        );
+
+        expect(single.message).toBe(
+            'store-full: tiny12 would hold 4 tiny12; the maximum is 3. Remove one before adding.'
+        );
+
+        // The removals in the same call ARE netted off: 3 held - 1 removed + 5 added = 7,
+        // so the advice counts 4 and not 5.
+        const netted = await expectCode(
+            run(
+                engine,
+                'records',
+                {
+                    collection: 'tiny12',
+                    entries: body(5),
+                    remove: ['1'],
+                    expects: [{ id: '1', rev: 1 }]
+                },
+                'author'
+            ),
+            RECORD_ERROR_CODES.storeFull
+        );
+
+        expect(netted.message).toBe(
+            'store-full: tiny12 would hold 7 tiny12; the maximum is 3. Remove 4 more before adding.'
+        );
+    });
+});
+
+// ---------------------------------------------------------------------------
 // 0011 — the floor watermark of a collection's retained change window.
 //
 // `changesTruncated` told a poller THAT it had lost events and never WHERE the retained
@@ -2731,14 +3173,204 @@ describe('records engine — the change feed names its floor (0011)', () => {
         // Proposal step 1 also covers a plain read of a collection, where the key costs one
         // integer and tells a cold reader where its `since` may start.
         expect(read.oldestAvailableRev).toBe(1);
-        // It is not a feed: `changes` still requires `since`.
+        // It is not a feed: `changes` still requires `since`, and so does 0012's
+        // `droppedEvents` — the gap size is a statement about a feed that is not here.
         expect(read.changes).toBeUndefined();
+        expect(read.droppedEvents).toBeUndefined();
+        // A receipt key never rides a read either.
+        expect(read.noopIds).toBeUndefined();
 
         // The batch wrapper's historical page envelope is pinned elsewhere byte-for-byte, so
         // the floor rides the wrapper only beside `changes` (`toWrapperResult`).
         const wrapper = await tasks(engine, {});
 
         expect(wrapper.oldestAvailableRev).toBeUndefined();
+        expect(wrapper.droppedEvents).toBeUndefined();
         expect(Object.keys(wrapper).sort()).toEqual(['counts', 'page', 'storeRev', 'tasks']);
+    });
+
+    // T12.10 (AC3) — the byte budget, not the entry cap, cutting the feed. This is the case
+    // `changesHasMore` alone cannot diagnose: it says "more exist" for BOTH a reader that
+    // lost events and one that was simply handed 50 of them. Here nothing is lost — the
+    // window still holds every event since `since` — and `droppedEvents: 0` is what says so.
+    it('0012: a byte-budget feed cut says `more to read` with zero loss', async () => {
+        const engine = createRecordEngine();
+
+        await run(
+            engine,
+            'records',
+            {
+                define: {
+                    name: 'feeds12',
+                    fields: [{ key: 'text', type: 'text', required: true }],
+                    responseBudgetBytes: 1024
+                }
+            }
+        );
+
+        // 20 events, and the smallest budget `define` admits, so the feed cannot fit.
+        await run(engine, 'records', {
+            collection: 'feeds12',
+            entries: Array.from({ length: 20 }, (_, index) => ({ text: `f${index + 1}` }))
+        });
+
+        const feed = await run(engine, 'records', { collection: 'feeds12', since: 0, limit: 1 });
+
+        expect(feed.storeRev).toBe(20);
+        expect(feed.oldestAvailableRev).toBe(1);
+        // 11 of 20 events fit the budget after the page was counted (an identity-less change
+        // entry is 73 bytes serialized), and 20 is well under the 50-entry cap
+        // (`RECORD_MAX_CHANGES_IN_RESULT`), so the short feed here can ONLY be the budget.
+        expect((feed.changes as RecordChange[]).map((change) => change.rev)).toEqual(
+            Array.from({ length: 11 }, (_, index) => 1 + index)
+        );
+        expect(feed.changesHasMore).toBe(true);
+        // The whole point of the pair: more to read, and nothing lost.
+        expect(feed.changesTruncated).toBe(false);
+        expect(feed.droppedEvents).toBe(0);
+        // The page itself still fits, so the budget marker stays off the page.
+        expect(feed.page).toEqual({ offset: 0, limit: 1, hasMore: true, nextOffset: 1 });
+    });
+
+    // T12.11 (AC3) — the count itself, at every watermark shape that exists on a trimmed
+    // window: fully behind it, one event behind, exactly at the boundary, inside it, and at
+    // the watermark itself. All five are `max(0, oldestAvailableRev - since - 1)`, i.e. the
+    // events between `since` and the floor, and `records.test.ts`'s at-floor case pins the
+    // off-by-one: `since = floor - 1` loses nothing.
+    it('0012: `droppedEvents` is exactly the events below the floor, at every watermark', async () => {
+        const engine = createRecordEngine();
+
+        await fillThreeHundredEvents(engine);
+
+        // 300 events, a 200-window, so revs 1..100 are gone: behind the floor by exactly 100.
+        const behind = await tasks(engine, { since: 0, limit: 1 });
+
+        expect(behind.oldestAvailableRev).toBe(101);
+        expect(behind.droppedEvents).toBe(100);
+        expect(behind.changesTruncated).toBe(true);
+
+        // One event behind: the count moves by one, it does not snap to a boolean.
+        expect((await tasks(engine, { since: 99, limit: 1 })).droppedEvents).toBe(1);
+
+        // `since = floor - 1` — the reader resumes exactly where the log starts: zero.
+        const atFloor = await tasks(engine, { since: 100, limit: 1 });
+
+        expect(atFloor.droppedEvents).toBe(0);
+        expect(atFloor.changesTruncated).toBe(false);
+        expect((atFloor.changes as RecordChange[])[0].rev).toBe(101);
+
+        // Inside the window and at the watermark: nothing was ever lost.
+        expect((await tasks(engine, { since: 101, limit: 1 })).droppedEvents).toBe(0);
+        expect((await tasks(engine, { since: 150, limit: 1 })).droppedEvents).toBe(0);
+
+        const current = await tasks(engine, { since: 300, limit: 1 });
+
+        expect(current.changes).toEqual([]);
+        expect(current.changesHasMore).toBe(false);
+        expect(current.droppedEvents).toBe(0);
+
+        // Through the `tasks` wrapper the key rides the feed and nothing else (AC3): the
+        // whole envelope, because the wrapper rebuilds it key by key.
+        expect(behind.droppedEvents).toBe(100);
+        expect(Object.keys(behind).sort()).toEqual([
+            'changes',
+            'changesHasMore',
+            'changesTruncated',
+            'counts',
+            'droppedEvents',
+            'oldestAvailableRev',
+            'page',
+            'storeRev',
+            'tasks'
+        ]);
+    });
+
+    // T12.12 (AC3) — the two empty-window shapes. Both compute the floor as `storeRev + 1`
+    // (`windowFloor`), and both therefore report zero loss: a reader at the watermark is
+    // current, and a reader below a re-`define`'s epoch floor is refused outright
+    // (`revision-epoch-reset`) rather than being handed a made-up gap.
+    it('0012: an empty window reports zero loss, fresh or after a re-`define`', async () => {
+        const engine = createRecordEngine();
+
+        const idle = await tasks(engine, { since: 0, limit: 1 });
+
+        expect(idle.changes).toEqual([]);
+        expect(idle.oldestAvailableRev).toBe(1);
+        expect(idle.droppedEvents).toBe(0);
+
+        // 2 events, then a drop + re-`define` of a DEFINED name: the new window is empty
+        // while `storeRev` carries the old epoch's high-water mark, so the floor is
+        // `storeRev + 1`. (`tasks` cannot be dropped — it is a built-in and permanent.)
+        const notes = createRecordEngine();
+
+        await run(
+            notes,
+            'records',
+            { define: { name: 'epoch12', fields: [{ key: 'body', type: 'text' }] } },
+            'author'
+        );
+        await run(notes, 'records', { collection: 'epoch12', entries: [{ body: 'one' }] }, 'author');
+        await run(
+            notes,
+            'records',
+            { collection: 'epoch12', remove: ['1'], expects: [{ id: '1', rev: 1 }] },
+            'author'
+        );
+        const dropped = await run(notes, 'records', { collection: 'epoch12', drop: true }, 'author');
+
+        expect(dropped.dropped).toBe(true);
+
+        const redefined = await run(
+            notes,
+            'records',
+            { define: { name: 'epoch12', fields: [{ key: 'body', type: 'text' }] } },
+            'author'
+        );
+
+        expect(redefined.storeRev).toBe(3);
+
+        const epoch = await run(notes, 'records', { collection: 'epoch12', since: 3, limit: 1 });
+
+        expect(epoch.changes).toEqual([]);
+        expect(epoch.oldestAvailableRev).toBe(4);
+        expect(epoch.droppedEvents).toBe(0);
+        expect(epoch.changesTruncated).toBe(false);
+
+        // Anything below the epoch floor is a named refusal, not a fabricated count.
+        await expectCode(
+            run(notes, 'records', { collection: 'epoch12', since: 0, limit: 1 }, 'author'),
+            RECORD_ERROR_CODES.revisionEpochReset
+        );
+    });
+
+    // T12.13 (AC3) — the key stops at the per-collection feed. The store-wide observation
+    // plane keeps its boolean `reset` and its `oldestAvailableRev`, and grows nothing: the
+    // REST delta and the swagger stay as published.
+    it('0012: `droppedEvents` never reaches the store-wide plane', async () => {
+        const engine = createRecordEngine();
+
+        await tasks(engine, { tasks: [{ text: 'one' }] }, 'author');
+
+        const delta = engine.changesSince(0);
+
+        expect(delta.reset).toBe(false);
+        expect(delta.oldestAvailableRev).toBe(1);
+        expect(Object.keys(delta).sort()).toEqual([
+            'changes',
+            'collectionsRev',
+            'oldestAvailableRev',
+            'reset',
+            'storeRev'
+        ]);
+
+        const snapshot = engine.view();
+
+        expect('droppedEvents' in snapshot).toBe(false);
+        expect(Object.keys(snapshot).sort()).toEqual([
+            'changes',
+            'collections',
+            'collectionsRev',
+            'storeRev'
+        ]);
     });
 });

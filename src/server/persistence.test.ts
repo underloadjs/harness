@@ -387,18 +387,29 @@ afterEach(() => {
 // R1/T1.1 — `entry` is optional and is passed ONLY where the call affected exactly one
 // record (src/core/records.ts:2857); reads and multi-record calls keep the page-only
 // shape, so the pins that omit it stay byte-exact.
+//
+// 0012 (R1/R4) — the third conditional group: the ID RECEIPTS (`addedIds`, `changedIds`,
+// `noopIds`), emitted by the engine (src/core/records.ts:3358-3362) whenever that kind of
+// write happened, AT ANY COUNT, and passed through by the `tasks` wrapper (:3827-3834). A
+// receipts object is passed ONLY at the sites whose call did that kind of write, so every
+// read pin here still omits all three — the assertion that they are conditional. Same rule
+// pinned in src/harness.records.test.ts and src/harness.task.test.ts.
 const taskPage = (
     tasks: TaskItem[],
     total: number,
     completed: number,
     storeRev: number,
-    entry?: TaskItem
+    entry?: TaskItem,
+    receipts?: { addedIds?: string[]; changedIds?: string[]; noopIds?: string[] }
 ) => ({
     tasks,
     counts: { total, completed, pending: total - completed },
     page: { offset: 0, limit: 20, hasMore: false },
     storeRev,
-    ...(entry === undefined ? {} : { entry })
+    ...(entry === undefined ? {} : { entry }),
+    ...(receipts?.addedIds === undefined ? {} : { addedIds: receipts.addedIds }),
+    ...(receipts?.changedIds === undefined ? {} : { changedIds: receipts.changedIds }),
+    ...(receipts?.noopIds === undefined ? {} : { noopIds: receipts.noopIds })
 });
 
 // One persisted record. `store.callTool` runs `harness.executeTool`, which hands the
@@ -473,7 +484,12 @@ describe('R3b durable harness database', () => {
             storeRev: 1,
             // R1/T1.1 — the call created exactly ONE record, so it also answers with
             // that record as `entry`; the snapshot below has to carry it back too.
-            entry: taskItem('1', 'one', 'keep me', { at: EPOCH_ISO })
+            entry: taskItem('1', 'one', 'keep me', { at: EPOCH_ISO }),
+            // 0012 (R1) — the add receipt is unconditional at any count: the engine
+            // (src/core/records.ts:3358) emits `addedIds` whenever the list is non-empty
+            // and the `tasks` wrapper passes it through (:3827), so a persisted one-record
+            // add names the id it minted. Same rule pinned in src/harness.records.test.ts.
+            addedIds: ['1']
         });
         expect(
             await first.store.callTool(id, 'toolCreate', {
@@ -521,7 +537,11 @@ describe('R3b durable harness database', () => {
                 2,
                 // R1/T1.1 — the guarded patch affected exactly ONE record, so it also
                 // answers with that record (the state it was patched INTO).
-                taskItem('1', 'one', 'keep me', { completed: true, rev: 2, at: EPOCH_ISO })
+                taskItem('1', 'one', 'keep me', { completed: true, rev: 2, at: EPOCH_ISO }),
+                // 0012 (R1) — the patch wrote `completed`, so the receipt names that id
+                // in `changedIds` at any count (engine :3359, wrapper pass-through :3828).
+                // The read pins below stay receipt-free.
+                { changedIds: ['1'] }
             )
         );
 
@@ -1635,12 +1655,15 @@ describe('R3b durable harness database', () => {
         // live per-agent model map and its own settings model.
         expect(await first.store.callTool(doomed.id, 'tasks', { tasks: [{ text: 'delete me too' }] })).toEqual(
             // R1/T1.1 — one record was created, so the same record answers as `entry`.
+            // 0012 (R1) — and the add receipt fires at any count, so the id it minted is
+            // named in `addedIds` (engine :3358, wrapper :3827).
             taskPage(
                 [taskItem('1', 'two', 'delete me too', { at: EPOCH_ISO })],
                 1,
                 0,
                 1,
-                taskItem('1', 'two', 'delete me too', { at: EPOCH_ISO })
+                taskItem('1', 'two', 'delete me too', { at: EPOCH_ISO }),
+                { addedIds: ['1'] }
             )
         );
         expect((await first.store.setAgentModels(doomed.id, { two: 'next/model' })).agentModels).toEqual({

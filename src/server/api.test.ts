@@ -3586,7 +3586,13 @@ describe('manual tool execution', () => {
                     rev: 1,
                     updatedBy: 'general',
                     updatedAt: expect.any(String)
-                }
+                },
+                // 0012 (R1) — the add receipt is unconditional at any count: the engine
+                // (src/core/records.ts) emits `addedIds` whenever the list is non-empty,
+                // so this one-record POST names the id it minted beside `entry`. The
+                // execution route is a plain tool call, so it gets the same envelope an
+                // agent turn does — same rule pinned in src/harness.records.test.ts.
+                addedIds: ['1']
             },
             duration_ms: expect.any(Number)
         });

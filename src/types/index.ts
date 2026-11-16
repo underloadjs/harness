@@ -1492,6 +1492,23 @@ export type HarnessDelegationResult = {
 
 // Terminal (or in-flight) state of one agent invocation. The same vocabulary
 // agentManage/agentResult report, exported so a host can switch on it.
+//
+// DEFECT M1 (2026-11-17) — THE KEYS THAT SIT BESIDE `'running'`. Neither door publishes a
+// typed envelope (`HarnessToolRuntime.agentManage: () => unknown` and
+// `HarnessToolRuntime.agentResult: (parameters) => unknown`, in this file above), so this is
+// the documented shape at the shared vocabulary both
+// of them report from. A row whose `status` is `'running'` carries, and only then:
+//   - `startedAt` — epoch milliseconds, stamped on the ledger by `registerInvocation` from
+//     `RunState.startedAt`, so it names the instant the run began, not the instant it was read;
+//   - `ageMs` — `max(0, now - startedAt)` computed at READ time, so a poller can tell a run
+//     that just started from one that has claimed `running` for an hour. `delegate` has no
+//     wall-clock bound by default (`DELEGATE_TIMEOUT_MS === +Infinity`) and retention never
+//     evicts a running row, so age is the only liveness-adjacent fact available at any
+//     boundary: in lane/worker mode the canonical harness never sees the worker's live runs.
+// Every NON-running envelope — `completed`, `failed`, `cancelled`, and `agentResult`'s
+// `status: 'empty'` — keeps its exact pre-M1 key set, and a row written by `archiveInvocation`
+// or by snapshot restore has no start stamp at all (both are terminal by construction), so the
+// pair is absent rather than `0` there.
 export type HarnessInvocationStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
 // ---------------------------------------------------------------------------
@@ -1992,9 +2009,19 @@ export type RecordStoreView = {
     changes: RecordStoreChange[];
     // 0011 — the FLOOR of that retained feed: the store revision the oldest returned
     // event carries. A client that bootstraps here and then polls
-    // `recordsChanges(lastRev)` needs the number to know whether its first `since` can
-    // be answered at all; the engine emits it (src/core/records.ts `view()`). Optional
-    // because a projection built by an older host may omit it.
+    // `recordsChanges(lastRev)` needs the number to know whether its first `since` can be
+    // answered at all — but NOT from this envelope. The key is declared and never populated
+    // here: the engine's `view()` (src/core/records.ts) returns `storeRev`, `collectionsRev`,
+    // `collections` and `changes` and nothing else, `Harness.records` (below) is a
+    // pass-through of that call, and the REST projection (src/server/api-reads.ts
+    // `recordsSnapshotOf`) maps no floor either, so a reader must treat it as ABSENT on this
+    // surface. Where the engine DOES emit it: `project()` (src/core/records.ts) sets it on
+    // every per-collection result — that is `RecordsResult.oldestAvailableRev?` below — and
+    // `toWrapperResult()` re-spells it onto a wrapper envelope ONLY beside `changes`;
+    // `changesSince()` (src/core/records.ts) sets it on every store-wide delta — that is
+    // `RecordStoreDelta.oldestAvailableRev?` below. Optional because the engine's own `view()`
+    // object omits the key — declaring it required would not compile — so nothing here may be
+    // read as a promise that a `records()` response carries it.
     oldestAvailableRev?: number;
 };
 
@@ -2039,7 +2066,7 @@ export type RecordCounts = Record<string, number>;
 // THE engine result — ONE shape for every success (Decision D): the page, the
 // counts, the cursor, the collection's store revision, and (when the call is a
 // single-id read or a one-record mutation) `entry`. `removed` names the records
-// this call deleted. The three change keys appear only when the call passed
+// this call deleted. The four change keys appear only when the call passed
 // `since`. `storeRev` lets a caller poll `since: storeRev` next time and get only
 // what it missed.
 export type RecordsResult = {
@@ -2055,12 +2082,15 @@ export type RecordsResult = {
     // `define`/`drop` only: the collection this call registered or removed.
     collection?: string;
     // 0008 — the ids a batch MINTED, in mint order, and the ids it REALLY changed (a
-    // no-op patch counts as nothing, exactly as it counts as nothing for `entry` and in
-    // the change log), in caller order. Emitted only when the call affected MORE THAN
-    // ONE record: at exactly one, `entry` already names the record. Before these keys a
-    // multi-record batch capped by `limit` answered with a survivor page and nothing that
-    // named what it had just written, so a caller could not confirm its own write without
-    // re-reading the list.
+    // no-op patch counts as nothing here, exactly as it counts as nothing for `entry`
+    // and in the change log), in caller order. 0012 relaxed the gate: each key is
+    // present whenever ITS OWN LIST IS NON-EMPTY, at any count, and independently of
+    // the other two. Before that, a batch of one add plus one patch answered with
+    // NEITHER list — `entry` needs exactly one affected record, so two ruled it out,
+    // and each list was still under its "more than one" bar — which is the case that
+    // left a caller unable to confirm its own write. Before 0008 there were no id
+    // lists at all, so a multi-record batch capped by `limit` answered with a survivor
+    // page and nothing that named what it had just written.
     //
     // The engine has emitted both since 0008 (src/core/records.ts `executeCollection`,
     // mirrored by the tasks wrapper at `toWrapperResult`); they lived in the engine's own
@@ -2068,19 +2098,45 @@ export type RecordsResult = {
     // consumer read them off the published result.
     addedIds?: string[];
     changedIds?: string[];
+    // 0012 — the ids whose PATCH WAS A NO-OP: the entry named the record and wrote
+    // nothing, either because every field it named already held that value or because it
+    // named no field at all. Such a call is a SUCCESS with no rev bump and no change
+    // event, so before this key a caller could not tell "my patch landed" from "my patch
+    // changed nothing" without re-reading `rev`. Present whenever the list is non-empty,
+    // on the same never-count-dependent rule as the two above, and disjoint from them:
+    // an id is in `changedIds` or in `noopIds`, never both.
+    noopIds?: string[];
     // 0011 — the floor of THIS collection's retained change window: the oldest revision
     // `changes` can still show. It rides the feed, so it appears when `since` asked for
     // changes (and on a plain read of one collection, which reports its own window).
     // `changesTruncated`/`changesHasMore` tell a poller it lost events; this tells it
     // where it can resume.
     oldestAvailableRev?: number;
-    // R6/T6.1 — `describe: true` only: the collection's OWN definition, verbatim from
-    // the stored spec (fields with `key`, `type`, `required`, `maxLength`, `maxItems`,
-    // `values`, `max`, `default`, `getOnly`, `sortable`, `count`, plus `maxRecords` and
-    // `responseBudgetBytes`). The read surface had no way to ask what a collection
-    // accepts, which cost a live session four failed `define` calls discovering the
-    // accepted `count` shapes.
+    // 0012 — HOW MANY events between `since` and `oldestAvailableRev` are gone for good
+    // (`max(0, oldestAvailableRev - since - 1)`), so a reader can report "100 events
+    // behind, resuming at 101" without knowing the 200-event window out of band. Present
+    // ONLY beside `changes` — outside a feed there is no gap to size — and it is the
+    // disclosure that stands in for a separate truncation field: `droppedEvents` plus
+    // `oldestAvailableRev` answers both halves of "what did I lose, and where do I pick
+    // up". Note `changesHasMore` is a different flag (the page was cut by the entry cap
+    // or the byte budget, which loses nothing) and `changesTruncated` is the boolean form
+    // of this one. The store-wide plane (`RecordStoreDelta`) keeps its boolean `reset`
+    // and does not carry this key.
+    droppedEvents?: number;
+    // R6/T6.1 — `describe: true`, and since 0012 also `define`: the collection's OWN
+    // definition, verbatim from the stored spec (fields with `key`, `type`, `required`,
+    // `maxLength`, `maxItems`, `values`, `max`, `default`, `getOnly`, `sortable`, `count`,
+    // plus `maxRecords` and `responseBudgetBytes`). The read surface had no way to ask
+    // what a collection accepts, which cost a live session four failed `define` calls
+    // discovering the accepted `count` shapes. On a `define` answer it is the spec the
+    // engine ACCEPTED — the validated spec, with the engine defaults the caller omitted
+    // filled in — so the caps a collection was just born with are readable at birth.
     definition?: RecordCollectionDefinition;
+    // 0012 — `drop` only: the marker that the collection is gone. `drop` used to answer
+    // with an empty page plus the name, byte-identical to a read of an EMPTY collection,
+    // so the result alone could not distinguish "dropped" from "still there, empty".
+    // Always `true` on success; the refusals (permanent collection, non-empty) throw.
+    dropped?: true;
     // R6/T6.2 — a `records` call with NO `collection` only: every registered collection
     // name, sorted. The name list used to be reachable only by TRIGGERING the
     // `unknown-collection` refusal.
@@ -2259,15 +2315,23 @@ export type TaskResult = Omit<RecordsResult, 'entries' | 'counts' | 'removed'> &
     // where `removed` already names the record and its body.
     removedIds?: string[];
     // INHERITED from `RecordsResult` through the `Omit`, but worth spelling out because
-    // the `batch` wrapper projects these three itself (`toWrapperResult`,
-    // src/core/records.ts:3711-3735) rather than passing the engine result through:
+    // the `batch` wrapper projects these five itself (`toWrapperResult`,
+    // src/core/records.ts:3711-3745) rather than passing the engine result through:
     //   - `addedIds` / `changedIds` ride through UNCHANGED (0008) — a
     //     `tasks {"tasks":[a,b], "limit":1}` answer names the ids it minted instead of
-    //     only a survivor page;
-    //   - `oldestAvailableRev` (0011) is copied ONLY when the response carries `changes`,
-    //     because the number is the floor OF THE FEED and a wrapper read has no feed to
-    //     bound. A truncated feed without it says "you lost events" and nothing about
-    //     where to resume.
+    //     only a survivor page. Since 0012 the engine emits each list whenever it is
+    //     NON-EMPTY, at any count, so a batch of one add plus one patch names BOTH ids
+    //     (it used to name neither: `entry` needs exactly one affected record and each
+    //     list had its own "more than one" bar);
+    //   - `noopIds` (0012) rides through the same way, and the wrapper has to re-spell it
+    //     explicitly or `tasks` swallows it — this branch rebuilds the envelope key by
+    //     key. It names every task whose patch wrote nothing, so `tasks
+    //     {"tasks":[{ id, text }], ...}` that re-sent the stored text says so instead of
+    //     looking like a write;
+    //   - `oldestAvailableRev` (0011) and `droppedEvents` (0012) are copied ONLY when the
+    //     response carries `changes`, because both are statements ABOUT THE FEED and a
+    //     wrapper read has no feed. A truncated feed without them says "you lost events"
+    //     and nothing about where to resume or how many were lost.
 };
 
 // The shared CRUD action set is declared above with the engine types.

@@ -1676,9 +1676,16 @@ describe('SessionStore manual tool calls', () => {
         // R1/T1.1 — this add affected exactly ONE record, so that record also answers
         // as `entry`. `onlyMine` itself stays the page-only shape, because the plain
         // re-reads below (which touch no record) must NOT carry it.
+        //
+        // 0012 (R1) — the add receipt is unconditional at any count: the engine
+        // (src/core/records.ts:3358) emits `addedIds` whenever the list is non-empty and
+        // the `tasks` wrapper passes it through (:3827), so this add names the id it
+        // minted. It is spread in ALONGSIDE `entry`, not instead of it, and the two read
+        // pins below still spread bare `onlyMine` — no receipt on a read.
         expect(await store.callTool(mine.id, 'tasks', { tasks: [{ text: '  only mine ' }] })).toEqual({
             ...onlyMine,
-            entry: onlyMine.tasks[0]
+            entry: onlyMine.tasks[0],
+            addedIds: ['1']
         });
 
         // The state lives in the session's harness: the same session sees the item —
