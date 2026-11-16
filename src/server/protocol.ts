@@ -650,7 +650,7 @@ export type SessionPluginDiagnostic = {
 
 // How many plugin diagnostics one session keeps, oldest dropped first. The cap exists because
 // the journal is DURABLE (`HarnessSessionRecord.pluginDiagnostics`): a plugin that throws on
-// every turn would otherwise grow `state.json` without bound, and the entries an operator needs
+// every turn would otherwise grow the session record without bound, and the entries an operator needs
 // are the newest ones. Owned by this file, not by ./sessions.ts, because ./persistence.ts has to
 // honour the same bound when it restores a journal that grew past it on disk — and persistence
 // cannot import the store (the store imports persistence).
@@ -1094,10 +1094,12 @@ export type CancelThreadResult = {
 //
 // R2 (primary spec): a thread deletion is a MARK, not a purge. The conversation and its
 // descendants become INACTIVE — their rows, transcripts, turn records and agent results stay
-// in `state.json` and in `events.jsonl` — and `session` is the post-mark snapshot, which
+// in the session's `session.json` shard and in their own `threads/<threadId>.json` shards,
+// and in `events.jsonl` — and `session` is the post-mark snapshot, which
 // simply no longer LISTS them. Nothing is destroyed here; the session itself being deleted
-// (or reset) is the only path that removes records, and a shell reading
-// `<databaseRoot>/harness/state.json` still finds every retired conversation.
+// (or reset) is the only path that removes records, and a shell reading that session's
+// `sessions/<sessionId>/session.json` (plus its `threads/` shards) still finds every retired
+// conversation.
 //
 // `removed_descendants`/`removed_turns` (the REST body's own fields, ../shared
 // `DeleteThreadResult`) therefore state the SIZE of the retired set, not a count of destroyed

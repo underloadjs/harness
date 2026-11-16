@@ -60,6 +60,10 @@ import type { HarnessAgentResultSnapshot } from '../../types';
 import { digestMemoryValue } from './lane-memory';
 import type { LaneAuthority } from './lane-authority';
 import { HarnessPersistence } from '../persistence';
+// v2 layout readers (../persistence-test-helpers.ts): this suite is one of the suites that
+// inspects the persisted bytes directly, so it goes through the shared layout reader rather
+// than re-spelling `sessions/<id>/...` paths here.
+import { harnessIndexFileOf, readPersistedDocument } from '../persistence-test-helpers';
 import {
     AUTHORITY_RUNTIME_METHODS,
     LOCAL_RUNTIME_METHODS,
@@ -122,28 +126,52 @@ const tempRoot = (label: string): string => {
     return root;
 };
 
-// T25: waits for a DEFERRED best-effort checkpoint to reach `state.json`. A lane commit that
-// lands outside a run is a core state change, and F1 made that observer a
+// T25: waits for a DEFERRED best-effort checkpoint to reach the DURABLE LAYOUT. A lane commit
+// that lands outside a run is a core state change, and F1 made that observer a
 // `VIEW_CHECKPOINT_INTERVAL_MS` writer rather than a synchronous one (../sessions.ts
 // `noteStateChange` → `checkpoint`); ../sessions.ts `scheduleCheckpoint` commits the pending
 // document at the end of the window, and this polls the bytes until it has. The budget is that
 // bound with slack, counted in iterations (a mocked clock must not be able to expire it), and
 // running it out is the failure: it would mean the lane's commit never became durable at all.
+//
+// v2: "the durable document" is no longer one file. `HarnessPersistence.file` is now
+// `index.json`, whose `sessions` is only `[{ id, ordinal }]` references
+// (../persistence.ts:2305 `harnessIndexDocumentOf`), so the transcript text this predicate
+// looks for lives in `sessions/<id>/threads/<threadId>.json`. `readPersistedDocument`
+// (../persistence-test-helpers.ts:182) reassembles index + session records + thread shards
+// into exactly the one-document shape the predicate was written against, so the pin still asks
+// the same question of the same bytes — it just asks it of the right files now.
 const waitForDurableDocument = async (
     root: string,
     settled: (document: unknown) => boolean,
     budgetMs = 8_000
 ): Promise<void> => {
-    const file = new HarnessPersistence(root).file;
     const attempts = Math.ceil(budgetMs / 25);
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-        if (fs.existsSync(file) && settled(JSON.parse(fs.readFileSync(file, 'utf8')))) return;
+        // The header is the "has anything landed yet" gate: shards are renamed thread → session
+        // → index (../workers/io-protocol.ts:176 `IO_SHARD_ORDER`), so polling the header first
+        // keeps a half-written tree from being read as a document.
+        if (fs.existsSync(harnessIndexFileOf(root))) {
+            let document: Record<string, any> | undefined;
+
+            try {
+                document = readPersistedDocument(root);
+            } catch {
+                // A shard mid-rename: one commit spans several files, so the tree can be read
+                // between them (or a shard can be replaced under the read). Retrying is what the
+                // budget is for.
+            }
+
+            // A THROW from `settled` is deliberately NOT swallowed: that is the test's own
+            // expectation failing, and it must surface as itself, not as a timeout.
+            if (document !== undefined && settled(document)) return;
+        }
 
         await new Promise((resolve) => setTimeout(resolve, 25));
     }
 
-    throw new Error(`state.json did not reach the expected shape within ${budgetMs} ms.`);
+    throw new Error(`the persisted v2 document did not reach the expected shape within ${budgetMs} ms.`);
 };
 
 const storeOf = (): SessionStore => {

@@ -209,7 +209,9 @@ const pendingCountOf = (record: SessionRecord): number => {
 // A conversation DELETE is a soft delete: the store marks the thread row `inactive` and
 // RETAINS it, with its turn rows, its transcript, its agent results and its journal lines
 // (./sessions.ts `markDeletedThread`, ../harness.ts `deleteThread`). The row stays durable
-// for a `shell`/`bash` read of `<databaseRoot>/harness/state.json` and for the revival doors
+// for a `shell`/`bash` read of the session's `sessions/<sessionId>/session.json` shard (the
+// row) and its `sessions/<sessionId>/threads/<threadId>.json` (the transcript) below
+// `<databaseRoot>/harness/`, and for the revival doors
 // (`reactivateThreadRow`, `steerIntoThread`, `resumeThread`); what a delete has to remove is
 // DISCOVERABILITY. The roster already does that for threads (./api.ts `threadRecordsOf` and
 // ./sessions.ts `threadRoster` ~:4639, both `origin === 'host' && inactive !== true`) with no new

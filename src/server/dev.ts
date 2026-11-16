@@ -23,8 +23,10 @@
 // Usage:
 //   yarn dev:server [--port 5181] [--host 127.0.0.1] [--database-root <path>]
 //
-// `--database-root` is passed straight to `startHarnessServer`, which persists
-// under `<root>/harness/state.json`. Omit it for the previous in-memory server.
+// `--database-root` is passed straight to `startHarnessServer`, which persists the v2
+// shard tree under `<root>/harness/` (`index.json`, one `sessions/<id>/session.json` per
+// session and one `sessions/<id>/threads/<threadId>.json` per conversation). Omit it for
+// the previous in-memory server.
 // Environment/config behaviour is the same as every other Node entry: the
 // package-root `.env` is loaded by `startHarnessServer` before configuration and
 // harness construction.
@@ -50,7 +52,7 @@ same host and port: ws://<host>:<port>${HARNESS_API_ROOT}/stream.
 Options:
   --port <port>           Server port (default: 5181; 0 = OS-assigned)
   --host <host>           Server host (default: 127.0.0.1)
-  --database-root <path>  Durable database root (<root>/harness/state.json)
+  --database-root <path>  Durable database root (<root>/harness/index.json plus sessions/<id>/session.json and sessions/<id>/threads/<threadId>.json)
   -h, --help              Show this help
 `);
 };

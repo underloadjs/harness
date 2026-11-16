@@ -60,7 +60,10 @@ import type { HarnessPreset, HarnessSnapshot, HarnessStreamEvent } from '../harn
 import type { RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { SHARED_TOOL_NAMES, createToolboxHarness } from './harnesses/toolbox';
-import { HARNESS_DATABASE_FILE, HarnessPersistence } from './persistence';
+import { HarnessPersistence } from './persistence';
+// v2 layout readers (./persistence-test-helpers.ts): the shard names are deliberately not
+// imported from ./persistence, so a writer that moves its files without updating the pins fails.
+import { harnessIndexFileOf, readPersistedDocument } from './persistence-test-helpers';
 import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { SessionStore } from './sessions';
@@ -237,12 +240,13 @@ const tempRoot = (label: string): string => {
     return root;
 };
 
-const stateFile = (root: string): string => path.join(root, 'harness', HARNESS_DATABASE_FILE);
-
+// v2 layout: the header document is `index.json` and each session is its own shard
+// (`sessions/<id>/session.json`, transcripts under `sessions/<id>/threads/`). `readDocument`
+// keeps the ONE-document view these pins are written against — including the `database` option
+// value it is fed back into, which is the unchanged in-memory `HarnessDatabase` shape — by
+// reassembling the shards in `index.json` order. Absent header still means "nothing saved".
 const readDocument = (root: string): Record<string, any> =>
-    fs.existsSync(stateFile(root))
-        ? (JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>)
-        : {};
+    fs.existsSync(harnessIndexFileOf(root)) ? readPersistedDocument(root) : {};
 
 const openPair = (
     root: string,

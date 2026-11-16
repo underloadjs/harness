@@ -1085,11 +1085,15 @@ export const createHarnessApi = ({
 
     // T19: commit ONE agent decision as a single unit. `store.mutateRegistry` already owns a
     // rollback for everything the registry holds (the overlay travels in its snapshot), and it
-    // commits `state.json` inside that unit; the overlay file is the second half. The order is
+    // commits the checkpoint shards inside that unit; the overlay file is the second half. The
+    // order is
     // deliberate:
-    //   - if `state.json` fails, `mutateRegistry` restores the captured snapshot (overlay
-    //     included) and `agents.json` was never touched, so the 500 the client gets matches a
-    //     disk that never changed;
+    //   - if a checkpoint shard fails, `mutateRegistry` restores the captured in-memory snapshot
+    //     (overlay included) and `agents.json` was never touched. The disk is not guaranteed
+    //     untouched — the shard commit is ordered (thread → `session.json` → `index.json`), so a
+    //     failure can leave shards it had already renamed — but `index.json` is the last thing
+    //     committed, so while it still describes the pre-mutation state those extra files are
+    //     the ones `load()` ignores (./persistence.ts:78-89);
     //   - if the OVERLAY write is the one that fails, the in-memory decision is put back before
     //     the failure propagates, so no channel can disagree with the refusal.
     const commitAgentEdit = async <T>(mutate: () => T): Promise<T> => {
@@ -1169,7 +1173,8 @@ export const createHarnessApi = ({
 
     // T16: a saved `PATCH /config` result is applied at construction, so the operator's global
     // defaults survive a restart instead of vanishing on the next boot. The credential is NOT part
-    // of that record (state.json holds no secret), so an api key set over HTTP stays process-only,
+    // of that record (the store holds no secret — no api key is written into `index.json` or
+    // any session shard), so an api key set over HTTP stays process-only,
     // which is exactly what the write document says about it.
     const savedGlobalSettings = store.globalSettings;
 
@@ -4816,7 +4821,8 @@ export const createHarnessApi = ({
     // filter below, which therefore cannot be pointed at a deleted conversation), the
     // single-thread read, and the 201 read-back of a create. Filtering HERE is what makes
     // "the tooling does not find it" true over HTTP without a new client-visible field;
-    // the row itself stays in `state.json` for a shell to read.
+    // the row itself stays in the session's `session.json` shard — with its
+    // `threads/<threadId>.json` transcript — for a shell to read.
     //
     // Written against the record, so the filter is correct whether or not the runtime
     // excludes inactive rows from `threads()` (then it is a no-op).

@@ -1,16 +1,22 @@
 // Per-step durable journal (R4).
 //
-// `state.json` (./persistence.ts) is a CHECKPOINT: one atomic full-document replace.
-// Rewriting it for every harness event is O(every session's every event), and text
+// The checkpoint (./persistence.ts) is now a set of atomic replaces — `index.json`, one
+// `sessions/<id>/session.json` per session and one
+// `sessions/<id>/threads/<threadId>.json` per conversation; the v2 layout. It was one
+// `state.json` document before the shard split, and the rules below are why a journal
+// exists at all: rewriting the checkpoint for every harness event costs the edited
+// session and its transcript (before the split: every session's every event), and text
 // deltas were previously not durable at all until the terminal save. The journal is
 // the other half of durability: an append-only, one-line-per-event log under
 //
 //     <databaseRoot>/harness/sessions/<sessionId>/events.jsonl
 //
-// which is O(1) per event and survives a crash. `state.json` keeps everything else
-// (core snapshot, roster, labels, queue) exactly as before, and its shape/version is
-// UNCHANGED, so a database written before this file existed still loads (the journal
-// directory is simply absent — see ./sessions.ts restore fallback).
+// which is O(1) per event and survives a crash. The checkpoint keeps everything else
+// (core snapshot, roster, labels, queue) in the shards above, and THE JOURNAL ITSELF IS
+// UNCHANGED by the split — same file, same directory, same lines — because that
+// directory IS the v2 session directory (./persistence.ts:217 reuses
+// `HARNESS_SESSION_DIRECTORY`), so a session's shards, its transcripts and its log stay
+// in one footprint.
 //
 // Read model (the two rules the brief pins):
 //   - a TRUNCATED LAST LINE is a crash artifact and is TOLERATED (the record was
@@ -76,7 +82,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { HarnessEvent } from '../harness';
 
-// Sibling of `state.json`, so an operator can see both in one place. Named
+// Sibling of the checkpoint header `index.json`, so an operator can see both in one
+// place; under the v2 layout this IS the session's own directory, holding its
+// `session.json`, its `threads/` shards and this file (./persistence.ts:217). Named
 // separately from the checkpoint's file/dir constants to keep the two lifecycles
 // obvious in code.
 export const HARNESS_JOURNAL_DIRECTORY = 'sessions';
@@ -434,8 +442,8 @@ export class HarnessJournal {
     }
 
     // Replace the whole log with `records` (atomic tmp + rename, the checkpoint's
-    // rule). Used after a checkpoint proves the same events are durable in
-    // `state.json`, and to repair a file whose tail was truncated.
+    // rule). Used after a checkpoint proves the same events are durable in the
+    // session's `session.json` shard, and to repair a file whose tail was truncated.
     rewrite(records: readonly JournalEventRecord[]): void {
         this.open();
         if (!this.opened) return;

@@ -36,6 +36,9 @@ import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import { SessionStore } from './sessions';
 import type { SessionStreamItem } from './protocol';
+// v2 layout readers (./persistence-test-helpers.ts): `readState` below probes the header bytes and
+// the value pins need the session records, which now live in `sessions/<id>/session.json`.
+import { harnessIndexFileOf, harnessSessionFileOf, readPersistedDocument } from './persistence-test-helpers';
 
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../../..');
@@ -77,10 +80,15 @@ const CATALOGUE = createToolCatalogue({
 const INTERRUPTED_MESSAGE =
     'The previous run was interrupted by a server restart; it was not replayed. Review the recorded events before continuing.';
 
-const stateFile = (root: string): string => path.join(root, 'harness', 'state.json');
+// v2 layout: the header document (`index.json`) is rewritten by EVERY save and carries `savedAt`,
+// so its raw bytes are the most sensitive possible "did another save happen" probe — exactly what
+// the byte-identity pins below ask. The value pins (session ids, turn statuses) need the records,
+// which live in `sessions/<id>/session.json`; `readDatabase` reassembles them into the
+// one-document view those assertions state.
+const readState = (root: string): string => fs.readFileSync(harnessIndexFileOf(root), 'utf8');
 
-// Read the persisted database exactly as written (no re-serialization).
-const readState = (root: string): string => fs.readFileSync(stateFile(root), 'utf8');
+// The persisted database, reassembled from the shards (no re-serialization of a single file).
+const readDatabase = (root: string): Record<string, any> => readPersistedDocument(root);
 
 // One macrotask: enough for an accidental replay/timer to become observable.
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
@@ -220,33 +228,40 @@ describe('T13 shutdown safety (P1-B)', () => {
 
         first.store.dispose();
 
-        // The graceful document is the one that must survive verbatim.
+        // The graceful state is the one that must survive verbatim: the header bytes (any save
+        // rewrites them) AND the running session's own shard (its row must not be re-written by
+        // the late completion).
         const committed = readState(root);
+        const committedShard = fs.readFileSync(harnessSessionFileOf(root, running.id), 'utf8');
 
         // The dropped queued turn's completion is released by the shutdown itself.
         await queued.settled;
         expect(saves).toEqual([3]);
 
         // Late, uncooperative completion of the aborted run: its sink and its
-        // post-finally save land AFTER dispose() and must not touch the file.
+        // post-finally save land AFTER dispose() and must not touch the files.
         fixture.release();
         await runSettled;
         await flush();
 
         expect(readState(root)).toBe(committed);
+        expect(fs.readFileSync(harnessSessionFileOf(root, running.id), 'utf8')).toBe(committedShard);
         expect(saves).toEqual([3]);
 
         // Exact persisted ids, in creation order.
-        const committedSessions = (
-            JSON.parse(committed) as { sessions: { id: string; status: string; turns: { status: string; prompt: string }[] }[] }
-        ).sessions;
+        const committedSessions = readDatabase(root).sessions as {
+            id: string;
+            status: string;
+            turns: { status: string; prompt: string }[];
+        }[];
+
         expect(committedSessions.map((session) => session.id)).toEqual([
             idleA.id,
             idleB.id,
             running.id
         ]);
 
-        // The document records the running turn (restored as interrupted) and the
+        // The persisted records carry the running turn (restored as interrupted) and the
         // queued prompt before execution began.
         expect(
             committedSessions.find((session) => session.id === running.id)?.turns.map(
@@ -299,15 +314,21 @@ describe('T13 shutdown safety (P1-B)', () => {
 
         // One graceful save with the session still present; that is the whole write.
         expect(saves).toEqual([1]);
+        // v2: the session LIST (with the ids, in order) is a header-document field, so `committed`
+        // answers the id pin; the shard of the one session is compared alongside so "no second
+        // write" covers every file the save would have rewritten.
         const committed = readState(root);
+        const committedShard = fs.readFileSync(harnessSessionFileOf(root, created.id), 'utf8');
+
         expect(
             (JSON.parse(committed) as { sessions: { id: string }[] }).sessions.map((session) => session.id)
         ).toEqual([created.id]);
 
-        // A second dispose() is a no-op: no save, byte-identical file.
+        // A second dispose() is a no-op: no save, byte-identical files.
         first.store.dispose();
         expect(saves).toEqual([1]);
         expect(readState(root)).toBe(committed);
+        expect(fs.readFileSync(harnessSessionFileOf(root, created.id), 'utf8')).toBe(committedShard);
     });
 
     it('refuses structural writes after dispose() instead of writing an empty document', async () => {
@@ -316,6 +337,8 @@ describe('T13 shutdown safety (P1-B)', () => {
 
         const created = await first.store.create('idle');
         first.store.dispose();
+        // v2: `committed` is the header document (any save rewrites it); its `sessions` list is
+        // exactly the id set these pins state.
         const committed = readState(root);
 
         // A request that raced the shutdown is answered honestly (503) and rolls its
@@ -325,6 +348,7 @@ describe('T13 shutdown safety (P1-B)', () => {
         );
         expect(first.store.size).toBe(0);
         expect(readState(root)).toBe(committed);
+        expect(fs.existsSync(harnessSessionFileOf(root, created.id))).toBe(true);
         expect(
             (JSON.parse(committed) as { sessions: { id: string }[] }).sessions.map((session) => session.id)
         ).toEqual([created.id]);

@@ -78,8 +78,10 @@
 // PERSISTENCE (R3b): the loader calls `handler(context, parameters, variables)`.
 // `variables.root` is the service's DATABASE_ROOT (packages/underload/service/
 // server.ts passes it as `variables: { root: DATABASE_ROOT }`; the loader merges
-// it ahead of the scan root). It selects the root-keyed runtime, which writes
-// `<root>/harness/state.json`. No root means the in-memory runtime (direct tests).
+// it ahead of the scan root). It selects the root-keyed runtime, which writes the v2
+// shard tree under `<root>/harness/` (`index.json` plus `sessions/<id>/session.json` and
+// `sessions/<id>/threads/<threadId>.json`). No root means the in-memory runtime (direct
+// tests).
 // A present-but-invalid root or a corrupt/unknown-version database is a 500 with
 // the real message — the root is never silently ignored and the store is never
 // silently reset.

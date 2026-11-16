@@ -176,7 +176,7 @@ export type HarnessToolCall = {
 //   - COPIED, never re-minted, by every copy path: a fork/branch carries its source's
 //     ids (T1.4 — two objects, one identity, and lookup is scoped to one agent's
 //     transcript), and a snapshot carries them back verbatim;
-//   - a pre-id transcript (an older `state.json`, a host-pushed message) restores with
+//   - a pre-id transcript (one written before ids existed, a host-pushed message) restores with
 //     the key ABSENT on read and gets ids BACKFILLED by the snapshot reader
 //     (core/snapshot.ts) — `restore -> snapshot` is idempotent;
 //   - it NEVER reaches a provider request: `withIncluded` (core/agent.ts) strips it
@@ -5213,7 +5213,8 @@ export type HarnessTurnBeforeContext = {
     // as an `agent_message` transcript change, exactly like `postThreadMessage` and
     // `writeThreadTranscript`. That notification is the ONLY durability mechanism, and
     // it buys: later turns of the same conversation, `snapshot()`/`restore()`, and any
-    // store that persists on that notification (the server's `state.json`) — in BOTH
+    // store that persists on that notification (the server's shard store — for a
+    // conversation, its `sessions/<id>/threads/<threadId>.json`) — in BOTH
     // execution lanes. Under `threadExecution: 'worker'` a lane used to owe the authority
     // only APPENDED SLICES, so an in-place flag change on an already-committed message
     // died with the worker process (finding F6); it now pushes that change too, as a
@@ -5221,7 +5222,8 @@ export type HarnessTurnBeforeContext = {
     // whole committed prefix, compare-and-set against the digest this lane adopted, which
     // the authority replays on the canonical harness through `patchThreadMessages` — the
     // same targeted-seam family as the append — and reports as the same `agent_message`
-    // change, which is what puts it in `state.json`. A flag a plugin writes in worker mode
+    // change, which is what puts it in that conversation's transcript shard. A flag a
+    // plugin writes in worker mode
     // is therefore restart-durable. What the CAS costs: if canonical rewrote that prefix
     // first, the patch is REFUSED whole, the lane re-reads canonical, and this round's
     // write is dropped — the policy that made it runs again on the next `turn.before`,

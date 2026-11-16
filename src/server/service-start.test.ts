@@ -32,6 +32,13 @@ import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
 // pins the target wire (canonical `/v1/harness`, paged catalogues, 202 submit receipts, the executions
 // route for a direct tool call) instead of the legacy adapter shapes it grew.
 import { HARNESS_API_ROOT, HARNESS_PATH_TEMPLATES, HARNESS_ROUTES } from '../shared/harness-api';
+// v2 layout readers: this suite spawns a real server over a real database root, so it pins the
+// bytes that root ends up holding (header document + per-session shard).
+import {
+    harnessIndexFileOf,
+    readPersistedIndex,
+    readPersistedSession
+} from './persistence-test-helpers';
 import type {
     DeleteSessionResult,
     GlobalConfigDocument,
@@ -103,7 +110,7 @@ target.listen = function (this: http.Server, ...args: unknown[]) {
 // the driver pre-seeds the root-keyed runtime with the shipped catalogue plus the
 // explicit fixtures. getHarnessRuntime keeps one runtime per resolved root, so the
 // discovered route reuses this one instead of building the default: everything else
-// (loader -> endpoint -> handler -> <root>/harness/state.json) is the real path.
+// (loader -> endpoint -> handler -> <root>/harness: index.json + session shards) is the real path.
 const serviceRoot = process.env.HARNESS_SERVICE_DATABASE_ROOT;
 setHarnessRuntime(
     createHarnessRuntime({
@@ -435,7 +442,8 @@ describeService('service endpoint discovery and canonical API', () => {
         // Proves the whole chain the production service uses: server.ts passes
         // DATABASE_ROOT as `variables: { root }`, the loader forwards it as the
         // handler's third argument, and the handler selects the root-keyed runtime
-        // that writes `<root>/harness/state.json`. A no-op root would leave no file.
+        // that writes the v2 layout under `<root>/harness/` (header `index.json` plus one
+        // shard per session). A no-op root would leave no files.
         const created = await fetch(`${base}${HARNESS_ROUTES.sessions()}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -444,34 +452,40 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(created.status).toBe(201);
         const session = (await json<SessionResponse>(created)).session;
 
-        const file = path.join(DATABASE_ROOT, 'harness', 'state.json');
-        expect(fs.existsSync(file)).toBe(true);
+        // v2 layout: the header document (`index.json`) carries the session LIST
+        // (`[{ id, ordinal }]`), while the session's own fields — including the credential-free
+        // provider `settings` — live in `sessions/<id>/session.json`. Both halves are pinned,
+        // exactly as the one-document version pinned them.
+        const indexFile = harnessIndexFileOf(DATABASE_ROOT);
+        expect(fs.existsSync(indexFile)).toBe(true);
 
-        const database = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+        const index = readPersistedIndex(DATABASE_ROOT) as {
             version: number;
-            sessions: { id: string; settings: Record<string, unknown> }[];
+            sessions: { id: string }[];
         };
         // Provider defaults are the configuration read now (the service document is constant-size), and
         // the wire spelling is snake_case while the DATABASE document keeps its internal camelCase DTO
         // fields — a persistence detail, not part of the network contract.
         const config = await json<GlobalConfigDocument>(await fetch(`${base}${HARNESS_ROUTES.config()}`));
 
-        expect(database.version).toBe(1);
-        expect(database.sessions.map((entry) => entry.id)).toEqual([session.id]);
+        expect(index.version).toBe(2);
+        expect(index.sessions.map((entry) => entry.id)).toEqual([session.id]);
+
         // The session's provider settings are stored WITHOUT the credential.
-        expect(database.sessions[0].settings).toEqual({
+        const persisted = readPersistedSession(DATABASE_ROOT, session.id) as {
+            settings: Record<string, unknown>;
+        };
+        expect(persisted.settings).toEqual({
             baseURL: config.defaults.base_url,
             model: config.defaults.model
         });
-        expect(Object.keys(database.sessions[0].settings)).toEqual(['baseURL', 'model']);
+        expect(Object.keys(persisted.settings)).toEqual(['baseURL', 'model']);
 
         // Clean up through the API as well, so the later create/list test still
         // starts from an empty session list.
         const deleted = await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionId(session.id)}`, { method: 'DELETE' });
         expect(deleted.status).toBe(200);
-        expect(
-            (JSON.parse(fs.readFileSync(file, 'utf8')) as { sessions: unknown[] }).sessions
-        ).toEqual([]);
+        expect(readPersistedIndex(DATABASE_ROOT).sessions).toEqual([]);
     });
 
     it('creates, runs, resets, and deletes a session over the real service', async () => {

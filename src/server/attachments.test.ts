@@ -8,7 +8,7 @@
 // opening a socket.
 //
 // Coverage map (acceptance evidence for R3/R4/R5):
-//   - a valid image travels queue → harness call → turn record → state.json →
+//   - a valid image travels queue → harness call → turn record → the persisted session shard →
 //     restart, with the raw base64 bytes intact;
 //   - a persisted QUEUED attachment turn still dispatches after a crash restart;
 //   - blank input is accepted only when a clip is present (store + HTTP);
@@ -39,6 +39,9 @@ import type { HarnessRuntime } from './runtime';
 import { createHarnessRuntime } from './runtime';
 import { createHarnessServiceHandler } from './service';
 import { SessionError } from './sessions';
+// v2 layout reader (./persistence-test-helpers.ts): this suite pins that attachment bytes reach
+// the persisted session shard, which is a different file than the v1 whole-document state.
+import { readPersistedDocument } from './persistence-test-helpers';
 import { MAX_API_BODY_BYTES, bodyLimitFor } from './api';
 import type { SessionSnapshot } from './protocol';
 // T35: canonical transport — one mount, a 202 receipt for the submit, and one named read per
@@ -81,7 +84,9 @@ const DEFAULTS = {
     hasApiKey: true
 };
 
-const stateFile = (root: string): string => path.join(root, 'harness', 'state.json');
+// v2 layout: turn records are fields of the SESSION record, so the byte reads below target
+// `sessions/<id>/session.json` (via the shared reader, which returns the one-document view).
+const documentOf = (root: string): Record<string, any> => readPersistedDocument(root);
 
 // ---------------------------------------------------------------------------
 // Attachments and the scripted preset
@@ -425,7 +430,7 @@ describe('queued attachments dispatch and persist', () => {
         expect(runtime.store.get(created.id).turns[0]!.attachments).toEqual([attachment]);
     });
 
-    it('carries a valid image through queue → harness → turn record → state.json', async () => {
+    it('carries a valid image through queue → harness → turn record → the persisted session shard', async () => {
         const root = tempRoot('queue');
         const seen: SeenTurn[] = [];
         const runtime = runtimeOf(recordingPreset('media', seen), root);
@@ -471,7 +476,7 @@ describe('queued attachments dispatch and persist', () => {
         });
 
         // The durable document stores the raw base64, not a URL or path.
-        const document = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+        const document = documentOf(root) as {
             sessions: { turns: { attachments?: HarnessAttachment[] }[] }[];
         };
         expect(document.sessions[0]!.turns[0]!.attachments).toEqual([attachment]);
@@ -500,7 +505,7 @@ describe('queued attachments dispatch and persist', () => {
         expect(queued.turn.prompt).toBe('');
         expect(queued.turn.attachments).toEqual([attachment]);
 
-        const duringRun = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+        const duringRun = documentOf(root) as {
             sessions: { turns: { id: string; status: string; attachments?: HarnessAttachment[] }[]; queue: string[] }[];
         };
         expect(duringRun.sessions[0]!.turns[1]!.attachments).toEqual([attachment]);

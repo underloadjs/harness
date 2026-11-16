@@ -11539,8 +11539,9 @@ const openLatestOfEnteredHarness = (name: string): void => {
 //
 // Delete is PERMANENT. The server (src/server/api.ts DELETE /sessions/:id ->
 // SessionStore.remove, src/server/sessions.ts) aborts an active run, discards the
-// retained queue, closes /events watchers, and rewrites state.json without the
-// record before answering.
+// retained queue, closes /events watchers, and commits the store without the record
+// (`index.json` no longer lists the session, and its `session.json` plus its `threads/`
+// shards are erased) before answering.
 //
 // T1/R1: the inline two-step confirmation is GONE. One click on `.session-pill-delete`
 // sends exactly one DELETE, because the control is a small `x` on a row the reader

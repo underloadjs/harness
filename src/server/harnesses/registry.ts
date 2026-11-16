@@ -1141,9 +1141,9 @@ export const restoreHarnessRegistry = (
 };
 
 export type HarnessRegistryOptions = {
-    // T5: built-in names the operator deleted, already recorded in the durable
-    // database (`deleted` in <root>/harness/state.json). A template whose name
-    // appears here is NOT inserted, so a shipped default stays removed across
+    // T5: built-in names the operator deleted, already recorded in the durable database
+    // header (`deleted` in <root>/harness/index.json, ./persistence.ts:2299). A template whose
+    // name appears here is NOT inserted, so a shipped default stays removed across
     // restarts. Order is preserved, which keeps the saved document stable.
     deletedBuiltins?: readonly string[];
     // T19: the durable global agent overlay (`<root>/harness/agents.json`), replayed

@@ -176,8 +176,10 @@ export type LaneBlueprint = {
     // ./lane-host.ts + ./lane-worker-loop.ts.
     withheldTools: string[];
     // R3 (the PLUGIN switches): the operator's per-plugin setting OVERRIDES as of lane
-    // creation, in the SAME shape `state.json` stores them (`HarnessPluginSettingsRecord`,
-    // plugin name -> key -> JSON scalar; ../persistence.ts). It joins the blueprint for the
+    // creation, in the SAME shape the checkpoint stores them (`HarnessPluginSettingsRecord`,
+    // plugin name -> key -> JSON scalar; ../persistence.ts — `index.json`'s `pluginSettings`
+    // block for the template scope at :2301, and each session record's own at :403).
+    // It joins the blueprint for the
     // one reason every other field is here: the store's provider is a closure over a live
     // Map, and a closure cannot cross `worker_threads`.
     //

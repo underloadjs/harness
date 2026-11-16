@@ -33,6 +33,9 @@ import type { HarnessStreamEvent } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
+// v2 layout readers/writers (./persistence-test-helpers.ts): the label maps live in the session
+// shard, so the "partial write" tamper below edits THAT file.
+import { readPersistedDocument, writePersistedDocument } from './persistence-test-helpers';
 import { SessionError, SessionStore } from './sessions';
 import type { SessionSnapshot } from './protocol';
 import { listAgentResultBlocks } from '../shared/agent-results';
@@ -257,15 +260,15 @@ describe('one canonical conversation/legacy label sequence', () => {
         store.dispose();
 
         // Simulate a partial write: the per-thread label map AND its high-water are
-        // gone while the surviving turn still records the label the user saw.
-        const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
-            sessions: Record<string, unknown>[];
-        };
+        // gone while the surviving turn still records the label the user saw. v2 keeps those
+        // maps in the SESSION shard (`sessions/<id>/session.json`), so the tamper goes there —
+        // same missing-fields state, one file deeper.
+        const document = readPersistedDocument(root);
         for (const session of document.sessions) {
             delete session.threadLabels;
             delete session.threadLabelHighWater;
         }
-        fs.writeFileSync(persistence.file, JSON.stringify(document, null, 2), 'utf8');
+        writePersistedDocument(root, document);
 
         const restored = createStore(researcherPreset(), persistence, persistence.load());
         const snapshot = restored.get(id);

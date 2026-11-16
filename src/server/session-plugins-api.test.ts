@@ -33,7 +33,8 @@
 //     8. REVISIONS   - `revision` (body and `X-Harness-Revision`) is PER STORE: a session's counter
 //                      moves only for that session, the template counter only for the template, and
 //                      neither route reads the other's number.
-//     9. DURABLE     - the value is in `state.json` before the 200, per session, beside that
+//     9. DURABLE     - the value is in the SESSION shard (`sessions/<id>/session.json`) before
+//                      the 200, per session, beside that
 //                      session's `toolSettings`; a session that changed nothing writes NO
 //                      `pluginSettings` key; a restart resumes each session's own copy while the
 //                      template keeps its own; a hand-edited block with a stale key, an unusable
@@ -60,9 +61,12 @@
 //   - ../shared/harness-api.ts        — the generated templates these routes come from
 //   - ./plugins-api.test.ts           — the template-scope contract (same probe, same helpers)
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+// v2 layout readers/writers (./persistence-test-helpers.ts): template settings live in the header
+// document, per-session settings in the session shard.
+import { readPersistedDocument, writePersistedDocument } from './persistence-test-helpers';
 import { fileURLToPath } from 'node:url';
 
 import { agent, harness } from '../harness';
@@ -145,10 +149,16 @@ const fixture = async (): Promise<string> => {
     return root;
 };
 
-const fileOf = (root: string): string => join(root, 'harness', 'state.json');
+// v2 layout: the header document (`index.json`) holds the TEMPLATE `pluginSettings` block, and
+// each session's OWN `pluginSettings` lives in `sessions/<id>/session.json`. `documentOf`
+// reassembles both into the one-document view these pins were written against, and the three
+// hand-edit cases below write through `writePersistedDocument`, which fans each mutated field
+// back to the shard it came from (so a per-session edit never rewrites the header).
+const documentOf = (root: string): Record<string, any> => readPersistedDocument(root);
 
-const documentOf = (root: string): Record<string, any> =>
-    JSON.parse(readFileSync(fileOf(root), 'utf8')) as Record<string, any>;
+// Writes a hand-edited document back to the shards it was read from.
+const writeDocument = (root: string, document: Record<string, any>): void =>
+    writePersistedDocument(root, document);
 
 const sessionBlock = (root: string, sessionId: string): Record<string, any> =>
     (documentOf(root).sessions as Record<string, any>[]).find((entry) => entry.id === sessionId);
@@ -903,7 +913,7 @@ describe('session plugin settings are durable before the answer', () => {
             'context-trimmer': { enabled: false }
         };
 
-        await writeFile(fileOf(root), JSON.stringify(document, null, 2), 'utf8');
+        writeDocument(root, document);
 
         const restarted = createRuntime({ root });
 
@@ -922,7 +932,7 @@ describe('session plugin settings are durable before the answer', () => {
 
         edited.sessions.find((entry: Record<string, any>) => entry.id === sessionId).pluginSettings = 'a string';
 
-        await writeFile(fileOf(root), JSON.stringify(edited, null, 2), 'utf8');
+        writeDocument(root, edited);
 
         const third = createRuntime({ root });
 
@@ -937,7 +947,7 @@ describe('session plugin settings are durable before the answer', () => {
 
         strict.pluginSettings = { 'async-ping': { intervalMs: [] } };
 
-        await writeFile(fileOf(root), JSON.stringify(strict, null, 2), 'utf8');
+        writeDocument(root, strict);
 
         let refusal = '';
 

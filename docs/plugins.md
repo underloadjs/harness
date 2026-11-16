@@ -163,12 +163,14 @@ consequences worth knowing:
   settings write moves no registration and removes no schema a model was promised — so the
   Plugins page is usable while a conversation is running. The value is durable before the
   response and a restart reads it back before the first request, at the scope that owns it:
-  the template under `state.json`'s top-level `pluginSettings`, a conversation's own values on
+  the template under `index.json`'s top-level `pluginSettings` (the three operator blocks
+  are document-level fields — `harnessIndexDocumentOf`, `src/server/persistence.ts:2299-2302`),
+  a conversation's own values on
   ITS record (`src/server/persistence.ts:293`, rebuilt on restore at
   `src/server/sessions.ts:3677`).
 * **Two scopes, not four.** There is no per-HARNESS plugin configuration — a harness template
   record carries no plugin column at all (`src/server/persistence.ts`, `HarnessPresetRecord`;
-  the durable homes are the document at `:415` and the session record at `:293`) — and no
+  the durable homes are the document at `:495` and the session record at `:293`) — and no
   per-THREAD one either: every conversation of a session, and the lane workers that run its
   threads, resolve that SESSION's store (`src/server/plugins.ts:107-121`). A plugin therefore
   has exactly two settings documents to be edited from, and asking for a third is open work,
@@ -400,7 +402,8 @@ and text cannot.
 
 All three writes are **canonical**: they survive later turns,
 `snapshot()`/`restore()`, and any store that persists on the notification
-(the server's `state.json`) — in BOTH execution lanes (under
+(the server's store — `index.json`, one `session.json` per session and one
+`threads/<threadId>.json` per conversation) — in BOTH execution lanes (under
 `threadExecution: 'worker'` the lane pushes the in-place change as a
 whole-prefix, digest-guarded `transcript:patch`; the authority replays and
 reports it. When canonical rewrote that prefix first, the patch is refused

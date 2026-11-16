@@ -112,7 +112,8 @@ export class HarnessToolSettingsError extends Error {
 }
 
 export type HarnessToolSettingsStoreOptions = {
-    // The deny list restored from `state.json` (./persistence.ts). Names are not checked
+    // The deny list restored from the document header `index.json`'s `toolSettings` block
+    // (./persistence.ts:2302). Names are not checked
     // against the catalogue, and no name is dropped for being harness-owned (see the header).
     values?: HarnessToolSettingsRecord;
 };
@@ -130,7 +131,7 @@ export type HarnessToolSettingsStore = {
      * store owner's decision (./sessions.ts `updateToolEnabled`).
      */
     setEnabled: (name: string, enabled: boolean) => void;
-    /** The `state.json` projection: `{}` when nothing is off, else `{ disabled: [...] }`. */
+    /** The `index.json` `toolSettings` projection: `{}` when nothing is off, else `{ disabled: [...] }`. */
     snapshot: () => HarnessToolSettingsRecord;
     /** Replace the whole set with a restored document (no revision bump: a boot is not a write). */
     restore: (values?: HarnessToolSettingsRecord) => void;

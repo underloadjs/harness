@@ -21,7 +21,8 @@
 //                  ./session-plugins-api.test.ts owns). A TEMPLATE write reaches an existing
 //                  session's plugin by NOTHING; it moves only the store a session created AFTER
 //                  it is seeded from - pinned by the companion case in the R2 block below.
-//   5. DURABLE   - `state.json` carries the override and nothing else, and a fresh runtime on
+//   5. DURABLE   - the persisted header document (`index.json`) carries the override and
+//                  nothing else, and a fresh runtime on
 //                  the same root boots with it (both through `GET /plugins` and through the
 //                  provider a new session would read). A deployment that never edited anything
 //                  writes no `pluginSettings` field at all.
@@ -40,9 +41,12 @@
 //   - ../plugins/context-compaction.plugin.ts — the settings the acceptance criteria name
 //   - ./api.ts                        — `getPlugins` / `patchPlugin` and the route table
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+// v2 layout readers/writers (./persistence-test-helpers.ts): the header document plus the shard
+// each field belongs to, reassembled into the one-document view these pins state.
+import { readPersistedDocument, writePersistedDocument } from './persistence-test-helpers';
 import { fileURLToPath } from 'node:url';
 
 import { agent, harness } from '../harness';
@@ -124,7 +128,7 @@ const SCRATCH_ROOT = join(WORKSPACE_ROOT, 'Temp', 'T5');
 // One scratch database per durability test, under the repo's scratch root
 // (AGENTS.md: throwaway work lives in `Temp/`, never in OS temp). Module-scoped
 // because BOTH durability describes need it — the declared-key round trip and the
-// R2 reserved-`enabled` round trip read and hand-edit the same `state.json`.
+// R2 reserved-`enabled` round trip read and hand-edit the same persisted shards.
 // ---------------------------------------------------------------------------
 
 const roots: string[] = [];
@@ -140,13 +144,15 @@ const fixture = async (): Promise<string> => {
     return root;
 };
 
-const fileOf = (root: string): string => join(root, 'harness', 'state.json');
-
-const documentOf = (root: string): Record<string, any> =>
-    JSON.parse(readFileSync(fileOf(root), 'utf8')) as Record<string, any>;
+// v2 layout: this suite pins the document HEADER (`pluginSettings`) AND one session field
+// (`pluginDiagnostics`), so `documentOf` reassembles the shards into the one-document view the
+// assertions were written against, and `writeDocument` fans a hand-edited document back out to
+// the shard each field belongs to (the header for the settings block, `sessions/<id>/session.json`
+// for a session field). Expected values are unchanged; only the file layout moved.
+const documentOf = (root: string): Record<string, any> => readPersistedDocument(root);
 
 const writeDocument = async (root: string, document: unknown): Promise<void> => {
-    await writeFile(fileOf(root), JSON.stringify(document, null, 2), 'utf8');
+    writePersistedDocument(root, document as Record<string, any>);
 };
 
 afterEach(async () => {
@@ -1362,11 +1368,10 @@ describe('the server installs a plugin-diagnostic sink (T1.5 last mile)', () => 
         return root;
     };
 
-    const documentOf = (root: string): Record<string, any> =>
-        JSON.parse(readFileSync(join(root, 'harness', 'state.json'), 'utf8')) as Record<string, any>;
+    const documentOf = (root: string): Record<string, any> => readPersistedDocument(root);
 
-    // T25: waits for a DEFERRED best-effort checkpoint to reach `state.json`. A state change
-    // inside one `VIEW_CHECKPOINT_INTERVAL_MS` window no longer rewrites the document
+    // T25: waits for a DEFERRED best-effort checkpoint to reach the persisted shards. A state
+    // change inside one `VIEW_CHECKPOINT_INTERVAL_MS` window no longer rewrites them
     // synchronously; ./sessions.ts `scheduleCheckpoint` commits it at the end of that window,
     // and this polls the bytes until it has (the budget is that bound with slack; running it
     // out is the failure, because it means the deferred commit never happened). Iteration-
@@ -1384,7 +1389,7 @@ describe('the server installs a plugin-diagnostic sink (T1.5 last mile)', () => 
             await new Promise((resolve) => setTimeout(resolve, 25));
         }
 
-        throw new Error(`state.json did not reach the expected shape within ${budgetMs} ms.`);
+        throw new Error(`the persisted shards did not reach the expected shape within ${budgetMs} ms.`);
     };
 
     afterEach(async () => {
@@ -1540,7 +1545,7 @@ describe('plugin settings survive a restart', () => {
     // The scratch helpers (`fixture`, `documentOf`, `writeDocument`) and their `afterEach`
     // are module-scoped now, because the R2 enablement round trip below uses them too.
 
-    it('writes only the override to state.json and restores it on the next boot', async () => {
+    it('writes only the override to the persisted header and restores it on the next boot', async () => {
         const root = await fixture();
         const first = createRuntime({ root });
 

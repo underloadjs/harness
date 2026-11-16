@@ -11,7 +11,8 @@
 //      binding does not leak into another session of the same store, and a retired profile
 //      cannot be newly selected;
 //   4. DURABILITY, the part every earlier in-memory test could fake: a SECOND process opened
-//      from `<root>/harness/state.json` through `HarnessPersistence.load()` — the reader, not a
+//      from `<root>/harness/` (v2: `index.json` plus `sessions/<id>/session.json`) through
+//      `HarnessPersistence.load()` — the reader, not a
 //      raw document injection — still has the bound member, still runs the overridden
 //      instruction text, and still names the conversation (the `title` field this owner also
 //      fixed in `readSessionRecord`) and keeps the operator defaults (`globalSettings` in
@@ -44,7 +45,10 @@ import { agentInstruction } from '../agents';
 import { effectiveAgentProfile } from './harnesses/agent-state';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
-import { HARNESS_DATABASE_FILE, HarnessPersistence } from './persistence';
+import { HarnessPersistence } from './persistence';
+// v2 layout readers (./persistence-test-helpers.ts): the reassembled database is read through
+// the helper rather than one raw file, so the durability pins below cover every shard.
+import { readPersistedDocument } from './persistence-test-helpers';
 import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { SessionStore } from './sessions';
@@ -95,10 +99,12 @@ const tempRoot = (label: string): string => {
     return root;
 };
 
-const stateFile = (root: string): string => path.join(root, 'harness', HARNESS_DATABASE_FILE);
-
-const readDocument = (root: string): Record<string, any> =>
-    JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+// v2 layout: the header document is `index.json` and each session is its own shard
+// (`sessions/<id>/session.json`, transcripts under `sessions/<id>/threads/`). `readDocument`
+// keeps the ONE-document view these pins are written against — including the `database` option
+// value it is fed back into, which is the unchanged in-memory `HarnessDatabase` shape — by
+// reassembling the shards in `index.json` order. A missing header still throws, as before.
+const readDocument = (root: string): Record<string, any> => readPersistedDocument(root);
 
 // An in-memory pair (no database root) for the behavior cases, and a file-backed one for the
 // restart case.

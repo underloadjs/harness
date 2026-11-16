@@ -26,7 +26,8 @@
 //   - and the ALREADY-COMMITTED prefix may be rewritten IN PLACE only by the lane holding the
 //     digest of that prefix (`transcript:patch`, pipeline T4.1). That is what makes a plugin's
 //     `setIncluded`/`edit` durable under `threadExecution: 'worker'`: the write is canonical and
-//     notified on the authority, so `state.json` captures it, while a concurrent rewrite of the
+//     notified on the authority, so that session's `session.json` shard captures it
+//     (./persistence.ts), while a concurrent rewrite of the
 //     same prefix is a refusal with the canonical facts in the receipt — never a silent overwrite.
 //   - one WRITER LEASE per shared conversation: a second lane delegating to the same
 //     agent's default conversation is refused and takes its own child conversation

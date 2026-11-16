@@ -1,4 +1,4 @@
-// Worker IO end to end, over a REAL worker thread (R1/R2/R4 acceptance).
+// Worker IO end to end, over a REAL worker thread (R1/R2/R4/R5 acceptance).
 //
 // Every test here drives the coordinator-side client against an ACTUAL spawned worker running
 // the package's OWN entry: `src/server/workers/io-worker.ts`, loaded by the thread through
@@ -7,23 +7,41 @@
 // exactly the integration the build owner depends on.
 //
 // What is asserted, and why it is the acceptance list:
-//   - ordered save/journal/barrier: the queue, not the caller, guarantees a journal line
-//     precedes the checkpoint that references it,
+//   - ordered shard commit (R5): one document becomes `<dir>/index.json` plus one
+//     `session.json` and one file per thread, posted threads-first (the journal fence
+//     lands before the first rename), and a coalesced burst posts one frame PER PATH in
+//     that same order - the queue, not the caller, guarantees it,
 //   - error propagation: a refused write rejects with the message the inline writer
-//     throws (no false success), and a queued write reports through the inline error
+//     throws (no false success), the sticky error channel describes the FIRST failing
+//     shard (inline parity), and a queued write reports through the inline error
 //     channels (no silent loss),
+//   - per-path accounting (R5): supersession, size measurement and refusal are tracked
+//     per SHARD FILE, so one oversized conversation neither freezes the other shards nor
+//     hides behind a composite number,
 //   - close: outstanding work is fenced, later work is refused rather than dropped,
 //   - round-trip load: the bytes the worker wrote are read back by the store's own
 //     `HarnessPersistence.load()` / `HarnessJournal.read()`, with no worker involved.
 //
 // Durability claims are checked as STATED, never relaxed: an append answers 'written',
-// a flush and a checkpoint answer 'durable' (./io-protocol.ts).
+// a flush and every shard save answer 'durable' (./io-protocol.ts).
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { HarnessJournal } from '../journal';
-import { HarnessPersistence, serializeHarnessDatabase } from '../persistence';
+import {
+    HARNESS_DATABASE_VERSION,
+    HARNESS_INDEX_FILE,
+    HarnessPersistence,
+    harnessIndexDocumentOf,
+    harnessSessionDirectoryOf,
+    harnessSessionFileOf,
+    harnessShardFileOf,
+    harnessThreadDirectoryOf,
+    harnessThreadFileOf,
+    serializeHarnessShard,
+    splitHarnessSessionRecord
+} from '../persistence';
 import type { HarnessDatabase } from '../persistence';
 import {
     HarnessIoError,
@@ -60,10 +78,17 @@ const tempRoot = (label: string): string => {
     return root;
 };
 
+// Path literals inside an expected MESSAGE need escaping before they go into a RegExp -
+// the refusal sentences quote the shard file, and a path is full of regex syntax.
+const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// The persistence TARGET this client is handed, spelled the way v2's `HarnessPersistence`
+// spells it: `file` is the index header, and it is only the subject of operator-facing
+// messages - every shard path comes from A1's layout primitives (the helpers below).
 const target = (root: string): { directory: string; file: string } => {
     const directory = path.join(root, 'harness');
 
-    return { directory, file: path.join(directory, 'state.json') };
+    return { directory, file: path.join(directory, HARNESS_INDEX_FILE) };
 };
 
 // The store's own reader is the judge of these records: `definition`/`preset` carry
@@ -96,8 +121,12 @@ const DEFINITION = {
     editable: true
 };
 
+// R5: the conversation content lives in `core.threads[]` - the rows A1's splitter moves
+// into `threads/<id>.json`. The id matches `HARNESS_THREAD_ID_PATTERN`, so the transcript
+// DOES split into its own shard (a foreign id would stay inline, and these tests would
+// silently stop covering the thread file).
 const document = (marker: string, events = 0): HarnessDatabase => ({
-    version: 1,
+    version: HARNESS_DATABASE_VERSION,
     savedAt: 1,
     registry: [],
     sessions: [
@@ -123,10 +152,42 @@ const document = (marker: string, events = 0): HarnessDatabase => ({
                 }
             ],
             queue: [],
-            core: { version: 1, agents: {}, memory: {} } as never
+            core: {
+                version: 1,
+                agents: {},
+                memory: {},
+                threads: [{ id: 'thread-1', title: 't', messages: [{ role: 'user', text: `transcript-${marker}` }] }]
+            } as never
         }
     ]
 });
+
+// The three shard files of `document(...)` for one root, derived through A1's own layout
+// primitives - the tests pin WHERE the client wrote, so the expectation must come from the
+// layout owner, not from a re-spelled literal.
+const shardFiles = (root: string): { index: string; session: string; thread: string } => {
+    const directory = path.join(root, 'harness');
+
+    return {
+        index: path.join(directory, HARNESS_INDEX_FILE),
+        session: harnessShardFileOf({ kind: 'session', directory: harnessSessionDirectoryOf(directory, 'session-1') } as never),
+        thread: harnessShardFileOf({ kind: 'thread', directory: harnessThreadDirectoryOf(directory, 'session-1'), id: 'thread-1', messages: [] } as never)
+    };
+};
+
+// The EXACT bytes each shard must hold for one document - the same units the client's
+// split builds, serialized by the same serializer the worker uses. Keyed by shard file.
+const shardTexts = (root: string, doc: HarnessDatabase, savedAt: number): Record<string, string> => {
+    const files = shardFiles(root);
+    const { record: stored } = splitHarnessSessionRecord(doc.sessions[0]);
+    const marker = doc.sessions[0].turns[0].id.replace('turn-', '');
+
+    return {
+        [files.thread]: serializeHarnessShard({ kind: 'thread', directory: path.dirname(files.thread), sessionId: 'session-1', id: 'thread-1', messages: [{ role: 'user', text: `transcript-${marker}` }] }),
+        [files.session]: serializeHarnessShard({ kind: 'session', directory: path.dirname(files.session), sessionId: 'session-1', record: stored }),
+        [files.index]: serializeHarnessShard({ kind: 'index', directory: path.dirname(files.index), document: harnessIndexDocumentOf(doc, savedAt) })
+    };
+};
 
 const openClient = async (root: string, options: Partial<HarnessIoClientOptions> = {}): Promise<HarnessIoClient> => {
     const client = await createHarnessIoClient({ persistence: target(root), entry, ...options });
@@ -173,11 +234,19 @@ describe('startup', () => {
             failed: 0,
             faults: 0,
             superseded: 0,
+            supersededByPath: {},
             refused: 0,
             late: 0,
             writtenBytes: 0,
-            lastCheckpointBytes: 0,
-            lastCheckpointDurationMs: 0,
+            // A skip is a worker answer, and the worker has answered nothing yet — `hello` is a
+            // control frame. This is the counter that separates "the store saved and the disk
+            // barely moved" (skips) from "the store saved and the disk moved a lot" (writes).
+            skippedShards: 0,
+            // R5: size accounting is PER SHARD FILE, and both maps start empty - no shard
+            // has been measured or written yet. `hello` is a control frame, not an
+            // operation, so the same reasoning that keeps `posted` at 0 keeps these empty.
+            lastShardBytes: {},
+            lastShardDurationMs: 0,
             // Per-kind posting starts empty for the same reason `posted` is 0: `hello` is a
             // control frame, so nothing has left this thread yet.
             postedByKind: {},
@@ -242,8 +311,11 @@ describe('startup', () => {
 
         client.queueJournalAppend('sess-early', { turnId: 't1', index: 0, at: 1, event: { type: 'text', agent: 'a', delta: 'early' } });
 
-        // Nothing has reached the port yet: both operations are registered, not written.
-        expect(client.pending()).toEqual({ operations: 2, gated: 2, lastFrameBytes: 0, coalescedCheckpoint: false });
+        // Nothing has reached the port yet: every operation is registered, not written.
+        // R5: the strict save is THREE frames (thread, session, index), so a v1 pair of
+        // operations is now four - and `measuredShards` is still 0 because no worker has
+        // measured anything yet.
+        expect(client.pending()).toEqual({ operations: 4, gated: 4, coalescedShards: 0, measuredShards: 0 });
         expect(client.stats().posted).toBe(0);
 
         await client.ready();
@@ -251,8 +323,8 @@ describe('startup', () => {
         expect((await save).outcome).toBe('durable');
         await client.barrier();
 
-        expect(client.stats().posted).toBe(2);
-        expect(client.pending()).toEqual({ operations: 0, gated: 0, lastFrameBytes: expect.any(Number), coalescedCheckpoint: false });
+        expect(client.stats().posted).toBe(4);
+        expect(client.pending()).toEqual({ operations: 0, gated: 0, coalescedShards: 0, measuredShards: 3 });
         expect(new HarnessPersistence(root).load()?.sessions[0]?.turns[0]?.id).toBe('turn-early');
         expect(new HarnessJournal(path.join(root, 'harness'), 'sess-early').read().events).toHaveLength(1);
     });
@@ -339,12 +411,20 @@ describe('durable checkpoint', () => {
 
         const receipt = await client.saveCheckpoint(doc, { savedAt });
 
+        const files = shardFiles(root);
+        const texts = shardTexts(root, doc, savedAt);
+
+        // The resolved promise carries the TERMINAL unit - the `index.json` write that
+        // makes the whole commit load-bearing - and it names the file it committed. The
+        // thread (call 1) and session (call 2) frames went out first, in `IO_SHARD_ORDER`,
+        // and each got its own durable receipt inside the commit.
         expect(receipt).toEqual({
-            callId: 1,
-            kind: 'checkpoint.save',
+            callId: 3,
+            kind: 'shard.save',
             outcome: 'durable',
             durationMs: expect.any(Number),
-            bytes: serializeHarnessDatabase(doc, savedAt).length
+            bytes: texts[files.index].length,
+            path: files.index
         });
 
         // Restart semantics: a FRESH persistence instance over the same root, no worker.
@@ -352,11 +432,26 @@ describe('durable checkpoint', () => {
 
         expect(loaded?.savedAt).toBe(savedAt);
         expect(loaded?.sessions[0]?.turns[0]?.id).toBe('turn-worker');
+        // The transcript came back from ITS OWN file - the split round-trips.
+        expect((loaded?.sessions[0]?.core as unknown as { threads: { id: string; messages: unknown }[] }).threads[0].messages).toEqual([
+            { role: 'user', text: 'transcript-worker' }
+        ]);
 
-        // The atomic replacement left nothing behind, and the file is byte-identical to
-        // what the inline writer produces for the same document.
-        expect(fs.readdirSync(target(root).directory)).toEqual(['state.json']);
-        expect(fs.readFileSync(target(root).file, 'utf8')).toBe(serializeHarnessDatabase(doc, savedAt));
+        // The atomic replacements left nothing staging behind, and EVERY shard file is
+        // byte-identical to what the inline writer produces for the same unit - the
+        // property that keeps both write modes readable by each other.
+        expect(fs.readdirSync(target(root).directory).sort()).toEqual([HARNESS_INDEX_FILE, 'sessions']);
+
+        for (const [file, text] of Object.entries(texts)) expect(fs.readFileSync(file, 'utf8')).toBe(text);
+
+        // Per-path accounting: exactly the three shards were measured, each with its own
+        // true size - no composite number exists anywhere.
+        expect(client.stats().lastShardBytes).toEqual({
+            [files.thread]: texts[files.thread].length,
+            [files.session]: texts[files.session].length,
+            [files.index]: texts[files.index].length
+        });
+        expect(client.stats().writtenBytes).toBe(Object.values(texts).reduce((total, text) => total + text.length, 0));
 
         const summary = await client.close();
 
@@ -376,7 +471,7 @@ describe('durable checkpoint', () => {
         const client = await createHarnessIoClient({
             persistence: {
                 directory: path.join(workerRoot, 'occupied', 'harness'),
-                file: path.join(workerRoot, 'occupied', 'harness', 'state.json')
+                file: path.join(workerRoot, 'occupied', 'harness', HARNESS_INDEX_FILE)
             },
             entry
         });
@@ -418,25 +513,104 @@ describe('durable checkpoint', () => {
         const stats = client.stats();
 
         expect(stats.completed).toBe(0);
-        expect(stats.failed).toBe(1);
+        // All THREE posted units hit the blocker - the queue could not know the first one
+        // would fail. They are counted per operation, not folded into one composite
+        // failure, and the rejection names the FIRST one, in posted order.
+        expect(stats.failed).toBe(3);
         expect(stats.outstanding).toBe(0);
+
+        // R5's parity rule for the sticky channel: the inline `save()` THROWS at its first
+        // failing unit and never reaches the rest, so `lastError()`/`lastErrorPath()` must
+        // describe THAT failure - the thread shard - even though the session and index
+        // frames failed afterwards and are recorded under their own paths.
+        expect(client.lastErrorPath()).toBe(path.join(workerRoot, 'occupied', 'harness', 'sessions', 'session-1', 'threads', 'thread-1.json'));
+        expect(error?.path).toBe(path.join(workerRoot, 'occupied', 'harness', 'sessions', 'session-1', 'threads', 'thread-1.json'));
     });
 
-    it('never reports success for a document the worker refused for size', async () => {
+    it('commits the shards that fit and refuses only the oversized one, per path', async () => {
+        // R5 in one test: under v1 a 256-byte bound made the WHOLE database uncommittable.
+        // Under R5 the same document splits, the fat session shard is refused with its own
+        // name and measured size, and the small thread and index shards commit anyway -
+        // reported per unit, never as a composite claim.
         const root = tempRoot('frame-bound');
         const client = await openClient(root, { maxFrameBytes: 256 });
+        const files = shardFiles(root);
+        const doc = document('huge', 200);
 
-        await expect(client.saveCheckpoint(document('huge', 200))).rejects.toThrow(/above the 256 byte IO frame limit/);
+        await expect(client.saveCheckpoint(doc)).rejects.toThrow(new RegExp(`The session shard ${escapeRegex(files.session)} is \\d+ bytes, above the 256 byte IO frame limit\\.`));
 
-        // Nothing was written, and the estimate now blocks further clones of a database
-        // that is permanently too large.
-        expect(new HarnessPersistence(root).load()).toBeUndefined();
-        expect(client.stats().refused).toBe(0);
+        // Refused means the SESSION shard was not written - but the other two were, and
+        // the per-path measurement is now in place so the next save of the same fat shard
+        // is refused CLIENT-SIDE, without another clone of the oversized conversation.
+        expect(fs.existsSync(files.session)).toBe(false);
+        expect(fs.existsSync(files.thread)).toBe(true);
+        expect(fs.existsSync(files.index)).toBe(true);
+
+        expect(client.stats().refused).toBe(0); // the WORKER decided the first refusal
         expect(client.stats().failed).toBe(1);
 
-        await expect(client.saveCheckpoint(document('huge', 200))).rejects.toThrow(/measured .* above the 256 byte frame limit/);
+        const measured = client.stats().lastShardBytes[files.session];
 
-        expect(client.stats().refused).toBe(1);
+        expect(measured).toBeTypeOf('number');
+        expect(client.lastErrorPath()).toBe(files.session);
+
+        await expect(client.saveCheckpoint(doc)).rejects.toThrow(/measured \d+ bytes on its last measurement, above the 256 byte frame limit/);
+
+        expect(client.stats().refused).toBe(1); // now the CLIENT refuses it, per path
+        // A refusal is NOT a failure: the second save posted no frame for the oversized
+        // path, so `failed` still only counts the ONE worker-side failure of the first
+        // save (the v1 pair of counters keeps its distinct meanings under R5).
+        expect(client.stats().failed).toBe(1);
+
+        // A refusal never produced a worker reply, so the per-path measurement never shrinks
+        // on its own - the SAME sticky guard v1 had, narrowed from the whole document to the
+        // ONE path that was measured oversized. The siblings still commit under it, which is
+        // the part v1 could not do: a 256-byte bound used to make the entire state
+        // uncommittable, where now only the oversized shard is held back.
+        const smaller = document('fit', 1);
+
+        await expect(client.saveCheckpoint(smaller)).rejects.toThrow(/measured \d+ bytes on its last measurement, above the 256 byte frame limit/);
+
+        expect(fs.existsSync(files.thread)).toBe(true);
+        expect(fs.existsSync(files.index)).toBe(true);
+        expect(fs.existsSync(files.session)).toBe(false);
+        expect(client.lastErrorPath()).toBe(files.session);
+
+        // The index header lists a session whose record file never arrived, so the store
+        // cannot load this state - the same torn-set rule the inline writer reports
+        // (../persistence.ts:2650).
+        expect(() => new HarnessPersistence(root).load()).toThrow(/record file is missing/);
+
+        // The measurement cache belongs to the CLIENT, not to the disk: a fresh client that
+        // has never seen the fat shard commits the SAME path, at a bound exactly large
+        // enough for the shard this document decomposes into.
+        const fitTexts = shardTexts(root, smaller, 1_700_000_000_008);
+        const fitBound = Math.max(...Object.values(fitTexts).map((text) => text.length));
+        const fresh = await openClient(root, { maxFrameBytes: fitBound });
+
+        await expect(fresh.saveCheckpoint(smaller, { savedAt: 1_700_000_000_008 })).resolves.toMatchObject({ outcome: 'durable' });
+
+        for (const [file, text] of Object.entries(fitTexts)) expect(fs.readFileSync(file, 'utf8')).toBe(text);
+
+        expect(new HarnessPersistence(root).load()?.sessions[0]?.turns[0]?.id).toBe('turn-fit');
+    });
+
+    it('refuses every oversized shard of one document and writes nothing at all', async () => {
+        // The degenerate case: a bound below EVERY unit's size refuses all three paths.
+        // Nothing is written, nothing claims durability, and the client-side guard then
+        // refuses the whole request without posting a frame per path.
+        const root = tempRoot('frame-bound-all');
+        const client = await openClient(root, { maxFrameBytes: 64 });
+
+        await expect(client.saveCheckpoint(document('huge', 200))).rejects.toThrow(/above the 64 byte IO frame limit/);
+
+        expect(new HarnessPersistence(root).load()).toBeUndefined();
+        expect(client.stats().refused).toBe(0);
+        expect(client.stats().failed).toBe(3);
+
+        await expect(client.saveCheckpoint(document('huge', 200))).rejects.toThrow(/measured \d+ bytes on its last measurement, above the 64 byte frame limit/);
+
+        expect(client.stats().refused).toBe(3);
     });
 });
 
@@ -457,6 +631,15 @@ describe('journal through the worker', () => {
         expect(committed.fenced).toEqual([sessionId]);
         expect(committed.checkpoint.outcome).toBe('durable');
 
+        // R5: the commit receipt names EVERY shard it wrote, in posted (disk) order -
+        // threads first, the session file that lists them second, the index last. The
+        // `checkpoint` field is that terminal index write, not an unnamed composite.
+        const files = shardFiles(root);
+
+        expect(committed.units.map((unit) => unit.path)).toEqual([files.thread, files.session, files.index]);
+        expect(committed.units.every((unit) => unit.outcome === 'durable')).toBe(true);
+        expect(committed.checkpoint).toBe(committed.units[2]);
+
         const read = new HarnessJournal(path.join(root, 'harness'), sessionId).read();
 
         expect(read.problems).toEqual([]);
@@ -468,11 +651,16 @@ describe('journal through the worker', () => {
             [3, 'd']
         ]);
 
-        // Four appends, then the commit's flush and checkpoint. The handshake and the
-        // close frames are controls, not operations, and are not counted (./io-client.ts).
-        expect(client.stats().posted).toBe(6);
-        expect(client.stats().completed).toBe(6);
+        // Four appends, the commit's flush, then the commit's THREE shard frames (thread,
+        // session, index - `IO_SHARD_ORDER`, posted after the flush so the fence lands
+        // before the first rename). The handshake and the close frames are controls, not
+        // operations, and are not counted (./io-client.ts).
+        expect(client.stats().posted).toBe(8);
+        expect(client.stats().completed).toBe(8);
         expect(client.stats().failed).toBe(0);
+        // `postedByKind` is where "the fence was posted, and the commit was three shards,
+        // in the order the disk must see" is a NUMBER an operator can read.
+        expect(client.stats().postedByKind).toEqual({ 'journal.append': 4, 'journal.flush': 1, 'shard.save': 3 });
         expect(new HarnessPersistence(root).load()?.sessions[0]?.turns[0]?.id).toBe('turn-ordered');
 
         // An awaited append answers 'written', never 'durable': the append's own receipt
@@ -595,9 +783,14 @@ describe('journal through the worker', () => {
         const root = tempRoot('timeout');
         const client = await openClient(root, { opTimeoutMs: 1 });
 
-        // 8000 recorded events is a document the worker needs several milliseconds to
-        // serialize, write and fsync, so a 1ms watchdog cannot race its way to a success.
-        await expect(client.saveCheckpoint(document('slow', 8_000))).rejects.toThrow(/did not answer checkpoint.save \(call 1\) within 1ms/);
+        // R5 moved this test off `saveCheckpoint`: a shard is small and fast, so "the
+        // first frame is still busy when the watchdog fires" is no longer something a
+        // document size can guarantee. ONE journal append carrying a 32 MB event is: the
+        // worker serializes, `writeSync`s and fsyncs that line synchronously, so the
+        // single outstanding frame is definitely still busy when a 1ms watchdog fires.
+        const heavy = 'x'.repeat(32 * 1024 * 1024);
+
+        await expect(client.journalAppend('sess-slow', { turnId: 't1', index: 0, at: 1, event: { type: 'text', agent: 'a', delta: heavy } })).rejects.toThrow(/did not answer journal.append \(call 1\) within 1ms/);
 
         expect(client.stats().failed).toBe(1);
         expect(client.stats().outstanding).toBe(0);
@@ -611,31 +804,79 @@ describe('journal through the worker', () => {
         expect(summary.failures).toEqual([]);
         expect(client.stats().late).toBe(1);
         expect(client.stats().completed).toBe(0);
+
+        // "Timed out" is not "lost": the line DID reach the file, and the reader — not the
+        // receipt — is the judge.
+        expect(new HarnessJournal(path.join(root, 'harness'), 'sess-slow').read().events).toHaveLength(1);
     });
 });
 
 describe('coalescing and barriers', () => {
-    it('collapses a synchronous burst of best-effort checkpoints into one commit', async () => {
+    it('collapses a synchronous burst of best-effort checkpoints into one write per shard', async () => {
         const root = tempRoot('coalesce');
         const client = await openClient(root);
 
         // Five observer fires in one synchronous turn (a burst of `noteStateChange`):
-        // only the newest document is worth serializing, and the client must say so.
+        // under R5 each request SPLITS, and the newest payload wins PER SHARD PATH. The
+        // deferred slot holds three entries (thread, session, index) - not one document -
+        // and every earlier payload for the same path is superseded.
         for (const marker of ['one', 'two', 'three', 'four', 'five']) client.queueCheckpointSave(document(marker));
 
-        expect(client.pending()).toEqual({ operations: 0, gated: 0, lastFrameBytes: 0, coalescedCheckpoint: true });
+        expect(client.pending()).toEqual({ operations: 0, gated: 0, coalescedShards: 3, measuredShards: 0 });
 
         await client.barrier();
 
-        expect(client.stats().superseded).toBe(4);
-        // Five queued saves, ONE frame: the coalescing is visible in the counter that
-        // says what was dropped, and in the fact that only one commit was posted.
-        expect(client.stats().posted).toBe(1);
+        // Five requests, four of them replaced before they ever left this thread: four
+        // supersessions PER PATH, twelve in total.
+        expect(client.stats().superseded).toBe(12);
+
+        const files = shardFiles(root);
+
+        expect(client.stats().supersededByPath).toEqual({
+            [files.thread]: 4,
+            [files.session]: 4,
+            [files.index]: 4
+        });
+
+        // Five queued saves, THREE frames - one per path - and the coalescing is visible
+        // in the counters that say what was dropped. The posted ORDER is `IO_SHARD_ORDER`,
+        // not insertion order: the burst filled the map thread-first... it does, but an
+        // out-of-order burst must still land disk-ordered, and the receipt order below is
+        // how the test sees it.
+        expect(client.stats().posted).toBe(3);
+        expect(client.stats().postedByKind).toEqual({ 'shard.save': 3 });
 
         const loaded = new HarnessPersistence(root).load();
 
         expect(loaded?.sessions[0]?.turns[0]?.id).toBe('turn-five');
-        expect(client.pending().coalescedCheckpoint).toBe(false);
+        // The surviving thread shard is the NEWEST transcript - a coalesced-away older
+        // payload never reached the disk.
+        expect((loaded?.sessions[0]?.core as unknown as { threads: { id: string; messages: { text: string }[] }[] }).threads[0].messages[0].text).toBe('transcript-five');
+        expect(client.pending().coalescedShards).toBe(0);
+    });
+
+    it('supersedes deferred shards per path when a strict commit covers them', async () => {
+        const root = tempRoot('strict-supersede-path');
+        const client = await openClient(root);
+
+        client.queueCheckpointSave(document('stale'));
+
+        // A strict save of a DIFFERENT (smaller) document covers all three paths too: the
+        // whole deferred map is subsumed, and it is counted per path.
+        await client.saveCheckpoint(document('current'), { savedAt: 1_700_000_000_007 });
+
+        const files = shardFiles(root);
+
+        expect(client.stats().superseded).toBe(3);
+        expect(client.stats().supersededByPath).toEqual({
+            [files.thread]: 1,
+            [files.session]: 1,
+            [files.index]: 1
+        });
+
+        // Nothing was written twice: the stale document never reached the disk.
+        expect(fs.readFileSync(files.session, 'utf8')).toContain('turn-current');
+        expect(fs.readFileSync(files.thread, 'utf8')).toContain('transcript-current');
     });
 
     it('lets a strict save supersede the pending document but fences queued appends', async () => {
@@ -649,7 +890,8 @@ describe('coalescing and barriers', () => {
         const receipt = await client.saveCheckpoint(document('current'), { savedAt: 1_700_000_000_003 });
 
         expect(receipt.outcome).toBe('durable');
-        expect(client.stats().superseded).toBe(1);
+        // The queued save is now three shard writes, so superseding it counts three times.
+        expect(client.stats().superseded).toBe(3);
         expect(new HarnessPersistence(root).load()?.sessions[0]?.turns[0]?.id).toBe('turn-current');
 
         // Order survived the coalescing: the append queued BEFORE the strict save ran
@@ -718,11 +960,27 @@ describe('main-thread accounting', () => {
         await client.saveCheckpoint(doc, { savedAt });
 
         const stats = client.stats();
+        // R5 measures PER SHARD FILE: the total is the sum of the three shard bodies, and
+        // each path carries its own true byte count and its own off-thread duration.
+        const files = shardFiles(root);
+        const texts = shardTexts(root, doc, savedAt);
+        const totalBytes = Object.values(texts).reduce((sum, text) => sum + text.length, 0);
 
-        expect(stats.writtenBytes).toBe(serializeHarnessDatabase(doc, savedAt).length);
-        expect(stats.lastCheckpointBytes).toBe(serializeHarnessDatabase(doc, savedAt).length);
-        expect(stats.lastCheckpointDurationMs).toBeTypeOf('number');
-        expect(client.pending().lastFrameBytes).toBe(stats.lastCheckpointBytes);
+        expect(stats.writtenBytes).toBe(totalBytes);
+        expect(stats.lastShardBytes).toEqual({
+            [files.thread]: texts[files.thread].length,
+            [files.session]: texts[files.session].length,
+            [files.index]: texts[files.index].length
+        });
+        // The duration stays "the last write" (v1 semantics); the per-shard durations ride
+        // on each receipt the commit returns.
+        expect(stats.lastShardDurationMs).toBeTypeOf('number');
+        // The worker-side clock is monotonic and the writes are real, so the duration is
+        // finite and plausible. `> 0` is not asserted: two syscalls can land in one coarse
+        // clock tick, and pinning that would be machine-dependent.
+        expect(stats.lastShardDurationMs).toBeLessThan(1_000);
+
+        expect(client.pending().measuredShards).toBe(3);
 
         const onCheckpointError = vi.fn();
         const second = await openClient(root, { onCheckpointError });
@@ -732,5 +990,243 @@ describe('main-thread accounting', () => {
         // A success clears the sticky error, as `lastWriteError` does inline.
         expect(second.lastError()).toBeUndefined();
         expect(onCheckpointError).not.toHaveBeenCalled();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Worker-mode parity for the two things inline `save()` does that a
+// write-only queue cannot: NOT writing a shard whose bytes are already on
+// disk, and REMOVING the shards a commit stopped naming.
+// ---------------------------------------------------------------------------
+
+describe('worker-mode skip and removal', () => {
+    // `document(...)` covers one session with one conversation. These helpers vary the
+    // SESSION set (a dropped session, a re-added one) and the CONVERSATION set (a transcript
+    // retired by the 256-record cap), which are the two shapes of removal the store produces.
+    const documentOf = (...sessions: { id: string; threads: string[] }[]): HarnessDatabase => ({
+        version: HARNESS_DATABASE_VERSION,
+        savedAt: 1,
+        registry: [],
+        sessions: sessions.map(({ id, threads }) => ({
+            ...document(id).sessions[0],
+            id,
+            core: {
+                version: 1,
+                agents: {},
+                memory: {},
+                threads: threads.map((threadId) => ({ id: threadId, title: 't', messages: [{ role: 'user', text: `transcript-${threadId}` }] }))
+            }
+        })) as never
+    });
+
+    const pathsOf = (root: string, sessionId: string, threadId = 'thread-1') => {
+        const directory = path.join(root, 'harness');
+        const sessionDirectory = harnessSessionDirectoryOf(directory, sessionId);
+
+        return {
+            record: harnessSessionFileOf(directory, sessionId),
+            thread: harnessThreadFileOf(directory, sessionId, threadId),
+            threads: harnessThreadDirectoryOf(directory, sessionId),
+            // The journal is the STORE's footprint (./sessions.ts), never the header's.
+            events: path.join(sessionDirectory, 'events.jsonl'),
+            directory: sessionDirectory
+        };
+    };
+
+    it('saves an unchanged document again without touching a byte, and says so in its own counters', async () => {
+        // The digest skip is what worker mode had NOT replicated: inline compares the payload it is
+        // about to write with the bytes it last committed, and so does the worker — but only the
+        // worker can, because only the worker holds these bytes (the coordinator would have to hand
+        // the payload back, which is the stringify this mode exists to move off the loop).
+        const root = tempRoot('skip-accounting');
+        const client = await openClient(root);
+        const doc = document('same');
+        const savedAt = 1_700_000_002_000;
+        const files = shardFiles(root);
+        const texts = shardTexts(root, doc, savedAt);
+        const totalBytes = Object.values(texts).reduce((sum, text) => sum + text.length, 0);
+
+        await client.saveCheckpoint(doc, { savedAt });
+
+        const first = client.stats();
+        const inodes = { thread: fs.statSync(files.thread).ino, session: fs.statSync(files.session).ino, index: fs.statSync(files.index).ino };
+
+        expect(first.writtenBytes).toBe(totalBytes);
+        expect(first.skippedShards).toBe(0);
+
+        await client.saveCheckpoint(doc, { savedAt });
+
+        const second = client.stats();
+
+        // Three frames, three skips, and no byte written twice. `writtenBytes` counts what REACHED a
+        // file in this process, so a skip adds nothing to it — and `skippedShards` is the number that
+        // explains why `writtenBytes` did not move, which is the question an operator would otherwise
+        // have to guess at.
+        expect(second.skippedShards).toBe(3);
+        expect(second.writtenBytes).toBe(totalBytes);
+        expect(second.completed).toBe(6);
+        expect(second.posted).toBe(6);
+        expect(second.postedByKind).toEqual({ 'shard.save': 6 });
+
+        for (const kind of ['thread', 'session', 'index'] as const) {
+            expect(fs.statSync(files[kind]).ino).toBe(inodes[kind]);
+        }
+
+        // A payload that moved IS written again, and the counters separate the two cases instead of
+        // merging them: `savedAt` lives only in the index, so exactly one shard changed.
+        await client.saveCheckpoint(doc, { savedAt: savedAt + 1_000 });
+
+        const third = client.stats();
+
+        expect(third.skippedShards).toBe(5);
+        expect(third.writtenBytes).toBe(totalBytes + texts[files.index].length);
+        expect(fs.statSync(files.index).ino).not.toBe(inodes.index);
+        expect(fs.statSync(files.session).ino).toBe(inodes.session);
+        expect(fs.statSync(files.thread).ino).toBe(inodes.thread);
+    });
+
+    it('removes the shards a strict save stopped naming, and keeps the journal it never owned', async () => {
+        const root = tempRoot('erase-strict');
+        const client = await openClient(root);
+        const savedAt = 1_700_000_002_100;
+        const dropped = pathsOf(root, 'session-2');
+        const kept = pathsOf(root, 'session-1');
+
+        await client.saveCheckpoint(documentOf({ id: 'session-1', threads: ['thread-1'] }, { id: 'session-2', threads: ['thread-2'] }), { savedAt });
+
+        await client.journalAppend('session-2', { turnId: 't1', index: 0, at: 1, event: { type: 'text', agent: 'a', delta: 'kept' } });
+        await client.journalFlush('session-2');
+
+        expect(fs.existsSync(dropped.record)).toBe(true);
+        expect(fs.existsSync(dropped.threads)).toBe(true);
+        expect(fs.existsSync(dropped.events)).toBe(true);
+
+        await client.saveCheckpoint(documentOf({ id: 'session-1', threads: ['thread-1'] }), { savedAt });
+
+        // The removal is a frame, so it is observable rather than implied: one `shard.erase`, and the
+        // commit's own receipts still contain only shard saves.
+        expect(client.stats().postedByKind['shard.erase']).toBe(1);
+        expect(client.lastError()).toBeUndefined();
+
+        // Unawaited on purpose: the strict save answered as soon as the SHARDS were durable, exactly
+        // as inline `save()` answers before its best-effort collector runs. Draining the queue is what
+        // makes the removal observable — and it lands behind every write, which is the next test.
+        await client.barrier();
+
+        expect(fs.existsSync(dropped.record)).toBe(false);
+        expect(fs.existsSync(dropped.threads)).toBe(false);
+        // v1's outcome, unchanged: the row is erased and the journal is kept, and the session
+        // DIRECTORY is the store's to delete (./sessions.ts `remove()`).
+        expect(fs.existsSync(dropped.events)).toBe(true);
+        expect(fs.existsSync(dropped.directory)).toBe(true);
+        // The session the header still names is untouched.
+        expect(fs.existsSync(kept.record)).toBe(true);
+        expect(fs.existsSync(kept.thread)).toBe(true);
+        expect(JSON.parse(fs.readFileSync(path.join(root, 'harness', HARNESS_INDEX_FILE), 'utf8')).sessions).toEqual([{ id: 'session-1', ordinal: 1 }]);
+    });
+
+    it('removes only the transcript a commit stopped naming, keeping the live conversation', async () => {
+        // The 256-record cap (./sessions.ts `capThreadRecords`) retires CONVERSATIONS under a session
+        // that survives. The frame therefore names FILES, never the `threads/` directory — erasing the
+        // directory here would delete every other conversation of a live session.
+        const root = tempRoot('erase-thread');
+        const client = await openClient(root);
+        const savedAt = 1_700_000_002_200;
+        const retired = pathsOf(root, 'session-1', 'thread-2');
+        const kept = pathsOf(root, 'session-1', 'thread-1');
+
+        await client.saveCheckpoint(documentOf({ id: 'session-1', threads: ['thread-1', 'thread-2'] }), { savedAt });
+
+        expect(fs.existsSync(retired.thread)).toBe(true);
+
+        await client.saveCheckpoint(documentOf({ id: 'session-1', threads: ['thread-1'] }), { savedAt });
+        await client.barrier();
+
+        expect(fs.existsSync(retired.thread)).toBe(false);
+        expect(fs.existsSync(kept.thread)).toBe(true);
+        expect(fs.existsSync(retired.record)).toBe(true);
+        expect(client.stats().postedByKind['shard.erase']).toBe(1);
+    });
+
+    it('orders a queued removal BEHIND the queued writes it follows, so an orphan cannot come back', async () => {
+        // The race the FIFO ordering is the whole answer to. Both documents land in the deferred slot
+        // in one synchronous burst, and the slot still holds session-2's shards from the FIRST save:
+        // posting the removal first would write session-2 back AFTER it was removed, leaving a
+        // `session.json` no header names — a file `load()` ignores but every reader and every
+        // operator sees.
+        const root = tempRoot('erase-queued-order');
+        const client = await openClient(root);
+        const savedAt = 1_700_000_002_300;
+        const dropped = pathsOf(root, 'session-2');
+
+        client.queueCheckpointSave(documentOf({ id: 'session-1', threads: ['thread-1'] }, { id: 'session-2', threads: ['thread-2'] }), { savedAt });
+        client.queueCheckpointSave(documentOf({ id: 'session-1', threads: ['thread-1'] }), { savedAt });
+
+        await client.barrier();
+
+        expect(client.stats().postedByKind['shard.erase']).toBe(1);
+        expect(fs.existsSync(dropped.record)).toBe(false);
+        expect(fs.existsSync(dropped.threads)).toBe(false);
+        // And the writes the slot still held did run — they ran FIRST, which is the point.
+        expect(fs.existsSync(pathsOf(root, 'session-1').record)).toBe(true);
+    });
+
+    it('cancels a queued removal when a later document in the same burst re-names the session', async () => {
+        // A drop followed by a re-add inside one microtask is a document that never went away. The
+        // pending removal is dropped (the plan above re-derives anything still owed), so no frame
+        // lands after the write — and `shard.erase` is never posted at all.
+        const root = tempRoot('erase-cancelled');
+        const client = await openClient(root);
+        const savedAt = 1_700_000_002_400;
+        const kept = pathsOf(root, 'session-2', 'thread-2');
+
+        client.queueCheckpointSave(documentOf({ id: 'session-1', threads: ['thread-1'] }, { id: 'session-2', threads: ['thread-2'] }), { savedAt });
+        client.queueCheckpointSave(documentOf({ id: 'session-1', threads: ['thread-1'] }), { savedAt });
+        client.queueCheckpointSave(documentOf({ id: 'session-1', threads: ['thread-1'] }, { id: 'session-2', threads: ['thread-2'] }), { savedAt });
+
+        await client.barrier();
+
+        expect(client.stats().postedByKind['shard.erase']).toBeUndefined();
+        expect(fs.existsSync(kept.record)).toBe(true);
+        expect(fs.existsSync(kept.thread)).toBe(true);
+    });
+
+    it('removes the shards a boot-time drop orphaned, once the loader says what was on disk', async () => {
+        // A client that has never committed anything knows the footprint only from the loader
+        // (`persistence.shardFootprint`). Without that priming a session the restorer dropped during
+        // startup would keep its shards forever: the next document simply does not mention it, and
+        // nothing else ever names the file for removal.
+        const root = tempRoot('erase-primed');
+        const directory = path.join(root, 'harness');
+        const savedAt = 1_700_000_002_500;
+        const dropped = pathsOf(root, 'session-2');
+        const kept = pathsOf(root, 'session-1');
+
+        // The bytes a previous process left behind.
+        const seeding = await openClient(root);
+
+        await seeding.saveCheckpoint(documentOf({ id: 'session-1', threads: ['thread-1'] }, { id: 'session-2', threads: ['thread-2'] }), { savedAt });
+
+        // The loader's view of those bytes is what a boot starts from — and it is the SAME shape
+        // `HarnessPersistence` hands its own inline garbage collector, which is why the client asks
+        // for it structurally instead of re-deriving the layout a second time.
+        const persistence = new HarnessPersistence(root);
+
+        persistence.load();
+
+        const boot = await createHarnessIoClient({
+            persistence: { ...target(root), shardFootprint: persistence.shardFootprint },
+            entry
+        });
+
+        clients.push(boot);
+
+        await boot.saveCheckpoint(documentOf({ id: 'session-1', threads: ['thread-1'] }), { savedAt });
+        await boot.barrier();
+
+        expect(boot.stats().postedByKind['shard.erase']).toBe(1);
+        expect(fs.existsSync(dropped.record)).toBe(false);
+        expect(fs.existsSync(dropped.threads)).toBe(false);
+        expect(fs.existsSync(kept.record)).toBe(true);
     });
 });

@@ -57,6 +57,9 @@ import type { HarnessPreset } from './harnesses/types';
 import type { RunnerSettings } from './harnesses/types';
 import { HarnessPersistence } from './persistence';
 import type { HarnessDatabase } from './persistence';
+// v2 layout readers/writers (./persistence-test-helpers.ts): the tampered snapshot fields live in
+// the session shard, not in the header document.
+import { readPersistedDocument, writePersistedDocument } from './persistence-test-helpers';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import { SessionStore } from './sessions';
@@ -254,8 +257,7 @@ const runtimeOf = (root: string, presets: readonly HarnessPreset[]): HarnessRunt
         loadEnvironment: false
     });
 
-const stateFile = (root: string): string => path.join(root, 'harness', 'state.json');
-
+// The persisted document, narrowed to the fields these tests tamper with.
 type StoredDocument = {
     version: number;
     savedAt: number;
@@ -270,21 +272,24 @@ type StoredDocument = {
     }[];
 };
 
-const readDocument = (root: string): StoredDocument =>
-    JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as StoredDocument;
+// v2 layout: `core.discovery` (and every other session field this suite tampers with) lives in
+// the SESSION shard `sessions/<id>/session.json`; the header `index.json` only lists sessions.
+// `readDocument`/`writeDocument` keep the one-document view, and the shared writer puts each edit
+// back in the shard it came from — so a tampered `enabled` list still lands where the loader reads it.
+const readDocument = (root: string): StoredDocument => readPersistedDocument(root) as StoredDocument;
 
 const writeDocument = (root: string, document: StoredDocument): void => {
-    fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+    writePersistedDocument(root, document as unknown as Record<string, any>);
 };
 
 // Append ONE enabled name to one session's committed snapshot, in the exact shape a real
-// pre-rename `state.json` carries it: an `enabled` list naming a tool this build no longer
+// pre-rename snapshot carries it: an `enabled` list naming a tool this build no longer
 // registers, next to names that still resolve.
 const tamperDiscovery = (root: string, id: string, staleName: string): void => {
     const document = readDocument(root);
     const session = document.sessions.find((entry) => entry.id === id);
 
-    if (session === undefined) throw new Error(`state.json holds no session "${id}".`);
+    if (session === undefined) throw new Error(`the persisted index holds no session "${id}".`);
 
     const enabled = session.core.discovery?.enabled ?? [];
 
@@ -301,7 +306,7 @@ const tamperWithheld = (root: string, id: string, withheld: readonly string[]): 
     const document = readDocument(root);
     const session = document.sessions.find((entry) => entry.id === id);
 
-    if (session === undefined) throw new Error(`state.json holds no session "${id}".`);
+    if (session === undefined) throw new Error(`the persisted index holds no session "${id}".`);
 
     session.core.discovery = { ...(session.core.discovery ?? {}), withheld: [...withheld] };
     writeDocument(root, document);

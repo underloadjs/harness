@@ -37,8 +37,6 @@ import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-suppo
 import { AGENT_PROFILES, agentInstruction } from '../agents';
 import { SessionStore } from './sessions';
 import {
-    HARNESS_DATABASE_DIRECTORY,
-    HARNESS_DATABASE_FILE,
     HARNESS_DATABASE_VERSION,
     HarnessPersistence,
     HarnessPersistenceError,
@@ -49,7 +47,16 @@ import {
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import { getHarnessRuntime, setHarnessRuntime } from './runtime';
-import type { SessionSnapshot } from './protocol';
+// v2 layout readers shared with every suite that inspects persisted bytes.
+import {
+    harnessIndexFileOf,
+    harnessSessionFileOf,
+    listHarnessDirectory,
+    listHarnessStagingLeftovers,
+    readPersistedDocument,
+    writePersistedSession,
+    writePersistedThread
+} from './persistence-test-helpers';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
 // src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
@@ -207,27 +214,105 @@ const runtimeOf = (root: string, presets: HarnessPreset[]): HarnessRuntime =>
         loadEnvironment: false
     });
 
-const stateFile = (root: string): string => path.join(root, 'harness', 'state.json');
+// ---------------------------------------------------------------------------
+// v2 ON-DISK LAYOUT: the two primitives this suite reads and writes through
+// ---------------------------------------------------------------------------
+//
+// Everything below was written against the v1 single-file document, so the suite's idea of
+// "the persisted database" is one object. v2 stores that object across
+// `index.json` + `sessions/<id>/session.json` + `sessions/<id>/threads/<tid>.json`, so the
+// two helpers below are the translators: `readDocument` reassembles the tree into the
+// one-document view (the same job the shared ./persistence-test-helpers readers do for the
+// suites that only READ), and `writeDocument` fans a tampered view back out to the shards.
+//
+// `writeDocument` is local (and not `writePersistedDocument`) for two reasons that both
+// change results:
+//   - `index.json` must keep its OWN `sessions` list (id + ordinal, in order): that list is
+//     what the store reads to find the records, and a header written without it is a torn
+//     set the loader refuses with "sessions must be an array";
+//   - a thread row keeps its transcript in a shard ONLY when its id can be a file name
+//     (`HARNESS_THREAD_ID_PATTERN`, ./persistence.ts) — the C8-m8 pins store a `__proto__`
+//     thread id, and v1 kept that transcript inline. Writing a `__proto__.json` shard for it
+//     would make the store report a missing transcript instead of the shape it is testing.
+const HARNESS_THREAD_ID_PATTERN = /^thread-[1-9][0-9]*$/;
+
+const readDocument = (root: string): Record<string, any> => readPersistedDocument(root);
+
+// The raw-text form of the document, for the pins that ask "does this string appear ANYWHERE
+// in the persisted database" (a secret, a deleted session's prompt, an answer text). v2 splits
+// the document across `index.json` + session shards + thread shards, so reassembling and
+// stringifying is the honest equivalent of the old single-file raw read of `state.json`:
+// it covers every byte of the database — a value left behind in ANY shard fails the pin.
+// Like v1, it excludes `sessions/<id>/events.jsonl`: the journal is an event log, not the
+// document these assertions are about.
+const documentText = (root: string): string => JSON.stringify(readDocument(root));
+
+const writeDocument = (root: string, document: Record<string, any>): void => {
+    const sessions: Record<string, any>[] = document.sessions ?? [];
+    const { sessions: _dropped, ...index } = document;
+
+    fs.mkdirSync(path.dirname(harnessIndexFileOf(root)), { recursive: true });
+    fs.writeFileSync(
+        harnessIndexFileOf(root),
+        JSON.stringify(
+            {
+                ...index,
+                sessions: sessions.map((record, position) => ({ id: record.id, ordinal: position + 1 }))
+            },
+            null,
+            2
+        ),
+        'utf8'
+    );
+
+    for (const record of sessions) {
+        const core = record.core as Record<string, any> | undefined;
+
+        if (core === undefined || !Array.isArray(core.threads)) {
+            writePersistedSession(root, record);
+            continue;
+        }
+
+        const rows = core.threads.map((row: Record<string, any>) =>
+            HARNESS_THREAD_ID_PATTERN.test(String(row.id)) ? rowWithoutMessages(row) : row
+        );
+
+        writePersistedSession(root, { ...record, core: { ...core, threads: rows } });
+
+        for (const row of core.threads as Record<string, any>[]) {
+            if (!HARNESS_THREAD_ID_PATTERN.test(String(row.id))) continue;
+
+            writePersistedThread(root, record.id, row.id, {
+                version: HARNESS_DATABASE_VERSION,
+                sessionId: record.id,
+                id: row.id,
+                messages: row.messages
+            });
+        }
+    }
+};
+
+// A thread row without its transcript, keys in the order the writer emits them.
+const rowWithoutMessages = (row: Record<string, any>): Record<string, unknown> => {
+    const { messages, ...rest } = row;
+
+    return rest;
+};
 
 // Rewrites the claim the FIRST session's first task record carries in the canonical
-// file. Same technique the orphaned-transcript test uses for a transcript: this is a
+// shards. Same technique the orphaned-transcript test uses for a transcript: this is a
 // document a DIFFERENT process wrote, which the running session cannot produce
 // through its own tools, and it is the only honest way to ask "does a restored
 // foreign claim still block?".
 const rewriteClaimOwner = (root: string, owner: string, leaseUntil: number): void => {
-    const file = stateFile(root);
-    const database = JSON.parse(fs.readFileSync(file, 'utf8')) as {
-        sessions: {
-            core: { records: { todos: { items: { id: string; owner?: string; leaseUntil?: number }[] } } };
-        }[];
-    };
+    const database = readDocument(root);
     const item = database.sessions[0].core.records.todos.items[0];
 
     if (item === undefined) throw new Error('the persisted task store held no record');
 
     item.owner = owner;
     item.leaseUntil = leaseUntil;
-    fs.writeFileSync(file, JSON.stringify(database, null, 2), 'utf8');
+    writeDocument(root, database);
 };
 
 // ---------------------------------------------------------------------------
@@ -271,9 +356,6 @@ const pinTaskClock = (): ((next: number) => void) => {
 // clock-based budget would never expire inside a pinned test, while `setTimeout` stays real
 // (the policy stated on `pinTaskClock`). Running out the budget is the failure — it means
 // the deferred write never happened, which is the bound F1 promises.
-const readDocument = (root: string): Record<string, any> =>
-    JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
-
 const waitForDocument = async (
     root: string,
     settled: (document: Record<string, any>) => boolean,
@@ -467,7 +549,7 @@ describe('R3b durable harness database', () => {
         expect(feedBefore.changesTruncated).toBe(false);
 
         // No secrets in the canonical file (server key or session model note).
-        const raw = fs.readFileSync(stateFile(root), 'utf8');
+        const raw = documentText(root);
         expect(raw).not.toContain('server-secret-key');
         const parsed = JSON.parse(raw) as {
             version: number;
@@ -537,7 +619,7 @@ describe('R3b durable harness database', () => {
         await first.store.persistRegistry();
 
         // It is in the durable document (not only in memory).
-        const stored = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+        const stored = readDocument(root) as {
             registry: { name: string; agentInstructions?: Record<string, string> }[];
         };
         expect(stored.registry.find((entry) => entry.name === 'voiced')?.agentInstructions).toEqual({
@@ -577,7 +659,7 @@ describe('R3b durable harness database', () => {
         await first.store.persistRegistry();
 
         // It is in the durable document, not only in memory.
-        const stored = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+        const stored = readDocument(root) as {
             registry: { name: string; agentColors?: Record<string, string> }[];
         };
         expect(stored.registry.find((entry) => entry.name === 'painted')?.agentColors).toEqual({
@@ -613,7 +695,7 @@ describe('R3b durable harness database', () => {
         });
         await first.store.persistRegistry();
 
-        const stored = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+        const stored = readDocument(root) as {
             registry: { name: string; agentColors?: Record<string, string> }[];
         };
         const row = stored.registry.find((entry) => entry.name === 'unpainted')!;
@@ -686,7 +768,7 @@ describe('R3b durable harness database', () => {
 
         first.store.dispose();
 
-        const document = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+        const document = readDocument(root) as Record<string, any>;
         const stored = document.sessions.find((entry: Record<string, any>) => entry.id === sessionId);
 
         // Absent, not `{}`: a session with no invented agent writes no key anywhere, so the
@@ -701,9 +783,9 @@ describe('R3b durable harness database', () => {
         document.registry[0].customAgents = {
             localizer: 'You rewrite copy for the target market.'
         };
-        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+        writeDocument(root, document);
 
-        const loaded = readHarnessDatabase(JSON.parse(fs.readFileSync(stateFile(root), 'utf8')));
+        const loaded = readHarnessDatabase(readDocument(root));
 
         expect(loaded.sessions.find((entry) => entry.id === sessionId)?.preset.customAgents).toEqual({
             localizer: 'You rewrite copy for the target market.'
@@ -713,7 +795,7 @@ describe('R3b durable harness database', () => {
         });
 
         // A non-string entry is a broken document, refused with the path that names it.
-        const broken = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+        const broken = readDocument(root) as Record<string, any>;
         broken.sessions
             .find((entry: Record<string, any>) => entry.id === sessionId)
             .preset.customAgents = { localizer: 7 };
@@ -740,7 +822,7 @@ describe('R3b durable harness database', () => {
 
         // The start transition was written through BEFORE provider work, and the
         // accepted backlog is part of the same document.
-        const duringRun = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+        const duringRun = readDocument(root) as {
             sessions: {
                 id: string;
                 status: string;
@@ -916,8 +998,8 @@ describe('R3b durable harness database', () => {
         expect(runtimeA.root).not.toBe(runtimeB.root);
         expect(runtimeA.store.list().map((session) => session.id)).toEqual([a.id]);
         expect(runtimeB.store.list().map((session) => session.id)).toEqual([b.id]);
-        expect(fs.existsSync(stateFile(rootA))).toBe(true);
-        expect(fs.existsSync(stateFile(rootB))).toBe(true);
+        expect(fs.existsSync(harnessIndexFileOf(rootA))).toBe(true);
+        expect(fs.existsSync(harnessIndexFileOf(rootB))).toBe(true);
 
         runtimeA.store.dispose();
         runtimeB.store.dispose();
@@ -965,8 +1047,11 @@ describe('R3b durable harness database', () => {
         expect(persistence.load()).toBeUndefined();
 
         // Malformed JSON: the error names the file and the canonical file is kept.
-        fs.mkdirSync(path.dirname(stateFile(root)), { recursive: true });
-        fs.writeFileSync(stateFile(root), '{', 'utf8');
+        // v2: the document `load()` opens is now `<root>/harness/index.json` (the session and
+        // transcript shards are separate files), so the corrupt bytes go there and the error
+        // has to name THAT path — the same failure mode, one file deeper in the layout.
+        fs.mkdirSync(path.dirname(harnessIndexFileOf(root)), { recursive: true });
+        fs.writeFileSync(harnessIndexFileOf(root), '{', 'utf8');
 
         let malformed: unknown;
         try {
@@ -977,11 +1062,11 @@ describe('R3b durable harness database', () => {
 
         expect(malformed).toBeInstanceOf(HarnessPersistenceError);
         expect((malformed as Error).message).toContain('is not valid JSON');
-        expect(fs.readFileSync(stateFile(root), 'utf8')).toBe('{');
+        expect(fs.readFileSync(harnessIndexFileOf(root), 'utf8')).toBe('{');
 
         // Unknown version: rejected before any field is interpreted.
         fs.writeFileSync(
-            stateFile(root),
+            harnessIndexFileOf(root),
             JSON.stringify({ version: 999, savedAt: 0, registry: [], sessions: [] }),
             'utf8'
         );
@@ -995,7 +1080,9 @@ describe('R3b durable harness database', () => {
 
         expect(versioned).toBeInstanceOf(HarnessPersistenceError);
         expect((versioned as Error).message).toContain('Unsupported harness database version 999');
-        expect((versioned as Error).message).toContain(path.join('harness', 'state.json'));
+        // v2: the header document is `index.json`, so the error that names the failing file
+        // names that one (the pin is "the message carries the path an operator can open").
+        expect((versioned as Error).message).toContain(path.join('harness', 'index.json'));
 
         // A runtime built over the corrupt root fails loudly instead of serving an
         // empty store.
@@ -1016,16 +1103,24 @@ describe('R3b durable harness database', () => {
         const runtime = runtimeOf(root, [liveScriptedPreset('one')]);
         await runtime.store.create('one');
 
-        const directory = path.join(root, 'harness');
-        expect(fs.readdirSync(directory)).toEqual(['state.json']);
+        // v2 layout pin. The v1 assertion `readdirSync(harness) === ['state.json']` was really
+        // TWO claims: (a) exactly one canonical file is there, and (b) the staging+rename left
+        // nothing behind. (a) is now the declared v2 shape — the header plus the per-session
+        // directory — and (b) is asserted independently and RECURSIVELY, because every shard
+        // (index, session, thread) is committed through the same staging sequence, so a
+        // leftover can now hide below `sessions/<id>/` where a flat listing could not see it.
+        expect(listHarnessDirectory(root)).toEqual(['index.json', 'sessions']);
+        expect(listHarnessStagingLeftovers(root)).toEqual([]);
 
-        // A second save replaces the same file atomically; staging names are
+        // A second save replaces the same files atomically; staging names are
         // unique and removed before the call returns.
         await runtime.store.persistRegistry();
-        expect(fs.readdirSync(directory)).toEqual(['state.json']);
+        expect(listHarnessDirectory(root)).toEqual(['index.json', 'sessions']);
+        expect(listHarnessStagingLeftovers(root)).toEqual([]);
 
         runtime.store.dispose();
-        expect(fs.readdirSync(directory)).toEqual(['state.json']);
+        expect(listHarnessDirectory(root)).toEqual(['index.json', 'sessions']);
+        expect(listHarnessStagingLeftovers(root)).toEqual([]);
     });
 
     it('persists registry create/patch made through the dispatcher before answering', async () => {
@@ -1352,8 +1447,7 @@ describe('R3b durable harness database', () => {
 
         // Simulate the active-snapshot window T22 discovered: the persisted core
         // ends with an assistant tool_call whose result was never appended.
-        const file = stateFile(root);
-        const database = JSON.parse(fs.readFileSync(file, 'utf8')) as {
+        const database = readDocument(root) as {
             sessions: { core: { agents: Record<string, { messages: HarnessMessage[] }> } }[];
         };
         const transcript = database.sessions[0].core.agents.probe;
@@ -1362,7 +1456,7 @@ describe('R3b durable harness database', () => {
             content: '',
             toolCalls: [{ id: 'orphan-1', name: 'tasks', arguments: '{"tasks":[{"never run"}]}' }]
         });
-        fs.writeFileSync(file, JSON.stringify(database, null, 2), 'utf8');
+        writeDocument(root, database);
 
         const second = runtimeOf(root, [preset]);
         const restored = second.store.get(created.id);
@@ -1513,7 +1607,7 @@ describe('R3b durable harness database', () => {
         // Restore must not fail on the missing key; the session is unauthenticated
         // because a foreign endpoint never receives the server credential.
         expect(second.store.get(created.id).harness).toBe('one');
-        const raw = fs.readFileSync(stateFile(root), 'utf8');
+        const raw = documentText(root);
         expect(raw).not.toContain('server-secret-key');
         expect(raw).not.toContain('apiKey');
     });
@@ -1556,7 +1650,7 @@ describe('R3b durable harness database', () => {
         const keptBefore = first.store.get(keep.id);
         const doomedBefore = first.store.get(doomed.id);
 
-        const before = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+        const before = readDocument(root) as {
             sessions: { id: string }[];
         };
         // Insertion order: the surviving session comes first.
@@ -1567,7 +1661,7 @@ describe('R3b durable harness database', () => {
         expect(await first.store.remove(doomed.id)).toBe(false);
         expect(first.store.list().map((session) => session.id)).toEqual([keep.id]);
 
-        const raw = fs.readFileSync(stateFile(root), 'utf8');
+        const raw = documentText(root);
         // Nothing from the removed record may survive: not the id, not the prompt,
         // the recorded answer, the todo text, or the live model id.
         expect(raw).not.toContain(doomed.id);
@@ -1608,10 +1702,10 @@ describe('T5 durable harness deletion', () => {
     };
 
     const readState = (root: string): Document =>
-        JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Document;
+        readDocument(root) as Document;
 
     const writeState = (root: string, document: Document): void => {
-        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+        writeDocument(root, document);
     };
 
     // A registry/store with a persistence owner whose WRITE always fails: the
@@ -1788,7 +1882,7 @@ describe('T5 durable harness deletion', () => {
             'chat'
         ]);
         expect(second.store.restoreErrors).toEqual([
-            `${stateFile(root)}: Session "${id}" could not be restored: ` +
+            `${harnessSessionFileOf(root, id)}: Session "${id}" could not be restored: ` +
                 'Scripted harness "demo" is not shipped in this build; the session cannot be restored.'
         ]);
 
@@ -1997,18 +2091,6 @@ describe('T5 durable harness deletion', () => {
 // loudly — exactly like any other structural corruption, and without touching the
 // file. A valid value is normalised to the allocator's uppercase spelling.
 describe('durable conversation labels (T14)', () => {
-    type StoredDocument = {
-        version: number;
-        savedAt: number;
-        registry: unknown[];
-        sessions: {
-            id: string;
-            threadLabels?: Record<string, string>;
-            threadLabelHighWater?: Record<string, number>;
-            turns: { id: string; threadLabel?: string }[];
-        }[];
-    };
-
     // One persisted session that owns exactly ONE host conversation (RR1), so every
     // case below has a real thread id and a real recorded turn label to tamper with.
     const persistOneConversation = async (label: string): Promise<{
@@ -2027,13 +2109,6 @@ describe('durable conversation labels (T14)', () => {
         const threadId = task.turn.threadId;
         if (threadId === undefined) throw new Error('the persisted submit opened no conversation');
         return { root, threadId, turnId: task.turn.id };
-    };
-
-    const readDocument = (root: string): StoredDocument =>
-        JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as StoredDocument;
-
-    const writeDocument = (root: string, document: StoredDocument): void => {
-        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
     };
 
     it('normalises a valid conversation label and its recorded turn label', async () => {
@@ -2138,9 +2213,9 @@ describe('prototype-shaped invalid transcript keys (C8-m8)', () => {
                 ' "messages": "also broken", "agent": "one" } }'
         ) as Record<string, unknown>;
 
-        const document = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+        const document = readDocument(root) as Record<string, any>;
         document.sessions[0].invalidThreads = invalidThreads;
-        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+        writeDocument(root, document);
 
         return { root, sessionId };
     };
@@ -2148,7 +2223,7 @@ describe('prototype-shaped invalid transcript keys (C8-m8)', () => {
     it('keeps a `__proto__` thread id as a stored entry through the reader', async () => {
         const { root, sessionId } = await documentWithProtoKey('invalid-proto-key');
 
-        const database = readHarnessDatabase(JSON.parse(fs.readFileSync(stateFile(root), 'utf8')));
+        const database = readHarnessDatabase(readDocument(root));
         const record = database.sessions.find((entry) => entry.id === sessionId);
         const invalid = record?.invalidThreads;
 
@@ -2205,7 +2280,7 @@ describe('durable per-turn instruction snapshots (T10)', () => {
 
         await runtime.store.run(created.id, 'remember this', async () => {});
 
-        const loaded = readHarnessDatabase(JSON.parse(fs.readFileSync(stateFile(root), 'utf8')));
+        const loaded = readHarnessDatabase(readDocument(root));
         const record = loaded.sessions.find((session) => session.id === created.id);
         const turnId = record?.turns[0]?.id ?? '';
 
@@ -2224,12 +2299,12 @@ describe('durable per-turn instruction snapshots (T10)', () => {
 
         await runtime.store.run(created.id, 'remember this', async () => {});
 
-        const written = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as { sessions: Record<string, unknown>[] };
+        const written = readDocument(root) as { sessions: Record<string, unknown>[] };
 
         // Rewrite the file the way a build BEFORE this feature wrote it.
         for (const session of written.sessions) delete session.turnInstructionSources;
 
-        fs.writeFileSync(stateFile(root), JSON.stringify(written));
+        writeDocument(root, written);
 
         const reopened = runtimeOf(root, [liveScriptedPreset('one', 'persisted answer')]);
 
@@ -2239,11 +2314,11 @@ describe('durable per-turn instruction snapshots (T10)', () => {
         // absent key is not re-invented on the way back out.
         await reopened.store.setAgentModels(created.id, { one: 'next/model' });
 
-        const rewritten = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as { sessions: Record<string, unknown>[] };
+        const rewritten = readDocument(root) as { sessions: Record<string, unknown>[] };
 
         expect('turnInstructionSources' in rewritten.sessions[0]).toBe(false);
 
-        const good = JSON.parse(fs.readFileSync(stateFile(root), 'utf8'));
+        const good = readDocument(root);
         const refusing = (mutate: (session: Record<string, unknown>) => void, message: string): void => {
             const broken = structuredClone(good);
 
@@ -2300,7 +2375,7 @@ describe('durable per-turn instruction snapshots (T10)', () => {
 
         // The turn-START write already carries the snapshot, before the run produced a
         // terminal record and before any later instruction edit could happen.
-        const duringRun = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+        const duringRun = readDocument(root) as {
             sessions: {
                 turns: { id: string; status: string }[];
                 turnInstructionSources?: Record<string, { agent: string; instructions: string[] }[]>;
@@ -2390,11 +2465,7 @@ describe('durable steered-submit text archive (T14)', () => {
     };
 
     const documentOf = (root: string): Record<string, any> =>
-        JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
-
-    const writeDocument = (root: string, document: Record<string, any>): void => {
-        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
-    };
+        readDocument(root) as Record<string, any>;
 
     it('archives every accepted submit durably, beside the unchanged audit ring', async () => {
         const { root, sessionId, turnId } = await steeredDocument('archive-write');

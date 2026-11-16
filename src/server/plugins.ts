@@ -7,7 +7,8 @@
 // server, and `./sessions.ts` owns both:
 //
 //   - THE PROCESS/TEMPLATE STORE — one per runtime, seeded from the durable document
-//     (`state.json`'s top-level `pluginSettings`). It is the seed source AND the answer of
+//     header (`index.json`'s top-level `pluginSettings`, ./persistence.ts:2301). It is the
+//     seed source AND the answer of
 //     `GET /v1/harness/plugins` + `PATCH /v1/harness/plugins/{plugin_id}`, whose meaning is
 //     unchanged: a write there changes what EVERY SESSION CREATED AFTER IT inherits, and
 //     nothing that already exists.
@@ -35,7 +36,8 @@
 // where a stored value came from, how it is validated, and how it survives a restart - that
 // is host policy. This module is the server's host: it seeds from the generated built-in
 // manifest, validates every write against the plugin's own descriptor, keeps the durable
-// overrides in `<databaseRoot>/harness/state.json`, and hands every harness ONE live
+// overrides in the document header `<databaseRoot>/harness/index.json`
+// (`harnessIndexDocumentOf`, ./persistence.ts:2289-2306), and hands every harness ONE live
 // provider object, so `PATCH /v1/harness/plugins/{plugin_id}` changes what an EXISTING
 // session reads on its very next turn (the settings view re-reads the provider on every
 // call - src/plugin/settings.ts `resolve`, and src/plugin/host.ts:151 builds the view over
@@ -46,7 +48,9 @@
 // `get(plugin, key)` answers `undefined` when the operator has never changed that key, which
 // is the provider's documented "nothing stored" signal (src/types/index.ts:3489-3497). The plugin's
 // declared `default` is therefore applied by the library, not duplicated here, and
-// `state.json` stores ONLY what the operator changed - the same minimal-delta rule as
+// the durable store keeps ONLY what the operator changed (the `index.json`
+// `pluginSettings` block for the template scope, ./persistence.ts:2301, or a session
+// record's own `pluginSettings` at :403) - the same minimal-delta rule as
 // `globalSettings` (./persistence.ts `HarnessGlobalSettingsRecord`). `values(plugin)` is the
 // projection the UI paints: declared default + stored override, resolved through the SAME
 // view a plugin reads, so a row can never disagree with runtime behaviour.
@@ -110,7 +114,7 @@
 // (src/server/workers/lane-worker-loop.ts `sayHello`) and passes `{ stateChange, interaction,
 // toolSettings, pluginSettings }` as the report. The LIVE provider is a closure, so it can
 // never cross a `worker_threads` boundary; what crosses instead is a store's `snapshot()`
-// - the override map in exactly the shape `state.json` holds it - carried as
+// - the override map in exactly the shape the durable store holds it - carried as
 // `LaneBlueprint.pluginSettings` (src/server/workers/protocol.ts), read at lane creation by
 // src/server/sessions.ts `blueprintFor` from THE SESSION'S OWN store (R4 — the lane replica
 // resolves that session's values, not the template's), and turned back into a read-only
@@ -206,7 +210,9 @@ export type HarnessPluginSettingsStoreOptions = {
     // injectable so a test can declare a plugin with `string`/`boolean` settings that no
     // shipped plugin uses yet, without touching src/plugins.
     descriptors?: readonly HarnessPluginMetadata[];
-    // Overrides restored from `state.json` (./persistence.ts). Anything this build does not
+    // Overrides restored from the durable store (./persistence.ts — `index.json`'s
+    // `pluginSettings` block for the template scope, a session record's own
+    // `pluginSettings` for a session store). Anything this build does not
     // declare is dropped rather than failing the load: a plugin may legitimately stop
     // shipping a key between versions, and a lost override must never abort a server boot.
     values?: HarnessPluginSettingsRecord;
@@ -252,7 +258,7 @@ export type HarnessPluginSettingsStore = {
      * store, `updateSessionPluginSettings` for one session's store).
      */
     update: (plugin: string, patch: Record<string, unknown> | undefined) => HarnessPluginSettingValues;
-    /** Only what the operator changed, in catalogue order - the `state.json` projection. */
+    /** Only what the operator changed, in catalogue order - the durable (`index.json` / session-record) projection. */
     snapshot: () => HarnessPluginSettingsRecord;
     /**
      * Replace every override with a restored document (no revision bump: a boot is not a
@@ -408,7 +414,7 @@ export const createPluginSettingsStore = (
     }
 
     // plugin -> key -> stored override. ONLY operator-changed values land here: a declared
-    // default is never stored, so `state.json` carries a delta and a plugin's default may
+    // default is never stored, so the durable record carries a delta and a plugin's default may
     // change in a release without a migration touching the file.
     const overrides = new Map<string, Map<string, HarnessPluginSettingValue>>();
 

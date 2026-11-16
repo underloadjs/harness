@@ -8,7 +8,7 @@
 //   1. it binds the harness API on an ephemeral loopback port;
 //   2. it serves NO UI/static files (`/` is 404) and starts no Vite banner;
 //   3. `--database-root` is forwarded to `startHarnessServer`, so a created session
-//      persists under `<root>/harness/state.json`.
+//      persists under `<root>/harness/` (v2: `index.json` plus `sessions/<id>/session.json`).
 //
 // Safety: loopback + port 0 only, a database root under the repo-root Temp/ (never
 // the package tree or a production root), and the child is terminated in a finally
@@ -21,6 +21,10 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+// v2 layout readers (./persistence-test-helpers.ts): the launcher's first save is pinned from the
+// shards it actually writes — `index.json` for the session list, `sessions/<id>/session.json` for
+// the record — where v1 read one `harness/state.json`.
+import { harnessIndexFileOf, readPersistedSession } from './persistence-test-helpers';
 // The launcher serves the canonical root, and the assertion below must not drift from it: imported
 // from the same module the launcher's adapter mounts on, rather than re-spelled here.
 import { STANDALONE_MOUNT } from './api';
@@ -186,20 +190,30 @@ describe('standalone server launcher', () => {
                 });
                 expect(created.status).toBe(201);
 
-                const stateFile = path.join(databaseRoot, 'harness', 'state.json');
-                expect(fs.existsSync(stateFile)).toBe(true);
-                const state = JSON.parse(fs.readFileSync(stateFile, 'utf8')) as {
+                // v2 layout: `--database-root` now produces `<root>/harness/index.json` (the
+                // document header, whose `sessions` list is `[{ id, ordinal }]`) plus
+                // `<root>/harness/sessions/<id>/session.json` (the session record). Same two
+                // facts pinned as before: the header says version 2 and carries exactly one
+                // session, and THAT session is the instruct one that is idle.
+                const indexFile = harnessIndexFileOf(databaseRoot);
+                expect(fs.existsSync(indexFile)).toBe(true);
+                const persistedIndex = JSON.parse(fs.readFileSync(indexFile, 'utf8')) as {
                     version: number;
                     deleted?: string[];
-                    sessions: { harness: string; status: string }[];
+                    sessions: { id: string; ordinal: number }[];
                 };
-                expect(state.version).toBe(1);
-                expect(state.sessions).toHaveLength(1);
-                expect(state.sessions[0]).toMatchObject({ harness: 'instruct', status: 'idle' });
+                expect(persistedIndex.version).toBe(2);
+                expect(persistedIndex.sessions).toHaveLength(1);
 
-                // Nothing was deleted, so the additive T5 field is absent: a document
-                // written by this build keeps the pre-T5 shape.
-                expect(state).not.toHaveProperty('deleted');
+                const persisted = readPersistedSession(databaseRoot, persistedIndex.sessions[0].id) as {
+                    harness: string;
+                    status: string;
+                };
+                expect(persisted).toMatchObject({ harness: 'instruct', status: 'idle' });
+
+                // Nothing was deleted, so the additive T5 field is absent: a header written by
+                // this build keeps the pre-T5 shape.
+                expect(persistedIndex).not.toHaveProperty('deleted');
             } finally {
                 await stop(child);
                 fs.rmSync(work, { recursive: true, force: true });

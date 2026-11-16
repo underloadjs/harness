@@ -107,7 +107,7 @@ export const nextMessageIdOf = (transcript: readonly unknown[]): string => {
 // Batch minting for the snapshot reader (core/snapshot.ts), which walks a whole
 // transcript and must not pay a fresh scan per message. It answers, per entry, the id
 // that entry should carry: its OWN when it already has one (a copy keeps its identity),
-// otherwise the next free id — so a pre-id `state.json` restores with ids, and
+// otherwise the next free id — so a pre-id transcript restores with ids, and
 // `restore -> snapshot` hands the same document back unchanged (idempotent, the same
 // property `applyIncluded` upholds for the flag).
 export const createMessageIdAllocator = (

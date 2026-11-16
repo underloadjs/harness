@@ -266,7 +266,8 @@ import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persiste
 import type { HarnessDatabase, HarnessGlobalSettingsRecord, HarnessInvalidThreadRecord, HarnessPersistence, HarnessSessionRecord } from './persistence';
 // T5 (R2/R3): the runtime-level plugin settings store. The store OWNS it (one per SessionStore,
 // hence one per HarnessRuntime / standalone listener) because it is durable registry-adjacent
-// state written through the same `state.json` commit as everything else here.
+// state written through the same document-header commit (`index.json`, ./persistence.ts:2329)
+// as everything else at that scope.
 import { createPluginSettingsStore, copyPluginSettingsStore } from './plugins';
 import type { HarnessPluginSettingsStore, HarnessPluginSettingValues } from './plugins';
 import { createToolSettingsStore } from './tool-settings';
@@ -460,7 +461,7 @@ type ViewWatcher = {
     close: () => void;
 };
 
-// R4: how often a RUNNING session may rewrite the whole `state.json`. Every event is
+// R4: how often a RUNNING session may rewrite its checkpoint shards. Every event is
 // appended to the journal regardless; the checkpoint exists so a crash between two
 // intervals loses at most this many milliseconds of PROGRESS deltas (a tool call,
 // commit, start, done or cancellation always checkpoints through the existing
@@ -1162,7 +1163,7 @@ const expiredActionIds = (turns: readonly SessionTurn[]): string[] => {
 //
 // `shareEvents` (T22 F3) is the DOCUMENT-BUILD mode, and it is the only caller that is
 // allowed to use it. The event objects stored in `turn.events` are ALREADY detached
-// copies: every recorder pushes `copyEvent(event)` (sessions.ts:8833, :7858) and never
+// copies: every recorder pushes `copyEvent(event)` (sessions.ts:8071, :9046) and never
 // mutates a stored event afterwards, so the array's elements are append-only,
 // store-owned JSON values. A response must still get its own deep copy (a browser
 // client may write through what it was handed), but a document that goes straight into
@@ -1313,7 +1314,7 @@ const copyTurns = (turns: readonly SessionTurn[], shareEvents = false): SessionT
 // A timestamp is usable only when it is a real epoch-ms number. 0 is the projector's
 // documented "no timestamp" sentinel (../server/turn-projector.ts
 // DISPLAY_NO_TIMESTAMP), and a record without `eventTimes` must never paint a
-// duration — the same honesty rule turns.ts:4778 applies to a recorded replay.
+// duration — the same honesty rule the projector states for a stored replay (./turn-projector.ts:897).
 const finiteAt = (value: unknown): value is number =>
     typeof value === 'number' && Number.isFinite(value) && value > 0;
 
@@ -2126,7 +2127,8 @@ export class SessionStore {
 
     /**
      * The operator's saved global provider defaults, or `undefined` when the deployment has never
-     * changed them. Credential-free by construction: `state.json` holds no api key, so a key set
+     * changed them. Credential-free by construction: the store holds no api key (`index.json`
+     * and every session shard are key-free), so a key set
      * over HTTP is PROCESS-ONLY and a restart falls back to the environment (the route says so).
      */
     get globalSettings(): HarnessGlobalSettingsRecord | undefined {
@@ -2551,7 +2553,8 @@ export class SessionStore {
             // T5 (R2/R3) + R4: THIS SESSION'S live plugin settings provider. Every build path
             // lands here — `create` (a fresh session, seeded by copying the template store
             // down) and the restore path (a session rebuilt from its own persisted copy) — so
-            // both a new conversation and one restored from `state.json` read the values that
+            // both a new conversation and one restored from its `session.json` shard read the
+            // values that
             // belong to THEM. The harness stores the REFERENCE and each plugin's
             // `api.settings` re-reads it on every call (../plugin/settings.ts,
             // ../plugin/host.ts:151), which is why a `PATCH /v1/harness/sessions/{id}/plugins/
@@ -2567,7 +2570,7 @@ export class SessionStore {
             // `PATCH /v1/harness/tools/{tool_id}` changes what an existing session can see
             // and call on its very next turn, with no rebuild. Every build path lands here:
             // `create` for a fresh session and the restore path for one rebuilt from
-            // `state.json`. Forwarded through `HarnessPresetReport.toolSettings` by the
+            // its `session.json` shard. Forwarded through `HarnessPresetReport.toolSettings` by the
             // shared toolbox (../harnesses/toolbox.ts), exactly like `pluginSettings`.
             toolSettings: this.tools.provider,
             // R1: the per-build toolbox seed, forwarded verbatim so a preset factory never has
@@ -2740,8 +2743,8 @@ export class SessionStore {
 
     // R5b (T10): THE OPERATOR DOOR, as a store method — the one call ./api.ts makes after a tool
     // write lands on the canonical harness. FOUR call sites use it, one per door that moves
-    // canonical tool state: the gate-only PATCH (../api.ts:4150), the gate half of a combined PATCH
-    // (:4446), a registration, create or update (:4308), and an un-registration (:4535). All four
+    // canonical tool state: the gate-only PATCH (./api.ts:4338), the gate half of a combined PATCH
+    // (:4634), a registration, create or update (:4496), and an un-registration (:4740). All four
     // are safe here for the same reason: the harness write has already happened, and this method
     // only reports it.
     //
@@ -2822,7 +2825,8 @@ export class SessionStore {
     // durable document carries (its `snapshot()`), just unwrapped for the wire.
     //
     // R3 (plugins) + R4: `pluginSettings` is the twin read — a SESSION's OWN override map, in
-    // exactly the shape `state.json` stores it, so a lane replica's plugin-settings view
+    // exactly the shape the store keeps it (`HarnessSessionRecord.pluginSettings`,
+    // ./persistence.ts:403), so a lane replica's plugin-settings view
     // resolves the SAME `enabled` switch and the SAME numeric/string knobs the SESSION (not
     // the deployment) runs with, and the framework's hook gate
     // (src/plugin/host.ts `settings.boolean('enabled', true)`) decides identically on both
@@ -2832,7 +2836,7 @@ export class SessionStore {
     // T6 (the SESSION tool switch): `withheldTools` is the third read of that group, and it is
     // the one figure in this object that is PER-CONVERSATION rather than per-deployment — the
     // names this session's user has switched off for its agents
-    // (`harness.withheldTools`, ../types/index.ts:3882-3907). `disabledTools` above is the
+    // (`harness.withheldTools`, ../types/index.ts:4344). `disabledTools` above is the
     // operator's deployment-wide deny and can never carry it: a global deny applies to every
     // session, so a value that lives in ONE harness's withheld Set has no process store to be
     // read from. It joins the blueprint for the same reason as the other two: the Set is behind
@@ -2854,11 +2858,11 @@ export class SessionStore {
             memoryKeys: this.memoryKeysFor(session),
             disabledTools: this.tools.disabled(),
             // THE CONVERSATION'S SWITCHES, sorted and copied by the handle's getter
-            // (../harness.ts:13165). Lane-creation snapshot like every other field here: a lane
+            // (../harness.ts:15650). Lane-creation snapshot like every other field here: a lane
             // that is already running keeps the set it was built with, and the CURRENT set
             // reaches the next lane its conversation creates.
             // Spread, not the getter's value: the handle hands back a `readonly string[]`
-            // (../types/index.ts:3907) and `LaneBlueprint.withheldTools` is a plain `string[]`
+            // (../types/index.ts:4344) and `LaneBlueprint.withheldTools` is a plain `string[]`
             // (./workers/protocol.ts:177), because the blueprint is serialised into the `hello`
             // frame. The spread is also an explicit ownership boundary — the lane cannot mutate a
             // array that is really this live handle's own state.
@@ -3132,7 +3136,7 @@ export class SessionStore {
     // the only writer is a plugin call (`setContextLane`, ../harness.ts), which mutates the
     // harness instance that host runs on. `setContextLane` appears nowhere under
     // ../server/workers, and that subsystem's op set carries no lane key (`thread:status` moves
-    // `status` alone, guarded by a status+label digest — ./workers/lane-commit.ts:685), so a
+    // `status` alone, guarded by a status+label digest — ./workers/lane-commit.ts:349), so a
     // bump raised on the lane side has no route back to the record read here and the bar stays
     // one row. The lane tests all run the default `inline` engine (../config.ts), so this is an
     // untested deployment shape, not a verified one — see 0017 (../docs/issues/) for the
@@ -3416,7 +3420,7 @@ export class SessionStore {
                       )
                   }),
             // T1.5 last mile: the plugin-diagnostic journal, written only when it is non-empty,
-            // so a healthy session's `state.json` keeps its pre-T4 shape exactly like the
+            // so a healthy session's `session.json` shard keeps its pre-T4 shape exactly like the
             // `invalidThreads` block above. Durable because a restart does not change the fact
             // that a plugin HAS been failing — that is the sentence an operator needs after one.
             ...(session.pluginDiagnostics.length === 0
@@ -3424,9 +3428,12 @@ export class SessionStore {
                 : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
             // R4 (durability, and the ONLY record of a session's own plugin settings): the
             // SESSION's override map, written only when this session has changed anything, so a
-            // session nobody configured keeps its exact pre-R4 `state.json` shape — the same
+            // session nobody configured keeps its exact pre-R4 `session.json` shape — the same
             // omit-when-empty rule the document-level `pluginSettings` block follows in
-            // `databaseRecord` below, and the reason no database version bump is needed.
+            // `databaseRecord` below, and the reason no database version bump is needed. It is
+            // also what lets the incremental writer skip this shard at all: an omitted key keeps
+            // the bytes identical, and a byte-identical shard is not opened
+            // (./persistence.ts:2839-2855).
             //
             // A restore reads THIS and never the process store, which is what makes a
             // per-session edit survive a restart. An absent field therefore means "this session
@@ -3741,7 +3748,7 @@ export class SessionStore {
             session.pluginDiagnostics.push(diagnostic);
 
             // Bounded, oldest first: the newest entries are the ones that explain a live problem,
-            // and a plugin that fails every turn must not grow `state.json` without limit.
+            // and a plugin that fails every turn must not grow the session record without limit.
             if (session.pluginDiagnostics.length > PLUGIN_DIAGNOSTIC_LIMIT) {
                 session.pluginDiagnostics.splice(0, session.pluginDiagnostics.length - PLUGIN_DIAGNOSTIC_LIMIT);
             }
@@ -3967,8 +3974,8 @@ export class SessionStore {
         sessionId: string
     ): HarnessSnapshot {
         // Defensive `??`s: `discovery`/`createdTools` are required by the snapshot TYPE, and
-        // `discovery.withheld` is OPTIONAL by design (../types/index.ts:3352-3366), but a
-        // hand-edited `state.json` reaches here after only the document-level shape check
+        // `discovery.withheld` is OPTIONAL by design (../types/index.ts:3791), but a
+        // hand-edited `session.json` shard reaches here after only the document-level shape check
         // (./persistence.ts `readHarnessSnapshot`), and an absent list means "nothing was
         // enabled" / "nothing was switched off", which is a valid state rather than a corruption
         // to report.
@@ -4437,8 +4444,14 @@ export class SessionStore {
             // direct restore failure is a real error with the file path and the
             // underlying reason in its message — but the load loop turns it into a
             // per-session drop so one stale record cannot abort the whole server.
+            //
+            // v2 layout: the session's bytes no longer live inside the one document the
+            // loader opened, so a failure ABOUT ONE SESSION names that session's own
+            // record file (`sessions/<id>/session.json`) — the file an operator has to
+            // open. `persistence.file` (the header) is only the fallback for a store with
+            // no persistence at all, exactly as before.
             throw new HarnessPersistenceError(
-                this.persistence?.file ?? '',
+                this.persistence?.sessionFile(record.id) ?? '',
                 `${location} could not be restored: ${messageOf(error)}`
             );
         }
@@ -4630,8 +4643,10 @@ export class SessionStore {
         // the single place every session-facing roster comes from — `snapshot()`, `viewOf()`
         // and `viewSummaryOf()` all call this method, so the SSE frames, `GET /sessions/:id`
         // and both compiled views inherit the filter and no client needs a new field to stop
-        // showing a deleted conversation. `shell`/`bash` still find the row, with its
-        // transcript, in `<databaseRoot>/harness/state.json`.
+        // showing a deleted conversation. `shell`/`bash` still find the row in that session's
+        // `sessions/<sessionId>/session.json` shard, and its transcript in the
+        // `sessions/<sessionId>/threads/<threadId>.json` beside it, under
+        // `<databaseRoot>/harness/`.
         //
         // The guard is written against the RECORD (../types `HarnessThreadRecord.inactive`),
         // so it holds whether the runtime excludes inactive rows from `threads()` (then it is
@@ -5097,11 +5112,11 @@ export class SessionStore {
             // its projection cache together, line ~2298/2320) and never reassigned, so a
             // cached projector can never be left holding a detached map. If a future
             // restore ever replaces the field instead of filling it in place — the rule
-            // `restoreCounterMap` (line ~4056) documents for the label maps — the
+            // `restoreCounterMap` (:7357) documents for the label maps — the
             // projector cache must be rebuilt in the same step.
             //
             // The fold reads it as a `ReadonlyMap`: the join is the store's authority
-            // (the roster's `SessionThreadView.invocationIds`, protocol.ts:437, is the
+            // (the roster's `SessionThreadView.invocationIds`, ./protocol.ts:591, is the
             // same map projected per thread), so the projector adopts it verbatim and
             // mints nothing of its own.
             invocationThreadIds: session.invocationThreads,
@@ -5760,8 +5775,8 @@ export class SessionStore {
             this.checkpoint(session, true);
         }, Math.max(0, delayMs));
 
-        // Same rule as the lane drain timer (see the `setTimeout(wake, remaining)` in
-        // `waitForDrain`): a pending checkpoint is work the process may legitimately die with,
+        // Same rule as the lane drain timer (see the `setTimeout(wake, remaining)` at
+        // :10570): a pending checkpoint is work the process may legitimately die with,
         // so it must not hold the event loop open.
         session.checkpointTimer.unref?.();
     }
@@ -6123,7 +6138,7 @@ export class SessionStore {
     // "the same turn calls a member that just left". A 409 is retryable on a settled session;
     // an unsafe history reset would have been silently destructive.
 
-    // The contract's roster budget (src/shared/harness-api.ts:951 states "the 64-binding
+    // The contract's roster budget (src/shared/harness-api.ts:1691 states "the 64-binding
     // roster budget"), and the same instruction ceiling the harness-definition PATCH applies
     // (./harnesses/registry.ts:148). Named here because the store is the component that
     // decides what its own document may hold.
@@ -9826,7 +9841,7 @@ export class SessionStore {
         // `stopped` thread with a resummable reason is resumable by THIS route.
         //
         // `idle` joins it for two reasons. (1) It is what an INTERRUPTED run leaves behind:
-        // the runtime persists a thread record as `stopped` or `idle` only (../harness.ts:10071),
+        // the runtime persists a thread record as `stopped` or `idle` only (../harness.ts:14000),
         // so a run that was in flight when the process died comes back on an `idle`
         // conversation whose newest turn the restore marked `error` (see `restoreSession`'s
         // recovery policy below) — the transcript is RETAINED, and under R2 so is every turn
@@ -10091,8 +10106,8 @@ export class SessionStore {
 
         // A FRESH settler under the SAME id: `settle` resolved and DELETED the interrupted
         // run's promise, so the caller of a resume needs its own handle on this row's next
-        // terminal transition (./sessions.ts:7246-7253). One promise per turn id at a time —
-        // the old one is already gone.
+        // terminal transition (`settle` resolves and deletes the map entry, ./sessions.ts:8710-8716).
+        // One promise per turn id at a time — the old one is already gone.
         let settleTurn!: () => void;
         const settled = new Promise<void>((resolve) => {
             settleTurn = resolve;
@@ -10158,7 +10173,7 @@ export class SessionStore {
 
         // Capture the ACCEPTED state before the pump can start the row again: the receipt must
         // state `queued` even though execution may begin in this same tick (the rule and the
-        // shape of `enqueue`'s snapshot, ./sessions.ts:6478-6488).
+        // shape of `enqueue`'s snapshot, ./sessions.ts:919-922).
         const snapshot = this.snapshot(session);
         const queuedTurn = copyTurn(turn);
 
@@ -10169,7 +10184,7 @@ export class SessionStore {
         if (clearsRestartNote) {
             // The banner is SESSION-scoped, so the row's upsert and this route's `thread.upsert`
             // can neither state nor retire it: `session.state` is the signal whose patch carries
-            // `status` + `last_error` (./api.ts:1005 -> `sessionStatePatchOf`), and it is what
+            // `status` + `last_error` (./api-reads.ts:1849 -> `sessionStatePatchOf`), and it is what
             // repaints the pane note on every open view the moment the replay is accepted — not
             // at the next poll. Only sent when this call actually cleared the note.
             this.notifyStream({ kind: 'session.state', sessionId: session.id, at: now });
@@ -10647,13 +10662,15 @@ export class SessionStore {
     // longer reports is put back from `projected` — the marked durable row this call just
     // wrote.
     //
-    // WHY THE DOCUMENT OWNS RETENTION: `session.core` is re-captured from
+    // WHY THE RECORD OWNS RETENTION: `session.core` is re-captured from
     // `harness.snapshot()` on every persist (see `noteStateChange`), so if the runtime still
-    // PHYSICALLY removed a conversation, its purge would be written back into `state.json`
-    // by the very next checkpoint and the transcript would be gone — the delete response
+    // PHYSICALLY removed a conversation, its purge would be written back into that session's
+    // `session.json` shard by the very next checkpoint — and the transcript shard that row
+    // names would be erased with it, because the row is what names it
+    // (`eraseVanishedShards`, ./persistence.ts:3025-3052) — so the delete response
     // would promise retention for one tick and then lose it. Restoring the projected row
-    // here keeps the retention promise in the one place the spec is about (the file a shell
-    // reads). A runtime that marks instead of purges (../harness.ts `deleteThread`) never
+    // here keeps the retention promise in the one place the spec is about (the shard set a
+    // shell reads). A runtime that marks instead of purges (../harness.ts `deleteThread`) never
     // takes this branch, so this is not a second source of truth in the normal case — it is
     // the floor under it.
     private reconcileMarkedThreads(
@@ -10709,10 +10726,13 @@ export class SessionStore {
     // thread 'inactive'"). This used to be a PURGE; it is now a soft delete, and the ONLY
     // durable thing it changes is the marker on the conversation's own row:
     //
-    //   - the `core.threads` row SURVIVES with its full `messages` transcript and gains
-    //     `inactive: true` + `inactiveAt` (../types `HarnessThreadRecord.inactive`), so
-    //     `state.json` still holds the conversation a `shell` user can read;
-    //   - the conversation's TURN ROWS survive, in the document and in memory, and every
+    //   - the `core.threads` row SURVIVES with its transcript and gains
+    //     `inactive: true` + `inactiveAt` (../types `HarnessThreadRecord.inactive`): the row in
+    //     the session's `session.json` shard, and its `messages` in the
+    //     `threads/<threadId>.json` that row still names (only the 256-record cap
+    //     `capThreadRecords` (:4924) retires a row, and a shard is erased only when its row
+    //     goes, ./persistence.ts:3025-3052), so a `shell` user can still read the conversation;
+    //   - the conversation's TURN ROWS survive, in the session record and in memory, and every
     //     link that pointed at them keeps resolving (they were never removed);
     //   - their `core.agentResults` rows survive (../types `HarnessAgentResultSnapshot` —
     //     the kernel keeps its invocation records too, so the durable registry and the
@@ -10954,7 +10974,7 @@ export class SessionStore {
         const threadLabelHighWaterEntries = [...session.threadLabelHighWater];
         // C4: an unreadable transcript's RAW value belongs to a conversation that still
         // exists durably, so the entry is RETAINED (hiding it from the read projections is
-        // `invalidThreadEntriesOf`'s job, not deleting the user's broken JSON).
+        // `record.invalidThreads`'s job — ./api-reads.ts:672, :809 — not deleting the user's broken JSON).
         const invalidEntries = [...session.invalidThreads];
         // T10: an instruction snapshot belongs to a TURN, and every doomed turn's row is
         // retained, so its snapshot is retained with it.
@@ -11039,7 +11059,7 @@ export class SessionStore {
         //
         // R1/R4: neither `forgetProjections` nor `compactJournal` runs any more, and both
         // were pure destruction here:
-        //   - `compactJournal` rewrites the per-step log (./journal.ts:439
+        //   - `compactJournal` rewrites the per-step log (./journal.ts:447
         //     `journal.rewrite`) down to the surviving turns. The log is the append-only,
         //     shell-reachable truth about what the conversation did, and the spec keeps it.
         //   - the ghost-step hazard the compaction existed for cannot arise while the

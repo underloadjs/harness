@@ -37,9 +37,10 @@
 //   3. `startHarnessServer({ databaseRoot, port: 0 })` serves the harness index and a
 //      session POST over real HTTP, persists under that root, and closes its listener;
 //   4. D4: `./io-worker` resolves to the published `.ts` entry and the shipped
-//      bootstrap handshakes, commits a checkpoint, appends and fences a journal line IN
-//      A THREAD — after which the published server's own reader loads what that thread
-//      wrote.
+//      bootstrap handshakes, commits an index SHARD (R5 replaced the one whole-document
+//      `checkpoint.save` frame with per-shard `shard.save` frames), appends and fences a
+//      journal line IN A THREAD — after which the published server's own reader loads
+//      what that thread wrote.
 //
 // Safety: loopback + port 0 only (never a fixed or production port), no signal
 // handlers, no machine-environment changes, and no `.env` value is ever printed —
@@ -61,7 +62,7 @@
 //   - src/server/workers/io-client.ts — the real client this smoke mirrors (spawn shape)
 //   - ../package.json              — `test:package:runtime`
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 // D4: the IO worker check spawns the SHIPPED bootstrap in a real thread, exactly as
@@ -271,11 +272,24 @@ await check('createHarnessRuntime persists a session under the requested root', 
     });
     assert(created.kind === 'json' && created.status === 201, 'the runtime API did not create a session');
 
-    const database = path.join(runtimeRoot, 'harness', 'state.json');
-    assert(existsSync(database), 'no database file under the runtime root');
-    assert(readFileSync(database, 'utf8').includes('"sessions"'), 'the database has no sessions section');
+    // v2 harness layout: `<root>/harness/index.json` is the document HEADER (version, registry,
+    // settings and the session LIST), and the created session is its OWN shard at
+    // `sessions/<id>/session.json`. The release gate proves the runtime wrote under the requested
+    // root AND that the session really got a file of its own — the v1 gate could only see the one
+    // combined document.
+    const header = path.join(runtimeRoot, 'harness', 'index.json');
+    assert(existsSync(header), 'no database header under the runtime root');
+    assert(readFileSync(header, 'utf8').includes('"sessions"'), 'the database header has no sessions section');
 
-    return { status: created.status, database: path.relative(work, database) };
+    const sessionId = String((created as { body: { session: { id: string } } }).body.session.id);
+    const shard = path.join(runtimeRoot, 'harness', 'sessions', sessionId, 'session.json');
+    assert(existsSync(shard), 'the created session has no shard of its own under the runtime root');
+
+    return {
+        status: created.status,
+        database: path.relative(work, header),
+        session: path.relative(work, shard)
+    };
 });
 
 // 3. A real listener on an ephemeral loopback port. The whole exchange is one check
@@ -357,9 +371,21 @@ try {
             return state;
         });
         await check('server session persisted under the database root', () => {
-            const database = path.join(serverRoot, 'harness', 'state.json');
-            assert(existsSync(database), 'no database file under databaseRoot');
-            return path.relative(work, database);
+            // v2 layout: the header (`index.json`) proves the root was written, and the session
+            // proves itself by the shard directory the listener created for it.
+            const header = path.join(serverRoot, 'harness', 'index.json');
+            assert(existsSync(header), 'no database header under databaseRoot');
+
+            const sessionsDirectory = path.join(serverRoot, 'harness', 'sessions');
+            const shards = existsSync(sessionsDirectory)
+                ? readdirSync(sessionsDirectory).filter((entry) =>
+                      existsSync(path.join(sessionsDirectory, entry, 'session.json'))
+                  )
+                : [];
+
+            assert(shards.length > 0, 'no session shard was written under databaseRoot');
+
+            return { header: path.relative(work, header), sessions: shards };
         });
     }
 }
@@ -369,14 +395,20 @@ try {
 //    actually RUN in a thread: importing cleanly proves nothing. This drives it exactly
 //    the way ./src/server/workers/io-client.ts does — `openHarnessWorkerSession(entry)`
 //    for the bootstrap + runner url + transport port, the boot marker in `workerData`,
-//    then `hello`, one checkpoint, one journal append + fence — and then makes the
+//    then `hello`, one shard commit, one journal append + fence — and then makes the
 //    published SERVER read what the published WORKER wrote.
 const IO_WORKER_ENTRY = `${EDITABLE_SOURCE_ROOT}/server/workers/io-worker.ts`;
 
-// Mirrors ./src/server/workers/io-protocol.ts (`IO_PROTOCOL_VERSION`, `IO_WORKER_BOOT_KEY`).
+// Mirrors ./src/server/workers/io-protocol.ts (`IO_PROTOCOL_VERSION`, `IO_WORKER_BOOT_KEY`)
+// and is deliberately HARDCODED: the worker's boot guard (`./src/server/workers/io-worker-loop.ts`
+// `startIoWorker`) compares this marker by EQUALITY, so a stale constant here does not look like a
+// handshake failure — the thread imports its graph, attaches nothing, and answers NOTHING (the
+// transport port keeps it alive), which the smoke can only report as "never answered hello" after
+// the full timeout. R5 proved the pin works: the protocol went 1 -> 2 (`shard.save` frames) and
+// this copy stayed at 1, which is exactly the drift this mirror exists to catch.
 // ./src/structure.test.ts pins the manifest half of the pairing, so a rename on one side fails
 // a check rather than producing a server that silently persists on its own loop.
-const IO_PROTOCOL_VERSION = 1;
+const IO_PROTOCOL_VERSION = 3;
 const IO_BOOT_KEY = 'harnessIoWorker';
 
 await check('the io-worker entry is published as its own subpath, as source', () => {
@@ -396,21 +428,27 @@ await check('the io-worker entry is published as its own subpath, as source', ()
 
 const ioRoot = path.join(work, 'io-root');
 const ioDirectory = path.join(ioRoot, 'harness');
-const ioState = path.join(ioDirectory, 'state.json');
 const ioSession = 'io-smoke-session';
 
 await check('the published io-worker commits, journals and fences off-thread', async () => {
     // The COPIED runner, so the shared Vite server is rooted inside the installed
     // layout rather than the repository (the same root the bootstrap resolves from).
     const workerRunner = await importPublished(`${EDITABLE_SOURCE_ROOT}/server/workers/worker-runner.ts`);
+    // The COPIED persistence layer too: the shard frame derives its destination through
+    // A1's own `harnessShardFileOf`, exactly like ./src/server/workers/io-client.ts does,
+    // so the worker's `shard-layout` guard compares the frame against the SAME derivation
+    // the writer uses — and a layout change in the packed copy moves this smoke with it.
+    const persistence = await importPublished(`${EDITABLE_SOURCE_ROOT}/server/persistence.ts`);
     const runner = workerRunner.openHarnessWorkerSession(path.join(packageRoot, IO_WORKER_ENTRY));
 
     // A `URL`, not a `file://` string: Node rejects the string form. The entry the
     // Worker is spawned with is the shipped JS bootstrap, never the `.ts` entry — raw
     // Node loads the spawn target, and the entry is fetched by the module runner.
     const worker = new Worker(pathToFileURL(runner.bootScript), {
-        // The boot marker is what makes the entry self-start its message loop at all; without it
-        // the thread imports, answers nothing, and exits 0.
+        // The boot marker is what makes the entry self-start its message loop at all; without
+        // it (or with a version that is not the protocol's) the thread imports its graph,
+        // attaches no listener, and answers nothing — the transport port keeps it alive, so
+        // the spawn looks healthy while every frame times out.
         workerData: {
             entry: runner.entryUrl,
             port: runner.transportPort,
@@ -449,17 +487,30 @@ await check('the published io-worker commits, journals and fences off-thread', a
 
         assert(hello.kind === 'hello' && hello.ok === true && hello.version === IO_PROTOCOL_VERSION, `handshake: ${JSON.stringify(hello)}`);
 
+        // R5: a commit is per-shard `shard.save` frames, one file each. The smoke commits
+        // the ONE unit a fresh database needs — the `index` header — and spells its
+        // destination with the packed persistence layer's own `harnessShardFileOf` (the
+        // same derivation ./src/server/workers/io-client.ts uses), so the worker's
+        // `shard-layout` guard sees client and worker agree from the installed layout.
+        const savedAt = 1_700_000_000_000;
+        const indexUnit = {
+            kind: 'index',
+            directory: ioDirectory,
+            document: { version: persistence.HARNESS_DATABASE_VERSION, savedAt, registry: [], sessions: [] }
+        };
+
         const saved = await call({
-            kind: 'checkpoint.save',
+            kind: 'shard.save',
             callId: 1,
-            target: { directory: ioDirectory, file: ioState },
-            document: { version: IO_PROTOCOL_VERSION, savedAt: 1_700_000_000_000, registry: [], sessions: [] },
-            savedAt: 1_700_000_000_000
+            target: { kind: 'index', directory: ioDirectory, file: persistence.harnessShardFileOf(indexUnit) },
+            unit: indexUnit,
+            savedAt
         });
 
-        // A checkpoint answers 'durable': fsynced staging plus atomic rename, never a partial
-        // write (../src/server/persistence.ts is the only writer of this format).
-        assert(saved.kind === 'result' && saved.ok === true && saved.outcome === 'durable', `checkpoint.save: ${JSON.stringify(saved)}`);
+        // A shard commit answers 'durable' for ITS OWN file: fsynced staging plus atomic
+        // rename, never a partial write (../src/server/persistence.ts is the only writer
+        // of this format).
+        assert(saved.kind === 'result' && saved.ok === true && saved.outcome === 'durable', `shard.save: ${JSON.stringify(saved)}`);
 
         for (const frame of [
             { kind: 'journal.open', callId: 2, target: { root: ioDirectory, sessionId: ioSession } },
@@ -480,17 +531,21 @@ await check('the published io-worker commits, journals and fences off-thread', a
 
         assert(bye.kind === 'bye' && bye.ok === true, `shutdown: ${JSON.stringify(bye)}`);
 
-        // RELOAD, by the published server's own readers: the checkpoint parses as a database,
-        // and the journal file holds the header line plus exactly the event the worker was
-        // told to write. Both sides ran from the installed layout, so this is the pairing a
-        // deployed host actually gets.
+        // RELOAD, by the published server's own readers: the worker-written index shard
+        // loads as a database (the header is what `load()` opens first), and the journal
+        // file holds the header line plus exactly the event the worker was told to write.
+        // Both sides ran from the installed layout, so this is the pairing a deployed host
+        // actually gets.
         const runtime = server.createHarnessRuntime({ root: ioRoot, loadEnvironment: false });
 
         assert(runtime.persistence !== undefined, 'the published runtime bound no persistence');
 
         const loaded = runtime.persistence.load();
 
-        assert(loaded?.version === IO_PROTOCOL_VERSION, 'the worker-written document did not load');
+        // The document version gate belongs to the persistence format (A1's
+        // `HARNESS_DATABASE_VERSION`), NOT to the IO wire version — the two coincided at 1
+        // until R5 moved them apart, and the smoke reads them apart accordingly.
+        assert(loaded?.version === persistence.HARNESS_DATABASE_VERSION, 'the worker-written index shard did not load');
         assert(Array.isArray(loaded.sessions) && loaded.sessions.length === 0, 'the reloaded sessions array is wrong');
         assert(runtime.persistence.lastWriteError === undefined, `lastWriteError: ${runtime.persistence.lastWriteError}`);
 

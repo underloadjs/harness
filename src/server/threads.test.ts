@@ -37,9 +37,17 @@ import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';
 import { createHarnessRuntime } from './runtime';
 import { HARNESS_DATABASE_VERSION, HarnessPersistence, readHarnessDatabase } from './persistence';
+// v2 layout readers/writers (./persistence-test-helpers.ts): `persistence.file` is now the header
+// document, while turn rows, `core` and the label/thread maps live in `sessions/<id>/session.json`.
+// The pins below keep their exact expectations and read the shard that actually stores each field.
+import {
+    harnessSessionFileOf,
+    readPersistedDocument,
+    writePersistedDocument
+} from './persistence-test-helpers';
 // R2's third durable footprint: the per-step event log next to the document. The store attaches it
 // whenever a database root exists (./sessions.ts `attachJournal`), so a durability proof that stops
-// at `state.json` is only two thirds of the story.
+// at the persisted document is only two thirds of the story.
 import { HarnessJournal } from './journal';
 import { SessionError, SessionStore } from './sessions';
 import type {
@@ -1003,8 +1011,11 @@ describe('SessionStore persistent threads', () => {
 
         if (written === undefined) throw new Error('the steer checkpoint did not persist');
 
-        // The whole archive is IN THE DOCUMENT (not only in memory), and it cost no schema
-        // bump — `HARNESS_DATABASE_VERSION` is still 1, so an older server reads this file too.
+        // The whole archive is IN THE PERSISTED GRAPH (not only in memory), and it cost no schema
+        // bump of its own: `written.version` is the version the writer STAMPS on the header
+        // (`HARNESS_DATABASE_VERSION`, ./persistence.ts:195, applied by `harnessIndexDocumentOf`
+        // at ./persistence.ts:2293), and the steer archive did not raise it. That constant is 2
+        // now — the sharded layout, which a v1 server refuses rather than misreads.
         expect(written.version).toBe(HARNESS_DATABASE_VERSION);
         expect(written.sessions[0].turns[0].steerTexts?.map((entry) => entry.prompt)).toEqual(prompts);
         expect(written.sessions[0].turns[0].steers?.map((steer) => steer.prompt)).toEqual(
@@ -1654,7 +1665,7 @@ describe('SessionStore thread persistence', () => {
         expect(task.turn.threadId).toBe('thread-1');
         store.dispose();
 
-        const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+        const document = readPersistedDocument(root) as {
             sessions: {
                 threadSequence?: unknown;
                 labelSeeds?: unknown;
@@ -1671,9 +1682,9 @@ describe('SessionStore thread persistence', () => {
             delete session.core.threadSequence;
             for (const turn of session.turns) delete turn.threadId;
         }
-        fs.writeFileSync(persistence.file, JSON.stringify(document, null, 2), 'utf8');
+        writePersistedDocument(root, document);
 
-        const old = readHarnessDatabase(JSON.parse(fs.readFileSync(persistence.file, 'utf8')));
+        const old = readHarnessDatabase(readPersistedDocument(root));
         expect(old.sessions).toHaveLength(1);
         // The turn was in flight when the store was disposed, so the document
         // records it as running (the reload marks it interrupted below).
@@ -3562,7 +3573,7 @@ describe('delegated child threads', () => {
         await store.waitForIdle(created.id);
 
         const persistedIds = (): string[] => {
-            const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+            const document = readPersistedDocument(root) as {
                 sessions: { core: { agentResults?: { invocationId: string }[] } }[];
             };
 
@@ -3762,7 +3773,7 @@ describe('delegated child threads', () => {
         // is the COMPLETED answer and this child never gave one; the partial and its position
         // travel beside the error instead. Before the fix this row carried neither key, which
         // is why the restart could not answer what the live door had shown.
-        const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+        const document = readPersistedDocument(root) as {
             sessions: { core: { agentResults?: Record<string, unknown>[] } }[];
         };
         const onDisk = (document.sessions[0].core.agentResults ?? []).find((record) => record.invocationId === '2');
@@ -3842,7 +3853,7 @@ describe('delegated child threads', () => {
         // The reloaded store re-projects the row it was given, byte for byte — the round trip
         // is a fixed point, so a second restart cannot drift the archive further.
         reloaded.dispose();
-        const rewritten = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+        const rewritten = readPersistedDocument(root) as {
             sessions: { core: { agentResults?: Record<string, unknown>[] } }[];
         };
 
@@ -3946,7 +3957,7 @@ describe('delegated child threads', () => {
         await store.waitForIdle(created.id);
 
         const persistedIds = (): string[] => {
-            const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+            const document = readPersistedDocument(root) as {
                 sessions: { core: { agentResults?: { invocationId: string }[] } }[];
             };
 
@@ -4177,11 +4188,11 @@ describe('delegated child threads', () => {
         store.dispose();
 
         // Simulate a document from before the map existed.
-        const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+        const document = readPersistedDocument(root) as {
             sessions: { invocationThreads?: unknown }[];
         };
         for (const session of document.sessions) delete session.invocationThreads;
-        fs.writeFileSync(persistence.file, JSON.stringify(document, null, 2), 'utf8');
+        writePersistedDocument(root, document);
 
         const reloaded = createStore([delegationPreset()], persistence, persistence.load()).get(created.id);
         expect(
@@ -4680,7 +4691,8 @@ describe('thread deletion atomicity', () => {
         // The run ignores the abort: the turn is still live at this instant.
         expect(store.get(created.id).turns[0].status).toBe('running');
 
-        const diskBefore = fs.readFileSync(persistence.file, 'utf8');
+        const sessionShard = harnessSessionFileOf(root, created.id);
+        const diskBefore = fs.readFileSync(sessionShard, 'utf8');
 
         const deleted = await store.deleteThread(created.id, 'thread-1');
 
@@ -4701,7 +4713,7 @@ describe('thread deletion atomicity', () => {
         const durable = persistence.load();
         if (durable === undefined) throw new Error('the delete did not persist');
 
-        expect(fs.readFileSync(persistence.file, 'utf8')).not.toBe(diskBefore);
+        expect(fs.readFileSync(sessionShard, 'utf8')).not.toBe(diskBefore);
         expect(
             durable.sessions.find((candidate) => candidate.id === created.id)?.turns?.map((turn) => `${turn.prompt}:${turn.status}`)
         ).toEqual(['work:cancelled']);
@@ -5543,9 +5555,7 @@ describe('display lane (C1)', () => {
         await durable.waitForIdle(session.id);
         durable.dispose();
 
-        const written = JSON.parse(
-            fs.readFileSync(path.join(root, 'harness', 'state.json'), 'utf8')
-        ) as Record<string, any>;
+        const written = readPersistedDocument(root) as Record<string, any>;
 
         // Two validation stages, in this order: the number check (`requireNumber`, the same
         // one every other numeric field goes through) and then the lane's own rule, which is

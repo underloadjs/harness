@@ -456,7 +456,7 @@ const applyOutcome = (
 };
 
 // The stable transcript address (context T1.3): `messageId` is OPTIONAL on read, so a
-// `state.json` written before ids existed keeps restoring byte-for-bit.
+// stored transcript written before ids existed keeps restoring byte-for-bit.
 //
 // BACKFILL-ON-READ, the option this file picks (the task left both open): every path
 // INTO canonical state goes through this reader — `snapshot()` uses it to project live

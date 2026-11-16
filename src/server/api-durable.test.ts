@@ -1,8 +1,9 @@
 // T16: the durable half of the canonical contract.
 //
 // What is asserted, exactly:
-//   1. `PATCH /sessions/{id} {title}` and a create-with-title reach `state.json` on the SESSION
-//      record, so a rail that names a conversation still names it after a restart;
+//   1. `PATCH /sessions/{id} {title}` and a create-with-title reach the SESSION shard
+//      (`sessions/<id>/session.json`), so a rail that names a conversation still names it after a
+//      restart;
 //   2. `PATCH /config {settings:{model}}` reaches the document's `globalSettings`, so an operator
 //      change does not vanish on the next boot, and a fresh store + API reports the saved model as
 //      its default (and a new session runs it);
@@ -22,7 +23,10 @@ import * as path from 'node:path';
 import { agent, harness } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
-import { HARNESS_DATABASE_FILE, HarnessPersistence } from './persistence';
+import { HarnessPersistence } from './persistence';
+// v2 layout readers (./persistence-test-helpers.ts) — the file names are deliberately NOT taken
+// from ./persistence, so a writer that moves its shards without updating the pins fails loudly.
+import { harnessIndexFileOf, readPersistedDocument } from './persistence-test-helpers';
 import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { SessionStore } from './sessions';
@@ -77,7 +81,11 @@ const tempRoot = (label: string): string => {
     return root;
 };
 
-const stateFile = (root: string): string => path.join(root, 'harness', HARNESS_DATABASE_FILE);
+// v2 layout: `state.json` is now the header document (`index.json`) plus one shard per session
+// (`sessions/<id>/session.json`) and one per transcript. `readDocument` keeps the ONE-document
+// view this suite drives — it is also what `openPair` feeds back as the store's `database`
+// option, which is the unchanged in-memory `HarnessDatabase` shape — by reassembling the shards.
+const stateFile = (root: string): string => harnessIndexFileOf(root);
 
 const openPair = (root: string, database?: Record<string, unknown>) => {
     const registry = createHarnessRegistry([preset()]);
@@ -109,8 +117,7 @@ const jsonOf = (result: HarnessApiResult): { status: number; body: Record<string
     return { status: result.status, body: result.body as Record<string, any> };
 };
 
-const readDocument = (root: string): Record<string, any> =>
-    JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+const readDocument = (root: string): Record<string, any> => readPersistedDocument(root);
 
 describe('durable canonical fields', () => {
     it('persists a session title on its record and restores it into the row', async () => {

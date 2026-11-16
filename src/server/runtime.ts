@@ -17,7 +17,8 @@
 // sandbox or fence, so advertising a root would claim behaviour the tools do not
 // implement. `variables.root` passed by the service loader is the DATABASE_ROOT
 // storage boundary (R3b): ./service.ts resolves it and this module keeps one
-// runtime per resolved root, writing `<root>/harness/state.json`. It is never
+// runtime per resolved root, writing the v2 shard tree under `<root>/harness/`
+// (`index.json` plus `sessions/<id>/…`). It is never
 // advertised as a workspace, and a different root never reuses another root's
 // singleton.
 //
@@ -160,7 +161,8 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
     const root = normalizeHarnessDatabaseRoot(options.root);
 
     // T19: the global agent overlay is durable registry state (`<root>/harness/agents.json`),
-    // so it is read at the same moment as `state.json` and replayed onto the registry BEFORE
+    // so it is read at the same moment as the checkpoint header `index.json` and replayed onto
+    // the registry BEFORE
     // its first `agents()` read. An injected registry gets the same replay below, after the
     // database load, so a host that owns its registry is not second-class.
     const agentRecords = readHarnessAgentRecords(root);

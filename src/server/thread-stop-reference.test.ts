@@ -45,6 +45,8 @@ import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import { SessionStore } from './sessions';
 import { HarnessPersistence } from './persistence';
+// v2 layout reader (./persistence-test-helpers.ts): turn rows live in the session shard.
+import { readPersistedDocument } from './persistence-test-helpers';
 import {
     REFERENCED_RESULTS_FOOTER,
     REFERENCED_RESULTS_HEADER,
@@ -725,9 +727,10 @@ describe('stop/delete against a turn parked on a referenced block', () => {
         expect(waiting.strippedReferences).toBeUndefined();
 
         // The durable record agrees: the link survives verbatim, and the deleted conversation's
-        // OWN row is still in the document (the retired assertion here was that the target's turn
-        // id appeared nowhere, i.e. that its row had been purged).
-        const document = JSON.parse(fs.readFileSync(path.join(root, 'harness', 'state.json'), 'utf8')) as {
+        // OWN row is still persisted (the retired assertion here was that the target's turn
+        // id appeared nowhere, i.e. that its row had been purged). v2 keeps turn rows in the
+        // SESSION shard; the shared reader reassembles the one-document view this pin states.
+        const document = readPersistedDocument(root) as {
             sessions: {
                 id: string;
                 turns: {

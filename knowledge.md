@@ -154,8 +154,9 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
 > `fetch` (Node 18+), and the browser build reaches neither dependency's module.
 > **Workspace consumers:** `@erosire/chat-assistant` (`distribution/chat-assistant`) — it declares
 > `@underload/harness` in `dependencies` (`distribution/chat-assistant/package.json:24`) and imports
-> the root, `/server` and `/frontend` entries (`src/server/presets.ts:34-35`,
-> `src/server/main.ts:35-36`, `src/server/main.test.ts:25-26`, `src/api/harness.ts:68,69,119`).
+> the root, `/server` and `/frontend` entries (`distribution/chat-assistant/src/server/presets.ts:34-35`,
+> `distribution/chat-assistant/src/server/main.ts:35-36`, `distribution/chat-assistant/src/server/main.test.ts:25-26`,
+> `distribution/chat-assistant/src/api/harness.ts:68,69,119`).
 > `@underload/dashboard` is NOT a consumer: it declares no dependency on this package at all, and its
 > own README says the example runs with "no `@underload/harness` import"
 > (`packages/underload/dashboard/README.md:360`). VERIFIED IN PLACE 2026-11-11: this line used to
@@ -443,7 +444,9 @@ src/server/
                         `createHarnessSseResponse` (./service.ts, issue 0006)
   service.ts            @underload/service adapter: /v1/harness, Origin gate, raw SSE
   runtime.ts            lazy shared store/catalogue for the service routes, keyed by root
-  persistence.ts        durable database: versioned JSON DTO, atomic write, validation
+  persistence.ts        durable database (v2 SHARDS): versioned JSON DTO, one file per
+                        session and per conversation under `sessions/<id>/`, ordered
+                        content-digested atomic commits, validation
   sessions.ts           authoritative turns + FIFO queue, watchers, single-flight gate,
                         owner-action registry (answerAction/expiry), core-snapshot
                         write-through and restart recovery; the submit `dispatch`
@@ -1790,7 +1793,10 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   reload answered the very same `invocationId` with `content: ""` and no `partialContent`
   key at all, and the caller lost an answer it had already been shown. The server persists
   `core` verbatim (`src/server/persistence.ts`), so this array IS what lands in
-  `state.json`, and `src/core/snapshot.ts` had to start accepting the pair for that file to
+  that session's `sessions/<sessionId>/session.json` shard — the only part of `core` the
+  writer splits out is `core.threads[].messages`, and an agent-result row never travels
+  with a transcript (`splitHarnessSessionRecord`, `src/server/persistence.ts:2320-2358`),
+  and `src/core/snapshot.ts` had to start accepting the pair for that file to
   come back at all — the record shape and the reader are one fix, not two. The pair is mutually exclusive with `content` by construction —
   `finishInvocation` and `archiveInvocation` write `content` for a COMPLETED run and
   `partialContent` for every other terminal state, never both — so the archive still holds
@@ -3041,6 +3047,11 @@ then `summarizer`. The five primaries are `instruct`, `research` (title
 
 ### Persistence restore policy (T3)
 
+What is replayed is the `registry` array and the optional `deleted` list of the document
+header `<root>/harness/index.json` (`harnessIndexDocumentOf`,
+`src/server/persistence.ts:2289-2306`, consumed at `src/server/runtime.ts:178-195`); sessions
+are independent shards, so one session's record is read from
+`sessions/<sessionId>/session.json` and a registry row cannot change it.
 `restoreHarnessRegistry()` replays saved rows, but a saved BUILT-IN row whose
 executable fields still match `LEGACY_PRESET_DEFINITIONS` (the previous shipped
 defaults) is refreshed to the current template instead of pinning the old one. It is
@@ -4784,8 +4795,10 @@ as their own entries.
   the canonical API URL (`/v1/harness`), not a filesystem root: file tools resolve against
   `process.cwd()` and have no sandbox, so advertising a workspace root would be a
   lie. `variables.root` is the service's database boundary, not a workspace. The
-  handler selects a runtime keyed by that resolved root, and the runtime writes
-  `<root>/harness/state.json` (see persistence.ts); restoring rebuilds the registry
+  handler selects a runtime keyed by that resolved root, and the runtime writes the v2
+  shard tree under `<root>/harness/` — `index.json`, one `sessions/<id>/session.json` per
+  session and one `sessions/<id>/threads/<threadId>.json` per conversation (see
+  persistence.ts); restoring rebuilds the registry
   first, then each session's frozen harness, then its core snapshot. Restore is
   best-effort PER SESSION, and it separates two degrees of staleness. A stale name in
   the snapshot's ENABLED set (`core.discovery.enabled`) is PRUNED, never fatal: the
@@ -5056,7 +5069,7 @@ session-level rows are not two views of one store, and the difference is a contr
   its `hello` blueprint, never the template's (`src/server/plugins.ts:107-121`).
   **There is no third plugin scope, in either direction.** A harness TEMPLATE carries no
   plugin settings at all — `HarnessPresetRecord` has no such field, and the two durable homes
-  are the document and the session record (`src/server/persistence.ts:293` and `:415`) — so a
+  are the document and the session record (`src/server/persistence.ts:495` and `:293`) — so a
   "this harness's plugins" scope does not exist yet, and neither does a per-THREAD one: a
   conversation shares its session's store, which is why a lane replica resolves the SESSION's
   values (`src/server/plugins.ts:107-121`). Both are open work, not an omission of this
@@ -5991,35 +6004,68 @@ primitives, `io-worker-bridge.test.ts` for the durability path, and
 ### IO workers: `ioExecution: 'worker'`
 
 The lane workers isolate a turn's CPU; the IO worker isolates **durability**. One
-thread per database root owns the write side of `harness/state.json` and
-`harness/sessions/<id>/events.jsonl`, so the whole-document stringify plus
+thread per database root owns the write side of the v2 shard tree —
+`harness/index.json`, one `harness/sessions/<id>/session.json` per session and one
+`harness/sessions/<id>/threads/<threadId>.json` per conversation — plus
+`harness/sessions/<id>/events.jsonl`, so the per-shard stringify plus
 mkdir/open/write/fsync/rename no longer block the loop that serves every other session
 and every open stream (the `harness.v1` WebSocket — there is no SSE route left, see
-[API](#api)). The flag is independent of `threadExecution`: a deployment may
+[API](#api)). Protocol **version 3** is the current frame set
+(`IO_PROTOCOL_VERSION`, `src/server/workers/io-protocol.ts:129`): version 2 turned a commit
+from one `checkpoint.save` frame carrying the whole document into one `shard.save` frame per
+file, and version 3 added the `shard.erase` kind so worker mode can also REMOVE what a
+document stopped naming — neither addition is addable, so a mismatched entry fails the
+handshake (`:109-129`). The durability
+rules were not relaxed to make the split, only the payload got smaller. The flag is
+independent of `threadExecution`: a deployment may
 want either, both, or neither, and the default for both is `inline` (today's behavior).
 
 Layout (`src/server/workers/`, same subsystem barrel as the lane workers):
 
 | File | Owns |
 |---|---|
-| `io-protocol.ts` | the data-only frames (`checkpoint.save`, `journal.open/append/flush/rewrite/truncate/remove/close`, `hello`, `shutdown`), the three outcomes (`durable` / `written` / `superseded`), the flattened `{message, code, path, cause}` error report, and the callId source |
-| `io-client.ts` | the coordinator side: one FIFO queue per root, the handshake gate, strict-vs-queued semantics, checkpoint coalescing, `barrier`, `close`, the `resolveIoWorkerEntry` chain, and the numbered integration contract at the bottom of the file |
+| `io-protocol.ts` | the data-only frames (`shard.save`, `shard.erase`, `journal.open/append/flush/rewrite/truncate/remove/close`, `hello`, `shutdown`), the commit order `IO_SHARD_ORDER` (`thread` → `session` → `index`, `:188`, applied by `orderIoShardUnits` `:643`), the three outcomes (`durable` / `written` / `superseded`) plus the additive `skipped` flag on a `result` (`:406-414`), the flattened `{message, code, path, cause}` error report, and the callId source |
+| `io-client.ts` | the coordinator side: one FIFO queue per root, the handshake gate, strict-vs-queued semantics, the document→shard split (`harnessShardUnitsOf`, `:506`), the vanished-shard **plan** (`shardErasesOf`, `:1172`) and its **unawaited** posting (`postShardErase`, `:1152`; strict path `:1426`, queued path via `deferredErases` `:703` drained by `flushDeferred` `:1098-1116`), **per-path** coalescing and per-path byte accounting (`lastShardBytes`, `:248-260`; the worker's skips land in `skippedShards`, `:259`), `barrier`, `close`, the `resolveIoWorkerEntry` chain, and the numbered integration contract at the bottom of the file |
 | `io-worker.ts` | the spawned **entry**: source vs built layout, resolve hooks for extension-less `.ts` specifiers, and the explicit `startIoWorker()` call the bundler needs to keep the loop |
-| `io-worker-loop.ts` | the thread body: the operation table, the cached per-session `HarnessJournal` (the append fd lives HERE), the staging owner `<pid>.io<threadId>`, and the frame bound re-check on the true serialized length |
+| `io-worker-loop.ts` | the thread body: the operation table, one per-shard commit per frame (`runShardSave`, `:302-384`) **with the worker-side skip gate** (`committedShards`, `:142`, judged on digest + `size`/`mtimeMs` witness at `:355-367`), the erase handler (`runShardErase`, `:401-423`, which calls persistence.ts's `eraseHarnessShardPaths` — the same primitive the inline collector uses), the cached per-session `HarnessJournal` (the append fd lives HERE), the staging owner `<pid>.io<threadId>` (`:108`), the shard-layout refusal (`shard-layout`, `:307-320`) and the frame bound enforced on the true serialized length of THAT shard (`:322-341`) |
 
 Invariants, in priority order:
 
 - **ORDER.** Frames are posted in call order and answered one at a time (every
   operation inside the thread is synchronous), so a journal append reaches the file
-  before the checkpoint that lists it, a reset's truncate precedes the document that
+  before the checkpoint that lists it, a reset's truncate precedes the record that
   forgets those turns, and a `journal.flush` ordered ahead of a save fences the tail.
-  The rule `src/server/journal.ts` always relied on becomes structural.
+  The rule `src/server/journal.ts` always relied on becomes structural. Inside one
+  commit the same queue applies `IO_SHARD_ORDER`, so a thread shard is on disk before
+  the `session.json` that indexes it and that before `index.json` — a reader starting at
+  the header never follows a reference to a shard written after it
+  (`io-protocol.ts:46-52`, `:161-176`).
 - **NO FALSE SUCCESS.** An awaited operation resolves only on the worker's own success
   receipt and rejects with the exact message the inline writer throws, so a 500 body is
   identical in both modes. A QUEUED operation never claims durability at all — it
   claims order — and its failure goes to the same channels the inline
-  `journal.error` / `persistence.lastWriteError` feed. A coalesced-away checkpoint is
-  counted `superseded`, never reported as written.
+  `journal.error` / `persistence.lastWriteError` feed. A coalesced-away shard is
+  counted `superseded`, in total and per path (`io-client.ts:57-64`, `:1003-1042`), never reported
+  as written. **No composite claim**: each `shard.save` answers for itself, and nothing
+  reads "all shards durable" out of the index receipt, because the index rename does not
+  fsync the shard renamed before it (`io-protocol.ts:72-77`).
+- **SKIP AND GARBAGE COLLECTION, RE-HOMED — NOT MISSING.** Both modes skip a shard whose
+  bytes did not change and both remove the shards a commit stopped naming; what differs is
+  WHERE the skip is decided and WHEN the erase is awaited. Inline decides it in
+  `commitShardIfChanged` (`src/server/persistence.ts:2994-3011`), worker mode on the worker
+  in `runShardSave` against `committedShards` (`src/server/workers/io-worker-loop.ts:142`,
+  judged at `:355-367`) — the only place that can decide it there, because only the worker
+  holds the serialized bytes; a restarted worker starts with an empty map and re-commits each
+  shard ONCE (`:135`). Removal is one shared primitive, `eraseHarnessShardPaths`
+  (`src/server/persistence.ts:3086-3106`): inline calls it inside `save()`
+  (`eraseVanishedShards`, `:3025-3052`), worker mode posts a `shard.erase` frame whose exact
+  `files`/`trees` the coordinator derives from `persistence.shardFootprint` (`:2577-2583`) and
+  hands to the queue UNAWAITED behind that commit's writes
+  (`src/server/workers/io-client.ts:1426` strict, `:1115` queued). No new durability outcome:
+  an erase failure answers `failure` with code `shard-erase`
+  (`src/server/workers/io-worker-loop.ts:412-421`), is not put on the sticky persistence-error
+  channel (`noteFailure`, `src/server/workers/io-client.ts:822-844`), and leaves bytes `load()`
+  never lists — disk, not correctness.
 - **ONE WRITER.** The store still owns the state and builds every record. In worker mode
   it must not write through a coordinator-side `HarnessJournal` for a session the client
   owns (two append handles is two writers), so `attachJournal` creates a READER only and
@@ -6029,15 +6075,23 @@ Invariants, in priority order:
   or a protocol-version mismatch throws a named `HarnessIoError`, fails every
   outstanding operation, and aborts startup. `startHarnessServer` awaits
   `store.ioReady()` before `listen`, and `close()` awaits `store.drainIo()` so the
-  graceful document is on disk before the process may exit — with `summary.failures`
+  graceful commits are on disk before the process may exit — with `summary.failures`
   listing what is NOT known durable.
 - **TERMINAL FENCES (new, strictly stronger than inline).** A cancel / cancelThread /
   turn-start / command-terminal commit maps to `io.commitCheckpoint({ document,
   fenceSessions: [session.id] })`. Inline never fsynced at those sites, so worker mode
   is an upgrade, not a parity claim.
 - **BOUNDED, NOT FREE.** The record build and the structured clone of each frame stay on
-  the main thread (the authority owns the state); a checkpoint is bounded by
-  `maxFrameBytes`, measured by the worker and fed back so the client's guard is O(1).
+  the main thread (the authority owns the state), and EVERY checkpoint re-fans the whole
+  document into units (`harnessShardUnitsOf`, `io-client.ts:506`), so per-commit fan-out,
+  clone and the worker's stringify are O(total store) — the split buys the **write syscall**
+  and the **failure radius**, not cheaper CPU; an unchanged shard is not opened at all in
+  either mode (see the bullet above). Each SHARD frame is bounded by
+  `maxFrameBytes`, measured by the worker per shard (`io-worker-loop.ts:322-341`) and fed
+  back per path so the client's guard is O(1) for that path (`io-client.ts:912`,
+  `:1288-1292`) — one oversized conversation
+  stops being cloned without freezing the other sessions' writes
+  (`io-client.ts:44-49`).
 
 `SessionStore` opens the client in its constructor when the resolved runtime says
 `ioExecution: 'worker'` (or when a host injects `options.io`), and the strict path is
@@ -6101,7 +6155,8 @@ the dispatcher:
 - `remove(name)` (T5) deletes any entry by its DIRECT name (an alias is a read redirect,
   not an identity), returns the removed preset, and answers 404 for an unknown or
   already-deleted name. A deleted **built-in** also records a tombstone
-  (`deletedBuiltins()`), persisted as the additive `deleted` array in `state.json`,
+  (`deletedBuiltins()`), persisted as the additive `deleted` array in the document header
+  `index.json` (`src/server/persistence.ts:2299`),
   because a fresh registry always re-seeds the shipped templates - the missing row
   alone cannot express a deletion. A deleted **user** harness needs no tombstone (its
   row is simply gone). `create()` clears the tombstone for the name it takes, so
@@ -6150,7 +6205,8 @@ create/patch request. `agentModels` is the single model-shaped field: it selects
 id, never credentials. `agentInstructions` (T3) is the single text-shaped field: a
 per-member OVERRIDE stored on the harness, validated and bounded by the registry,
 that never rewrites the trusted profile. The registry is **in memory only unless a database root is
-supplied**: with one, registry metadata is saved in `<root>/harness/state.json` and
+supplied**: with one, registry metadata is saved in the document header
+`<root>/harness/index.json` and
 replayed on restart (see the Persistence section in README.md); without one, a
 restart returns to the shipped catalogue.
 
@@ -6193,9 +6249,13 @@ the exception a saved chat exposes directly.
   same `harness()` a CLI does; neither the CLI nor the server adds tool execution
   or model policy.
 - **Sessions are durable only when a database root is supplied.** With one, the
-  server writes `<root>/harness/state.json` and a restart rebuilds the registry,
+  server writes the v2 shard tree under `<root>/harness/` (`index.json` plus
+  `sessions/<id>/session.json` and `sessions/<id>/threads/<threadId>.json`) and a restart
+  rebuilds the registry,
   sessions, queues, and core state; without one the store is in memory and a
-  restart is a clean slate (the default for direct unit tests).
+  restart is a clean slate (the default for direct unit tests). The v1 single-file
+  `harness/state.json` is neither read nor removed: an upgrade starts empty and says so
+  once (`src/server/persistence.ts:2530-2549`).
 - **The queue belongs to the server, not to a response.** `/tasks` answers `202`
   because a task accepted with a socket would die with that socket. CORRECTED IN PLACE
   2026-11-11: this bullet still named the legacy `/messages` route as the one holder of
@@ -6416,7 +6476,7 @@ library itself still has no thread/CPU isolation; a server deployment can now mo
 each conversation onto its own worker thread (`threadExecution: 'worker'`, see
 [Lane workers](#lane-workers-threadexecution-worker)), which is documented there
 with the boundaries that stay refused. The same deployment can also move the
-whole-document checkpoint and the per-event journal off the request loop
+checkpoint's shard commits and the per-event journal off the request loop
 (`ioExecution: 'worker'`, see [IO workers](#io-workers-ioexecution-worker)); the
 library-level statements above are about the library, and neither flag changes them.
 

@@ -10,7 +10,12 @@
 // file remains for local development and for a single-process deployment that also
 // serves the built UI (`../frontend/dist`, when present).
 //
-// PERSISTENCE (R3b): pass `databaseRoot` to resume `<root>/harness/state.json`.
+// PERSISTENCE (R3b): pass `databaseRoot` to resume the shard tree under
+// `<root>/harness/` — `index.json`, `sessions/<id>/session.json` per session and
+// `sessions/<id>/threads/<threadId>.json` per conversation. A legacy single-file
+// `harness/state.json` in that root is reported once and never read, rewritten, renamed
+// or deleted (./persistence.ts `noteLegacyHarnessDatabase`), so this build starts empty
+// beside it.
 // Omitted is the previous in-memory server (the default used by direct tests).
 
 import http from 'node:http';

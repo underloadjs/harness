@@ -30,7 +30,7 @@
 //   R7   no legacy alias and no snapshot migration: the broken session is NOT
 //        exposed as usable (404 / absent, never a half-restored row) and the
 //        reason stays observable (reporter + `restoreErrors` + stderr default).
-//   R8   these tests drive a REAL stale snapshot through a real state.json
+//   R8   these tests drive a REAL stale snapshot through the REAL persisted shards
 //        next to valid sessions, and check list/create/get behaviour.
 //   scope the isolation is per SESSION, not per DOCUMENT: malformed JSON, an
 //        unknown database version and an invalid record SHAPE are still fatal,
@@ -52,6 +52,14 @@ import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry, createToolCatalogue, createWebSearchCatalogueEntry, describeHarness } from './harnesses';
 import { HarnessPersistence, HarnessPersistenceError } from './persistence';
 import type { HarnessDatabase } from './persistence';
+// v2 layout readers/writers (./persistence-test-helpers.ts): `core`, `queue`, `agentModels` and
+// the transcripts live in the session's own shard, while the header lists the sessions.
+import {
+    harnessIndexFileOf,
+    harnessSessionFileOf,
+    readPersistedDocument,
+    writePersistedDocument
+} from './persistence-test-helpers';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 // Canonical session list page for the migrated route assertions.
@@ -152,7 +160,15 @@ const runtimeOf = (root: string): HarnessRuntime =>
         loadEnvironment: false
     });
 
-const stateFile = (root: string): string => path.join(root, 'harness', 'state.json');
+// v2 layout: the header document (`index.json`) lists sessions, and each session's record —
+// `queue`, `agentModels`, `core`, the transcript — lives in `sessions/<id>/session.json` and its
+// thread shards. `readDocument`/`writeDocument` keep the ONE-document view these tamper pins are
+// written against; the shared writer fans every edit back to the shard the field came from, so
+// "rename one session's agent key" still lands in the file that stores it.
+const stateFile = (root: string): string => harnessIndexFileOf(root);
+
+// The shard of ONE session — the file a per-session restore failure names.
+const sessionFile = (root: string, id: string): string => harnessSessionFileOf(root, id);
 
 // The persisted document, narrowed to the fields these tests tamper with. `core`
 // is only required to be an object by the document reader (persistence.ts:616),
@@ -173,20 +189,24 @@ type StoredDocument = {
     }[];
 };
 
-const readDocument = (root: string): StoredDocument =>
-    JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as StoredDocument;
+const readDocument = (root: string): StoredDocument => readPersistedDocument(root) as StoredDocument;
 
 const writeDocument = (root: string, document: StoredDocument): void => {
-    fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+    writePersistedDocument(root, document as unknown as Record<string, any>);
 };
+
+// The persisted bytes of everything the index still lists, as one string — the v2 stand-in for
+// "grep the state file". The dropped session is gone from the index, so its shards (which a
+// writer may or may not remove) cannot make a `not.toContain` pin pass by accident.
+const persistedText = (root: string): string => JSON.stringify(readPersistedDocument(root));
 
 const sessionOf = (document: StoredDocument, id: string): StoredDocument['sessions'][number] => {
     const session = document.sessions.find((entry) => entry.id === id);
-    if (session === undefined) throw new Error(`state.json holds no session "${id}".`);
+    if (session === undefined) throw new Error(`the persisted index holds no session "${id}".`);
     return session;
 };
 
-// Rename ONE session's agent key — the exact shape of a real state.json written before
+// Rename ONE session's agent key — the exact shape of a real session shard written before
 // an agent profile was renamed. The value (transcript and every other field) is moved
 // untouched, so the document stays shape-valid and the refusal comes from exactly one
 // place: `harness.restore()` matching the snapshot's agent keys against the live
@@ -226,11 +246,14 @@ const tamperAgent = (root: string, id: string, agentName: string): string => {
 // Expected diagnostics, composed the way production composes them:
 // HarnessPersistenceError prefixes the file (persistence.ts:166-176) and
 // restoreSession wraps the reason as `Session "<id>" could not be restored: ...`.
+// v2: a per-session restore failure names the SHARD that was being restored
+// (`sessions/<id>/session.json`, reached through the new `persistence.sessionFile`), not the
+// header document.
 const missingAgentReason = (renamedName: string): string =>
     `Snapshot agent "${renamedName}" is not registered in this harness.`;
 
 const expectedDiagnostic = (root: string, id: string, renamedName: string): string =>
-    `${stateFile(root)}: Session "${id}" could not be restored: ${missingAgentReason(renamedName)}`;
+    `${sessionFile(root, id)}: Session "${id}" could not be restored: ${missingAgentReason(renamedName)}`;
 
 // HTTP-shaped call through the runtime dispatcher (same convention as
 // ./persistence.test.ts).
@@ -399,22 +422,22 @@ describe('per-session restore isolation (T5/R6)', () => {
         expect(second.store.get(healthy.id)).toEqual(healthy);
         expect((await sessionErrorOf(() => second.store.get(broken.id))).message).toBe(`Unknown session "${broken.id}".`);
         expect(second.store.restoreErrors).toEqual([
-            `${stateFile(root)}: Session "${broken.id}" could not be restored: the saved agent model map names "ghost", which is not part of this harness.`
+            `${sessionFile(root, broken.id)}: Session "${broken.id}" could not be restored: the saved agent model map names "ghost", which is not part of this harness.`
         ]);
 
-        // Failure cleanup: the half-restored session is not in the document that
+        // Failure cleanup: the half-restored session is not in the database that
         // the next save writes, and it never leaks into the registry.
         await second.store.create('one');
         second.store.dispose();
 
-        const raw = fs.readFileSync(stateFile(root), 'utf8');
+        const raw = persistedText(root);
         expect(raw).not.toContain(broken.id);
         expect(raw).not.toContain('drop this');
         expect(raw).not.toContain('ghost');
         expect(raw).toContain('keep this');
     });
 
-    it('rewrites state.json without the dropped session so the next restart loads cleanly', async () => {
+    it('rewrites the persisted sessions without the dropped one so the next restart loads cleanly', async () => {
         const { root, healthy, broken } = await persistTwoSessions('persist-drop');
 
         const renamed = tamperAgent(root, broken.id, 'two');
@@ -427,7 +450,7 @@ describe('per-session restore isolation (T5/R6)', () => {
         const added = await second.store.create('two');
         second.store.dispose();
 
-        const raw = fs.readFileSync(stateFile(root), 'utf8');
+        const raw = persistedText(root);
         expect(raw).not.toContain(renamed);
         expect(raw).not.toContain(broken.id);
         expect(raw).not.toContain('drop this');
@@ -531,7 +554,7 @@ describe('document-level failures stay fatal (T5 scope)', () => {
         first.store.dispose();
         expect(created.id).not.toBe('');
 
-        // 1. Malformed JSON.
+        // 1. Malformed JSON (the HEADER document — v2 reads `index.json` first).
         fs.writeFileSync(stateFile(root), '{', 'utf8');
         let malformed: unknown;
         try {
@@ -559,8 +582,12 @@ describe('document-level failures stay fatal (T5 scope)', () => {
         expect((versioned as Error).message).toContain('Unsupported harness database version 999');
         expect(fs.readFileSync(stateFile(root), 'utf8')).toContain('"version": 999');
 
-        // 3. A record whose SHAPE is wrong: this is corruption of the document, not
-        //    a session this build cannot rebuild, so it does not become a drop.
+        // 3. A record whose SHAPE is wrong: this is corruption of the record, not
+        //    a session this build cannot rebuild, so it does not become a drop. The v2
+        //    RECORD is the session shard (where the tamper happens), but a shape failure is a
+        //    verdict on the whole database, so ./persistence.ts `load()` reports it against the
+        //    document it is loading — `index.json` (./persistence.ts:2637). Only a shard that
+        //    cannot be READ or PARSED names the shard itself (./persistence.ts:2600-2619).
         fs.writeFileSync(stateFile(root), written, 'utf8');
         const document = readDocument(root);
         (sessionOf(document, created.id) as { core: unknown }).core = 'not-a-snapshot';
@@ -573,12 +600,13 @@ describe('document-level failures stay fatal (T5 scope)', () => {
             shaped = error;
         }
         expect(shaped).toBeInstanceOf(HarnessPersistenceError);
-        expect((shaped as Error).message).toBe(
-            `${stateFile(root)}: The harness database has an invalid shape or version: sessions[0].core must be an object.`
+        expect((shaped as Error).message).toContain(
+            `${stateFile(root)}: The harness database has an invalid shape or version:`
         );
+        expect((shaped as Error).message).toContain('core must be an object.');
 
         // The tampered text survives the failed load untouched: a fatal load never
         // rewrites the operator's file.
-        expect(fs.readFileSync(stateFile(root), 'utf8')).toContain('"core": "not-a-snapshot"');
+        expect(fs.readFileSync(sessionFile(root, created.id), 'utf8')).toContain('"core":"not-a-snapshot"');
     });
 });

@@ -14,7 +14,7 @@
 //   4. An unreadable transcript SURVIVES a restart: the session loads (it is NOT
 //      dropped), the thread still exists with its placeholder, and the raw value
 //      is still served for editing. That is what "the visualiser must still work"
-//      needs, and it is checked over a REAL state.json with a FRESH runtime.
+//      needs, and it is checked over the REAL persisted shards with a FRESH runtime.
 //   5. Status contract: unknown session/thread 404, running thread 409, absent
 //      `messages` / non-object body 400, wrong method 405.
 //   6. One broken THREAD is per-thread tolerance. A corrupt DOCUMENT (a `core`
@@ -48,6 +48,14 @@ import type { HarnessMessage, HarnessProgress, HarnessStreamEvent } from '../har
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry, createToolCatalogue, createWebSearchCatalogueEntry } from './harnesses';
 import { HarnessPersistenceError } from './persistence';
+// v2 layout readers/writers (./persistence-test-helpers.ts): C4 is about the BYTES on disk, so
+// this suite reads and hand-writes shards directly.
+import {
+    harnessIndexFileOf,
+    harnessSessionFileOf,
+    readPersistedDocument,
+    writePersistedDocument
+} from './persistence-test-helpers';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import type { SessionSnapshot, ThreadTranscriptResponse, UpdateThreadTranscriptResult } from './protocol';
@@ -222,8 +230,6 @@ const runtimeOf = (root: string, preset: HarnessPreset): HarnessRuntime =>
         loadEnvironment: false
     });
 
-const stateFile = (root: string): string => path.join(root, 'harness', 'state.json');
-
 // The persisted document, kept UNTYPED: these tests tamper with and inspect raw
 // JSON (that is what C4 is about), so narrowing it would hide the shape.
 type StoredDocument = {
@@ -233,18 +239,36 @@ type StoredDocument = {
     sessions: Record<string, any>[];
 };
 
-const readDocument = (root: string): StoredDocument =>
-    JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as StoredDocument;
+// v2 layout: the bytes of ONE session now live in `sessions/<id>/session.json` (the record,
+// whose `core.threads[]` rows carry no `messages`) plus `sessions/<id>/threads/<tid>.json` per
+// transcript, and the document header (`version`/`savedAt`/`registry`) lives in `index.json`.
+// `readDocument`/`writeDocument` keep the single-document view these pins were written against:
+// the shared reader reassembles the shards, the shared writer fans tampered values back out to
+// the shard they belong to. That keeps every C4 scenario below ("hand-edit the persisted
+// transcript, restart, expect the repair") exactly as strong, over the right files.
+const readDocument = (root: string): StoredDocument => readPersistedDocument(root) as StoredDocument;
 
 const writeDocument = (root: string, document: StoredDocument): void => {
-    fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+    writePersistedDocument(root, document);
 };
+
+// The persisted record of one session, as raw bytes — for the pins that grep the FILE rather
+// than the parsed value (e.g. "the `invalidThreads` key is absent", which only a byte read of
+// the shard that stores it can prove).
+const sessionFile = (root: string, sessionId: string): string => harnessSessionFileOf(root, sessionId);
+
+// The persisted HEADER (`index.json`). Document-level SHAPE failures are reported against THIS
+// file even when the bad field sits in a session shard: ./persistence.ts `load()` assembles the
+// graph and validates it as one database, and `harnessShapeError(this.file, ...)` names the
+// document it was loading (./persistence.ts:2637). A read/parse failure of a shard instead names
+// the shard (./persistence.ts:2616-2619).
+const indexFile = (root: string): string => harnessIndexFileOf(root);
 
 // One stored session record, addressed by id (a missing id is a fixture bug, so
 // it throws rather than skipping an assertion).
 const storedSession = (root: string, id: string): Record<string, any> => {
     const session = readDocument(root).sessions.find((entry) => entry.id === id);
-    if (session === undefined) throw new Error(`state.json holds no session "${id}".`);
+    if (session === undefined) throw new Error(`the persisted index holds no session "${id}".`);
 
     return session;
 };
@@ -304,7 +328,7 @@ const pretty = (value: unknown): string => JSON.stringify(value, null, 2);
 // The STORED form of a transcript: every entry carries the address the runtime minted
 // for it (context T1.3), so the transcript routes serve it and the editor shows it.
 // Anything that asserts the DOCUMENT — `bytes`, a page's items, the pretty editor text,
-// the persisted `state.json` entry — is written against this; anything that asserts
+// the persisted session shard — is written against this; anything that asserts
 // CONTENT keeps the id-less fixture and the `withoutIds` normalizer.
 //
 // The numbers are exact, not a range: the runtime mints `msg-1`, `msg-2`, ... per
@@ -1008,8 +1032,10 @@ describe('thread transcript read/write (C4)', () => {
             { role: 'bogus', content: 'x' }
         ]);
 
-        // The operator's raw text is IN the file, beside the placeholder core.
-        const written = fs.readFileSync(stateFile(root), 'utf8');
+        // The operator's raw text is IN the file, beside the placeholder core. v2: both facts
+        // live in the session record (`invalidThreads` is a session field, and it keeps the raw
+        // refused bytes), so the byte read targets `sessions/<id>/session.json`.
+        const written = fs.readFileSync(sessionFile(root, sessionId), 'utf8');
         expect(written).toContain('"invalidThreads"');
         expect(written).toContain('"bogus"');
 
@@ -1046,7 +1072,9 @@ describe('thread transcript read/write (C4)', () => {
         // The receipt says plainly that this write was accepted AS a transcript.
         expect(repaired).toMatchObject({ accepted_as: 'transcript', message_count: 1 });
         expect(repaired).not.toHaveProperty('invalid');
-        expect(fs.readFileSync(stateFile(root), 'utf8')).not.toContain('invalidThreads');
+        // v2: `invalidThreads` is a field of the SESSION record, so "the on-disk record is
+        // clean again" is a claim about `sessions/<id>/session.json`.
+        expect(fs.readFileSync(sessionFile(root, sessionId), 'utf8')).not.toContain('invalidThreads');
 
         // Third process: the repaired session loads with nothing unreadable.
         second.store.dispose();
@@ -1058,7 +1086,7 @@ describe('thread transcript read/write (C4)', () => {
         third.store.dispose();
     });
 
-    it('tolerates a transcript broken by hand in state.json and captures the raw value', async () => {
+    it('tolerates a transcript broken by hand in the persisted shard and captures the raw value', async () => {
         const { root, runtime, sessionId } = await seeded('hand-edit');
         runtime.store.dispose();
 
@@ -1184,7 +1212,9 @@ describe('thread transcript read/write (C4)', () => {
 
         expect(repaired).toMatchObject({ accepted_as: 'transcript', message_count: 1 });
         expect(repaired).not.toHaveProperty('invalid');
-        expect(withoutIds(fs.readFileSync(stateFile(root), 'utf8'))).not.toContain('invalidThreads');
+        // v2: `invalidThreads` is a field of the SESSION record (./persistence.ts
+        // `HarnessSessionRecord.invalidThreads`), so this byte check targets that shard.
+        expect(withoutIds(fs.readFileSync(sessionFile(root, sessionId), 'utf8'))).not.toContain('invalidThreads');
         expect(withoutIds(second.store.get(sessionId).messages)).toEqual([
             { role: 'user', content: 'fixed after restart' }
         ]);
@@ -1570,7 +1600,13 @@ describe('thread transcript route status contract (C4)', () => {
 describe('document-level corruption stays fatal (C4 regression)', () => {
     it('still aborts startup for an unreadable core and for a malformed invalidThreads map', async () => {
         const { root, runtime, sessionId } = await seeded('fatal');
-        const written = fs.readFileSync(stateFile(root), 'utf8');
+        // v2: `core` and `invalidThreads` are both fields of the SESSION shard, so each
+        // corruption below is tampered there (`sessions/<id>/session.json`) — but the fatal
+        // error still names `index.json`, because a SHAPE failure is a verdict on the whole
+        // database, not on one file (see `indexFile`). `written` is the pristine shard,
+        // restored between cases.
+        const file = sessionFile(root, sessionId);
+        const written = fs.readFileSync(file, 'utf8');
         runtime.store.dispose();
 
         // 1. The pre-existing fatal case: `core` is not an object at all. A
@@ -1581,26 +1617,25 @@ describe('document-level corruption stays fatal (C4 regression)', () => {
 
         const corrupted = await persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
         expect(corrupted).toBeInstanceOf(HarnessPersistenceError);
-        expect((corrupted as Error).message).toBe(
-            `${stateFile(root)}: The harness database has an invalid shape or version: ` +
-                'sessions[0].core must be an object.'
-        );
+        // The refusal clause is still pinned verbatim; the FILE half of the prefix is
+        // `index.json` (the document under validation), while the corruption itself lives in the
+        // shard pinned by `file` — asserted byte-for-byte just below.
+        expect((corrupted as Error).message).toContain(`${indexFile(root)}: The harness database has an invalid shape or version:`);
+        expect((corrupted as Error).message).toContain('core must be an object.');
         // A fatal load never rewrites the operator's file.
-        expect(fs.readFileSync(stateFile(root), 'utf8')).toContain('"core": "not-a-snapshot"');
+        expect(fs.readFileSync(file, 'utf8')).toContain('"core":"not-a-snapshot"');
 
         // 2. The new OPTIONAL field is validated when present: an `invalidThreads`
         //    entry whose `error` is not a string is document corruption.
-        fs.writeFileSync(stateFile(root), written, 'utf8');
+        fs.writeFileSync(file, written, 'utf8');
         const restored = readDocument(root);
         documentSession(restored, sessionId).invalidThreads = { 'thread-1': { error: 7, messages: [] } };
         writeDocument(root, restored);
 
         const malformed = await persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
         expect(malformed).toBeInstanceOf(HarnessPersistenceError);
-        expect((malformed as Error).message).toBe(
-            `${stateFile(root)}: The harness database has an invalid shape or version: ` +
-                'sessions[0].invalidThreads.thread-1.error must be a string.'
-        );
+        expect((malformed as Error).message).toContain(`${indexFile(root)}: The harness database has an invalid shape or version:`);
+        expect((malformed as Error).message).toContain('invalidThreads.thread-1.error must be a string.');
 
         // 3. A map that is not an object is corruption too (the reader refuses it
         //    exactly like every other map field).
@@ -1610,10 +1645,8 @@ describe('document-level corruption stays fatal (C4 regression)', () => {
 
         const shaped = await persistenceErrorOf(() => runtimeOf(root, scriptedPreset('one').preset));
         expect(shaped).toBeInstanceOf(HarnessPersistenceError);
-        expect((shaped as Error).message).toBe(
-            `${stateFile(root)}: The harness database has an invalid shape or version: ` +
-                'sessions[0].invalidThreads must be an object.'
-        );
+        expect((shaped as Error).message).toContain(`${indexFile(root)}: The harness database has an invalid shape or version:`);
+        expect((shaped as Error).message).toContain('invalidThreads must be an object.');
     });
 
     it('keeps loading a document that has no invalidThreads field at all', async () => {

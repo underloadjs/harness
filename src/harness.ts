@@ -7731,7 +7731,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Returns the detached canonical transcript, like `appendThreadMessages`, so the caller
     // can publish the committed digest without a second read. Notifies `agent_message` — the
     // same reason every other transcript write reports, and the ONLY durability mechanism:
-    // it is what makes the server snapshot this conversation into `state.json`, which is the
+    // it is what makes the server snapshot this conversation into the store — this
+    // conversation's `sessions/<id>/threads/<threadId>.json` shard, indexed by the session's
+    // `session.json` record — which is the
     // restart half of the claim this seam exists for.
     const patchThreadMessages = (
         threadId: string,
@@ -11583,8 +11585,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // Persistence: the flag change IS transcript state, so a conversation with
             // a shared store reports it exactly like every other transcript write
             // (`runAgentCore`'s root append, `writeThreadTranscript`, `restore`) — the
-            // observer snapshots the whole harness, and the server writes it to
-            // `state.json`.
+            // observer snapshots the whole harness, and the server writes it to the
+            // session's `session.json` shard (and this conversation's
+            // `threads/<threadId>.json` transcript shard).
             // A branch run (fork/autoanswer) has `run.threadState === undefined`
             // (`runAgent`'s `resolvedThread` returns undefined for a branch, so no
             // threadState is ever put on the run), owns an ephemeral transcript, and is

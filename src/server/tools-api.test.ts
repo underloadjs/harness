@@ -19,7 +19,7 @@
 //                  hides the name from its declarations, the launch gate answers a guess
 //                  with the switch's readable tool result, `toolRequest` reports it under
 //                  `forbidden`, and re-enabling puts all of it back.
-//   6. DURABLE   - `state.json` carries `toolSettings: { disabled: [...] }` and nothing else,
+//   6. DURABLE   - `index.json` carries `toolSettings: { disabled: [...] }` and nothing else,
 //                  a deployment that never switched anything writes no field at all, and a
 //                  fresh runtime on the same root boots with the switch applied. A hand-edited
 //                  document listing a core name is HONOURED, not dropped.
@@ -36,7 +36,7 @@
 //   - ../harness.tool-settings.test.ts — the same three consumers at the library boundary
 //   - ./plugins-api.test.ts         — the sibling REST+durability suite this one mirrors
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,6 +51,9 @@ import type { HarnessRuntime, HarnessRuntimeOptions } from './runtime';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { CORE_TOOL_NAMES } from './harnesses/toolbox';
 import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../shared/harness-api';
+// v2 layout readers/writers (./persistence-test-helpers.ts): the operator settings blocks live in
+// the header document `index.json`, so this suite pins THAT file.
+import { harnessIndexFileOf, readPersistedIndex } from './persistence-test-helpers';
 
 const MOUNT = '/v1/harness';
 
@@ -101,10 +104,13 @@ const fixture = async (): Promise<string> => {
     return root;
 };
 
-const fileOf = (root: string): string => join(root, 'harness', 'state.json');
+// v2 layout: the OPERATOR blocks this suite pins (`toolSettings`, and the registry list) are
+// fields of the document HEADER, which is now `index.json` — sessions and transcripts moved to
+// their own shards. `documentOf`/`writeDocument` therefore read and rewrite that one file; every
+// expected value below is unchanged, only the file and its shape moved.
+const fileOf = (root: string): string => harnessIndexFileOf(root);
 
-const documentOf = (root: string): Record<string, any> =>
-    JSON.parse(readFileSync(fileOf(root), 'utf8')) as Record<string, any>;
+const documentOf = (root: string): Record<string, any> => readPersistedIndex(root);
 
 const writeDocument = async (root: string, document: unknown): Promise<void> => {
     await writeFile(fileOf(root), JSON.stringify(document, null, 2), 'utf8');

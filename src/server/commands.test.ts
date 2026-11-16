@@ -37,6 +37,9 @@ import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';
 import { createHarnessRuntime } from './runtime';
 import { SessionError, SessionStore } from './sessions';
+// v2 layout reader (./persistence-test-helpers.ts): the turn row whose save failed is pinned from
+// the session shard that stores it.
+import { readPersistedSession } from './persistence-test-helpers';
 import type { SessionStreamItem, SessionTurn } from './protocol';
 // T35: the canonical transport. A submit answers a 202 `TaskReceipt` and the turn's own
 // members are separate named reads, so every HTTP assertion below composes them through
@@ -1054,16 +1057,14 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         expect(live.status).toBe('idle');
         expect(live.queueDepth).toBeUndefined();
 
-        // HONEST DURABILITY (the remaining trade-off): the document STILL holds the
+        // HONEST DURABILITY (the remaining trade-off): the persisted record STILL holds the
         // RUNNING row, because the write that would have replaced it failed. A restart
         // therefore recovers that turn as an interrupted run rather than pretending the
         // command was never submitted. Checked before the tool call below, whose own
-        // successful save would rewrite the file.
-        const written = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
-            sessions: Record<string, any>[];
-        };
+        // successful save would rewrite the file. (v2: the row is in the session shard.)
+        const written = readPersistedSession(root, id);
 
-        expect(written.sessions.find((entry) => entry.id === id)?.turns[0]?.status).toBe('running');
+        expect(written?.turns[0]?.status).toBe('running');
 
         // The command DID execute in the live session (its harness side effect is in
         // memory, and the answer is recorded in the turn's events). This later save

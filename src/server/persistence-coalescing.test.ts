@@ -37,7 +37,10 @@ import { agent, harness } from '../harness';
 import type { HarnessPreset, HarnessPresetReport, RunnerSettings } from './harnesses/types';
 import type { HarnessStream, HarnessStreamEvent } from '../harness';
 import { createHarnessRegistry } from './harnesses';
-import { HARNESS_DATABASE_FILE, HarnessPersistence } from './persistence';
+import { HarnessPersistence } from './persistence';
+// v2 layout readers (./persistence-test-helpers.ts): turns and the session title are stored in the
+// session shard; only the session LIST moved into the header document.
+import { harnessSessionFileOf, readPersistedSession } from './persistence-test-helpers';
 import { HARNESS_JOURNAL_FILE, HarnessJournal } from './journal';
 import { SessionStore } from './sessions';
 
@@ -181,7 +184,9 @@ const durableStoreOf = (preset: HarnessPreset, root: string): { store: SessionSt
     return { store, writes, persistence };
 };
 
-const stateFileOf = (root: string): string => path.join(root, 'harness', HARNESS_DATABASE_FILE);
+// v2 layout: turn records and the session `title` are fields of the SESSION shard, so the "is it
+// really on disk" reads below go through the shared reader for that shard. `journalFileOf` is
+// unchanged: the event log still sits next to the record at `sessions/<id>/events.jsonl`.
 const journalFileOf = (root: string, sessionId: string): string =>
     path.join(root, 'harness', 'sessions', sessionId, HARNESS_JOURNAL_FILE);
 
@@ -234,10 +239,11 @@ describe('state-change persistence coalescing (F1)', () => {
         expect(journal.missing).toBe(false);
         expect(journal.events).toHaveLength(16);
 
-        const document = JSON.parse(fs.readFileSync(stateFileOf(root), 'utf8')) as {
-            sessions: { id: string; turns: { id: string; status: string; events: unknown[] }[] }[];
-        };
-        const storedTurn = document.sessions.find((session) => session.id === created.id)?.turns.find((candidate) => candidate.id === turn?.id);
+        // v2: the coalesced turn rows live in the SESSION shard, so that is the file this check
+        // reads (the header only lists the session).
+        const storedTurn = readPersistedSession(root, created.id).turns.find(
+            (candidate: { id: string }) => candidate.id === turn?.id
+        ) as { status: string; events: unknown[] } | undefined;
 
         expect(storedTurn?.status).toBe('done');
         expect(storedTurn?.events).toHaveLength(16);
@@ -267,16 +273,18 @@ describe('state-change persistence coalescing (F1)', () => {
         expect(writes[before].strict).toBe(true);
         expect(writes[before].fromStateChange).toBe(false);
 
-        // And the mutation is really on disk by the time the call resolves.
-        const document = JSON.parse(fs.readFileSync(stateFileOf(root), 'utf8')) as { sessions: { id: string; title?: string }[] };
+        // And the mutation is really on disk by the time the call resolves (v2: the session's own
+        // shard is what stores a title).
+        expect(readPersistedSession(root, created.id).title).toBe('coalesced title');
 
-        expect(document.sessions.find((session) => session.id === created.id)?.title).toBe('coalesced title');
-
-        // The strict commit also proves the document is compact (F2): the bytes this store
-        // wrote are `serializeHarnessDatabase`'s output, i.e. one line, no indentation.
+        // The strict commit also proves the persisted bytes are compact (F2): what this store
+        // wrote is `serializeHarnessDatabase`'s output, i.e. one line, no indentation. v2 writes
+        // two kinds of file through that same serializer, so BOTH are checked — a pretty-printed
+        // shard would be the same regression F2 retired.
         const raw = fs.readFileSync(persistence.file, 'utf8');
 
         expect(raw.includes('\n  ')).toBe(false);
+        expect(fs.readFileSync(harnessSessionFileOf(root, created.id), 'utf8').includes('\n  ')).toBe(false);
 
         store.dispose();
     });

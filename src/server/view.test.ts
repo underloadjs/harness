@@ -38,7 +38,14 @@ import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import type { HarnessEvent, HarnessStream, HarnessStreamEvent } from '../harness';
 import { createHarnessRegistry } from './harnesses';
 import { SessionError, SessionStore } from './sessions';
-import { HARNESS_DATABASE_DIRECTORY, HARNESS_DATABASE_FILE, HarnessPersistence } from './persistence';
+import { HarnessPersistence } from './persistence';
+// v2 layout readers/writers (./persistence-test-helpers.ts): the fields pinned below
+// (`turnInstructionSources`) belong to the session shard, not to the document header.
+import {
+    readPersistedDocument,
+    readPersistedSessions,
+    writePersistedDocument
+} from './persistence-test-helpers';
 import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { HARNESS_JOURNAL_FILE, HarnessJournal } from './journal';
@@ -474,7 +481,11 @@ describe('restart reconstruction (R4)', () => {
         await runTurn(first, created.id, 'old server wrote this');
 
         // Simulate an upgrade: the checkpoint exists, the per-step log does not.
-        fs.rmSync(path.dirname(journalFileOf(root, created.id)), { recursive: true, force: true });
+        // v2: `sessions/<id>/` is no longer journal-only — it also holds `session.json` and the
+        // thread shards — so the removal targets the JOURNAL FILE. Deleting the directory (what
+        // v1 did, harmlessly, because it only ever contained `events.jsonl`) would delete the
+        // checkpoint too and turn this pin into a missing-shard load failure.
+        fs.rmSync(journalFileOf(root, created.id), { force: true });
 
         const second = storeOf([singlePreset()], root);
         const view = second.getView(created.id);
@@ -2059,12 +2070,14 @@ describe('the context bar survives a restart with the counts it recorded', () =>
 
         await runTurn(seeded, legacySession.id, 'do the work');
 
-        const file = path.join(legacyRoot, HARNESS_DATABASE_DIRECTORY, HARNESS_DATABASE_FILE);
-        const document = JSON.parse(fs.readFileSync(file, 'utf8')) as { sessions: Record<string, unknown>[] };
+        // v2: `turnInstructionSources` is a field of the SESSION shard, so "a document written
+        // before snapshots existed" is produced by dropping the key from that shard (the shared
+        // writer fans the edit back to the file it came from).
+        const document = readPersistedDocument(legacyRoot);
 
         for (const session of document.sessions) delete session.turnInstructionSources;
 
-        fs.writeFileSync(file, JSON.stringify(document));
+        writePersistedDocument(legacyRoot, document);
 
         const legacy = storeOf([toolRoundPreset()], legacyRoot);
         const legacyView = legacy.getView(legacySession.id);
@@ -2202,18 +2215,20 @@ describe('the context bar survives a restart with the counts it recorded', () =>
         expect(JSON.stringify(store.getView(created.id))).not.toContain(SENTINEL);
         expect(frames.some((frame) => (frame as { type: string }).type === 'event')).toBe(false);
 
-        const statePath = path.join(root, HARNESS_DATABASE_DIRECTORY, HARNESS_DATABASE_FILE);
-        const before = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { sessions: Record<string, unknown>[] };
+        // v2: the recorded instruction snapshots are part of the SESSION record, so the byte
+        // check reads that shard (`sessions/<id>/session.json`) rather than one whole-document file.
+        const persistedSession = (): Record<string, unknown> => readPersistedSessions(root)[0];
+        const before = persistedSession();
 
-        expect(before.sessions[0].turnInstructionSources).toBeDefined();
+        expect(before.turnInstructionSources).toBeDefined();
 
         // A reset ends the conversation, so the recorded snapshots go with it; the next
         // turn freezes whatever its agents run with then.
         await store.reset(created.id);
 
-        const after = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { sessions: Record<string, unknown>[] };
+        const after = persistedSession();
 
-        expect('turnInstructionSources' in after.sessions[0]).toBe(false);
+        expect('turnInstructionSources' in after).toBe(false);
         expect(store.getView(created.id).turns).toEqual([]);
     });
 });

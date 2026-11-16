@@ -39,8 +39,18 @@ import { agent, harness } from '../harness';
 import type { HarnessPreset, HarnessProgress, HarnessStream, HarnessStreamEvent, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HARNESS_JOURNAL_DIRECTORY, HarnessJournal } from './journal';
-import { HARNESS_DATABASE_DIRECTORY, HARNESS_DATABASE_FILE, HarnessPersistence } from './persistence';
+import {
+    HARNESS_DATABASE_VERSION,
+    HARNESS_DATABASE_DIRECTORY,
+    HARNESS_INDEX_FILE,
+    HARNESS_SESSION_DIRECTORY,
+    HARNESS_SESSION_FILE,
+    HarnessPersistence
+} from './persistence';
 import type { HarnessDatabase } from './persistence';
+// The v2 layout reader (./persistence-test-helpers.ts): this suite also pins the bytes from
+// outside the writer, and the helper - not a re-spelled path - says where they live.
+import { readPersistedIndex } from './persistence-test-helpers';
 import { SessionStore } from './sessions';
 import { startHarnessServer } from './start';
 // The service adapter is the OTHER host entry point (the @underload/service gateway owns the
@@ -266,7 +276,10 @@ describe('startup and readiness', () => {
 
         expect(io.isOpen()).toBe(true);
         // `hello` is a control frame, not an operation: readiness alone has posted nothing.
-        expect(io.pending()).toEqual({ operations: 0, gated: 0, lastFrameBytes: 0, coalescedCheckpoint: false });
+        // R5: the readiness snapshot is per SHARD PATH, not per document - `coalescedShards`
+        // counts shard paths waiting in the deferred slot and `measuredShards` counts the paths
+        // that carry a worker-measured size (./workers/io-client.ts:1472).
+        expect(io.pending()).toEqual({ operations: 0, gated: 0, coalescedShards: 0, measuredShards: 0 });
 
         const summary = await store.drainIo('ready check');
 
@@ -300,7 +313,12 @@ describe('startup and readiness', () => {
 
         expect(thrown).toBeInstanceOf(HarnessIoError);
         expect((thrown as HarnessIoError).code).toBe('worker-entry-missing');
+        // The failed create left NOTHING behind: `persistence.file` is the v2 header
+        // (`<root>/harness/index.json`, ./persistence.ts:2466), and not even the namespace
+        // directory exists - a store that never opened its client never ran a commit, so there
+        // is no header, no `sessions/` tree and no legacy `state.json` to reload.
         expect(fs.existsSync(persistence.file)).toBe(false);
+        expect(fs.existsSync(path.join(root, HARNESS_DATABASE_DIRECTORY))).toBe(false);
     });
 
     it('a standalone listener with worker IO binds its port only after readiness, and persists over HTTP', async () => {
@@ -337,13 +355,19 @@ describe('startup and readiness', () => {
 
         expect(reloaded?.sessions.map((session) => session.id)).toEqual([created.session.id]);
 
-        // Off-loop, and measurable as off-loop: the coordinator posted exactly one operation and
-        // the worker reported it complete.
+        // Off-loop, and measurable as off-loop: the coordinator posted exactly the shards this
+        // commit is made of, and the worker reported each one complete. R5: a strict save is no
+        // longer ONE frame - `harnessShardUnitsOf` (./workers/io-client.ts:491-524) splits a
+        // freshly created one-session database into its `session.json` record and its
+        // `index.json` header, and `commitShardEntries` posts one `shard.save` frame per unit
+        // (./workers/io-client.ts:1164). No thread shard: a created session has no
+        // `core.threads[]` rows yet, so the split produces exactly 2 units.
         const stats = started.store.ioWorker?.stats();
 
-        expect(stats?.posted).toBe(1);
-        expect(stats?.completed).toBe(1);
+        expect(stats?.posted).toBe(2);
+        expect(stats?.completed).toBe(2);
         expect(stats?.failed).toBe(0);
+        expect(stats?.postedByKind).toEqual({ 'shard.save': 2 });
 
         await started.close();
 
@@ -408,8 +432,10 @@ describe('service host (the gateway has no startup hook)', () => {
         expect(response.status).toBe(500);
         expect((response.response as { error: { message: string } }).error.message).toMatch(/IO worker entry|does not exist/);
         // Nothing was written, because nothing started: the failure is startup, not a degraded
-        // inline store.
-        expect(fs.existsSync(path.join(root, HARNESS_DATABASE_DIRECTORY, HARNESS_DATABASE_FILE))).toBe(false);
+        // inline store. v2 names that "nothing" by its header - `index.json` is what
+        // `HarnessPersistence.file` resolves to now (./persistence.ts:2466), and a store that
+        // never opened its IO client never reached a commit at all.
+        expect(fs.existsSync(path.join(root, HARNESS_DATABASE_DIRECTORY, HARNESS_INDEX_FILE))).toBe(false);
     });
 });
 
@@ -427,14 +453,33 @@ describe('strict writes are off the coordinator', () => {
 
         const stats = io.stats();
 
-        expect(stats).toMatchObject({ posted: 1, completed: 1, failed: 0, refused: 0, faults: 0, superseded: 0, outstanding: 0 });
-        // The size the worker measured is the size of the file, byte for byte: the client's
-        // O(1) frame guard is fed by a real measurement taken off-thread, not by a second
-        // stringify on the coordinator.
-        expect(stats.lastCheckpointBytes).toBe(fs.statSync(persistence.file).size);
+        // 2 SHARDS, not 1 document: `session.json` + `index.json` (see the split cited above,
+        // ./workers/io-client.ts:491-524), posted in `IO_SHARD_ORDER` - threads, then the
+        // session record, then the header (./workers/io-protocol.ts:176).
+        expect(stats).toMatchObject({ posted: 2, completed: 2, failed: 0, refused: 0, faults: 0, superseded: 0, outstanding: 0 });
+        expect(stats.postedByKind).toEqual({ 'shard.save': 2 });
+        // The size the worker measured is the size of EACH shard's file, byte for byte: the
+        // client's O(1) frame guard is fed by a real measurement taken off-thread, not by a
+        // second stringify on the coordinator - and it is accounted PER PATH
+        // (`stats.lastShardBytes`, ./workers/io-client.ts:820-824), which is what a
+        // whole-document measurement could never say.
+        expect(stats.lastShardBytes[persistence.file]).toBe(fs.statSync(persistence.file).size);
+        expect(stats.lastShardBytes[persistence.sessionFile(created.id)]).toBe(fs.statSync(persistence.sessionFile(created.id)).size);
+        expect(Object.keys(stats.lastShardBytes).sort()).toEqual([persistence.file, persistence.sessionFile(created.id)].sort());
         // No staging debris: the worker's staging name carries its own owner, and the rename
-        // consumed it.
-        expect(fs.readdirSync(path.join(root, HARNESS_DATABASE_DIRECTORY))).toEqual([HARNESS_DATABASE_FILE]);
+        // consumed it. The v1 "the harness directory holds only `state.json`" pin becomes the
+        // v2 footprint: the header plus the session directory (the session's own shards -
+        // `session.json`, and `threads/` once a turn exists - live inside it, beside
+        // `events.jsonl`, because `HARNESS_SESSION_DIRECTORY` IS the journal directory,
+        // ./persistence.ts:217).
+        expect(fs.readdirSync(path.join(root, HARNESS_DATABASE_DIRECTORY)).sort()).toEqual([
+            HARNESS_INDEX_FILE,
+            HARNESS_SESSION_DIRECTORY
+        ]);
+        expect(fs.readdirSync(path.join(root, HARNESS_DATABASE_DIRECTORY, HARNESS_SESSION_DIRECTORY))).toEqual([created.id]);
+        expect(
+            fs.readdirSync(path.join(root, HARNESS_DATABASE_DIRECTORY, HARNESS_SESSION_DIRECTORY, created.id)).sort()
+        ).toEqual([HARNESS_SESSION_FILE]);
     });
 
     it('a failed durable commit rejects with the inline message and rolls the mutation back', async () => {
@@ -458,30 +503,54 @@ describe('strict writes are off the coordinator', () => {
 
         expect(failure).toBeInstanceOf(Error);
         // The 500 body carries the same sentence in both modes (./io-protocol.ts keeps the raw
-        // writer text verbatim).
+        // writer text verbatim). Under R5 it names the SHARD that failed - here the session
+        // record, the first unit the commit posts (./workers/io-worker-loop.ts:273).
         expect(failure?.message).toContain('Could not save the harness database: ');
         expect(failure?.message).toMatch(/IO frame limit/);
-        // Rollback: the session never existed, and the file was never written.
+        // Rollback: the session never existed, and NO shard of the commit was written - the
+        // worker measures the payload and refuses before it touches the disk
+        // (./workers/io-worker-loop.ts:265-276), so neither the header nor the record exists.
         expect(store.size).toBe(0);
         expect(fs.existsSync(persistence.file)).toBe(false);
+        // ...and the session subtree never appeared either: the record shard is posted BEFORE the
+        // header, and both were refused, so no session directory exists to reload.
+        expect(fs.existsSync(path.join(root, HARNESS_DATABASE_DIRECTORY, HARNESS_SESSION_DIRECTORY))).toBe(false);
         // The sticky error channel (worker-mode twin of `persistence.lastWriteError`) holds the
         // raw reason, without the store's 500 wrapper.
         expect(store.persistenceError).toMatch(/above the 1 byte IO frame limit/);
-        expect(io.stats()).toMatchObject({ posted: 1, completed: 0, failed: 1, refused: 0 });
+        // 2 SHARDS posted and 2 failed: the split produced the record and the header, and each
+        // one is over the 1 byte limit on its own (./workers/io-client.ts:1157-1165 posts every
+        // unit; the queue cannot know the first one would fail).
+        expect(io.stats()).toMatchObject({ posted: 2, completed: 0, failed: 2, refused: 0 });
 
-        // Second attempt: the client now KNOWS the size, so it refuses locally - counted, reported,
-        // and never presented as a write.
+        // Second attempt - and here is THE R5 DIFFERENCE, stated rather than smoothed over.
+        // `create` mints a NEW session id, so it writes a NEW `session.json` PATH, and the
+        // client's size knowledge is per path (`oversizedShardOf` reads
+        // `stats.lastShardBytes[path]`, ./workers/io-client.ts:1073-1077). So:
+        //   - the record shard, never measured on this client, is POSTED again and the worker's
+        //     own bound refuses it ("... is N bytes, above the 1 byte IO frame limit",
+        //     ./workers/io-worker-loop.ts:269-274) - the message the 500 body carries, because
+        //     it is the first failure in posted order (./workers/io-client.ts:1172-1187);
+        //   - the header, the one path this client HAS measured, is refused LOCALLY
+        //     ("... measured N bytes on its last measurement", ./workers/io-client.ts:1079-1084)
+        //     and counted in `refused` - never posted, never presented as a write. That local
+        //     refusal text is pinned end to end at the client level in
+        //     ./workers/io-client.test.ts:551.
         const second = await store.create('one').then(
             () => undefined,
             (error: unknown) => error as Error
         );
 
-        expect(second?.message).toMatch(/measured \d+ bytes on its last measurement/);
+        expect(second?.message).toContain('Could not save the harness database: ');
+        expect(second?.message).toMatch(/is \d+ bytes, above the 1 byte IO frame limit/);
         expect(store.size).toBe(0);
-        // The SECOND failure is a local refusal, not a second worker round trip: `refused` counts
-        // it and `failed` stays at the one operation the worker actually answered (posted is still
-        // 1, because the refused frame never reached the port).
-        expect(io.stats()).toMatchObject({ posted: 1, completed: 0, failed: 1, refused: 1 });
+        expect(fs.existsSync(persistence.file)).toBe(false);
+        // The counts say which half happened where: the second commit has 2 units, exactly ONE
+        // of them left this thread (the un-measured record shard, which then failed on the
+        // worker: posted 2 -> 3, failed 2 -> 3) and exactly ONE was refused on it (the measured
+        // header: refused 0 -> 1). A `refused` of 1 is only reachable through a per-path
+        // measurement, so this also pins that the header's size is what the pre-check used.
+        expect(io.stats()).toMatchObject({ posted: 3, completed: 0, failed: 3, refused: 1 });
     });
 
     it('a terminal transition fences the journal tail it references, then commits', async () => {
@@ -508,15 +577,17 @@ describe('strict writes are off the coordinator', () => {
         expect(cancelled).toBe(true);
 
         // The terminal commit posted EXACTLY one journal fence: one fsync of the tail this
-        // document references, and `cancel` resolved only after its receipt. The checkpoint count
-        // is `>= 1` on purpose rather than exact: the abort continuation settles inside the same
-        // window, and its own best-effort saves (the run's terminal write plus a state-change
-        // observer) are queued behind it - legitimately, because the queue is FIFO, which is also
-        // what puts the fence ahead of the rename. Ordering itself is proven per operation in
+        // document references, and `cancel` resolved only after its receipt. The SHARD count is
+        // `>= 1` on purpose rather than exact - R5 renamed the kind to `shard.save` (one frame
+        // per shard file, ./workers/io-protocol.ts:267) and the count is still non-deterministic
+        // for the same reason: the abort continuation settles inside the same window, and its
+        // own best-effort saves (the run's terminal write plus a state-change observer) are
+        // queued behind it - legitimately, because the queue is FIFO, which is also what puts the
+        // fence ahead of the renames. Ordering itself is proven per operation in
         // ./workers/io-client.test.ts; what is pinned here is that the store ASKED for the fence
         // exactly once, and that the document the response acknowledges is on disk.
         expect((after.postedByKind['journal.flush'] ?? 0) - (before.postedByKind['journal.flush'] ?? 0)).toBe(1);
-        expect((after.postedByKind['checkpoint.save'] ?? 0) - (before.postedByKind['checkpoint.save'] ?? 0)).toBeGreaterThanOrEqual(1);
+        expect((after.postedByKind['shard.save'] ?? 0) - (before.postedByKind['shard.save'] ?? 0)).toBeGreaterThanOrEqual(1);
         expect(after.failed).toBe(before.failed);
 
         gate.release();
@@ -564,10 +635,11 @@ describe('strict writes are off the coordinator', () => {
 
             expect(saves).not.toHaveBeenCalled();
 
-            // The commits happened, on the other thread: at least one checkpoint operation (the
-            // strict create, the strict reset, and any coalesced observer save - the exact count
-            // depends on how many observer fires merged, which is the point of the coalescing).
-            expect(io.stats().postedByKind['checkpoint.save'] ?? 0).toBeGreaterThan(0);
+            // The commits happened, on the other thread: at least one SHARD commit (the strict
+            // create, the strict reset, and any coalesced observer save - the exact count depends
+            // on how many observer fires merged, and on which shards they touched, which is the
+            // point of the per-path coalescing).
+            expect(io.stats().postedByKind['shard.save'] ?? 0).toBeGreaterThan(0);
             expect(io.stats().failed).toBe(0);
 
             // And the bytes are real: the coordinator's own reader loads the worker's document
@@ -714,18 +786,31 @@ describe('the real built entry', () => {
 
         clients.push(io);
 
+        // The payload's own `version` is a v1 leftover on purpose: under v2 the writer STAMPS
+        // the header with `HARNESS_DATABASE_VERSION` and never trusts the document's field
+        // (./persistence.ts:2289-2306 `harnessIndexDocumentOf`, reached through
+        // ./workers/io-client.ts:521), and `load()` refuses any other version
+        // (./persistence.ts:195). The cast keeps the literal honest about that.
         const document = {
             version: 1,
             savedAt: 1_700_000_000_000,
             registry: [],
             sessions: []
-        };
+        } as unknown as HarnessDatabase;
 
         const checkpoint = await io.saveCheckpoint(document, { savedAt: 1_700_000_000_000 });
 
-        expect(checkpoint.kind).toBe('checkpoint.save');
+        // R5: the receipt is a SHARD receipt. With `sessions: []` the split produces exactly one
+        // unit - the header - so `saveCheckpoint` returns that unit's receipt: kind `shard.save`
+        // (./workers/io-protocol.ts:267), `path` naming the file it committed
+        // (./workers/io-client.ts:845), and `bytes` the size the worker measured for it.
+        expect(checkpoint.kind).toBe('shard.save');
         expect(checkpoint.outcome).toBe('durable');
+        expect(checkpoint.path).toBe(persistence.file);
         expect(checkpoint.bytes).toBe(fs.statSync(persistence.file).size);
+        // One commit, one shard, and it is the index: no session rows means no record shards and
+        // no transcript shards (./workers/io-client.ts:498-521).
+        expect(io.stats()).toMatchObject({ posted: 1, completed: 1, failed: 0, postedByKind: { 'shard.save': 1 } });
 
         expect((await io.journalOpen(sessionId)).outcome).toBe('written');
         expect(
@@ -740,8 +825,10 @@ describe('the real built entry', () => {
         ).toBe('written');
         expect((await io.journalFlush(sessionId)).outcome).toBe('durable');
 
-        // The store's own reader, with no worker involved, is the judge of the bytes.
-        expect(new HarnessPersistence(root).load()?.version).toBe(1);
+        // The store's own reader, with no worker involved, is the judge of the bytes. The header
+        // it parses carries the stamped v2 version, whatever the payload claimed.
+        expect(new HarnessPersistence(root).load()?.version).toBe(HARNESS_DATABASE_VERSION);
+        expect(readPersistedIndex(root).sessions).toEqual([]);
 
         const read = new HarnessJournal(persistence.directory, sessionId).read();
 

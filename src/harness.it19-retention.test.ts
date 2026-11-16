@@ -23,8 +23,8 @@
 //        account, no extra parent turn);
 //   AC6  deleted-but-retained: `threadDelete` marks `inactive` + `inactiveAt`, the session
 //        tooling stops discovering it, an agent-facing `threadRead` refuses it, the
-//        transcript BYTES are still on disk (asserted by reading `state.json` with `fs`, the
-//        way a shell user would), and a host send revives it and clears the mark;
+//        transcript BYTES are still on disk (asserted by reading the persisted v2 shards with
+//        `fs`, the way a shell user would), and a host send revives it and clears the mark;
 //   AC7  repair honesty: exactly one synthesized `role:'tool'` result per unanswered call, it
 //        says "cancelled or interrupted" (never "server restarted"), and a second repair
 //        pass changes nothing.
@@ -64,6 +64,9 @@ import {
     repairInterruptedToolCalls
 } from './core/transcript-repair';
 import { HarnessPersistence } from './server/persistence';
+// v2 layout readers (./server/persistence-test-helpers.ts): this suite pins what survives ON
+// DISK after a soft delete, so it reads the shards directly instead of through `load()`.
+import { readPersistedDocument } from './server/persistence-test-helpers';
 import { createHarnessRegistry } from './server/harnesses';
 import { SessionStore } from './server/sessions';
 import type { HarnessPreset } from './server/harnesses/types';
@@ -1252,7 +1255,7 @@ describe('AC6 — a deleted thread is INACTIVE, never destroyed, and still on di
         ]);
     });
 
-    it('AC6.3 the persisted state.json still carries the row, inactive, with its messages intact — the shell-visible proof', async () => {
+    it('AC6.3 the persisted shards still carry the row, inactive, with its messages intact — the shell-visible proof', async () => {
         const root = tempRoot('it19-retention');
         const persistence = new HarnessPersistence(root);
         const store = createStore([answeringPreset()], persistence);
@@ -1527,9 +1530,9 @@ const tempRoot = (label: string): string => {
     return root;
 };
 
-// The exact file a `cat` would show: `<root>/harness/state.json` (./server/persistence.ts:5,116).
-const readDatabase = (root: string): Record<string, any> =>
-    JSON.parse(fs.readFileSync(path.join(root, 'harness', 'state.json'), 'utf8')) as Record<
-        string,
-        any
-    >;
+// The exact bytes a `cat` would show. v2 splits one session across shards — `sessions/<id>/
+// session.json` (the record, whose `core.threads[]` rows carry NO messages) and
+// `sessions/<id>/threads/<threadId>.json` (the transcript) — so the shared reader reassembles
+// them into the one-document view these pins were written against; the messages it puts back
+// are read from the shard files, which is what makes "the bytes are still on disk" a real claim.
+const readDatabase = readPersistedDocument;
