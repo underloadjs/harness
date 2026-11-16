@@ -4,7 +4,7 @@
 // ----------------------------
 // `main.ts` keeps its hosts and its paint call-sites, and every paint now goes:
 //
-//     paintPanels() -> runtime.paint({ hosts, media, sessionId })
+//     paintPanels() -> runtime.paint({ hosts, media, sessionId, visibility })
 //                        |                 -> host.setExtensions({ before, after })
 //                        |                    (the shell-panel registry's elements)
 //                        -> host.apply(media)
@@ -33,6 +33,17 @@
 // the first paint — before the remembered session has been read — and dispose it
 // again the moment the session arrives: a rebuilt panel and one wasted subscription
 // for a state the reader never saw.
+//
+// BOARD VISIBILITY IS A SUSPENSION, NOT AN UNMOUNT (T5/R3)
+// --------------------------------------------------------
+// `PanelPaintInput.visibility` says which slots the reader can actually look at. A
+// hidden slot keeps everything mounted — the rails stay in the DOM by the shell's own
+// contract, so their content and state survive the toggle — but every instance in it is
+// TOLD, through `controller.setVisibility`, that its slot went off screen. That is the
+// seam a live panel uses to release its realtime registration and stop reading while
+// the phone scratch drawer is shut; the runtime itself never touches panel internals,
+// and it only ever calls on an actual CHANGE of a slot's value (the paint loop runs on
+// every stream frame).
 //
 // Failure isolation: a `mount` that throws is recorded in `runtime.failures()`, its
 // half-built instance is disposed, and it is not retried until it is re-registered
@@ -74,6 +85,16 @@ export type PanelPaintInput = {
     media?: readonly PanelMedia[];
     /** The conversation on screen; null when none is. */
     sessionId?: string | null;
+    /**
+     * Whether each SLOT is on screen (T5/R3). A missing map, a missing slot, or a slot
+     * mapped to anything but `false` all mean VISIBLE, so a host that never passes this
+     * keeps exactly the behaviour it has today. The shell passes it for one slot only:
+     * the phone scratch board is a drawer, and a card inside a closed drawer must stop
+     * reading, subscribing and ticking (./context.ts `PanelContext.onVisibility`,
+     * ../main.ts `scratchRailVisible`). Suspension, not unmounting — a hidden slot keeps
+     * its instances mounted, its DOM and its state.
+     */
+    visibility?: Readonly<Partial<Record<PanelSlot, boolean>>>;
 };
 
 export type PanelRuntime = {
@@ -93,6 +114,11 @@ type Mounted = {
     panel: ShellPanel;
     element: HTMLElement;
     controller: PanelContextController;
+    /**
+     * The visibility last DELIVERED to this instance (T5/R3). The diff that decides
+     * whether `setVisibility` runs, so a panel is never woken on every paint.
+     */
+    visible: boolean;
 };
 
 // The container a shell panel paints into. `.panel` gives it the same card chrome
@@ -118,6 +144,15 @@ export const createPanelRuntime = (options: PanelRuntimeOptions = {}): PanelRunt
     const failed = new Map<string, { panel: ShellPanel; message: string }>();
 
     let activeSession: string | null = null;
+    // The slot states the LAST paint carried. Kept here rather than passed into `mount`
+    // because a panel can only be mounted from inside a paint, and a freshly mounted one
+    // must be told the state its slot is ALREADY in — waiting for the next change would
+    // leave a panel in a closed drawer reading the store forever (./context.ts).
+    let visibility: Readonly<Partial<Record<PanelSlot, boolean>>> = {};
+
+    // One rule for "can this slot be looked at": anything that is not an explicit
+    // `false` is visible, so an omitted map or an omitted slot changes nothing.
+    const slotVisible = (slot: PanelSlot): boolean => visibility[slot] !== false;
 
     const unmount = (id: string): void => {
         const mounted = instances.get(id);
@@ -162,8 +197,20 @@ export const createPanelRuntime = (options: PanelRuntimeOptions = {}): PanelRunt
             return;
         }
 
-        instances.set(panel.id, { panel, element, controller });
+        // The state this instance is born into, recorded and delivered from one read.
+        const visible = slotVisible(panel.slot);
+
+        instances.set(panel.id, { panel, element, controller, visible });
         failed.delete(panel.id);
+
+        // The INITIAL visibility delivery, and it has to happen here: this panel's
+        // `mount` callback ran to completion a moment ago and registered its listener
+        // during that mount, so the value its slot is in is now published to it. A slot
+        // that is visible matches the context's own default and is silently absorbed
+        // (the panel reads it from `context.visible`); a slot that is already hidden is a
+        // change, and fires — which is the case that would otherwise leak a live panel
+        // into a closed drawer.
+        controller.setVisibility(visible);
 
         // The host places it (`setExtensions` below); nothing is appended here, which
         // is what keeps one insertion point — and one ordering rule — per slot.
@@ -182,6 +229,10 @@ export const createPanelRuntime = (options: PanelRuntimeOptions = {}): PanelRunt
         const sessionId = input.sessionId ?? null;
         const hosts = input.hosts;
         const media: readonly PanelMedia[] = input.media ?? [];
+
+        // Stashed BEFORE anything mounts, so a panel mounted by this paint is born into
+        // the slot state this paint describes rather than into the previous paint's.
+        visibility = input.visibility ?? {};
 
         if (sessionId !== activeSession) {
             activeSession = sessionId;
@@ -221,6 +272,24 @@ export const createPanelRuntime = (options: PanelRuntimeOptions = {}): PanelRunt
             mount(panel);
         }
 
+        // T5/R3 — the visibility signal, for everything this paint KEEPS. A panel mounted
+        // a moment ago already carries its slot state (see `mount`), so this loop fires
+        // only for an instance whose slot actually CHANGED; one that never hears anything
+        // stays visible, which is the behaviour from before this seam existed. It runs
+        // BEFORE the hosts are applied, so a card releases its reads and its registration
+        // before the board is drawn over it.
+        for (const panel of desired) {
+            const mounted = instances.get(panel.id);
+            if (mounted === undefined) continue;
+
+            const visible = slotVisible(panel.slot);
+
+            if (mounted.visible === visible) continue;
+
+            mounted.visible = visible;
+            mounted.controller.setVisibility(visible);
+        }
+
         // Ordered node lists per slot. `desired` order == draw order == mount order.
         const before = new Map<PanelSlot, HTMLElement[]>();
         const after = new Map<PanelSlot, HTMLElement[]>();
@@ -252,6 +321,9 @@ export const createPanelRuntime = (options: PanelRuntimeOptions = {}): PanelRunt
 
         failed.clear();
         activeSession = null;
+        // No slot state survives a teardown: the next host may mount these panels into a
+        // drawer that is shut, and the fresh instances must be told (see `mount`).
+        visibility = {};
     };
 
     // The ids currently mounted, in paint order — the same sort `paint` mounts in, so

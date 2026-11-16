@@ -8,14 +8,19 @@
  * shared ONE session registration, live add/complete/reopen/remove arriving over the
  * wake, the "just landed" and FLIP bookkeeping, the frozen reading position with its
  * "N new" pill, the collection chips and their footer honesty, the row-opened detail
- * (full text, meta line and per-record history), the batched announcements, the records panel's collapse gate (closed by
- * default, no read and no registration while closed), and a teardown that leaves no
- * registration, no timer and no paint behind.
+ * (full text, meta line and per-record history — all of it local to the read the card
+ * already has, so a disclosure never costs a request), the batched announcements, the
+ * collapse gate BOTH cards share (each one mounts SHUT, and a shut card takes no read,
+ * holds no registration, answers no wake and shows no state box), the phone board's
+ * DRAWER (a slot the shell reports off screen SUSPENDS both cards — the registration and
+ * the reads and the clock stop, while the rows, the disclosures and the filter survive
+ * untouched because that is not an unmount), and a teardown that leaves no registration,
+ * no timer and no paint behind.
  *
  * Run: npx vitest run --config src/frontend/vitest.config.ts
  */
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
     RecordChangeRow,
     RecordsDeltaResponse,
@@ -333,6 +338,13 @@ type HostOptions = {
     seam?: Seam;
     sessionId?: string | null;
     bodyRefreshMs?: number;
+    /**
+     * Replaces the panel's clock (and therefore the engine's). The default is the frozen
+     * `NOW` every other case uses; the T5/R3 clock cases hand over an accessor they move
+     * forward, because "the tick did nothing while the board was off screen" is only a
+     * falsifiable claim if a tick that DID run would be visible in the stamps.
+     */
+    now?: () => number;
 };
 
 /**
@@ -361,9 +373,11 @@ const createHost = (options: HostOptions): Host => {
     });
 
     options.mount(controller.context, {
-        now: () => NOW,
+        now: options.now ?? ((): number => NOW),
         schedule: timers.schedule,
-        // Long enough that the 30s clock tick never fires inside a test.
+        // Long enough that the 30s clock tick never fires inside a test. The T5/R3 clock
+        // cases fire it themselves with `vi.advanceTimersByTime`, so the period stays
+        // deliberate for every other case in this file.
         tickMs: 60 * 60_000,
         clientOptions: { bodyRefreshMs: options.bodyRefreshMs ?? 0 }
     });
@@ -397,14 +411,25 @@ const tasksHost = (options: Omit<HostOptions, 'mount'> = {}): Host =>
 const recordsHost = (options: Omit<HostOptions, 'mount'> = {}): Host =>
     createHost({ mount: (ctx, opts) => mountRecordsPanel(ctx, opts), id: HARNESS_RECORDS_PANEL_ID, ...options });
 
-// The records panel ships COLLAPSED (./records-panels.ts): every test below that pins
-// feed behaviour opens the card first, the way a reader does. A plain `.click()` — the
-// same dispatch the chip tests use — is the whole gesture; `settle` drains the boot
-// the expansion starts.
+// BOTH scratch-board cards ship COLLAPSED (./records-panels.ts): every test below that
+// pins rail or feed behaviour opens the card first, the way a reader does. A plain
+// `.click()` — the same dispatch the chip tests use — is the whole gesture; `settle`
+// drains the boot the expansion starts.
 const expandRecords = async (host: Host): Promise<void> => {
     const toggle = host.query<HTMLButtonElement>('button[data-panel-toggle="records"]');
 
     if (toggle === null) throw new Error('the records panel has no collapse toggle');
+
+    toggle.click();
+    await host.settle();
+};
+
+// The tasks card is gated by its own heading exactly the same way, so every task-rail
+// case opens it deliberately rather than relying on a mount-time boot.
+const expandTasks = async (host: Host): Promise<void> => {
+    const toggle = host.query<HTMLButtonElement>('button[data-panel-toggle="tasks"]');
+
+    if (toggle === null) throw new Error('the tasks panel has no collapse toggle');
 
     toggle.click();
     await host.settle();
@@ -487,7 +512,10 @@ describe('harness.tasks — the five states', () => {
 
         backend.holdSnapshots(true);
         const host = tasksHost({ backend });
-        await host.settle();
+
+        // The card mounts SHUT, so the first read is the reader's, not the mount's: the
+        // expansion is what starts the request, and it stays parked in `loading`.
+        await expandTasks(host);
 
         // THE HEADING IS THE CONTROL, and it is the card's first child: a live card reads
         // title-then-body exactly as a tool card does, and the title is a real `<button>`
@@ -499,7 +527,10 @@ describe('harness.tasks — the five states', () => {
         expect(toggle?.className).toBe('panel-title panel-title-toggle');
         expect(toggle?.textContent).toBe('Tasks');
         expect(toggle?.getAttribute('type')).toBe('button');
+        // `true` because the helper above pressed the heading — the card itself starts
+        // `false`, which the collapse case below pins on its own.
         expect(toggle?.getAttribute('aria-expanded')).toBe('true');
+        expect(toggle?.dataset.expanded).toBe('true');
         expect(toggle?.getAttribute('aria-controls')).toBe(host.query('.panel-tasks-body')?.id);
 
         // The live region is next, and it is there before any content moves: a region that
@@ -542,8 +573,10 @@ describe('harness.tasks — the five states', () => {
     });
 
     it('paints the progress bar, the two groups and a row that is a mark, a sentence and a control', async () => {
-        const host = tasksHost();
-        await host.settle();
+        const backend = createBackend();
+        const host = tasksHost({ backend });
+
+        await expandTasks(host);
 
         expect(host.phase()).toBe('ready');
         expect(host.text('.panel-tasks-status')).toBe('2 tasks · 1 completed · 1 open');
@@ -622,10 +655,17 @@ describe('harness.tasks — the five states', () => {
         // --- the detail a press buys -----------------------------------------
         // `.click()` is the whole gesture; in a browser an Enter or Space keypress on
         // the focused button performs this same activation.
+        //
+        // THE ROW COLLAPSE COSTS THE SERVER NOTHING. A row's detail is the history and
+        // the meta this card has ALREADY read — there is no per-record endpoint — so a
+        // disclosure must never be a request. The one read in the log is the boot.
+        const readsBeforeRowToggle = backend.reads.length;
+
         head.click();
 
         expect(head.getAttribute('aria-expanded')).toBe('true');
         expect(detail.hidden).toBe(false);
+        expect(backend.reads).toHaveLength(readsBeforeRowToggle);
         // No word-glyph appeared with it either — the row's own text is still a mark
         // and a sentence, and the meta below is the only thing that changed.
         expect(detail.querySelector('.panel-tasks-id')?.textContent).toBe('#rec_b');
@@ -652,6 +692,7 @@ describe('harness.tasks — the five states', () => {
         expect(detail.hidden).toBe(true);
         expect(detail.children).toHaveLength(0);
         expect(row.querySelector('.panel-tasks-id')).toBeNull();
+        expect(backend.reads).toHaveLength(readsBeforeRowToggle);
 
         const doneRow = done?.querySelector<HTMLElement>('li.panel-tasks-row');
 
@@ -667,6 +708,10 @@ describe('harness.tasks — the five states', () => {
         expect(doneRow?.querySelector('.panel-tasks-actor')?.textContent).toBe('agent');
         expect(doneRow?.querySelector('.panel-tasks-actor')?.dataset.actor).toBe('agent');
         expect(doneRow?.querySelector('.panel-tasks-rev')?.textContent).toBe('r1');
+        // Three disclosures opened across two groups, and the log still holds exactly the
+        // boot's one snapshot — no delta, no per-record read.
+        expect(backend.snapshotReads()).toBe(1);
+        expect(backend.deltaReads()).toBe(0);
 
         host.dispose();
     });
@@ -689,7 +734,7 @@ describe('harness.tasks — the five states', () => {
         });
         const host = tasksHost({ backend });
 
-        await host.settle();
+        await expandTasks(host);
 
         const row = taskRowOf(host, 'rec_e') as HTMLElement;
         const preview = row.querySelector('.panel-tasks-row-text') as HTMLElement;
@@ -704,13 +749,17 @@ describe('harness.tasks — the five states', () => {
         // The full text, untruncated and un-titled, beside the meta line.
         expect(row.querySelector('.panel-tasks-detail-text')?.textContent).toBe(longText);
         expect(row.querySelector('.panel-tasks-detail-meta')?.textContent).toBe('system#rec_er05m');
+        // And the tail came out of the read the card already had: opening the row issued
+        // nothing (the one entry in the log is the boot).
+        expect(backend.reads).toHaveLength(1);
 
         host.dispose();
     });
 
     it('calls an empty store empty, and does not offer a retry for something that never failed', async () => {
         const host = tasksHost({ backend: createBackend(EMPTY_SNAPSHOT) });
-        await host.settle();
+
+        await expandTasks(host);
 
         expect(host.phase()).toBe('empty');
         expect(host.text('.panel-tasks-empty')).toBe('No tasks yet. This list fills when an agent writes to the session task store.');
@@ -729,7 +778,10 @@ describe('harness.tasks — the five states', () => {
 
         backend.failSnapshots(1);
         const host = tasksHost({ backend });
-        await host.settle();
+
+        // The failure is the boot's, and the boot only happens once the reader opens the
+        // card — a shut card never reaches the error state because it never reads.
+        await expandTasks(host);
 
         expect(host.phase()).toBe('error');
         expect(host.text('.panel-tasks-error')).toBe('The task store could not be read: the record store is not readable right now.Retry');
@@ -756,8 +808,11 @@ describe('harness.tasks — the five states', () => {
     it('keeps the rows it has and reads as stale when a wake cannot be answered', async () => {
         const backend = createBackend();
         const host = tasksHost({ backend });
-        await host.settle();
 
+        await expandTasks(host);
+
+        // A wake only ever arrives to a card the reader has opened — the registration is
+        // part of the boot — so `stale` is a state an OPEN panel reaches.
         backend.failDeltas(1);
         host.seam.wake(3);
         await host.settle();
@@ -1067,40 +1122,77 @@ describe('harness.records — the collapse gate', () => {
 });
 
 // -----------------------------------------------------------------------------
-// The title is the toggle: the tasks card closes the same way
+// The collapse gate: the tasks card ships shut too, and a shut card costs nothing
 // -----------------------------------------------------------------------------
 
 describe('harness.tasks — the title as the collapse control', () => {
-    it('ships open, closes from its own heading, and holds nothing while shut', async () => {
+    it('mounts collapsed by default: no read, no registration, body hidden', async () => {
         const backend = createBackend();
         const seam = createSeam();
         const host = tasksHost({ backend, seam });
-
         await host.settle();
 
         const toggle = host.query<HTMLButtonElement>('button[data-panel-toggle="tasks"]') as HTMLButtonElement;
 
-        // Tasks ships OPEN — it is the card a reader glances at without thinking — but the
-        // heading is the control all the same, and it is the ONLY control: no second button
-        // under it, the way the records card has none either.
-        expect(toggle.getAttribute('aria-expanded')).toBe('true');
-        expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(false);
+        // THE HEADING IS THE GATE, and it starts SHUT: the scratch board is collapsed by
+        // default, so the tasks card is closed until the reader presses the word "Tasks" —
+        // and, like the records card, it has no second control under the heading.
+        expect(host.element.firstElementChild).toBe(toggle);
+        expect(toggle.className).toBe('panel-title panel-title-toggle');
+        expect(toggle.getAttribute('type')).toBe('button');
+        expect(toggle.getAttribute('aria-expanded')).toBe('false');
+        expect(toggle.dataset.expanded).toBe('false');
+        expect(toggle.textContent).toBe('Tasks');
+        expect(toggle.getAttribute('aria-controls')).toBe(host.query('.panel-tasks-body')?.id);
         expect(host.queryAll('button.panel-expand')).toHaveLength(0);
-        expect(host.text('.panel-status')).toBe('live');
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(true);
+        // A card with no engine has no state to report, so it shows no box either, and no
+        // progress sentence claiming a tally it has not read. `hidden` is the published
+        // contract that renders the box away — `../styles.css` `.panel-status[hidden]
+        // { display: none }`, pinned by ./records-style.test.ts — and the box is built ONCE
+        // with a pre-baked word (./records-panels.ts `recordsStatusOf`), so its text is not
+        // blank at mount, only never painted. This is byte-identical to the shipped records
+        // card's mount case above, which asserts `hidden` and no text.
+        expect(host.query<HTMLElement>('.panel-status')?.hidden).toBe(true);
+        expect(host.text('.panel-tasks-status')).toBe('');
+        expect(host.phase()).toBeUndefined();
+        // The gate is the whole point: not one request, not one plane slot.
+        expect(backend.reads).toEqual([]);
+        expect(seam.specs).toEqual([]);
 
+        // --- opening is what boots the engine ---------------------------------
+        toggle.click();
+        await host.settle();
+
+        expect(toggle.getAttribute('aria-expanded')).toBe('true');
+        expect(toggle.dataset.expanded).toBe('true');
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(false);
+        // Opening changes `aria-expanded` and the box, never the heading's word: the title
+        // is the same title open or shut.
+        expect(host.text('button[data-panel-toggle="tasks"]')).toBe('Tasks');
+        expect(host.text('.panel-status')).toBe('live');
+        expect(backend.snapshotReads()).toBe(1);
+        expect(seam.specs).toHaveLength(1);
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
+
+        // --- closing releases the wake ---------------------------------------
         toggle.click();
         await host.settle();
 
         expect(toggle.getAttribute('aria-expanded')).toBe('false');
         expect(toggle.dataset.expanded).toBe('false');
         expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(true);
-        // Shut: the surface is blank, the corner box included, and the plane let go.
+        // The last listener let go, so the registration went with the card.
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+        // Shut: the surface is blank, the corner box included.
         expect(host.phase()).toBeUndefined();
         expect(host.query<HTMLElement>('.panel-status')?.hidden).toBe(true);
+        expect(host.text('.panel-status')).toBe('');
         expect(host.queryAll('li.panel-tasks-row')).toHaveLength(0);
-        expect(seam.unsubscribed).toEqual(['sub_1']);
 
-        // The store keeps moving while the card is shut: not one read answers it.
+        // The store keeps moving while the card is shut: not one read answers it. The
+        // seam still fans the frame to the retired registration, so this is the released
+        // client being asked to do nothing — and doing it.
         const readsBefore = backend.reads.length;
 
         backend.push({
@@ -1118,16 +1210,31 @@ describe('harness.tasks — the title as the collapse control', () => {
         await host.settle();
 
         expect(backend.reads).toHaveLength(readsBefore);
+        expect(backend.snapshotReads()).toBe(1);
+        expect(backend.deltaReads()).toBe(0);
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(0);
 
+        // --- re-opening is a fresh boot ---------------------------------------
         toggle.click();
         await host.settle();
 
-        // Re-opening is a fresh boot, not a resurrection of the rows it dropped.
+        // Not a resurrection of the rows it dropped: a second read, a re-dialled
+        // registration (the first one is still the only one released), and a rail painted
+        // from the fresh answer.
         expect(toggle.getAttribute('aria-expanded')).toBe('true');
         expect(backend.snapshotReads()).toBe(2);
+        expect(seam.specs).toHaveLength(2);
+        expect(seam.unsubscribed).toEqual(['sub_1']);
         expect(host.phase()).toBe('ready');
         expect(host.text('.panel-status')).toBe('live');
         expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
+
+        // And the re-opened card is listening again: the wake that landed in the dark is
+        // answered now, once — the retired registration beside it stays inert.
+        host.seam.wake(3);
+        await host.settle();
+
+        expect(backend.deltaReads()).toBe(1);
 
         host.dispose();
     });
@@ -1144,7 +1251,12 @@ describe('the two panels on one conversation', () => {
         const tasks = tasksHost({ backend, seam });
         const records = recordsHost({ backend, seam });
 
-        await tasks.settle();
+        // Both cards ship shut, so before anyone presses nothing exists on the plane at
+        // all; opening either one is what dials, and the pair still shares the ONE slot.
+        expect(seam.specs).toEqual([]);
+        expect(backend.reads).toEqual([]);
+
+        await expandTasks(tasks);
         await expandRecords(records);
 
         // Both panels are attached and the plane holds one registration for the pair.
@@ -1182,7 +1294,9 @@ describe('the two panels on one conversation', () => {
         });
         const healthy = recordsHost({ backend, seam });
 
-        await broken.settle();
+        // Each card has to be open before it can read at all — the missing read is what
+        // the OPEN broken panel then runs into.
+        await expandTasks(broken);
         await expandRecords(healthy);
 
         // A missing read is a rejected read, not a TypeError from inside the client's
@@ -1204,17 +1318,32 @@ describe('the two panels on one conversation', () => {
 
         await host.settle();
 
-        // No session: no engine, no read, no registration on the plane.
+        // Shut and conversationless: two reasons to stay silent. The surface is the
+        // cleared one — no `data-phase`, no corner box — and the live region is still
+        // there, pre-mounted, waiting for content.
         expect(backend.reads).toEqual([]);
         expect(seam.specs).toEqual([]);
         expect(host.phase()).toBeUndefined();
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(true);
+        expect(host.query<HTMLElement>('.panel-status')?.hidden).toBe(true);
         expect(host.query('.panel-live')).not.toBeNull();
+
+        // OPEN, and still no conversation: the gate is not the only thing keeping the
+        // plane quiet — an open card with nothing to read holds nothing either.
+        await expandTasks(host);
+
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(false);
+        expect(backend.reads).toEqual([]);
+        expect(seam.specs).toEqual([]);
+        expect(host.phase()).toBeUndefined();
 
         // The shell moves the conversation BEFORE it notifies; the host does the same.
         host.setSession('sess_a');
         host.controller.notifySessionChange('sess_a');
         await host.settle();
 
+        // The open choice is the reader's: a conversation arriving to an OPEN card is read
+        // at once, not held back for a second press.
         expect(host.phase()).toBe('ready');
         expect(host.queryAll('.panel-tasks-row')).toHaveLength(2);
         expect(seam.specs).toHaveLength(1);
@@ -1225,7 +1354,8 @@ describe('the two panels on one conversation', () => {
 
     it('a refused registration is the panel error note, not an exception', async () => {
         const host = tasksHost();
-        await host.settle();
+
+        await expandTasks(host);
 
         host.seam.refuse('unknown resource records:3f2a9c1b-7788-4a11-9d22-112233445566');
         await host.settle();
@@ -1373,7 +1503,7 @@ describe('harness.tasks — live updates', () => {
         const backend = createBackend();
         const host = tasksHost({ backend, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandTasks(host);
 
         const rowB = taskRowOf(host, 'rec_b') as HTMLElement;
         const headB = rowB.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
@@ -1449,7 +1579,7 @@ describe('harness.tasks — live updates', () => {
         const backend = createBackend();
         const host = tasksHost({ backend, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandTasks(host);
 
         const box = host.query<HTMLElement>('.panel-status') as HTMLElement;
         const body = host.query<HTMLElement>('.panel-tasks-body') as HTMLElement;
@@ -1516,7 +1646,7 @@ describe('harness.tasks — live updates', () => {
         const backend = createBackend();
         const host = tasksHost({ backend, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandTasks(host);
 
         backend.push(TASK_ADDED, TASK_DONE);
         host.seam.wake(4);
@@ -1556,7 +1686,7 @@ describe('harness.tasks — live updates', () => {
         const backend = createBackend();
         const host = tasksHost({ backend, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandTasks(host);
 
         const scroller = host.query('.panel-tasks-scroller') as HTMLElement;
         const pill = host.query('.panel-new-pill') as HTMLButtonElement;
@@ -1604,7 +1734,7 @@ describe('harness.tasks — live updates', () => {
         const seam = createSeam();
         const host = tasksHost({ backend, seam, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandTasks(host);
 
         const rowA = taskRowOf(host, 'rec_a') as HTMLElement;
         const headA = rowA.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
@@ -1699,7 +1829,7 @@ describe('harness.tasks — live updates', () => {
         const backend = createBackend();
         const host = tasksHost({ backend, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandTasks(host);
 
         backend.push({
             seq: 3,
@@ -1893,7 +2023,7 @@ describe('harness.records — live updates', () => {
         const backend = createBackend(WINDOWED_SNAPSHOT);
         const host = tasksHost({ backend, bodyRefreshMs: 150 });
 
-        await host.settle();
+        await expandTasks(host);
 
         // One event behind a task is not a history, and there is no separate disclosure
         // button left to find: the row is the only control it has.
@@ -1922,10 +2052,16 @@ describe('harness.records — live updates', () => {
         expect(detailA.hidden).toBe(true);
         expect(rowA.querySelector('ol.panel-tasks-history')).toBeNull();
 
+        // THE HISTORY IS LOCAL, TOO. The events behind a row are the ones this client
+        // already accumulated, so opening the disclosure must cost no request on top of
+        // the two reads that put the row here.
+        const readsBeforeHistory = backend.reads.length;
+
         headA.click();
 
         expect(headA.getAttribute('aria-expanded')).toBe('true');
         expect(detailA.hidden).toBe(false);
+        expect(backend.reads).toHaveLength(readsBeforeHistory);
 
         const history = rowA.querySelectorAll('ol.panel-tasks-history > li') as NodeListOf<HTMLElement>;
 
@@ -1941,6 +2077,7 @@ describe('harness.records — live updates', () => {
         expect(headA.getAttribute('aria-expanded')).toBe('false');
         expect(rowA.querySelector('ol.panel-tasks-history')).toBeNull();
         expect(rowA.querySelectorAll('div.panel-tasks-detail')).toHaveLength(1);
+        expect(backend.reads).toHaveLength(readsBeforeHistory);
 
         host.dispose();
     });
@@ -1951,7 +2088,7 @@ describe('the plane, the conversation and the way out', () => {
         const backend = createBackend();
         const host = tasksHost({ backend });
 
-        await host.settle();
+        await expandTasks(host);
 
         host.seam.gap('frames_dropped');
         await host.settle();
@@ -2072,7 +2209,7 @@ describe('the plane, the conversation and the way out', () => {
         const seam = createSeam();
         const host = tasksHost({ backend, seam });
 
-        await host.settle();
+        await expandTasks(host);
 
         expect(seam.specs).toHaveLength(1);
 
@@ -2118,5 +2255,454 @@ describe('the panels the shell ships', () => {
         extensions.registerBuiltinShellPanels();
 
         expect(listShellPanels().map((panel) => panel.id)).toEqual([HARNESS_TASKS_PANEL_ID, HARNESS_RECORDS_PANEL_ID]);
+    });
+});
+
+// -----------------------------------------------------------------------------
+// T5/R3 — the board's drawer: a hidden slot SUSPENDS the cards, it does not unmount them
+// -----------------------------------------------------------------------------
+
+// The phone scratch board is a drawer, so `../runtime.ts` publishes `scratch: false` for
+// both cards while it is shut (../main.ts `scratchRailVisible`). This unit harness has no
+// shell and no rail, so the cases below move the same channel the runtime moves: the
+// controller's `setVisibility` (./context.ts:341-367), which is the only thing a host can
+// do to a panel it did not build.
+//
+// The contract being pinned, per card:
+//   1. hidden ⇒ the `records.updated` registration is released and a wake that lands in
+//      the dark costs no read, no delta and no paint;
+//   2. hidden ⇒ the DOM and the reader's state SURVIVE — same rows, same open disclosure,
+//      same filter. This is deliberately NOT the collapse release: a rail's content comes
+//      back exactly where the reader left it (../main.ts `setRailOpen`), so no
+//      `clearSurface` runs;
+//   3. hidden ⇒ the 30s clock is inert (no re-aged stamps, no repaint, no read);
+//   4. shown ⇒ exactly one fresh boot: one more snapshot, a re-dialled registration, and
+//      the registration that ran in the dark released rather than orphaned.
+describe('the phone scratch drawer suspends both cards', () => {
+    it('suspends the tasks card: the wake goes, the rows and the open row stay, re-showing is one fresh boot', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = tasksHost({ backend, seam });
+
+        await expandTasks(host);
+
+        // A reader mid-session: an open card with an open row, two rows on the rail, and
+        // one registration on the plane. Everything below is what they would see.
+        const rowPending = taskRowOf(host, 'rec_b') as HTMLElement;
+        const rowDone = taskRowOf(host, 'rec_a') as HTMLElement;
+        const head = rowPending.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
+
+        head.click();
+
+        expect(head.getAttribute('aria-expanded')).toBe('true');
+        expect(backend.reads).toHaveLength(1);
+        expect(host.phase()).toBe('ready');
+
+        const statusBox = host.query<HTMLElement>('.panel-status') as HTMLElement;
+
+        expect(statusBox.textContent).toBe('live');
+
+        // --- the drawer shuts -------------------------------------------------
+        host.controller.setVisibility(false);
+
+        expect(host.controller.context.visible).toBe(false);
+        // THE REGISTRATION IS GONE. Nothing on this page is subscribed to `records.updated`
+        // for a board nobody can look at, and the panel holds no client to answer with.
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+        expect(seam.specs).toHaveLength(1);
+
+        // NOT AN UNMOUNT: the body is still open, the rows are the SAME nodes, and the
+        // disclosure the reader had opened is still open (./records-panels.ts:1425-1462 runs
+        // `stopEngine` with no `clearSurface` precisely for this).
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(false);
+        expect(taskRowOf(host, 'rec_b')).toBe(rowPending);
+        expect(taskRowOf(host, 'rec_a')).toBe(rowDone);
+        expect(head.getAttribute('aria-expanded')).toBe('true');
+        expect(rowPending.querySelector('div.panel-tasks-detail')?.hidden).toBe(false);
+        expect(rowPending.querySelector('.panel-tasks-id')?.textContent).toBe('#rec_b');
+        expect(host.text('.panel-tasks-status')).toBe('2 tasks · 1 completed · 1 open');
+
+        // The corner box does not lie about liveness either way: it keeps the last honest
+        // word (`live`, not a `reading` for a fetch that is not running), and
+        // `data-fetching` says out loud that nothing is outstanding.
+        expect(statusBox.hidden).toBe(false);
+        expect(statusBox.textContent).toBe('live');
+        expect(statusBox.dataset.state).toBe('ready');
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.dataset.fetching).toBe('false');
+        expect(host.query<HTMLElement>('.panel-tasks-body')?.getAttribute('aria-busy')).toBe('false');
+
+        // --- the store keeps moving behind the drawer ------------------------
+        const readsBefore = backend.reads.length;
+
+        backend.push(TASK_ADDED);
+        seam.wake(3);
+        await host.settle();
+
+        // The seam still fans the frame to the retired registration, so what is under test
+        // is the released client being asked to do nothing — and doing it: no delta read,
+        // no new row, no repaint of a rail that is not on screen.
+        expect(backend.reads).toHaveLength(readsBefore);
+        expect(backend.deltaReads()).toBe(0);
+        expect(taskRowOf(host, 'rec_d')).toBeNull();
+        expect(host.text('.panel-tasks-status')).toBe('2 tasks · 1 completed · 1 open');
+
+        // --- the drawer opens again ------------------------------------------
+        host.controller.setVisibility(true);
+        await host.settle();
+
+        // One fresh boot, not two: a second snapshot, a re-dialled registration, and the
+        // first one still the only one released (the seam keeps both handlers, which is why
+        // the count is the proof).
+        expect(backend.snapshotReads()).toBe(2);
+        expect(backend.deltaReads()).toBe(0);
+        expect(seam.specs).toHaveLength(2);
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+        expect(host.phase()).toBe('ready');
+        expect(statusBox.textContent).toBe('live');
+        // The rows came back as the SAME elements — the pool was never dropped — and the
+        // rail is exactly as tall as the reader left it.
+        expect(taskRowOf(host, 'rec_b')).toBe(rowPending);
+        expect(taskRowOf(host, 'rec_a')).toBe(rowDone);
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
+
+        // Listening again: the wake that landed in the dark is answered now.
+        seam.wake(3);
+        await host.settle();
+
+        expect(backend.deltaReads()).toBe(1);
+
+        host.dispose();
+    });
+
+    it('suspends the records card the same way: feed, filter and corner box survive a closed drawer', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = recordsHost({ backend, seam });
+
+        await expandRecords(host);
+
+        // The reader's own narrowing, local to the card (./records-panels.ts says the chips
+        // are not a server query), on top of the two snapshot rows.
+        chipOf(host, 'tasks').click();
+
+        const rowOne = host.query('li.panel-records-row[data-row-key="1"]') as HTMLElement;
+
+        expect(feedKeysOf(host)).toEqual(['1']);
+        expect(backend.reads).toHaveLength(1);
+        expect(seam.specs).toHaveLength(1);
+
+        const statusBox = host.query<HTMLElement>('.panel-status') as HTMLElement;
+
+        // --- the drawer shuts -------------------------------------------------
+        host.controller.setVisibility(false);
+
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+        expect(seam.specs).toHaveLength(1);
+        // Suspended, not unmounted: the feed row is the same node, and the filter is still
+        // the one they pressed — a drawer toggle is not a conversation switch, which is the
+        // only thing allowed to drop a filter (./records-panels.ts `onSessionChange`).
+        expect(host.query<HTMLElement>('.panel-records-body')?.hidden).toBe(false);
+        expect(host.query('li.panel-records-row[data-row-key="1"]')).toBe(rowOne);
+        expect(host.query('li.panel-records-row[data-row-key="2"]')).toBeNull();
+        expect(chipOf(host, 'tasks').getAttribute('aria-pressed')).toBe('true');
+        expect(host.text('.panel-records-footer')).toBe('1 of 2 retained changes · filtered to tasks');
+        expect(host.phase()).toBe('ready');
+        // Same corner-box honesty as the tasks card: the last honest word, and no read
+        // claimed as outstanding.
+        expect(statusBox.hidden).toBe(false);
+        expect(statusBox.textContent).toBe('live');
+        expect(statusBox.dataset.state).toBe('ready');
+        expect(host.query<HTMLElement>('.panel-records-body')?.dataset.fetching).toBe('false');
+
+        // --- the store keeps moving behind the drawer ------------------------
+        const readsBefore = backend.reads.length;
+
+        backend.push(TASK_ADDED);
+        seam.wake(3);
+        await host.settle();
+
+        expect(backend.reads).toHaveLength(readsBefore);
+        expect(backend.deltaReads()).toBe(0);
+        // No prepend, and the frozen reading position is untouched: a frame nobody saw is
+        // not a reason to move a reader's scroll or grow their "N new" pill.
+        expect(feedKeysOf(host)).toEqual(['1']);
+        expect(host.text('.panel-records-footer')).toBe('1 of 2 retained changes · filtered to tasks');
+
+        // --- the drawer opens again ------------------------------------------
+        host.controller.setVisibility(true);
+        await host.settle();
+
+        expect(backend.snapshotReads()).toBe(2);
+        expect(seam.specs).toHaveLength(2);
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+        expect(host.phase()).toBe('ready');
+        expect(statusBox.textContent).toBe('live');
+        // Repainted from the fresh read onto the same row node, with the reader's filter
+        // still applied and the footer still honest about it.
+        expect(host.query('li.panel-records-row[data-row-key="1"]')).toBe(rowOne);
+        expect(feedKeysOf(host)).toEqual(['1']);
+        expect(chipOf(host, 'tasks').getAttribute('aria-pressed')).toBe('true');
+        expect(host.text('.panel-records-footer')).toBe('1 of 2 retained changes · filtered to tasks');
+
+        host.dispose();
+    });
+
+    it('freezes the tasks clock while the board is off screen, and re-ages it the moment the drawer opens', async () => {
+        // The clock is a real `setInterval`, so it is the one piece of this file a test has
+        // to own. Fake timers plus an `now` accessor the test moves make "the tick did
+        // nothing" falsifiable: a tick that ran WOULD have re-aged the stamp below.
+        vi.useFakeTimers();
+
+        const clock = { now: NOW };
+        const backend = createBackend();
+        const host = tasksHost({ backend, now: () => clock.now });
+
+        await expandTasks(host);
+
+        // An open row, because that is where a task's timestamp lives: `5m` at `NOW`.
+        const row = taskRowOf(host, 'rec_b') as HTMLElement;
+        const head = row.querySelector('button.panel-tasks-row-head') as HTMLButtonElement;
+
+        head.click();
+
+        expect(row.querySelector('time.panel-tasks-stamp')?.textContent).toBe('5m');
+
+        host.controller.setVisibility(false);
+
+        // Half an hour of shut drawer — the interval runs past its (test) period once.
+        clock.now = NOW + 90 * 60_000;
+
+        const armed = host.timers.armed.length;
+
+        vi.advanceTimersByTime(60 * 60_000);
+        await host.settle();
+
+        // The tick is inert end to end: the stamp is NOT re-aged (the guard is
+        // `ctx.disposed || !panelExpanded || !panelVisible`), nothing is repainted, nothing
+        // is read, and no timer is armed by a card nobody can see.
+        expect(row.querySelector('time.panel-tasks-stamp')?.textContent).toBe('5m');
+        expect(head.getAttribute('aria-expanded')).toBe('true');
+        expect(backend.reads).toHaveLength(1);
+        expect(host.timers.armed).toHaveLength(armed);
+
+        host.controller.setVisibility(true);
+        await host.settle();
+
+        // The re-boot that the way back in performs paints with the clock it actually reads
+        // now, so the stamp catches up — which is what makes the assertion above a claim
+        // about the guard rather than about a formatter that never changes.
+        expect(head.getAttribute('aria-expanded')).toBe('true');
+        expect(row.querySelector('time.panel-tasks-stamp')?.textContent).toBe('1h');
+        expect(backend.snapshotReads()).toBe(2);
+
+        // THE CONTROL, in the same test: with the board shown, that very same interval IS
+        // still armed and the next tick does re-age the row. The frozen stamp above is
+        // therefore the visibility guard, not a dead clock.
+        clock.now = NOW + 180 * 60_000;
+        vi.advanceTimersByTime(60 * 60_000);
+
+        expect(row.querySelector('time.panel-tasks-stamp')?.textContent).toBe('3h');
+
+        vi.useRealTimers();
+        host.dispose();
+    });
+
+    it('freezes the records clock while the board is off screen, and re-ages it the moment the drawer opens', async () => {
+        vi.useFakeTimers();
+
+        const clock = { now: NOW };
+        const backend = createBackend();
+        const host = recordsHost({ backend, now: () => clock.now });
+
+        await expandRecords(host);
+
+        // A feed row needs no disclosure: its stamp is on the row itself.
+        expect(host.query('li.panel-records-row[data-row-key="1"] time.panel-records-stamp')?.textContent).toBe('5m');
+
+        host.controller.setVisibility(false);
+
+        clock.now = NOW + 90 * 60_000;
+
+        const armed = host.timers.armed.length;
+        const painted = host.element.innerHTML;
+
+        vi.advanceTimersByTime(60 * 60_000);
+        await host.settle();
+
+        // Nothing at all happened: same bytes, same reads, same bookkeeping. `painted` is the
+        // whole surface, so this also catches a hidden tick that announced something or grew
+        // a pill.
+        expect(host.element.innerHTML).toBe(painted);
+        expect(backend.reads).toHaveLength(1);
+        expect(host.timers.armed).toHaveLength(armed);
+
+        host.controller.setVisibility(true);
+        await host.settle();
+
+        expect(host.query('li.panel-records-row[data-row-key="1"] time.panel-records-stamp')?.textContent).toBe('1h');
+        expect(backend.snapshotReads()).toBe(2);
+
+        // THE CONTROL: shown, the same interval fires and the same stamp moves. The frozen
+        // surface above is the guard, not an unarmed clock.
+        clock.now = NOW + 180 * 60_000;
+        vi.advanceTimersByTime(60 * 60_000);
+
+        expect(host.query('li.panel-records-row[data-row-key="1"] time.panel-records-stamp')?.textContent).toBe('3h');
+
+        vi.useRealTimers();
+        host.dispose();
+    });
+
+    it('leaves a card the reader never opened alone across a hide and a show', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const tasks = tasksHost({ backend, seam });
+        const records = recordsHost({ backend, seam });
+
+        // Both cards ship SHUT (T5/R1), so the boot state is already the state a hide asks
+        // for — and the re-show must not treat "the drawer opened" as "the reader pressed
+        // the title".
+        expect(backend.reads).toEqual([]);
+        expect(seam.specs).toEqual([]);
+
+        tasks.controller.setVisibility(false);
+        records.controller.setVisibility(false);
+        tasks.controller.setVisibility(true);
+        records.controller.setVisibility(true);
+        await tasks.settle();
+
+        expect(backend.reads).toEqual([]);
+        expect(seam.specs).toEqual([]);
+        expect(seam.unsubscribed).toEqual([]);
+        expect(tasks.phase()).toBeUndefined();
+        expect(records.phase()).toBeUndefined();
+        expect(tasks.query<HTMLElement>('.panel-tasks-body')?.hidden).toBe(true);
+        expect(records.query<HTMLElement>('.panel-records-body')?.hidden).toBe(true);
+        expect(tasks.controller.context.visible).toBe(true);
+        expect(records.controller.context.visible).toBe(true);
+
+        tasks.dispose();
+        records.dispose();
+    });
+
+    it('honours a press made while the board is off screen, and re-boots it on the way back in', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = tasksHost({ backend, seam });
+
+        host.controller.setVisibility(false);
+
+        expect(host.controller.context.visible).toBe(false);
+
+        // EXPAND IS NOT VISIBILITY-GATED, on purpose: pressing the card's own title is a
+        // decision to look at it, and the card answers with a boot — a host whose drawer is
+        // mid-animation, or a desktop host that reports the slot hidden for another reason,
+        // must not get a card that reads nothing until the second press.
+        await expandTasks(host);
+
+        expect(backend.snapshotReads()).toBe(1);
+        expect(seam.specs).toHaveLength(1);
+        expect(host.phase()).toBe('ready');
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
+
+        host.controller.setVisibility(true);
+        await host.settle();
+
+        // The engine that ran in the dark is released, not orphaned: the way back in stops it
+        // before re-targeting, so the plane holds exactly the live registration afterwards
+        // (./records-panels.ts:1451-1461).
+        expect(backend.snapshotReads()).toBe(2);
+        expect(seam.specs).toHaveLength(2);
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+        expect(host.phase()).toBe('ready');
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
+
+        host.dispose();
+        expect(seam.unsubscribed).toEqual(['sub_1', 'sub_2']);
+    });
+
+    // The hardening case for `retarget` in ./records-panels.ts (`createPanelMount`): a
+    // retarget now releases the engine it replaces by itself, so a call site can never
+    // forget `stopEngine()` and orphan a live client plus its registration on the shared
+    // channel. The reachable paths must look EXACTLY like they did before that change,
+    // including the case this file did not cover: a hide that arrives while the board is
+    // ALREADY hidden. Every value below is exact, and the whole point is the bookkeeping of
+    // the plane across four visibility moves.
+    it('holds exactly one live registration across a repeated hide while the board is off screen', async () => {
+        const backend = createBackend();
+        const seam = createSeam();
+        const host = tasksHost({ backend, seam });
+
+        // Reading in the dark (the case above): the shut board hid the boot, and the seam
+        // holds the ONE registration the press dialled.
+        host.controller.setVisibility(false);
+        await expandTasks(host);
+
+        expect(backend.snapshotReads()).toBe(1);
+        expect(seam.specs).toHaveLength(1);
+        expect(seam.unsubscribed).toEqual([]);
+
+        // A SECOND hide with nothing moved. `setVisibility` delivers on a CHANGE only
+        // (./context.ts:341-353), so the panel is never even asked; and if a future host did
+        // ask, `stopEngine` is idempotent (./records-panels.ts:228-239), so the answer is the
+        // same either way: the engine keeps running and the plane is untouched.
+        host.controller.setVisibility(false);
+
+        expect(host.controller.context.visible).toBe(false);
+        expect(seam.specs).toHaveLength(1);
+        expect(seam.unsubscribed).toEqual([]);
+        expect(backend.snapshotReads()).toBe(1);
+        expect(host.phase()).toBe('ready');
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
+
+        // The way back in: the engine that ran in the dark is released ONCE and the
+        // re-target dials the second registration. Had `retarget` kept overwriting the client
+        // without stopping it, `sub_1` would still be attached here (no entry in
+        // `unsubscribed`) and the channel would hold two registrations for one panel.
+        host.controller.setVisibility(true);
+        await host.settle();
+
+        expect(seam.specs).toHaveLength(2);
+        expect(seam.unsubscribed).toEqual(['sub_1']);
+        expect(backend.snapshotReads()).toBe(2);
+        expect(host.phase()).toBe('ready');
+
+        // A real hide: the registration goes with the engine, and the surface stays painted
+        // (a hidden board is a SUSPENDED board — no `clearSurface`, ./records-panels.ts).
+        host.controller.setVisibility(false);
+
+        expect(seam.specs).toHaveLength(2);
+        expect(seam.unsubscribed).toEqual(['sub_1', 'sub_2']);
+        expect(host.phase()).toBe('ready');
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
+
+        // AND NOW THE GAP THIS CASE EXISTS FOR: a second hide while already hidden, AFTER a
+        // hide that really released. Nothing may be released twice (a duplicate id would land
+        // in `unsubscribed`) and nothing may be re-dialled (`specs` unchanged) — the panel is
+        // already in the state a hide asks for.
+        host.controller.setVisibility(false);
+
+        expect(seam.specs).toHaveLength(2);
+        expect(seam.unsubscribed).toEqual(['sub_1', 'sub_2']);
+        expect(backend.snapshotReads()).toBe(2);
+
+        // The re-show that follows is a fresh boot on the plane: a THIRD registration, and
+        // the release list is still exactly the two that went before — so at this moment the
+        // panel holds one live registration (`sub_3`) and no orphan.
+        host.controller.setVisibility(true);
+        await host.settle();
+
+        expect(seam.specs).toHaveLength(3);
+        expect(seam.unsubscribed).toEqual(['sub_1', 'sub_2']);
+        expect(backend.snapshotReads()).toBe(3);
+        expect(host.phase()).toBe('ready');
+        expect(host.queryAll('li.panel-tasks-row')).toHaveLength(2);
+
+        // Every registration this panel ever dialled is released by its teardown: a repeated
+        // hide that had double-released, or a re-show that had orphaned the dark-booted
+        // client, would leave a hole in this list.
+        host.dispose();
+
+        expect(seam.unsubscribed).toEqual(['sub_1', 'sub_2', 'sub_3']);
     });
 });

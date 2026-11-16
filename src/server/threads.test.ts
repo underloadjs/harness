@@ -8,8 +8,10 @@
 //     duplicate turn; the response names the owning turn);
 //   - two thread lanes execute CONCURRENTLY with isolated event records;
 //   - stop-one aborts only its lane (running or queued work) and stops the thread;
-//   - delete purges owning turns/references/transcripts/persisted copies, rejects
-//     running work (409) and the default conversation (400);
+//   - delete MARKS the conversation `inactive` and RETAINS everything (its turn rows, its
+//     transcript, the document), rejects running work (409) and the default conversation (400),
+//     and hides the conversation from every LIST read — the roster AND the turns page the UI
+//     refreshes from — while its identified reads (turn, transcript) keep answering the rows;
 //   - turn indices stay monotonic and label seeds keep surviving labels stable;
 //   - a same-root restart restores threads/turns/joins and never replays work;
 //   - an old (pre-thread) document still loads;
@@ -35,11 +37,16 @@ import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';
 import { createHarnessRuntime } from './runtime';
 import { HARNESS_DATABASE_VERSION, HarnessPersistence, readHarnessDatabase } from './persistence';
+// R2's third durable footprint: the per-step event log next to the document. The store attaches it
+// whenever a database root exists (./sessions.ts `attachJournal`), so a durability proof that stops
+// at `state.json` is only two thirds of the story.
+import { HarnessJournal } from './journal';
 import { SessionError, SessionStore } from './sessions';
 import type {
     CancelSessionResult,
     CancelThreadResult,
     DeleteThreadResult,
+    ResetSessionResult,
     TaskReceipt,
     ThreadSummary,
     ThreadSummaryPage,
@@ -1688,12 +1695,23 @@ describe('SessionStore thread persistence', () => {
 // HTTP contract: task threadId, thread cancel, thread delete
 // ---------------------------------------------------------------------------
 
-const callApi = (runtime: HarnessRuntime, method: string, pathname: string, body: unknown = {}) =>
+// `searchParams` is the channel a real transport uses for a query string (./api.ts `queryOf`
+// accepts a `?`-prefixed one); it is a SEPARATE request field from `pathname` here exactly as it is
+// over the wire, so a route's query filter cannot be exercised by smuggling `?…` into the path —
+// that misses the route match and answers 404.
+const callApi = (
+    runtime: HarnessRuntime,
+    method: string,
+    pathname: string,
+    body: unknown = {},
+    searchParams?: string
+) =>
     runtime.api({
         method,
         pathname,
         mount: '/v1/harness',
         readBody: async <T>() => body as T,
+        ...(searchParams === undefined ? {} : { searchParams }),
         bootstrapRoot: true
     });
 
@@ -1739,9 +1757,23 @@ describe('thread HTTP contract', () => {
         return result.body.items;
     };
 
-    const turnRowsOf = async (runtime: HarnessRuntime, sessionId: string): Promise<TurnSummary[]> => {
+    // The TURNS PAGE — the read the frontend's refresh performs (../frontend/view-api.ts
+    // `openSession` calls `listTurns(id, { limit, order: 'desc' })`), so `query` is exposed to pin
+    // the exact shape of that read, not only the bare route. It goes out as the request's
+    // `searchParams`, the way a transport sends it.
+    const turnRowsOf = async (
+        runtime: HarnessRuntime,
+        sessionId: string,
+        query = ''
+    ): Promise<TurnSummary[]> => {
         const result = await jsonOf<TurnSummaryPage>(
-            await callApi(runtime, 'GET', `/v1/harness/sessions/${sessionId}/turns`)
+            await callApi(
+                runtime,
+                'GET',
+                `/v1/harness/sessions/${sessionId}/turns`,
+                {},
+                query.length === 0 ? undefined : query
+            )
         );
 
         expect(result.status).toBe(200);
@@ -1848,17 +1880,26 @@ describe('thread HTTP contract', () => {
             thread_id: 'thread-1',
             session_id: id
         });
-        // THE ROSTER IS DISCOVERY, THE TURN PAGE IS THE LEDGER (IT19 R2). Old purpose: the delete took
-        // the conversation's rows out of the turn page as well, so neither surface named `thread-1`.
-        // New proof: only discovery stops naming it. The three rows are still served, in order, and
-        // each one still says which conversation produced it — a shell/`turnRead` client can walk
-        // them, which is the whole point of retaining them.
+        // THE ROSTER IS DISCOVERY, AND SO IS THE TURNS PAGE (R1). Old purpose (IT19 R2): only
+        // discovery stopped naming `thread-1`, and the turn page kept every row it owned "so a
+        // shell/`turnRead` client can walk them". The bug that ruling shipped: the frontend builds
+        // one conversation card per distinct `turn.threadId` off THIS page and never consults the
+        // roster (../frontend/ui/turns.ts), so the deleted conversation's card came back on the
+        // next refresh. Retention is UNCHANGED — the rows are still on the disc, and the identified
+        // reads below still answer them by name — but a retired conversation is undiscoverable
+        // through BOTH list reads now, with no new client-visible field on either row.
         expect((await threadRosterOf(runtime, id)).map((row) => row.id)).not.toContain('thread-1');
-        expect((await turnRowsOf(runtime, id)).map((row) => `${row.index}:${row.threadId}:${row.status}`)).toEqual([
-            '0:thread-1:done',
-            '1:thread-1:done',
-            '2:thread-1:cancelled'
-        ]);
+        expect((await turnRowsOf(runtime, id)).map((row) => `${row.index}:${row.threadId}:${row.status}`)).toEqual([]);
+
+        // THE RETAINED ROWS ARE STILL ADDRESSABLE BY NAME: the identified turn read is the door
+        // retention exists for, and it still answers the first row of the deleted conversation with
+        // the conversation it belongs to. Only the LIST hides it (./api.ts `getSessionTurn`).
+        expect(await turnOf(runtime, id, accepted.body.turn_id)).toMatchObject({
+            id: accepted.body.turn_id,
+            index: 0,
+            thread_id: 'thread-1',
+            status: 'done'
+        });
 
         const missing = await jsonOf<{ error: { message: string } }>(
             await callApi(runtime, 'DELETE', `/v1/harness/sessions/${id}/threads/thread-1`)
@@ -1868,6 +1909,264 @@ describe('thread HTTP contract', () => {
             // The canonical 404 scopes the miss to the session in the path.
             body: { error: { message: `Unknown thread "thread-1" in session "${id}".` } }
         });
+    });
+
+    // R1 / R2 / R3 — THE DELETE THE READER REPORTED: "delete sent its payload, but a refresh
+    // brings the conversation back". Both halves were true at once: the DELETE is a soft delete
+    // that retains everything (./sessions.ts `markDeletedThread`), and the turns PAGE the refresh
+    // performs still served the retired conversation's rows, so the frontend — which builds one
+    // conversation card per distinct `turn.threadId` off that page and never consults the roster
+    // (../frontend/ui/threads.ts + ../frontend/ui/turns.ts) — repainted the card without a delete
+    // affordance. The ruling is that retention stays and DISCOVERABILITY goes: the row is hidden
+    // from every list read (./api.ts `threadRecordsOf`, and now `getSessionTurns` through
+    // ./api-reads.ts `discoverableTurnFilterOf`), and stays addressable by name.
+    //
+    // THE SHAPE, derived before the run (offline, scripted preset, no provider):
+    //   - `one` OPENS `thread-1`, `two` CONTINUES it -> the two rows this delete retires;
+    //   - `three` is unfocused, so it opens `thread-2` — the LIVE SIBLING, which is what makes
+    //     "the page went empty" a scoping proof rather than an accident of an empty session;
+    //   - `agent lane` is addressed to `agent:probe`, the entry agent's OWN conversation (origin
+    //     `agent`, which the roster has never published and a delete refuses with a 400). Its row
+    //     must survive the filter: the rule keys on the `inactive` marker, never on an origin;
+    //   - the reset and the session DELETE at the end are the paths that really destroy, so the
+    //     retention above is not something nothing can clean up (./api.ts `postSessionReset`).
+    it('keeps a deleted conversation off the turns page while its rows stay durable, and reset still destroys them', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
+        const fixture = createFixture();
+        const persistence = new HarnessPersistence(root);
+        const runtime = createHarnessRuntime({
+            settings: SETTINGS,
+            defaults: RUNTIME_DEFAULTS,
+            store: createStore([fixture.preset], persistence),
+            loadEnvironment: false
+        });
+        const id = await createSession(runtime, 'probe');
+
+        const submit = async (input: string, threadId?: string): Promise<TaskReceipt> => {
+            const accepted = await jsonOf<TaskReceipt>(
+                await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
+                    input,
+                    ...(threadId === undefined ? {} : { thread_id: threadId })
+                })
+            );
+
+            expect(accepted.status).toBe(202);
+            await runtime.store.waitForIdle(id);
+
+            return accepted.body;
+        };
+
+        // The comparison string for a turns page: `index:threadId:status`. camelCase because the
+        // display subtree keeps camelCase on the wire (../shared/harness-api.ts `TurnSummary`), and
+        // `threadId` is exactly the field the card builder groups by.
+        const pageOf = async (query = ''): Promise<string[]> =>
+            (await turnRowsOf(runtime, id, query)).map((row) => `${row.index}:${row.threadId}:${row.status}`);
+
+        const one = await submit('one');
+        const two = await submit('two', 'thread-1');
+        const three = await submit('three');
+        const lane = await submit('agent lane', 'agent:probe');
+
+        // The routing this whole case rests on, pinned at the receipt rather than assumed.
+        expect([one.thread_id, two.thread_id, three.thread_id, lane.thread_id]).toEqual([
+            'thread-1',
+            'thread-1',
+            'thread-2',
+            'agent:probe'
+        ]);
+
+        // (1) THE BASELINE before anything is retired: four rows over three conversations, with
+        // the agent's own lane among them.
+        expect(await pageOf()).toEqual([
+            '0:thread-1:done',
+            '1:thread-1:done',
+            '2:thread-2:done',
+            '3:agent:probe:done'
+        ]);
+
+        // The doomed thread row, captured off the disc BEFORE the call so the durability check
+        // below is a real before/after and not a reconstruction of what the write should have done.
+        const threadRowBefore = (persistence.load()!.sessions[0].core.threads ?? []).find(
+            (thread) => thread.id === 'thread-1'
+        )!;
+
+        // The per-step event log, per turn, also captured BEFORE. `HarnessJournal` reads the JSONL
+        // file beside the document (./journal.ts), which is the third durable footprint R2 names —
+        // the one `markDeletedThread`'s "the journal compaction is unnecessary" note depends on
+        // (./sessions.ts:10866-10876: the document still lists every turn, so `mergeJournal` can
+        // never meet a record for a turn the document forgot).
+        const journalLines = (): Record<string, number> => {
+            const counts: Record<string, number> = {};
+
+            for (const entry of new HarnessJournal(persistence.directory, id).read().events) {
+                counts[entry.turnId] = (counts[entry.turnId] ?? 0) + 1;
+            }
+
+            return counts;
+        };
+
+        const linesBefore = journalLines();
+
+        // Every turn of the session wrote lines, the two rows of `thread-1` included — so the
+        // equality below is an equality over non-empty data, not over two empty maps.
+        expect(Object.keys(linesBefore).sort()).toEqual(
+            [one.turn_id, two.turn_id, three.turn_id, lane.turn_id].sort()
+        );
+
+        const deleted = await jsonOf<DeleteThreadResult>(
+            await callApi(runtime, 'DELETE', `/v1/harness/sessions/${id}/threads/thread-1`)
+        );
+
+        expect(deleted.status).toBe(200);
+        // `removed_turns` states the SIZE of the retired set, not records destroyed (./api.ts
+        // `deleteSessionThread`), and nothing was owned by `thread-1`.
+        expect(deleted.body).toMatchObject({
+            deleted: true,
+            thread_id: 'thread-1',
+            session_id: id,
+            removed_turns: 2,
+            removed_descendants: 0
+        });
+
+        // (2) R1 — THE REFRESH ITSELF: the exact read `openSession` issues, in both orders, and no
+        // row of `thread-1` in either, so the card builder has nothing left to group.
+        expect(await pageOf('?limit=25&order=desc')).toEqual(['3:agent:probe:done', '2:thread-2:done']);
+        expect(await pageOf()).toEqual(['2:thread-2:done', '3:agent:probe:done']);
+        // The other filters cannot smuggle it back either: `status` alone used to surface a retired
+        // conversation as if it were merely idle (./api.ts `getSessionThreads` says the same for the
+        // roster), and naming it as the `thread_id` filter is still a list read, not an address —
+        // the identified route for the conversation is a 404, so a filter that 404s on the same id
+        // would be inconsistent, and one that returned it would be the leak again.
+        expect(await pageOf('?status=done')).toEqual(['2:thread-2:done', '3:agent:probe:done']);
+        expect(await pageOf('?thread_id=thread-1')).toEqual([]);
+        expect(await pageOf('?thread_id=thread-2')).toEqual(['2:thread-2:done']);
+        expect(await pageOf('?thread_id=agent:probe')).toEqual(['3:agent:probe:done']);
+        // Paging is scoped by the SAME filter, so a cursor never walks onto a row the server
+        // refused to show: one row per page, and the whole visible page is two rows.
+        expect(await pageOf('?limit=1&order=asc')).toEqual(['2:thread-2:done']);
+
+        // (3) R3 — WHAT THE FILTER MUST NOT DROP. (a) the agent lane and (c) the live sibling are
+        // the pages above; here the same rows, addressed: every row of the retired conversation is
+        // still served by the identified read, with the conversation it belongs to. Retention is
+        // only worth anything if a named lookup still lands, and this is that door.
+        for (const turnId of [one.turn_id, two.turn_id]) {
+            expect(await turnOf(runtime, id, turnId)).toMatchObject({
+                id: turnId,
+                thread_id: 'thread-1',
+                status: 'done'
+            });
+        }
+
+        // The TRANSCRIPT door answers the way the roster does — a 404 — because the runtime does not
+        // name a retired row through `thread()` either (./api.ts `requireThread`; ./sessions.ts
+        // `isThreadInactive` is where the store reads the marker from instead, the ledger and the
+        // durable row). Pinned as it is, not changed: discovery hides the conversation at every list
+        // AND at the identified thread/transcript reads, and the transcript itself is proven
+        // retained BELOW, on the disc. The rows of the conversation stay addressable by TURN id,
+        // which is the door retention is actually useful through.
+        const transcriptRead = await jsonOf<{ error: { message: string } }>(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${id}/threads/thread-1/transcript/messages`)
+        );
+
+        expect(transcriptRead.status).toBe(404);
+        expect(transcriptRead.body).toEqual({
+            error: { message: `Unknown thread "thread-1" in session "${id}".` }
+        });
+
+        // The session row states the asymmetry out loud: `turn_count` counts the RETAINED ledger,
+        // `thread_count` counts what the roster LISTS (./api-reads.ts `hostThreads`), so the hidden
+        // conversation stopped being counted as a conversation and kept being counted as history.
+        const session = await jsonOf<{ session: { turn_count: number; thread_count: number } }>(
+            await callApi(runtime, 'GET', `/v1/harness/sessions/${id}`)
+        );
+
+        expect(session.status).toBe(200);
+        expect({
+            turn_count: session.body.session.turn_count,
+            thread_count: session.body.session.thread_count
+        }).toEqual({ turn_count: 4, thread_count: 1 });
+
+        // (4) R2 — DURABILITY, ON THE DISC. Every turn row is still written, with the conversation
+        // that produced it (the retired ones included), and the retired thread row is still there
+        // marked. `agent:probe` is absent from `core.threads` by design — a default agent
+        // conversation is implicit and is never persisted as a thread row (../types
+        // `HarnessThreadSnapshot`) — which is why the filter reads the live record, not the document.
+        const stored = persistence.load()!.sessions[0];
+
+        expect(stored.turns.map((turn) => `${turn.index}:${turn.threadId}:${turn.status}`)).toEqual([
+            '0:thread-1:done',
+            '1:thread-1:done',
+            '2:thread-2:done',
+            '3:agent:probe:done'
+        ]);
+        expect(
+            (stored.core.threads ?? []).map(
+                (thread) => `${thread.id}:${thread.inactive === true ? 'inactive' : 'active'}`
+            )
+        ).toEqual(['thread-1:inactive', 'thread-2:active']);
+
+        // `inactive` is the ONLY field a delete writes (./sessions.ts `markDeletedThread`:
+        // spread-then-mark, "keeps every other field verbatim (the transcript included)"). Strip
+        // the two marks and this row is byte-for-byte the row captured before the call — which is
+        // the difference between "hidden" and "destroyed", stated as data.
+        const threadRowAfter = (stored.core.threads ?? []).find((thread) => thread.id === 'thread-1')!;
+
+        expect(threadRowAfter.inactive).toBe(true);
+        expect(typeof threadRowAfter.inactiveAt).toBe('number');
+        expect({ ...threadRowAfter, inactiveAt: undefined }).toEqual({
+            ...threadRowBefore,
+            inactive: true,
+            inactiveAt: undefined
+        });
+
+        // The committed transcript, spelled out (its entries mint ids like any other row, hence
+        // `withoutIds`, and the profile prompt is the row's own first entry — ../harness.ts seeds
+        // the agent instruction into every conversation): the retired conversation's history is
+        // still IN the row — the positive half of "retained", of which the 404 above is only the
+        // negative space.
+        expect(withoutIds(threadRowAfter.messages)).toEqual([
+            { role: 'system', content: 'sys' },
+            { role: 'user', content: 'one' },
+            { role: 'assistant', content: 'answer:one' },
+            { role: 'user', content: 'two' },
+            { role: 'assistant', content: 'answer:two' }
+        ]);
+
+        // The JOURNAL lines are unchanged by the mark, per turn and in total: the delete hid the
+        // conversation from the reads without un-writing the evidence of what it did — which is also
+        // the invariant the retired journal compaction was removed for.
+        expect(journalLines()).toEqual(linesBefore);
+
+        // (5) THE DESTRUCTIVE PATHS STILL DESTROY. A reset is the path the spec keeps for clearing
+        // a conversation's history (./api.ts `postSessionReset`: the one destructive path), so the
+        // rows a delete retained have to leave the document when the conversation history goes —
+        // otherwise hiding them would be a leak nothing could clean up.
+        const reset = await jsonOf<ResetSessionResult>(
+            await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/reset`)
+        );
+
+        expect(reset.status).toBe(200);
+        expect(reset.body.discarded_turns).toBe(4);
+
+        const afterReset = persistence.load()!.sessions[0];
+
+        expect({
+            turns: afterReset.turns.length,
+            threads: (afterReset.core.threads ?? []).length
+        }).toEqual({ turns: 0, threads: 0 });
+        expect(await pageOf()).toEqual([]);
+
+        // And the session DELETE removes the session record itself — the one path that really
+        // destroys, which is exactly why a conversation delete did not need to.
+        expect((await callApi(runtime, 'DELETE', `/v1/harness/sessions/${id}`)).status).toBe(200);
+        expect(persistence.load()!.sessions).toEqual([]);
+
+        // It takes the per-step log with the session (./sessions.ts `remove` -> `journal.remove()`),
+        // so "retained" can never mean "nothing is ever able to clean this up".
+        expect(new HarnessJournal(persistence.directory, id).exists()).toBe(false);
+
+        runtime.store.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
     });
 
     it('keeps /cancel { all: true } and reports the canonical cancel receipt', async () => {

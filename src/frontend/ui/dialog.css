@@ -11,11 +11,14 @@
  * tokens (--bg-elevated, --border-strong, ...), so the dialog matches the harness
  * dark UI without redefining the palette.
  *
- * All selectors are scoped to `.dialog-*`, except the file-preview section at the
- * end, which is scoped to `.preview*` (the dialog content classes in styles.css),
- * and the two dialog-content rules named in the section above (the `.harness-details`
- * divider for R3 and the thread-delete confirmation copy for R5 — both are content
- * classes styles.css owns for OTHER hosts, adjusted only inside a dialog).
+ * All selectors are scoped to `.dialog-*`, except the file-preview sections at the
+ * end, which are scoped to `.preview*` (the dialog content classes styles.css owns for
+ * OTHER hosts), and the one rule that reaches into a styles.css content class: the
+ * `.harness-details` divider for R3, written under `.dialog-body` so it can only ever
+ * apply inside a dialog. The header's Copy button is the `.dialog-copy*` group below —
+ * a `.dialog-*` family like every other rule here, and the only copy affordance this
+ * sheet styles at all: thread DELETE has no confirmation panel to style, because one
+ * press deletes and its bar lives in styles.css (ui/turns.ts `createThreadActionBar`).
  * Nothing here touches shell classes. */
 
 /* Full-viewport dismiss layer. Fixed + inset keeps it out of the shell grid, and
@@ -397,28 +400,6 @@
     margin: 14px 0 10px;
     border: 0;
     border-top: 1px solid var(--border);
-}
-
-/* --- the thread-delete confirmation copy (ui/turns.ts `openThreadDeleteConfirmation`) --
- * R5: a phone/tablet Delete press opens THIS shell rather than a second hand-rolled
- * overlay, and the body re-uses the class names styles.css already ships for the old
- * two-step toolbar row, so the warning and its two buttons keep one look. Three of that
- * rule's declarations are toolbar-only and wrong in a dialog:
- *   - `flex: 1 0 100%` — the toolbar is a WRAPPING ROW, where a 100% basis is what puts the
- *     confirmation on its own line. `.dialog-body` is a flex COLUMN, so the same 100% is a
- *     height basis and `flex-grow` then hands this group the panel's whole height, leaving
- *     the two actions floating in empty space below the warning.
- *   - `padding-top` + `border-top` — the toolbar needed a divider to separate the row from
- *     the actions above it; `.dialog-head` already draws one, so this would be a second
- *     rule two pixels apart.
- * Only those three are cancelled: the wrapping row of warning + actions and its 8px gaps
- * come straight through. Two classes beat the sheet's one (0,2,0 > 0,1,0), so the override
- * holds regardless of `@import` order, and a DESCENDANT combinator keeps it out of the
- * `> .thread-delete*` shape styles.css deliberately no longer has. */
-.dialog-body .thread-delete-confirm {
-    flex: 0 1 auto;
-    padding-top: 0;
-    border-top: 0;
 }
 
 /* --- ambiguous basename: the candidate list (ui/file-preview.ts) -----------

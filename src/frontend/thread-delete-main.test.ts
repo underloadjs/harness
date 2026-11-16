@@ -12,11 +12,12 @@
 // three children on every surface, while the two actions this fixture's threads need stay
 // exactly Delete and Transcript.
 //
-// T6/R5 makes the NEXT step responsive, and it decides what every test below sees:
-// jsdom has no `matchMedia`, so the board cannot prove a desktop and each press takes the
-// confirmation branch — the SHARED dialog layer (`openDialog`), never an inline row in
-// the bar. The desktop branch (one press, one DELETE, no layer) is pinned by stubbing the
-// two media queries before the import.
+// R3 decides what every test below sees: a Delete press PERFORMS the delete. There is no
+// confirmation dialog on any surface — the board does not ask the device anything on the
+// way to the DELETE — so the first click is the request and no layer is ever created. The
+// `stubDesktop` / `stubPhone` pair below only pins the shell's own media-driven chrome,
+// and the pair of tests that uses it proves the phone and the desktop press are one and
+// the same press.
 //
 // `main.ts` boots on import, so this file stubs fetch and opens a saved session
 // exactly like the real page (remembered id -> GET /sessions/:id). No server and no
@@ -175,34 +176,26 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(
     return found;
 };
 
-// T6/R5: the mobile/narrow Delete confirmation is the SHARED dialog layer
-// (`openDialog`, src/frontend/ui/dialog.ts). Selection is by CONTENT, because an open
-// transcript is a second `.dialog` in the same document and must never answer here.
-const deleteDialogs = (): HTMLElement[] =>
-    Array.from(document.querySelectorAll<HTMLElement>('.dialog')).filter(
-        (panel) => panel.querySelector('.thread-delete-confirm') !== null
-    );
-
-const deleteDialog = (): HTMLElement => {
-    const open = deleteDialogs();
-    if (open.length !== 1) throw new Error(`expected one delete dialog, found ${open.length}`);
-    return open[0];
+// R3: a Delete press must create NO layer. Counting every panel — instead of filtering on
+// the content class the removed confirmation used to carry — also catches a stray second
+// dialog, so this is the assertion every test below uses.
+const noDialog = (): void => {
+    expect(document.querySelectorAll('.dialog')).toHaveLength(0);
+    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
 };
 
-const deleteDialogButton = (selector: string): HTMLButtonElement => {
-    const button = deleteDialog().querySelector<HTMLButtonElement>(selector);
-    if (button === null) throw new Error(`missing ${selector} in the delete dialog`);
-    return button;
-};
+// Two tests press Delete while the JSON transcript is already open, so the honest check
+// there is "nothing NEW stacked": the count is taken before the press, and the transcript
+// alone is what the delete's reconcile closes.
+const layers = (): number => document.querySelectorAll('.dialog').length;
 
-// A PROVEN desktop for the board's click-time samples (ui/turns.ts
-// `requiresDeleteConfirmation`): the layout query does NOT match (wide) and the primary
-// pointer IS fine. Stubbed before the import so main.ts' own media samples agree with the
-// board's.
-const stubDesktop = (): void => {
+// `main.ts` samples these two queries for its OWN layout rules (rails, composer). The
+// delete decision no longer reads them at all, so a stub here only pins the surface the
+// shell paints itself — which is exactly what the desktop/phone pair below is for.
+const stubMedia = (phone: boolean, fine: boolean): void => {
     const answers: Record<string, boolean> = {
-        '(max-width: 860px)': false,
-        '(pointer: fine)': true
+        '(max-width: 860px)': phone,
+        '(pointer: fine)': fine
     };
 
     vi.stubGlobal(
@@ -216,6 +209,9 @@ const stubDesktop = (): void => {
         }))
     );
 };
+
+const stubDesktop = (): void => stubMedia(false, true);
+const stubPhone = (): void => stubMedia(true, false);
 
 // Submit through the real composer path so the shell's own `run()` teardown is
 // exercised (not a direct API call).
@@ -268,8 +264,8 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(bar.hidden).toBe(false);
     // T26 (shell wiring): the toolbar is the ONLY action surface of an expanded tile, and
     // it holds Delete first and Transcript second — no `.tile-header-action` exists
-    // anywhere, and T6/R5 removed the third child (the inline confirmation row) in favour
-    // of the shared dialog. R3/R4: the identity line is the badge ALONE (`IN1`) and the
+    // anywhere, and the confirmation step (first an inline row, then a shared dialog) is
+    // gone for good: a press deletes. R3/R4: the identity line is the badge ALONE (`IN1`) and the
     // measurement line (`34.2s | 18,654`) now shares that line at the right edge where
     // Delete used to be painted; T2 clips the state box to screen-reader-only, so no
     // `- done` suffix is painted even though the word is still in the DOM (below).
@@ -336,35 +332,13 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(pre?.textContent).toContain('"hello thread"');
     expect(pre?.textContent).toContain('"hello answer"');
 
-    // T6/R5: the first click only CONFIRMS. jsdom has no `matchMedia`, so the board cannot
-    // prove a desktop and opens the shared dialog on top of the still-open transcript
-    // layer; the API is untouched. T26: the click still comes from the SAME toolbar, and
-    // the bar itself gained no inline row.
+    // R3: the first click IS the delete. Nothing new stacks on top of the still-open
+    // transcript — the transcript itself is what the reconcile closes. T26: the click still
+    // comes from the SAME toolbar, and the bar owns no inline row.
+    const openLayers = layers();
+    expect(openLayers).toBe(1);
     byClass('.tile-transcript-action .thread-delete', 'button').click();
-
-    const confirmation = deleteDialog();
-    expect(confirmation.getAttribute('role')).toBe('dialog');
-    expect(confirmation.getAttribute('aria-modal')).toBe('true');
-    expect(confirmation.querySelector<HTMLElement>('.dialog-title')?.textContent).toBe(
-        'Delete thread'
-    );
-    expect(
-        confirmation.querySelector<HTMLElement>('.thread-delete-confirm-body')?.textContent
-    ).toBe(
-        'Delete thread IN1? It leaves this session, and its transcript is kept until the session itself is deleted.'
-    );
-    expect(
-        [...confirmation.querySelectorAll<HTMLButtonElement>('.dialog-body button')].map(
-            (button) => button.textContent
-        )
-    ).toEqual(['Delete thread', 'Cancel']);
-    expect(document.querySelector('.tile-transcript-action .thread-delete-confirm')).toBeNull();
-    // The two layers stack in open order (transcript underneath, confirmation on top), so
-    // the reader can still Escape out of the destructive step alone.
-    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(2);
-    expect(calls.some((call) => call.method === 'DELETE')).toBe(false);
-
-    deleteDialogButton('.thread-delete-confirm-delete').click();
+    expect(layers()).toBe(openLayers);
     await flush();
 
     const deletes = calls.filter((call) => call.method === 'DELETE');
@@ -405,14 +379,13 @@ it('reconciles the DELETE result even when the snapshot is stale for the waterma
     await flush();
     expect(document.querySelector('.thread-transcript-json')).not.toBeNull();
 
-    // T26: Delete is reached through the toolbar (`.tile-header-action` is gone), and
-    // T6/R5: the confirmation is the shared dialog stacked on top of this transcript
-    // layer — pressing Delete alone still sends nothing.
+    // T26: Delete is reached through the toolbar (`.tile-header-action` is gone), and R3:
+    // the press rides straight through the DELETE route while the transcript layer sits
+    // underneath — no confirmation step in between, and no extra layer joins the stack.
+    const openLayers = layers();
+    expect(openLayers).toBe(1);
     byClass('.tile-transcript-action .thread-delete', 'button').click();
-    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
-    expect(deleteDialogs()).toHaveLength(1);
-
-    deleteDialogButton('.thread-delete-confirm-delete').click();
+    expect(layers()).toBe(openLayers);
     await flush();
 
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
@@ -525,12 +498,11 @@ it('recomputes tool panels from surviving records on a stale DELETE answer', asy
 
     expect(document.querySelector('.panel[data-panel-id="thread-panel"]')).not.toBeNull();
 
-    // T6/R5: the same confirmation branch as every other test in this file (no
-    // `matchMedia` in jsdom), because the panel reconciliation only ever runs after the
-    // reader actually confirmed the destructive press.
+    // R3: the press IS the request, and the panel reconciliation only runs once the DELETE
+    // answer comes back — so the panel is still painted the instant after the click.
     byClass('.tile-transcript-action .thread-delete', 'button').click();
     expect(document.querySelector('.panel[data-panel-id="thread-panel"]')).not.toBeNull();
-    deleteDialogButton('.thread-delete-confirm-delete').click();
+    noDialog();
     await flush();
 
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
@@ -540,12 +512,13 @@ it('recomputes tool panels from surviving records on a stale DELETE answer', asy
     expect(document.querySelector('.panel[data-panel-id="thread-panel"]')).toBeNull();
 });
 
-it('deletes on ONE desktop press with no dialog and no inline row', async () => {
+it('deletes on ONE press with no dialog and no inline row on a desktop surface', async () => {
     const before = active();
     const after = emptyAfterDelete();
     localStorage.setItem(SESSION_KEY, 's1');
 
-    // The waiver has to be PROVEN: a wide viewport AND a fine primary pointer.
+    // A wide viewport with a fine pointer: the surface that used to be the ONLY one
+    // allowed to delete on a single press.
     stubDesktop();
 
     const calls = stubFetch((url, method) => {
@@ -573,20 +546,69 @@ it('deletes on ONE desktop press with no dialog and no inline row', async () => 
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
         { url: '/api/sessions/s1/threads/thread-a', method: 'DELETE' }
     ]);
-    expect(document.querySelector('.dialog')).toBeNull();
-    expect(document.querySelectorAll('.thread-delete-confirm')).toHaveLength(0);
-    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
+    noDialog();
 
-    // The shell reconciled the answer exactly as the confirmed path does: the conversation
-    // and its transcript surface are gone.
+    // The shell reconciled the answer: the conversation and the surface it was open on are
+    // gone and the composer fell back to a new thread.
     expect(document.querySelector('.tile')).toBeNull();
     expect(document.querySelector('.composer-target')?.textContent).toBe('New thread');
 });
 
-it('sends nothing while the mobile confirmation is open, on Cancel or on Escape', async () => {
+it('deletes on ONE press with no dialog and no inline row on a phone surface', async () => {
+    // R3's whole point: the phone cell of the old matrix IS the desktop cell. Same toolbar,
+    // same single press, same single DELETE, and no layer at any point.
     const before = active();
     const after = emptyAfterDelete();
     localStorage.setItem(SESSION_KEY, 's1');
+
+    // Narrow viewport, coarse pointer — the surface that used to owe a dialog.
+    stubPhone();
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap(before));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: before });
+        if (url === '/api/sessions/s1/threads/thread-a' && method === 'DELETE') {
+            return json({ deleted: true, session: after });
+        }
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+
+    byClass('.tile', 'article').querySelector<HTMLButtonElement>('.tile-select')?.click();
+    await flush();
+    expect(byClass('.tile', 'article').classList.contains('is-expanded')).toBe(true);
+
+    // The bar is the same three permanent children on a phone; nothing about the toolbar
+    // changes with the surface.
+    const bar = byClass('.tile-transcript-action', 'div');
+    expect([...bar.children].map((node) => node.className)).toEqual([
+        'thread-delete',
+        'resume-open action-resume',
+        'transcript-open action-transcript'
+    ]);
+
+    byClass('.tile-transcript-action .thread-delete', 'button').click();
+    // Asserted BEFORE the request settles: the board never grows a layer at all.
+    noDialog();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
+        { url: '/api/sessions/s1/threads/thread-a', method: 'DELETE' }
+    ]);
+    noDialog();
+    expect(document.querySelector('.tile')).toBeNull();
+    expect(document.querySelector('.composer-target')?.textContent).toBe('New thread');
+});
+
+it('sends exactly one DELETE however often the phone reader taps', async () => {
+    const before = active();
+    const after = emptyAfterDelete();
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    stubPhone();
 
     const calls = stubFetch((url, method) => {
         if (url === '/api') return json(bootstrap(before));
@@ -606,37 +628,23 @@ it('sends nothing while the mobile confirmation is open, on Cancel or on Escape'
 
     const shellDelete = byClass('.tile-transcript-action .thread-delete', 'button');
 
-    // Cancel: the layer closes, the conversation stays, and no request ever left.
+    // The burst a thumb on glass actually produces: the first press owns the conversation
+    // and disables the control, the rest are no-ops, and not one of them opens a layer.
     shellDelete.click();
-    expect(deleteDialogs()).toHaveLength(1);
-    deleteDialogButton('.thread-delete-confirm-cancel').click();
-
-    expect(deleteDialogs()).toHaveLength(0);
-    expect(document.querySelector('.dialog-overlay')).toBeNull();
-    expect(document.querySelector('.tile')).not.toBeNull();
-    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
-
-    // Escape is the same "no": it closes the top layer alone and sends nothing.
+    noDialog();
     shellDelete.click();
-    deleteDialog().dispatchEvent(
-        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
-    );
-
-    expect(deleteDialogs()).toHaveLength(0);
-    expect(document.querySelector('.tile')).not.toBeNull();
-    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
-    // Focus lands back on the control the reader pressed, so the toolbar is still usable.
-    expect(document.activeElement).toBe(shellDelete);
-
-    // And the confirmation still works when the reader means it.
     shellDelete.click();
-    deleteDialogButton('.thread-delete-confirm-delete').click();
     await flush();
 
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
         { url: '/api/sessions/s1/threads/thread-a', method: 'DELETE' }
     ]);
+    expect(shellDelete.disabled).toBe(true);
+    noDialog();
+
+    await flush();
     expect(document.querySelector('.tile')).toBeNull();
+    expect(document.querySelector('.composer-target')?.textContent).toBe('New thread');
 });
 
 

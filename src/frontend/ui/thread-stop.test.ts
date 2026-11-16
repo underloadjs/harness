@@ -12,8 +12,8 @@
 //     destructive button's identity or its slot);
 //   - one press sends exactly one `stopThread(sessionId, threadId)` and opens NOTHING —
 //     no dialog, no two-press arming — on a proven desktop AND on every narrow/coarse
-//     surface, because the delete-confirmation waiver (`requiresDeleteConfirmation`)
-//     guards an irreversible removal, not a pause the server can resume;
+//     surface. R3 made the Delete press follow the same rule, so the waiver that used to
+//     make Stop the exception (`requiresDeleteConfirmation`) no longer exists;
 //   - single flight: the control disables and relabels `Stopping…` while the promise is
 //     pending, a press burst is one request, and a rejection is reported non-destructively
 //     (no tile/focus/selection is lost) and the same control is pressable again;
@@ -161,16 +161,12 @@ const labelText = (button: HTMLButtonElement): string =>
 const glyphText = (button: HTMLButtonElement): string =>
     button.querySelector<HTMLElement>('.action-glyph')?.textContent ?? '';
 
-// Any confirmation layer (the shared dialog whose body carries the delete group). Stop
-// must never produce one, so the check is content-based, exactly like the delete tests.
-const deleteDialogs = (): HTMLElement[] =>
-    Array.from(document.querySelectorAll<HTMLElement>('.dialog')).filter(
-        (panel) => panel.querySelector('.thread-delete-confirm') !== null
-    );
-
+// R3: no layer of any kind may exist around a Stop press. Counting every panel beats the
+// old content filter (which could not tell a second transcript apart from a confirmation),
+// so `confirmNothing` now means "nothing is stacked at all".
 const confirmNothing = (): void => {
+    expect(document.querySelectorAll('.dialog')).toHaveLength(0);
     expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
-    expect(deleteDialogs()).toHaveLength(0);
 };
 
 // --- device stub ------------------------------------------------------------
@@ -180,9 +176,10 @@ const FINE_QUERY = '(pointer: fine)';
 
 type Device = { phone: boolean; fine: boolean };
 
-// Same stub as thread-delete-confirmation.test.ts: this jsdom has no `matchMedia`, and the
-// board samples both queries at CLICK time, so `stubDevice` picks which rule the press is
-// judged by (`set` models a resize/rotation between presses).
+// The device stub the delete suite used to branch on. The board no longer samples either
+// query when a destructive control is pressed, so `stubDevice` now only records WHICH
+// surface the reader is on — every one of them behaves identically, which is what the
+// phone/desktop pairs across this file pin (`set` still models a resize/rotation).
 const stubDevice = (device: Device): { set: (next: Partial<Device>) => void } => {
     const state: Device = { ...device };
 
@@ -561,9 +558,9 @@ describe('stop in flight, and delete after it', () => {
         );
     });
 
-    it('keeps the mobile delete confirmation for the stopped conversation', async () => {
+    it('deletes the stopped conversation on ONE phone press, with no dialog', async () => {
         stubDevice({ phone: true, fine: false });
-        const { board, handles, pending } = mount();
+        const { board, deleteCalls, handles, pending } = mount();
         const button = actionOf(at(handles, 0));
 
         button.click();
@@ -579,20 +576,15 @@ describe('stop in flight, and delete after it', () => {
 
         expect(labelText(button)).toBe('Delete');
 
-        // T6/R5 survives R1: on a phone the DELETE still owes a confirmation, even though
-        // the Stop that made it possible never asked for one.
+        // R3 replaces the T6/R5 rule that used to live here: on a phone the DELETE no
+        // longer owes a confirmation, even though the Stop that made it possible never
+        // asked for one either. One press, one request, and no layer at any point.
         button.click();
-        expect(deleteDialogs()).toHaveLength(1);
-        expect(
-            deleteDialogs()[0]?.querySelector<HTMLElement>('.thread-delete-confirm-body')
-                ?.textContent
-        ).toBe(
-            'Delete thread RR1? It leaves this session, and its transcript is kept until the session itself is deleted.'
-        );
-
-        actionButton(deleteDialogs()[0], '.thread-delete-confirm-delete').click();
+        confirmNothing();
         await flush();
-        expect(deleteDialogs()).toHaveLength(0);
+
+        expect(deleteCalls).toEqual([['s1', 'thread-a']]);
+        confirmNothing();
     });
 
     it('reports a failed stop without touching the conversation and re-arms the same control', async () => {

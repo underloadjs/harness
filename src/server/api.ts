@@ -268,6 +268,8 @@ import {
     agentSummaryOf,
     commandRowsOf,
     createdToolNames,
+    // R1: the ONE retired-conversation rule, shared with `thread_count` in the same module.
+    discoverableTurnFilterOf,
     pendingActionRowOf,
     harnessCardOf,
     harnessDefinitionOf,
@@ -1281,6 +1283,21 @@ export const createHarnessApi = ({
     // One conversation's roster row, rebuilt cheaply for a stream update: the thread RECORD plus
     // the store's own label, and the transcript read is bounded to that ONE conversation (its
     // entries are what the row's counts and preview state).
+    //
+    // NO `inactive` guard here, and that is not the gap it looks like: `record.harness.thread(id)`
+    // IS the runtime's discovery door, and it answers `undefined` for a soft-deleted conversation
+    // (../harness.ts:15489-15501 — the same exclusion `threads()` applies at :15478-15482, pinned by
+    // ../harness.it19-retention.test.ts:1187-1188 and :1243), so the `undefined` bail below already
+    // refuses a retired conversation, with the SAME rule the roster's `threadRecordsOf` further below
+    // spells for the thread LIST. A filter here would read one source twice. That covers the only two
+    // `thread.upsert` emissions the store makes (../sessions.ts:9744 stop, :9972 resume): the stop
+    // 404s a retired target BEFORE signalling (../sessions.ts:9603-9607), and the delete's own
+    // internal stop runs ahead of `markDeletedThread`, so its frame names a still-live conversation;
+    // the resume accepts a retired target (../sessions.ts:9852-9866) but lifts the marker only in the
+    // run it starts (`reactivateThreadRow`, ../sessions.ts:9313), so at the instant that frame is
+    // written the door still answers `undefined` — which is also what `GET /sessions/:id/threads`
+    // says then, so HTTP and the stream cannot diverge. The refusal survives a restart because
+    // restore re-seats `inactive: true` into the live record (../harness.ts:14479-14484).
     const threadRowForStream = (
         record: SessionRecord,
         id: string
@@ -5264,8 +5281,24 @@ export const createHarnessApi = ({
             order === 'asc' ? left.index - right.index : right.index - left.index
         );
 
+        // R1/R3: the retired-conversation filter is applied HERE, before the page slice, so a
+        // soft-deleted conversation is undiscoverable through this read the same way the roster
+        // hides it (./api-reads.ts `discoverableTurnFilterOf` for the rule and the exact list of
+        // rows it does NOT touch). This is the leak the UI reported as "delete, then refresh
+        // brings it back": the frontend builds one conversation card per distinct
+        // `turn.threadId` (../frontend/ui/turns.ts) off this page and never consults the roster,
+        // so a retained row that stayed listed here repainted its card.
+        //
+        // The set of retired ids is built ONCE for the read (not per row), and filtering before
+        // `slicePage` keeps the cursor semantics honest: the page is the ledger minus the retired
+        // conversations, so a `next_cursor` never walks back onto a row the server refused to
+        // show. Direct addressing is untouched — `GET /turns/:turnId` still answers a retained
+        // row, which is what keeps the retention rule useful to a `shell` or a `turnRead` client.
+        const discoverable = discoverableTurnFilterOf(record);
+
         const filtered = ordered.filter(
             (turn) =>
+                discoverable(turn) &&
                 (threadId === undefined || turn.threadId === threadId) &&
                 (status === undefined || turn.status === status)
         );

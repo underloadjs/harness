@@ -288,13 +288,17 @@ describe('the canonical directory', () => {
         await flush();
         await flush();
 
-        // TWO session-scoped subscriptions, both addressed to THIS conversation: the
-        // shell's observer, and the ONE shared record-update channel the live panels of
-        // T6 register together (./extensions/records-wake.ts) — two panels, one
-        // registration, which is the point of the broker. An unnormalized row left
-        // `pendingOf` false and the shell never dialed at all.
-        expect(stream.subscriptions).toHaveLength(2);
-        expect(stream.subscriptions.map((sub) => sub.scope).sort()).toEqual(['session', 'session']);
+        // ONE session-scoped subscription, addressed to THIS conversation: the shell's
+        // observer. The ONE shared record-update channel the live panels of T6 register
+        // together (./extensions/records-wake.ts) is NOT dialled here: a card only attaches
+        // to the broker when it is EXPANDED, and both built-ins ship collapsed (the scratch
+        // board's collapse gate) — on top of that this jsdom boot is a phone layout with the
+        // board shut, which releases the wake for the whole slot. Zero attached panels, zero
+        // registrations, which is exactly what the collapse gate is for; the broker's own
+        // "two panels, one registration" is pinned in ./extensions/records-panels.test.ts.
+        // An unnormalized row left `pendingOf` false and the shell never dialed at all.
+        expect(stream.subscriptions).toHaveLength(1);
+        expect(stream.subscriptions.map((sub) => sub.scope).sort()).toEqual(['session']);
         expect(stream.subscriptions.every((sub) => sub.session_id === 's-live')).toBe(true);
         expect(stream.status()).toBe('open');
 
@@ -423,11 +427,12 @@ describe('the canonical directory', () => {
         const action = byClass('.composer-action', 'button');
 
         // 1. The pending state that REMAINS is the running conversation's own: the composer
-        //    offers STOP, and the observer is open on the socket (one session-scope
-        //    registration for the shell's observer, one for the shared record channel).
+        //    offers STOP, and the observer is open on the socket (ONE session-scope
+        //    registration, the shell's observer — the scratch board is shut, so the shared
+        //    record channel of ./extensions/records-wake.ts is not dialled).
         expect(cycle.dataset.sessionId).toBe('s-live');
         expect(action.dataset.action).toBe('stop');
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2']);
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1']);
 
         // 2. R1/R2: a run locks NONE of the session controls. The cycler is enabled and its
         //    tooltip offers the switch rather than blaming the run; so are BOTH dashboard pills
@@ -456,10 +461,10 @@ describe('the canonical directory', () => {
         expect(action.dataset.action).toBe('none');
         expect(byClass('.composer-stop', 'button').hidden).toBe(true);
 
-        // 5. R3: leaving was an UNSUBSCRIBE and nothing else. Both registrations for `s-live`
-        //    said goodbye on the socket, no `POST …/cancel` was sent, and the directory still
-        //    states that conversation as running (it was never touched).
-        expect(unsubscriptions(stream)).toEqual(['s1', 's2']);
+        // 5. R3: leaving was an UNSUBSCRIBE and nothing else. The ONE registration `s-live`
+        //    held said goodbye on the socket, no `POST …/cancel` was sent, and the directory
+        //    still states that conversation as running (it was never touched).
+        expect(unsubscriptions(stream)).toEqual(['s1']);
         expect(cancellations(calls)).toEqual([]);
         expect(dashboard().querySelector<HTMLElement>('.session-pill[data-session-id="s-live"]')?.dataset.status).toBe(
             'running'
@@ -467,24 +472,20 @@ describe('the canonical directory', () => {
         closeDashboard();
 
         // 6. R3: coming back re-attaches. The walk wraps to `s-live`, its live state is painted
-        //    again (STOP), and the observer is dialled a SECOND time on the same socket. The
-        //    registration the idle conversation needed (`s-idle:s3`) sits between the two pairs:
-        //    a conversation with no queue gets the record channel only, never an observer.
+        //    again (STOP), and the observer is dialled a SECOND time on the same socket. The idle
+        //    conversation dialled NOTHING between the two observers — no observer (no queue) and,
+        //    with the scratch board shut, no record channel either (a conversation only ever got
+        //    that channel while an expanded panel was attached to the broker).
         cycle.click();
         await flush();
         await flush();
 
         expect(cycle.dataset.sessionId).toBe('s-live');
         expect(action.dataset.action).toBe('stop');
-        expect(sessionSubscriptions(stream)).toEqual([
-            's-live:s1',
-            's-live:s2',
-            's-idle:s3',
-            's-live:s4',
-            's-live:s5'
-        ]);
-        // Everything the idle conversation held was released on the way back out of it.
-        expect(unsubscriptions(stream)).toEqual(['s1', 's2', 's3']);
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2']);
+        // The idle conversation never held a registration, so leaving it released nothing; the
+        // one release on this page is the observer of the conversation that was left.
+        expect(unsubscriptions(stream)).toEqual(['s1']);
 
         // The re-opened observer is LIVE, not merely present: the settled document pushed now
         // lands in the reopened conversation and releases its stop state.
@@ -604,9 +605,11 @@ describe('the canonical directory', () => {
         expect(document.querySelector('.session-note')?.hasAttribute('hidden')).toBe(true);
 
         // Leaving was still an unsubscribe only: no cancellation on the wire, the shared socket
-        // stayed open, and the conversation the reader left is still listed as running.
+        // stayed open, and the conversation the reader left is still listed as running. ONE id,
+        // because ONE registration was open for `s-live` (the observer); the fresh `made-1` card
+        // dials nothing at all — no queue, and no record channel while the board is shut.
         expect(cancellations(calls)).toEqual([]);
-        expect(unsubscriptions(stream)).toEqual(['s1', 's2']);
+        expect(unsubscriptions(stream)).toEqual(['s1']);
         expect(stream.status()).toBe('open');
         expect(dashboard().querySelector<HTMLElement>('.session-pill[data-session-id="s-live"]')?.dataset.status).toBe(
             'running'
@@ -807,10 +810,11 @@ describe('the conversation switch', () => {
         const action = byClass('.composer-action', 'button');
 
         // The running conversation is on screen: STOP is its own action, and the observer is
-        // dialled (one registration for the shell, one for the shared record channel).
+        // dialled (ONE session-scope registration — the shell's observer; the board is shut, so
+        // the shared record channel of ./extensions/records-wake.ts is not dialled).
         expect(cycle.dataset.sessionId).toBe('s-live');
         expect(action.dataset.action).toBe('stop');
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2']);
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1']);
 
         // 1. The pill press dials the record read, and that read stays unserved. A run locks
         //    no session control, so the `+` the next step needs is enabled RIGHT NOW.
@@ -852,11 +856,11 @@ describe('the conversation switch', () => {
         expect(localStorage.getItem(SESSION_KEY)).toBe('made-1');
         expect(action.dataset.action).toBe('none');
         // The open never bound anything: no registration for `s-parked` was ever dialled. The
-        // only session-scope facts on the socket are the two `s-live` ones `+` had already
-        // released (an unsubscribe, not a cancel) plus the record channel of the conversation
-        // the create adopted — which `+` had already released with an unsubscribe, not a cancel.
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2', 'made-1:s3']);
-        expect(unsubscriptions(stream)).toEqual(['s1', 's2']);
+        // only session-scope fact on the socket is the `s-live` observer `+` had already released
+        // (an unsubscribe, not a cancel); the conversation the create adopted dials nothing while
+        // the board is shut, and `made-1` is therefore absent from the log entirely.
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1']);
+        expect(unsubscriptions(stream)).toEqual(['s1']);
         expect(cancellations(calls)).toEqual([]);
 
         // 4. The guard is not sticky: the same pill press after the drop really does open it.
@@ -867,10 +871,10 @@ describe('the conversation switch', () => {
 
         expect(cycle.dataset.sessionId).toBe('s-parked');
         expect(localStorage.getItem(SESSION_KEY)).toBe('s-parked');
-        // An idle conversation gets the record channel only, never an observer. The log is the
-        // registrations this page has ever dialled, so the create's `made-1` channel is still
-        // named in it (released, not erased) — and `s-parked` is the newest one.
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2', 'made-1:s3', 's-parked:s4']);
+        // An idle conversation gets NEITHER an observer NOR the record channel while the board is
+        // shut, so the log still names only the one observer this page ever dialled. The log is
+        // cumulative: it names every registration the page made, released or not.
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1']);
     });
 
     // R3: two rapid conversation clicks resolve by the LAST CLICK, not by the last ANSWER. The
@@ -977,14 +981,15 @@ describe('the conversation switch', () => {
         const action = byClass('.composer-action', 'button');
 
         // The running conversation is on screen with its observer open, and it has no rows yet.
-        // `s1` is the record channel the open view keeps while its conversation is on screen and
-        // `s2` is that conversation's observer (`startWatching`), so this is the state an ordinary
-        // mid-run screen is in. The list a `StreamDouble` keeps is CUMULATIVE: it names every
-        // registration this page ever made, and `unsubscriptions` below names which went.
+        // `s1` is that conversation's observer (`startWatching`) — the shared record channel that
+        // used to be dialled alongside it (./extensions/records-wake.ts) is gone while the board
+        // is shut — so this is the state an ordinary mid-run screen is in. The list a
+        // `StreamDouble` keeps is CUMULATIVE: it names every registration this page ever made,
+        // and `unsubscriptions` below names which went.
         expect(cycle.dataset.sessionId).toBe('s-live');
         expect(action.dataset.action).toBe('stop');
         expect(transcriptRows()).toEqual([]);
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2']);
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1']);
 
         // 1. The pill press parks on the record read, so the card is still `s-live`'s. The open's
         //    own teardown released the observer, which is what leaves the conversation in the state
@@ -995,7 +1000,7 @@ describe('the conversation switch', () => {
 
         expect(conversationReads(calls)).toEqual(['s-live', 's-target']);
         expect(cycle.dataset.sessionId).toBe('s-live');
-        expect(unsubscriptions(stream)).toEqual(['s2']);
+        expect(unsubscriptions(stream)).toEqual(['s1']);
 
         // 2. A submit goes to the conversation still on screen (its queue is what grows), and its
         //    receipt re-dials that conversation's stream — the internal re-point this case is about.
@@ -1003,13 +1008,13 @@ describe('the conversation switch', () => {
         await flush();
         await flush();
 
-        // One observer, not two: `s4` is the re-dialled session registration for `s-live`, and the
-        // accepted task's display channel took `s3`, which is why the session-scope ids are not
+        // One observer, not two: `s3` is the re-dialled session registration for `s-live`, and the
+        // accepted task's display channel took `s2`, which is why the session-scope ids are not
         // consecutive. The re-point had nothing of its own to release (the parked open had already
-        // released `s2`), so the release list is unchanged — no subscription was dropped and none
+        // released `s1`), so the release list is unchanged — no subscription was dropped and none
         // was left open twice.
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2', 's-live:s4']);
-        expect(unsubscriptions(stream)).toEqual(['s2']);
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s3']);
+        expect(unsubscriptions(stream)).toEqual(['s1']);
         // The submitted row is on screen, and the parked read has still painted nothing.
         expect(cycle.dataset.sessionId).toBe('s-live');
         expect(localStorage.getItem(SESSION_KEY)).toBe('s-live');
@@ -1029,13 +1034,14 @@ describe('the conversation switch', () => {
         expect(stageText()).not.toContain('another task');
         expect(action.dataset.action).toBe('none');
         // Nothing was left subscribed behind the switch. Every registration made for `s-live` is
-        // released — `s1`/`s2` (the boot pair), `s3` (the queued task's display channel) and `s4`
-        // (the observer the submit re-dialled) — and the only session registration still open belongs
-        // to the conversation now on screen. `s6`/`s7` are the display channels this read opened for
-        // the queued task and then for the newest recorded turn; both were released as their display
-        // ended, and nothing on this page cancelled a run.
-        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s2', 's-live:s4', 's-target:s5']);
-        expect(unsubscriptions(stream)).toEqual(['s1', 's2', 's3', 's4', 's6', 's7']);
+        // released — `s1` (the boot observer), `s2` (the queued task's display channel), `s3` (the
+        // observer the submit re-dialled) — and the conversation now on screen holds no
+        // session-scope registration at all: it is idle, and the record channel an expanded panel
+        // would have dialled is gone with the shut board. `s4`/`s5` are the display channels this
+        // read opened for the queued task and then for the newest recorded turn; both were released
+        // as their display ended, and nothing on this page cancelled a run.
+        expect(sessionSubscriptions(stream)).toEqual(['s-live:s1', 's-live:s3']);
+        expect(unsubscriptions(stream)).toEqual(['s1', 's2', 's3', 's4', 's5']);
         expect(cancellations(calls)).toEqual([]);
     });
 
@@ -1078,7 +1084,10 @@ describe('the conversation switch', () => {
         expect(transcriptRows()).toEqual([{ id: 't-busy', thread: 'thread-1', prompt: 'prompt alpha' }]);
         expect(stageText()).toContain('answer alpha');
         expect(stageText()).not.toContain('answer bravo');
-        expect(sessionSubscriptions(stream)).toEqual(['s-busy:s1', 's-busy:s3']);
+        // `s1` is the running turn's DISPLAY channel and `s2` is this conversation's observer —
+        // the only session-scope registration the shut board leaves on the socket, since the
+        // record channel an expanded card would have dialled is gone.
+        expect(sessionSubscriptions(stream)).toEqual(['s-busy:s2']);
 
         // B. Away: the OTHER conversation mints the SAME thread id, and it is the only thing
         //    the transcript now holds. The pending figure moves with the selection, so an idle
@@ -1094,7 +1103,11 @@ describe('the conversation switch', () => {
         expect(stageText()).toContain('answer bravo');
         expect(stageText()).not.toContain('answer alpha');
         expect(action.dataset.action).toBe('none');
-        expect(unsubscriptions(stream)).toEqual(['s1', 's3']);
+        // Leaving released the ONE session-scope registration the working conversation held: its
+        // observer (`s2`). The turn's display channel (`s1`) is still open — exactly as before the
+        // collapse gate, when the released pair was the record channel plus the observer and the
+        // display channel stayed. The idle conversation dials nothing, so the log stays here.
+        expect(unsubscriptions(stream)).toEqual(['s2']);
 
         // C. Back: every row of `s-quiet` is gone — the shared thread id must not have let the
         //    idle conversation's row or marks survive under `s-busy` — and the working
@@ -1110,7 +1123,12 @@ describe('the conversation switch', () => {
         expect(stageText()).toContain('answer alpha');
         expect(stageText()).not.toContain('answer bravo');
         expect(action.dataset.action).toBe('stop');
-        expect(sessionSubscriptions(stream)).toEqual(['s-busy:s1', 's-busy:s3', 's-quiet:s4', 's-busy:s5', 's-busy:s6']);
+        // The reopened conversation dials its SECOND observer (`s3`) and nothing else: `s-quiet`
+        // is recorded, so it dialled NO subscription of its own (no queue, no observer, and no
+        // record channel while the board is shut), and the display channel of the running turn
+        // (`s1`) was never released. A second observer is all the way back adds now that the
+        // record channel is gone with the shut board.
+        expect(sessionSubscriptions(stream)).toEqual(['s-busy:s2', 's-busy:s3']);
 
         // D. The re-opened observer is LIVE: a frame for the running turn reaches the row that
         //    carries the reused thread id, which is exactly what a mark left behind by

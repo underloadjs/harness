@@ -175,13 +175,39 @@ export type PanelContext = {
     onSessionChange(listener: (sessionId: string | null) => void): () => void;
     /** Rewrites the card heading; an empty title removes it. */
     setTitle(title: string): void;
+    /**
+     * Whether this panel's SLOT is on screen right now (T5/R3). `true` is the shipped
+     * default and only the host can move it (./runtime.ts delivers it from
+     * `PanelPaintInput.visibility`), so a host that never touches the seam leaves every
+     * panel visible. The one host that does is the phone scratch drawer: a card inside a
+     * closed drawer cannot be looked at, and must not read, subscribe or tick while it
+     * is shut (../main.ts `scratchRailVisible`).
+     */
+    readonly visible: boolean;
+    /**
+     * Registers a board-visibility listener; returns the unsubscribe. Delivery is ON
+     * CHANGE ONLY — never on registration: the value in force when a panel mounts is the
+     * context default until the runtime says otherwise, and `visible` is the readable
+     * answer (./runtime.ts calls `setVisibility` with the slot's current value right
+     * after `panel.mount()` returns, which fires only when that value differs from the
+     * default). Isolated like `onDispose`: one throwing listener cannot keep the others
+     * from being told.
+     */
+    onVisibility(listener: (visible: boolean) => void): () => void;
 };
 
 // The runtime's half: the extension gets `context`, the shell keeps the two
-// capabilities that must not be public (teardown and the session-change dispatch).
+// capabilities that must not be public (teardown and the session-change dispatch) plus
+// the one the shell itself owns (whether the slot is on screen).
 export type PanelContextController = {
     context: PanelContext;
     notifySessionChange: (sessionId: string | null) => void;
+    /**
+     * Publishes the slot's visibility. A no-op while disposed, and a no-op when the
+     * value is unchanged — listeners fire on the CHANGE, not on every paint (the paint
+     * loop runs on every stream frame).
+     */
+    setVisibility: (visible: boolean) => void;
     dispose: () => void;
 };
 
@@ -204,9 +230,17 @@ export const createPanelContext = (input: PanelContextInput): PanelContextContro
     const disposers: (() => void)[] = [];
     const subscriptions = new Set<StreamSubscription>();
     const listeners = new Set<(sessionId: string | null) => void>();
+    // T5/R3 — the board-visibility channel. A SET (not a single callback) because one
+    // slot can hold several panels (Tasks and Records both sit in `scratch`) and each
+    // suspends its own reads; every one of them must hear the same change.
+    const visibilityListeners = new Set<(visible: boolean) => void>();
     const controller = new AbortController();
 
     let disposed = false;
+    // VISIBLE BY DEFAULT, and it is the host that has to say otherwise: a panel in a
+    // slot nobody publishes (a host that never passes `PanelPaintInput.visibility`) keeps
+    // the behaviour it had before this seam existed.
+    let visible = true;
 
     // One teardown path for every resource this context handed out. Reverse order so
     // a disposer that unwinds another's work runs first (the last thing mounted is the
@@ -238,6 +272,9 @@ export const createPanelContext = (input: PanelContextInput): PanelContextContro
         subscriptions.clear();
 
         listeners.clear();
+        // Released for the same reason `listeners` is: each visibility listener closes
+        // over the panel's whole surface, and the context must not keep that alive.
+        visibilityListeners.clear();
         controller.abort();
     };
 
@@ -288,6 +325,47 @@ export const createPanelContext = (input: PanelContextInput): PanelContextContro
         };
     };
 
+    const onVisibility = (listener: (visible$: boolean) => void): (() => void) => {
+        // Same shape as `onSessionChange`: registering on a disposed context is a no-op
+        // (a late answer must not leave a listener behind), and the current value is
+        // readable through `context.visible` instead of being replayed here.
+        if (disposed || typeof listener !== 'function') return () => {};
+
+        visibilityListeners.add(listener);
+
+        return () => {
+            visibilityListeners.delete(listener);
+        };
+    };
+
+    const setVisibility = (next: boolean): void => {
+        // A panel that is gone has nothing to suspend.
+        if (disposed) return;
+
+        // Anything that is not `false` is visible, so a host that hands over `undefined`
+        // for a slot gets the default rather than a suspension it never asked for.
+        const value = next !== false;
+
+        // CHANGE only. `paint` runs on every stream frame, and a live panel's answer to
+        // "still hidden?" is a no-op it should not have to run at all (./runtime.ts
+        // diffs per instance too — this guard is the one that makes the seam itself
+        // safe for any other caller).
+        if (value === visible) return;
+
+        visible = value;
+
+        // Iterated over a copy: a listener may unsubscribe itself (or a sibling) from
+        // inside the callback, and a `Set` mutated during `for..of` skips entries.
+        for (const listener of [...visibilityListeners]) {
+            try {
+                listener(value);
+            } catch {
+                // One panel throwing must not stop the next one being told — the same
+                // isolation the teardown loop keeps.
+            }
+        }
+    };
+
     const setTitle = (title: string): void => {
         const existing = titleNodeOf(input.element);
 
@@ -330,8 +408,19 @@ export const createPanelContext = (input: PanelContextInput): PanelContextContro
         subscribeSeam: subscribe,
         onDispose,
         onSessionChange,
+        // A live getter, not a snapshot: the value the host published is the answer, and
+        // a panel that registers `onVisibility` mid-mount can read the state it is in.
+        get visible() {
+            return visible;
+        },
+        onVisibility,
         setTitle
     };
 
-    return { context, dispose, notifySessionChange: (sessionId) => void listeners.forEach((l) => l(sessionId)) };
+    return {
+        context,
+        dispose,
+        notifySessionChange: (sessionId) => void listeners.forEach((l) => l(sessionId)),
+        setVisibility
+    };
 };

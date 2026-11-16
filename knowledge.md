@@ -1558,7 +1558,8 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   control-plane members (`src/types/index.ts:3441-3443`), and the server's record
   routes over them. `readRecordsStoreState()` is the exported pure reader that the
   snapshot and `restore()` paths share. The browser renders the live view in the two
-  shell panels — see [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords).
+  shell panels, and only in an OPEN card on a SHOWN board — see
+  [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords).
 
 **Concurrency and ownership (T1).** One store is shared by every agent on every
 thread, and a call is not a transaction: a read is a snapshot, and somebody else can
@@ -1749,7 +1750,8 @@ drift from what the engine returns and adding a collection adds no validator.
   collection set — and `GET /sessions/{id}/records` answers both. A change row names the
   fields it touched (`fields: string[]`) and carries no values, so a consumer that wants
   the values re-reads; the `records.updated` stream event says only that one of those two
-  counters moved. The two live shell panels are the only consumers of that surface today —
+  counters moved. The two live shell panels are the only consumers of that surface today,
+  and only while their cards are open and the board is showing —
   see [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords).
 
 ## Agent results (R3)
@@ -4966,7 +4968,11 @@ as their own entries.
   leaving the breakpoint clears the state so a resize cannot resurrect a dismissed
   rail. The rails stay in the DOM — CSS only hides them — so their content and
   state survive a toggle, and wider layouts ignore the state and show both rails
-  permanently. `src/frontend/rail-toggle.test.ts` pins the DOM of this contract.
+  permanently. A shut drawer also PARKS the scratch board's live data plane — the
+  panels' rows, disclosures and filter survive the toggle untouched, while their read
+  and their realtime registration are released until it opens again (see
+  [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords)).
+  `src/frontend/rail-toggle.test.ts` pins the DOM of this contract.
   Above the phone breakpoint each rail is **resizable**. A `role="separator"` seam sits in
   its own 6px grid track between the rail and the chat (`src/frontend/ui/rail-resize.ts`),
   and a drag writes `--rail-left-width` / `--rail-right-width` on `.shell` — the two
@@ -4975,7 +4981,12 @@ as their own entries.
   like a double-click on a seam, returns the stylesheet's 248px / 320px, and the chat
   keeps a 320px floor so a rail can never be pulled over the transcript. Both seams are
   hidden on a phone (the rails are fixed-width drawers there) and only the right one on a
-  tablet (the scratch board is a full-width strip). A drag re-runs the reflow a window
+  tablet (the scratch board is a full-width strip). The board's own live-ness signal is the
+  one `main.ts` `scratchRailVisible` reads — `!isPhoneLayout() || openRail === 'right'` — so
+  the panels are dormant on a phone until the drawer opens and live on tablet and desktop
+  whatever the drawer state is. That value is published on every `paintPanels()`, which
+  `setRailOpen()` (including the branch where the harness drawer displaces the board) and
+  both branches of the breakpoint handler call. A drag re-runs the reflow a window
   resize does (`main.ts` `reflowLayout`), so the composer's grown height, the scratch
   button's anchor and the notched routing label re-measure against the new chat width.
   `src/frontend/ui/rail-resize.test.ts` pins the drag, keyboard, clamp and reset.
@@ -5720,12 +5731,17 @@ ordinary entries in the shell's panel registry — the definitions sit at the fo
 and re-exported by `extensions/index.ts` — hands them to the runtime, and
 `src/frontend/main.ts` calls it at startup — so the extension runtime
 (`extensions/runtime.ts`) owns their mount, session scoping and teardown exactly as it
-owns a plugin panel's. Nothing in `src/server/**`, `src/shared/**` or
-`src/core/records.ts` knows they exist, and they are display-only — their controls are
-view-side only: a task row opening its own detail (the collapsed row is a tick-or-cross
-mark plus its text, and pressing it reveals the full text, the meta line and the
-record's history), the collection filter chips, the "N new" follow pill, and a Retry
-where a read failed.
+owns a plugin panel's. They mount from boot, but both cards ship **closed**, and a closed
+card has no engine: nothing on the records surface moves until a reader opens one. Nothing
+in `src/server/**`, `src/shared/**` or `src/core/records.ts` knows they exist, and they are
+display-only — their controls are view-side only. The first is the card's own title, the
+collapse control: pressing it boots the engine (one snapshot read, one wake registration)
+and pressing it again releases both and clears the surface, so a re-open is a fresh boot,
+never a resurrection of rows nothing was reading. The others are a task row opening its own
+detail (the collapsed row is a tick-or-cross mark plus its text, and pressing it reveals the
+full text, the meta line and the record's history — a local disclosure of history the panel
+already holds, with no request of its own), the collection filter chips, the "N new" follow
+pill, and a Retry where a read failed.
 
 - **Reads.** `src/frontend/api.ts` adds the two bounded REST reads (`getSessionRecords` =
   `GET …/records`, `getSessionRecordsDelta` = `GET …/records?since=`). They are wrapped as
@@ -5740,13 +5756,29 @@ where a read failed.
   its client, but the WS registration is SHARED: `extensions/records-wake.ts` brokers one
   subscription per (seam, session) and fans its frames to every attached panel, keyed on
   the RAW `ctx.subscribeSeam` rather than the per-context wrapper. A conversation switch
-  releases the old registration with the old client.
+  releases the old registration with the old client — and so does the collapse gate: the
+  registration's lifetime is now CARD- and BOARD-dependent, created by expanding a card on
+  a shown board and retired by closing it (`stopEngine` — the wake first, then the client)
+  or by the board going off screen. A closed card, and any card inside a shut phone drawer,
+  holds no registration and does no clock work at all.
+- **Board visibility.** `PanelContext.visible` (default true) and its
+  `PanelContext.onVisibility(listener)` are the runtime's channel for "is this slot the
+  reader can actually look at"; `PanelContextController.setVisibility` publishes it — once at
+  mount, then on every paint — and fires listeners only on a CHANGE, so a host that never
+  passes `PanelPaintInput.visibility` leaves every panel visible. A HIDE is a SUSPENSION, not
+  a collapse and not an unmount: the plane is released (wake detach, then client dispose) and
+  the clock idles, but the element, its painted rows, its open row disclosures and its filter
+  survive untouched, exactly as the rail contract asks. A re-show boots a card the reader left
+  OPEN with exactly one fresh snapshot read — the frames the drawer missed are what that read
+  answers — and leaves a collapsed one inert.
 - **One owner per answer.** A dead plane makes the client hold a pending resync, and the
   next baseline answers it. A panel re-reads on that baseline only when the client is not
   already owed the read, so a reconnect costs exactly one delta read, not two.
 - **States.** Five, derived and published as `data-phase` on the panel root: `loading`,
   `empty`, `error` + Retry, `stale`, `ready`. `recordsPanelPhaseOf` is the single derivation;
-  the stylesheet switches on the same attribute the tests assert. The corner box
+  the stylesheet switches on the same attribute the tests assert. A closed card carries neither
+  a `data-phase` nor a word in the corner box — the surface is cleared and the box stays
+  hidden, so the open card is not the default state to be in. The corner box
   (`recordsStatusOf`) adds ONE dimension the phase does not carry: while a read is in flight
   it says `reading` whatever `data-phase` says, because an unanswered fetch is not evidence
   that the rows on screen are behind — a badge that went `live` → `stale` → `live` on every
@@ -5760,7 +5792,9 @@ where a read failed.
   edge), the keyed-list FLIP mover, the "just landed" marker (a LIVE apply only), and the
   relative-stamp ladder that renders `5m` inside `<time datetime>` with the ISO in `title`.
 - **Isolation.** Every failure is local to one panel: a refused registration, a rejected
-  read or a dead seam changes one rail, never its neighbour and never the shell.
+  read or a dead seam changes one rail, never its neighbour and never the shell. Going off
+  screen is not a failure at all — the board parks each card it carries, and re-boots an open
+  one when the reader opens the drawer again.
 - **CSS.** One clearly-marked section appended at the end of `src/frontend/styles.css`,
   namespaced `.panel-tasks-*` / `.panel-records-*`; it overrides nothing above it, and
   `prefers-reduced-motion` plus forced-colors are part of the contract.
@@ -5768,8 +5802,12 @@ where a read failed.
 Tests: `extensions/records-client.test.ts` (watermarks, windows, the value-honesty rule,
 the outage protocol), `extensions/records-wake.test.ts` (one shared registration, fan-out,
 release on the last panel), `extensions/records-dom.test.ts` (announcer, follow, FLIP,
-stamps), `extensions/records-panels.test.ts` (both mounts end to end: the five states, the
-live burst, the pill, the chips, the session switch, the teardown), and
+stamps), `extensions/records-panels.test.ts` (both mounts end to end: the collapse gates —
+both cards mount CLOSED with no read and no registration, and the title press is what boots
+the engine and what releases it — the five states, the live burst, the pill, the chips, the
+session switch, the teardown, and the drawer suspension: a hidden slot releases the
+registration and idles the clock while the rows, the open disclosure and the filter survive
+untouched, and a re-show is one fresh boot), and
 `src/frontend/records-style.test.ts` (the appended section stays at EOF, the namespace
 allow-list, every painted class is styled, the phase/motion/contrast rules).
 

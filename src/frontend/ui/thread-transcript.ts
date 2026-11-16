@@ -515,9 +515,9 @@ export const THREAD_TRANSCRIPT_SAVE_NOTE =
     'Save replaces only this thread\'s transcript messages. Turns and events are session history and are never changed.';
 
 // The shared modal has NO actions API, so a dialog's own buttons live in the adopted
-// content node — the same precedent as the board's delete-confirmation row
-// (ui/turns.ts `createThreadActionBar`). `hidden` on the bar itself is never used
-// here: both bars are always meaningful in the mode that renders them.
+// content node — the same precedent as the board's conversation action bar, the one-press
+// Delete/Resume/Transcript row (ui/turns.ts `createThreadActionBar`). `hidden` on the bar
+// itself is never used here: both bars are always meaningful in the mode that renders them.
 const transcriptActions = (className: string, ...buttons: HTMLElement[]): HTMLElement => {
     const bar = el('div', `thread-transcript-actions ${className}`);
     bar.setAttribute('role', 'group');

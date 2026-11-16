@@ -7,6 +7,14 @@
 // gone, the timer is gone, the subscription is released, the element is gone, and
 // none of them run twice.
 //
+// The `board visibility` block is T5/R3: `PanelPaintInput.visibility` says which slots the
+// reader can actually look at, and a hidden slot is SUSPENDED rather than unmounted — the
+// instance keeps its element, its painted content and its state, and is told about the
+// change EXACTLY once (the paint loop runs on every stream frame). The `the context
+// contract` block pins the channel that ride is on: `PanelContextController.setVisibility`
+// and `PanelContext.onVisibility` (./context.ts), including its change-only, disposed-inert,
+// throwing-listener-isolated rules.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,7 +22,7 @@ import { createPanelHost } from '../ui/panels';
 import type { PanelHost, PanelMedia } from '../ui/panels';
 import type { StreamSubscription } from '../stream';
 import { clearPanelKinds, registerPanelKind } from './panel-kinds';
-import type { PanelSubscribe, PanelSubscriptionSpec } from './context';
+import type { PanelContext, PanelSubscribe, PanelSubscriptionSpec } from './context';
 import { createPanelContext, panelApi } from './context';
 import { clearShellPanels, registerShellPanel, unregisterShellPanel } from './shell-panels';
 import { createPanelRuntime } from './runtime';
@@ -596,5 +604,394 @@ describe('the context contract', () => {
 
         controller.dispose();
         expect(log).toEqual(['dropped']);
+    });
+
+    // --- T5/R3: the board-visibility channel ---------------------------------
+    // This is the seam `../main.ts` drives from `scratchRailVisible` through
+    // ./runtime.ts: a phone drawer that shuts has to reach every card in the slot, once,
+    // and must not have to. The cases below are the rules the runtime relies on — the
+    // runtime cannot re-implement any of them, so they are pinned at the source.
+    const bareContext = (): ReturnType<typeof createPanelContext> =>
+        createPanelContext({
+            id: 'tasks',
+            slot: 'scratch',
+            element: document.createElement('div'),
+            sessionId: () => 's1'
+        });
+
+    it('publishes visibility on a CHANGE, and treats anything but false as visible', () => {
+        const seen: boolean[] = [];
+        const controller = bareContext();
+
+        controller.context.onVisibility((visible) => seen.push(visible));
+
+        // VISIBLE BY DEFAULT, and the default is not a delivery: a host that never
+        // touches the seam leaves every panel exactly as it was before it existed.
+        expect(controller.context.visible).toBe(true);
+        controller.setVisibility(true);
+        expect(seen).toEqual([]);
+
+        controller.setVisibility(false);
+        expect(seen).toEqual([false]);
+
+        // A `paint` per stream frame, and the answer to "still hidden?" is a no-op the
+        // panel should not have to run at all (./context.ts:341-367).
+        controller.setVisibility(false);
+        controller.setVisibility(false);
+        expect(seen).toEqual([false]);
+
+        controller.setVisibility(true);
+        expect(seen).toEqual([false, true]);
+
+        // `undefined` for a slot is the host saying "no opinion", not "suspend it".
+        controller.setVisibility(false);
+        controller.setVisibility(undefined as unknown as boolean);
+        expect(seen).toEqual([false, true, false, true]);
+        expect(controller.context.visible).toBe(true);
+    });
+
+    it('never replays the current value on registration: `visible` is the readable answer', () => {
+        const seen: boolean[] = [];
+        const controller = bareContext();
+        const { context } = controller;
+
+        controller.setVisibility(false);
+
+        // A panel that registers mid-mount must be able to find out what state it is in
+        // WITHOUT a synthetic callback: the value is a live getter, and the listener only
+        // ever carries a transition.
+        context.onVisibility((visible) => seen.push(visible));
+        expect(seen).toEqual([]);
+        expect(context.visible).toBe(false);
+
+        context.onVisibility(() => {
+            throw new Error('unused');
+        });
+        controller.setVisibility(true);
+        expect(seen).toEqual([true]);
+        expect(context.visible).toBe(true);
+    });
+
+    it('isolates a throwing visibility listener from the others', () => {
+        const seen: string[] = [];
+        const controller = bareContext();
+
+        controller.context.onVisibility((visible) => {
+            seen.push(`first:${visible}`);
+            // One card whose hide handler blew up cannot strand its siblings — they would
+            // keep a wake and a client for a board that is off screen.
+            throw new Error('the task card threw on the way out');
+        });
+        controller.context.onVisibility((visible) => seen.push(`second:${visible}`));
+
+        controller.setVisibility(false);
+        expect(seen).toEqual(['first:false', 'second:false']);
+        // The value is committed BEFORE the fan-out, so a throw cannot leave the slot
+        // claiming the opposite of what its cards just did.
+        expect(controller.context.visible).toBe(false);
+
+        controller.setVisibility(true);
+        expect(seen).toEqual(['first:false', 'second:false', 'first:true', 'second:true']);
+    });
+
+    it('unsubscribes one visibility listener without disturbing its sibling', () => {
+        const seen: string[] = [];
+        const controller = bareContext();
+
+        const off = controller.context.onVisibility((visible) => seen.push(`first:${visible}`));
+        controller.context.onVisibility((visible) => seen.push(`second:${visible}`));
+
+        controller.setVisibility(false);
+        expect(seen).toEqual(['first:false', 'second:false']);
+
+        off();
+        controller.setVisibility(true);
+        expect(seen).toEqual(['first:false', 'second:false', 'second:true']);
+    });
+
+    it('lets a listener unsubscribe a sibling mid-delivery, for the next change only', () => {
+        const seen: string[] = [];
+        const controller = bareContext();
+
+        let offSecond: (() => void) | undefined;
+
+        controller.context.onVisibility((visible) => {
+            seen.push(`first:${visible}`);
+            // The fan-out is over a COPY of the set (./context.ts:359), so removing an
+            // entry here cannot skip the next one in this round — a card that retires its
+            // neighbour during the hide still gets THIS transition.
+            offSecond?.();
+        });
+        offSecond = controller.context.onVisibility((visible) => seen.push(`second:${visible}`));
+
+        controller.setVisibility(false);
+        expect(seen).toEqual(['first:false', 'second:false']);
+
+        controller.setVisibility(true);
+        expect(seen).toEqual(['first:false', 'second:false', 'first:true']);
+    });
+
+    it('is inert for visibility after dispose: no delivery, and no late listener', () => {
+        const seen: boolean[] = [];
+        const controller = bareContext();
+        const { context } = controller;
+
+        controller.dispose();
+
+        // A board that went off screen while this panel was being torn down has nobody
+        // left to tell.
+        controller.setVisibility(false);
+        expect(seen).toEqual([]);
+        // Disposal does not rewrite the slot's value — it only stops it moving.
+        expect(context.visible).toBe(true);
+
+        // A late answer that registers after the teardown leaves nothing behind.
+        context.onVisibility((visible) => seen.push(visible));
+        controller.setVisibility(false);
+        expect(seen).toEqual([]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T5/R3 — board visibility: a hidden slot is a SUSPENSION, not an unmount
+// ---------------------------------------------------------------------------
+
+describe('board visibility', () => {
+    // The probe records what its instance was TOLD, labelled `id#instance` so a delivery
+    // to a dead instance can never be mistaken for one to the live one (the same
+    // labelling discipline the session-scoping cases above use). `mount` reports the value
+    // the callback itself saw, which is the runtime default: ./runtime.ts publishes the
+    // slot's state AFTER `panel.mount()` returns, and that ordering is part of the contract.
+    type ProbeLog = string[];
+
+    const installProbe = (
+        log: ProbeLog,
+        options: { id?: string; slot?: 'scratch' | 'center'; title?: string } = {}
+    ): PanelContext[] => {
+        const contexts: PanelContext[] = [];
+        let instances = 0;
+
+        registerShellPanel({
+            id: options.id ?? 'tasks',
+            ...(options.slot === undefined ? {} : { slot: options.slot }),
+            ...(options.title === undefined ? {} : { title: options.title }),
+            mount: (context) => {
+                instances += 1;
+                const label = `${context.id}#${instances}`;
+
+                contexts.push(context);
+                log.push(`mount:${label}:${context.visible}`);
+                context.onVisibility((visible) => log.push(`visibility:${label}:${visible}`));
+                context.onDispose(() => log.push(`dispose:${label}`));
+
+                // The "state" the rail contract says must survive a toggle: one node the
+                // panel painted itself, checked for IDENTITY, not just for a matching string.
+                const line = document.createElement('p');
+                line.textContent = `state:${label}`;
+                context.element.append(line);
+            }
+        });
+
+        return contexts;
+    };
+
+    const extensionOf = (id: string): HTMLElement | null =>
+        hosts.scratch.element.querySelector<HTMLElement>(`[data-panel-extension="${id}"]`);
+
+    it('leaves every panel visible and silent when the paint carries no visibility map', () => {
+        const log: ProbeLog = [];
+        const contexts = installProbe(log);
+
+        runtime.paint({ hosts, sessionId: 's1' });
+
+        // The host that never passes the seam (every test above, and every other host) is
+        // exactly the behaviour it had before it: no listener, no call, `visible` true.
+        expect(log).toEqual(['mount:tasks#1:true']);
+        expect(contexts[0]?.visible).toBe(true);
+    });
+
+    it('treats a map that omits the slot, and a slot mapped to undefined, as visible', () => {
+        const log: ProbeLog = [];
+        const contexts = installProbe(log);
+
+        // Another slot named, this one not: the centre rail being off screen says nothing
+        // about the board.
+        runtime.paint({ hosts, sessionId: 's1', visibility: { center: false } });
+        expect(log).toEqual(['mount:tasks#1:true']);
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: undefined } });
+        expect(log).toEqual(['mount:tasks#1:true']);
+        expect(contexts[0]?.visible).toBe(true);
+    });
+
+    it('tells an instance born into a hidden slot, once, however many paints follow', () => {
+        const log: ProbeLog = [];
+        const contexts = installProbe(log);
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+
+        // The mount callback saw the default; the delivery landed the moment it returned.
+        // This is the case that would otherwise leak a live panel into a closed drawer: a
+        // panel mounted by the boot paint of a phone is BORN hidden, and has to hear so.
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false']);
+        expect(contexts[0]?.visible).toBe(false);
+
+        // The paint loop runs on every stream frame; three more paints for a slot that has
+        // not moved cost the panel nothing.
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+        runtime.paint({ hosts, media: [], sessionId: 's1', visibility: { scratch: false } });
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false']);
+    });
+
+    it('delivers a hidden → shown transition, and nothing for the paints in between', () => {
+        const log: ProbeLog = [];
+        const contexts = installProbe(log);
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: true } });
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false', 'visibility:tasks#1:true']);
+        expect(contexts[0]?.visible).toBe(true);
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: true } });
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false', 'visibility:tasks#1:true']);
+    });
+
+    it('reads the map fresh on every paint: an omitted map means visible, and the change lands', () => {
+        const log: ProbeLog = [];
+        installProbe(log);
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false']);
+
+        // The state is not latched: a host that stops publishing the slot gets the default
+        // back, and an instance that was told `false` is told the truth now.
+        runtime.paint({ hosts, sessionId: 's1' });
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false', 'visibility:tasks#1:true']);
+    });
+
+    it('suspends a hidden slot: the instance, its element and its painted state all survive', () => {
+        const log: ProbeLog = [];
+        installProbe(log);
+
+        runtime.paint({ hosts, sessionId: 's1' });
+
+        const element = extensionOf('tasks');
+        if (element === null) throw new Error('the panel was not mounted');
+
+        const line = element.querySelector('p');
+
+        expect(line?.textContent).toBe('state:tasks#1');
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+
+        // THE POINT OF THE SEAM: hidden is not unmounted. The rails stay in the DOM by the
+        // shell's own contract (./rail-toggle.test.ts), so their content and the panel's own
+        // state have to come back exactly as the reader left them.
+        expect(runtime.mountedIds()).toEqual(['tasks']);
+        expect(hosts.scratch.extensionIds()).toEqual(['tasks']);
+        expect(extensionOf('tasks')).toBe(element);
+        expect(element.isConnected).toBe(true);
+        expect(element.querySelector('p')).toBe(line);
+        expect(line?.textContent).toBe('state:tasks#1');
+        // One transition in, no teardown, no re-mount.
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false']);
+
+        // ...and the way back is the SAME instance, not a rebuild.
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: true } });
+
+        expect(extensionOf('tasks')).toBe(element);
+        expect(element.querySelector('p')).toBe(line);
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false', 'visibility:tasks#1:true']);
+    });
+
+    it('publishes per slot: hiding the board says nothing about the centre rail', () => {
+        const log: ProbeLog = [];
+
+        installProbe(log, { id: 'tasks', slot: 'scratch' });
+        installProbe(log, { id: 'summary', slot: 'center' });
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+
+        // Only the board moved; the centre panel is never told a word, and keeps reading.
+        // (Draw order is `order` then id — ./shell-panels.ts:183 — so `summary` mounts first.)
+        expect(log).toEqual(['mount:summary#1:true', 'mount:tasks#1:true', 'visibility:tasks#1:false']);
+
+        // Handing the sidebar back and taking the centre away are two independent signals,
+        // delivered per instance in draw order: the centre card is hidden, the scratch card
+        // is re-shown, each exactly once.
+        runtime.paint({ hosts, sessionId: 's1', visibility: { center: false } });
+        expect(log).toEqual([
+            'mount:summary#1:true',
+            'mount:tasks#1:true',
+            'visibility:tasks#1:false',
+            'visibility:summary#1:false',
+            'visibility:tasks#1:true'
+        ]);
+    });
+
+    it('tells nothing after an unmount, and a fresh host is born into the map it is given', () => {
+        const log: ProbeLog = [];
+
+        installProbe(log);
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+
+        // A slot whose host is not handed over IS an unmount (the opposite of a hide), and
+        // the unmount itself is not a visibility delivery: the disposer runs, the listener
+        // goes with its context, and nothing else is said.
+        runtime.paint({ hosts: {}, sessionId: 's1' });
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false', 'dispose:tasks#1']);
+        expect(runtime.mountedIds()).toEqual([]);
+
+        // Shown again while nothing is mounted: no listener is left to tell, hidden or not.
+        runtime.paint({ hosts: {}, sessionId: 's1', visibility: { scratch: true } });
+        runtime.paint({ hosts: {}, sessionId: 's1', visibility: { scratch: false } });
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false', 'dispose:tasks#1']);
+
+        // A page teardown clears the stashed slot states (./runtime.ts:325), so a fresh host
+        // that hands over no map mounts VISIBLE and silent — and its own hide is a change
+        // worth telling again. This is the observable consequence of that reset: `paint`
+        // re-reads the map at the top of every call either way (./runtime.ts:235), so the
+        // stash cannot leak a previous host's opinion into a new instance through any other path.
+        runtime.disposeAll();
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false', 'dispose:tasks#1']);
+
+        runtime.paint({ hosts, sessionId: 's1' });
+        expect(log).toEqual(['mount:tasks#1:true', 'visibility:tasks#1:false', 'dispose:tasks#1', 'mount:tasks#2:true']);
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+        expect(log).toEqual([
+            'mount:tasks#1:true',
+            'visibility:tasks#1:false',
+            'dispose:tasks#1',
+            'mount:tasks#2:true',
+            'visibility:tasks#2:false'
+        ]);
+    });
+
+    it('never tells a mount that threw, and does not retry it into a delivery', () => {
+        const log: ProbeLog = [];
+
+        registerShellPanel({
+            id: 'broken',
+            mount: (context) => {
+                log.push(`mount:${context.id}:${context.visible}`);
+                context.onVisibility((visible) => log.push(`visibility:${context.id}:${visible}`));
+
+                throw new Error('no view for you');
+            }
+        });
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: false } });
+
+        // The half-built instance was disposed before the slot state could be published to
+        // it, so its listener has already been released with its context.
+        expect(log).toEqual(['mount:broken:true']);
+        expect(runtime.failures()).toEqual({ broken: 'no view for you' });
+        expect(runtime.mountedIds()).toEqual([]);
+
+        runtime.paint({ hosts, sessionId: 's1', visibility: { scratch: true } });
+        expect(log).toEqual(['mount:broken:true']);
     });
 });

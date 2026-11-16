@@ -251,12 +251,10 @@ import type { AgentBlockDescriptor } from './references';
 // It lives in ui/dialog.ts because the transcript, a tool dialog and a file preview
 // all copy text the same way; the tile only supplies the payload provider.
 //
-// T6/R5: the SAME module now also supplies the modal shell the mobile thread Delete
-// confirmation runs in, so that surface gets the dialog's proven focus trap, Escape /
-// backdrop dismissal, stacking and focus restoration instead of a second hand-rolled
-// overlay. The transcript (ui/thread-transcript.ts) opened that layer first.
-import { createTextCopyButton, openDialog } from './dialog';
-import type { DialogHandle } from './dialog';
+// The thread Delete confirmation used to be opened from here too, through the shared modal
+// shell. That confirmation is GONE — a Delete press deletes on every surface — so this
+// tile opens no layer of its own and only the copy helper is still needed.
+import { createTextCopyButton } from './dialog';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
@@ -1840,66 +1838,18 @@ export const threadDeleteProtectionOf = (
     return undefined;
 };
 
-// --- T6/R5: which Delete press is immediate, and which one owes a confirmation -----
+// --- T6/R5 (superseded by R3): the responsive Delete waiver is GONE -----------------
 //
-// The request: desktop deletes on ONE press; a phone confirms through a dialog, because
-// a thumb resting next to a destructive control must never destroy a conversation (plus
-// its whole subtree of turns) on the press that only meant to look at the row.
+// The request is "Delete simply deletes": one press on the Delete control performs the
+// delete, with no confirmation dialog and no two-press arming, on a phone exactly as on a
+// desktop. The `(max-width: 860px)` / `(pointer: fine)` sampling that used to decide which
+// press owed a question (the exported responsive waiver and its two media-query readers)
+// had exactly one caller, that branch, so it goes with it.
 //
-// Two independent axes decide it, and BOTH have to positively say "desktop" before the
-// request goes out unasked:
-//   - layout width: `(max-width: 860px)` — the SAME breakpoint the shell's rails
-//     (main.ts `phoneMedia`) and the composer's cap (ui/composer.ts
-//     `COMPOSER_MOBILE_WIDTH`) switch at, so the app never grows a second, drifting
-//     "is this a phone" threshold;
-//   - primary input device: `(pointer: fine)` — also main.ts's own axis (`finePointerMedia`),
-//     and asked in the POSITIVE direction on purpose: a query that only names coarse
-//     input would classify `(pointer: none)` (keyboard-only, assistive tech) and any
-//     undetected device as a desktop.
-//
-// Anything the engine cannot vouch for (no `matchMedia` at all — jsdom, old webviews,
-// some embedded shells — a throwing implementation, or a list without a boolean
-// `matches`) reads as UNKNOWN, and unknown keeps the confirmation. A mistaken extra
-// dialog costs one press; a mistaken delete costs the conversation.
-//
-// Both queries are sampled at CLICK time rather than captured at module init.
-// `MediaQueryList.matches` is live, but the list object itself is not always available
-// at import time, and the reader may resize or rotate the window between presses — the
-// answer must describe the device as it is when the finger lands.
-const PHONE_LAYOUT_QUERY = '(max-width: 860px)';
-const FINE_POINTER_QUERY = '(pointer: fine)';
-
-// One media feature, three-valued: `true` / `false` only when the engine answered,
-// `undefined` when it could not.
-const mediaMatches = (query: string): boolean | undefined => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined;
-
-    try {
-        const list = window.matchMedia(query);
-        return typeof list.matches === 'boolean' ? list.matches : undefined;
-    } catch {
-        // A hostile/stubbed implementation that throws is still "unknown", never a
-        // licence to delete without asking.
-        return undefined;
-    }
-};
-
-// Exported because it is the whole policy, it is pure, and a caller (or a test) can pin
-// the matrix without mounting a board.
-export const requiresDeleteConfirmation = (): boolean =>
-    mediaMatches(PHONE_LAYOUT_QUERY) !== false || mediaMatches(FINE_POINTER_QUERY) !== true;
-
-// The one warning sentence, shared by the confirmation dialog so the wording does not
-// drift per surface. `<name>` is the conversation code (`RR1`), never a raw id.
-// R-FB: it no longer says "permanently" or promises the transcript is "removed" — the
-// DELETE only marks the conversation (`SessionStore.deleteThread`,
-// src/server/sessions.ts:10389, writes `inactive`/`inactiveAt`), the roster projection then
-// drops the row (src/server/api.ts:4637-4648 filters `inactive !== true`), and the
-// transcript survives until the SESSION itself is deleted. So the sentence states the
-// visible effect (it leaves this session) plus the real retention boundary, and drops
-// nothing.
-const threadDeleteWarningOf = (name: string): string =>
-    `Delete thread ${name}? It leaves this session, and its transcript is kept until the session itself is deleted.`;
+// What still protects the reader is the conversation's STATE, not an extra tap: live work
+// morphs the control into a Stop (`deleteProtectionFor`, and the bar's click listener
+// routes that press to `requestThreadStop`), an `origin: 'agent'` conversation hides it,
+// and an unwired host keeps it disabled.
 
 export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const element = el('div', 'turns');
@@ -1965,14 +1915,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // refresh it; another view with a coincidentally equal thread id cannot.
     const transcriptScope = {};
 
-    // R9 destructive-action state. T6/R5: the armed inline confirmation is GONE — a
-    // mobile/narrow press opens the shared confirmation DIALOG instead, and a proven
-    // desktop press sends the request on its own. The dialog reference is still BOARD
-    // state (not per bar) because the expanded tile, a nested child card and the
-    // roster-only panel can all name the SAME thread: one pending confirmation and one
-    // layer no matter which one was pressed. In-flight keys keep deduping a double
-    // pointer/confirm into exactly one request.
-    let deleteConfirmation: { handle: DialogHandle; threadId: string } | undefined;
+    // R9 destructive-action state. Both confirmations are GONE: the armed inline row
+    // (R9) and the mobile confirmation DIALOG (T6/R5). A Delete press sends its request on
+    // every surface, so the only delete state a board holds is the in-flight bookkeeping
+    // below, which keeps a double pointer/Enter burst at exactly one request.
     // In-flight deletes are keyed by SESSION + THREAD. Thread ids are only unique
     // per session, and a session switch may show the same id in the new roster; a
     // late resolution of the old request must not clear the new session's dedupe.
@@ -2149,125 +2095,37 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         return undefined;
     };
 
-    // T6/R5: dismiss the confirmation layer this board holds. `close()` is idempotent
-    // and its `onClose` (fired exactly once, after the overlay is removed and focus is
-    // restored) owns the state clear plus the toolbar repaint, so the dialog's own
-    // header close, Escape, the backdrop, Cancel, the Delete action and every
-    // programmatic teardown below all share ONE dismissal path.
-    const closeThreadDeleteConfirmation = (): void => {
-        deleteConfirmation?.handle.close();
-    };
-
-    // The mobile/tablet confirmation: the SAME shared dialog shell the transcript and the
-    // previews use (ui/dialog.ts), so the focus trap, Escape/backdrop dismissal, stacking
-    // under an open transcript and focus restoration are the proven implementation
-    // instead of a second hand-rolled overlay. `trigger` is the Delete control that was
-    // pressed, which is where closing puts focus back.
-    const openThreadDeleteConfirmation = (threadId: string, trigger?: HTMLElement): void => {
-        const entry = roster.find((candidate) => candidate.id === threadId);
-        if (entry === undefined) return;
-
-        if (deleteConfirmation !== undefined) {
-            // Second press for the SAME conversation: keep the layer already open rather
-            // than stack an identical one — the request must stay exactly one, and a
-            // reader double-tapping a disabled-looking control gets nothing new.
-            if (deleteConfirmation.threadId === threadId) return;
-
-            // A DIFFERENT conversation replaces the layer instead of stacking it, so the
-            // dialog on screen always names the thread the reader pressed last.
-            closeThreadDeleteConfirmation();
-        }
-
-        const name = threadNameOf(entry);
-        // The class names are the ones styles.css already ships for the destructive
-        // confirmation (`.thread-delete-confirm*`), so the dialog body is styled by the
-        // rules that styled the old inline row — this worker does not own styles.css, and
-        // reusing the vocabulary keeps one look. Inside `.dialog-body` the container's
-        // `flex: 1 0 100%` basis is inert, so it lays out as a wrapping row either way.
-        const content = el('div', 'thread-delete-confirm');
-        content.setAttribute('role', 'group');
-        content.setAttribute('aria-label', `Confirm deleting thread ${name}`);
-
-        const text = el('p', 'thread-delete-confirm-text');
-        text.append(el('span', 'thread-delete-confirm-body', threadDeleteWarningOf(name)));
-
-        const confirmButton = el('button', 'thread-delete-confirm-delete', 'Delete thread');
-        confirmButton.type = 'button';
-        const cancelButton = el('button', 'thread-delete-confirm-cancel', 'Cancel');
-        cancelButton.type = 'button';
-        content.append(text, confirmButton, cancelButton);
-
-        confirmButton.addEventListener('click', () => {
-            // Ownership guard: only the layer that still OWNS the pending confirmation may
-            // act. A body left over from a replaced or cleared dialog (a detached node a
-            // synthetic click can still reach) must never fire a second request.
-            if (deleteConfirmation === undefined || deleteConfirmation.handle !== handle) return;
-
-            // Dismiss FIRST, then request: the confirmation is spent either way, and the
-            // answer (including the transcript/focus teardown on success) must never queue
-            // behind a modal layer. `confirmThreadDelete` re-checks protection, session
-            // identity, in-flight dedupe and its own errors.
-            closeThreadDeleteConfirmation();
-            void confirmThreadDelete(threadId);
-        });
-
-        cancelButton.addEventListener('click', () => {
-            // "No": the layer closes, nothing is sent, focus returns to the trigger.
-            if (deleteConfirmation === undefined || deleteConfirmation.handle !== handle) return;
-
-            closeThreadDeleteConfirmation();
-        });
-
-        let handle: DialogHandle | undefined;
-        handle = openDialog({
-            title: 'Delete thread',
-            content,
-            // Focus goes back to the control the reader actually pressed — Escape, the
-            // backdrop and the header close all land on the same rule. `undefined` keeps
-            // the dialog's own capture of what was focused at open time.
-            returnFocus: trigger,
-            onClose: () => {
-                // Identity guard: a replaced layer's late cleanup must not clear the
-                // confirmation that took its place.
-                if (deleteConfirmation?.handle === handle) deleteConfirmation = undefined;
-                refreshActionBars();
-            }
-        });
-
-        deleteConfirmation = { handle, threadId };
-    };
-
-    // First click. A PROVEN desktop (wide viewport + fine pointer, see
-    // `requiresDeleteConfirmation`) deletes on this press: one callback, no layer. Every
-    // other surface — narrow, coarse, `none`, or an engine that cannot answer either
-    // query — opens the confirmation dialog and sends nothing yet.
-    const requestThreadDelete = (threadId: string, trigger?: HTMLElement): void => {
+    // The Delete press (R3): ONE click, NO confirmation dialog, NO two-press arming and
+    // NO media/pointer branch — a phone deletes exactly as a desktop does. What still
+    // protects the reader is the conversation's STATE rather than an extra tap: live work
+    // routes this very control to Stop (the bar's listener sends
+    // `deleteProtectionFor(threadId) === 'active'` to `requestThreadStop`, R3b), an
+    // `origin: 'agent'` conversation hides the control, and an unwired host keeps it
+    // disabled so a press can only ever be a no-op.
+    const requestThreadDelete = (threadId: string): void => {
         if (isDeleting(threadId)) return;
 
         const entry = roster.find((candidate) => candidate.id === threadId);
         if (
             entry === undefined ||
-            // Nothing to confirm when there is no transport: an unwired host keeps its
-            // honest disabled control (see `sync`) and must not grow a dead-end dialog.
+            // Nothing to send when there is no transport: an unwired host keeps its
+            // honest disabled control (see `sync`) and must not fire a doomed request.
             options.deleteThread === undefined ||
+            // R3b: live work belongs to the Stop control; a press here cannot destroy a
+            // conversation that still has work (or a running descendant) in flight.
             deleteProtectionFor(threadId) !== undefined
         ) {
             return;
         }
 
-        if (!requiresDeleteConfirmation()) {
-            void confirmThreadDelete(threadId);
-            return;
-        }
-
-        openThreadDeleteConfirmation(threadId, trigger);
+        void performThreadDelete(threadId);
     };
 
-    // The confirmed click (mobile dialog) or the single desktop click: exactly one
-    // DELETE. The shell callback owns the existing API and reconciles its returned
-    // snapshot/tombstones; this board only closes the surfaces that are provably gone
-    // and reports failure without dropping data.
-    const confirmThreadDelete = async (threadId: string): Promise<void> => {
+    // The delete itself, reached from the single press above: exactly one DELETE. The
+    // shell callback owns the existing API and reconciles its returned snapshot/tombstones;
+    // this board only closes the surfaces that are provably gone and reports failure
+    // without dropping data.
+    const performThreadDelete = async (threadId: string): Promise<void> => {
         const sessionId = currentSessionId();
         if (sessionId !== undefined && isDeleting(threadId)) return;
 
@@ -2279,8 +2137,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             options.deleteThread === undefined ||
             sessionId === undefined
         ) {
-            // A protected/vanished conversation cannot answer. Repaint the toolbar (the
-            // confirmation layer already dismissed itself) and send nothing.
+            // A protected/vanished conversation cannot answer. Repaint the toolbar (its
+            // control is already in its honest state) and send nothing.
             refreshActionBars();
             return;
         }
@@ -2328,11 +2186,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     };
 
     // R1: the Stop press. ONE click, NO confirmation dialog, NO two-press arming — on
-    // every surface. `requiresDeleteConfirmation` deliberately does not apply here: that
-    // policy guards an IRREVERSIBLE removal, while a stop only halts work the server can
-    // resume, and asking a thumb to confirm a pause would be the friction the request is
-    // removing. The same control also stays a Stop for the whole time the roster says the
-    // work is live, so there is no state in which a Stop click could land as a Delete.
+    // every surface. The Delete press now follows the SAME rule (R3), so neither press
+    // has to be asked about any more: a stop only halts work the server can resume, and
+    // asking a thumb to confirm a pause would be pure friction. The same control also
+    // stays a Stop for the whole time the roster says the work is live, so there is no
+    // state in which a Stop click could land as a Delete.
     const requestThreadStop = (threadId: string): void => {
         // Single-flight: a double tap while the POST is in flight is one request. The
         // repaint below is what keeps the control honest about that.
@@ -2386,12 +2244,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     };
 
     // T4/R2: the Resume press. ONE click, NO confirmation dialog, NO two-press arming —
-    // the same rule the Stop press follows, because `requiresDeleteConfirmation` guards an
-    // IRREVERSIBLE removal while resuming only asks the host to keep working on a
-    // conversation it already holds. Visibility is the roster's job (see the `sync` gate in
-    // `createThreadActionBar`); this guard re-reads the CURRENT roster frame instead of the
-    // copy painted at the last sync, exactly like the Delete↔Stop click path does, so a
-    // frame that settled the thread in between cannot send a stale request.
+    // the same rule the Stop press follows, and now the rule the Delete press follows too:
+    // the confirmation that used to guard an IRREVERSIBLE removal is gone, and a resume
+    // only asks the host to keep working on a conversation it already holds. Visibility is
+    // the roster's job (see the `sync` gate in `createThreadActionBar`); this guard re-reads
+    // the CURRENT roster frame instead of the copy painted at the last sync, exactly like
+    // the Delete↔Stop click path does, so a frame that settled the thread in between cannot
+    // send a stale request.
     const requestThreadResume = (threadId: string): void => {
         // Single-flight: a double tap while the POST is in flight is one request, and the
         // repaint below is what keeps the control honest about that.
@@ -2541,11 +2400,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // one right. Labels are desktop text, mobile glyphs; `aria-label` always carries the
     // full accessible name.
     //
-    // T6/R5: the confirmation no longer lives in THIS bar. A proven desktop press deletes
-    // on the click itself, and every other surface opens the shared confirmation DIALOG
-    // (`openThreadDeleteConfirmation`). The bar is therefore exactly its two actions: no
-    // inline row that a stray second tap could confirm, and nothing left to reflow the
-    // identity line on a click.
+    // The confirmation no longer lives in THIS bar, or anywhere else: a Delete press
+    // deletes on the click itself, on every surface. The bar is therefore exactly its
+    // actions — no inline row that a stray second tap could confirm, and nothing left to
+    // reflow the identity line on a click.
     //
     // R1: the destructive slot is ONE control with TWO meanings, never a third button.
     // Live work makes it `Stop` (one press, no dialog); an idle/terminal conversation
@@ -2612,9 +2470,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 return;
             }
 
-            // The pressed control travels with the request so a confirmation dialog can
-            // hand focus back to it on dismissal (desktop presses never open one).
-            requestThreadDelete(threadId, deleteButton);
+            // Idle/terminal conversation: one press, straight to the DELETE. No
+            // confirmation step and no device-dependent branch (R3).
+            requestThreadDelete(threadId);
         });
 
         // T4/R2: the stopped-conversation Resume, modelled on Transcript (a PERMANENT bar
@@ -4129,9 +3987,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         body.append(promptBlock, contextBarHost, flow);
 
         // R7/R8/T26: the thread's toolbar. Delete leads (left), Transcript closes
-        // it (right), and those are its ONLY children: T6/R5 moved the Delete confirmation
-        // out of the bar and into the shared dialog (`openThreadDeleteConfirmation`), where
-        // a stray tap cannot confirm it. Both actions live between the header and body so
+        // it (right), and those are its ONLY children: the confirmation step that used to
+        // be a third child is gone for good — a Delete press deletes — so a stray tap has
+        // nothing to confirm. Both actions live between the header and body so
         // they are visible without scrolling and disappear with expansion. The header's
         // right edge is no longer a control slot — it now carries the measurement line
         // (styles.css).
@@ -10056,11 +9914,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         expandedTurn = undefined;
         hideFocusPanel();
         focusedThreadId = undefined;
-        // A confirmation/in-flight delete belongs to the projection being torn down.
-        // T6/R5: the confirmation is a live modal layer now, so it is dismissed (no
-        // stale dialog left naming a thread this board no longer shows) rather than
-        // un-armed.
-        closeThreadDeleteConfirmation();
+        // An in-flight delete belongs to the projection being torn down; the dedupe keys
+        // and suppression tokens go with it (a late resolution only ever removes its own).
         deletingRequests.clear();
         activeDeleteSuppressions.clear();
 
@@ -10625,15 +10480,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             followedIds.clear();
         }
 
-        // A transcript/confirmation from the conversation being left cannot be
-        // updated or acted on here. The raw snapshot belonged to the old session;
-        // the shell will install the new one through `setSessionSnapshot`.
+        // A transcript from the conversation being left cannot be updated or acted on
+        // here. The raw snapshot belonged to the old session; the shell will install the
+        // new one through `setSessionSnapshot`.
         if (boundSession !== undefined) {
             closeThreadTranscript(transcriptScope);
             sessionSnapshot = undefined;
-            // T6/R5: the confirmation layer names a thread of the conversation being
-            // left; confirming it here could only ever target the wrong roster.
-            closeThreadDeleteConfirmation();
             // T29: an owner question belongs to the conversation that asked it. Turn and
             // step ids are minted inside ONE session, so both the hydrated request and
             // the "already asked" marker are dropped with the session — otherwise a

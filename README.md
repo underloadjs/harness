@@ -2923,7 +2923,11 @@ On a phone (`max-width: 860px`) both side rails start **collapsed** and the topb
 grows one toggle per rail; opening one closes the other, and a backdrop click or
 `Escape` dismisses it. The rails stay in the DOM (CSS only hides them), so their
 content and state survive opening and closing, and every wider layout ignores the
-toggle state and shows both rails permanently.
+toggle state and shows both rails permanently. A shut scratch board also parks its
+panels' live read: the rows, filter and open details stay exactly where the reader
+left them, while the request and the realtime subscription behind them are released
+and taken up again — with one fresh read — when the board opens. So the scratch board is
+dormant on a phone until the reader opens it, and live on every wider layout.
 
 ```bash
 yarn build:frontend       # UI -> src/frontend/dist (base /, standalone/static hosts)
@@ -4154,23 +4158,33 @@ service gateway below.
 
 The scratch board mounts two first-party panels over the session's record store:
 `harness.tasks` (title **Tasks**) above `harness.records` (title **Records**). Both
-are `scratch`-slot, `requiresSession: true`, and **display-only** — their controls are
-view-side only: a task row opening its own detail (the collapsed row is a tick-or-cross
-mark plus its text, and pressing it reveals the full text, the meta line and the
-record's history), the records panel's collection filter chips, the "N new" follow pill,
-and a Retry where a read failed. Nothing writes: the agent owns the store, so a checkbox
-that looks clickable but is not would be a lie.
+are `scratch`-slot, `requiresSession: true`, and **display-only** — every control is a
+reader-side affordance, never a write. The first is the card's own title, its collapse
+control, and both cards ship **closed**. Nothing boots until the reader presses a title:
+that press is what makes the one snapshot read and the one realtime registration, and
+closing the card releases both and clears its surface, so opening it again is a fresh
+read, never a stale view kept "live" by nothing. On a phone, closing the whole board
+suspends both cards at once: their reads park while the board is shut, and their rows,
+filter and open details are still there when it opens again. The other controls are a
+task row opening its own detail (the collapsed row is a tick-or-cross mark plus its text,
+and pressing it reveals the full text, the meta line and the record's history), the
+records panel's collection filter chips, the "N new" follow pill, and a Retry where a
+read failed. Nothing writes: the agent owns the store, so a checkbox that looks clickable
+but is not would be a lie.
 
 - **Data, once, then deltas.** Each panel reads the two bounded REST reads
-  (`GET …/records` for the snapshot, `GET …/records?since=` for the delta). The
+  (`GET …/records` for the snapshot, `GET …/records?since=` for the delta) — and a
+  closed card reads nothing at all, because opening it is what builds the engine. The
   `records.updated` wake carries the store's watermarks and no records at all, so it
   is a nudge, never a payload; the two panels share ONE registration on that topic
-  (`extensions/records-wake.ts`), and a burst costs one delta read, not one per
-  frame. There is no polling anywhere.
+  (`extensions/records-wake.ts`), held only while a card is open on a shown board, and
+  a burst costs one delta read, not one per frame. There is no polling anywhere.
 - **Five states, and the panel says which one it is in.** `loading`, `empty`, `error`
   with a Retry, `stale` (rows on screen that may be behind), and `ready`. The state is
   published as `data-phase` on the panel root, so the stylesheet and assistive tech read
-  the same fact the reader sees. A fixed box in the card's top-right corner names it in
+  the same fact the reader sees. A closed card has no state to report: it carries no
+  `data-phase` and the corner box stays blank and hidden — it is not reading, so it has
+  nothing to say about a read. A fixed box in the open card's top-right corner names it in
   one word — no skeleton is ever laid over the list, because a block of bars inserted and
   pulled out on every re-read is what made the tile flicker — and while a read is
   outstanding that box says `reading` whatever `data-phase` says: an unanswered fetch is

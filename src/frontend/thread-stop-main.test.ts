@@ -6,12 +6,12 @@
 //   - `main.ts` passes `stopThread` into the board (mirroring how `deleteThread` reaches
 //     it), so a live conversation's bar leads with `Stop` rather than a disabled `Delete`;
 //   - one press sends exactly ONE cancel for the pressed thread, and no DELETE and no
-//     dialog layer ever appear (the delete waiver in ui/turns.ts is irrelevant here — this
-//     jsdom cannot prove a desktop, and Delete below still confirms);
+//     dialog layer ever appear (R3 took the delete confirmation off every surface, so a
+//     Stop press and a Delete press are both un-asked-for presses now);
 //   - the control flips back to `Delete` from the ROSTER the shell re-reads after the stop
 //     (`cancelViewThread` -> `refreshRoster` -> `applyView`), not from a local flag;
-//   - and the Delete that follows is the untouched existing flow: confirmation on this
-//     surface, then `DELETE .../threads/{tid}`, then the snapshot reconcile.
+//   - and the Delete that follows needs nothing: the FIRST press is the
+//     `DELETE .../threads/{tid}`, then the snapshot reconcile.
 //
 // `main.ts` boots on import, so (exactly like thread-delete-main.test.ts) the fixture stubs
 // fetch and opens a saved session through the raw routes; `viewAwareFetch` compiles the
@@ -198,12 +198,11 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(
     return found;
 };
 
-// The shared delete-confirmation layer, selected by CONTENT (an open transcript is another
-// `.dialog`), exactly as thread-delete-main.test.ts does.
-const deleteDialogs = (): HTMLElement[] =>
-    Array.from(document.querySelectorAll<HTMLElement>('.dialog')).filter(
-        (panel) => panel.querySelector('.thread-delete-confirm') !== null
-    );
+// R3: NO layer of any kind may appear around either press. Counting every panel — instead
+// of filtering on the content class the removed confirmation used to carry — also catches
+// a stray second dialog, which is what the old helper could not tell apart.
+const dialogPanels = (): HTMLElement[] =>
+    Array.from(document.querySelectorAll<HTMLElement>('.dialog'));
 
 // The bar's ONE destructive control, in whichever meaning it currently has.
 const actionOf = (): HTMLButtonElement =>
@@ -263,14 +262,14 @@ it('shows Stop for a running thread and cancels it with one press and no dialog'
     await flush();
 
     // The existing cancel route, exactly once, and nothing destructive: no DELETE and no
-    // confirmation layer anywhere — this jsdom cannot prove a desktop, which is precisely
-    // the surface where a DELETE would have asked.
+    // layer of any kind. R3 is what makes that statement complete — the DELETE this
+    // surface would otherwise grow would not have asked either.
     expect(
         fixture.calls.filter((call) => call.url.endsWith('/threads/thread-a/cancel'))
     ).toEqual([{ url: '/api/sessions/s1/threads/thread-a/cancel', method: 'POST' }]);
     expect(fixture.calls.filter((call) => call.method === 'DELETE')).toEqual([]);
     expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
-    expect(deleteDialogs()).toHaveLength(0);
+    expect(dialogPanels()).toHaveLength(0);
 
     // The stop does not destroy the conversation: the tile and its focus survive.
     expect(document.querySelector('.tile')).not.toBeNull();
@@ -304,21 +303,11 @@ it('turns the same control back into Delete once the stopped roster lands, and t
     );
     expect(button.disabled).toBe(false);
 
-    // And the delete behaves exactly as it did before R1 on this surface: the shared
-    // confirmation first, then the existing DELETE route.
+    // R3: the same control, ONE press, the existing DELETE route. The confirmation this
+    // surface used to require (jsdom cannot prove a desktop) is gone, and with it every
+    // trace of a layer.
     button.click();
-    expect(deleteDialogs()).toHaveLength(1);
-    expect(
-        deleteDialogs()[0]?.querySelector<HTMLElement>('.thread-delete-confirm-body')?.textContent
-    ).toBe(
-        'Delete thread IN1? It leaves this session, and its transcript is kept until the session itself is deleted.'
-    );
-
-    const confirm = deleteDialogs()[0]?.querySelector<HTMLButtonElement>(
-        '.thread-delete-confirm-delete'
-    );
-    if (confirm === undefined) throw new Error('missing the confirm action');
-    confirm.click();
+    expect(dialogPanels()).toHaveLength(0);
     await flush();
     await flush();
 

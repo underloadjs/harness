@@ -21,8 +21,8 @@
 //     gives the control to all three surfaces (the expanded tile footer, a nested child
 //     card and the roster-only focus panel) for free. Each is pinned below;
 //   - one press sends exactly one `resumeThread(sessionId, threadId)` and opens NOTHING:
-//     resuing is not irreversible, so `requiresDeleteConfirmation` does not apply, the same
-//     rule R1 established for Stop;
+//     resuming is not irreversible, and since R3 neither is a delete — the confirmation
+//     that used to need waiving is gone, the same rule R1 established for Stop;
 //   - single flight: the control disables and relabels `Resuming…` while the promise is
 //     pending, a press burst is one request, and a rejection is reported through the board's
 //     error notice (no silent failure) with the same control pressable again;
@@ -274,13 +274,11 @@ const glyphText = (button: HTMLButtonElement): string =>
     button.querySelector<HTMLElement>('.action-glyph')?.textContent ?? '';
 
 // No layer of any kind may appear on a Resume press (the Stop tests' `confirmNothing`).
+// Counting panels beats the old content filter on the removed confirmation's class: it
+// also catches a stray dialog of any other shape.
 const confirmNothing = (): void => {
+    expect(document.querySelectorAll('.dialog')).toHaveLength(0);
     expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
-    expect(
-        Array.from(document.querySelectorAll<HTMLElement>('.dialog')).filter(
-            (panel) => panel.querySelector('.thread-delete-confirm') !== null
-        )
-    ).toHaveLength(0);
 };
 
 // --- device stub ------------------------------------------------------------
@@ -290,10 +288,10 @@ const FINE_QUERY = '(pointer: fine)';
 
 type Device = { phone: boolean; fine: boolean };
 
-// Same stub as ui/thread-stop.test.ts: this jsdom has no `matchMedia`, and the board
-// samples both queries at CLICK time, so `stubDevice` picks which rule the press is judged
-// by. A proven desktop is what makes a DELETE go out unasked — the only path that can put a
-// delete in flight while Resume is being watched.
+// Same stub as ui/thread-stop.test.ts. It used to decide which rule a press was judged
+// by; R3 removed that branch, so every surface now sends a DELETE unasked — which only
+// makes putting a delete in flight while Resume is watched easier. The stub now just names
+// the surface the test is pretending to be on.
 const stubDevice = (device: Device): void => {
     const state: Device = { ...device };
 
@@ -531,7 +529,7 @@ describe('the Resume control while the conversation has an answer that never arr
 
         // Exact transport call: the bound session id plus THIS thread, once, and no
         // confirmation layer on a coarse/narrow surface either — resuming is not
-        // irreversible, so `requiresDeleteConfirmation` does not apply.
+        // irreversible, and since R3 a destructive press never owes one on ANY surface.
         expect(resumeCalls).toEqual([['s1', 'thread-a']]);
         expect(pending).toHaveLength(1);
         confirmNothing();
@@ -914,11 +912,11 @@ describe('the Resume control in the stylesheet contract', () => {
         expect(sizing).toContain('font: 500 11.5px/1.4 var(--sans);');
         expect(sizing).toContain('cursor: pointer;');
 
-        // The focus ring covers the new control too, in the same list as its two siblings
-        // (the list continues into the confirmation buttons, so only the three action
-        // entries are pinned here).
+        // The focus ring covers the new control too, in the same list as its two siblings.
+        // R3 removed the confirmation's two buttons, so that list — and the sizing, hover and
+        // disabled lists beside it — now hold exactly the three actions of the bar.
         expect(css).toMatch(
-            /\.transcript-open:focus-visible,\n\.resume-open:focus-visible,\n\.thread-delete:focus-visible,/
+            /\.transcript-open:focus-visible,\n\.resume-open:focus-visible,\n\.thread-delete:focus-visible \{/
         );
 
         // T6 correction: the SHARED disabled dim lists the third control as well, in the same
@@ -930,7 +928,7 @@ describe('the Resume control in the stylesheet contract', () => {
         const disabled = blockOf('\n.transcript-open:disabled,');
         expect(disabled).toBe('\n    cursor: not-allowed;\n    opacity: 0.55;\n');
         expect(css).toMatch(
-            /\.transcript-open:disabled,\n\.resume-open:disabled,\n\.thread-delete:disabled,\n\.thread-delete-confirm-delete:disabled \{/
+            /\.transcript-open:disabled,\n\.resume-open:disabled,\n\.thread-delete:disabled \{/
         );
     });
 

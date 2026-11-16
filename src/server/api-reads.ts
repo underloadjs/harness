@@ -202,9 +202,139 @@ const pendingCountOf = (record: SessionRecord): number => {
     return count;
 };
 
-/** Host conversations only: an agent's default `agent:<name>` lane is internal plumbing. */
+// ---------------------------------------------------------------------------
+// The ONE retired-conversation rule (R1/R3/R4)
+// ---------------------------------------------------------------------------
+//
+// A conversation DELETE is a soft delete: the store marks the thread row `inactive` and
+// RETAINS it, with its turn rows, its transcript, its agent results and its journal lines
+// (./sessions.ts `markDeletedThread`, ../harness.ts `deleteThread`). The row stays durable
+// for a `shell`/`bash` read of `<databaseRoot>/harness/state.json` and for the revival doors
+// (`reactivateThreadRow`, `steerIntoThread`, `resumeThread`); what a delete has to remove is
+// DISCOVERABILITY. The roster already does that for threads (./api.ts `threadRecordsOf` and
+// ./sessions.ts `threadRoster` ~:4639, both `origin === 'host' && inactive !== true`) with no new
+// client-visible field on the wire, and these two helpers are the SAME rule written for the
+// surfaces that are keyed by a conversation instead of naming one:
+//
+//   - `GET /sessions/:id/turns` (./api.ts `getSessionTurns`) — the read the frontend's
+//     refresh uses, and the reason a deleted conversation used to repaint its card: the
+//     page builds one card per distinct `turn.threadId` and never consults the roster;
+//   - `thread_count` below, which has to keep matching the roster it counts.
+//
+// Deliberately NOT filtered here, and why: `usageFoldOf`'s `by_thread` (a cost tally —
+// dropping a retired conversation from it would understate what the session spent and break
+// `by_thread` summing to `usage`), `queueRowsOf` and the pending-action join (a delete
+// refuses queued work with a 409 and drops a lane backlog on the way in, so a retired
+// conversation has neither by the time the mark lands — ./sessions.ts `deleteThread`), and
+// the identified reads (`GET /turns/:turnId`, `GET /threads/:threadId/transcript*`), which
+// address a retained row by name and keep answering it exactly as long as the row exists.
+//
+// TWO guards, deliberately spelled differently because they read different sources:
+// `retiredThreadIdsOf` below reads the store's OWN pair (the retention ledger plus the durable
+// `core` rows — the same pair ./sessions.ts `isThreadInactive` answers from), because a turn list
+// has to be scoped against what the SESSION knows it retired. `hostThreads` keeps the roster's
+// belt-and-braces form (`origin === 'host' && inactive !== true` against the live handle), which
+// is a no-op on a runtime that hides retired rows and the whole guard on one that does not —
+// ./api.ts `threadRecordsOf` documents that pair the same way.
+
+/** Every conversation this session has RETIRED (soft-deleted), by id.
+ *
+ *  ONE pass, so a caller filters a large turn list with a set lookup per row — never a thread
+ *  scan per row.
+ *
+ *  THE SOURCES are the store's OWN pair (./sessions.ts `isThreadInactive`), in that order:
+ *    1. `record.inactiveThreads`, the retention LEDGER — the store's knowledge of what it retired,
+ *       and the floor that keeps the marker true in the window between a delete and the next
+ *       whole-document re-derive of `core` (./sessions.ts `Session.inactiveThreads`,
+ *       `applyInactiveLedger`). Its entries go away when the retention bound prunes the row
+ *       (`capThreadRecords`), so a pruned conversation is not hidden by a stale key forever.
+ *    2. `record.core.threads`, the durable rows — `inactive: true` being the only field a delete
+ *       writes on one (./sessions.ts `markDeletedThread`). The fallback for a session whose ledger
+ *       was never hydrated (a document marked by a build that had no ledger).
+ *
+ *  THE BOUND, stated rather than engineered away (and NO machinery was changed for it). The ledger
+ *  is the durable source of retired ids — the row list is the fallback, not the keeper — and BOTH
+ *  sources are bounded by the same 256-record thread budget (../core/thread.ts:46
+ *  `MAX_THREAD_RECORDS`, enforced by ./sessions.ts `capThreadRecords`, :4909-4925, which may evict
+ *  ONLY `inactive` rows). When the cap retires a row, the write funnel deletes that id's LEDGER KEY
+ *  with it (./sessions.ts:3462-3466: a key whose row is gone would be re-appended on every
+ *  following write and the document could never come back under the bound), and a restore
+ *  re-hydrates the ledger FROM the marked rows only, AFTER the cap has already run
+ *  (./sessions.ts:4367-4371). So for a session that has passed 256 thread records, the cap removes
+ *  the retired conversation from both sources at once, and after the next process restart nothing
+ *  hides its retained turns any more: the deleted conversation repaints a card — the original
+ *  symptom, surviving in that one corner (>256 thread records AND a restart). Accepted knowingly:
+ *  retention is bounded by the same budget as the rows it retains, so no discovery rule can
+ *  outlive the fact it keys on, and widening that bound is a retention decision, not a read fix.
+ *
+ *  NOT a source, on purpose: `record.harness.threads()`. A live handle hands out DETACHED copies,
+ *  and the runtime does not name a retired row there at all — which is why the roster filter at
+ *  ./api.ts `threadRecordsOf` is a no-op against it, and why a turns filter written against it
+ *  would hide nothing (the first attempt at this fix did exactly that, and the turns page kept
+ *  serving the deleted conversation). A thread with no row is likewise NOT retired: that is the
+ *  shape of an agent's default `agent:<name>` conversation, which is never persisted as a thread
+ *  row (../types `HarnessThreadSnapshot`), not the shape of a deletion. */
+export const retiredThreadIdsOf = (record: SessionRecord): Set<string> => {
+    const retired = new Set<string>();
+
+    // The ledger is keyed by the retired conversation id — the value is the transition stamp and
+    // may legitimately be `undefined`, so only the KEYS mean "retired". Read defensively: the
+    // store always hydrates it, and a hand-built record for a focused read test may not.
+    for (const threadId of (record.inactiveThreads ?? new Map<string, number | undefined>()).keys()) {
+        retired.add(threadId);
+    }
+
+    for (const thread of record.core.threads ?? []) {
+        // `inactive: true` is the only spelling a delete writes; absent means active and a `false`
+        // on disk is normalized away by the reader (../types `HarnessThreadSnapshot.inactive`), so
+        // the strict `=== true` is the additive-when-absent discipline the type documents.
+        if (thread.inactive === true) retired.add(thread.id);
+    }
+
+    return retired;
+};
+
+/** A turn filter bound to ONE record: the retired set is built once per read, and the
+ *  returned predicate only answers "may this row still be DISCOVERED?".
+ *
+ *  R3 — what it does NOT drop, all of which stay visible:
+ *    (a) a turn of an `origin === 'agent'` lane (`agent:<name>` is never marked, and the
+ *        rule keys on the marker, never on the origin);
+ *    (b) a turn with no conversation at all — `threadId` absent, `undefined` or `null`
+ *        (a pre-thread document row or a legacy run);
+ *    (c) a turn of a live host conversation;
+ *    (d) a turn whose `threadId` names an id the record has no row for (a foreign id is a
+ *        gap in the ledger, not a deletion — the filter invents no stricter rule). */
+export const discoverableTurnFilterOf = (
+    record: SessionRecord
+): ((turn: { threadId?: string | null }) => boolean) => {
+    const retired = retiredThreadIdsOf(record);
+
+    // The overwhelmingly common case is a session that never deleted anything: an empty set
+    // makes every row discoverable, so such a read keeps the single bare predicate pass it
+    // always had instead of paying a set lookup per row.
+    if (retired.size === 0) return () => true;
+
+    return (turn) => {
+        const threadId = turn.threadId;
+
+        // R3(b): no conversation named, nothing retired — including the `null` a restored
+        // document can carry, which the `!== undefined` shorthand would let through as a key.
+        if (threadId === undefined || threadId === null) return true;
+
+        return !retired.has(threadId);
+    };
+};
+
+/** Host conversations only: an agent's default `agent:<name>` lane is internal plumbing.
+ *  R4: retired conversations are excluded here too, so `thread_count` keeps stating the
+ *  number of conversations the roster LISTS (./api.ts `threadRecordsOf`), which is what this
+ *  figure has always meant (./api.ts `postSessionReset` spells the same intent out for the
+ *  reset receipt: "the conversations this session was listing", not "every row in the
+ *  document"). A deleted conversation still counts in `turn_count`, because its retained rows
+ *  are still in the ledger — the asymmetry is the retention rule, not an oversight. */
 const hostThreads = (record: SessionRecord) =>
-    record.harness.threads().filter((thread) => thread.origin === 'host');
+    record.harness.threads().filter((thread) => thread.origin === 'host' && thread.inactive !== true);
 
 /** The turn a conversation's run belongs to (the same join the store's roster uses). */
 const owningTurnOf = (record: SessionRecord, threadId?: string) =>

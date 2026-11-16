@@ -1,32 +1,27 @@
-// T6/R5 — responsive thread Delete: ONE press on a proven desktop, a shared dialog
-// everywhere else.
+// R3 — thread Delete is ONE press on EVERY surface: the confirmation is gone.
 //
-// Pins (ui/turns.ts `requiresDeleteConfirmation`, `requestThreadDelete`,
-// `openThreadDeleteConfirmation`, `closeThreadDeleteConfirmation`):
-//   - the waiver is a PROOF, not a default: an immediate Delete needs the viewport to be
-//     positively wide (`(max-width: 860px)` does NOT match — the shell's own layout
-//     breakpoint, main.ts `phoneMedia` / ui/composer.ts `COMPOSER_MOBILE_WIDTH`) AND the
-//     primary pointer to be positively fine (`(pointer: fine)`, main.ts
-//     `finePointerMedia`). Narrow, coarse, `none`, a throwing `matchMedia` and an absent
-//     `matchMedia` (this jsdom) all keep the confirmation;
-//   - both queries are sampled at CLICK time, so resizing or rotating between presses
-//     changes the answer without any re-import;
-//   - a desktop press sends exactly one callback and opens NO layer;
-//   - any other press sends NOTHING and opens the shared `openDialog` layer (ui/dialog
-//     .ts) with the exact warning sentence, a `Delete thread` action and a `Cancel`
-//     action — and no inline row anywhere in the bar;
-//   - Cancel, Escape, the backdrop and the header close all mean "no": no request, the
-//     layer is gone, and focus returns to the Delete control that was pressed;
-//   - one pending confirmation per conversation: a second press for the SAME thread does
-//     not stack a second dialog, and a press for a DIFFERENT conversation replaces the
-//     layer instead of stacking it;
-//   - everything that already protected the request survives the move: a default
-//     conversation never opens a dialog, live work is the Stop control instead (R1, and it
-//     never opens one either), an unwired host never opens one, an in-flight
-//     thread never starts a second request, and a failed DELETE leaves the conversation
-//     intact and retryable;
-//   - a session switch or a cleared board dismisses the layer instead of leaving a dialog
-//     that names a conversation this board no longer shows.
+// The file keeps its T6/R5 name because it is the retargeted version of that suite: what
+// it used to pin (a wide fine-pointer desktop deletes on one press while every other
+// surface owes a shared confirmation DIALOG) no longer exists. It now pins the
+// replacement rule in ui/turns.ts (`requestThreadDelete`, `performThreadDelete`):
+//
+//   - one press on the Delete control performs the delete. No confirmation dialog, no
+//     two-press arming, no media/pointer branch — a phone deletes exactly as a desktop
+//     does. The device matrix is swept below (wide/narrow x fine/coarse/none, plus an
+//     absent, a throwing and an untyped `matchMedia`): EVERY cell sends the same single
+//     request and creates no dialog element at any point;
+//   - the board never asks the device anything on the way to the DELETE, which is the
+//     structural form of "no media/pointer-dependent branching";
+//   - the destructive control still means Stop while the conversation (or a descendant its
+//     delete would cascade into) has live work (R3b): that press rides the stop transport
+//     and the delete transport never fires;
+//   - the protections that were never about the dialog survive: an `origin: 'agent'`
+//     conversation hides the control, an unwired host keeps it disabled and sends nothing,
+//     a request in flight is single-flight (a press burst is one request), and a failed
+//     DELETE drops nothing — the tile, the focus and a usable control survive and the next
+//     press simply tries again;
+//   - a board owns no layer at all, so a session switch or a cleared board can leave no
+//     stale dialog behind.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/thread-delete-confirmation.test.ts
 
@@ -38,7 +33,7 @@ import type {
     SessionTurn
 } from '../../server/protocol';
 import type { TurnBoard, TurnHandle } from './turns';
-import { createTurnBoard, requiresDeleteConfirmation } from './turns';
+import { createTurnBoard } from './turns';
 import { sessionThreadsOf } from './threads';
 
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
@@ -111,42 +106,13 @@ const barOf = (turn: TurnHandle): HTMLElement => {
 const deleteOf = (turn: TurnHandle): HTMLButtonElement =>
     actionButton(barOf(turn), '.thread-delete');
 
-// The confirmation is the shared dialog layer (ui/dialog.ts). Selection is by CONTENT,
-// so a transcript layer stacked underneath can never be mistaken for it.
-const deleteDialogs = (): HTMLElement[] =>
-    Array.from(document.querySelectorAll<HTMLElement>('.dialog')).filter(
-        (panel) => panel.querySelector('.thread-delete-confirm') !== null
-    );
-
-const deleteDialog = (): HTMLElement => {
-    const open = deleteDialogs();
-    if (open.length !== 1) throw new Error(`expected one delete dialog, found ${open.length}`);
-    return open[0];
-};
-
-const dialogTitle = (panel: ParentNode): string =>
-    panel.querySelector<HTMLElement>('.dialog-title')?.textContent ?? '';
-
-const dialogWarning = (panel: ParentNode): string =>
-    panel.querySelector<HTMLElement>('.thread-delete-confirm-body')?.textContent ?? '';
-
-// The confirmation's own buttons, in DOM order. The shell's `×` lives in `.dialog-head`,
-// so `.dialog-body button` is exactly the two actions.
-const dialogActions = (panel: ParentNode): string[] =>
-    Array.from(panel.querySelectorAll<HTMLButtonElement>('.dialog-body button')).map(
-        (button) => button.textContent ?? ''
-    );
-
-// A browser dispatches a key on the focused node and lets it bubble to the document,
-// which is where the dialog's capture-phase listener lives (ui/dialog.test.ts).
-const pressKey = (target: Element, key: string): void => {
-    target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
-};
-
-const overlayOf = (panel: HTMLElement): HTMLElement => {
-    const overlay = panel.parentElement;
-    if (!(overlay instanceof HTMLElement)) throw new Error('dialog panel has no overlay');
-    return overlay;
+// R3: a Delete press must create NO layer of any kind. Counting every dialog panel —
+// rather than filtering on the content class the removed confirmation used to carry — is
+// the strongest form of the assertion: it also catches a second transcript or any other
+// surface the board might have grown.
+const noLayer = (): void => {
+    expect(document.querySelectorAll('.dialog')).toHaveLength(0);
+    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
 };
 
 // --- device stub ------------------------------------------------------------
@@ -154,28 +120,58 @@ const overlayOf = (panel: HTMLElement): HTMLElement => {
 const PHONE_QUERY = '(max-width: 860px)';
 const FINE_QUERY = '(pointer: fine)';
 
-type Device = { phone: boolean; fine: boolean };
+// The two answers the removed policy used to branch on, for each surface worth naming.
+// `Record<string, boolean>` because the board queries by an arbitrary string.
+const DEVICE_ANSWERS: Record<
+    'desktop' | 'tablet' | 'narrow-window' | 'phone',
+    Record<string, boolean>
+> = {
+    // Wide viewport, fine pointer: the one cell that used to delete unasked.
+    desktop: { [PHONE_QUERY]: false, [FINE_QUERY]: true },
+    // Wide viewport, coarse pointer: a tablet, or `(pointer: none)` keyboard-only input.
+    tablet: { [PHONE_QUERY]: false, [FINE_QUERY]: false },
+    // Narrow viewport, fine pointer: a desktop window dragged under the breakpoint.
+    'narrow-window': { [PHONE_QUERY]: true, [FINE_QUERY]: true },
+    // Narrow viewport, coarse pointer: THE phone case this request is about.
+    phone: { [PHONE_QUERY]: true, [FINE_QUERY]: false }
+};
 
-// This repo's jsdom has NO `window.matchMedia` at all (jsdom 29 — verified), which is the
-// policy's UNKNOWN branch, so every unstubbed test here runs as "must confirm". A test
-// that wants a specific device stubs the two queries the board samples. `matches` is
-// resolved per `matchMedia` CALL from live state, so `set()` models a resize/rotation
-// between presses without re-importing anything.
-const stubDevice = (device: Device): { set: (next: Partial<Device>) => void } => {
-    const state: Device = { ...device };
+// `absent` is this jsdom (no `matchMedia` natively — old engines and embedded shells
+// behave the same), `throws` is a hostile implementation and `untyped` is a list that
+// never answers with a boolean. All three used to be UNKNOWN and owed a confirmation.
+type Device = keyof typeof DEVICE_ANSWERS | 'absent' | 'throws' | 'untyped';
 
+// Installs the surface's `matchMedia` and records EVERY query asked of it, so a test can
+// prove the board no longer asks. `queries` is shared with the harness.
+const installDevice = (device: Device, queries: string[]): void => {
+    if (device === 'absent') return;
+
+    if (device === 'throws') {
+        vi.stubGlobal(
+            'matchMedia',
+            vi.fn((query: string) => {
+                queries.push(query);
+                throw new Error('stubbed failure');
+            })
+        );
+        return;
+    }
+
+    const answers = device === 'untyped' ? undefined : DEVICE_ANSWERS[device];
     vi.stubGlobal(
         'matchMedia',
-        vi.fn((query: string) => ({
-            media: query,
-            matches: query === PHONE_QUERY ? state.phone : query === FINE_QUERY ? state.fine : false,
-            addEventListener: () => undefined,
-            removeEventListener: () => undefined,
-            onchange: null
-        }))
-    );
+        vi.fn((query: string) => {
+            queries.push(query);
 
-    return { set: (next: Partial<Device>) => Object.assign(state, next) };
+            return {
+                media: query,
+                matches: answers === undefined ? 'no' : answers[query] ?? false,
+                addEventListener: () => undefined,
+                removeEventListener: () => undefined,
+                onchange: null
+            };
+        })
+    );
 };
 
 // --- board harness ----------------------------------------------------------
@@ -185,28 +181,45 @@ type Harness = {
     // One handle per snapshot turn, in recorded order (the tiles a reader sees).
     handles: TurnHandle[];
     calls: Array<[string, string]>;
+    // Every `matchMedia` query the board asked about while handling the press. R3 asks
+    // about NONE of them: the device is no longer part of the decision.
+    queries: string[];
     // One resolver per request, in request order: a test keeps the DELETE in flight by
     // simply not resolving it.
     pending: Array<(value: DeleteThreadResult) => void>;
 };
 
-// Mount a board with `deleteThread` wired to a recording transport, adopt every turn and
-// expand the first one (expansion IS focus, and only an expanded tile shows its bar).
-const mount = (
-    snapshot: SessionSnapshot = targetSnapshot(),
-    deleteThread?: (sessionId: string, threadId: string) => Promise<DeleteThreadResult>
-): Harness => {
+type MountOptions = {
+    snapshot?: SessionSnapshot;
+    // The surface the press happens on. Defaults to the phone, the surface that used to
+    // behave differently.
+    device?: Device;
+    // A failing transport (the server's 409 for live work) is what the retry test needs.
+    deleteThread?: (sessionId: string, threadId: string) => Promise<DeleteThreadResult>;
+    stopThread?: (sessionId: string, threadId: string) => Promise<unknown>;
+};
+
+// Mount a board with recording transports, adopt every turn and expand the first one
+// (expansion IS focus, and only an expanded tile shows its bar).
+const mount = (options: MountOptions = {}): Harness => {
+    const snapshot = options.snapshot ?? targetSnapshot();
     const calls: Array<[string, string]> = [];
+    const queries: string[] = [];
     const pending: Array<(value: DeleteThreadResult) => void> = [];
 
+    installDevice(options.device ?? 'phone', queries);
+
     const board = createTurnBoard({
-        deleteThread:
-            deleteThread ??
-            ((sessionId, threadId) =>
-                new Promise<DeleteThreadResult>((resolve) => {
-                    calls.push([sessionId, threadId]);
-                    pending.push(resolve);
-                }))
+        ...(options.deleteThread === undefined
+            ? {
+                  deleteThread: (sessionId: string, threadId: string) =>
+                      new Promise<DeleteThreadResult>((resolve) => {
+                          calls.push([sessionId, threadId]);
+                          pending.push(resolve);
+                      })
+              }
+            : { deleteThread: options.deleteThread }),
+        ...(options.stopThread === undefined ? {} : { stopThread: options.stopThread })
     });
     document.body.replaceChildren(board.element);
 
@@ -218,7 +231,7 @@ const mount = (
     const expanded = handles[0];
     if (expanded !== undefined) board.expand(expanded);
 
-    return { board, handles, calls, pending };
+    return { board, handles, calls, queries, pending };
 };
 
 beforeEach(() => {
@@ -226,88 +239,121 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-    // Dismiss whatever layer a passing or failing assertion left behind: the dialog
-    // module's layer stack and its reference-counted scroll lock must start empty.
+    // The dialog module keeps a module-level layer stack and a reference-counted scroll
+    // lock; whatever a passing or failing assertion left behind must not leak into the
+    // next test's `.dialog` count.
     for (const button of document.querySelectorAll<HTMLButtonElement>('.dialog-close')) button.click();
     document.body.replaceChildren();
     vi.unstubAllGlobals();
 });
 
-describe('delete confirmation policy', () => {
-    it('keeps the confirmation on every surface the page cannot prove is a desktop', () => {
-        // No `matchMedia` at all (this jsdom, old engines, embedded shells): UNKNOWN.
-        expect(requiresDeleteConfirmation()).toBe(true);
-
-        // Wide viewport, NOT a fine pointer: a tablet at 1280px, or `(pointer: none)`
-        // (keyboard-only / assistive tech) — asking the question positively is what keeps
-        // both of these on the confirmation side.
-        stubDevice({ phone: false, fine: false });
-        expect(requiresDeleteConfirmation()).toBe(true);
-
-        // Narrow viewport WITH a fine pointer: a desktop window dragged under 860px.
-        stubDevice({ phone: true, fine: true });
-        expect(requiresDeleteConfirmation()).toBe(true);
-
-        // A `matchMedia` that answers without a boolean `matches` answered nothing.
-        vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: 'no' })));
-        expect(requiresDeleteConfirmation()).toBe(true);
-    });
-
-    it('waives the confirmation only for a proven wide fine-pointer desktop', () => {
-        stubDevice({ phone: false, fine: true });
-        expect(requiresDeleteConfirmation()).toBe(false);
-    });
-
-    it('treats a throwing matchMedia as unknown rather than as licence to delete', () => {
-        vi.stubGlobal(
-            'matchMedia',
-            vi.fn(() => {
-                throw new Error('stubbed failure');
-            })
-        );
-
-        expect(requiresDeleteConfirmation()).toBe(true);
-    });
-});
-
-describe('desktop thread Delete', () => {
-    it('sends exactly one callback on the first press and opens no layer', async () => {
-        stubDevice({ phone: false, fine: true });
-        const { board, handles, calls } = mount();
+describe('one press deletes, on every surface', () => {
+    it('sends exactly one request on the first press of a proven desktop and opens no layer', async () => {
+        const { board, calls, handles } = mount({ device: 'desktop' });
         const turn = at(handles, 0);
 
         deleteOf(turn).click();
         await flush();
 
         expect(calls).toEqual([['s1', 'thread-a']]);
-        expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
-        // The bar carries no inline confirmation row either: nothing else in the document
-        // holds that class, and its children are its permanent actions in DOM order —
-        // Delete, the T4/R2 Resume slot (hidden, this thread is not `stopped`) and
-        // Transcript.
+        noLayer();
+        // The bar carries no inline confirmation row either: its children are its permanent
+        // actions in DOM order — Delete, the T4/R2 Resume slot (hidden, this thread is not
+        // `stopped`) and Transcript.
         expect([...barOf(turn).children].map((node) => node.className)).toEqual([
             'thread-delete',
             'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
-        expect(document.querySelectorAll('.thread-delete-confirm')).toHaveLength(0);
-        // The conversation is still on screen while the request runs (the shell's
-        // snapshot answer is what removes it).
+        // The conversation is still on screen while the request runs (the shell's snapshot
+        // answer is what removes it).
         expect(board.turns()).toHaveLength(1);
     });
 
+    it('sends exactly one request on the first press of a phone and opens no layer', async () => {
+        // THE regression this request is about: a narrow viewport with a coarse pointer used
+        // to send NOTHING and open a dialog. It is now the same press as the desktop cell.
+        const { board, calls, handles } = mount({ device: 'phone' });
+        const turn = at(handles, 0);
+
+        deleteOf(turn).click();
+        await flush();
+
+        expect(calls).toEqual([['s1', 'thread-a']]);
+        noLayer();
+        expect([...barOf(turn).children].map((node) => node.className)).toEqual([
+            'thread-delete',
+            'resume-open action-resume',
+            'transcript-open action-transcript'
+        ]);
+        expect(board.turns()).toHaveLength(1);
+    });
+
+    it('answers every device cell with the same single request and no dialog element', async () => {
+        // The full matrix the removed policy used to branch on, swept as one contract. The
+        // assertions carry the cell label so a failing cell names itself.
+        const cells: Device[] = ['desktop', 'tablet', 'narrow-window', 'phone', 'absent', 'throws', 'untyped'];
+
+        for (const cell of cells) {
+            document.body.innerHTML = '';
+            vi.unstubAllGlobals();
+
+            const { calls, handles } = mount({ device: cell });
+            deleteOf(at(handles, 0)).click();
+            await flush();
+
+            expect({ cell, calls }).toEqual({ cell, calls: [['s1', 'thread-a']] });
+            expect({ cell, dialogs: document.querySelectorAll('.dialog').length }).toEqual({
+                cell,
+                dialogs: 0
+            });
+        }
+    });
+
+    it('never consults the device while deciding the press', async () => {
+        // The structural form of "no media/pointer-dependent branching": the board asks
+        // `matchMedia` NOTHING on the way to the DELETE.
+        const { calls, handles, queries } = mount({ device: 'desktop' });
+
+        deleteOf(at(handles, 0)).click();
+        await flush();
+
+        expect(queries).toEqual([]);
+        expect(calls).toEqual([['s1', 'thread-a']]);
+    });
+
+    it('follows neither a resize nor a rotation between presses', async () => {
+        // A device changing underneath the reader used to flip the rule mid-session; the
+        // phone press and the desktop press are now one and the same press.
+        const phone = mount({ device: 'phone' });
+        deleteOf(at(phone.handles, 0)).click();
+        await flush();
+
+        document.body.innerHTML = '';
+        vi.unstubAllGlobals();
+        const desktop = mount({ device: 'desktop' });
+        deleteOf(at(desktop.handles, 0)).click();
+        await flush();
+
+        expect(phone.calls).toEqual([['s1', 'thread-a']]);
+        expect(desktop.calls).toEqual([['s1', 'thread-a']]);
+        noLayer();
+    });
+});
+
+describe('what still protects the conversation', () => {
     it('sends no second request while the first is still in flight', async () => {
-        stubDevice({ phone: false, fine: true });
-        const { calls, handles, pending } = mount();
+        const { calls, handles, pending } = mount({ device: 'phone' });
         const deleteButton = deleteOf(at(handles, 0));
 
+        deleteButton.click();
         deleteButton.click();
         deleteButton.click();
         await flush();
 
         expect(calls).toEqual([['s1', 'thread-a']]);
         expect(pending).toHaveLength(1);
-        expect(deleteDialogs()).toHaveLength(0);
+        noLayer();
 
         // The bar states the live request instead of offering another destructive press.
         expect(deleteButton.disabled).toBe(true);
@@ -317,17 +363,19 @@ describe('desktop thread Delete', () => {
         await flush();
 
         expect(calls).toHaveLength(1);
-        expect(document.querySelector('.dialog-overlay')).toBeNull();
+        noLayer();
     });
 
     it('keeps the thread and re-arms the same one-press rule after a failed request', async () => {
-        stubDevice({ phone: false, fine: true });
-        // The transport records the attempt and then refuses, exactly like the server's
-        // 409 for live work: the board must keep everything and stay retryable.
+        // The transport records the attempt and then refuses, exactly like the server's 409
+        // for live work: the board must keep everything and stay retryable.
         const attempts: Array<[string, string]> = [];
-        const { board, handles } = mount(targetSnapshot(), async (sessionId, threadId) => {
-            attempts.push([sessionId, threadId]);
-            throw new Error('Thread "thread-a" still has live work.');
+        const { board, handles } = mount({
+            device: 'phone',
+            deleteThread: async (sessionId, threadId) => {
+                attempts.push([sessionId, threadId]);
+                throw new Error('Thread "thread-a" still has live work.');
+            }
         });
         const deleteButton = deleteOf(at(handles, 0));
 
@@ -336,16 +384,15 @@ describe('desktop thread Delete', () => {
 
         const notice = board.element.querySelector<HTMLElement>('.notice');
         expect(notice?.dataset.tone).toBe('error');
-        expect(notice?.textContent).toBe(
-            'delete thread: Thread "thread-a" still has live work.'
-        );
-        // Nothing was dropped: the conversation, its focus and a usable control survive.
+        expect(notice?.textContent).toBe('delete thread: Thread "thread-a" still has live work.');
+        // Nothing was dropped: the conversation, its focus and a usable control survive,
+        // and no layer was opened at any point.
         expect(board.turns()).toHaveLength(1);
         expect(board.focusedThread()).toBe('thread-a');
         expect(deleteButton.disabled).toBe(false);
-        expect(deleteDialogs()).toHaveLength(0);
+        noLayer();
 
-        // Recovery is not a special state: the next desktop press deletes on its own.
+        // Recovery is not a special state: the next press deletes on its own again.
         deleteButton.click();
         await flush();
 
@@ -353,204 +400,71 @@ describe('desktop thread Delete', () => {
             ['s1', 'thread-a'],
             ['s1', 'thread-a']
         ]);
-        expect(document.querySelectorAll('.thread-delete-confirm')).toHaveLength(0);
-    });
-});
-
-describe('mobile thread Delete', () => {
-    it('sends nothing on the first press and opens the shared confirmation dialog', () => {
-        stubDevice({ phone: true, fine: false });
-        const { calls, handles } = mount();
-        const deleteButton = deleteOf(at(handles, 0));
-
-        deleteButton.click();
-
-        expect(calls).toEqual([]);
-
-        const panel = deleteDialog();
-        expect(panel.getAttribute('role')).toBe('dialog');
-        expect(panel.getAttribute('aria-modal')).toBe('true');
-        expect(dialogTitle(panel)).toBe('Delete thread');
-        expect(dialogWarning(panel)).toBe(
-            'Delete thread RR1? It leaves this session, and its transcript is kept until the session itself is deleted.'
-        );
-        expect(dialogActions(panel)).toEqual(['Delete thread', 'Cancel']);
-        expect(
-            panel.querySelector<HTMLElement>('.thread-delete-confirm')?.getAttribute('aria-label')
-        ).toBe('Confirm deleting thread RR1');
-
-        // The bar gained no inline row: the confirmation lives only inside the layer.
-        expect(document.querySelectorAll('.tile-transcript-action .thread-delete-confirm')).toHaveLength(0);
+        noLayer();
     });
 
-    it('sends exactly one request when the dialog is confirmed', async () => {
-        stubDevice({ phone: true, fine: false });
-        const { calls, handles, pending } = mount();
-        const deleteButton = deleteOf(at(handles, 0));
-
-        deleteButton.click();
-        const confirm = actionButton(deleteDialog(), '.thread-delete-confirm-delete');
-        confirm.click();
-        await flush();
-
-        expect(calls).toEqual([['s1', 'thread-a']]);
-        // The layer is spent: the dialog is gone, and the bar reports the live request.
-        expect(deleteDialogs()).toHaveLength(0);
-        expect(document.querySelector('.dialog-overlay')).toBeNull();
-        expect(deleteButton.disabled).toBe(true);
-
-        // A synthetic press on the discarded body (jsdom reaches detached nodes a real
-        // pointer cannot) cannot fire a second request, and the disabled bar cannot open
-        // another dialog while the DELETE is in flight.
-        confirm.click();
-        deleteButton.click();
-        await flush();
-
-        expect(calls).toHaveLength(1);
-        expect(deleteDialogs()).toHaveLength(0);
-
-        pending[0]?.({ deleted: true, session: snapshotOf({ updatedAt: 11 }) });
-        await flush();
-        expect(calls).toHaveLength(1);
-    });
-
-    it('sends nothing and restores focus on Cancel', () => {
-        stubDevice({ phone: true, fine: false });
-        const { calls, handles } = mount();
-        const deleteButton = deleteOf(at(handles, 0));
-
-        deleteButton.click();
-        actionButton(deleteDialog(), '.thread-delete-confirm-cancel').click();
-
-        expect(calls).toEqual([]);
-        expect(deleteDialogs()).toHaveLength(0);
-        expect(document.querySelector('.dialog-overlay')).toBeNull();
-        expect(document.activeElement).toBe(deleteButton);
-
-        // And the surface is usable again: the next press arms a fresh confirmation.
-        deleteButton.click();
-        expect(deleteDialogs()).toHaveLength(1);
-        expect(calls).toEqual([]);
-    });
-
-    it('sends nothing on Escape, the backdrop or the header close', () => {
-        stubDevice({ phone: true, fine: false });
-        const { calls, handles } = mount();
-        const deleteButton = deleteOf(at(handles, 0));
-
-        for (const dismiss of ['escape', 'backdrop', 'header'] as const) {
-            deleteButton.click();
-            const panel = deleteDialog();
-
-            if (dismiss === 'escape') pressKey(panel, 'Escape');
-            else if (dismiss === 'backdrop') overlayOf(panel).click();
-            else actionButton(panel, '.dialog-close').click();
-
-            expect(calls).toEqual([]);
-            expect(deleteDialogs()).toHaveLength(0);
-            expect(document.querySelector('.dialog-overlay')).toBeNull();
-            // Every dismissal lands back on the control the reader pressed.
-            expect(document.activeElement).toBe(deleteButton);
-        }
-    });
-
-    it('keeps one pending confirmation per conversation however often it is pressed', () => {
-        stubDevice({ phone: true, fine: false });
-        const { calls, handles } = mount();
-        const deleteButton = deleteOf(at(handles, 0));
-
-        deleteButton.click();
-        deleteButton.click();
-        actionButton(barOf(at(handles, 0)), '.thread-delete').click();
-
-        expect(deleteDialogs()).toHaveLength(1);
-        expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(1);
-
-        actionButton(deleteDialog(), '.thread-delete-confirm-delete').click();
-        expect(calls).toEqual([['s1', 'thread-a']]);
-    });
-
-    it('replaces the layer when a different conversation is pressed', async () => {
-        stubDevice({ phone: true, fine: false });
-        const { calls, handles } = mount(
-            targetSnapshot({
+    it('is the Stop control while the conversation has live work, and never deletes (R3b)', async () => {
+        const stopCalls: Array<[string, string]> = [];
+        const { board, calls, handles } = mount({
+            device: 'phone',
+            snapshot: targetSnapshot({
                 threads: [
-                    threadOf({ id: 'thread-a', label: 'RR1', messages: [] }),
-                    threadOf({ id: 'thread-b', label: 'RR2', messages: [] })
+                    threadOf({ id: 'thread-running', label: 'RR6', status: 'running', messages: [] })
                 ],
                 turns: [
-                    turnOf({ id: 'turn-a', index: 0, threadId: 'thread-a' }),
-                    turnOf({ id: 'turn-b', index: 1, threadId: 'thread-b' })
+                    turnOf({
+                        id: 'turn-running',
+                        index: 0,
+                        threadId: 'thread-running',
+                        status: 'running'
+                    })
                 ]
-            })
-        );
-        const first = at(handles, 0);
-        const second = at(handles, 1);
+            }),
+            stopThread: async (sessionId, threadId) => {
+                stopCalls.push([sessionId, threadId]);
+                return { cancelled: true };
+            }
+        });
+        const button = deleteOf(at(handles, 0));
 
-        deleteOf(first).click();
-        expect(dialogWarning(deleteDialog())).toBe(
-            'Delete thread RR1? It leaves this session, and its transcript is kept until the session itself is deleted.'
-        );
+        // The SAME control, one meaning at a time: live work makes it Stop.
+        expect(button.classList.contains('thread-delete')).toBe(true);
+        expect(button.classList.contains('thread-stop')).toBe(true);
+        expect(button.querySelector('.action-label')?.textContent).toBe('Stop');
+        expect(button.getAttribute('aria-label')).toBe('Stop thread RR6');
+        expect(button.disabled).toBe(false);
 
-        // The second conversation replaces the confirmation instead of stacking an
-        // identical modal on top of it.
-        deleteOf(second).click();
-
-        expect(deleteDialogs()).toHaveLength(1);
-        expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(1);
-        expect(dialogWarning(deleteDialog())).toBe(
-            'Delete thread RR2? It leaves this session, and its transcript is kept until the session itself is deleted.'
-        );
-
-        actionButton(deleteDialog(), '.thread-delete-confirm-delete').click();
+        button.click();
         await flush();
 
-        expect(calls).toEqual([['s1', 'thread-b']]);
-        expect(deleteDialogs()).toHaveLength(0);
+        // One cancel for the pressed thread, no DELETE, and nothing stacked. The roster
+        // still says the work is live, so the control is still a Stop afterwards.
+        expect(stopCalls).toEqual([['s1', 'thread-running']]);
+        expect(calls).toEqual([]);
+        noLayer();
+        expect(button.querySelector('.action-label')?.textContent).toBe('Stop');
+        expect(board.turns()).toHaveLength(1);
     });
 
-    it('never opens a dialog for a protected or unwired conversation', () => {
-        stubDevice({ phone: true, fine: false });
-
-        // Live work: the control stays visible but disabled, and a press cannot arm a
-        // dialog that could only ever fail.
-        const running = mount(
-            targetSnapshot({
-                threads: [threadOf({ id: 'thread-running', label: 'RR6', status: 'running', messages: [] })],
-                turns: [
-                    turnOf({ id: 'turn-running', index: 0, threadId: 'thread-running', status: 'running' })
-                ]
-            })
-        );
-        const runningDelete = deleteOf(at(running.handles, 0));
-        // R1: live work no longer means a dead Delete button — it means the SAME control
-        // is a Stop. This mount wires only `deleteThread`, so the Stop reports the missing
-        // transport rather than firing a request, and (as before) a press cannot arm a
-        // dialog that could only ever fail.
-        expect(runningDelete.classList.contains('thread-delete')).toBe(true);
-        expect(runningDelete.classList.contains('thread-stop')).toBe(true);
-        expect(runningDelete.querySelector('.action-label')?.textContent).toBe('Stop');
-        expect(runningDelete.getAttribute('aria-label')).toBe('Stop thread RR6');
-        expect(runningDelete.disabled).toBe(true);
-        expect(runningDelete.title).toBe('Thread stop is not wired in this host.');
-        runningDelete.click();
-        expect(running.calls).toEqual([]);
-        expect(deleteDialogs()).toHaveLength(0);
-
-        // The agent's default conversation hides the control; it cannot be confirmed.
-        const agent = mount(
-            targetSnapshot({
-                threads: [threadOf({ id: 'thread-agent', origin: 'agent', label: 'RR5', messages: [] })],
+    it('sends nothing for an agent conversation or an unwired host', () => {
+        // The agent's default conversation hides the control; there is nothing to press.
+        const agent = mount({
+            device: 'phone',
+            snapshot: targetSnapshot({
+                threads: [
+                    threadOf({ id: 'thread-agent', origin: 'agent', label: 'RR5', messages: [] })
+                ],
                 turns: [turnOf({ id: 'turn-agent', index: 0, threadId: 'thread-agent' })]
             })
-        );
+        });
         const agentDelete = deleteOf(at(agent.handles, 0));
         expect(agentDelete.hidden).toBe(true);
         agentDelete.click();
         expect(agent.calls).toEqual([]);
-        expect(deleteDialogs()).toHaveLength(0);
+        noLayer();
 
-        // No transport at all: an honest disabled control, never a dead-end dialog.
+        // No transport at all: an honest disabled control, and a press cannot fire a
+        // doomed request.
         const unwired = createTurnBoard();
         document.body.replaceChildren(unwired.element);
         const unwiredSnapshot = targetSnapshot();
@@ -565,60 +479,27 @@ describe('mobile thread Delete', () => {
         expect(unwiredDelete.title).toBe('Thread deletion is not wired in this host.');
         unwiredDelete.click();
         expect(unwired.focusedThread()).toBe('thread-a');
-        expect(deleteDialogs()).toHaveLength(0);
+        noLayer();
     });
 
-    it('dismisses the layer on a session switch and on a cleared board', () => {
-        stubDevice({ phone: true, fine: false });
+    it('owns no layer, so a session switch and a cleared board leave nothing behind', async () => {
+        const switched = mount({ device: 'desktop' });
+        deleteOf(at(switched.handles, 0)).click();
+        expect(switched.calls).toEqual([['s1', 'thread-a']]);
 
-        const switched = mount();
-        const switchedDelete = deleteOf(at(switched.handles, 0));
-        switchedDelete.click();
-        expect(deleteDialogs()).toHaveLength(1);
-
+        // The request is in flight (the transport never resolves) when the reader switches.
         switched.board.bindSession('s2');
-        expect(deleteDialogs()).toHaveLength(0);
-        expect(document.querySelector('.dialog-overlay')).toBeNull();
-        expect(switched.calls).toEqual([]);
+        await flush();
+        noLayer();
 
-        const cleared = mount();
+        document.body.innerHTML = '';
+        vi.unstubAllGlobals();
+        const cleared = mount({ device: 'desktop' });
         deleteOf(at(cleared.handles, 0)).click();
-        expect(deleteDialogs()).toHaveLength(1);
-
         cleared.board.clear();
-        expect(deleteDialogs()).toHaveLength(0);
-        expect(document.querySelector('.dialog-overlay')).toBeNull();
-        expect(cleared.calls).toEqual([]);
-    });
-});
-
-describe('the device between presses', () => {
-    it('follows the surface as it changes rather than the one seen at import', async () => {
-        // A phone press first: nothing is sent, the confirmation arms.
-        const device = stubDevice({ phone: true, fine: false });
-        const { calls, handles } = mount();
-        const deleteButton = deleteOf(at(handles, 0));
-
-        deleteButton.click();
-        expect(calls).toEqual([]);
-        expect(deleteDialogs()).toHaveLength(1);
-
-        // The reader cancels, rotates to landscape and picks up a trackpad.
-        actionButton(deleteDialog(), '.thread-delete-confirm-cancel').click();
-        device.set({ phone: false, fine: true });
-
-        deleteButton.click();
         await flush();
 
-        expect(calls).toEqual([['s1', 'thread-a']]);
-        expect(deleteDialogs()).toHaveLength(0);
-
-        // And the other way round: a coarse press after that owes a dialog again.
-        device.set({ phone: false, fine: false });
-        const second = mount();
-        deleteOf(at(second.handles, 0)).click();
-
-        expect(second.calls).toEqual([]);
-        expect(deleteDialogs()).toHaveLength(1);
+        expect(cleared.calls).toEqual([['s1', 'thread-a']]);
+        noLayer();
     });
 });

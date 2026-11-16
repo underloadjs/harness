@@ -1,5 +1,5 @@
 // R7/R8/R9 — lossless JSON thread transcript, responsive action bars and
-// confirmed thread deletion.
+// one-press thread deletion (R3).
 //
 // Pins:
 //   - the JSON document contains the EXACT raw thread (messages included), every
@@ -26,8 +26,8 @@
 //   - T26 action-bar anatomy (the controls SWAPPED homes): ONE bar per surface — an
 //     expanded turn tile, an expanded nested child card and the roster-only focus
 //     panel — whose children are EXACTLY, in order, `Delete` and `Transcript` (T6/R5
-//     retired the third child, the inline confirmation row, and moved that step into the
-//     shared dialog). Delete leads the bar at the left edge and Transcript closes
+//     retired the third child, the inline confirmation row, and R3 retired that step
+//     entirely). Delete leads the bar at the left edge and Transcript closes
 //     it (styles.css `margin-left: auto`), i.e. exactly where each other one used to
 //     be painted; there is NO header control host any more (`.tile-header-action`,
 //     `.thread-header-action` and `.thread-focus-head-action` are gone from the DOM
@@ -39,11 +39,10 @@
 //     or card hides it, expansion/focus reveals it) — the paired header host that
 //     used to toggle alongside it no longer exists. Delete's own `hidden` is the
 //     default-conversation protection, and it never hides the bar's Transcript;
-//   - delete is confirmed before it is sent, and the confirmation is responsive (T6/R5):
-//     a proven wide fine-pointer desktop deletes on the first press, every other surface
-//     (narrow, coarse, `none`, or an engine without `matchMedia` — which is what this
-//     jsdom is) opens the SHARED dialog layer with `Delete thread` and `Cancel`. The
-//     action bar itself owns no inline confirmation row any more. Deletion stays
+//   - delete is sent by the press itself, on every surface (R3): the confirmation dialog
+//     that T6/R5 put on every non-desktop surface is GONE, so a press on `Delete` is one
+//     DELETE and no layer is created. The action bar owns no inline confirmation row any
+//     more either. Deletion stays
 //     deduped while in flight, disabled for default/running/queued/descendant work, keeps
 //     data on failure and closes focus/transcript on success.
 //
@@ -1060,7 +1059,8 @@ describe('responsive thread action bar', () => {
 
         // T26: the bar holds BOTH actions now, in the requested order — destructive first,
         // transcript last. T6/R5 removed the third child it used to own, the inline
-        // confirmation row: that step is the shared dialog now. T4/R2 adds the Resume
+        // confirmation row, and R3 removed the dialog that replaced it: the bar owns
+        // nothing but actions. T4/R2 adds the Resume
         // control as a PERMANENT middle child (hidden unless the roster says `stopped`), so
         // the DOM anatomy of a bar is three children on every surface, and the two actions
         // this thread needs are still the visible ones.
@@ -1362,7 +1362,7 @@ describe('responsive thread action bar', () => {
 
         expect(board.focusThread('thread-child')).toBe(true);
         expect(childBar?.hidden).toBe(false);
-        // T26: header → bar → body, and the bar is Delete, Transcript, confirmation — the
+        // T26: header → bar → body, and the bar is its actions — the
         // identical anatomy of the main tile. T7 removed the card's header chevron again:
         // the collapsed row is itself the expander, so the card owns ONE control per slot
         // and the Collapse chevron lives in the section's footer, inside `.thread-body`
@@ -1569,10 +1569,10 @@ const hostTarget = (overrides: Partial<SessionThread> = {}): SessionSnapshot =>
 // T26: there is ONE action surface per card — the bar. It is a direct child of the tile
 // (`.tile-transcript-action`), of the nested card (`:scope > .thread-tile >
 // .thread-transcript-action`, scoped so a grandchild row's own bar can never answer
-// instead) or of the roster panel (`:scope > .thread-focus-actions`), and T6/R5 it holds
-// its TWO actions and nothing else — the inline confirmation row is gone. That step is
-// the shared dialog layer now, so `confirmDialogs()` selects by CONTENT: an open
-// transcript is a second `.dialog` in the same document and must never answer here.
+// instead) or of the roster panel (`:scope > .thread-focus-actions`), and it holds
+// its TWO actions and nothing else — the inline confirmation row is gone, and R3 retired
+// the confirmation step that replaced it. The transcript dialog is therefore the only
+// layer these surfaces can own.
 // These bar helpers still take the SURFACE element (`turn.element`, a `.thread-row`, or
 // the `.thread-focus-panel`).
 const threadBarOf = (surface: ParentNode): HTMLElement => {
@@ -1586,32 +1586,19 @@ const threadBarOf = (surface: ParentNode): HTMLElement => {
 const deleteButton = (surface: HTMLElement): HTMLButtonElement =>
     actionButton(threadBarOf(surface), '.thread-delete');
 
-const confirmDialogs = (): HTMLElement[] =>
-    Array.from(document.querySelectorAll<HTMLElement>('.dialog')).filter(
-        (panel) => panel.querySelector('.thread-delete-confirm') !== null
-    );
+// R3 removed the delete confirmation, so in this section the ONLY dialog that can exist is
+// the transcript itself. `layers()` counts panels (an open transcript is one), and
+// `noLayers()` is what a press on a surface with no transcript open must satisfy: the
+// destructive press never grows a layer of any shape.
+const layers = (): number => document.querySelectorAll('.dialog').length;
 
-const confirmDialog = (): HTMLElement => {
-    const open = confirmDialogs();
-    if (open.length !== 1) throw new Error(`expected one delete confirmation, found ${open.length}`);
-    return open[0];
+const noLayers = (): void => {
+    expect(document.querySelectorAll('.dialog')).toHaveLength(0);
+    expect(document.querySelectorAll('.dialog-overlay')).toHaveLength(0);
 };
 
-const dialogTitleOf = (panel: ParentNode): string =>
-    panel.querySelector<HTMLElement>('.dialog-title')?.textContent ?? '';
-
-const confirmWarning = (panel: ParentNode): string =>
-    panel.querySelector<HTMLElement>('.thread-delete-confirm-body')?.textContent ?? '';
-
-// The confirmation's own buttons, in DOM order: the shell's `×` close lives in
-// `.dialog-head`, so the body carries exactly the two actions.
-const confirmActions = (panel: ParentNode): (string | null)[] =>
-    Array.from(panel.querySelectorAll<HTMLButtonElement>('.dialog-body button')).map(
-        (button) => button.textContent
-    );
-
-describe('confirmed thread deletion', () => {
-    it('sends no request before confirm, cancel sends none, confirm sends exactly one', async () => {
+describe('one press thread deletion', () => {
+    it('sends exactly one request on the press, and a second press is a no-op', async () => {
         const calls: [string, string][] = [];
         let resolveDelete: ((value: DeleteThreadResult) => void) | undefined;
         const board = mount({
@@ -1630,50 +1617,32 @@ describe('confirmed thread deletion', () => {
         const card = turn.element;
 
         // T26: Delete first (it is clickable from the bar, no header host needed) and
-        // Transcript last. T6/R5: those are the bar's ONLY ACTIONS — an accidental
-        // second press has no inline row to confirm any more. T4/R2: the third child is
-        // the always-present Resume control, hidden because this thread is not stopped.
+        // Transcript last — the bar's ONLY actions, so there is no inline row an accidental
+        // second press could confirm, and since R3 no dialog to confirm through either.
+        // T4/R2: the third child is the always-present Resume control, hidden because this
+        // thread is not stopped.
         expect([...bar.children].map((node) => node.className)).toEqual([
             'thread-delete',
             'resume-open action-resume',
             'transcript-open action-transcript'
         ]);
 
-        // This jsdom has no `matchMedia`, so the press takes the fail-safe branch: the
-        // shared confirmation layer opens and the API is still untouched.
+        // R3: this jsdom has no `matchMedia` and the board no longer asks the device
+        // anything — the press IS the request. Both assertions land on the SAME tick as the
+        // click, which is what pins "immediately" and "no dialog element ever created".
         deleteButton(card).click();
-        const dialog = confirmDialog();
-        expect(dialog.getAttribute('role')).toBe('dialog');
-        expect(dialog.getAttribute('aria-modal')).toBe('true');
-        expect(dialogTitleOf(dialog)).toBe('Delete thread');
-        expect(confirmWarning(dialog)).toBe(
-            'Delete thread RR1? It leaves this session, and its transcript is kept until the session itself is deleted.'
-        );
-        expect(confirmActions(dialog)).toEqual(['Delete thread', 'Cancel']);
-        expect(calls).toEqual([]);
-
-        actionButton(dialog, '.thread-delete-confirm-cancel').click();
-        expect(confirmDialogs()).toHaveLength(0);
-        expect(document.querySelector('.dialog-overlay')).toBeNull();
-        expect(calls).toEqual([]);
-
-        deleteButton(card).click();
-        const yes = actionButton(confirmDialog(), '.thread-delete-confirm-delete');
-        expect(yes.textContent).toBe('Delete thread');
-        yes.click();
-        await flush();
-
         expect(calls).toEqual([['s1', 'thread-a']]);
-        expect(confirmDialogs()).toHaveLength(0);
+        noLayers();
         expect(deleteButton(card).disabled).toBe(true);
+        await flush();
+        noLayers();
 
-        // A second confirm/pointer event while the DELETE is in flight is a no-op: the
-        // spent dialog body cannot re-send, and the disabled bar cannot re-arm.
-        yes.click();
+        // A second pointer event while the DELETE is in flight is a no-op: the control is
+        // already disabled and the in-flight key owns the conversation.
         deleteButton(card).click();
         await flush();
         expect(calls).toHaveLength(1);
-        expect(confirmDialogs()).toHaveLength(0);
+        noLayers();
 
         resolveDelete?.({ deleted: true, session: snapshotOf({ updatedAt: 11 }) });
         await flush();
@@ -1682,6 +1651,7 @@ describe('confirmed thread deletion', () => {
         expect(bar.hidden).toBe(true);
         board.expand(turn);
         expect(deleteButton(card).disabled).toBe(false);
+        noLayers();
     });
 
     it('closes focus/transcript and removes the row on a successful shell snapshot', async () => {
@@ -1708,8 +1678,13 @@ describe('confirmed thread deletion', () => {
         openTranscriptFrom(tileAction(turn));
         expect(document.querySelector('.dialog')).not.toBeNull();
 
+        // R3: the press IS the request and it never grows a layer. This transport applies
+        // its own reconciliation synchronously inside the call, so the open transcript is
+        // already closed on the SAME tick as the click — the document holds no layer at any
+        // point during the press, which is the whole point of removing the confirmation.
+        expect(layers()).toBe(1);
         deleteButton(turn.element).click();
-        actionButton(confirmDialog(), '.thread-delete-confirm-delete').click();
+        expect(layers()).toBe(0);
         await flush();
 
         expect(board.turns()).toHaveLength(0);
@@ -1729,8 +1704,9 @@ describe('confirmed thread deletion', () => {
         const turn = board.adopt(snapshot.turns[0]);
         board.expand(turn);
 
+        // R3: one press, and the failure lands with nothing stacked anywhere.
         deleteButton(turn.element).click();
-        actionButton(confirmDialog(), '.thread-delete-confirm-delete').click();
+        noLayers();
         await flush();
 
         expect(board.turns()).toHaveLength(1);
@@ -1743,11 +1719,10 @@ describe('confirmed thread deletion', () => {
             'delete thread: Thread "thread-a" still has live work; wait for it to stop before deleting it.'
         );
 
-        // T6/R5 error recovery: the failed request spent its dialog and changed nothing,
-        // so the very next press arms a fresh confirmation and can try again.
+        // R3 error recovery: the failed press changed nothing, so the very next press
+        // simply tries again — no layer is armed before or after it.
         deleteButton(turn.element).click();
-        expect(confirmDialogs()).toHaveLength(1);
-        actionButton(confirmDialog(), '.thread-delete-confirm-delete').click();
+        noLayers();
         await flush();
 
         // One board-level notice per failed attempt (`notice()` appends to the board
@@ -1755,7 +1730,7 @@ describe('confirmed thread deletion', () => {
         expect(board.element.querySelectorAll(':scope > .notice')).toHaveLength(2);
         expect(board.turns()).toHaveLength(1);
         expect(board.focusedThread()).toBe('thread-a');
-        expect(confirmDialogs()).toHaveLength(0);
+        noLayers();
     });
 
     it('hides Delete for a default agent conversation and disables it for live work', () => {
@@ -1835,7 +1810,9 @@ describe('confirmed thread deletion', () => {
         expect(runningStop.title).toBe('Thread stop is not wired in this host.');
 
         runningStop.click();
-        expect(confirmDialogs()).toHaveLength(0);
+        // R3: a press on a live conversation routes to Stop and never arms a layer, and
+        // since the DELETE branch no longer asks either, no surface here can grow one.
+        noLayers();
     });
 
     it('protects a queued turn and a running descendant subtree', () => {
@@ -1945,8 +1922,9 @@ describe('confirmed thread deletion', () => {
         useSnapshot(board, first);
         const firstTurn = board.adopt(first.turns[0]);
         board.expand(firstTurn);
+        // R3: the press is the request, so the first session's DELETE is already in
+        // flight before the switch even happens.
         deleteButton(firstTurn.element).click();
-        actionButton(confirmDialog(), '.thread-delete-confirm-delete').click();
         await flush();
 
         expect(requests).toHaveLength(1);
@@ -1965,7 +1943,6 @@ describe('confirmed thread deletion', () => {
         const secondTurn = reconciled[0];
         board.expand(secondTurn);
         deleteButton(secondTurn.element).click();
-        actionButton(confirmDialog(), '.thread-delete-confirm-delete').click();
         await flush();
 
         expect(requests).toHaveLength(2);
@@ -1978,7 +1955,7 @@ describe('confirmed thread deletion', () => {
         await flush();
 
         expect(deleteButton(secondTurn.element).disabled).toBe(true);
-        expect(confirmDialogs()).toHaveLength(0);
+        noLayers();
 
         requests[1].resolve({ deleted: true, session: second });
         await flush();
@@ -1993,12 +1970,16 @@ describe('confirmed thread deletion', () => {
         board.expand(turn);
 
         const bar = tileAction(turn);
-        // T6/R5: the bar carries no inline confirmation row at all, and an unwired host
-        // cannot open a dialog that would only ever say it is unwired.
-        expect(bar.querySelector('.thread-delete-confirm')).toBeNull();
+        // R3: the bar owns no confirmation UI of any shape, and an unwired host must not
+        // grow a layer that could only ever report itself unwired.
+        expect([...bar.children].map((node) => node.className)).toEqual([
+            'thread-delete',
+            'resume-open action-resume',
+            'transcript-open action-transcript'
+        ]);
         expect(deleteButton(turn.element).disabled).toBe(true);
         expect(deleteButton(turn.element).title).toBe('Thread deletion is not wired in this host.');
         deleteButton(turn.element).click();
-        expect(confirmDialogs()).toHaveLength(0);
+        noLayers();
     });
 });

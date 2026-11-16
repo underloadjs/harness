@@ -5720,7 +5720,14 @@ const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement):
         // The harness drawer is modal-ish: move focus to its own dismiss control (R4:
         // the heading toggle, which is what the removed `×` used to be) so Escape/Tab
         // and the dismissal affordance are immediately reachable.
+        // T5/R3: the harness drawer DISPLACES the scratch board in the single phone
+        // sidebar slot, and this branch returns before the end of the function — so the
+        // board's visibility signal has to go out here too. Without it a card the reader
+        // left open behind the drawer keeps a wake and a client for a store that is no
+        // longer on screen. Painted BEFORE the focus move: a repaint may re-composed the
+        // rails, and the focus claim after it is the one that wins either way.
         if (side === 'left') {
+            paintPanels();
             harnessTitleToggle.focus({ preventScroll: true });
             return;
         }
@@ -5740,6 +5747,22 @@ const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement):
     const returnFocus = railReturnFocus;
     railReturnFocus = undefined;
     if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
+
+    // T5/R3 — the rail state IS board visibility on a phone, so every path that moves it
+    // has to tell the board: opening the scratch drawer shows the cards again (a card the
+    // reader left open re-boots), closing it — or handing the sidebar slot to the harness
+    // drawer — suspends them. This extra paint is NOT free, and it is not a different,
+    // cheaper kind of paint: it is the same full reconcile the per-frame path already does.
+    // `panelRuntime.paint` hands the media list to all three hosts (./extensions/runtime.ts
+    // :307-315) and each host re-renders its tool cards from scratch (`./ui/panels.ts:712-716`
+    // mints a new node per card) before reconciling them in place. What makes it safe to add
+    // here is that it is idempotent and cheap WHERE IT MATTERS: the visibility signal goes
+    // only to an instance whose slot value moved (./extensions/runtime.ts:281-291), and
+    // `reconcile` never moves a child that is already in place (./ui/panels.ts:678-688), so a
+    // live extension card keeps its scroll and its focus through it. It runs on a rail press
+    // and on a breakpoint crossing — never per stream frame. The left-drawer branch above
+    // returns early and carries the same call.
+    paintPanels();
 };
 
 // Initial platform pass: desktop disables the brand before first paint; a phone gets
@@ -5809,10 +5832,25 @@ phoneMedia?.addEventListener?.('change', (event) => {
 
     if (event.matches) {
         syncBrandTrigger();
+        // T5/R3: crossing INTO phone width can hide the scratch board on its own —
+        // `scratchRailVisible` consults `isPhoneLayout()`, and the drawer state it then
+        // reads is closed unless the reader opened it. This branch touches no rail state,
+        // so without this paint the signal for the crossing would never be sent and the
+        // live panels would keep reading a board the window no longer shows.
+        paintPanels();
+
         return;
     }
 
     setRailOpen(undefined);
+    // T5/R3: leaving phone width puts the board back on screen for good. The call above
+    // ends with a paint of its own, so this one changes nothing today; it is here so the
+    // breakpoint handler stays correct whatever `setRailOpen` does internally. It is the
+    // same full three-host reconcile every other paint is (see the note in `setRailOpen`),
+    // NOT a no-op — it re-renders the tool cards and reconciles the hosts again — and it
+    // delivers nothing to the live panels only because the runtime fires a visibility
+    // listener on a real change (./extensions/runtime.ts:281-291).
+    paintPanels();
 });
 
 // ---------------------------------------------------------------------------
@@ -6674,12 +6712,37 @@ const panelHosts = (): Partial<Record<PanelSlot, PanelHost>> => ({
     left: leftPanels
 });
 
+// T5/R3 — is the scratch board actually ON SCREEN? This is the one reading of that state
+// the live panels get (./extensions/runtime.ts `PanelPaintInput.visibility` →
+// ./extensions/context.ts `PanelContext.onVisibility`): a card inside a shut drawer cannot
+// be looked at, so it must hold no read, no realtime registration and no clock work until
+// the drawer opens again. It is a SUSPENSION — the rail keeps its DOM and its state across
+// the toggle, which is the rail's contract.
+// THE GATE IS THE SCRATCH SLOT ONLY, and it is not because the other slots are always on
+// screen. Below 860px BOTH rails become off-canvas drawers: `styles.css:7239-7244` sets
+// `.rail-left, .rail-right { display: none }` unless `shell[data-rail-open]` names that
+// rail, so the left rail is hidden exactly as the right one is (it also carries the
+// harness drawer, which is why `setRailOpen` holds a single `openRail`). The gate is
+// scratch-only because of what is mounted where, not because of what is visible: the
+// `left` slot holds no live panel at all (`panelHosts` above registers hosts for scratch,
+// centre and left, and only tool cards ever land in `left`), and the centre column is laid
+// out at every width. A panel that is only mounted in a slot that is never hidden needs no
+// signal, so adding a `left` gate today would be a signal with no listener.
+const scratchRailVisible = (): boolean => !isPhoneLayout() || openRail === 'right';
+
 const paintPanels = (): void => {
     const media: readonly PanelMedia[] = current === undefined ? [] : [...current.panels.values()];
 
     // The session pointer is what scopes a live panel: a switch, a New session or a
     // delete moves this value, and the runtime releases the conversation it came from.
-    panelRuntime.paint({ hosts: panelHosts(), media, sessionId: current?.sessionId ?? null });
+    // `visibility` scopes it FURTHER, and only for the slot that has live panels to
+    // suspend — see `scratchRailVisible` above for why the other two slots go ungated.
+    panelRuntime.paint({
+        hosts: panelHosts(),
+        media,
+        sessionId: current?.sessionId ?? null,
+        visibility: { scratch: scratchRailVisible() }
+    });
 
     // The scratch note explains an empty board instead of leaving a blank section.
     // `ids()` is the TOOL-panel list — a registered live panel never changes this

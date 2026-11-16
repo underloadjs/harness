@@ -37,8 +37,23 @@
 // cost the conversation nothing: no snapshot read, no delta, no registration on the
 // realtime plane. Expanding the card is what mounts the engine; collapsing it again
 // releases the wake and the client and clears the surface, so every expansion is a
-// fresh boot rather than a stale view kept "live" by nothing. Records ships CLOSED
-// (the feed is the long one); Tasks ships OPEN (it is the card a reader glances at).
+// fresh boot rather than a stale view kept "live" by nothing. BOTH cards ship CLOSED:
+// the reader presses the one they came for, and the other one costs the page nothing
+// until then. Tasks used to ship OPEN — "the card a reader glances at" — and what that
+// bought was a snapshot read, a registration on the plane and a 30s clock on a card
+// that was usually not even on screen.
+//
+// THE BOARD CAN CLOSE BOTH OF THEM AT ONCE (T5/R3)
+// ------------------------------------------------
+// On a phone the whole scratch board is a drawer, and a closed drawer shows nothing.
+// The shell publishes that through `PanelContext.onVisibility` (./context.ts, fed by
+// ../main.ts `scratchRailVisible`) and both panels answer it the way they answer a
+// collapse — the plane first, then the client (`stopEngine`) — while the card stays
+// exactly as it was on screen. It is a SUSPENSION, not a collapse and not an
+// unmount: no `clearSurface`, no dropped rows, no reset disclosures, because the rail
+// keeps its DOM and its state across the toggle. Opening the drawer again re-boots a
+// card the reader had left OPEN (the frames it missed are exactly what a fresh read
+// answers) and leaves a collapsed one inert.
 //
 // HOW A ROW ARRIVES ON SCREEN
 // ---------------------------
@@ -153,7 +168,11 @@ type PanelMount = {
     /** Fresh id for the clock tick, so a late tick never paints a dead panel. */
     now: () => number;
     schedule: RecordsSchedule;
-    /** Creates the engine for `sessionId` and starts its first read. */
+    /**
+     * Creates the engine for `sessionId` and starts its first read. Releases whatever
+     * engine was running FIRST (it calls `stopEngine` itself), so a retarget can never
+     * orphan the client or the plane registration it replaces.
+     */
     retarget: (sessionId: string, repaint: () => void) => void;
     /** The engine's client, or undefined before the first session. */
     engine: () => RecordsClient | undefined;
@@ -195,13 +214,29 @@ const createPanelMount = (
     });
 
     let client: RecordsClient | undefined;
-    // The wake detach of whichever engine is running. `retarget` replaces it and
-    // `stopEngine` runs it. The registration belongs to the conversation the engine was
-    // built for (./records-wake.ts dials one per session id), so a conversation switch
-    // that only disposed the client would leave the OLD session's registration on the
-    // plane forever: the broker still counts this panel as attached and keeps every
-    // frame of that conversation alive.
+    // The wake detach of whichever engine is running. `stopEngine` runs it, and `retarget`
+    // runs `stopEngine` before it replaces this pair. The registration belongs to the
+    // conversation the engine was built for (./records-wake.ts dials one per session id), so
+    // a conversation switch that only disposed the client would leave the OLD session's
+    // registration on the plane forever: the broker still counts this panel as attached and
+    // keeps every frame of that conversation alive.
     let detachWake: () => void = () => undefined;
+
+    // The one release path for whatever engine is running: the store AND its registration
+    // on the plane. Hoisted out of the returned object because `retarget` calls it too — see
+    // the note there.
+    const stopEngine = (): void => {
+        const current = client;
+        const detach = detachWake;
+
+        client = undefined;
+        detachWake = () => undefined;
+        // The plane first: a frame that lands after this belongs to the conversation that is
+        // going away, and its client is about to be disposed. `release` is idempotent, so the
+        // context's own teardown still runs it harmlessly later.
+        detach();
+        current?.dispose();
+    };
 
     return {
         region,
@@ -209,19 +244,33 @@ const createPanelMount = (
         now,
         schedule,
         engine: () => client,
-        stopEngine: () => {
-            const current = client;
-            const detach = detachWake;
-
-            client = undefined;
-            detachWake = () => undefined;
-            // The plane first: a frame that lands after this belongs to the conversation
-            // that is going away, and its client is about to be disposed. `release` is
-            // idempotent, so the context's own teardown still runs it harmlessly later.
-            detach();
-            current?.dispose();
-        },
+        stopEngine,
         retarget: (sessionId, repaint) => {
+            // A RETARGET NEVER INHERITS AN ENGINE: this drops whatever is running before it
+            // builds the next one, in the order the plane requires (wake first, then client).
+            // Without it, a call site that forgot `stopEngine()` would overwrite `client` and
+            // `detachWake` here and orphan a live engine plus its registration on the shared
+            // channel — ./records-wake.ts counts this panel as attached until the detach runs,
+            // so the orphan keeps every frame of that conversation alive forever.
+            //
+            // A NO-OP ON EVERY REACHABLE PATH TODAY, which is what makes this a behaviour-free
+            // hardening rather than a fix. The three call sites:
+            //   - `expandPanel` (Tasks and Records) enters only while `panelExpanded` is false
+            //     — its only caller is the title toggle's `if (expanded) collapse() else
+            //     expand()` — and a shut card holds no engine: the mount never builds one (see
+            //     "NOTHING READS AT MOUNT" in the Tasks mount), and both `onVisibility` and
+            //     `onSessionChange` return on `!panelExpanded` before they re-target;
+            //   - the two `onVisibility` re-show branches arrive straight after the `!visible`
+            //     branch ran `stopEngine`, or after a press that booted the card in the dark —
+            //     in both cases exactly one engine needs releasing, which is what happens here
+            //     now (that is why those callers no longer spell the stop out themselves: one
+            //     release path, one place that orders it);
+            //   - `onSessionChange` was stopped at the top of that handler, which it still
+            //     needs for its own early return.
+            // `stopEngine` is idempotent (`client` is undefined and `detachWake` is the no-op),
+            // so releasing nothing costs nothing — and the next call site cannot get it wrong.
+            stopEngine();
+
             const engine = createRecordsEngine({
                 ctx,
                 sessionId,
@@ -926,16 +975,26 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
     // `recordsStatusOf`). `statusBox`, because `status` is already the progress sentence.
     const statusBox = recordsStatusOf('loading', PHASE_LABEL.loading);
 
+    // Hidden until there is a conversation to report on, and a collapsed card never
+    // paints one: `paintChrome` is the only thing that shows this box, and while the
+    // card is shut (or the board is off screen) nothing runs that could reach `paint` —
+    // the engine is gone and the clock self-guards below.
     statusBox.hidden = true;
+    // COLLAPSED BY DEFAULT: the body starts hidden and stays that way until the reader
+    // opens the card by pressing its title (the collapse gate below). Nothing is read
+    // while it is — the engine is not built at mount any more than it is for Records.
+    body.hidden = true;
     body.append(progress, scroller, pill);
     scroller.append(stateArea, listWrap);
     ctx.element.append(mount.region, statusBox, body);
 
     // --- the collapse gate ---------------------------------------------------
-    // Tasks ships OPEN: it is the card a reader glances at without thinking. The title
-    // still closes it like any other card, and a closed card holds nothing — no client,
-    // no plane registration, no announcements (`collapsePanel`, at the engine below).
-    let panelExpanded = true;
+    // Tasks ships CLOSED, gated exactly like Records: the card is the one a reader
+    // glances at, and glancing is a press away — a board nobody is looking at must not
+    // hold a read and a registration for every conversation it has ever shown. The
+    // title opens and closes it like any other card, and a closed card holds nothing: no
+    // client, no plane registration, no announcements (`collapsePanel`, below).
+    let panelExpanded = false;
     const toggle = titleToggleOf({
         ctx,
         label: 'Tasks',
@@ -1397,11 +1456,51 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         }
     };
 
+    // --- the board's drawer (T5/R3) ------------------------------------------
+    // The same release a collapse performs — plane first, then client — minus the
+    // surface. A closed drawer is a card nobody can look at, so it owes the page no
+    // wake, no delta and no re-aged stamps; but the rail contract is that its content
+    // and state SURVIVE the toggle, so this is a suspension: no `clearSurface`, the rows
+    // and disclosures stay exactly where the reader left them, and the re-open re-reads
+    // the store into them. A collapsed card stays inert in both directions: pressing its
+    // title is what builds an engine.
+    let panelVisible = true;
+
+    ctx.onVisibility((visible) => {
+        if (ctx.disposed) return;
+
+        panelVisible = visible;
+
+        if (!visible) {
+            // `stopEngine` is idempotent, so a card that never booted (no conversation,
+            // or still collapsed) is already in the state a hide asks for. `current` goes
+            // with the client it pointed at: nothing may read a disposed store between the
+            // hide and the re-boot.
+            mount.stopEngine();
+            current = undefined;
+
+            return;
+        }
+
+        if (!panelExpanded || ctx.sessionId === null) return;
+
+        // Shown again with the card open: a FRESH boot, never a resurrection — the frames the
+        // drawer missed are precisely what a snapshot read answers. An engine that ran in the
+        // dark (a host that opened the card while the board was hidden) is released on the way
+        // in by `retarget` itself, which stops the engine it replaces before building the new
+        // one (./createPanelMount) — so the plane holds exactly the registration of the client
+        // that is on screen, never the one that was reading behind the shut drawer.
+        mount.retarget(ctx.sessionId, paintNow);
+        paintNow();
+    });
+
     // --- the engine ----------------------------------------------------------
     const clock = globalThis.setInterval(() => {
         // A closed card has nothing to re-age and no engine to repaint; the tick must not
-        // be the thing that keeps a collapsed panel "working".
-        if (ctx.disposed || !panelExpanded) return;
+        // be the thing that keeps a collapsed panel "working". A board that is off screen
+        // (the phone drawer shut) is the same case one level up — no stamp refresh, no
+        // paint, no work while nobody can see the rail.
+        if (ctx.disposed || !panelExpanded || !panelVisible) return;
 
         refreshRecordsStamps(ctx.element, now());
         paintNow();
@@ -1409,10 +1508,10 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
 
     ctx.onDispose(() => globalThis.clearInterval(clock));
 
-    if (ctx.sessionId !== null) {
-        mount.retarget(ctx.sessionId, paintNow);
-        paintNow();
-    }
+    // NOTHING READS AT MOUNT. The card ships collapsed, so `expandPanel` is the only
+    // thing that builds an engine: a mount hands the reader a heading and a hidden body,
+    // and a mount that happens while the phone drawer is shut is told so right after this
+    // function returns (./runtime.ts publishes the slot state after `panel.mount()`).
 
     ctx.onSessionChange(() => {
         // A session-scoped panel is normally DISPOSED on a switch rather than told
@@ -1426,8 +1525,11 @@ export const mountTasksPanel = (ctx: PanelContext, options?: RecordsPanelOptions
         freshMarker.clearAll();
         flip.reset();
 
-        // Closed, or no conversation to read: the surface goes back to blank and waits.
-        if (ctx.sessionId === null || !panelExpanded) {
+        // Closed, off screen, or no conversation to read: the surface goes back to blank
+        // and waits. A switch that lands while the drawer is shut must not boot a reader
+        // nobody has — the re-open re-targets (the `onVisibility` handler above), and the
+        // rows cleared here belong to the conversation that just went away anyway.
+        if (ctx.sessionId === null || !panelExpanded || !panelVisible) {
             clearSurface();
 
             return;
@@ -1969,11 +2071,45 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         }
     };
 
+    // --- the board's drawer (T5/R3) ------------------------------------------
+    // The feed is the noisier of the two cards, so it has the most to lose from a
+    // drawer nobody is looking at: every wake it still held would be a delta read on a
+    // closed screen. The release is the collapse release (`stopEngine`: the wake, then
+    // the client) WITHOUT the surface — the filter, the rows and the open disclosures
+    // belong to the reader, and they are still there when the drawer comes back. A
+    // collapsed card is left alone in both directions; only the reader opens a card.
+    let panelVisible = true;
+
+    ctx.onVisibility((visible) => {
+        if (ctx.disposed) return;
+
+        panelVisible = visible;
+
+        if (!visible) {
+            mount.stopEngine();
+            current = undefined;
+
+            return;
+        }
+
+        if (!panelExpanded || ctx.sessionId === null) return;
+
+        // Shown again with the card open: a FRESH boot. The frames missed while the drawer
+        // was shut are exactly what a snapshot read puts right. A card that was opened while
+        // hidden was reading in the dark, and `retarget` releases that engine before it builds
+        // the new one (./createPanelMount), so no client and no registration on the shared
+        // channel is ever left behind by the way back in.
+        mount.retarget(ctx.sessionId, paintNow);
+        paintNow();
+    });
+
     // --- the engine ----------------------------------------------------------
     const clock = globalThis.setInterval(() => {
         // A closed card has nothing to re-age and no engine to repaint; the tick must
-        // not be the thing that keeps a collapsed panel "working".
-        if (ctx.disposed || !panelExpanded) return;
+        // not be the thing that keeps a collapsed panel "working". A board that is off
+        // screen (the phone drawer shut) is the same case one level up: no re-aging, no
+        // paint, no work while nobody can see the rail.
+        if (ctx.disposed || !panelExpanded || !panelVisible) return;
 
         refreshRecordsStamps(ctx.element, now());
         paintNow();
@@ -1992,7 +2128,10 @@ export const mountRecordsPanel = (ctx: PanelContext, options?: RecordsPanelOptio
         freshMarker.clearAll();
         flip.reset();
 
-        if (ctx.sessionId === null || !panelExpanded) {
+        // Closed, off screen, or no conversation to read — the card waits. A switch that
+        // lands while the phone drawer is shut must not boot a reader nobody has; the
+        // re-open re-targets through the `onVisibility` handler above.
+        if (ctx.sessionId === null || !panelExpanded || !panelVisible) {
             clearSurface();
 
             return;

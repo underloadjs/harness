@@ -4056,12 +4056,15 @@ body.is-resizing-rail {
 }
 
 /* R7/R8/T26: the toolbar of an EXPANDED block, shared by a turn tile, a nested invocation
-   card and the roster-only focus panel. It owns BOTH actions now, in the requested order:
+   card and the roster-only focus panel. It owns the row's actions, in the requested order:
    DELETE leads (left, where Transcript used to be) and TRANSCRIPT closes the row (right,
-   the slot Delete used to be painted in above the header). The inline Delete confirmation
-   still wraps onto its own full-width row so nothing moves. ui/turns.ts toggles `hidden`
-   with expansion, so a collapsed row never shows a permanent second row. The header's
-   right edge is no longer a control slot at all: the measurement line lives there.
+   the slot Delete used to be painted in above the header), with RESUME grouped at the right
+   edge beside Transcript. Delete is ONE press: there is no confirmation step to render, so
+   this bar never grows a second row and its height is constant whatever the thread's state
+   (ui/turns.ts goes straight from the press to the delete transport, `performThreadDelete`).
+   ui/turns.ts toggles `hidden` with expansion, so a collapsed row never shows a permanent
+   second row. The header's right edge is no longer a control slot at all: the measurement
+   line lives there.
    R2: WHICH one of these is visible is the board's `showsThreadActionBar` rule — one bar
    per conversation SURFACE, on that surface's first exchange, i.e. directly under the
    thread header and above every entry body. It is deliberately in-flow (NOT sticky): the
@@ -4150,9 +4153,7 @@ body.is-resizing-rail {
 
 .transcript-open:focus-visible,
 .resume-open:focus-visible,
-.thread-delete:focus-visible,
-.thread-delete-confirm-delete:focus-visible,
-.thread-delete-confirm-cancel:focus-visible {
+.thread-delete:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
 }
@@ -4164,8 +4165,7 @@ body.is-resizing-rail {
    dimmed ones. */
 .transcript-open:disabled,
 .resume-open:disabled,
-.thread-delete:disabled,
-.thread-delete-confirm-delete:disabled {
+.thread-delete:disabled {
     cursor: not-allowed;
     opacity: 0.55;
 }
@@ -4181,55 +4181,6 @@ body.is-resizing-rail {
     font-family: var(--mono);
     font-size: 12px;
     line-height: 1;
-}
-
-/* R9/T26: the two-step confirmation's anatomy. It occupies the full toolbar width below
-   the two actions; Cancel sends no request (ui/turns.ts).
-   R5 (T6) moved the confirmation itself into the SHARED dialog (ui/turns.ts
-   `openThreadDeleteConfirmation`): a proven desktop deletes on one press, so no host
-   paints this row inline any more. The class names stay — the dialog re-uses them, which
-   is what keeps the warning and the two controls looking exactly like the row they
-   replaced — and the toolbar geometry below still describes a row inside a WRAPPING ROW
-   container (`flex: 1 0 100%` is what forces it onto its own line, the top border what
-   separates it from the actions above). Inside `.dialog-body`, a flex COLUMN, that basis
-   would hand the group the panel's whole height and the border would draw a second rule
-   under the dialog header, so `ui/dialog.css` carries the one dialog-scoped override that
-   cancels exactly those three declarations. */
-.thread-delete-confirm {
-    display: flex;
-    flex: 1 0 100%;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px;
-    padding-top: 7px;
-    border-top: 1px solid var(--border);
-}
-
-.thread-delete-confirm[hidden] {
-    display: none;
-}
-
-.thread-delete-confirm-text {
-    flex: 1 1 220px;
-    margin: 0;
-    color: var(--muted);
-    font: 11.5px/1.4 var(--sans);
-}
-
-.thread-delete-confirm-delete,
-.thread-delete-confirm-cancel {
-    padding: 4px 10px;
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-sm);
-    background: var(--bg-elevated);
-    color: var(--text);
-    font: 500 11.5px/1.4 var(--sans);
-    cursor: pointer;
-}
-
-.thread-delete-confirm-delete {
-    border-color: rgba(248, 113, 113, 0.55);
-    color: var(--danger);
 }
 
 /* T26: the header's right-edge CONTROL slot is GONE. `.tile-header-action`,
@@ -4416,7 +4367,9 @@ body.is-resizing-rail {
 /* C5: the dialog's own control row. The shared modal has no actions API, so the
    transcript buttons live in the adopted content (the same precedent as the thread
    toolbars above); this row is a plain flex line, NOT the `.thread-transcript-action`
-   toolbar — that one is hidden by expansion state and owns Delete's confirmation row.
+   toolbar — that one is hidden by expansion state and carries the conversation bar's own
+   one-press actions (Delete, Resume, Transcript; ui/turns.ts `createThreadActionBar`, and
+   Delete has no confirmation row of its own any more).
    `margin-left: auto` on the last action keeps Copy (a secondary affordance) at the
    trailing edge while Save/Cancel stay where the reader looks first. The read row has no
    trailing-affordance problem to solve - it carries exactly one control and T4 puts it
