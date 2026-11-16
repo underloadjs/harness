@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { openAICompatible } from '@underload/harness';
 import type { HarnessMessage, HarnessStreamEvent } from '@underload/harness';
 
-const BASE_URL = 'http://localhost:5500/providers/private/v1';
+const BASE_URL = 'http://localhost:6660/providers/private/v1';
 const MODEL = 'local/basalt';
 
 // This is the only test in the package that talks to a real server, and the point

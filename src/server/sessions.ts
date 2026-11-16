@@ -466,6 +466,30 @@ type ViewWatcher = {
 // commit, start, done or cancellation always checkpoints through the existing
 // strict/best-effort calls). 2s is bounded work per turn and far below the old
 // per-non-delta-event full-document serialization.
+//
+// T22 F1 — what this gate now covers, and exactly what that costs. The core
+// state-change observer (`noteStateChange`) used to bypass it and rewrite the whole
+// document on EVERY committed mutation: two synchronous full writes per settled tool
+// call, measured at 816 ms each on the live 110 MB document (279 ms deep-copying the
+// recorded events + 407 ms pretty-serializing + 130 ms write/fsync/rename). For the
+// 902-tool-call session that is ~1,470 s of blocked event loop — ~36 % of its run, and
+// the source of the "sometimes very slow" UI. Every best-effort writer now shares this
+// one interval, so the DURABILITY TRADE-OFF has to be read here:
+//   - EVENTS: nothing is lost. `./journal.ts` still appends every event, per event,
+//     un-throttled, and `mergeJournal` folds the log back over the document on restore.
+//   - NON-EVENT state (the `session.core` conversation snapshot, thread rows, the usage
+//     tally, labels, the queue): a crash now loses at most ONE interval of it, where the
+//     old behaviour lost at most one mutation. Restore does not half-apply anything — it
+//     regresses to an earlier COHERENT commit point, the same property `executeTurn`
+//     argues for when it commits the fresh-block snapshot at turn start. The bound is
+//     enforced, not incidental: a gated state change arms a TRAILING write for the rest of
+//     the window (T25, `scheduleCheckpoint`), so a session that goes quiet right after a
+//     mutation — a hanging tool, a plugin diagnostic, an idle lane commit — still commits
+//     within one interval instead of leaving the document stale indefinitely.
+//   - Anything that must be durable BEFORE a response is a strict `persistOrThrow` call
+//     (enqueue, callTool, updateThreadTranscript, settings/registry/agents, the cancel
+//     terminals), and those are untouched — a successful one also stamps the gate, so it
+//     is never followed by a redundant best-effort rewrite of the same state.
 const VIEW_CHECKPOINT_INTERVAL_MS = 2_000;
 
 // One host thread's execution lane (R1-R6). Every thread-capable submit runs in a
@@ -800,6 +824,25 @@ export type Session = {
     // Last full-document checkpoint for THIS session, so a long run writes the
     // document at a bounded interval instead of once per step (R4).
     checkpointAt: number;
+    // T22 F1: the COLD-START ANCHOR. The interval gate starts OPEN for one session, so the
+    // first committed mutation boundary after a create or a restore is always made durable —
+    // that is the snapshot a crash between two intervals falls back to, and the two
+    // mutation-boundary contracts in ./persistence.test.ts (a completed tool's store writes,
+    // a hanging tool's transcript ending on its unresolved `tool_call`) depend on it. It
+    // costs ONE extra document write per session (and per restore), never per tool call, and
+    // strict saves deliberately do NOT clear it: `persistOrThrow` stamps `checkpointAt`, and
+    // only this flag survives that stamping, which is what keeps the anchor from being
+    // swallowed by the create/turn-start commits that precede the first mutation.
+    firstCommitPending: boolean;
+    // T25: the TRAILING half of the checkpoint throttle (see `scheduleCheckpoint`). A gated
+    // state change arms ONE timer for the rest of the window; the timer performs the write the
+    // gate deferred. Absent means "nothing is outstanding".
+    checkpointTimer?: ReturnType<typeof setTimeout>;
+    // T25: when that timer was armed, i.e. the earliest instant the pending write describes.
+    // `persistOrThrow` compares it against the moment its record was built to decide whether
+    // the document it just committed already contains the deferred change (cancel the flush)
+    // or not (keep it pending).
+    checkpointArmedAt?: number;
 };
 
 // T13: the two aliases the canonical read model imports (./api-reads.ts). A live view,
@@ -1116,7 +1159,28 @@ const expiredActionIds = (turns: readonly SessionTurn[]): string[] => {
 // `startedAt` is OMITTED while the turn is queued (the server has not started it),
 // so a client sees "not started" instead of a fabricated timestamp; the key order
 // for a started turn is unchanged from the pre-queue contract.
-const copyTurn = (turn: SessionTurn): SessionTurn => ({
+//
+// `shareEvents` (T22 F3) is the DOCUMENT-BUILD mode, and it is the only caller that is
+// allowed to use it. The event objects stored in `turn.events` are ALREADY detached
+// copies: every recorder pushes `copyEvent(event)` (sessions.ts:8833, :7858) and never
+// mutates a stored event afterwards, so the array's elements are append-only,
+// store-owned JSON values. A response must still get its own deep copy (a browser
+// client may write through what it was handed), but a document that goes straight into
+// `JSON.stringify` does not: re-deep-copying 354,613 events per write measured 279 ms
+// of a synchronous 816 ms persist. In that mode the array is fresh (`slice()`, so a
+// later `turn.events.push` cannot leak into a document that is still being staged) and
+// its elements are shared by REFERENCE.
+//
+// Why the bytes are unchanged (the property the probe hashes, not a hope):
+//   - `copyEvent` is `JSON.parse(JSON.stringify(e))`, and JSON round-trips are
+//     idempotent and order-preserving — re-serializing a round-tripped value emits the
+//     same characters in the same key order as serializing the original, so the
+//     document is byte-identical (modulo the F2 whitespace change, which is separate);
+//   - the only two lifetimes that see the record are `persistence.save()` (build and
+//     stringify in the same synchronous call) and the IO worker's coalesced slot, whose
+//     `postMessage` clone runs on a microtask while the stored events are immutable —
+//     no mutation window, and no consumer that could write through into the live store.
+const copyTurn = (turn: SessionTurn, shareEvents = false): SessionTurn => ({
     id: turn.id,
     index: turn.index,
     prompt: turn.prompt,
@@ -1153,7 +1217,9 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     status: turn.status,
     ...(turn.startedAt === undefined ? {} : { startedAt: turn.startedAt }),
     updatedAt: turn.updatedAt,
-    events: turn.events.map(copyEvent),
+    // T22 F3: fresh array, shared elements in document mode (see `shareEvents` above);
+    // a deep copy of every event for a client-facing frame or snapshot.
+    events: shareEvents ? turn.events.slice() : turn.events.map(copyEvent),
     ...(turn.eventTimes === undefined ? {} : { eventTimes: [...turn.eventTimes] }),
     ...(turn.usage === undefined ? {} : { usage: { ...turn.usage } }),
     // Steered guidance audit (R5). Detached copies for the same reason as the rest:
@@ -1239,7 +1305,10 @@ const viewDescriptorOf = (descriptor: HarnessDescriptor): HarnessDescriptor => {
     return copy;
 };
 
-const copyTurns = (turns: readonly SessionTurn[]): SessionTurn[] => turns.map(copyTurn);
+// `shareEvents` is handed straight to `copyTurn`; pass `true` ONLY from a code path
+// whose result goes to the writer (`sessionRecord`), never to a client-facing read.
+const copyTurns = (turns: readonly SessionTurn[], shareEvents = false): SessionTurn[] =>
+    turns.map((turn) => copyTurn(turn, shareEvents));
 
 // A timestamp is usable only when it is a real epoch-ms number. 0 is the projector's
 // documented "no timestamp" sentinel (../server/turn-projector.ts
@@ -2351,6 +2420,9 @@ export class SessionStore {
             journalProblems: [],
             blockCache: new Map(),
             checkpointAt: Date.now(),
+            // T22: the first mutation boundary of a fresh session is always committed (see
+            // `Session.firstCommitPending`).
+            firstCommitPending: true,
             // An empty session is a valid commit point: snapshot() succeeds here.
             core: harness.snapshot()
         };
@@ -3279,7 +3351,11 @@ export class SessionStore {
             createdAt: session.createdAt,
             updatedAt: session.updatedAt,
             ...(session.lastError === undefined ? {} : { lastError: session.lastError }),
-            turns: copyTurns(session.turns),
+            // T22 F3: the ONE document-build caller. Events are shared by reference
+            // because this record is only ever serialized (see `copyTurn.shareEvents`);
+            // every other `copyTurns` call hands its result to a client and keeps the
+            // deep copy, so the wire shape is untouched.
+            turns: copyTurns(session.turns, true),
             // Queue entries must be the same turns; ids keep the document compact
             // and let the loader re-link them to the (already copied) turns. F1:
             // EVERY pending turn is included — the legacy queue and each lane's
@@ -3482,6 +3558,11 @@ export class SessionStore {
         // Built on THIS thread either way: the coordinator owns the state, so it owns the
         // record. What moves off-thread is the stringify and the syscalls.
         const record = this.databaseRecord(overrides);
+        // The instant this document's CONTENT is true. The checkpoint gate is stamped from
+        // this value, not from `Date.now()` after the await, so a strict save can only ever
+        // suppress a best-effort checkpoint whose window is measured from the state the
+        // file actually describes (worker mode spends real time between the two).
+        const committedAt = Date.now();
         const fences = commit?.fenceSessions;
 
         try {
@@ -3490,6 +3571,30 @@ export class SessionStore {
             else await this.io.commitCheckpoint({ document: record, fenceSessions: fences });
 
             this.lastPersistenceError = undefined;
+
+            // T22 F1: a strict commit wrote the WHOLE document — every session, every field —
+            // so an immediately-following best-effort rewrite of the same state is pure cost.
+            // Stamping the per-session gate here is what removes the measured turn-start
+            // duplicate (the strict save at `executeTurn` and the best-effort commit ~1 ms
+            // later were two full rewrites of the same logical change). It costs nothing in
+            // durability: the file on disk is at least as fresh as any checkpoint this
+            // suppresses. Only a SUCCESSFUL commit stamps, and the journal append is
+            // untouched (./journal.ts), so per-event durability is unchanged.
+            //
+            // T25: the stamp also retires a pending TRAILING write. `checkpointArmedAt` is the
+            // instant that write's state became true; when that is at or before `committedAt`
+            // (the instant this document's content is true, taken right after the record was
+            // built) the file already describes it, so the flush would be a redundant
+            // full-document rewrite — measured ~800 ms on the live 110 MB document — paid up
+            // to one interval after every strict commit. A flush armed later than that can
+            // only describe a change made during the `await` (worker mode), so it stays pending.
+            for (const live of this.sessions.values()) {
+                live.checkpointAt = committedAt;
+
+                if (live.checkpointArmedAt !== undefined && live.checkpointArmedAt <= committedAt) {
+                    this.clearCheckpointTimer(live);
+                }
+            }
         } catch (error) {
             // The message parity is deliberate: `io.saveCheckpoint` rejects with the exact
             // text `persistence.save` throws (./workers/io-protocol.ts `ioErrorReportOf`), so
@@ -3682,7 +3787,16 @@ export class SessionStore {
             this.lastPersistenceError = `Could not capture harness state: ${messageOf(error)}`;
         }
 
-        this.persistBestEffort();
+        // T22 F1: through the checkpoint gate, not straight at the writer. A settled tool
+        // call fires this observer twice (`tool_execute`, then the `agent_message`
+        // tool-result commit), and each call used to rewrite the whole `state.json`
+        // synchronously: measured 2 writes per settled tool call, 816 ms each on the live
+        // 110 MB document — about 36 % of a long run's wall clock. `checkpoint()` calls the
+        // SAME `persistBestEffort()` body, so the document build, the atomic staging file,
+        // the fsync and the rename are identical; only the FREQUENCY changes, and it becomes
+        // the same 2 s interval the recorder already uses (see `VIEW_CHECKPOINT_INTERVAL_MS`
+        // for the durability trade-off this accepts).
+        this.checkpoint(session);
     }
 
     // C4: validate every HOST thread transcript in a persisted snapshot and
@@ -3980,7 +4094,12 @@ export class SessionStore {
                 model: record.settings.model
             });
 
-            const turns = record.turns.map(copyTurn);
+            // T25: explicit arrow, not `map(copyTurn)`. `copyTurn` grew the `shareEvents`
+            // document-build mode (T22 F3), and `map` would hand it the array INDEX as that
+            // boolean; this restore path is not a document build, so it keeps the historical
+            // deep copy of every event (the only sharing caller is `sessionRecord`, which passes
+            // `true` to `copyTurns`).
+            const turns = record.turns.map((turn) => copyTurn(turn));
             const byId = new Map(turns.map((turn) => [turn.id, turn]));
             const queue: SessionTurn[] = [];
 
@@ -4175,6 +4294,9 @@ export class SessionStore {
                 journalProblems: [],
                 blockCache: new Map(),
                 checkpointAt: restoredAt,
+                // T22: a restored session re-arms the anchor, so the first boundary after a
+                // restart is committed just like a fresh session's first one.
+                firstCommitPending: true,
                 // Replaced with a fresh snapshot after restore succeeds.
                 core: record.core
             };
@@ -5568,15 +5690,91 @@ export class SessionStore {
     // unconditionally, so the interval only decides how often the FULL document is
     // rewritten; the strict (`persistOrThrow`) and terminal saves are unchanged and
     // still land at every structural transition.
+    //
+    // T22 F1: this is now the single throttle for EVERY best-effort document rewrite of a
+    // live session — the recorder's per-step checkpoint, the command recorder's, the
+    // turn-start commit, and the core state-change observer, which used to bypass the gate
+    // completely. Because all of them stamp the SAME `session.checkpointAt`, a burst of
+    // state changes inside one interval produces at most ONE whole-document write, however
+    // many mutations caused it. `force` is the escape hatch a caller uses when it must
+    // commit now without throwing: the trailing timer below (T25) is the only caller today,
+    // because the deferred write has already waited out the interval.
     private checkpoint(session: Session, force = false): void {
         if (this.persistence === undefined) return;
 
         const now = Date.now();
 
-        if (!force && now - session.checkpointAt < VIEW_CHECKPOINT_INTERVAL_MS) return;
+        // T22 F1: the cold-start anchor keeps the FIRST mutation boundary of a session (or of
+        // a session after a restore) durable however fast it follows the create/turn-start
+        // commits — the interval alone would otherwise swallow it, and with it the two
+        // mutation-boundary contracts ./persistence.test.ts pins.
+        const anchor = session.firstCommitPending;
 
+        if (!force && !anchor && now - session.checkpointAt < VIEW_CHECKPOINT_INTERVAL_MS) {
+            // T25: "gated" must not become "unwritten". The interval decides WHEN the document
+            // is rewritten, never WHETHER a committed change ever reaches the file, so the
+            // deferred write is scheduled for the rest of the window.
+            this.scheduleCheckpoint(session, VIEW_CHECKPOINT_INTERVAL_MS - (now - session.checkpointAt));
+
+            return;
+        }
+
+        this.clearCheckpointTimer(session);
+
+        session.firstCommitPending = false;
         session.checkpointAt = now;
         this.persistBestEffort();
+    }
+
+    // T25: the trailing write of the throttle (why the gate alone is not enough).
+    //
+    // A gated change is only "lost for at most one interval" if something eventually writes.
+    // Nothing does when the session goes quiet at exactly that moment, and the three real
+    // cases are not hypothetical: a tool that hangs (no further event, so not even the
+    // recorder's interval checkpoint fires), a plugin diagnostic recorded at `turn.before`
+    // (./plugins-api.test.ts pins that the NEXT state change journals it), and an in-place
+    // lane commit that lands after its run settled (./workers/lane-worker.test.ts). With a
+    // pure gate the document then stays as stale as it was at the last commit for as long as
+    // the session lives — an UNBOUNDED regression, not the bounded one this file promises.
+    //
+    // So the timer performs the deferred write UNCONDITIONALLY rather than re-running the
+    // gate: re-evaluating `now - checkpointAt` with a mocked clock (`pinTaskClock` in
+    // ./persistence.test.ts freezes `Date.now`) would drop the change again forever, which is
+    // exactly how the two mutation-boundary pins broke. One pending timer per session: while a
+    // burst runs, the 12 gated state changes of a tool round share the ONE flush, so the
+    // write rate stays at most one whole-document commit per interval (the contract
+    // ./persistence-coalescing.test.ts counts).
+    private scheduleCheckpoint(session: Session, delayMs: number): void {
+        if (session.checkpointTimer !== undefined) return;
+
+        session.checkpointArmedAt = Date.now();
+        session.checkpointTimer = setTimeout(() => {
+            session.checkpointTimer = undefined;
+            session.checkpointArmedAt = undefined;
+
+            // A session that went away, a store that is restoring, and a store that is closing
+            // all refuse a write anyway (`persistBestEffort` guards the last two); say so here
+            // so the deferred commit is not attempted into a document that no longer exists.
+            if (session.disposed || this.loading || this.shuttingDown) return;
+
+            this.checkpoint(session, true);
+        }, Math.max(0, delayMs));
+
+        // Same rule as the lane drain timer (see the `setTimeout(wake, remaining)` in
+        // `waitForDrain`): a pending checkpoint is work the process may legitimately die with,
+        // so it must not hold the event loop open.
+        session.checkpointTimer.unref?.();
+    }
+
+    // T25: drops a pending trailing write. Called when the state it was going to commit has
+    // reached the file some other way (an immediate or forced `checkpoint`, a successful
+    // strict commit that already contains it) and at teardown.
+    private clearCheckpointTimer(session: Session): void {
+        if (session.checkpointTimer === undefined) return;
+
+        clearTimeout(session.checkpointTimer);
+        session.checkpointTimer = undefined;
+        session.checkpointArmedAt = undefined;
     }
 
     // Merge the durable log with the loaded checkpoint (see the rules on the method
@@ -8982,7 +9180,16 @@ export class SessionStore {
                 // Defensive: keep the previous committed snapshot; the turn is
                 // still valid because the live harness was reset above.
             }
-            this.persistBestEffort();
+
+            // T22 F1: this used to be an UNGATED `persistBestEffort()`, ~1 ms after the
+            // strict turn-start commit above (`persistOrThrow`), i.e. a second full-document
+            // rewrite of the same logical change — one measured write thrown away at every
+            // single turn start. Gating it keeps the guarantee the comment above states (a
+            // turn that starts more than an interval after the last commit still writes its
+            // coherent fresh-block snapshot immediately) and drops the duplicate; the strict
+            // save at `persistOrThrow` also stamps the gate, so the duplicate cannot come
+            // back through the side door.
+            this.checkpoint(session);
 
             // Expand AFTER the reset and only once every referenced turn is
             // terminal, so the injected text is the recorded `done` content. With
@@ -11140,6 +11347,11 @@ export class SessionStore {
         // Set BEFORE aborting: the aborted run's terminal publish is then
         // suppressed (the session no longer exists for any client).
         session.disposed = true;
+
+        // T25: no trailing checkpoint for a session that no longer exists — the write would
+        // rebuild the whole document to say "this session is gone", which remove()/dispose()
+        // have already committed strictly.
+        this.clearCheckpointTimer(session);
 
         // N4: no owner question can be answered for a removed/gone session. Reject
         // the runtime's await before the abort so teardown never leaves a pending

@@ -99,3 +99,35 @@ export const FORK_TIMEOUT_MS = Number.POSITIVE_INFINITY;
 // ever LOWERS what one child may do, never raises the session limit. The delegate
 // entry inlines `64`.
 export const DELEGATE_MAX_TURNS_MAX = 64;
+
+// ---------------------------------------------------------------------------
+// Provider connection failures (T6, 2026-11-16).
+//
+// `../core/agent.ts` is the ONE retry owner for model calls, and until T6 it had
+// exactly ONE policy: one initial attempt plus `maxRetries` (default 10) with waits
+// of 1 s, 2 s, 4 s ... 512 s. A REFUSED CONNECTION — the single most common reason a
+// thread "runs forever", because the configured provider is simply not listening on
+// the port the harness dials — went through that policy like any transient blip, so
+// the user watched a spinner for 1+2+4+...+512 = 1023 s (~17.05 min) before an error
+// named the endpoint. A dial that reached nobody is a CONFIGURATION condition, not a
+// transient one: a minute of patience is proportionate, eight minutes of backoff is
+// not, and the answer the user needs is "nothing is listening on 6660".
+//
+// So this class gets its own short, capped ladder: 1 initial attempt plus 2 retries,
+// with waits of 250 ms and 500 ms. The waiting totals 750 ms, so the whole failure is
+// bounded by 750 ms plus the three dial attempts themselves — under a second for a
+// localhost refusal, and bounded by 3x the platform dial timeout for a slow name
+// resolution. Then it fails TERMINALLY with a frame that names the dialled host:port.
+//
+// The numbers live here (the declared contract AND the runtime values, the rule the
+// rest of this file follows) rather than in `../transport`, because the transport
+// classifies WHAT failed and only the retry owner decides HOW OFTEN it is retried.
+// ---------------------------------------------------------------------------
+
+// Retries AFTER the initial attempt for a `provider-connection` failure.
+export const PROVIDER_CONNECTION_MAX_RETRIES = 2;
+
+// The base of that ladder's doubling waits: 250 ms, then 500 ms. Single-digit
+// seconds by design — long enough to outlast a restarting provider process, short
+// enough that the terminal answer arrives in seconds.
+export const PROVIDER_CONNECTION_RETRY_BASE_DELAY_MS = 250;

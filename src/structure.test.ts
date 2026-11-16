@@ -40,6 +40,15 @@
 //     library bundles, and the `retired build layer` block below pins its absence.
 //   - ./server/service-start.test.ts — the end-to-end proof that the real service
 //     gateway serves /v1/harness from the moved endpoint folder
+//
+// Node environment ON PURPOSE: every assertion here reads the source tree through
+// `fileURLToPath(import.meta.url)` (./openai.ts, package.json, the tsconfigs). Under the
+// repository ROOT config (../../../vitest.config.ts, `environment: 'jsdom'`) that call
+// threw `TypeError: The URL must be of scheme file` at COLLECTION time — the whole file
+// was an unrunnable suite in a root `yarn vitest run`. The package's own vitest.config.ts
+// already pins `node`; the docblock keeps that true for the root run too. Same reasoning
+// as service/src/server/start.test.ts:1-9.
+// @vitest-environment node
 
 import fs from 'node:fs';
 import http from 'node:http';

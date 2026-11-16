@@ -1804,17 +1804,28 @@ export const repairInterruptedToolCalls = (snapshot: HarnessSnapshot): HarnessSn
 // test. Both are pure (no instance state), so nothing about them is per-store.
 //
 // What is expensive here, and therefore what moves off the main thread:
-//   - the serialization: a two-space pretty-print of the WHOLE document, i.e. O(all
-//     sessions x all recorded events). On the coordinator this is a synchronous
-//     block of the event loop proportional to the database size.
+//   - the serialization of the WHOLE document, i.e. O(all sessions x all recorded
+//     events). On the coordinator this is a synchronous block of the event loop
+//     proportional to the database size.
 //   - the syscalls: mkdir + open + write + fsync + close + rename.
+//
+// FORMAT (measured, T22): the payload is COMPACT `JSON.stringify`, not the historical
+// two-space pretty-print. Nothing else about the document changed - same keys, same
+// order, same values - so no database version bump is required: the reader gates on
+// `version` only (`readHarnessDatabase`), never on whitespace, and JSON whitespace is
+// insignificant by definition. The win is paid twice: stringify drops 407 ms to 242 ms
+// on the live 110 MB document, and the bytes handed to write+fsync halve (110.0 MB to
+// 54.6 MB), which is where the other half of the saving is.
+// Pretty-printing was never a contract: every byte test in this package pins the file
+// relative to THIS function (./io-client.test.ts, ./workers/io-worker.test.ts), so the
+// inline and worker writers stay byte-identical whatever the spacing is.
 //
 // What stays on the coordinator no matter what (honest limit, restated in
 // ./workers/io-client.ts): building the `HarnessDatabase` record itself, and the
 // structured clone `postMessage` performs on it. Worker mode moves the stringify and
 // every syscall off the loop; it cannot move the object graph it is handed.
 export const serializeHarnessDatabase = (database: HarnessDatabase, savedAt = Date.now()): string =>
-    JSON.stringify({ ...database, version: HARNESS_DATABASE_VERSION, savedAt }, null, 2);
+    JSON.stringify({ ...database, version: HARNESS_DATABASE_VERSION, savedAt });
 
 // Post-increment staging counter: the first write of a writer gets `from`. Hoisted
 // out of the class so the worker keeps its OWN counter (a worker thread shares

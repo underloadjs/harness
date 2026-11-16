@@ -381,7 +381,13 @@ describe('one bar per turn', () => {
             ]
         });
         const { board, tile } = mount();
-        board.upsertView(summary(), view).renderDisplay((view.displays as Record<string, TurnDisplay>).t1);
+        // T23/C2: the tile's parsed prompt surface is created when its body is on screen (a
+        // collapsed body is `display: none`, styles.css:3267, and the collapsed row prints
+        // plain text), so this test reveals the tile before reading the prompt it renders.
+        const handle = board.upsertView(summary(), view);
+
+        handle.renderDisplay((view.displays as Record<string, TurnDisplay>).t1);
+        board.expand(handle);
 
         expect(tile().querySelector('.tile-prompt')?.textContent).toBe('read the notes and tell me what changed');
         expect(tile().querySelector('.turn-prompt')?.textContent).toContain('read the notes and tell me what changed');

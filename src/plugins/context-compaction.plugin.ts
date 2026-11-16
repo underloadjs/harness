@@ -189,6 +189,26 @@
 // silently stops mid-task. Its text names the summary as the source of the next step,
 // which is what makes the retained head usable without the model having to ask.
 //
+// THE ONE CASE WHERE IT IS A STEER INSTEAD (the delegated run). When the answer is owed to
+// a parent (`payload.depth >= 2`, `turn.after`:1611-1716), an out-of-band send would start a
+// run the parent has already stopped awaiting, so the tool result would carry the summary and
+// the real answer would be orphaned; there the same text is `api.threads.steer`ed into the run
+// that is still running, which buys that run one more turn. Two consequences a reader needs:
+//   - the nudge is drained into the transcript BEFORE the boundary that writes the range
+//     (src/harness.ts:12669 -> `emitTurnBefore` :12182), so it shares the marker and must not
+//     become the retention anchor — see `isContinuationNudge` and the F1 note there;
+//   - the fold lands on the continuation turn itself (`finalizeInRequest`, via `setIncluded`),
+//     never on a `thread.idle` rewrite, and the lane bump stays with `keepLaneBump` (:1213).
+// KNOWN LIMITATION (F2, accepted 2026-11-16): if that queued nudge is never drained — the turn
+// cap throws at src/harness.ts:12603-12649, before the :12669 drain — the run fails with the
+// nudge still sitting in `state.queue`, and the net's `thread.idle` send below starts a run
+// whose root turn AND first boundary drain both carry it: the nudge text appears twice
+// (measured per-request nudge counts [0,0,2]). It is retained rather than anchor-forming, so it
+// costs tokens and one duplicated instruction, not the retained head. Suppressing it needs a
+// queue read/clear the plugin api does not expose (`api.threads` has neither), and skipping the
+// idle send instead would strand a failed child whose answer nobody is awaiting — a duplicate
+// nudge is the cheaper failure.
+//
 // KNOWN LIMITATION (T11/D4, ratified as accepted 2026-11-10): that nudge run has NO
 // server-side turn record. The server's focused-submit path steers a thread it sees as
 // 'running' and then looks for the turn that owns it, and a run the RUNTIME started
@@ -967,6 +987,36 @@ const isAnswerMessage = (message: HarnessMessage): boolean =>
     message.role === 'assistant' &&
     !((message as { toolCalls?: unknown[] }).toolCalls?.length ?? 0);
 
+// True for the entry that IS the continuation nudge. The nudge carries the SAME marker prefix
+// as the instruction (both are built from `COMPACTION_MARKER`, :521/:539/:566, and
+// src/plugin/context-compaction.test.ts:4393-4394 pins both prefixes), so a marker-prefix scan
+// cannot tell the two apart — and the nudge is NOT an anchor: it is the entry that arrives AFTER
+// the answer to restart the conversation, while the retained head is defined relative to the
+// instruction THIS pass committed.
+//
+// WHY IT MATTERS (defect F1, found by review, not by the shipped suite). On the delegated
+// in-run continuation `drainThreadQueue` appends the nudge to the transcript BEFORE the request
+// is built (src/harness.ts:12669 -> :12671 -> `emitTurnBefore` :12182), so at the boundary that
+// writes the range the LAST marker-prefixed `user` entry is the nudge, not the instruction.
+// Anchoring there yields `answerIndex: -1` and disables every entry up to the nudge — this
+// pass's instruction and its summary included — so the continuation turn would be asked with the
+// nudge ALONE: the retained head is gone, inclusion flags are never re-enabled (durable), and the
+// next pass compounds it. A host conversation never hits this because host guidance is not
+// marker-prefixed, which is exactly the shape pinned at
+// src/plugin/context-compaction.test.ts:2752-2756 and :3387-3391.
+//
+// EXACT equality rather than another prefix: the marker contract stays intact for everything
+// else (a host's own shorter marker-prefixed instruction remains an anchor — pinned at
+// src/plugin/context-compaction.test.ts:4652-4668, and `isInstructionMessage` above is
+// unchanged), and the nudge is a constant this plugin writes VERBATIM — both the queue drain
+// (src/harness.ts:12669) and the idle-path `send` (:1740) commit `CONTINUATION_NUDGE`
+// byte-for-byte — so exactness cannot miss it. A nudge that sits BEFORE the current instruction
+// is still ordinary superseded history: the exclusion is only from the anchor scan, never from
+// the disable range.
+const isContinuationNudge = (message: HarnessMessage): boolean =>
+    message.role === 'user' &&
+    String((message as { content?: unknown }).content ?? '') === CONTINUATION_NUDGE;
+
 // The disable rule BOTH finalize paths share (`setIncluded` on a live run, a canonical
 // rewrite on an idle one). Everything before the instruction goes, because the summary
 // replaced it; everything strictly between the instruction and the final answer goes too,
@@ -985,9 +1035,13 @@ export const planCompactionRetention = (
     let instructionIndex = -1;
 
     // LAST match, not first: a transcript that still carries an older, already-compacted
-    // instruction must resolve against the one this pass committed.
+    // instruction must resolve against the one this pass committed. A continuation nudge is
+    // skipped as an anchor (see `isContinuationNudge`): it shares the marker, and anchoring on
+    // it would withhold the very instruction and summary this pass produced.
     for (let index = messages.length - 1; index >= 0; index -= 1) {
-        if (isInstructionMessage(messages[index])) {
+        const message = messages[index];
+
+        if (isInstructionMessage(message) && !isContinuationNudge(message)) {
             instructionIndex = index;
             break;
         }
@@ -1568,14 +1622,96 @@ export const createContextCompactionPasses = (
         // The record goes back to 'running' here because this run is still attached.
         unpark(threadId);
 
+        // ── Compaction inside a DELEGATED run: continue in the SAME run ─────────────────────
+        // A delegation answer travels back as the DELEGATE TOOL RESULT, whose `content` is the
+        // LAST assistant message of the awaited child run (src/harness.ts:5061-5070 builds the
+        // envelope from `message`). If compaction lets that run end on its own summary, the whole
+        // delegated task is answered with that meta-text, while the real answer — produced by the
+        // out-of-band nudge continuation the idle hook starts, in a run the parent stopped
+        // awaiting — is orphaned on the child thread (src/harness.ts:13525 -> 13547). That is the
+        // reported defect: a green, "finished" child whose parent was answered with a summary.
+        //
+        // So for a child run the continuation is queued INTO the run that is still running. The
+        // chain, in the order the harness runs it:
+        //   1. `steer` appends the nudge to `thread.queue` and marks the live run dirty
+        //      (src/harness.ts:7367-7422, `markRunDirty`: src/harness.ts:8409);
+        //   2. back in this turn's terminal branch, `run.dirty` is set, so the run takes another
+        //      turn instead of resolving (src/harness.ts:12813-12819) — and that branch emits
+        //      `attempt_commit`, NOT `done`, so the summary never folds the thread row green
+        //      (src/server/turn-projector.ts, src/frontend/ui/turns.ts read `done.pending`);
+        //   3. the top-of-loop drain (src/harness.ts:12669) appends the nudge as the next USER
+        //      turn of the SAME run, so its request is a fresh boundary;
+        //   4. that boundary finds the phase 'finishing' and `finalizeInRequest` withholds the
+        //      superseded range through `setIncluded` — the same lazy-write shape the host flow
+        //      pins at src/plugin/context-compaction.test.ts:2713;
+        //   5. the run ends on the real answer, which is what the parent's envelope carries.
+        let continuedInRun = false;
+        if (payload.depth >= 2) {
+            // `payload.depth` is the delegation-chain depth the runner computes for every run
+            // (src/harness.ts:13315-13320, and it is NOT on the `turn.before` payload — only on the
+            // `run.*`/`turn.*` identity block, src/types/index.ts:4990-4998): 1 is a host
+            // submission on the main thread (and a branch run, which has no persistent thread to
+            // compact), >= 2 is a run a tool started — `delegate`, or an explicit `ctx.run` bound
+            // to a durable conversation. A depth-1 run keeps the historical host flow untouched:
+            // the submission promise resolves on the summary and the nudge continuation runs as a
+            // second run.
+            let refusal: string | undefined;
+
+            try {
+                // THE RECEIPT IS THE ARBITER, not the absence of a throw: `steerThread` answers
+                // `{ queued: false, reason }` (src/harness.ts:7407-7413) when the conversation has
+                // no queueable run attached — status not `running`, or no live `state.run` — and
+                // `drainThreadQueue` (src/harness.ts:12439-12441) would then return false on an
+                // empty or missing queue, i.e. the nudge would be queued into a state that cannot
+                // drain it. Queuing into a conversation that cannot drain it is worse than not
+                // queuing at all, so only a `queued: true` receipt counts as the in-run path.
+                const receipt = api.threads.steer(threadId, CONTINUATION_NUDGE);
+
+                continuedInRun = receipt.queued;
+
+                if (!continuedInRun) {
+                    refusal = receipt.reason ?? 'the conversation refused the steering';
+                }
+            } catch (error) {
+                // Unknown or already purged conversation.
+                refusal = error instanceof Error ? error.message : String(error);
+            }
+
+            if (refusal !== undefined) {
+                // Neither a refusal nor a throw is a failure: the idle hook below still sends the
+                // nudge out of band, exactly the pre-fix behavior, which leaves the run ending on
+                // the summary and the tool result carrying it. The operator is told which shape
+                // this was, because it is the shape where the reported defect stays visible.
+                api.report.diagnostic({
+                    message:
+                        `context-compaction thread ${threadId} could not queue the compaction continuation inside ` +
+                        `the running child (${refusal}). The continuation will be sent out-of-band instead, so the ` +
+                        `delegate tool result stays the summary.`,
+                    data: { mode: MODE_SUMMARIZE, threadId, iteration: payload.iteration, stage: 'continue' }
+                });
+            }
+        }
+
         api.report.diagnostic({
             message:
                 `context-compaction thread ${threadId} answered its compaction instruction on turn ` +
-                `${payload.iteration}; the conversation is un-parked and the superseded range is withheld at the ` +
-                `next boundary (or now, if this was the run's last turn).`,
-            data: { mode: MODE_SUMMARIZE, threadId, iteration: payload.iteration }
+                `${payload.iteration}; the conversation is un-parked and the superseded range is withheld ` +
+                (continuedInRun
+                    ? `on the continuation turn this same run now owns.`
+                    : `at the next boundary (or now, if this was the run's last turn).`),
+            data: {
+                mode: MODE_SUMMARIZE,
+                threadId,
+                iteration: payload.iteration,
+                // Marks the pass whose answer is owed to a parent: the fold happens in this run
+                // rather than on the next boundary, and one report per pass is kept.
+                ...(continuedInRun ? { continuedInRun: true } : {})
+            }
         });
 
+        // The pass needs no explicit de-duplication: the continuation turn's own `turn.before`
+        // consumes the 'finishing' phase through `finalizeInRequest`, which deletes the phase and
+        // emits the single finalize report, and this handler is gated on 'compacting' (line 1615).
         return undefined;
     };
 
@@ -1613,6 +1749,38 @@ export const createContextCompactionPasses = (
 
     // The safety nets. A summarize pass that never reached its answer must still leave a
     // conversation the host can use: the park is the only durable thing it touched.
+    //
+    // Whether a `compacting` pass whose run terminated anyway still OWES the transcript a fold:
+    // both the injected instruction and its prose answer are committed in the conversation. That
+    // state is reachable without `turn.after` ever promoting the phase, and the hook bus is NOT
+    // a cause of it: src/plugin/hooks.ts rule 2 (FAIL-OPEN) runs the remaining handlers even
+    // when one throws, so a sibling subscription cannot swallow this hook. What can skip the
+    // hand-off is the answering turn never REACHING the `turn.after` emit at all — the throws
+    // between the turn's commit and that emit (tool-call id integrity src/harness.ts:12694-12707,
+    // the autoanswer contract :12712-12716, the state-change notify :12721) leave a committed
+    // answer in a conversation whose run then fails or finishes, and an out-of-loop write (a host
+    // `replaceMessages`, a restore, another lane answering our instruction) leaves the same shape
+    // with no emit at all. Which cause it was does not matter to this hook: the probe reads the
+    // transcript, so a pass whose instruction and answer still stand is carried forward and one
+    // they rolled back is not. It is also the only net case that has work in flight: the answer
+    // exists, so the superseded range still has to be withheld and the conversation still has to
+    // be continued. A transcript this hook cannot read (purged thread, host-refused read) counts
+    // as "no answer", so the nets keep their historical abandon path instead of rewriting a
+    // transcript they never saw.
+    const hasCommittedCompactionAnswer = (threadId: string): boolean => {
+        try {
+            const range = planCompactionRetention(api.threads.messages(threadId));
+
+            // `answerIndex === -1` is the ordinary abandoned pass: the instruction went in and the
+            // model never answered in prose. `planCompactionRetention` would then withhold
+            // everything before the instruction with no summary to stand in for it, so the fold
+            // needs BOTH ends of the range.
+            return range.instructionIndex !== -1 && range.answerIndex !== -1;
+        } catch {
+            return false;
+        }
+    };
+
     const runFinished: HarnessLifecycleHandler<'run.finished'> = (payload) => {
         const threadId = payload.threadId;
 
@@ -1637,26 +1805,55 @@ export const createContextCompactionPasses = (
         // `finishing` itself still survives this hook (only `compacting` clears): the
         // `thread.idle` that follows it in the same `finally` is where the range is written,
         // and that path needs the phase.
+        //
+        // THE SECONDARY DEFECT THIS CLOSES: clearing a `compacting` phase used to be
+        // unconditional, which silently destroyed the one thing that same `thread.idle`
+        // (src/harness.ts:13821) is gated on. When the transcript already holds instruction AND
+        // answer, the pass is not abandoned — its fold and its continuation nudge would simply
+        // never happen, leaving the superseded range in context forever and the conversation idle
+        // mid-task. So the net PROMOTES to `finishing` whenever an answer is actually there to
+        // fold, and the idle hook does the rest; anything else keeps the abandon path below.
+        let carriedToIdleFinalize = false;
+
         if (phase === 'compacting') {
-            phases.delete(threadId);
-            // DISPLAY LANE (C1): the pass ended without ever producing a compaction
-            // answer, so the instruction it committed never became a summary. The lane it
-            // raised on the way in is undone here, or every later turn of this conversation
-            // would be drawn one row too low with no boundary that happened.
-            //
-            // THE RESIDUAL: this restores the COUNTER only. Events the recorder already
-            // stamped carry the bumped lane verbatim (../server/sessions.ts stamps at record
-            // time and nothing rewrites a stored event), so an abandoned pass can leave the
-            // boundary turn's bar showing the bumped row — the conversation may show one
-            // empty row in its context bar, exactly as the refused-write diagnostic in
-            // `revertLaneBump` says.
-            revertLaneBump(threadId);
+            if (hasCommittedCompactionAnswer(threadId)) {
+                phases.set(threadId, 'finishing');
+                carriedToIdleFinalize = true;
+            } else {
+                phases.delete(threadId);
+                // DISPLAY LANE (C1): the pass ended without ever producing a compaction
+                // answer, so the instruction it committed never became a summary. The lane it
+                // raised on the way in is undone here, or every later turn of this conversation
+                // would be drawn one row too low with no boundary that happened.
+                //
+                // THE RESIDUAL: this restores the COUNTER only. Events the recorder already
+                // stamped carry the bumped lane verbatim (../server/sessions.ts stamps at record
+                // time and nothing rewrites a stored event), so an abandoned pass can leave the
+                // boundary turn's bar showing the bumped row — the conversation may show one
+                // empty row in its context bar, exactly as the refused-write diagnostic in
+                // `revertLaneBump` says.
+                revertLaneBump(threadId);
+            }
         }
 
         // A no-op in the ordinary `finishing` case — `turn.after` un-parked two hooks
         // earlier — which is also why no report is emitted for it: the pass is not
         // abandoned there, and the finalize report below already covers it.
         unpark(threadId);
+
+        if (carriedToIdleFinalize) {
+            // Not an abandonment, and not a silent lift either: the pass is handed to the idle
+            // finalize, which reports the range it withholds and sends the continuation.
+            api.report.diagnostic({
+                message:
+                    `context-compaction thread ${threadId} had its run end before the turn.after hand-off, but the ` +
+                    `compaction answer is committed: the pass is carried to the idle finalize, which withholds the ` +
+                    `superseded range and sends the continuation nudge.`,
+                data: { mode: MODE_SUMMARIZE, threadId, hook: 'run.finished', phase: 'finishing' }
+            });
+
+            return undefined;
+        }
 
         if (phase !== 'compacting') return undefined;
 
@@ -1687,23 +1884,50 @@ export const createContextCompactionPasses = (
         // the range from the surviving entries, and if it did not, that boundary finds no
         // instruction and clears the phase itself. What never survives is the park: a
         // thread left 'paused' is a conversation its host cannot reach.
+        //
+        // The rollback assumption is what the transcript probe below checks instead of
+        // trusting: when it DID roll back (the usual case) there is no answer to find and this
+        // hook abandons as before; when an answer survived, this hook hands the pass to the
+        // idle finalize exactly as `runFinished` does.
+        let carriedToIdleFinalize = false;
+
         if (phase === 'compacting') {
-            phases.delete(threadId);
-            // DISPLAY LANE (C1): the run's rollback took the instruction and any answer
-            // back out of the transcript, so this pass left nothing behind and its lane
-            // bump is undone with the rest. A `finishing` pass keeps its bump: its summary
-            // may well have survived (the failure came later), and the next boundary owns
-            // that decision.
-            //
-            // THE RESIDUAL: as in `runFinished`, only the COUNTER comes back — events the
-            // recorder stamped while the lane was raised keep their bumped `lane` key
-            // (../server/sessions.ts), so this abandoned pass can leave the boundary turn's
-            // bar showing the bumped row: one empty row in its context bar, the same
-            // cosmetic cost the refused-write diagnostic in `revertLaneBump` reports.
-            revertLaneBump(threadId);
+            if (hasCommittedCompactionAnswer(threadId)) {
+                // Same hand-off as `runFinished`: something DID survive this run's rollback
+                // (the failure landed after the answer was committed), so the range it describes
+                // must still be withheld and the conversation still has to be continued.
+                phases.set(threadId, 'finishing');
+                carriedToIdleFinalize = true;
+            } else {
+                phases.delete(threadId);
+                // DISPLAY LANE (C1): the run's rollback took the instruction and any answer
+                // back out of the transcript, so this pass left nothing behind and its lane
+                // bump is undone with the rest. A `finishing` pass keeps its bump: its summary
+                // may well have survived (the failure came later), and the next boundary owns
+                // that decision.
+                //
+                // THE RESIDUAL: as in `runFinished`, only the COUNTER comes back — events the
+                // recorder stamped while the lane was raised keep their bumped `lane` key
+                // (../server/sessions.ts), so this abandoned pass can leave the boundary turn's
+                // bar showing the bumped row: one empty row in its context bar, the same
+                // cosmetic cost the refused-write diagnostic in `revertLaneBump` reports.
+                revertLaneBump(threadId);
+            }
         }
 
         unpark(threadId);
+
+        if (carriedToIdleFinalize) {
+            api.report.diagnostic({
+                message:
+                    `context-compaction thread ${threadId} had its run fail before the turn.after hand-off, but the ` +
+                    `compaction answer survived the rollback: the pass is carried to the idle finalize, which ` +
+                    `withholds the superseded range and sends the continuation nudge.`,
+                data: { mode: MODE_SUMMARIZE, threadId, hook: 'run.failed', phase: 'finishing' }
+            });
+
+            return undefined;
+        }
 
         api.report.diagnostic({
             message:

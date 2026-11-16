@@ -80,8 +80,21 @@ import { HarnessError, isInstanceOf, toErrorInfo } from '../util';
 import {
     CONTEXT_OVERFLOW_CODE,
     MAX_RESPONSE_SCHEMA_NAME_CHARS,
-    openAICompatible
+    openAICompatible,
+    // (T6) The two provider failure CLASSES the transport names, so the retry policy
+    // below switches on a machine code exactly like `context-overflow` does — never on
+    // English. `provider-timeout` is terminal; `provider-connection` gets the short
+    // ladder from ./agent-limits.ts.
+    // (T8, AC3) `provider-rejected` is the third class: a deterministic HTTP refusal
+    // (400/401/403/404) is terminal for the same reason a missed bound is — the next
+    // attempt re-sends the request the provider already refused.
+    PROVIDER_CONNECTION_CODE,
+    PROVIDER_REJECTED_CODE,
+    PROVIDER_TIMEOUT_CODE
 } from '../transport';
+// (T6) The short ladder a dead dial gets, kept in the same leaf as every other run
+// bound (the declared contract AND the runtime values).
+import { PROVIDER_CONNECTION_MAX_RETRIES, PROVIDER_CONNECTION_RETRY_BASE_DELAY_MS } from './agent-limits';
 import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
 import {
     agentBranchOf,
@@ -546,6 +559,67 @@ const resolveRetryPolicy = (configuration: HarnessRetryConfiguration | undefined
 // The wait before retry `attempt` (1-based): 1000, 2000, 4000 ... by default.
 const retryDelayOf = (policy: RetryPolicy, attempt: number): number =>
     policy.baseDelayMs * 2 ** (attempt - 1);
+
+// ---------------------------------------------------------------------------
+// Provider failure classes (T6)
+// ---------------------------------------------------------------------------
+
+// Total attempts for the connection ladder (the initial one plus its 2 retries).
+// `retry.maxRetries` does NOT stretch it: a host widening the transient ladder is
+// saying "my provider blips", not "my provider is down", and a dial that reached
+// nobody still deserves the fast terminal answer.
+const PROVIDER_CONNECTION_MAX_ATTEMPTS = PROVIDER_CONNECTION_MAX_RETRIES + 1;
+
+// The wait before retry `attempt` (1-based) of the connection ladder: 250, 500.
+const providerConnectionDelayOf = (attempt: number): number =>
+    PROVIDER_CONNECTION_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+
+// Lift the transport's structured diagnostics off a failed attempt's error.
+//
+// The transport puts them on the error FRAME (`details`, see ../types), the frame
+// loop below puts them on the thrown `HarnessError`, and this is the one place that
+// decides whether they are SHAPE-ABLE: a custom transport may put anything in
+// `details`, so every field is checked before it rides onto a published event.
+// Anything unrecognised yields `undefined`, and the `retry` event keeps the exact
+// shape it had before T6.
+type ProviderAttemptDiagnostics = {
+    errorClass: string;
+    url: string;
+    port?: number;
+    phase?: 'response-head' | 'first-token' | 'stream-chunk';
+    timeoutMs?: number;
+    errno?: string;
+};
+
+const providerDiagnosticsOf = (error: unknown): ProviderAttemptDiagnostics | undefined => {
+    try {
+        if (!isInstanceOf(error, HarnessError)) return undefined;
+
+        const details = error.details;
+
+        if (typeof details !== 'object' || details === null) return undefined;
+
+        const record = details as Record<string, unknown>;
+
+        if (typeof record.errorClass !== 'string' || typeof record.url !== 'string') return undefined;
+
+        return {
+            errorClass: record.errorClass,
+            // Already redacted by the transport (origin + path, no userinfo/query), so
+            // a UI can render it without risking an echoed credential.
+            url: record.url,
+            ...(typeof record.port === 'number' ? { port: record.port } : {}),
+            ...(record.phase === 'response-head' || record.phase === 'first-token' || record.phase === 'stream-chunk'
+                ? { phase: record.phase }
+                : {}),
+            ...(typeof record.timeoutMs === 'number' ? { timeoutMs: record.timeoutMs } : {}),
+            ...(typeof record.errno === 'string' ? { errno: record.errno } : {})
+        };
+    } catch {
+        // Diagnostics are never worth a second failure on an error path.
+        return undefined;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Pre-request context floor (issue 0004)
@@ -1015,7 +1089,13 @@ const createAgent = (
                             // transport-declared overflow is still a `context-overflow`
                             // failure here rather than an anonymous one — the retry
                             // ladder below reads the code, not the prose.
-                            failure = new HarnessError(event.message, { code: event.code });
+                            // (T6) `details` rides along for the same reason `code`
+                            // does: it is the transport's structured diagnosis, and the
+                            // retry event below publishes it.
+                            failure = new HarnessError(event.message, {
+                                code: event.code,
+                                details: event.details
+                            });
                         }
                         continue;
                     }
@@ -1045,7 +1125,7 @@ const createAgent = (
                             // code throws exactly the codeless `HarnessError` it threw
                             // before, so `error.name` and every existing payload are
                             // unchanged.
-                            throw new HarnessError(event.message, { code: event.code });
+                            throw new HarnessError(event.message, { code: event.code, details: event.details });
 
                         case 'done':
                             stopReason = event.stopReason;
@@ -1120,22 +1200,69 @@ const createAgent = (
                         throw error;
                     }
 
-                    // Out of retries: the last attempt's own error is the answer.
-                    if (attempt >= maxAttempts) throw error;
+                    const code = isInstanceOf(error, HarnessError) ? error.code : undefined;
 
-                    const delayMs = retryDelayOf(retryPolicy, attempt);
+                    // A TIMEOUT IS NOT A TRANSIENT FAILURE EITHER (T6, AC1). A provider
+                    // that missed a five-minute head or first-token bound, or went
+                    // silent for two minutes mid-stream, has already consumed the whole
+                    // patience budget the ladder exists to buy; re-sending into the same
+                    // wedge would pay ANOTHER bound on top, which is how a stalled
+                    // gateway would take 30 minutes to say nothing. So the attempt that
+                    // tripped a bound is TERMINAL, and the error (already naming the
+                    // endpoint, the phase and the variable to raise) is what the caller
+                    // sees. `provider.*TimeoutMs` = 0 remains the escape hatch for a
+                    // legitimately slower provider: with no bound there is no
+                    // `provider-timeout`, and the pre-T6 behaviour is back exactly.
+                    // A DETERMINISTIC REFUSAL IS NOT A TRANSIENT FAILURE EITHER (T8,
+                    // AC3). `provider-rejected` is the transport's name for an HTTP
+                    // 400/401/403/404 answer (transport/openai.ts): the provider is up
+                    // and refused THESE BYTES — a bad key, a wrong model id, a refused
+                    // argument. Only the request can change, so the ladder cannot help;
+                    // before this, that frame carried no code and spent the full
+                    // 1 + 10-attempt ladder (~17 min) looking exactly like a hang. 408,
+                    // 429 and 5xx are NOT in that class (time, not the request fixes
+                    // them) and keep the ladder, as does every codeless frame — so an
+                    // unclassified 4xx or a scripted provider error is still retried
+                    // exactly as src/core/agent.retry.test.ts pins it.
+                    if (code === PROVIDER_TIMEOUT_CODE || code === PROVIDER_REJECTED_CODE) throw error;
+
+                    // A DEAD DIAL IS NOT A TRANSIENT FAILURE EITHER (T6, AC2). A refused
+                    // connection, an unresolvable host, or a reset before the first byte
+                    // means nothing answered the port — a configuration condition, not a
+                    // blip. It gets the short, capped ladder from ./agent-limits.ts
+                    // (1 + 2 retries, 250 ms and 500 ms, 750 ms of waiting in total)
+                    // instead of the 1 s -> 512 s one, then fails terminally with a
+                    // message that names the dialled host:port. 17.05 minutes became
+                    // under a second for a localhost refusal.
+                    const connection = code === PROVIDER_CONNECTION_CODE;
+                    const attemptsForClass = connection ? PROVIDER_CONNECTION_MAX_ATTEMPTS : maxAttempts;
+
+                    // Out of retries for THIS class: the last attempt's own error is the answer.
+                    if (attempt >= attemptsForClass) throw error;
+
+                    const delayMs = connection
+                        ? providerConnectionDelayOf(attempt)
+                        : retryDelayOf(retryPolicy, attempt);
 
                     // Tell the consumer this attempt failed and what comes next. The
                     // event precedes the wait, so a UI can show the backoff while it
                     // happens; the message is the failed attempt's error, and every
                     // delta streamed since the previous boundary belongs to that
                     // failed attempt (consumers discard them).
+                    // (T6, AC6) `provider` is the structured diagnostic the UI needs to
+                    // say WHICH provider and port is blocking, and how long the next
+                    // wait is. Absent for an unclassified failure, so every existing
+                    // consumer sees the event shape it always saw. `maxAttempts` is the
+                    // CLASS's total, so a connection retry honestly reports "1 of 3".
+                    const provider = providerDiagnosticsOf(error);
+
                     yield {
                         type: 'retry',
                         attempt,
-                        maxAttempts,
+                        maxAttempts: attemptsForClass,
                         delayMs,
-                        error: toErrorInfo(error)
+                        error: toErrorInfo(error),
+                        ...(provider === undefined ? {} : { provider })
                     };
 
                     // Waits abort-immediately; the timer and listener are cleaned up

@@ -716,10 +716,16 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     // R1 (T3) + T9: the header is the title row plus the note, and the row's session items
     // are the compact cycler and its `+`. The pill strip that used to sit under the title is
     // gone at every width; the directory is the dashboard behind the title button.
+    //
+    // T9 adds the THIRD child: `.harness-provider`, the always-visible provider-target line
+    // (`provider localhost:5500 · model basalt-8k`). It is a sibling of the note, never part
+    // of it, because `.harness-note`'s text is owned by every head painter and pinned by its
+    // own assertions, and a session fact must not be appended into a shared line.
     const head = document.querySelector<HTMLElement>('.harness-head');
     expect([...(head?.children ?? [])].map((node) => node.className)).toEqual([
         'harness-title-row',
-        'harness-note'
+        'harness-note',
+        'harness-provider'
     ]);
     expect(document.querySelector('.session-pills-bar-head')).toBeNull();
     expect(head?.querySelector('.session-pills')).toBeNull();

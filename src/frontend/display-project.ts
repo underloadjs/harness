@@ -444,8 +444,22 @@ export const projectSection = (section: WireTurnSection): TurnSection => {
 export const projectDisplay = (display: WireTurnDisplay): TurnDisplay => ({
     turnId: display.turnId,
     sections: (display.sections ?? []).map(projectSection),
-    ...(display.lastSectionOrdinal === undefined ? {} : { lastSectionOrdinal: display.lastSectionOrdinal })
-});
+    ...(display.lastSectionOrdinal === undefined ? {} : { lastSectionOrdinal: display.lastSectionOrdinal }),
+    // T23/C1 (additive): the server's per-tree change counter (../shared/harness-api.ts:3596
+    // `TurnDisplay.revision`, minted at src/server/api.ts:5174) used to be DROPPED here, so
+    // the tile's unchanged-tree gate (./ui/turns.ts `syncCompiledDisplay` →
+    // ./ui/display-stamp.ts) had no access to it. It travels through as the plain scalar the
+    // wire states — never re-derived — and is one more signal in that stamp: a fresh read of a
+    // tree whose content happens to read identically now repaints deterministically. It is
+    // deliberately NOT the only signal, because the ops fold (../view-state.ts
+    // `applyOpToDisplay`) mutates this object in place without restamping the counter.
+    //
+    // The cast is the seam: `TurnDisplay` (../shared/turn-display.ts:1149) is the internal
+    // fold model and does not name the field, and src/shared is another writer's surface, so
+    // the frontend carries the wire's scalar structurally rather than widening the shared
+    // type. Absent on a hand-built fixture means "no statement", exactly as on the wire.
+    ...(display.revision === undefined ? {} : { revision: display.revision })
+} as TurnDisplay);
 
 // The background calls a cold tree reports per section, addressed the way
 // `view-state.ts` addresses them (`pendingKeyOf(turnId, sectionId)`), so a tree read

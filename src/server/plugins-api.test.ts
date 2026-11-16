@@ -1365,6 +1365,28 @@ describe('the server installs a plugin-diagnostic sink (T1.5 last mile)', () => 
     const documentOf = (root: string): Record<string, any> =>
         JSON.parse(readFileSync(join(root, 'harness', 'state.json'), 'utf8')) as Record<string, any>;
 
+    // T25: waits for a DEFERRED best-effort checkpoint to reach `state.json`. A state change
+    // inside one `VIEW_CHECKPOINT_INTERVAL_MS` window no longer rewrites the document
+    // synchronously; ./sessions.ts `scheduleCheckpoint` commits it at the end of that window,
+    // and this polls the bytes until it has (the budget is that bound with slack; running it
+    // out is the failure, because it means the deferred commit never happened). Iteration-
+    // counted rather than wall-clock so a mocked clock cannot make it expire early.
+    const waitForDocument = async (
+        root: string,
+        settled: (document: Record<string, any>) => boolean,
+        budgetMs = 8_000
+    ): Promise<void> => {
+        const attempts = Math.ceil(budgetMs / 25);
+
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+            if (settled(documentOf(root))) return;
+
+            await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+
+        throw new Error(`state.json did not reach the expected shape within ${budgetMs} ms.`);
+    };
+
     afterEach(async () => {
         probeThrows = false;
         probeReportsPolicy = false;
@@ -1452,6 +1474,14 @@ describe('the server installs a plugin-diagnostic sink (T1.5 last mile)', () => 
         // The document, not just the in-memory session. The store writes the journal with the NEXT
         // state change rather than scheduling a save for a diagnostic, and a run always produces
         // one — so "broken since before the restart" is a fact the next process can still read.
+        //
+        // T25: "with the next state change" is now a CHECKPOINT-WINDOW writer, not a synchronous
+        // one (F1, ./sessions.ts `noteStateChange` → `checkpoint`), so the durable plane carries
+        // the journal entry at the end of that window via `scheduleCheckpoint`. Waiting for the
+        // byte is what keeps this pin about durability instead of about how fast the observer
+        // happened to write; the assertion below is unchanged.
+        await waitForDocument(root, (document) => JSON.stringify(document).includes('could not read the transcript'));
+
         expect(documentOf(root).sessions[0].pluginDiagnostics).toEqual([diagnostic]);
 
         const second = createRuntime({ root });

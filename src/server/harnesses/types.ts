@@ -18,10 +18,27 @@ import type {
 } from '../../harness';
 
 // The provider settings a caller can change per session.
+//
+// (T8, AC2) The three provider TIME BOUNDS ride along with the endpoint they bound.
+// They are optional and additive: absent means "this session has no opinion", and the
+// transport then resolves the value itself — environment variable first, shipped
+// default last (`../../transport/provider-timeouts.ts`, one parser:
+// `resolveProviderTimeout`). Supplying one makes THIS session authoritative over both,
+// which is the whole point: a deployment whose slow provider needs a longer head bound
+// can raise it for one provider without restarting the process on an env var, and
+// `0` disables that bound for that session alone. Validation (and therefore the
+// 400-vs-what a client sent decision) lives in `mergeSettings` (../config.ts), so the
+// REST surface and the store refuse the same bad value with the same message.
 export type RunnerSettings = {
     baseURL: string;
     apiKey: string;
     model: string;
+    // Bound on `fetch` resolving with response headers, in ms (`0` = off).
+    responseHeadTimeoutMs?: number;
+    // Bound on the FIRST streamed token after the head, in ms (`0` = off).
+    firstTokenTimeoutMs?: number;
+    // Bound BETWEEN consecutive reads of an open body, in ms (`0` = off).
+    streamChunkTimeoutMs?: number;
 };
 
 // Persistence observer the server may attach at construction (R3a/R3b). Optional

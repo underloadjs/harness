@@ -245,10 +245,21 @@ export const coreToolNames = (
 
 // Provider settings are never used by construction; they only feed `agent(...)`.
 // An empty key is omitted rather than sent as `Bearer `.
+//
+// (T8, AC2) The three time bounds are forwarded ONLY when this session actually set
+// one, and that conditional is the precedence mechanism: `provider.*TimeoutMs` absent
+// leaves the transport free to resolve environment -> shipped default at construction
+// (transport/openai.ts -> `resolveProviderTimeout`), while a set field is authoritative
+// over both. Spreading `undefined` in instead would be the same value to the parser but
+// would make every settings object claim all three fields, so `providerOf`'s output for
+// an untouched session stays exactly the object it was before T8.
 export const providerOf = (settings: RunnerSettings) => ({
     baseURL: settings.baseURL.trim(),
     apiKey: settings.apiKey.trim().length === 0 ? undefined : settings.apiKey,
-    sampling: { temperature: 0.3 }
+    sampling: { temperature: 0.3 },
+    ...(settings.responseHeadTimeoutMs === undefined ? {} : { responseHeadTimeoutMs: settings.responseHeadTimeoutMs }),
+    ...(settings.firstTokenTimeoutMs === undefined ? {} : { firstTokenTimeoutMs: settings.firstTokenTimeoutMs }),
+    ...(settings.streamChunkTimeoutMs === undefined ? {} : { streamChunkTimeoutMs: settings.streamChunkTimeoutMs })
 });
 
 // Build one agent from a TRUSTED profile. The profile supplies the identity and

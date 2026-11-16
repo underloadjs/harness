@@ -549,6 +549,22 @@ export interface RuntimeSettings {
 export interface GlobalConfigDocument {
     defaults: ProviderDefaults;
     runtime?: RuntimeSettings;
+    /**
+     * The EFFECTIVE provider time bounds in force for this process, in milliseconds, after the environment has
+     * been merged with the shipped defaults. They are reported read-only (a deployment sets them with
+     * `HARNESS_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS`, `HARNESS_PROVIDER_FIRST_TOKEN_TIMEOUT_MS` or
+     * `HARNESS_PROVIDER_STREAM_CHUNK_TIMEOUT_MS`, never with this document) so a client can explain a
+     * `provider-timeout` failure with the number that actually expired instead of the constant. A value of `0`
+     * means that bound is DISABLED, i.e. that leg waits forever, exactly as before the bounds existed.
+     */
+    providerTimeouts?: {
+      /** Bound on the provider returning response headers for a chat request (`0` = no bound). */
+      responseHeadTimeoutMs: number;
+      /** Bound on the FIRST streamed token after the head (`0` = no bound). */
+      firstTokenTimeoutMs: number;
+      /** Bound between consecutive reads of an open stream (`0` = no bound). */
+      streamChunkTimeoutMs: number;
+      };
     /** The exact fields `PATCH /config` accepts, so a client cannot guess the allowlist. */
     writable_fields: ("settings.base_url" | "settings.model" | "settings.api_key")[];
     /**

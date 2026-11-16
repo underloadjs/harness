@@ -162,6 +162,12 @@ import type { DisplayPlane, ThreadTranscriptLoader, ViewStreamItem } from './vie
 // `startWatching`). Accessing the singleton here cannot dial anything: `harnessStream()` only
 // creates the client the first time, and the observer above already did.
 import { harnessStream } from './stream';
+// (T9) Provider-target diagnosis: the persistent "which provider does this conversation
+// dial" line, the live provider-retry line, and the classified terminal failure. All three
+// are pure text/decision helpers in ./provider-diagnostics.ts (pinned there); this file
+// only owns the nodes and when they are painted.
+import { providerFailureOf, providerTargetNote, providerTimeoutsNote } from './provider-diagnostics';
+import type { ProviderTimeouts } from './provider-diagnostics';
 // The lazy payload reads the display plane needs: one turn's tree (the focused
 // subscription's resync recovery), the out-of-band pending figure a cold tree states,
 // and the frozen definition — the only remaining source of a conversation's
@@ -494,7 +500,7 @@ const resolveFileForPreview: FilePreviewResolver = async (name) => {
 const STORAGE_KEY = 'underload-harness-app:settings';
 
 const DEFAULT_SETTINGS: RunnerSettings = {
-    baseURL: 'http://localhost:5500/providers/private/v1',
+    baseURL: 'http://localhost:6660/providers/private/v1',
     apiKey: '',
     // The local basalt model: the id the gateway above serves for it, and the model
     // every preset agent shows in the deck when it has no per-agent override.
@@ -2792,11 +2798,22 @@ const harnessList = el('div', 'harness-list');
 // walking away from the dialog is the same decision as never opening it.
 const endpointBody = el('div', 'endpoint-body');
 
-const controls = new Map<keyof RunnerSettings, HTMLInputElement>();
+// The three text fields this pane edits. NARROWED on purpose (T9): `RunnerSettings`
+// (../server/harnesses/types.ts) now also carries the three numeric provider BOUNDS
+// (`responseHeadTimeoutMs` / `firstTokenTimeoutMs` / `streamChunkTimeoutMs`), and a generic
+// `keyof RunnerSettings` map would make every `endpointDraft[key]` a
+// `string | number | undefined` — which is a type error at every `control.value` write, and
+// a product question this pane has not answered: the bounds are read-only here (they are
+// not in `writable_fields`), they are only REPORTED, by the `.endpoint-timeouts` line below.
+// So the controls map holds exactly the keys that are strings, and the bounds stay out of
+// the draft-then-Apply cycle they were never part of.
+type EndpointTextField = 'baseURL' | 'apiKey' | 'model';
+
+const controls = new Map<EndpointTextField, HTMLInputElement>();
 
 const field = (
     label: string,
-    key: keyof RunnerSettings,
+    key: EndpointTextField,
     type: string,
     placeholder: string
 ): HTMLElement => {
@@ -3506,6 +3523,29 @@ const commitFromEnter = (event: KeyboardEvent): void => {
     }
 };
 
+// (T9/AC4) The provider bounds this deployment runs, read from `GET /config`
+// (`providerTimeouts`). It sits directly under `Base URL` because it answers the next
+// question a reader has after seeing an address: how long does one attempt wait there.
+//
+// The field is OPTIONAL by contract (a parallel server task is adding it now), so:
+//   - boot reads it through `providerTimeoutsOf` (./provider-diagnostics.ts), which
+//     answers `undefined` for a missing, null, non-object or all-invalid block;
+//   - `undefined` leaves this node EMPTY and `hidden`, so an older server changes nothing
+//     in the dialog — no empty paragraph, no `undefined`, no throw, and the settings pane
+//     still renders its four normal rows (AC4).
+const providerTimeoutsLine = el('p', 'endpoint-timeouts', '');
+providerTimeoutsLine.id = 'endpoint-timeouts';
+providerTimeoutsLine.hidden = true;
+
+// One painter, called once from boot. Nothing else writes it: the bounds are deployment
+// configuration, and this UI cannot change them (they are not in `writable_fields`).
+const paintProviderTimeouts = (timeouts: ProviderTimeouts | undefined): void => {
+    const note = providerTimeoutsNote(timeouts);
+
+    providerTimeoutsLine.textContent = note ?? '';
+    providerTimeoutsLine.hidden = note === undefined;
+};
+
 endpointBody.append(
     // The server choice reads FIRST: it decides where the provider credentials below
     // are about to be sent.
@@ -3516,7 +3556,9 @@ endpointBody.append(
     // Terse state line: the root THIS load dials. A deployment question ("is this page
     // talking to /v1/harness or /api?") stays answerable without devtools.
     serverRootLive,
-    field('Base URL', 'baseURL', 'text', 'http://localhost:5500/providers/private/v1'),
+    field('Base URL', 'baseURL', 'text', 'http://localhost:6660/providers/private/v1'),
+    // (T9/AC4) The bounds that address belongs to, immediately under it.
+    providerTimeoutsLine,
     field('API key', 'apiKey', 'password', 'optional'),
     modelField,
     // LAST, and right-aligned: the single commit for everything above it.
@@ -3659,6 +3701,24 @@ const headName = el('span', 'harness-id', '');
 const headNote = el('p', 'harness-note', '');
 headNote.id = 'harness-note';
 
+// (T9/AC1) The persistent provider-target line: `provider localhost:5500 · model basalt`.
+//
+// WHY A SEPARATE NODE: `.harness-note` is owned by every head painter (chat, tools,
+// plugins) and its exact text is pinned by main.test/compact-ui/catalogue, so a session
+// fact must not be appended into it. This is a sibling under the same head, so it sits in
+// the always-visible detail line under the title — next to where the user reads the
+// conversation label — and it is app-wide-visible without opening settings, which is the
+// whole point: "5500 or 6660?" has to be answerable while the run is stuck.
+//
+// It states the EFFECTIVE per-session endpoint (`SessionView.endpoint`, ./view-api.ts:167
+// from `GET /sessions/:id`), not the shipped default. `providerTargetNote` returns
+// undefined when the endpoint is unknown AND no model is known, and then this line is
+// `hidden` — an unknown target prints nothing rather than the built-in default, because a
+// default is exactly the answer that misled the user.
+const providerLine = el('p', 'harness-provider', '');
+providerLine.id = 'harness-provider';
+providerLine.hidden = true;
+
 // T7 (user feedback, phone): "Lower screen … needed to highlight which session is being
 // viewed, but I want a pill next to the instruct button … clicking it will rotate through
 // the session available. There is no need for delete button in this mode."
@@ -3755,6 +3815,48 @@ const paintHeadTitleTrigger = (mode: 'harness' | 'sessions'): void => {
     // The tools head names the catalogue or a tool, so the popup it opens is the session
     // dashboard, never "harness details" for a harness the head is not describing.
     headTitleButton.title = mode === 'sessions' ? 'Show sessions' : 'Show harness details';
+    // (T9/AC1) Same hook, same rule: this function is the ONE place every head painter
+    // passes through (`renderHarnessChrome` with 'harness', the tools/plugins heads with
+    // 'sessions'), so the provider-target line can never be left showing another view's
+    // conversation, and no new painter has to remember it.
+    paintProviderLine(mode);
+};
+
+// Paints the persistent provider-target line (T9/AC1): `provider localhost:5500 · model
+// basalt`, so "which provider is this run dialling?" is answerable without opening
+// settings and without reading a failure message.
+//
+// WHY THE VALUES ARE CHOSEN THIS WAY:
+//   - `endpoint.base_url` is the session's EFFECTIVE value (`GET /sessions/:id` →
+//     ./view-api.ts:167), which is what the stuck sessions actually dial. A row-only
+//     document reports `''` (./view-api.ts:232: a `SessionSummary` row never carries an
+//     endpoint) and a harness with no conversation yet reports nothing at all — in both
+//     cases this browser's COMMITTED `settings.baseURL` is the address its next submit
+//     dials (`createSession` sends exactly that), so it is the honest fallback. The
+//     shipped `DEFAULT_SETTINGS` is deliberately NOT the fallback: after the reader has
+//     re-pointed the app, a default is precisely the wrong answer to print.
+//   - `view.model` is the entry agent's live model; `settings.model` is the value a new
+//     session starts with. Both are facts about what runs, never about what was shipped.
+//   - Absence prints nothing: `providerTargetNote` answers `undefined` when neither side
+//     is known, and the line goes `hidden` rather than showing an empty reserved row
+//     (the same rule `.harness-note` follows two lines below `headNote`).
+const paintProviderLine = (mode: 'harness' | 'sessions'): void => {
+    // Only the chat head describes a conversation; Tools and Plugins own the head with a
+    // catalogue title, where a provider claim would be about the wrong subject.
+    const view = mode === 'harness' && current !== undefined ? renderDocument(current) : undefined;
+
+    const stated = (view?.endpoint?.base_url ?? '').trim();
+    const baseUrl = stated.length > 0 ? stated : settings.baseURL;
+    const statedModel = (view?.model ?? '').trim();
+    const model = statedModel.length > 0 ? statedModel : settings.model;
+
+    const note = providerTargetNote({ baseUrl, model });
+
+    providerLine.textContent = note ?? '';
+    providerLine.hidden = note === undefined;
+    // The visible text is the host:port; the full base URL (path included) is the tooltip,
+    // because a reader who spots the wrong port is about to go fix it in settings.
+    providerLine.title = `Provider base URL: ${baseUrl}`;
 };
 
 // The open harness-details layer, if any. One at a time (a second open would stack a
@@ -4184,7 +4286,7 @@ const harnessTitleTools = el('div', 'harness-title-tools');
 harnessTitleTools.append(toolsToggle, pluginsToggle);
 
 titleRow.append(headTitle, sessionCycle, sessionNew, headName, harnessTitleTools);
-mainHead.append(titleRow, headNote);
+mainHead.append(titleRow, headNote, providerLine);
 
 const agentSlot = el('div', 'agent-slot');
 
@@ -15126,7 +15228,20 @@ const run = async (): Promise<void> => {
         // Not a stream failure, and it is NOT painted into the app-scoped header
         // (R1): a run failure must not outlive the session it belongs to.
         turn.setState('error', message);
-        instance.view.notice(`task failed: ${message}`, 'error');
+        // (T9/AC3) A classified provider failure is not a generic `task failed: …`. The
+        // sentence the server raises names the class and the dialed host:port (T6's contract
+        // for the terminal frame), so `providerFailureOf` reads it back out and the notice
+        // leads with what the reader has to check — the provider ADDRESS. An unclassified
+        // message (a 400 from the submit route, a gateway 502, `submit rejected`) answers
+        // `undefined` and keeps the wording the composer tests pin, byte for byte.
+        const failure = providerFailureOf({ message });
+
+        instance.view.notice(
+            failure === undefined
+                ? `task failed: ${message}`
+                : `task failed · ${failure.label}: ${failure.text}`,
+            'error'
+        );
         void refreshSessions();
     } finally {
         submitting = false;
@@ -15595,6 +15710,11 @@ const boot = async (): Promise<void> => {
         const data = await loadBootstrap();
 
         applyDefaults(data.defaults);
+        // (T9/AC4) The provider bounds ride the SAME config read the defaults came from
+        // (./api.ts `loadBootstrap`), and a server without the field leaves
+        // `data.providerTimeouts` absent — `paintProviderTimeouts` then hides the line, so
+        // boot neither throws nor blanks the settings pane.
+        paintProviderTimeouts(data.providerTimeouts);
 
         // The defaults may have replaced the model, and the stored settings may name a model the
         // provider no longer serves. Rendering first and then fetching keeps the dropdown correct

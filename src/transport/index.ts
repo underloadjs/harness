@@ -17,5 +17,26 @@ export {
     CONTEXT_OVERFLOW_CODE,
     PROVIDER_REQUEST_BODY_CODE
 } from './openai';
+// (T6) The two provider failure classes and their bounds. The codes are what
+// ../core/agent.ts switches on for its retry policy; the defaults and variable names
+// are the operator-facing contract (`.env.example` quotes the same names).
+export {
+    PROVIDER_CONNECTION_CODE,
+    PROVIDER_TIMEOUT_CODE,
+    // (T8, AC3) The third provider failure class: a deterministic refusal. Exported so
+    // ../core/agent.ts can keep it out of the ladder on the same switch as the others.
+    PROVIDER_REJECTED_CODE,
+    DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
+    DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
+    DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS,
+    PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV,
+    PROVIDER_FIRST_TOKEN_TIMEOUT_ENV,
+    PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
+    PROVIDER_TIMEOUT_MAX_MS,
+    resolveProviderTimeout,
+    providerURLOf,
+    connectionFailureOf
+} from './provider-timeouts';
+export type { ProviderConnectionFailure, ProviderTimeoutPhase } from './provider-timeouts';
 export { listModels, ModelListError } from './models';
 export type { ModelListConfiguration, ModelListErrorKind } from './models';

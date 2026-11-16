@@ -189,6 +189,8 @@ import { mountContextBar } from './context-bar';
 import type { ContextBar, ContextBarActivateInput } from './context-bar';
 import { blockDetailFingerprintOf, openBlockDetail } from './context-detail';
 import type { BlockDetailDialog } from './context-detail';
+// V1 change stamp of one compiled display tree (see ./display-stamp.ts for the rationale).
+import { displayStampOf } from './display-stamp';
 import { applyAttachmentChips } from './attachments';
 import { enhanceFileLinks } from './file-links';
 import { openFilePreview } from './file-preview';
@@ -220,6 +222,12 @@ import {
     wakeupOf
 } from '../contract';
 import type { HarnessPendingTool, HarnessThreadInfo } from '../contract';
+// (T9) Provider-target diagnosis for the two frames that carry the transport's provider
+// diagnostics: a `retry` frame with a `provider` block (the live attempt/backoff/dial-target
+// line, ./provider-diagnostics.ts `providerRetryNote`) and a terminal `error` frame whose
+// class names the provider (AC3, `providerFailureOf`). Both answer `undefined` when the
+// frame carries nothing, and then the tile renders exactly what it rendered before.
+import { providerFailureOf, providerRetryNote } from '../provider-diagnostics';
 import { createActionRequestCard } from './action-request';
 import type { ActionRequestCard } from './action-request';
 // Deterministic agent identity colour (R3): shared by the turn tile, every nested
@@ -782,34 +790,43 @@ const el = <K extends keyof HTMLElementTagNameMap>(
     return node;
 };
 
-// V1: the "this tile is already painted from EXACTLY this content" fingerprint of one
-// compiled tree, used by `syncCompiledDisplay` to skip a whole node-level pass.
+// V1: the "this tile is already painted from EXACTLY this content" stamp of one compiled
+// tree, used by `syncCompiledDisplay` to skip a whole node-level pass. The stamp itself is
+// `./display-stamp.ts` `displayStampOf`, kept in its own module so it is testable and
+// measurable without importing this DOM-heavy file (its header carries the full rationale).
 //
 // WHY IT IS NEEDED: every applied document hands each loaded tile its display tree again
-// (`reconcileView` → `syncDisplay`, :9739), and the poll carry (`./main.ts carryDisplays`)
+// (`reconcileView` → `syncDisplay`, :10250), and the poll carry (`./main.ts carryDisplays`)
 // re-applies an unchanged tree once a second while work is pending. The pass is idempotent
 // but not free: a COMMITTED text node takes the ungated branch of `syncCompiledNode`
-// (:7939-7948) and calls `renderText` → `paintProse` (:5472-5478) → `replaceChildren(
-// markdownFragment(text))`. A polling session therefore re-parsed every loaded tile's
-// Markdown every second and threw away the reader's live text selection with each replaced
-// fragment.
+// and calls `renderText` → `paintProse` → `replaceChildren(markdownFragment(text))`. A
+// polling session therefore used to re-parse every loaded tile's Markdown every second and
+// throw away the reader's live text selection with each replaced fragment.
 //
-// WHY A STRUCTURAL FINGERPRINT AND NOT A REFERENCE CHECK: display trees are NOT immutable.
-// The stream ops fold mutates the very object a tile was painted from, IN PLACE —
-// `../view-state.ts` `applyViewOps` does `display.sections.push` (:396), `node.text +=
+// WHY A STRUCTURAL STAMP AND NOT A REFERENCE CHECK: display trees are NOT immutable. The
+// stream ops fold mutates the very object a tile was painted from, IN PLACE —
+// `../view-state.ts` `applyOpToDisplay` does `display.sections.push` (:396), `node.text +=
 // op.delta` (:443) and `display.sections.splice` (:509) — so "same object" does not imply
 // "same content", and a bare `display === painted` skip would freeze an actively streaming
-// tile. The server's own change counter for the tree (`revision`, src/server/api.ts:4352)
-// never reaches this layer: `projectDisplay` (./display-project.ts:432) keeps only
-// `turnId`/`sections`/`lastSectionOrdinal`. So the only safe signal is the tree's content.
+// tile. Equally, a stamp built ONLY on the server's change counter would be wrong: the ops
+// fold never restamps `revision` on the object it just mutated, and the counter is dropped
+// unless a read carried it.
 //
-// WHY `JSON.stringify` IS THE SAFE CHOICE: it is EXACT — equal strings mean byte-equal
-// content, so a skip can never hide a change. Anything that alters the tree (an in-place op
-// mutation, or a fresh object from a re-read) yields a different string and the tile
-// re-renders; a key-ORDER difference between two equal-content objects only ever costs one
-// redundant repaint, never a stale tile. The cost is one stringify per tile per applied
-// document; the work it buys is a Markdown parse plus a fragment swap per text node.
-const displaySignatureOf = (display: TurnDisplay): string => JSON.stringify(display);
+// WHY THE COUNTER IS NOW PART OF IT ANYWAY: `display.revision` arrives on the wire
+// (../shared/harness-api.ts:3599, served at src/server/api.ts:5174) and `projectDisplay`
+// (./display-project.ts:444) now passes it through instead of dropping it. It is one more
+// scalar in the stamp, which makes a FRESH read of an unchanged-content tree repaint
+// deterministically; it is never the only signal, so it cannot hide an in-place mutation.
+//
+// WHY NOT `JSON.stringify` (what T23/C1 replaced): the signature was byte-exact, which is
+// the right safety property, but its cost is proportional to the tree's SIZE — it walks and
+// escapes every character of every prose body, payload and preview. `displayStampOf` costs
+// the tree's FIELD COUNT instead, and a long body costs a length read plus 48 characters no
+// matter how big it is. Measured with Temp/coding-t23/stamp-bench.ts on the real 974 KB
+// capture (3 sections, 1099 nodes, 1100 context blocks — a field-DENSE tree, the worst case
+// for this trade): ~1.9-2.5 ms per signature vs ~1.6-1.9 ms per stamp, i.e. ~1.2x under on
+// the tree where the property count dominates; on a prose-dominated tree (one multi-MB
+// streaming answer) the signature's cost grows with the bytes and the stamp's does not.
 
 // Incremental Markdown: coalesce every delta that arrives in one frame into a
 // single parse. `flushPending` cancels the queued frame and renders now.
@@ -3263,12 +3280,60 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // the authoritative roster: `id`, `invocationId`, `originInvocationId`,
     // `invocationIds`) — NOT from content. A task-text match would be a guess that
     // cannot separate two identical sibling delegations, so it is deliberately absent.
+    // --- deferred prompt surfaces (T23/C2) ----------------------------------
+    //
+    // A COLLAPSED tile shows one plain-text line (`.tile-prompt`, `plainPreview(prompt,
+    // 220)` at :3924) while styles.css keeps its whole body hidden
+    // (styles.css:3267 `.tile:not(.is-expanded) .tile-body { display: none }`). Until now
+    // the hidden body still carried a PARSED Markdown prompt from the moment the row was
+    // created: `renderPrompt` ran `markdownFragment` + `enhanceFileLinks` + `enhanceImages`
+    // + `applyAttachmentChips` for EVERY row before the first paint — ~5 HTML
+    // parse/serialize passes per prompt (./markdown.ts:451), i.e. ~125 passes for a 25-row
+    // session, for prose nobody can see.
+    //
+    // A collapsed tile therefore registers its painter here and runs it the first time its
+    // body is actually on screen. "On screen" is exactly what CSS states: the tile's own
+    // `is-expanded` (set by `expand`, :3750) or an expanded CONVERSATION host, whose rule
+    // (styles.css:3357 `.conversation.is-expanded .tile-body { display: flex }`) opens every
+    // exchange of the card at once. Two hooks cover every way this board changes that state:
+    // `placeAllTurns` (the pass that creates/replaces cards, restores remembered expansions
+    // and re-places the expanded turn) and `expand` (a click, a hydration reveal,
+    // `openEnclosingCards`). A tile created while already expanded paints synchronously in
+    // `create` itself, so no visible surface is ever empty — which is also what keeps the
+    // jsdom tests, which assert parsed prompt HTML without a browser frame, green.
+    const pendingPrompts = new Set<{
+        card: HTMLElement;
+        bodyVisible: () => boolean;
+        paint: () => void;
+    }>();
+
+    const flushPendingPrompts = (): void => {
+        // A copy, because a painter may add or remove entries (a tile created during a
+        // paint, a `setAttachments` that paints now and unregisters itself).
+        for (const entry of [...pendingPrompts]) {
+            // A tile the projection dropped is simply gone; its painter goes with it.
+            if (!entry.card.isConnected) {
+                pendingPrompts.delete(entry);
+                continue;
+            }
+
+            if (!entry.bodyVisible()) continue;
+
+            pendingPrompts.delete(entry);
+            entry.paint();
+        }
+    };
+
     const placeAllTurns = (): void => {
         for (const turn of turns) placeTurn(turn);
         reorderBoard();
         // C5: the projection can create or replace a conversation card, so the
         // unreadable-transcript mark is re-applied from the roster in the same pass.
         paintRosterInvalid();
+        // T23/C2: this pass is where a conversation card is (re)created, where the reader's
+        // remembered expansions are restored and where the expanded turn is re-placed, so it
+        // is where a body that has just become visible gets its prompt surface parsed.
+        flushPendingPrompts();
         // T3: this pass (re)creates cards, applies roster joins and restores the reader's
         // remembered expansions, so it is where the followed set can MOVE without any
         // click or focus change. Cheap to ask: the report is deduped by value.
@@ -3773,6 +3838,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         focusedThreadId = threadId;
         explicitUnfocus = false;
         notifyFocus();
+        // T23/C2: expansion is the moment this body (and, through the host class toggled
+        // above, every other exchange of this conversation) becomes visible, so every prompt
+        // surface that hid behind it is parsed here — synchronously, before the browser
+        // paints the newly opened body.
+        flushPendingPrompts();
     };
 
     const collapse = (): void => {
@@ -4000,15 +4070,43 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             openImageDialog(source, { alt });
         };
 
-        // Rebuild the prompt's DOM from its sanitized Markdown and then apply the
-        // post-sanitization transforms (file links, clickable images, attachment
-        // chips). Called on creation and on every `setAttachments`, so optimistic
-        // and replayed turns always show the same chips at the same marker positions.
-        const renderPrompt = (): void => {
+        // Parse the prompt's Markdown and apply the post-sanitization transforms (file
+        // links, clickable images, attachment chips). T23/C2: this is the WHOLE first-paint
+        // cost of a row's body (see `pendingPrompts` above, :3275), so a collapsed row runs
+        // it lazily the first time its body is on screen, and an expanded one runs it now.
+        let promptSurfacePainted = false;
+
+        const paintPromptSurface = (): void => {
+            promptSurfacePainted = true;
             promptBlock.replaceChildren(markdownFragment(prompt));
             enhanceFileLinks(promptBlock, { open: openTranscriptFile });
             enhanceImages(promptBlock, { open: openTranscriptImage });
             applyAttachmentChips(promptBlock, attachmentRecords, { onOpen: openAttachment });
+        };
+
+        // What styles.css says about this body: hidden unless the tile itself is expanded,
+        // or the conversation card it lives in is (which opens every exchange in it).
+        const promptBodyVisible = (): boolean =>
+            card.classList.contains('is-expanded') || card.closest('.conversation.is-expanded') !== null;
+
+        // This tile's entry in the board's deferred set. One stable object so `renderPrompt`
+        // can unregister the moment the surface is real.
+        const promptSurface = { card, bodyVisible: promptBodyVisible, paint: paintPromptSurface };
+
+        // Called on creation and on every `setAttachments`, so optimistic and replayed turns
+        // always show the same chips at the same marker positions. `attachmentRecords` is read
+        // at PAINT time, so an ack that lands while the row is collapsed still shows its chips
+        // when the reader opens it — nothing is re-stamped or reordered by the deferral.
+        const renderPrompt = (): void => {
+            // On screen now, or already parsed once (an expanded tile whose attachments
+            // changed): repaint immediately and drop the pending registration.
+            if (promptBodyVisible() || promptSurfacePainted) {
+                pendingPrompts.delete(promptSurface);
+                paintPromptSurface();
+                return;
+            }
+
+            pendingPrompts.add(promptSurface);
         };
 
         const setAttachments = (attachments: readonly HarnessAttachment[]): void => {
@@ -6679,9 +6777,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // True once anything was painted from the display wire. The raw event fold
         // and this renderer never share a tile: a view-driven tile has no events.
         let compiledMode = false;
-        // V1: the fingerprint of the tree this tile's compiled DOM was last painted from
-        // (`displaySignatureOf`, :779). Written by BOTH paint passes, read only by the skip
-        // in `syncCompiledDisplay`. `resetCompiled()` runs inside `renderCompiledDisplay`,
+        // V1: the stamp of the tree this tile's compiled DOM was last painted from
+        // (`./display-stamp.ts` `displayStampOf`). Written by BOTH paint passes, read only by
+        // the skip in `syncCompiledDisplay`. `resetCompiled()` runs inside `renderCompiledDisplay`,
         // which re-records the value at the same call, so a teardown never leaves a stale
         // fingerprint behind; and the raw event fold never shares a tile with this renderer
         // (see `compiledMode`), so nothing else can invalidate it.
@@ -7750,8 +7848,20 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             const line = el('div', 'agent-notice');
             line.dataset.tone = node.tone;
-            line.append(el('span', 'agent-notice-label', node.tone));
-            line.append(el('span', 'agent-notice-text', node.text));
+            // (T9/AC3) An error notice the transport CLASSIFIED is labelled with its class,
+            // not with the generic word `error`. The live plane carries only this node's text
+            // (the server mints the sentence, and it names the class, the host:port, the
+            // phase and the bound), so the class is recovered from that sentence by
+            // `providerFailureOf` — an echo of what the frame already states, never a guess.
+            // The text stays verbatim: the server's sentence is the diagnosis, and its own
+            // host:port is already in it.
+            const provider = node.tone === 'error' ? providerFailureOf({ message: node.text }) : undefined;
+
+            line.append(
+                el('span', 'agent-notice-label', provider === undefined ? node.tone : provider.label),
+                el('span', 'agent-notice-text', node.text)
+            );
+            if (provider !== undefined) line.dataset.provider = provider.label;
             if (node.at !== undefined) line.dataset.at = String(node.at);
             section.flow.append(line);
 
@@ -8266,10 +8376,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // projection (including sections the document no longer names) is dropped.
         const renderCompiledDisplay = (display: TurnDisplay): void => {
             // V1: a full paint replaces the DOM wholesale, so THIS tree is what the tile now
-            // shows — the previous fingerprint is meaningless and is re-recorded here (the
+            // shows — the previous stamp is meaningless and is re-recorded here (the
             // action-card repaint path, `./main.ts` `repaintActionCard`, goes through this
             // function with the same tree it just painted).
-            compiledPaintedSignature = displaySignatureOf(display);
+            compiledPaintedSignature = displayStampOf(display);
             resetCompiled();
             compiledMode = true;
 
@@ -8325,11 +8435,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // fragment (`syncCompiledNode` :7966 → `paintProse` :5472), which on a polling
             // session meant one re-parse per loaded tile per second and a lost text selection.
             //
-            // The gate is the tree's content (`displaySignatureOf`, :779), NOT its identity,
-            // because the ops fold mutates this object in place (../view-state.ts:396/:443/:509)
-            // — a mutated tree always fingerprints differently, so a streaming tile can never
-            // be frozen by this skip.
-            const signature = displaySignatureOf(display);
+            // The gate is the tree's content (`./display-stamp.ts` `displayStampOf`), NOT its
+            // identity, because the ops fold mutates this object in place
+            // (../view-state.ts:396/:443/:509/:623) — a mutated tree always stamps
+            // differently, so a streaming tile can never be frozen by this skip.
+            const signature = displayStampOf(display);
 
             if (compiledMode && compiledPaintedSignature === signature) {
                 // Everything this pass derives from ANYTHING BUT the tree still runs, because a
@@ -9229,7 +9339,38 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     const frame = retryOf(event);
                     if (frame === undefined) break;
 
-                    discardAttempt(route().section);
+                    const retried = route();
+                    discardAttempt(retried.section);
+
+                    // (T9) A provider-classified retry is the ONE retry a reader can act
+                    // on: the transport (../types/index.ts `retry.provider`, T6) named the
+                    // class, the dialled URL and the backoff, so "still trying localhost:5500,
+                    // attempt 6 of 11, 32s apart" is the diagnosis of a provider that is not
+                    // listening — not machinery chatter.
+                    //
+                    // `providerRetryNote` answers `undefined` when the frame carries NO
+                    // `provider` block, and then NOTHING is appended: an ordinary retry keeps
+                    // the silence T19 (R19) decided on, which is what ui/turns-retry.test.ts
+                    // pins (`no .agent-notice, no word "retry"`). The line reuses the compiled
+                    // notice's vocabulary (./turns.ts `paintCompiledNotice`: `.agent-notice` +
+                    // label + text) so both render paths speak one DOM dialect, and the tone is
+                    // `provider` — not `retry` — because this is not the suppressed line.
+                    const retryNote = providerRetryNote(frame);
+
+                    if (retryNote !== undefined) {
+                        // A notice is readable prose between chips, so it breaks the chip run
+                        // — the same rule the error path below applies.
+                        closeText(retried.section);
+                        closeToolGroup(retried.section);
+
+                        const notice = el('div', 'agent-notice');
+                        notice.dataset.tone = 'provider';
+                        notice.append(
+                            el('span', 'agent-notice-label', 'provider'),
+                            el('span', 'agent-notice-text', retryNote)
+                        );
+                        retried.section.flow.append(notice);
+                    }
                     break;
                 }
 
@@ -9438,8 +9579,32 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     // The error notice is not a chip, so the next call starts a
                     // fresh row below it.
                     closeToolGroup(section);
+                    // (T9/AC3) A provider-classified failure gets its OWN label and a text
+                    // the reader can act on, instead of the generic red `error` block:
+                    //   provider-connection → `dialled http://localhost:5500/… · <message> ·
+                    //     this is the provider address, …`
+                    //   provider-timeout    → `response-head · bound 30.0s · <message>`
+                    // `providerFailureOf` reads the frame's `code` (and, defensively, the
+                    // class the server's own sentence names) and answers `undefined` for an
+                    // unclassified failure — which keeps the generic block byte-identical
+                    // for every ordinary error, the honest fallback the brief requires.
+                    const failure = providerFailureOf(event.error);
                     const error = el('div', 'agent-error');
-                    error.append(el('span', 'agent-error-label', 'error'), el('span', 'agent-error-text', event.error.message));
+
+                    if (failure === undefined) {
+                        error.append(
+                            el('span', 'agent-error-label', 'error'),
+                            el('span', 'agent-error-text', event.error.message)
+                        );
+                    } else {
+                        // The class is a data attribute as well as a label, so the sheet can
+                        // tone a provider failure without the JS re-deriving it.
+                        error.dataset.provider = failure.label;
+                        error.append(
+                            el('span', 'agent-error-label', failure.label),
+                            el('span', 'agent-error-text', failure.text)
+                        );
+                    }
                     section.flow.append(error);
 
                     // A child that reported its own failure is terminal; the parent's

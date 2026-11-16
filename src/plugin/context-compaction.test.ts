@@ -75,6 +75,7 @@ import { agent, harness, tool } from '@underload/harness';
 import type {
     Agent,
     Harness,
+    HarnessAssistantMessage,
     HarnessContextEntry,
     HarnessDiagnosticEvent,
     HarnessLifecycleHandler,
@@ -3857,9 +3858,13 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
             message: { role: 'assistant', content: 'not a compaction answer' }
         });
 
-        // The restore comes FIRST (the lane goes back before the park is lifted, so no event
-        // can be recorded against a phantom row), then the lift, then the report.
+        // The probe comes FIRST: the net has to look at the transcript before it may call this
+        // pass abandoned (the fake's `threads.messages` refuses, which is the plugin's "cannot
+        // read → no answer" branch, so the abandon path is what runs). The restore then comes
+        // before the lift (the lane goes back before the park is lifted, so no event can be
+        // recorded against a phantom row), then the lift, then the report.
         expect(fake.touches).toEqual([
+            'threads.messages',
             'threads.setContextLane:thread-1:0',
             'threads.resume',
             'report.diagnostic'
@@ -3888,6 +3893,353 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
             status: 'idle'
         });
         expect(fake.touches).toEqual([]);
+    });
+
+    // THE SECONDARY DEFECT: a net must not swallow a pass whose answer SURVIVED.
+    //
+    // WHY THIS CASE EXISTS. Both nets used to CLEAR a `compacting` phase unconditionally, and the
+    // `thread.idle` that fires LATER IN THE SAME terminal `finally` (src/harness.ts:13821, after
+    // `run.finished`) is gated on `finishing` (../plugins/context-compaction.plugin.ts:1724).
+    // Clearing the phase therefore destroyed the finalize AND the continuation without a word:
+    // the superseded range stayed in the model's context forever, and the conversation sat idle
+    // mid-task with its answer owed to nobody. The state is reachable whenever `turn.after` never
+    // got to hand the phase on although the answer DID land — a handler subscribed before this one
+    // throws inside the same `turn.after` emit (src/harness.ts:12727-12740).
+    //
+    // The fake above cannot express that transcript: its `threads.messages` throws, which is the
+    // plugin's "cannot read → nothing to fold" branch the case above pins. So this case hands the
+    // api a real transcript and asserts the whole carry-through — the net PROMOTES, the idle hook
+    // writes the range and sends the nudge, and the lane keeps the boundary it claimed.
+    it('carries a compacting pass whose answer survived to the idle finalize instead of idling silently', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        // The pass opens exactly as the shipped trigger opens it: `compacting`, parked, lane 1.
+        await passes.turnBefore(
+            createFakeTurn({
+                api: fake.api,
+                estimatedTokens: 400,
+                currentTokens: 400,
+                calls: [],
+                threadId: 'thread-1'
+            })
+        );
+
+        // The conversation ALREADY holds both ends of the range: the superseded turn, the injected
+        // instruction, and the prose answer `turn.after` never got to promote.
+        const transcript: HarnessMessage[] = [
+            { role: 'user', content: 'question' },
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            { role: 'assistant', content: 'SUMMARY' }
+        ];
+        const written: HarnessMessage[][] = [];
+        const sent: string[] = [];
+
+        fake.api.threads.messages = (threadId) => {
+            fake.touches.push('threads.messages');
+
+            return transcript.map((message) => ({ ...message }));
+        };
+        fake.api.threads.replaceMessages = (threadId, messages) => {
+            fake.touches.push('threads.replaceMessages');
+            written.push(messages.map((message) => ({ ...message })));
+        };
+        fake.api.threads.send = (threadId, input) => {
+            fake.touches.push('threads.send');
+            sent.push(input);
+
+            return Promise.resolve({ role: 'assistant', content: 'continuation' } as HarnessAssistantMessage);
+        };
+
+        fake.touches.length = 0;
+        fake.diagnostics.length = 0;
+
+        passes.runFinished({
+            ...runLifecycle,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+
+        // Probe, lift, report — and NO lane revert, because this pass DID compact the conversation.
+        expect(fake.touches).toEqual(['threads.messages', 'threads.resume', 'report.diagnostic']);
+        expect(fake.lanes.get('thread-1')).toBe(1);
+        expect(fake.diagnostics).toHaveLength(1);
+        expect(fake.diagnostics[0].message).toContain('carried to the idle finalize');
+        expect(fake.diagnostics[0].data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-1',
+            hook: 'run.finished',
+            phase: 'finishing'
+        });
+
+        // THE POINT: the `thread.idle` that follows in the same `finally` still finds a phase, so
+        // it writes the range (the turn before the instruction stops being sent; the instruction
+        // and the answer stay), un-parks, and sends the continuation nudge.
+        fake.touches.length = 0;
+        fake.diagnostics.length = 0;
+
+        passes.threadIdle({
+            id: 'thread-1',
+            agent: 'writer',
+            origin: 'host',
+            sequence: 1,
+            status: 'idle'
+        });
+
+        expect(fake.touches).toEqual([
+            'threads.messages',
+            'threads.replaceMessages',
+            'report.diagnostic',
+            'threads.resume',
+            'threads.send'
+        ]);
+        expect(written).toEqual([
+            [
+                { role: 'user', content: 'question', included: false },
+                { role: 'user', content: COMPACTION_INSTRUCTION },
+                { role: 'assistant', content: 'SUMMARY' }
+            ]
+        ]);
+        expect(sent).toEqual([CONTINUATION_NUDGE]);
+        expect(fake.diagnostics).toHaveLength(1);
+        expect(fake.diagnostics[0].message).toContain('compacted thread thread-1 itself');
+        // The boundary this pass created stays claimed (C1).
+        expect(fake.lanes.get('thread-1')).toBe(1);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE DELEGATED IN-RUN CONTINUATION, at the handler level (T12/F1).
+//
+// WHY THIS BLOCK EXISTS. The shipped file had NO plugin-level case for the in-run continuation:
+// the shared fake answers `threads.steer` by recording the touch and THROWING
+// (src/plugin/context-compaction.test.ts:269), so the delegated path could only ever be measured
+// end-to-end, and the end-to-end file watched the delivered ANSWER rather than the request the
+// continuation turn was asked with. That is the gap F1 fell through: with the nudge drained into
+// the transcript ahead of the finalize (src/harness.ts:12669 -> `emitTurnBefore` :12182) and
+// sharing the instruction's marker, the range anchored on the nudge, `answerIndex` was -1 and
+// the instruction plus the summary were withheld — the child was asked with the nudge alone,
+// durably, and still answered correctly, so every existing green stayed green.
+//
+// These cases pin the request view itself: [instruction, summary, nudge], the inclusion flags
+// behind it, the finalize indices, and one lane bump for the pass. The end-to-end counterpart is
+// src/harness.compaction-delegation.test.ts, which now asserts the same view from the provider's
+// side.
+// ---------------------------------------------------------------------------
+
+describe('context-compaction delegated in-run continuation (T12/F1)', () => {
+    // The identity a run started by a tool reports: depth 2, the delegation chain below a host
+    // submission (src/harness.ts:13315-13320) — the dispatch condition for the in-run path.
+    const childLifecycle = { threadId: 'thread-2', agent: 'researcher', depth: 2, input: 'dig' };
+
+    // The child's transcript at the continuation boundary: superseded history, this pass's
+    // instruction, its summary, and the nudge the queue drain appended before this boundary.
+    const childEntries = (): HarnessContextEntry[] => [
+        entryOf(0, { role: 'user', content: 'dig into the seeded report' }),
+        entryOf(1, { role: 'user', content: COMPACTION_INSTRUCTION }),
+        entryOf(2, { role: 'assistant', content: 'SUMMARY' }),
+        entryOf(3, { role: 'user', content: CONTINUATION_NUDGE })
+    ];
+
+    // What the model is actually sent: an entry whose `included` flag was switched off by
+    // `setIncluded` is withheld from the request, so this IS the request view.
+    const requestView = (entries: readonly HarnessContextEntry[]): string[] =>
+        entries
+            .filter((entry) => entry.included !== false)
+            .map((entry) => String((entry.message as { content?: unknown }).content ?? ''));
+
+    // The shared fake refuses `threads.steer` (see the block header); the in-run path needs the
+    // receipt the real `steerThread` hands back (src/harness.ts:7407-7421).
+    const steerInto = (
+        fake: ReturnType<typeof createFakeApi>,
+        text: string[]
+    ): void => {
+        fake.api.threads.steer = (threadId, input) => {
+            fake.touches.push('threads.steer');
+            text.push(input);
+
+            return { threadId, queued: true };
+        };
+    };
+
+    it('queues the continuation into the child run and asks the next turn with instruction, summary and nudge', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const steered: string[] = [];
+
+        steerInto(fake, steered);
+
+        // THE PASS opens on the child (parked, instruction committed, lane raised to 1).
+        const openCalls: string[] = [];
+
+        await passes.turnBefore(
+            createFakeTurn({
+                api: fake.api,
+                estimatedTokens: 400,
+                currentTokens: 400,
+                calls: openCalls,
+                threadId: 'thread-2',
+                agent: 'researcher'
+            })
+        );
+        expect(openCalls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        expect(fake.lanes.get('thread-2')).toBe(1);
+
+        // THE BUMP, recorded exactly once (one read to know where the lane is, one write to raise
+        // it), at the instruction commit (C1).
+        expect(fake.touches.filter((entry) => entry.includes('ContextLane'))).toEqual([
+            'threads.getContextLane:thread-2',
+            'threads.setContextLane:thread-2:1'
+        ]);
+
+        // THE ANSWER lands on a depth-2 turn: lift, then the nudge is queued INTO the live run —
+        // one `threads.steer`, no `threads.send`, and the report says which run owns the
+        // continuation now.
+        fake.touches.length = 0;
+        fake.diagnostics.length = 0;
+
+        passes.turnAfter({
+            ...childLifecycle,
+            iteration: 2,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+
+        expect(fake.touches).toEqual(['threads.resume', 'threads.steer', 'report.diagnostic']);
+        expect(steered).toEqual([CONTINUATION_NUDGE]);
+        expect(fake.diagnostics).toHaveLength(1);
+        expect(fake.diagnostics[0].message).toContain(
+            'answered its compaction instruction on turn 2'
+        );
+        expect(fake.diagnostics[0].message).toContain(
+            'on the continuation turn this same run now owns'
+        );
+        expect(fake.diagnostics[0].data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-2',
+            iteration: 2,
+            continuedInRun: true
+        });
+
+        // THE CONTINUATION BOUNDARY: the same run, one more turn, and the nudge already in the
+        // entry list — the state F1 mis-anchored on.
+        const entries = childEntries();
+        const calls: string[] = [];
+
+        fake.diagnostics.length = 0;
+
+        passes.turnBefore(
+            createFakeTurn({
+                api: fake.api,
+                estimatedTokens: 400,
+                currentTokens: 400,
+                entries,
+                calls,
+                threadId: 'thread-2',
+                agent: 'researcher'
+            })
+        );
+
+        // THE RANGE: only the superseded turn goes. The instruction, the summary and the nudge
+        // are the retained head — the same contract the host path pins at :2752-2756 (lazy
+        // in-run) and :3387-3391 (out-of-band).
+        expect(calls).toEqual(['setIncluded:0:false']);
+        expect(requestView(entries)).toEqual([COMPACTION_INSTRUCTION, 'SUMMARY', CONTINUATION_NUDGE]);
+
+        // THE FINALIZE REPORT, with the indices that prove the anchor: `answerIndex: -1` (the
+        // pre-fix answer) here means the nudge became the anchor and the head was withheld.
+        expect(fake.diagnostics).toHaveLength(1);
+        expect(fake.diagnostics[0].message).toContain(
+            'context-compaction compacted thread thread-2 itself: 1 of 4 entry(ies) stop being sent'
+        );
+        expect(fake.diagnostics[0].data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-2',
+            path: 'turn.before',
+            instructionIndex: 1,
+            answerIndex: 2,
+            disabled: [0],
+            total: 4
+        });
+
+        // ONE bump for the pass: the range was written, so the undo is dropped and no second
+        // boundary appears (the value is still 1, and the continuation boundary wrote no lane at
+        // all), and the finalize consumed the phase — a still-over-limit child does not start
+        // another pass on its continuation turn.
+        expect(fake.lanes.get('thread-2')).toBe(1);
+        expect(fake.touches.filter((entry) => entry.includes('ContextLane'))).toEqual([]);
+    });
+
+    it('falls back to the out-of-band nudge when the conversation refuses to queue it', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const steered: string[] = [];
+
+        // A `queued: false` receipt (`src/harness.ts:7407-7413`: idle conversation, no live run)
+        // is the shape the plugin must NOT treat as a continuation.
+        fake.api.threads.steer = (threadId, input) => {
+            fake.touches.push('threads.steer');
+            steered.push(input);
+
+            return { threadId, queued: false, reason: 'idle' };
+        };
+
+        await passes.turnBefore(
+            createFakeTurn({
+                api: fake.api,
+                estimatedTokens: 400,
+                currentTokens: 400,
+                calls: [],
+                threadId: 'thread-2',
+                agent: 'researcher'
+            })
+        );
+
+        fake.touches.length = 0;
+        fake.diagnostics.length = 0;
+
+        passes.turnAfter({
+            ...childLifecycle,
+            iteration: 2,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+
+        // Lift, the refused steer, the refusal report, then the ordinary hand-off report — and no
+        // `continuedInRun` marker, because nothing was queued.
+        expect(fake.touches).toEqual([
+            'threads.resume',
+            'threads.steer',
+            'report.diagnostic',
+            'report.diagnostic'
+        ]);
+        expect(steered).toEqual([CONTINUATION_NUDGE]);
+        expect(fake.diagnostics[0].message).toContain('could not queue the compaction continuation');
+        expect(fake.diagnostics[0].data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-2',
+            iteration: 2,
+            stage: 'continue'
+        });
+        expect(fake.diagnostics[1].data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-2',
+            iteration: 2
+        });
+
+        // The run ends on the summary, so the idle hook is the one that owns the finalize and the
+        // nudge (the pre-existing host-shaped flow, unchanged). Under this fake the transcript
+        // read refuses — the plugin's "cannot read" branch — so the observable half is the read
+        // and the lift, exactly as in the `finishing`-phase case above; the range and the nudge
+        // are pinned by the `run-terminal nets` cases (the transcript-backed one among them).
+        fake.touches.length = 0;
+
+        passes.threadIdle({
+            id: 'thread-2',
+            agent: 'researcher',
+            origin: 'host',
+            sequence: 1,
+            status: 'idle'
+        });
+
+        expect(fake.touches).toEqual(['threads.messages', 'threads.resume']);
     });
 });
 
@@ -4251,6 +4603,50 @@ describe('context-compaction retention range (planCompactionRetention)', () => {
                 turn('assistant', 'a tool call', { toolCalls: [{ id: 't1', name: 'read', arguments: '{}' }] })
             ])
         ).toEqual({ instructionIndex: 1, answerIndex: -1, disabled: [0] });
+    });
+
+    // DEFECT F1 (found by review, 2026-11-16): the continuation nudge carries the SAME marker
+    // prefix as the instruction (`COMPACTION_MARKER` feeds both exports, and the case at the end
+    // of this describe pins both prefixes), so the anchor scan must not stop on it. On the
+    // delegated in-run continuation the nudge is drained into the transcript BEFORE the boundary
+    // that writes the range (src/harness.ts:12669 -> `emitTurnBefore` :12182), so the LAST
+    // marker-prefixed entry IS the nudge: anchoring there gave `answerIndex: -1` and disabled the
+    // instruction and the summary, so the continuation turn was asked with the nudge alone.
+    it('does not anchor on a continuation nudge: the instruction and its summary survive', () => {
+        expect(
+            planCompactionRetention([
+                turn('user', 'old work'),
+                turn('user', INSTRUCTION),
+                turn('assistant', 'the summary'),
+                // The drained nudge, sitting after the answer exactly as the in-run continuation
+                // puts it there.
+                turn('user', CONTINUATION_NUDGE)
+            ])
+        ).toEqual({ instructionIndex: 1, answerIndex: 2, disabled: [0] });
+
+        // A nudge with no instruction of its own is not an anchor at all: there is nothing to
+        // withhold, rather than withholding the whole conversation up to the nudge.
+        expect(
+            planCompactionRetention([
+                turn('user', 'old work'),
+                turn('user', CONTINUATION_NUDGE),
+                turn('assistant', 'an answer')
+            ])
+        ).toEqual({ instructionIndex: -1, answerIndex: -1, disabled: [] });
+
+        // The second pass anchors on ITS instruction, and pass one's nudge goes with the rest of
+        // that pass's superseded head — the exclusion is about the anchor, never about the range.
+        expect(
+            planCompactionRetention([
+                turn('user', 'old'),
+                turn('user', INSTRUCTION),
+                turn('assistant', 'summary one'),
+                turn('user', CONTINUATION_NUDGE),
+                turn('assistant', 'the continuation answer'),
+                turn('user', SHORT_INSTRUCTION),
+                turn('assistant', 'summary two')
+            ])
+        ).toEqual({ instructionIndex: 5, answerIndex: 6, disabled: [0, 1, 2, 3, 4] });
     });
 
     it('anchors on the marker PREFIX of a user turn, not on the body or another role', () => {

@@ -256,6 +256,46 @@ const pinTaskClock = (): ((next: number) => void) => {
     };
 };
 
+// T25: the durability seam the F1 coalescing contract moved.
+//
+// A core state change that lands INSIDE one `VIEW_CHECKPOINT_INTERVAL_MS` window of the last
+// commit no longer rewrites `state.json` synchronously (./sessions.ts `noteStateChange` →
+// `checkpoint`). The write is not dropped: it is deferred to the end of the window by
+// `scheduleCheckpoint`. A crash-recovery pin therefore has to say WHEN the crash happens —
+// one interval later — and the honest way to say it is to wait for the bytes, not for a
+// guessed sleep.
+//
+// `readDocument` is the synchronous snapshot (what a crash at THIS instant would recover);
+// `waitForDocument` polls until the deferred commit has landed. The budget is counted in
+// iterations rather than wall clock on purpose: `pinTaskClock` freezes `Date.now`, so a
+// clock-based budget would never expire inside a pinned test, while `setTimeout` stays real
+// (the policy stated on `pinTaskClock`). Running out the budget is the failure — it means
+// the deferred write never happened, which is the bound F1 promises.
+const readDocument = (root: string): Record<string, any> =>
+    JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+
+const waitForDocument = async (
+    root: string,
+    settled: (document: Record<string, any>) => boolean,
+    budgetMs = 8_000
+): Promise<Record<string, any>> => {
+    const attempts = Math.ceil(budgetMs / 25);
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const document = readDocument(root);
+
+        if (settled(document)) return document;
+
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    throw new Error(`state.json did not reach the expected shape within ${budgetMs} ms.`);
+};
+
+// The serialized document is what these pins grep: F2 writes it compact (./persistence.ts
+// `serializeHarnessDatabase`), so a re-stringified parse is byte-comparable to the file.
+const serializedOf = (document: unknown): string => JSON.stringify(document);
+
 afterEach(() => {
     vi.restoreAllMocks();
 });
@@ -1079,6 +1119,25 @@ describe('R3b durable harness database', () => {
         const running = first.store.run(created.id, 'mutate then hold', async () => {});
         await secondRequest;
 
+        // T25 — THE CONTRACT F1 ACTUALLY SHIPS, pinned in both directions:
+        //
+        // (1) INSIDE the checkpoint window the store does not rewrite the document at all. The
+        //     tool's store write committed a few milliseconds after the turn-start commit, so
+        //     at this instant the crash-recovery copy on disk is the previous coherent commit
+        //     and does NOT carry the new record. Pre-F1 the observer wrote here, which is why
+        //     this pin used to pass without saying so; the accepted trade-off (sessions.ts
+        //     `VIEW_CHECKPOINT_INTERVAL_MS`) is one interval of non-event state, so say it.
+        expect(serializedOf(readDocument(root))).not.toContain('done before crash');
+
+        // (2) The deferred write still happens: `scheduleCheckpoint` commits the pending state
+        //     at the end of that window, so the worst-case loss is one interval — never
+        //     "whatever the last strict commit happened to be". The crash this test models now
+        //     lands one interval after the mutation instead of between two mutations, and every
+        //     recovery assertion below is unchanged.
+        const durable = await waitForDocument(root, (document) => serializedOf(document).includes('done before crash'));
+
+        expect(serializedOf(durable)).toContain('"text":"done before crash"');
+
         // The tool completed while the run was still active. The core now permits a
         // synchronous snapshot at a mutation boundary, so the observer saved the
         // todo record; a crash here must not lose it.
@@ -1104,6 +1163,14 @@ describe('R3b durable harness database', () => {
         // Interrupted, not replayed: the restored turn keeps the completed tool
         // exchange and gains no new provider request.
         expect(restored.turns[0].events.map((event) => event.type)).toContain('tool_result');
+
+        // (3) STRICT WRITES ARE STILL IMMEDIATE: an awaited mutation commits inside the same
+        // window, before the call resolves — coalescing may delay nothing a caller is waiting
+        // for. (The write-COUNTING half of this rule is ./persistence-coalescing.test.ts
+        // "still commits a strict mutation immediately, once, inside the same window".)
+        await first.store.renameSession(created.id, 'strict inside the window');
+
+        expect(readDocument(root).sessions[0].title).toBe('strict inside the window');
 
         release();
         await running;
@@ -1399,6 +1466,20 @@ describe('R3b durable harness database', () => {
         // leave it paused (no replay). Reset the counter so a second execution in
         // this process would be observable.
         executions = 0;
+
+        // T25 — the same bound, from the other side. This is the case a pure interval gate
+        // could NOT promise: the tool hangs, so no further event and no further state change
+        // ever arrives to carry the transcript commit that opened the tool call. Pin (1) that
+        // the commit really was absorbed by the window (the assistant tool_call is not on disk
+        // yet — pre-F1 it was, and that is what this test quietly relied on), then (2) that
+        // `scheduleCheckpoint` commits it at the end of the window anyway, so the crash this
+        // test models recovers to a commit that is at most one interval stale rather than to
+        // the turn-start document. Every recovery assertion below is unchanged.
+        expect(serializedOf(readDocument(root))).not.toContain('hang-1');
+
+        const durable = await waitForDocument(root, (document) => serializedOf(document).includes('hang-1'));
+
+        expect(serializedOf(durable)).toContain('hang-1');
 
         const second = runtimeOf(root, [preset]);
         const restored = second.store.get(created.id);

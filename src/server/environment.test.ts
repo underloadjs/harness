@@ -214,7 +214,11 @@ describe('configuration wiring', () => {
                 workerIdleMs: 120_000,
                 maxLaneWorkers: 16,
                 workerHandshakeMs: 60_000
-            }
+            },
+            // T6 added `providerTimeouts` to `loadConfiguration()`; this is a whole-object
+            // assertion, so it carries the bounds this (worker-free, timeout-free) fixture
+            // resolves: the three shipped defaults.
+            providerTimeouts: { responseHeadMs: 300_000, firstTokenMs: 300_000, streamChunkMs: 120_000 }
         });
         expect(process.env.EXA_API_KEY).toBe('search-key');
     });
@@ -248,7 +252,10 @@ describe('configuration wiring', () => {
                 workerIdleMs: 120_000,
                 maxLaneWorkers: 16,
                 workerHandshakeMs: 60_000
-            }
+            },
+            // T6's `providerTimeouts` (see the sibling test above): the shipped defaults,
+            // because this fixture sets none of the three timeout variables.
+            providerTimeouts: { responseHeadMs: 300_000, firstTokenMs: 300_000, streamChunkMs: 120_000 }
         });
     });
 

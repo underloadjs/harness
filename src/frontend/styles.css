@@ -897,6 +897,19 @@ body.is-resizing-rail {
    (`.composer-actions`, `.agent-dialog-footer`): right-aligned, and separated from the
    fields it commits. There is no second button — dismissing the dialog (×, Escape,
    backdrop, a second pill press) is the discard, so `Reset` had nothing left to do. */
+/* (T9/AC4) The provider bounds under the Base URL field, read from
+   `GET /config.providerTimeouts`. Read-only deployment facts, so they render like the other
+   read-only lines in this pane (`.endpoint-server-live`): muted mono, no border, no control
+   affordance. The node is `hidden` when the server does not report them, so an older service
+   shows the dialog exactly as it did before. */
+.endpoint-timeouts {
+    margin: 0 0 10px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
 .endpoint-actions {
     display: flex;
     justify-content: flex-end;
@@ -2029,6 +2042,25 @@ body.is-resizing-rail {
     margin: 0;
     color: var(--muted);
     font-size: 12px;
+}
+
+/* (T9/AC1) The persistent provider-target line: `provider localhost:5500 · model basalt`.
+   Same register as `.harness-note` above it — a muted fact under the title, never a badge
+   or a control — and MONO with `font-variant-numeric: tabular-nums` because the whole
+   point is reading a PORT off it and comparing it against the one you expected. The line
+   is `hidden` (attribute, not a rule) when the target is unknown, so there is no
+   empty-state styling to design. */
+.harness-provider {
+    margin: 2px 0 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+    /* Long base URLs must not push the head wide on a phone; the ellipsis is the graceful
+       end of the line and `title` carries the full text. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* R2: the harness title IS the details trigger — no disclosure arrow. The button is
@@ -3167,6 +3199,23 @@ body.is-resizing-rail {
     border-radius: var(--radius);
     background: var(--bg-elevated);
     overflow: hidden;
+    /* T23/C3: layout containment for the transcript. A painted tile is the heaviest box
+       in the list (Markdown prose, tool cards, the context bar), and without containment a
+       change inside ONE tile — a streaming delta, a settling call — invalidates layout for
+       every row in `.turns`, so repaint cost grows with the number of loaded turns.
+       `layout` scopes that invalidation to this subtree, `style` scopes counters, and
+       `paint` lets the engine skip work for what this box does not show.
+       WHY THESE THREE ARE SAFE HERE: the tile already clips (`overflow: hidden` above) and
+       already IS the containing block for its absolutely positioned descendants
+       (`position: relative`, :3158) — the busy ring (`::before`, :3665), the clipped
+       screen-reader labels (:3236, :3546) — so `paint` clips nothing new and `layout`
+       re-parents no positioning. `size` containment is deliberately NOT used (the box keeps
+       its content-driven height), and `content-visibility: auto` is deliberately left out:
+       `./main.ts:1161-1190` decides which turns are on screen from every row's
+       `getBoundingClientRect()`, and a skipped subtree reports placeholder geometry, which
+       would drive the per-turn display fetches (`../view-shell.ts:376`) from wrong numbers.
+       jsdom cannot verify that measurement, so it stays a follow-up. */
+    contain: layout style paint;
     /* R3: the agent-owned outline. Drawn as an `outline` (not a border) so it does
        NOT participate in the state border below: identity and state can be shown at
        the same time, and a settled/errored row keeps its agent colour. The offset
@@ -3853,6 +3902,12 @@ body.is-resizing-rail {
     /* R6: same width cap as `.tile`; the indent above already reduced the width. */
     max-width: 100%;
     overflow: hidden;
+    /* T23/C3: the nested block is the same surface as `.tile` (see the containment note
+       there), only indented — it clips already (`overflow: hidden`) and is `position:
+       relative` for its own busy ring, so the same three containment kinds are equally
+       inert visually and equally useful for layout: a delta inside one child card can no
+       longer invalidate the sibling cards' layout. */
+    contain: layout style paint;
     /* Same surface as `.tile` (radius, background) so main and nested blocks read
        as one component; only the indentation differs (R3). The state/expanded
        surface rules are the SHARED `:is(.tile, .thread-tile)` ones above — nothing
@@ -5025,6 +5080,44 @@ body.is-resizing-rail {
 .agent-error-label {
     text-transform: uppercase;
     letter-spacing: 0.09em;
+}
+
+/* (T9/AC3) A provider-classified terminal failure carries its class in the label and in
+   `data-provider` (`provider-connection` / `provider-timeout`, ../types/index.ts
+   `HarnessProviderAttemptDiagnostics.errorClass`). Same red surface as the generic block —
+   it IS a failure — with the mono uppercase label already provided by `.agent-error-label`,
+   so the only difference is the WORDING the reader acts on: the class, the dialed address
+   and the hint. No new colour, no new component. */
+.agent-error[data-provider] {
+    border-color: rgba(248, 113, 113, 0.55);
+}
+
+/* (T9/AC2) The provider-retry line inside a RUNNING tile:
+   `provider · attempt 6 of 11 failed · retrying in 32.0s · ECONNREFUSED · http://localhost:5500/…`.
+   It shares the `.agent-notice` vocabulary the compiled path already mints (./ui/turns.ts
+   `paintCompiledNotice`) so one rule styles both render paths, and it stays in the muted
+   mono register of the other status markers: the run is still going, so this must not read
+   as an outcome. `data-tone='provider'` — NOT `retry` — because an unclassified retry still
+   mints no line at all (T19/R19). */
+.agent-notice {
+    display: flex;
+    gap: 8px;
+    padding: 3px 0 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.agent-notice-label {
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    flex: 0 0 auto;
+}
+
+.agent-notice-text {
+    /* A long URL wraps; the line never becomes the widest thing in the tile. */
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 /* Concurrent-tool wakeup (R6): the agent resumed because background calls

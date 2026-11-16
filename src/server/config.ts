@@ -23,6 +23,20 @@
 //   - src/server/api.ts — maps SettingsError to its 400 status
 
 import type { RunnerSettings } from './harnesses/types';
+// (T6) The provider time bounds. Imported from the LEAF the transport also uses
+// (`../transport/provider-timeouts`, which depends on nothing but ../util), so the
+// server validates the same variables with the SAME grammar and no new edge between
+// the server layer and the transport is opened. One parser, two callers.
+import {
+    DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
+    DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
+    DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS,
+    PROVIDER_FIRST_TOKEN_TIMEOUT_ENV,
+    PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV,
+    PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
+    PROVIDER_TIMEOUT_MAX_MS,
+    resolveProviderTimeout
+} from '../transport/provider-timeouts';
 import type { HarnessIndex } from './protocol';
 
 // How a session's LOGICAL threads get CPU.
@@ -86,10 +100,57 @@ export type ServerRuntimeConfiguration = {
     ioEntry?: string;
 };
 
+// (T6) The three provider time bounds in force for this process. They are a
+// DEPLOYMENT property like the runtime below — the transport enforces them per
+// request, and a per-session override is the same three numbers on
+// `provider.*TimeoutMs` (../types). Resolved once, at startup, so an operator typo
+// (`HARNESS_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS=5m`) aborts the process naming the
+// variable rather than quietly landing on a different bound.
+export type ProviderTimeoutConfiguration = {
+    responseHeadMs: number;
+    firstTokenMs: number;
+    streamChunkMs: number;
+};
+
+// The shipped defaults, spelled out here so a status surface can show what is in
+// force without re-deriving them. `0` on any leg means "that bound is off".
+export const DEFAULT_PROVIDER_TIMEOUT_CONFIGURATION: ProviderTimeoutConfiguration = {
+    responseHeadMs: DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
+    firstTokenMs: DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
+    streamChunkMs: DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS
+};
+
+// Read the three bounds from an environment. Idempotent and side-effect free, like
+// `loadRuntimeConfiguration`; the ceilings are the transport's, and the accepted
+// grammar is identical (digits only, `0` disables, no coercion).
+export const loadProviderTimeoutConfiguration = (
+    env: NodeJS.ProcessEnv = process.env
+): ProviderTimeoutConfiguration => ({
+    responseHeadMs: resolveProviderTimeout({
+        variable: PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV,
+        fallback: DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
+        env
+    }),
+    firstTokenMs: resolveProviderTimeout({
+        variable: PROVIDER_FIRST_TOKEN_TIMEOUT_ENV,
+        fallback: DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
+        env
+    }),
+    streamChunkMs: resolveProviderTimeout({
+        variable: PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
+        fallback: DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS,
+        env
+    })
+});
+
 export type ServerConfiguration = {
     settings: RunnerSettings;
     defaults: HarnessIndex['defaults'];
     runtime: ServerRuntimeConfiguration;
+    // (T6) Optional on the type (a host that assembles a configuration by hand keeps
+    // compiling) but ALWAYS present from `loadConfiguration`, because the reported
+    // bounds are what a status bar needs in order to explain a `provider-timeout`.
+    providerTimeouts?: ProviderTimeoutConfiguration;
 };
 
 // A bad runtime setting is a DEPLOYMENT error, so it is not a SettingsError (that
@@ -102,7 +163,7 @@ export class ServerRuntimeError extends Error {
     }
 }
 
-const DEFAULT_BASE_URL = 'http://localhost:5500/providers/private/v1';
+const DEFAULT_BASE_URL = 'http://localhost:6660/providers/private/v1';
 // The local basalt model, which is the id the private provider at DEFAULT_BASE_URL
 // actually serves for it (its /models catalogue lists `local/basalt`; a hosted
 // `merge/ds4-flash` request costs money and a `localhost/basalt` request 404s).
@@ -142,6 +203,10 @@ export const DEFAULT_RUNTIME_CONFIGURATION: ServerRuntimeConfiguration = {
 // document; a model name is an id. Both caps are generous (an OpenAI-compatible
 // gateway URL with a long provider path still fits) and exist so a settings body
 // cannot smuggle an unbounded string into every provider request.
+// (T6) Re-exported so the server layer, `.env.example` and any status surface quote
+// ONE set of names for these bounds.
+export { PROVIDER_TIMEOUT_MAX_MS };
+
 export const MAX_BASE_URL_LENGTH = 2048;
 export const MAX_MODEL_LENGTH = 256;
 
@@ -168,6 +233,38 @@ const optionalString = (value: unknown, field: keyof RunnerSettings): string | u
 
     return value;
 };
+
+// (T8, AC2) One optional provider TIME BOUND from a client-supplied settings body,
+// mirroring `optionalString` above and `MAX_BASE_URL_LENGTH` validation in
+// `mergeSettings`: a field that can be ANY JSON value is checked once, here, so a
+// route never 500s on a string and a bad value answers 400 (SettingsError) naming the
+// field. Nothing is coerced — `numberEnsures` would map `"12s"` to 0, and 0 means
+// "this bound is OFF", i.e. a typo would silently re-open the very hang the bound
+// exists to close. The accepted grammar is the transport's own (`resolveProviderTimeout`):
+// a safe integer, `0` = disabled, ceiling `PROVIDER_TIMEOUT_MAX_MS`.
+const optionalTimeout = (value: unknown, field: keyof RunnerSettings): number | undefined => {
+    if (value === undefined) return undefined;
+
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > PROVIDER_TIMEOUT_MAX_MS) {
+        throw new SettingsError(
+            `\`settings.${field}\` must be an integer between 0 and ${PROVIDER_TIMEOUT_MAX_MS} ` +
+                `(0 disables the bound); received ${JSON.stringify(value)}.`
+        );
+    }
+
+    return value;
+};
+
+// ONE bound of a merged result: the client's explicit value wins, the server default
+// comes next, and NEITHER present stays `undefined` so the transport can still resolve
+// the environment variable and the shipped default (`../transport/provider-timeouts`).
+// A `0` is a real value ("this bound is off"), never "unset", which is why only
+// `undefined` falls through.
+const mergedTimeout = (
+    requested: number | undefined,
+    fallback: number | undefined,
+    field: keyof RunnerSettings
+): number | undefined => (requested === undefined ? fallback : optionalTimeout(requested, field));
 
 // Canonical comparison form for a provider URL: scheme + host + base path, with
 // trailing slashes removed. Query and hash are KEPT on purpose — a client that
@@ -381,7 +478,10 @@ export const loadConfiguration = (): ServerConfiguration => {
             model,
             hasApiKey: apiKey.trim().length > 0
         },
-        runtime: loadRuntimeConfiguration()
+        runtime: loadRuntimeConfiguration(),
+        // Validated here as well as at transport construction: an operator must learn
+        // about a bad bound at startup, not on the first stalled provider.
+        providerTimeouts: loadProviderTimeoutConfiguration()
     };
 };
 
@@ -424,6 +524,22 @@ export const mergeSettings = (
     const baseURL = requestedBaseURL !== undefined ? requestedBaseURL.trim() : defaults.baseURL;
     const model = requestedModel?.trim() || defaults.model;
 
+    // (T8, AC2) The three time bounds, merged with the SAME precedence the transport
+    // already documents for them: this session's field is authoritative when present,
+    // the server default comes next, and an absent pair stays absent so the environment
+    // variable and the shipped default still resolve downstream. A rejected value is a
+    // 400 (SettingsError) before anything is returned, exactly like the length caps
+    // below, because both the model listing and session creation consume this result.
+    const responseHeadTimeoutMs = mergedTimeout(
+        input?.responseHeadTimeoutMs,
+        defaults.responseHeadTimeoutMs,
+        'responseHeadTimeoutMs'
+    );
+
+    const firstTokenTimeoutMs = mergedTimeout(input?.firstTokenTimeoutMs, defaults.firstTokenTimeoutMs, 'firstTokenTimeoutMs');
+
+    const streamChunkTimeoutMs = mergedTimeout(input?.streamChunkTimeoutMs, defaults.streamChunkTimeoutMs, 'streamChunkTimeoutMs');
+
     // Validate before returning: both the model listing and session creation use
     // the result, so one cap here covers every provider request path.
     if (baseURL.length > MAX_BASE_URL_LENGTH) {
@@ -450,5 +566,15 @@ export const mergeSettings = (
               ? serverKey.trim()
               : '';
 
-    return { baseURL, model, apiKey };
+    // The bounds are attached only when a value exists at either layer, so an untouched
+    // session returns the exact `{ baseURL, model, apiKey }` object it always did (no
+    // `undefined`-valued keys, which `toStrictEqual` consumers would see).
+    return {
+        baseURL,
+        model,
+        apiKey,
+        ...(responseHeadTimeoutMs === undefined ? {} : { responseHeadTimeoutMs }),
+        ...(firstTokenTimeoutMs === undefined ? {} : { firstTokenTimeoutMs }),
+        ...(streamChunkTimeoutMs === undefined ? {} : { streamChunkTimeoutMs })
+    };
 };

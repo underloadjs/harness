@@ -2,7 +2,15 @@
 //
 // `fetch` is stubbed, so these tests exercise the real request shape, the real
 // wire-format mapping, and the real frame parser without any network.
-
+//
+// Node environment ON PURPOSE: the `keeps the transport free of any Node built-in
+// import` guard near the end of this file reads `./openai.ts` off disk with `fs` +
+// `fileURLToPath(import.meta.url)`. The repository ROOT config (../../../vitest.config.ts)
+// defaults to `jsdom`, where `import.meta.url` is shimmed to a non-file URL, so a root
+// `yarn vitest run` failed that one test with `TypeError: The URL must be of scheme
+// file` — the browser-safety pin never actually ran. Same reasoning as the harness
+// package's own node config, and as service/src/server/start.test.ts:1-9.
+// @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -69,7 +77,7 @@ describe('openAICompatible', () => {
         const fetchMock = stubFetch(['data: [DONE]\n\n']);
 
         const stream = openAICompatible({
-            baseURL: 'http://localhost:5500/providers/private/v1/',
+            baseURL: 'http://localhost:6660/providers/private/v1/',
             apiKey: 'secret',
             headers: { 'x-extra': 'yes' },
             sampling: { temperature: 0.7, top_p: 0.9 }
@@ -80,7 +88,7 @@ describe('openAICompatible', () => {
         expect(fetchMock).toHaveBeenCalledTimes(1);
         const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
 
-        expect(url).toBe('http://localhost:5500/providers/private/v1/chat/completions');
+        expect(url).toBe('http://localhost:6660/providers/private/v1/chat/completions');
         expect(init.method).toBe('POST');
         expect(init.headers).toMatchObject({
             'content-type': 'application/json',
@@ -1023,8 +1031,27 @@ describe('openAICompatible', () => {
 
         const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
 
+        // (T6) The frame is CLASSIFIED now. The historical text hid WHERE the request
+        // went, and the new frame names the dialled host:port (how an operator tells a
+        // wrong port from a dead provider) plus `provider-connection`, the code
+        // ../core/agent.ts uses to spend a short capped ladder instead of 17 minutes.
         expect(events).toEqual([
-            { type: 'error', message: 'Request to http://x/v1/chat/completions failed: ECONNREFUSED' }
+            {
+                type: 'error',
+                code: 'provider-connection',
+                message:
+                    'provider-connection: nothing answered on x:80 — the request was dialled to ' +
+                    'http://x/v1/chat/completions. ECONNREFUSED (ECONNREFUSED). Check that the provider is ' +
+                    'running on that port and that the configured base URL is the one you meant. Set the ' +
+                    'per-session base URL (Endpoint & model) to the endpoint that is actually up; ' +
+                    '`HARNESS_BASE_URL` counts only when the session has no stored address.',
+                details: {
+                    errorClass: 'provider-connection',
+                    url: 'http://x/v1/chat/completions',
+                    port: 80,
+                    errno: 'ECONNREFUSED'
+                }
+            }
         ]);
     });
 
@@ -1659,21 +1686,30 @@ describe('provider context overflow (issue 0004)', () => {
         }
     });
 
-    it('keeps an unrelated 400 with its raw detail and no code', async () => {
+    it('keeps an unrelated 400 with its raw detail, classified as a refusal (T8, AC3)', async () => {
         // The near-miss that must NOT be called an overflow: a complaint about the
-        // `max_tokens` FIELD. Nothing here may rewrite it into a size diagnosis.
+        // `max_tokens` FIELD. Nothing here may rewrite it into a size diagnosis. Since
+        // T8 the frame IS classified — a refused request shape is terminal, and the raw
+        // detail is preserved verbatim inside it. The exact sentence is pinned in
+        // ./openai.provider-rejected.test.ts; this file's contract is the one above:
+        // the detail survives and no size advice is invented.
         stubFetch(['Invalid value for max_tokens: expected integer'], { status: 400 });
 
         const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+        const frame = events[0] as { type: string; code?: string; message: string };
 
-        expect(events).toStrictEqual([{ type: 'error', message: 'HTTP 400: Invalid value for max_tokens: expected integer' }]);
+        expect(events).toHaveLength(1);
+        expect(frame.code).toBe('provider-rejected');
+        expect(frame.message).toContain('HTTP 400');
+        expect(frame.message).toContain('The provider said: "Invalid value for max_tokens: expected integer"');
+        expect(frame.message).not.toContain('context window');
     });
 
     it('never calls a non-400/413 answer an overflow, whatever it quotes', async () => {
-        // The status gate: a broken credential or a dead gateway whose error page
-        // happens to mention the context window must stay the plain frame it always
-        // was, because the remedy there is not "send less".
-        for (const status of [401, 429, 500, 503]) {
+        // The status gate: a dead gateway or a rate limit whose error page happens to
+        // mention the context window must stay the plain frame it always was, because
+        // the remedy there is not "send less".
+        for (const status of [429, 500, 503]) {
             stubFetch(["This model's maximum context length is 8192 tokens"], { status });
 
             const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
@@ -1685,6 +1721,18 @@ describe('provider context overflow (issue 0004)', () => {
                 }
             ]);
         }
+
+        // (T8, AC3) A 401 quoting the same words is STILL not an overflow — its remedy is
+        // the credential — it simply carries its own class now instead of reading like a
+        // transient failure. Pinned as a refusal in ./openai.provider-rejected.test.ts.
+        stubFetch(["This model's maximum context length is 8192 tokens"], { status: 401 });
+
+        const [auth] = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+        const authFrame = auth as { type: string; code?: string; message: string };
+
+        expect(authFrame.code).toBe('provider-rejected');
+        expect(authFrame.message).toContain('HTTP 401');
+        expect(authFrame.message).not.toContain('context window');
     });
 
     it('collapses a multi-line provider message into one quoted line', async () => {

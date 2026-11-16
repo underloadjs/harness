@@ -217,13 +217,14 @@ import { coreToolNames } from './harnesses/toolbox';
 // `PATCH /config` refuses an oversize value instead of parking it in `defaults`.
 import {
     DEFAULT_RUNTIME_CONFIGURATION,
+    loadProviderTimeoutConfiguration,
     loadRuntimeConfiguration,
     MAX_BASE_URL_LENGTH,
     MAX_MODEL_LENGTH,
     mergeSettings,
     SettingsError
 } from './config';
-import type { ProviderCredential, ServerRuntimeConfiguration } from './config';
+import type { ProviderCredential, ProviderTimeoutConfiguration, ServerRuntimeConfiguration } from './config';
 import { HarnessRegistryError } from './harnesses/registry';
 // T19: the global agent overlay's error type (status-carrying, like the registry's) and the
 // durable overlay file. The dispatcher never builds the layer itself: the registry owns it,
@@ -462,6 +463,14 @@ export type HarnessApiOptions = {
     // `runtime_execution` on a session. Defaults to `loadRuntimeConfiguration()` (the same
     // validated environment parse ./start.ts performs), so omitting it stays correct.
     runtime?: ServerRuntimeConfiguration;
+    // T8 (AC4): the EFFECTIVE provider time bounds in force for this process, reported
+    // read-only on `GET /config` as `providerTimeouts`. Like `runtime`, it defaults to
+    // the validated environment parse (`loadProviderTimeoutConfiguration()`), so a host
+    // that omits it still reports the truth rather than the shipped constants — and a
+    // host that resolves them through `loadConfiguration()` can hand the SAME resolved
+    // object to the API and the transport, which is what keeps the report and the
+    // behaviour from disagreeing. `0` on any leg means "that bound is off".
+    providerTimeouts?: ProviderTimeoutConfiguration;
     // T13: attach an existing hub (a host that also mounts the realtime transport must hand
     // BOTH surfaces the same hub, or a REST read and a stream frame can disagree).
     events?: HarnessEventHub;
@@ -1039,6 +1048,10 @@ export const createHarnessApi = ({
     registry = createHarnessRegistry(),
     catalogue = createToolCatalogue(),
     runtime = loadRuntimeConfiguration(),
+    // T8 (AC4): defaults to the same validated environment parse ./config.ts performs at
+    // startup, so the reported bounds are the ENFORCED ones even for a host that never
+    // thinks about this option.
+    providerTimeouts = loadProviderTimeoutConfiguration(),
     events = createHarnessEventHub(),
     databaseRoot,
     capabilities
@@ -1651,6 +1664,122 @@ export const createHarnessApi = ({
             .filter((id) => id !== turn.threadId)
     ];
 
+    // ------------------------------------------------------------------
+    // T21: THE PER-REQUEST TRANSCRIPT VIEW (the display read's hot path)
+    // ------------------------------------------------------------------
+    //
+    // WHAT IT FIXES, MEASURED. One display read of a 66k-event turn answered in 2,776 ms, and
+    // 2,753 ms of it (99.2 %) was `JSON.parse(JSON.stringify(...))`: the inclusion join below
+    // ran once PER CONTEXT BLOCK (1,096 addressable blocks) and each run walked the candidate
+    // roster (8.29 visits per block, 88.7 % of them ending in a miss whose clone was then
+    // thrown away) — 9,068 clones and ~915 MB of garbage for ONE request. The joins are
+    // correct; the reading was not. Two facts about the data make both halves cheap:
+    //
+    //   1. THE OWNER IS ALREADY KNOWN. Every recorded event carries `thread.id`, the store maps
+    //      invocation id -> persistent conversation (`./sessions.ts` `Session.invocationThreads`,
+    //      handed to the projector as `DisplayProjectContext.invocationThreadIds`), and the
+    //      projector stamps `TurnSection.threadId` from that join (`./turn-projector.ts`
+    //      `syncThreadIds`; ../shared/turn-display.ts documents it as absent ONLY for a legacy
+    //      document or a branch that owns no conversation). The delegated child conversations that
+    //      own 80 % of this turn's segments were being found at roster indices 9 and 10 behind
+    //      eight single-entry `agent:*` conversations — the join was hunting for an address the
+    //      display already carried. Probing the section's conversation first is therefore not a
+    //      guess: it is the recorded join, used. (Verified on that session: for 1,095/1,095
+    //      joinable segments the owning conversation IS `section.threadId`, and its roster index
+    //      is exactly the index the old hunt resolved at.)
+    //   2. A CONVERSATION'S TRANSCRIPT IS ONE FACT PER REQUEST. Nothing moves it inside the
+    //      synchronous body of a read, so cloning it once and reading it many times answers the
+    //      same entries — the join only ever reads (the write path copies through
+    //      `messagesWithInclusion`, never in place), and the clone stays detached exactly as the
+    //      harness's `threadMessages` contract promises its other holders.
+    //
+    // WHAT DELIBERATELY DID NOT CHANGE. The clone STAYS a clone: `./sessions.ts`
+    // `releaseRecordedRootInput` slices the value it is handed, and the lane digest read
+    // (./workers/lane-worker-loop.ts) treats it as its own copy, so a shared live array would
+    // leak a caller's mutation into the harness. And the memo lives and dies WITH THIS REQUEST:
+    // `included` is a request-time verdict by design (see `contextSegmentIncludedOf` below — a
+    // plugin's `setIncluded` or another tab's toggle must show up on the next read), so caching
+    // it across requests would put back the staleness that join exists to avoid.
+    // ------------------------------------------------------------------
+
+    /** The entry a recorded CALL resolves to (see `blockEntryOf`), with the conversation and the
+     *  transcript clone it was found in — one identity, so the read, the write and the receipt
+     *  cannot address different objects. */
+    type BlockEntryTarget = {
+        threadId: string;
+        callId: string;
+        messages: HarnessMessage[];
+        entry: HarnessMessage;
+    };
+
+    /** The entry a recorded TEXT (thinking bytes, or answer bytes) resolves to, with its
+     *  conversation and clone. */
+    type BlockTextTarget = {
+        threadId: string;
+        messages: HarnessMessage[];
+        entry: Extract<HarnessMessage, { role: 'assistant' }>;
+    };
+
+    /** ONE request's view of this session's transcripts: every conversation is read at most once,
+     *  and a caller may probe conversations in any order it likes. Created per request (or per
+     *  post-write re-read, which is a DIFFERENT live state) and thrown away with it. */
+    type TranscriptView = {
+        /** The record this view reads — carried so a caller can state an invalid-thread fact
+         *  without re-resolving the session. */
+        record: SessionRecord;
+        /** This conversation's transcript for THIS request: the harness's detached clone on the
+         *  first read, the same array instance on every later one. */
+        messagesOf: (threadId: string) => HarnessMessage[];
+        /** The conversations this segment may be looked for in, in the order the join is allowed
+         *  to try them (the `threadCandidatesOf` claim, with the segment's own conversation moved
+         *  to the front when the caller can name it). */
+        candidatesOf: (turn: SessionTurn, ownerHint?: string) => string[];
+    };
+
+    const transcriptViewOf = (record: SessionRecord): TranscriptView => {
+        // Keyed by conversation, NOT by turn or block: every block of one section shares one
+        // transcript, which is the whole saving. An unreadable transcript is cached as `[]` too —
+        // `transcriptMessagesOf` answers `[]` for it, so the cached value is the honest one.
+        const clones = new Map<string, HarnessMessage[]>();
+
+        const messagesOf = (threadId: string): HarnessMessage[] => {
+            const cloned = clones.get(threadId);
+
+            if (cloned !== undefined) return cloned;
+
+            const messages = transcriptMessagesOf(record, threadId);
+
+            clones.set(threadId, messages);
+
+            return messages;
+        };
+
+        return {
+            record,
+            messagesOf,
+            candidatesOf: (turn: SessionTurn, ownerHint?: string): string[] => {
+                const roster = threadCandidatesOf(record, turn);
+
+                // A hint the roster does not name is DROPPED rather than prepended: the join may
+                // probe ONLY the conversations today's roster would have probed, so a section
+                // whose stamped conversation has since left the harness (a deleted thread, or a
+                // stale projector row) resolves exactly as it did before this order existed.
+                if (ownerHint === undefined || !roster.includes(ownerHint)) return roster;
+
+                // Owner-direct first, then TODAY'S EXACT ROSTER ORDER behind it. The fallback is
+                // what keeps every ABSENT verdict: an owner with no match (or an ambiguous match,
+                // which `transcriptEntryOfReasoning`/`transcriptEntryOfAnswer` answer `undefined`
+                // for) still walks the whole roster, so a segment recorded in a conversation the
+                // section does not name — a legacy row with no thread join, or a hand-edited
+                // document — keeps resolving where it always resolved. Already-probed
+                // conversations are skipped instead of re-probed: the entry lookups are pure
+                // functions of (transcript, identity), so a second visit can only repeat the
+                // first answer, and `messagesOf` makes that repeat cheap anyway.
+                return [ownerHint, ...roster.filter((threadId) => threadId !== ownerHint)];
+            }
+        };
+    };
+
     /**
      * T7: the conversation and the ONE transcript entry a context segment's text is built
      * from (`blockCallIdOf` + `transcriptEntryOfCall` above), or undefined when no live entry
@@ -1658,22 +1787,23 @@ export const createHarnessApi = ({
      * receipt all resolve through here, so the chip and the transcript cannot disagree.
      */
     const blockEntryOf = (
-        record: SessionRecord,
+        view: TranscriptView,
         turn: SessionTurn,
-        block: { kind?: string; eventFrom?: number }
-    ): { threadId: string; callId: string; messages: HarnessMessage[]; entry: HarnessMessage } | undefined => {
+        block: { kind?: string; eventFrom?: number },
+        ownerHint?: string
+    ): BlockEntryTarget | undefined => {
         const callId = blockCallIdOf(turn.events, block);
 
         if (callId === undefined) return undefined;
 
-        for (const threadId of threadCandidatesOf(record, turn)) {
+        for (const threadId of view.candidatesOf(turn, ownerHint)) {
             // An unreadable transcript has no live entries to address (`transcriptMessagesOf`
             // answers []), so it is passed over rather than reported as "this call is not in
             // the transcript" — the reader's problem there is the broken document, and the
             // transcript routes say so.
-            if (record.invalidThreads.has(threadId)) continue;
+            if (view.record.invalidThreads.has(threadId)) continue;
 
-            const messages = transcriptMessagesOf(record, threadId);
+            const messages = view.messagesOf(threadId);
             const entry = transcriptEntryOfCall(messages, callId);
 
             if (entry !== undefined) return { threadId, callId, messages, entry };
@@ -1694,18 +1824,19 @@ export const createHarnessApi = ({
      * from resolving different entries.
      */
     const blockThoughtOf = (
-        record: SessionRecord,
+        view: TranscriptView,
         turn: SessionTurn,
-        block: { kind?: string; text?: unknown }
-    ): { threadId: string; messages: HarnessMessage[]; entry: Extract<HarnessMessage, { role: 'assistant' }> } | undefined => {
+        block: { kind?: string; text?: unknown },
+        ownerHint?: string
+    ): BlockTextTarget | undefined => {
         const text = blockReasoningTextOf(block);
 
         if (text === undefined) return undefined;
 
-        for (const threadId of threadCandidatesOf(record, turn)) {
-            if (record.invalidThreads.has(threadId)) continue;
+        for (const threadId of view.candidatesOf(turn, ownerHint)) {
+            if (view.record.invalidThreads.has(threadId)) continue;
 
-            const messages = transcriptMessagesOf(record, threadId);
+            const messages = view.messagesOf(threadId);
             const entry = transcriptEntryOfReasoning(messages, text);
 
             if (entry !== undefined) return { threadId, messages, entry };
@@ -1740,18 +1871,19 @@ export const createHarnessApi = ({
      * (`transcriptEntryOfAnswer` above, and ./view.test.ts pins both runs).
      */
     const blockAnswerOf = (
-        record: SessionRecord,
+        view: TranscriptView,
         turn: SessionTurn,
-        block: { kind?: string; eventFrom?: number; eventTo?: number }
-    ): { threadId: string; messages: HarnessMessage[]; entry: Extract<HarnessMessage, { role: 'assistant' }> } | undefined => {
+        block: { kind?: string; eventFrom?: number; eventTo?: number },
+        ownerHint?: string
+    ): BlockTextTarget | undefined => {
         const text = blockAnswerTextOf(turn, block);
 
         if (text === undefined) return undefined;
 
-        for (const threadId of threadCandidatesOf(record, turn)) {
-            if (record.invalidThreads.has(threadId)) continue;
+        for (const threadId of view.candidatesOf(turn, ownerHint)) {
+            if (view.record.invalidThreads.has(threadId)) continue;
 
-            const messages = transcriptMessagesOf(record, threadId);
+            const messages = view.messagesOf(threadId);
             const entry = transcriptEntryOfAnswer(messages, text);
 
             if (entry !== undefined) return { threadId, messages, entry };
@@ -1827,10 +1959,15 @@ export const createHarnessApi = ({
      * still leaves bytes of this segment in the prompt, and those answer `true` (opaque).
      */
     const contextSegmentIncludedOf = (
-        record: SessionRecord,
+        view: TranscriptView,
         turn: SessionTurn,
-        block: ContextBlock
+        block: ContextBlock,
+        ownerHint?: string
     ): boolean | undefined => {
+        // T21: `ownerHint` is the SECTION's stamped conversation (`TurnSection.threadId`), passed
+        // through so a segment of a delegated section is looked for in the conversation that
+        // recorded it FIRST; every route that cannot name one passes nothing and probes today's
+        // roster order unchanged.
         if (block.kind === 'reasoning') {
             // THE SEGMENT'S VERDICT IS THE THINKING AXIS, and nothing else — the ratified rule
             // (../shared/turn-display.ts `ContextBlock.included`), and pinned from both sides in
@@ -1849,7 +1986,7 @@ export const createHarnessApi = ({
 
             if (text === undefined) return undefined;
 
-            const thought = blockThoughtOf(record, turn, { kind: block.kind, text });
+            const thought = blockThoughtOf(view, turn, { kind: block.kind, text }, ownerHint);
 
             return thought === undefined ? undefined : thoughtIncludedOf(thought.entry);
         }
@@ -1859,7 +1996,8 @@ export const createHarnessApi = ({
         // window (FIX C). `blockEntryOf` answers nothing for a kind that mints no call id, which
         // is why the two can share one variable — and why an unresolved segment of ANY kind still
         // answers `undefined` rather than a boolean.
-        const target = block.kind === 'assistant' ? blockAnswerOf(record, turn, block) : blockEntryOf(record, turn, block);
+        const target =
+            block.kind === 'assistant' ? blockAnswerOf(view, turn, block, ownerHint) : blockEntryOf(view, turn, block, ownerHint);
 
         // No entry behind the segment: NO verdict. This is the case the client calls
         // "unaddressable", and it is where a fabricated `true` would be as wrong as a `false`.
@@ -1900,7 +2038,7 @@ export const createHarnessApi = ({
      * already matches is left alone too, which keeps this a no-op allocation for the common case.
      */
     const displaySectionsWithInclusionOf = (
-        record: SessionRecord,
+        view: TranscriptView,
         turn: SessionTurn,
         sections: TurnSection[]
     ): TurnSection[] =>
@@ -1911,7 +2049,12 @@ export const createHarnessApi = ({
 
             let moved = false;
             const blocks = context.map((block) => {
-                const verdict = contextSegmentIncludedOf(record, turn, block);
+                // T21: EVERY block of one section was recorded by that section's conversation, so
+                // the section's own `threadId` is the hint for all of them — the join probes it
+                // once and, with the per-request clone memo, reads that transcript exactly once for
+                // the whole section. An absent `threadId` (a legacy document, or a branch that owns
+                // no conversation) answers `undefined` and the roster hunt runs as before.
+                const verdict = contextSegmentIncludedOf(view, turn, block, section.threadId);
 
                 if (verdict === undefined || block.included === verdict) return block;
 
@@ -1967,9 +2110,21 @@ export const createHarnessApi = ({
     // GLOBAL configuration: the session-visible provider defaults plus read-only
     // deployment runtime facts. A session's own merged settings are per-session state and
     // are reported on the session, never here.
+    // T8 (AC4): the internal `ProviderTimeoutConfiguration` spelling (`responseHeadMs`)
+    // is a server-layer field name; the wire contract a frontend is already coded against
+    // names each leg after the env var it mirrors, so the mapping is done once, here, and
+    // the document never leaks the short names. Values are the EFFECTIVE (env-merged)
+    // bounds, not the shipped constants.
+    const providerTimeoutSettingsOf = (timeouts: ProviderTimeoutConfiguration) => ({
+        responseHeadTimeoutMs: timeouts.responseHeadMs,
+        firstTokenTimeoutMs: timeouts.firstTokenMs,
+        streamChunkTimeoutMs: timeouts.streamChunkMs
+    });
+
     const configDocument = (): GlobalConfigDocument => ({
         defaults: effectiveProviderDefaults(),
         runtime: runtimeSettingsOf(context.runtime),
+        providerTimeouts: providerTimeoutSettingsOf(providerTimeouts),
         writable_fields: ['settings.base_url', 'settings.model', 'settings.api_key'],
         revision: events.getRevision('config')
     });
@@ -4632,37 +4787,55 @@ export const createHarnessApi = ({
 
     // ---- threads (conversations) ------------------------------------------------
 
-    const threadRowsOf = (record: SessionRecord, opts: { withPreview?: boolean } = {}) => {
-        // R2/AC2: a soft-deleted conversation is RETAINED (../types
-        // `HarnessThreadRecord.inactive`) but not DISCOVERABLE, and this is the row source
-        // for every thread route — `GET /sessions/:id/threads` (including the `status`
-        // filter below, which therefore cannot be pointed at a deleted conversation), the
-        // single-thread read, and the 201 read-back of a create. Filtering HERE is what makes
-        // "the tooling does not find it" true over HTTP without a new client-visible field;
-        // the row itself stays in `state.json` for a shell to read.
-        //
-        // Written against the record, so the filter is correct whether or not the runtime
-        // excludes inactive rows from `threads()` (then it is a no-op).
-        const threads = record.harness
-            .threads()
-            .filter((thread) => thread.origin === 'host' && thread.inactive !== true);
+    // The roster's conversation RECORDS, in roster order: the transcript-free half of
+    // `threadRowsOf`, and the only half a page filter needs. A row's `agent`, `status` and
+    // `sequence` are the record's OWN fields (./api-reads.ts `threadRowOf` copies them straight
+    // through), so filtering and paging HERE is exactly filtering and paging the rows — with no
+    // transcript read at all for the conversations the page does not answer with.
+    //
+    // R2/AC2: a soft-deleted conversation is RETAINED (../types
+    // `HarnessThreadRecord.inactive`) but not DISCOVERABLE, and this is the row source
+    // for every thread route — `GET /sessions/:id/threads` (including the `status`
+    // filter below, which therefore cannot be pointed at a deleted conversation), the
+    // single-thread read, and the 201 read-back of a create. Filtering HERE is what makes
+    // "the tooling does not find it" true over HTTP without a new client-visible field;
+    // the row itself stays in `state.json` for a shell to read.
+    //
+    // Written against the record, so the filter is correct whether or not the runtime
+    // excludes inactive rows from `threads()` (then it is a no-op).
+    type RosterThread = ReturnType<SessionRecord['harness']['threads']>[number];
 
-        // `sequence` order is the roster's stable order (creation order per session).
-        return [...threads]
-            .sort((left, right) => left.sequence - right.sequence)
-            .map((thread) =>
-                threadRowOf(
-                    record,
-                    thread,
-                    labelOf(record, thread.id),
-                    // The transcript is read ONLY for the rows a page actually returns, and
-                    // only when a preview was asked for: the roster page itself stays
-                    // transcript-free by counting entries through the same call the
-                    // metadata route uses.
-                    transcriptMessagesOf(record, thread.id),
-                    opts
-                )
-            );
+    const threadRecordsOf = (record: SessionRecord): RosterThread[] =>
+        record.harness
+            .threads()
+            .filter((thread) => thread.origin === 'host' && thread.inactive !== true)
+            // `sequence` order is the roster's stable order (creation order per session).
+            .sort((left, right) => left.sequence - right.sequence);
+
+    /** ONE roster row — the record, the store's label, and the transcript figures the row states.
+     *  This is the ONLY place a roster read clones a transcript, so the number of clones a roster
+     *  request pays is exactly the number of rows it answers with.
+     *
+     *  T21: the old `threadRowsOf` cloned EVERY conversation's transcript, including the ones a
+     *  page window dropped and the ones a filter had already thrown away — the comment here has
+     *  always promised the roster page "stays transcript-free", and now the code does it. The
+     *  figures themselves are unchanged: `threadRowOf` derives `message_count`, `chars` and
+     *  `has_transcript` from the same `transcriptMessagesOf` value it always received (the harness
+     *  clones it by contract), and a roster read never asks for a preview. */
+    const threadRowFor = (
+        record: SessionRecord,
+        thread: RosterThread,
+        opts: { withPreview?: boolean } = {}
+    ): ReturnType<typeof threadRowOf> =>
+        threadRowOf(record, thread, labelOf(record, thread.id), transcriptMessagesOf(record, thread.id), opts);
+
+    /** The ONE roster row addressing a conversation, or undefined when the roster does not list it
+     *  (a deleted or foreign id) — the same answer a whole-roster `threadRowsOf(...).find(...)`
+     *  gave, at the cost of one transcript read instead of one per conversation. */
+    const threadRowOfId = (record: SessionRecord, threadId: string) => {
+        const thread = threadRecordsOf(record).find((entry) => entry.id === threadId);
+
+        return thread === undefined ? undefined : threadRowFor(record, thread);
     };
 
     const getSessionThreads: Handler = (ctx) => {
@@ -4672,21 +4845,26 @@ export const createHarnessApi = ({
         const agent = paramOf(ctx.query, 'agent');
         const status = enumParamOf(ctx.query, 'status', ['idle', 'running', 'stopped'] as const);
 
-        let rows = threadRowsOf(record);
+        // T21: filter and page the RECORDS, then build the rows the page answers with — see
+        // `threadRecordsOf` above for why that is the same page, byte for byte.
+        let records = threadRecordsOf(record);
 
-        if (agent !== undefined) rows = rows.filter((row) => row.agent === agent);
-        // R2: `rows` already excludes inactive conversations (`threadRowsOf` above), so a
-        // `status=idle|running|stopped` query can no longer surface a deleted conversation
-        // as if it were merely idle. R4: the status alone never says WHO halted a run — the
-        // cause is `stopReason` on the WS thread views (./protocol.ts). The REST row is the
-        // generated `ThreadSummary` shape and has no `stop_reason` field yet, so a REST-only
-        // client still reads a bare `status: 'stopped'`; widening that row is a contract
-        // change for the generated surface, not this one.
-        if (status !== undefined) rows = rows.filter((row) => row.status === status);
+        if (agent !== undefined) records = records.filter((thread) => thread.agent === agent);
+        // R2: `threadRecordsOf` above already excludes inactive conversations, so a
+        // `status=idle|running|stopped` query can no longer surface a deleted conversation as if
+        // it were merely idle. R4: the status alone never says WHO halted a run — the cause is
+        // `stopReason` on the WS
+        // thread views (./protocol.ts). The REST row is the generated `ThreadSummary` shape and has
+        // no `stop_reason` field yet, so a REST-only client still reads a bare `status: 'stopped'`;
+        // widening that row is a contract change for the generated surface, not this one.
+        if (status !== undefined) records = records.filter((thread) => thread.status === status);
 
-        const page = slicePage(rows, cursor, limit, rows.length);
+        const page = slicePage(records, cursor, limit, records.length);
 
-        const result: ThreadSummaryPage = pageMeta({ items: page.items, next: page.next }, events.getRevision('threads', record.id));
+        const result: ThreadSummaryPage = pageMeta(
+            { items: page.items.map((thread) => threadRowFor(record, thread)), next: page.next },
+            events.getRevision('threads', record.id)
+        );
 
         // Every page read stamps its own collection revision in the contract header (a receipt
         // without a revision simply carries none), so a client can order a read against a stream
@@ -4700,8 +4878,9 @@ export const createHarnessApi = ({
 
         requireThread(record, threadId);
 
-        const rows = threadRowsOf(record);
-        const row = rows.find((entry) => entry.id === threadId);
+        // T21: one roster row for the conversation this route addresses (the whole roster's rows
+        // were built and thrown away before, one transcript clone each).
+        const row = threadRowOfId(record, threadId);
 
         if (row === undefined) throw missing('thread', threadId, record.id);
 
@@ -4754,7 +4933,7 @@ export const createHarnessApi = ({
 
         // Read the row back through the SAME projection the roster route uses, so a create
         // and a later list can never state the same conversation differently.
-        const row = threadRowsOf(store.liveSession(record.id)).find((entry) => entry.id === created.id);
+        const row = threadRowOfId(store.liveSession(record.id), created.id);
 
         if (row === undefined) throw missing('thread', created.id, record.id);
 
@@ -5159,6 +5338,10 @@ export const createHarnessApi = ({
         // record does not narrow back to the member, so the widening is asserted here, at the
         // boundary, rather than loosening the projector's internal model.
         const display = projector.display();
+        // T21: ONE view for this request, so the join below reads each conversation's transcript
+        // at most once instead of once per segment. The verdict is still computed live, per
+        // segment, at request time — the view memoizes READS, never verdicts.
+        const view = transcriptViewOf(record);
 
         const response: TurnDisplayResponse = {
             display: {
@@ -5170,7 +5353,7 @@ export const createHarnessApi = ({
                 // and the projector's per-kind `inPrompt` is a fallback, not a verdict. A segment
                 // the join cannot name keeps NO key, which is what the reader shows as opaque with
                 // no control (../frontend/view-context.ts `contextBlockIsExcluded`).
-                sections: displaySectionsWithInclusionOf(record, turn, display.sections),
+                sections: displaySectionsWithInclusionOf(view, turn, display.sections),
                 // One counter per comparison: the tree is a pure fold of the turn record, so
                 // its revision IS the turn's (the contract defines `turn_display` that way).
                 revision: events.getRevision('turn', turnKey(record.id, turnId))
@@ -5256,7 +5439,13 @@ export const createHarnessApi = ({
         // for every turn's whole answer — no chip, nothing to click — even though the recorded
         // bytes name one assistant entry whenever the answer streamed in one run. Same rule as the
         // thinking join below: exact bytes, one entry or none, never a borrowed flag.
-        const target = block.kind === 'assistant' ? blockAnswerOf(record, turn, block) : blockEntryOf(record, turn, block);
+        // T21: one view for this request's joins (the entry join and, below, the thought join), so
+        // the two lookups share one clone of the conversation they both end up naming. This route
+        // addresses ONE segment by id and carries no section, so it passes no owner hint: today's
+        // roster order is the order here, and the single-segment read is already bounded.
+        const view = transcriptViewOf(record);
+        const target =
+            block.kind === 'assistant' ? blockAnswerOf(view, turn, block) : blockEntryOf(view, turn, block);
 
         // Uplift T7 (F8): the thinking axis. A `reasoning` segment names no call, so the
         // entry join answers nothing for it and the thought join gets its turn — the flag
@@ -5266,7 +5455,7 @@ export const createHarnessApi = ({
         // per-kind `inPrompt: false` stays on the block UNTOUCHED: it is the fallback verdict
         // for a server that cannot name the entry, not a claim about the segment class
         // (../shared/turn-display.ts `inPrompt`).
-        const thought = target === undefined ? blockThoughtOf(record, turn, block) : undefined;
+        const thought = target === undefined ? blockThoughtOf(view, turn, block) : undefined;
         const verdict =
             target !== undefined
                 ? entryIncludedOf(target.entry)
@@ -5349,12 +5538,16 @@ export const createHarnessApi = ({
         const isThinkingSegment = block.kind === 'reasoning';
         const entryRequested = !isThinkingSegment && body.included !== undefined;
         const thinkingRequested = isThinkingSegment || body.reasoningIncluded !== undefined;
+        // T21: the same per-request view the read uses, so a body naming both axes resolves both
+        // joins against ONE clone of the conversation, and the entry the write moves is the entry
+        // the read would name (one identity, one thread — the receipt writes to `target.threadId`).
+        const view = transcriptViewOf(record);
         const entryTarget = entryRequested
             ? block.kind === 'assistant'
-                ? blockAnswerOf(record, turn, block)
-                : blockEntryOf(record, turn, block)
+                ? blockAnswerOf(view, turn, block)
+                : blockEntryOf(view, turn, block)
             : undefined;
-        const thoughtTarget = thinkingRequested ? blockThoughtOf(record, turn, block) : undefined;
+        const thoughtTarget = thinkingRequested ? blockThoughtOf(view, turn, block) : undefined;
 
         // EACH REQUESTED AXIS IS CHECKED ON ITS OWN, the thinking axis first: on a segment that
         // records a call, a body naming both axes must REFUSE rather than write the entry and drop
@@ -5409,14 +5602,20 @@ export const createHarnessApi = ({
         // flag moves the entry out of the request, never out of the document, so the join keeps
         // naming it and the receipt states the figure the next read will publish.
         const live = store.liveSession(record.id);
-        const liveMessages = transcriptMessagesOf(live, target.threadId);
+        // T21: a SECOND view, built AFTER the write and over the post-write record — the write
+        // replaces the transcript array in place, so the pre-write clone is a stale value to
+        // re-read through, and this view's memo must start empty. Within it, the two re-read joins
+        // and both count reads below all name the same synchronous live state, so they share one
+        // clone per conversation instead of four.
+        const liveView = transcriptViewOf(live);
+        const liveMessages = liveView.messagesOf(target.threadId);
         const afterEntry =
             entryTarget === undefined
                 ? undefined
                 : 'callId' in entryTarget
                   ? transcriptEntryOfCall(liveMessages, entryTarget.callId)
-                  : blockAnswerOf(live, turn, block)?.entry;
-        const afterThought = thoughtTarget === undefined ? undefined : (blockThoughtOf(live, turn, block) ?? thoughtTarget);
+                  : blockAnswerOf(liveView, turn, block)?.entry;
+        const afterThought = thoughtTarget === undefined ? undefined : (blockThoughtOf(liveView, turn, block) ?? thoughtTarget);
         const key = threadKey(record.id, target.threadId);
         const revision = events.getRevision('transcript', key);
 
@@ -5426,7 +5625,7 @@ export const createHarnessApi = ({
         // and which entries — and which entries' thinking — the model reads IS content.
         events.bumpRevision('thread', key);
 
-        const messages = transcriptMessagesOf(live, target.threadId);
+        const messages = liveView.messagesOf(target.threadId);
         const unreadable = live.invalidThreads.has(target.threadId);
 
         publish('transcript.updated', [{ resource: 'transcript', id: key }], {
@@ -5468,7 +5667,9 @@ export const createHarnessApi = ({
         // means the dim lands on the same frame as the write. ABSENT (no entry) is not patchable
         // and is not announced: a `context:set` has no way to say "unknown" again, and this route
         // has already refused any write whose axis names no entry.
-        const barVerdict = contextSegmentIncludedOf(live, turn, block);
+        // T21: joined through the POST-WRITE view (the same live state the receipt re-reads), so the
+        // repaint verdict and the receipt come from one clone of one transcript.
+        const barVerdict = contextSegmentIncludedOf(liveView, turn, block);
 
         if (barVerdict !== undefined) {
             const displayKey = resourceKeyOf('turn_display', turnKey(record.id, turn.id));

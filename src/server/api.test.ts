@@ -697,7 +697,17 @@ describe('canonical root and provider document', () => {
         const before = await callWithHeaders(runtime, 'GET', `${MOUNT}/config`);
 
         expect(before.status).toBe(200);
-        expect(Object.keys(before.body).sort()).toEqual(['defaults', 'revision', 'runtime', 'writable_fields']);
+        // T8 (AC4) adds one top-level member: `providerTimeouts`, the effective provider
+        // time bounds. Everything else about this document is unchanged (key-free,
+        // snake_case, revision-stamped), and the new member's own shape is pinned by
+        // ./api-provider-timeouts.test.ts.
+        expect(Object.keys(before.body).sort()).toEqual([
+            'defaults',
+            'providerTimeouts',
+            'revision',
+            'runtime',
+            'writable_fields'
+        ]);
         expect(before.body.revision).toBe(0);
         // snake_case on the wire, and key-free: `has_api_key` is an advertisement, not a secret.
         expect(before.body.defaults).toEqual({
@@ -1168,7 +1178,7 @@ describe('service origin gate', () => {
 
         // Loopback is allowed by design (dev UI), even on another port; a LAN origin is not.
         const sameHostDifferentPort = await callHandler(runtime, 'GET', MOUNT, {
-            headers: { origin: 'http://127.0.0.1:6000', host: '127.0.0.1:5000' }
+            headers: { origin: 'http://127.0.0.1:6660', host: '127.0.0.1:5000' }
         });
         expect(sameHostDifferentPort.status).toBe(200);
 

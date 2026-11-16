@@ -489,7 +489,16 @@ describe('canonical REST contract', () => {
         const before = jsonOf(await call(api, 'GET', `${MOUNT}/config`));
 
         expect(before.status).toBe(200);
-        expect(Object.keys(before.body).sort()).toEqual(['defaults', 'revision', 'runtime', 'writable_fields']);
+        // T8 (AC4) adds the one read-only member `providerTimeouts`; the document is
+        // otherwise the same bounded, key-free, revision-stamped shape. Its own shape is
+        // pinned by ./api-provider-timeouts.test.ts.
+        expect(Object.keys(before.body).sort()).toEqual([
+            'defaults',
+            'providerTimeouts',
+            'revision',
+            'runtime',
+            'writable_fields'
+        ]);
         expect(before.body.revision).toBe(0);
         expect(before.body.defaults).toEqual({
             base_url: 'http://scripted.invalid/v1',

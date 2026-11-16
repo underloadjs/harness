@@ -58,6 +58,8 @@
 
 import { HARNESS_API_ROOT, HARNESS_EPOCH_HEADER, HARNESS_PAGE_LIMIT, HARNESS_REVISION_HEADER, HARNESS_ROUTES } from '../shared/harness-api';
 import { isTrustedRuntimeOrigin } from '../shared/origin';
+import { providerTimeoutsOf } from './provider-diagnostics';
+import type { ProviderTimeouts } from './provider-diagnostics';
 import { STATIC_API_CANDIDATES, isStaticPagesHost } from './deployment';
 import type {
     ActionChoiceInput,
@@ -189,6 +191,12 @@ export type HarnessBootstrap = {
     agents: AgentRowView[];
     // Key-free provider defaults from GET /config (`base_url`, `model`, `has_api_key`).
     defaults: ProviderDefaults;
+    // The provider bounds GET /config reports alongside those defaults
+    // (`providerTimeouts`). OPTIONAL on purpose: a server without the field answers
+    // without the key at all — the key is absent, never `undefined` — so a `toEqual` on a
+    // bootstrap from an older server keeps the shape it always had, and the settings pane
+    // prints no timeouts line (./provider-diagnostics.ts `providerTimeoutsOf`).
+    providerTimeouts?: ProviderTimeouts;
     // Session rows, first page only: metadata + counters, never turns or threads.
     sessions: SessionSummary[];
     // Paging cursors of the four seed pages, so the shell can extend a directory
@@ -789,8 +797,19 @@ export const getHealth = (): Promise<HealthResponse> =>
 
 // `GET /v1/harness/config` — global defaults (key-free) + read-only runtime facts.
 // The session's own merged settings are per-session state, reported on the session.
-export const getGlobalConfig = (): Promise<GlobalConfigDocument> =>
-    request<GlobalConfigDocument>(HARNESS_ROUTES.config());
+//
+// `HarnessConfigDocument` is that document PLUS the OPTIONAL `providerTimeouts` block
+// (../shared/harness-api.ts `GlobalConfigDocument.providerTimeouts`: the three provider
+// bounds, each `0` = that leg is DISABLED). It is declared here as an intersection rather
+// than read off the generated name so the reader below can stay DEFENSIVE: the contract
+// requires all three members inside the block, while a gateway or an older service may
+// answer a partial one, and `providerTimeoutsOf` (./provider-diagnostics.ts) turns any
+// unusable member into absence instead of a fake `0` (which the contract reserves for
+// "disabled"). Nothing in this UI may require the field (AC4).
+export type HarnessConfigDocument = GlobalConfigDocument & { providerTimeouts?: ProviderTimeouts };
+
+export const getGlobalConfig = (): Promise<HarnessConfigDocument> =>
+    request<HarnessConfigDocument>(HARNESS_ROUTES.config());
 
 // `PATCH /v1/harness/config` — patch the provider defaults. `api_key` is
 // write-only: it travels in this body and never appears in any response.
@@ -1778,6 +1797,8 @@ export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
         listSessions()
     ]);
 
+    const timeouts = providerTimeoutsOf(config);
+
     return {
         rootPath: info.api_root,
         info,
@@ -1785,6 +1806,8 @@ export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
         tools: tools.items.map(toolRowOf),
         agents: agents.items.map(agentRowOf),
         defaults: config.defaults,
+        // Conditional spread: absence stays absence (see `HarnessBootstrap.providerTimeouts`).
+        ...(timeouts === undefined ? {} : { providerTimeouts: timeouts }),
         sessions: sessions.items,
         cursors: {
             harnesses: harnesses.nextCursor,

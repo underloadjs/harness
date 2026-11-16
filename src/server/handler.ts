@@ -31,7 +31,7 @@ import type { HarnessIndex } from './protocol';
 // T28: the credential-bearing settings type (`createHarnessApi({ settings })`).
 import type { RunnerSettings } from './harnesses/types';
 // T28: the resolved runtime block type (`createHarnessApi({ runtime })`).
-import type { ServerRuntimeConfiguration } from './config';
+import type { ProviderTimeoutConfiguration, ServerRuntimeConfiguration } from './config';
 import { SessionStore } from './sessions';
 import {
     bodyLimitFor,
@@ -75,6 +75,11 @@ export type HarnessHandlerOptions = {
     // (a fresh `loadRuntimeConfiguration()`), which is a second environment parse and can
     // disagree with a host that passed explicit `options.runtime` overrides.
     runtime?: ServerRuntimeConfiguration;
+    // T8 (AC4): the resolved provider time bounds, forwarded unchanged to the dispatcher
+    // so `GET /config` reports the bounds this process actually enforces. Absent leaves
+    // api.ts's fallback (its own `loadProviderTimeoutConfiguration()`), which agrees today
+    // but is a second parse of the same environment.
+    providerTimeouts?: ProviderTimeoutConfiguration;
     // T13's epoch/revision hub. Forwarded to the dispatcher, whose `api.epoch` is the value the
     // stream's `welcome` carries — one process, one epoch, two transports.
     events?: HarnessEventHub;
@@ -228,6 +233,7 @@ export const createHarnessHandler = ({
     defaults,
     settings,
     runtime,
+    providerTimeouts,
     registry,
     catalogue,
     stream,
@@ -249,6 +255,9 @@ export const createHarnessHandler = ({
         // T28: forward the RESOLVED runtime so the reported block and the enforced one are the
         // same object (see the option comment above).
         ...(runtime === undefined ? {} : { runtime }),
+        // T8: forward the RESOLVED bounds for the same reason (absent stays absent, so the
+        // dispatcher's documented fallback still applies to a host that has none).
+        ...(providerTimeouts === undefined ? {} : { providerTimeouts }),
         registry,
         ...(catalogue === undefined ? {} : { catalogue }),
         ...(stream === undefined ? {} : { stream }),

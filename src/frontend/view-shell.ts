@@ -33,6 +33,7 @@ import {
     apiUrl,
     getSession,
     listSessions,
+    listThreads,
     listTurns,
     putTranscriptDocument
 } from './api';
@@ -1226,7 +1227,11 @@ export const getRawSession = async (
         turnIds === undefined || turnIds.length === 0
             ? listTurns(sessionId, { limit: 100, order: 'desc' })
             : Promise.resolve(undefined),
-        import('./api').then((api) => api.listThreads(sessionId, { limit: 100 }))
+        // `./api` is ALREADY a static dependency of this module (see the named import
+        // above), so a dynamic `import('./api')` here could never move it into another
+        // chunk — Vite warned `[INEFFECTIVE_DYNAMIC_IMPORT]`. Same module, same binding,
+        // identical evaluation order: api.ts is fully evaluated when this module is.
+        listThreads(sessionId, { limit: 100 })
     ]);
 
     const rows = page === undefined ? [] : ascRows(page);

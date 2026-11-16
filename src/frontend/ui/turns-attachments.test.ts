@@ -105,6 +105,12 @@ describe('inline attachment chips', () => {
         const board = mount();
         const turn = board.adopt(withAttachments(record(), [attachment()]));
 
+        // T23/C2: a COLLAPSED tile keeps its body `display: none` (styles.css:3267) and the
+        // collapsed row prints plain text, so the parsed prompt surface arrives when the body
+        // is first on screen. Revealing the tile is part of this contract now; the placement
+        // assertions below are exactly the ones the eager paint used to satisfy.
+        board.expand(turn);
+
         expect(turn.element.querySelectorAll('.turn-prompt .attachment-inline')).toHaveLength(1);
         expect(turn.element.querySelector('.turn-prompt')?.textContent).toBe(
             'look at Image[Image 1]holiday.png now\n'

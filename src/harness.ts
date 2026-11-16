@@ -12279,7 +12279,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                                 attempt: event.attempt,
                                 maxAttempts: event.maxAttempts,
                                 delayMs: event.delayMs,
-                                error: event.error
+                                error: event.error,
+                                // (T6) The transport's diagnosis (redacted endpoint, port,
+                                // failure class). Only present for a classified provider
+                                // failure, so an unclassified retry frame stays exactly the
+                                // payload it was — and the later UI task has a structured
+                                // field to render instead of parsing the message.
+                                ...(event.provider === undefined ? {} : { provider: event.provider })
                             });
                             break;
 
@@ -12288,7 +12294,37 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                             break;
 
                         case 'error':
-                            throw new HarnessError(event.error.message);
+                            // (T8, AC1) The machine CODE has to survive this hop. The
+                            // agent's terminal frame is `toErrorInfo(error)` (core/agent.ts
+                            // + util/errors.ts), which carries `code` for every coded
+                            // failure — `provider-timeout`, `provider-connection`,
+                            // `context-overflow`, a T28 limitation — and re-throwing with
+                            // only the message erased it, so a session/run consumer could
+                            // classify the failure by parsing English prose. Passing the
+                            // code keeps `error.code` on the run's `error` event and on the
+                            // rejection the caller sees, which is what the UI's provider
+                            // panel and a durable `run.failed` record need. `details` is
+                            // read the same way: the agent's frame is message-only today,
+                            // so this stays a no-op there, but a coded error that DOES
+                            // carry a recovery payload keeps it instead of losing it here.
+                            // Both keys are only added when present, so every pre-existing
+                            // `HarnessError` (no `code`, no `details`) is byte-identical —
+                            // `error.name` stays 'HarnessError' and the retries-exhausted
+                            // reporting pinned by src/harness.retry.test.ts is untouched,
+                            // because the retry frame that sets that flag is a different
+                            // event entirely.
+                            {
+                                const info = event.error as {
+                                    message: string;
+                                    code?: string;
+                                    details?: unknown;
+                                };
+
+                                throw new HarnessError(info.message, {
+                                    ...(info.code === undefined ? {} : { code: info.code }),
+                                    ...(info.details === undefined ? {} : { details: info.details })
+                                });
+                            }
                     }
                 }
 
@@ -15801,7 +15837,25 @@ export {
     // whether the agent refused before sending or the provider refused after. A host
     // switches on it instead of matching English, and it is also `error.name`.
     CONTEXT_OVERFLOW_CODE,
-    PROVIDER_REQUEST_BODY_CODE
+    PROVIDER_REQUEST_BODY_CODE,
+    // (T6) The two provider failure classes, so a host (and the UI status bar) can
+    // branch on `provider-timeout` / `provider-connection` instead of matching
+    // English. The defaults and variable names ride along because a UI has to state
+    // which bound expired and which variable would raise it.
+    // (T8, AC3) `provider-rejected` joins them: the third deterministic class, so a
+    // host sees one vocabulary for "re-sending cannot help" instead of a codeless
+    // `HTTP 401` string.
+    PROVIDER_CONNECTION_CODE,
+    PROVIDER_REJECTED_CODE,
+    PROVIDER_TIMEOUT_CODE,
+    DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
+    DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
+    DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS,
+    PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV,
+    PROVIDER_FIRST_TOKEN_TIMEOUT_ENV,
+    PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
+    PROVIDER_TIMEOUT_MAX_MS,
+    resolveProviderTimeout
 } from './transport';
 // (issue 0001 B) `agent({ structured })` fails two ways, and a host that has to tell
 // "my schema is rejected" from "the model answered something else" switches on these

@@ -426,7 +426,7 @@ describe('agent', () => {
             agent({
                 name: 'writer',
                 model: 'm',
-                provider: { baseURL: 'http://localhost:5500/providers/private/v1' }
+                provider: { baseURL: 'http://localhost:6660/providers/private/v1' }
             })
         ).not.toThrow();
     });

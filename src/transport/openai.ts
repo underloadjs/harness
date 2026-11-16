@@ -52,6 +52,29 @@
 //   - ./index.ts      — the transport barrel
 
 import { HarnessError, toErrorInfo } from '../util';
+// (T6) The three provider time bounds, the two new failure classes, and the
+// connection classifier. A leaf module, so this adds no cycle; the same facts are
+// read by ../server/config.ts for startup validation.
+import {
+    connectionFailureOf,
+    DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
+    DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
+    DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS,
+    PROVIDER_CONNECTION_CODE,
+    PROVIDER_FIRST_TOKEN_TIMEOUT_ENV,
+    PROVIDER_REJECTED_CODE,
+    PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV,
+    PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
+    PROVIDER_TIMEOUT_CODE,
+    isTerminalProviderStatus,
+    providerConnectionMessage,
+    providerRejectedMessage,
+    providerTimeoutMessage,
+    providerURLOf,
+    redactProviderKey,
+    resolveProviderTimeout
+} from './provider-timeouts';
+import type { ProviderConnectionFailure, ProviderTimeoutPhase } from './provider-timeouts';
 import {
     attachmentMarker,
     DOWNLOAD_ATTACHMENT_LIMITS,
@@ -655,9 +678,107 @@ const dataPayload = (line: string): string | undefined => {
 // ended the response early), which the caller reports as a failure rather than
 // committing a half answer. The flag is the only thing the caller needs, so it
 // travels by reference instead of changing the yielded payload type.
+// The state the payload loop shares with its caller. `sentinel` is the pre-existing
+// truncation flag; `delivered` counts body reads that carried bytes (so the stall
+// message can say how much arrived, and so a reset BEFORE the first byte is
+// distinguishable from a reset mid-answer); `stalled`/`stallError` park a failure
+// the payload generator cannot express as a payload — the caller turns them into the
+// classified error frame.
+export type StreamReadState = {
+    sentinel: boolean;
+    delivered: number;
+    stalled?: ProviderTimeoutPhase;
+    stallError?: unknown;
+};
+
+// The per-read bound (see `guardedRead`). `expire` records which bound fired and
+// releases the request; `expired` is what the caller reads to tell a stall from a
+// dead socket; `stopped` asks whether the CALLER cancelled, which must still behave
+// exactly as it did before the bounds existed.
+type StreamGuard = {
+    msFor: (delivered: number) => number;
+    expire: (phase: 'first-token' | 'stream-chunk') => void;
+    expired: () => ProviderTimeoutPhase | undefined;
+    stopped: () => boolean;
+};
+
+// One `reader.read()` under a bound.
+//
+// WHY A RACE AND NOT JUST THE ABORT SIGNAL: aborting the fetch controller does error
+// the body of a real `fetch` response, but a body built by a test double or a custom
+// `Response` is not wired to that signal, and the bound has to hold in every case —
+// so the guard settles the await itself. The timer calls `expire` (which aborts the
+// request to release the socket) and rejects the race; the caller then reads
+// `expired()` to name the phase. A read abandoned by the guard is swallowed
+// (`read.catch`) so it cannot surface as an unhandled rejection, and the timer is
+// cleared on every path, including the one where a chunk arrives the same tick.
+const guardedRead = async (
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    guard: StreamGuard | undefined,
+    state: { delivered: number }
+): Promise<Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>> => {
+    const read = reader.read();
+    const bound = guard === undefined ? 0 : guard.msFor(state.delivered);
+
+    if (!(bound > 0)) return await read;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const expiry = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+            // Nothing has arrived yet -> the provider opened the body and never
+            // produced; otherwise this is an inter-chunk stall.
+            guard?.expire(state.delivered === 0 ? 'first-token' : 'stream-chunk');
+            reject(new Error('The provider stream stopped delivering.'));
+        }, bound);
+
+        // A pending bound must never be the reason a process stays alive. Vitest's
+        // fake timers return an object without `unref`, hence the optional call.
+        (timer as unknown as { unref?: () => void }).unref?.();
+    });
+
+    try {
+        return await Promise.race([read, expiry]);
+    } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        read.catch(() => {});
+    }
+};
+
+// One `fetch` under the response-head bound, by the same argument as `guardedRead`:
+// a real `fetch` rejects when its signal aborts, but nothing obliges an arbitrary
+// implementation (or a stubbed one) to, and the bound has to hold either way — so the
+// transport settles the wait itself. On expiry `expire` records the phase and releases
+// the request, the race rejects, and the caller's catch classifies the failure from
+// the RECORDED phase instead of from the rejection text. A work promise that loses the
+// race is swallowed so it cannot surface later as an unhandled rejection.
+const raceHeadBound = async <T>(work: Promise<T>, timeoutMs: number, expire: () => void): Promise<T> => {
+    // `timeoutMs <= 0` is the documented opt-out: no timer at all, the pre-T6 wait.
+    if (!(timeoutMs > 0)) return await work;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const expiry = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+            expire();
+            reject(new Error('The provider never returned a response.'));
+        }, timeoutMs);
+
+        (timer as unknown as { unref?: () => void }).unref?.();
+    });
+
+    try {
+        return await Promise.race([work, expiry]);
+    } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        work.catch(() => {});
+    }
+};
+
 async function* dataFrames(
     body: ReadableStream<Uint8Array>,
-    state: { sentinel: boolean }
+    state: StreamReadState,
+    guard?: StreamGuard
 ): AsyncGenerator<string> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -665,9 +786,10 @@ async function* dataFrames(
 
     try {
         while (true) {
-            const { done, value } = await reader.read();
+            const { done, value } = await guardedRead(reader, guard, state);
             if (done) break;
 
+            state.delivered += 1;
             buffer += decoder.decode(value, { stream: true });
 
             // Keep the trailing partial line for the next read.
@@ -692,6 +814,17 @@ async function* dataFrames(
             return;
         }
         if (trailing !== undefined) yield trailing;
+    } catch (error) {
+        // A CALLER STOP keeps its historical path: the rejection propagates untouched
+        // and the agent's abort path owns the outcome (T6 AC5 — no regression on the
+        // `AbortSignal` path). Every other read failure is parked so the caller can
+        // classify it into a terminal frame instead of leaving the turn `running`.
+        if (guard?.stopped() === true) throw error;
+
+        state.stalled = guard?.expired();
+        state.stallError = error;
+
+        return;
     } finally {
         // Consumers stop early on [DONE]; cancel so the socket is not held open.
         await reader.cancel().catch(() => {});
@@ -1146,6 +1279,36 @@ export const openAICompatible = (
     // Resolve the key per request: a getter may rotate credentials between turns.
     const resolveKey = (): string | undefined => (typeof apiKey === 'function' ? apiKey() : apiKey);
 
+    // --- (T6) the three time bounds, resolved ONCE here ------------------------
+    // Precedence: `provider.*TimeoutMs` beats the environment variable beats the
+    // shipped default, and `0` turns that bound off (the pre-T6 behaviour, kept
+    // reachable because a legitimately slower provider must stay usable). A bad
+    // value fails HERE, on the transport the host wrote, exactly like the
+    // request-body seams below. `server/config.ts` validates the same variables at
+    // startup through the same parser, so a deployment typo is a startup failure.
+    const responseHeadTimeoutMs = resolveProviderTimeout({
+        explicit: configuration.responseHeadTimeoutMs,
+        variable: PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV,
+        fallback: DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS
+    });
+
+    const firstTokenTimeoutMs = resolveProviderTimeout({
+        explicit: configuration.firstTokenTimeoutMs,
+        variable: PROVIDER_FIRST_TOKEN_TIMEOUT_ENV,
+        fallback: DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS
+    });
+
+    const streamChunkTimeoutMs = resolveProviderTimeout({
+        explicit: configuration.streamChunkTimeoutMs,
+        variable: PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
+        fallback: DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS
+    });
+
+    // The dial target, in the form that is safe to quote: origin + path, no
+    // userinfo/query/fragment, plus the EFFECTIVE host:port. This is the sentence
+    // that answers "which port is it actually using?" without a log line.
+    const dial = providerURLOf(url);
+
     // --- fail-early validation of the request-body seams (issue 0001 AC3) -----
     //
     // Everything checkable WITHOUT a request is checked HERE, at transport
@@ -1275,134 +1438,343 @@ export const openAICompatible = (
             return;
         }
 
-        let response: Response;
-        try {
-            response = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    ...(key ? { authorization: `Bearer ${key}` } : {}),
-                    ...headers
-                },
-                body: serialized,
-                signal: request.signal
-            });
-        } catch (error) {
-            // Abort and DNS/connection failures both land here.
-            yield { type: 'error', message: `Request to ${url} failed: ${toErrorInfo(error).message}` };
-            return;
+        // --- (T6) one linked controller, three bounds, per attempt --------------
+        // WHY A LINKED CONTROLLER INSTEAD OF `request.signal` DIRECTLY: the time
+        // bounds must be able to abort the request (release the socket) while a user
+        // STOP must keep aborting it with the caller's own reason. Linking keeps
+        // `request.signal` the single owner of cancellation — the agent's abort path,
+        // the harness's stop, and the terminal-frame path all stay as they were
+        // (AC5) — and gives every bound one place to fire from.
+        const callerSignal = request.signal;
+        const controller = new AbortController();
+
+        let expired: ProviderTimeoutPhase | undefined;
+
+        const expire = (phase: ProviderTimeoutPhase): void => {
+            // The first bound to fire wins; a later one cannot overwrite the phase,
+            // and the abort must be issued exactly once.
+            if (expired !== undefined) return;
+
+            expired = phase;
+            controller.abort();
+        };
+
+        const onCallerStop = (): void => controller.abort(callerSignal?.reason);
+
+        if (callerSignal !== undefined) {
+            if (callerSignal.aborted === true) controller.abort(callerSignal.reason);
+            else callerSignal.addEventListener('abort', onCallerStop, { once: true });
         }
 
-        if (!response.ok) {
-            const detail = await response.text().catch(() => '');
+        // The single release point. The head bound is raced and the body bounds arm
+        // their timers per read, so each one clears its own timer; the thing that
+        // would leak without this is the listener, which lives on the CALLER'S signal
+        // (a run-scoped signal outlives one request, so a per-turn listener would
+        // accumulate). The bounds deliberately do NOT abort on unwind: that is exactly
+        // what pre-T6 did not do, and a consumer that walks away without aborting is
+        // documented as unsupported in ../core/agent.ts.
+        const release = (): void => {
+            if (callerSignal !== undefined) callerSignal.removeEventListener('abort', onCallerStop);
+        };
 
-            // (issue 0004) A context overflow is a DIFFERENT failure from a broken
-            // credential or a dead route, and the frame says so: the code is the
-            // machine name `agent()` uses to keep it out of the retry ladder, and the
-            // message leads with that same name instead of pasting a raw body. An
-            // unrelated 400, and every other status, keeps the historical frame
-            // byte-for-byte — including the absence of the `code` key.
-            if (isContextOverflowResponse(response.status, detail)) {
-                const providerSaid = overflowDetailOf(detail || response.statusText);
+        // The two new terminal frames. Both carry the machine `code` (the retry
+        // policy in ../core/agent.ts switches on it, never on prose) and structured
+        // `details` (the redacted dial target plus the class), which the agent
+        // forwards on its `retry` event so a UI can show WHAT is being retried
+        // without parsing English. The API key is scrubbed out of every message: an
+        // echoed gateway body must not reach the browser or a log line.
+        const timeoutFrame = (phase: ProviderTimeoutPhase, frames: number): HarnessStreamEvent => {
+            const bound =
+                phase === 'response-head'
+                    ? responseHeadTimeoutMs
+                    : phase === 'first-token'
+                      ? firstTokenTimeoutMs
+                      : streamChunkTimeoutMs;
+            const variable =
+                phase === 'response-head'
+                    ? PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV
+                    : phase === 'first-token'
+                      ? PROVIDER_FIRST_TOKEN_TIMEOUT_ENV
+                      : PROVIDER_STREAM_CHUNK_TIMEOUT_ENV;
 
-                // The provider's own line is the actionable half (it usually quotes
-                // both numbers), and a gateway that answers a 413 with an empty body
-                // leaves nothing to quote — then the sentence simply ends.
-                const quoted = providerSaid.length > 0 ? ` The provider said: "${providerSaid}"` : '';
+            return {
+                type: 'error',
+                code: PROVIDER_TIMEOUT_CODE,
+                message: redactProviderKey(
+                    providerTimeoutMessage({
+                        phase,
+                        host: dial.host,
+                        url: dial.url,
+                        timeoutMs: bound,
+                        variable,
+                        frames
+                    }),
+                    key
+                ),
+                details: {
+                    errorClass: PROVIDER_TIMEOUT_CODE,
+                    url: dial.url,
+                    ...(dial.port === undefined ? {} : { port: dial.port }),
+                    phase,
+                    timeoutMs: bound
+                }
+            };
+        };
 
+        const connectionFrame = (failure: ProviderConnectionFailure): HarnessStreamEvent => ({
+            type: 'error',
+            code: PROVIDER_CONNECTION_CODE,
+            message: redactProviderKey(providerConnectionMessage({ host: dial.host, url: dial.url, failure }), key),
+            details: {
+                errorClass: PROVIDER_CONNECTION_CODE,
+                url: dial.url,
+                ...(dial.port === undefined ? {} : { port: dial.port }),
+                ...(failure.errno === undefined ? {} : { errno: failure.errno })
+            }
+        });
+
+        try {
+            let response: Response;
+            // The response-head bound: it covers ONLY the wait for response headers, so
+            // it is over the moment the head arrives and can never cut off a stream that
+            // is delivering — the first-token and inter-chunk bounds own the body from
+            // there. It is a RACE rather than a reliance on the abort signal, because a
+            // `fetch` is not obliged to reject when its signal aborts and the bound has
+            // to hold either way.
+            try {
+                response = await raceHeadBound(
+                    fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'content-type': 'application/json',
+                            ...(key ? { authorization: `Bearer ${key}` } : {}),
+                            ...headers
+                        },
+                        body: serialized,
+                        signal: controller.signal
+                    }),
+                    responseHeadTimeoutMs,
+                    () => expire('response-head')
+                );
+            } catch (error) {
+
+                // A caller stop keeps its historical frame byte-for-byte: `Request to
+                // <url> failed: <abort reason>`, no code, no class. That is the path a
+                // user stop takes today, and it must stay the path it takes tomorrow.
+                if (callerSignal?.aborted === true) {
+                    yield { type: 'error', message: `Request to ${url} failed: ${toErrorInfo(error).message}` };
+                    return;
+                }
+
+                // The head bound expired: the provider accepted the connection and never
+                // answered. Terminal by design (../core/agent.ts never re-sends a
+                // `provider-timeout`), because the user has already waited minutes.
+                if (expired === 'response-head') {
+                    yield timeoutFrame('response-head', 0);
+                    return;
+                }
+
+                // A refused connection / unresolvable host / reset before any byte: named
+                // honestly (the errno AND the dialled host:port) and classed so the agent
+                // spends a short, capped ladder on it instead of 17 minutes. The
+                // historical frame hid this behind `fetch failed`, because undici keeps
+                // the real reason on the `cause` nobody printed.
+                const failure = connectionFailureOf(error, true);
+
+                if (failure !== undefined) {
+                    yield connectionFrame(failure);
+                    return;
+                }
+
+                // Anything else is exactly the pre-T6 frame.
+                yield { type: 'error', message: `Request to ${url} failed: ${toErrorInfo(error).message}` };
+                return;
+            }
+
+            if (!response.ok) {
+                const detail = await response.text().catch(() => '');
+
+                // (issue 0004) A context overflow is a DIFFERENT failure from a broken
+                // credential or a dead route, and the frame says so: the code is the
+                // machine name `agent()` uses to keep it out of the retry ladder, and the
+                // message leads with that same name instead of pasting a raw body. An
+                // unrelated 400, and every other status, keeps the historical frame
+                // byte-for-byte — including the absence of the `code` key.
+                if (isContextOverflowResponse(response.status, detail)) {
+                    const providerSaid = overflowDetailOf(detail || response.statusText);
+
+                    // The provider's own line is the actionable half (it usually quotes
+                    // both numbers), and a gateway that answers a 413 with an empty body
+                    // leaves nothing to quote — then the sentence simply ends.
+                    const quoted = providerSaid.length > 0 ? ` The provider said: "${providerSaid}"` : '';
+
+                    yield {
+                        type: 'error',
+                        code: CONTEXT_OVERFLOW_CODE,
+                        message:
+                            `${CONTEXT_OVERFLOW_CODE}: HTTP ${response.status} — the provider says this request is too ` +
+                            `large for the model's context window, so a retry would be refused again. Send less: a ` +
+                            `turn.before handler may replace the transcript, and the shipped context-compaction ` +
+                            `plugin does exactly that.${quoted}`
+                    };
+                    return;
+                }
+
+                // (T8, AC3) A DETERMINISTIC REFUSAL IS NOT A TRANSIENT FAILURE EITHER.
+                // 400/401/403/404 are answers about OUR request (the credential, the
+                // route, the model id, the argument), so the next attempt is the same
+                // request with the same answer — yet this frame used to carry no code,
+                // which meant a REVOKED KEY walked the whole 1 s -> 512 s ladder for
+                // ~17 minutes and read exactly like a hang. The code is what `agent()`
+                // switches on (core/agent.ts), and the status is in the message because
+                // the message is the half the model, a log line and an event consumer
+                // actually see. 408/429/5xx keep the ladder and the historical frame
+                // byte-for-byte (time, not the request, fixes those) — see
+                // ./provider-timeouts.ts `isTerminalProviderStatus` for the cut-off.
+                if (isTerminalProviderStatus(response.status)) {
+                    yield {
+                        type: 'error',
+                        code: PROVIDER_REJECTED_CODE,
+                        message: redactProviderKey(
+                            providerRejectedMessage({
+                                status: response.status,
+                                url: dial.url,
+                                detail: detail || response.statusText
+                            }),
+                            key
+                        )
+                    };
+                    return;
+                }
+
+                yield { type: 'error', message: `HTTP ${response.status}: ${detail || response.statusText}` };
+                return;
+            }
+
+            if (!response.body) {
+                yield { type: 'error', message: `HTTP ${response.status}: response body is empty` };
+                return;
+            }
+
+            let finishReason: unknown = null;
+            let usage: HarnessUsage | undefined;
+            const pendingToolCalls = new Map<number, PendingToolCall>();
+            // `sentinel`: whether the provider terminated the stream (`[DONE]`).
+            // `delivered` / `stalled` / `stallError` are the T6 additions: how much of the
+            // body arrived, and what stopped it.
+            const streamState: StreamReadState = { sentinel: false, delivered: 0 };
+
+            // The SSE body guard: the first read answers to the first-token bound (a
+            // thinking model may be silent before its first delta), every later read to
+            // the inter-chunk bound. Without this an SSE body that opens and then stops
+            // delivering leaves `reader.read()` pending forever, which is the second
+            // "runs forever" mechanism.
+            const streamGuard: StreamGuard = {
+                msFor: (delivered: number) => (delivered === 0 ? firstTokenTimeoutMs : streamChunkTimeoutMs),
+                expire: (phase: 'first-token' | 'stream-chunk') => expire(phase),
+                expired: () => expired,
+                stopped: () => callerSignal?.aborted === true
+            };
+
+            for await (const frame of dataFrames(response.body, streamState, streamGuard)) {
+                let chunk: any;
+                try {
+                    chunk = JSON.parse(frame);
+                } catch {
+                    // A malformed frame is a provider/proxy bug. Surfacing it beats
+                    // silently emitting half a response.
+                    yield { type: 'error', message: `Malformed stream frame: ${frame.slice(0, 200)}` };
+                    return;
+                }
+
+                // Gateways occasionally attach a provider error to an otherwise 200
+                // stream instead of failing the request.
+                if (chunk.error) {
+                    yield { type: 'error', message: chunk.error.message ?? 'Provider reported an error' };
+                    return;
+                }
+
+                const choice = chunk.choices?.[0];
+                const delta = choice?.delta;
+
+                // `reasoning_content` is the DeepSeek-compatible field; `reasoning`
+                // is what several gateways normalize it to.
+                const reasoning = delta?.reasoning_content ?? delta?.reasoning;
+                if (typeof reasoning === 'string' && reasoning.length > 0) {
+                    yield { type: 'reasoning', delta: reasoning };
+                }
+
+                if (typeof delta?.content === 'string' && delta.content.length > 0) {
+                    yield { type: 'text', delta: delta.content };
+                }
+
+                if (Array.isArray(delta?.tool_calls)) {
+                    for (const fragment of delta.tool_calls) {
+                        mergeToolCallDelta(pendingToolCalls, fragment);
+                    }
+                }
+
+                if (choice?.finish_reason) {
+                    finishReason = choice.finish_reason;
+                }
+
+                // Some providers send usage on its own final chunk (choices: []).
+                if (chunk.usage) {
+                    usage = usageOf(chunk.usage);
+                }
+            }
+
+            // A body that stopped delivering. `dataFrames` parks the failure instead of
+            // throwing it (it yields payloads, not frames), so the classification lives
+            // here, next to the other terminal frames, and every path below is TERMINAL:
+            // the turn cannot stay `running` forever (AC1, AC3).
+            if (streamState.stallError !== undefined) {
+                if (streamState.stalled !== undefined) {
+                    yield timeoutFrame(streamState.stalled, streamState.delivered);
+                    return;
+                }
+
+                // A read that died before a single byte arrived is the same dead dial as
+                // a refused connection: the provider never started answering, so the
+                // short ladder applies. AFTER the first byte it is a truncated
+                // generation, which keeps its pre-T6 classification untouched.
+                if (streamState.delivered === 0) {
+                    const failure = connectionFailureOf(streamState.stallError, true);
+
+                    if (failure !== undefined) {
+                        yield connectionFrame(failure);
+                        return;
+                    }
+                }
+
+                // Nothing recognised: rethrow exactly what the body threw, as before.
+                throw streamState.stallError;
+            }
+
+            // Truncation guard (R1): a body that ends WITHOUT the `[DONE]` sentinel and
+            // without a finish_reason never reported a completed generation, so whatever
+            // arrived is half a response (a dropped socket, a proxy closing the body).
+            // It is a FAILED request, not an empty answer: the agent retries it.
+            if (!streamState.sentinel && !finishReason) {
                 yield {
                     type: 'error',
-                    code: CONTEXT_OVERFLOW_CODE,
-                    message:
-                        `${CONTEXT_OVERFLOW_CODE}: HTTP ${response.status} — the provider says this request is too ` +
-                        `large for the model's context window, so a retry would be refused again. Send less: a ` +
-                        `turn.before handler may replace the transcript, and the shipped context-compaction ` +
-                        `plugin does exactly that.${quoted}`
+                    message: 'The model stream ended before reporting a completion.'
                 };
                 return;
             }
 
-            yield { type: 'error', message: `HTTP ${response.status}: ${detail || response.statusText}` };
-            return;
+            const toolCalls = finishToolCalls(pendingToolCalls);
+
+            // A provider that reports tool calls without a finish_reason still
+            // requested tools; treat that as a tool turn rather than a stop.
+            const stopReason = stopReasonOf(toolCalls.length > 0 && !finishReason ? 'tool_calls' : finishReason);
+
+            yield { type: 'done', stopReason, toolCalls, usage };
+        } finally {
+            // One release point for the linked controller's listener and every armed
+            // bound, on every exit: a completed request, a terminal frame, a throw, or
+            // a consumer that stopped reading early.
+            release();
         }
-
-        if (!response.body) {
-            yield { type: 'error', message: `HTTP ${response.status}: response body is empty` };
-            return;
-        }
-
-        let finishReason: unknown = null;
-        let usage: HarnessUsage | undefined;
-        const pendingToolCalls = new Map<number, PendingToolCall>();
-        // Whether the provider actually terminated the stream (`[DONE]`).
-        const streamState = { sentinel: false };
-
-        for await (const frame of dataFrames(response.body, streamState)) {
-            let chunk: any;
-            try {
-                chunk = JSON.parse(frame);
-            } catch {
-                // A malformed frame is a provider/proxy bug. Surfacing it beats
-                // silently emitting half a response.
-                yield { type: 'error', message: `Malformed stream frame: ${frame.slice(0, 200)}` };
-                return;
-            }
-
-            // Gateways occasionally attach a provider error to an otherwise 200
-            // stream instead of failing the request.
-            if (chunk.error) {
-                yield { type: 'error', message: chunk.error.message ?? 'Provider reported an error' };
-                return;
-            }
-
-            const choice = chunk.choices?.[0];
-            const delta = choice?.delta;
-
-            // `reasoning_content` is the DeepSeek-compatible field; `reasoning`
-            // is what several gateways normalize it to.
-            const reasoning = delta?.reasoning_content ?? delta?.reasoning;
-            if (typeof reasoning === 'string' && reasoning.length > 0) {
-                yield { type: 'reasoning', delta: reasoning };
-            }
-
-            if (typeof delta?.content === 'string' && delta.content.length > 0) {
-                yield { type: 'text', delta: delta.content };
-            }
-
-            if (Array.isArray(delta?.tool_calls)) {
-                for (const fragment of delta.tool_calls) {
-                    mergeToolCallDelta(pendingToolCalls, fragment);
-                }
-            }
-
-            if (choice?.finish_reason) {
-                finishReason = choice.finish_reason;
-            }
-
-            // Some providers send usage on its own final chunk (choices: []).
-            if (chunk.usage) {
-                usage = usageOf(chunk.usage);
-            }
-        }
-
-        // Truncation guard (R1): a body that ends WITHOUT the `[DONE]` sentinel and
-        // without a finish_reason never reported a completed generation, so whatever
-        // arrived is half a response (a dropped socket, a proxy closing the body).
-        // It is a FAILED request, not an empty answer: the agent retries it.
-        if (!streamState.sentinel && !finishReason) {
-            yield {
-                type: 'error',
-                message: 'The model stream ended before reporting a completion.'
-            };
-            return;
-        }
-
-        const toolCalls = finishToolCalls(pendingToolCalls);
-
-        // A provider that reports tool calls without a finish_reason still
-        // requested tools; treat that as a tool turn rather than a stop.
-        const stopReason = stopReasonOf(toolCalls.length > 0 && !finishReason ? 'tool_calls' : finishReason);
-
-        yield { type: 'done', stopReason, toolCalls, usage };
     };
 };

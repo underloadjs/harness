@@ -36,7 +36,12 @@
 //                                        array is not a drain signal) plus the exact
 //                                        wakeup / pending line texts. A transient
 //                                        `retry` deliberately has NO line of its own
-//                                        here (T16/R16a) — see the `retry` handler.
+//                                        here (T16/R16a) — see the `retry` handler. T13
+//                                        keeps that silence for an UNCLASSIFIED retry and
+//                                        mints one `error`-tone line when the transport
+//                                        named a provider failure, because that one the
+//                                        reader can act on (../frontend/ui/turns.ts:9338
+//                                        renders the same facts off the raw frame).
 //   - ../frontend/ui/turns.ts:5154-5186  the parent's tool_result is the authoritative
 //                                        completion of the child its call spawned
 //   - ../frontend/ui/time.ts:19 and ./cli/render.ts:83  `formatDuration`
@@ -624,6 +629,105 @@ const messageOf = (value: unknown): string => {
     const error = (value ?? {}) as { message?: unknown };
 
     return typeof error.message === 'string' ? error.message : '';
+};
+
+/**
+ * The compiled-plane sentence for a PROVIDER-CLASSIFIED retry (T13).
+ *
+ * WHY THE COMPILED PLANE NEEDS A SENTENCE AT ALL. The live WebSocket plane carries only
+ * `TurnDisplayOp`s (`ViewStreamItem` = view | ops | thread | header | failed), never a raw
+ * `HarnessEvent`, so the `retry` frame's `provider` block (../types/index.ts
+ * `HarnessProviderAttemptDiagnostics`, T6) cannot cross `harness.v1` on its own. The one
+ * carrier that can reach the browser is a notice NODE, and the frontend reads its whole
+ * diagnosis from the node's TEXT (see the fixed consumer contract, cited below) — hence the
+ * server composes the sentence, exactly as it already composes the wake line (:2687) and the
+ * error line (:2715).
+ *
+ * TONE `error`, and why (evidence, not taste):
+ *   - the compiled renderer suppresses ONLY `tone === 'retry'` (../frontend/ui/turns.ts:7840,
+ *     T19/R19), so any other tone paints;
+ *   - `error` is the ONE tone whose provider rendering exists on the compiled plane
+ *     (../frontend/ui/turns.ts:7858): `providerFailureOf({ message: node.text })` labels the
+ *     line with the class and sets `data-provider`. The raw watcher has a structured
+ *     `frame.provider` to read, so it can use the literal `provider` tone
+ *     (../frontend/ui/turns.ts:9367); a compiled node has no provider field on the wire
+ *     (../shared/harness-api.ts:3378 closes `DisplayNode.tone` to the six documented tones),
+ *     so `error` + a class-naming sentence is the only tone that reaches that rendering
+ *     without a contract change;
+ *   - styling costs nothing either way: `.agent-notice` has no per-tone rules at all
+ *     (../frontend/styles.css:5102-5117).
+ *
+ * THE CLASS HAS TO SIT IN THE TEXT, VERBATIM: `providerClassOf`
+ * (../frontend/provider-diagnostics.ts:222-238) recovers the class from `error.code`, then
+ * `error.provider.errorClass`, then `message.includes(<class>)`. A compiled notice node
+ * carries none of the first two, so the leading `<errorClass>: ` is what makes the frontend
+ * label the line with its class instead of the generic word `error`. The same
+ * `class: sentence` shape is what T6's terminal failure already writes and what
+ * ../frontend/ui/provider-tile-diagnostics.test.ts:263 pins for a compiled notice.
+ *
+ * THE REST OF THE SENTENCE is a verbatim mirror of the raw plane's `providerRetryNote`
+ * (../frontend/provider-diagnostics.ts:184-217) — attempt/delay from the frame, reason =
+ * errno else the error's message, then the redacted URL, else the bare port — so the live
+ * line and the raw-watcher line state the same facts in the same order. `formatDuration`
+ * (exported above, mirror of ../frontend/ui/time.ts:19) is why 32000 reads `32.0s` in both.
+ *
+ * `undefined` means "mint nothing", and every branch of it is load-bearing:
+ *   - no `provider` block at all → AC2: an ordinary retry keeps the byte-identical node
+ *     sequence it had before this handler existed (the silence T16/R16a + T19/R19 pinned);
+ *   - `attempt` / `maxAttempts` / `delayMs` unusable (absent, NaN, negative) → the raw plane
+ *     prints nothing for the same frame, so the compiled plane must not invent a ladder count.
+ * Nothing is defaulted and no port is guessed: `url` absent AND `port` absent prints no target.
+ */
+export const providerRetryNoticeText = (event: {
+    attempt?: unknown;
+    maxAttempts?: unknown;
+    delayMs?: unknown;
+    error?: unknown;
+    provider?: unknown;
+}): string | undefined => {
+    const provider = event.provider as
+        | { errorClass?: unknown; url?: unknown; port?: unknown; errno?: unknown }
+        | null
+        | undefined;
+
+    if (provider === undefined || provider === null || typeof provider !== 'object') return undefined;
+
+    // Mirror of the frontend's `boundOf` gate (../frontend/provider-diagnostics.ts:194-198).
+    // Read into locals so the guard narrows for the composition below as well.
+    const attempt = event.attempt;
+    const maxAttempts = event.maxAttempts;
+    const delayMs = event.delayMs;
+
+    if (!finiteNumber(attempt) || attempt < 0) return undefined;
+    if (!finiteNumber(maxAttempts) || maxAttempts < 0) return undefined;
+    if (!finiteNumber(delayMs) || delayMs < 0) return undefined;
+
+    // The reason the reader recognises: the platform errno when the transport recovered one,
+    // otherwise the error's own message. Never an empty segment.
+    const errno = typeof provider.errno === 'string' ? provider.errno.trim() : '';
+    const message = messageOf(event.error).trim();
+    const reason = errno.length > 0 ? errno : message;
+
+    // The dialled target: the redacted URL when the frame states one, else the bare port
+    // (a stated port with an unknown host is still half an answer), else nothing at all.
+    const url = typeof provider.url === 'string' ? provider.url.trim() : '';
+    const port = finiteNumber(provider.port) && provider.port >= 0 ? provider.port : undefined;
+    const target = url.length > 0 ? url : port === undefined ? undefined : `port ${port}`;
+
+    const parts = [
+        `attempt ${Math.trunc(attempt)} of ${Math.trunc(maxAttempts)} failed`,
+        `retrying in ${formatDuration(delayMs)}`
+    ];
+
+    if (reason.length > 0) parts.push(reason);
+    if (target !== undefined) parts.push(target);
+
+    const sentence = parts.join(' \u00b7 ');
+    const errorClass = typeof provider.errorClass === 'string' ? provider.errorClass.trim() : '';
+
+    // An unclassified frame (no class token) still gets the line — it carries diagnostics —
+    // and the frontend then labels it with its tone, which is the honest answer.
+    return errorClass.length > 0 ? `${errorClass}: ${sentence}` : sentence;
 };
 
 /**
@@ -2661,7 +2765,44 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 // `streaming` through the backoff (the tile derives its state from
                 // `TurnSection.state`, turns.ts:5376, and the activity ring from ops that
                 // name the agent, ../view-state.ts:820).
+                //
+                // T13 — THE ONE EXCEPTION, AND WHY IT IS NOT A CONTRADICTION: a retry the
+                // TRANSPORT CLASSIFIED is not machinery chatter. The frame names the failure
+                // class, the redacted endpoint and the port, so "attempt 6 of 11 failed ·
+                // retrying in 32.0s · ECONNREFUSED · http://localhost:5500/…" is the
+                // diagnosis of a provider that is not listening, and the reader can act on
+                // it (raise `HARNESS_PROVIDER_CONNECTION_ATTEMPTS`, fix the endpoint) while
+                // the ladder burns. The raw watcher already prints exactly that line
+                // (../frontend/ui/turns.ts:9338-9374, T9); the live plane could not, because
+                // a raw `HarnessEvent` never crosses `harness.v1`. So the notice is minted
+                // HERE, on the compiled plane, from the frame's own `provider` block.
+                //
+                // Rules this handler must keep, each one pinned by a test:
+                //   - `provider` ABSENT → `providerRetryNoticeText` answers `undefined` and
+                //     this still mints NO node, so an ordinary retry's node sequence is
+                //     byte-identical to before (AC2, and the silence ui/turns-retry.test.ts
+                //     pins on the render side);
+                //   - the tone is `error`, never `retry` — `retry` is suppressed by the
+                //     renderer (../frontend/ui/turns.ts:7840) and `error` is the tone the
+                //     provider rendering is gated on (../frontend/ui/turns.ts:7858); see
+                //     `providerRetryNoticeText` above for the full evidence;
+                //   - NO `lastError` and NO section patch: the run is still working, so the
+                //     turn stays `streaming` and the turn's real failure (if the budget runs
+                //     out) is still the terminal `error` frame's own notice (:2715);
+                //   - the node is minted AFTER `discardAttempt`, and `noticeNode` is not
+                //     attempt-owned (:1379 passes `attemptOwned: false`), so the line survives
+                //     the very discard that follows it — it describes the failed attempt, it
+                //     is not part of it. Identity is the frame's own event index (`n${index}`),
+                //     so a replay, a restore and a reconnect re-mint the SAME id at the SAME
+                //     position: one line per retry frame, in stream order.
+                const providerNote = providerRetryNoticeText(event);
+
                 discardAttempt(record, ops);
+
+                if (providerNote !== undefined) {
+                    noticeNode(record, 'error', providerNote, `n${index}`, stamp, undefined, ops);
+                }
+
                 invalidate();
                 break;
             }

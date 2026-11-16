@@ -368,7 +368,7 @@ paths:
                 summary: Point future sessions at another gateway without sending a key
                 value:
                   settings:
-                    base_url: http://localhost:5500/providers/private/v1
+                    base_url: http://localhost:6660/providers/private/v1
                     model: merge/ds4-flash
               drop-key:
                 summary: Remove the configured server key
@@ -4461,6 +4461,31 @@ components:
           $ref: '#/components/schemas/ProviderDefaults'
         runtime:
           $ref: '#/components/schemas/RuntimeSettings'
+        providerTimeouts:
+          type: object
+          description: >-
+            The EFFECTIVE provider time bounds in force for this process, in milliseconds, after the environment
+            has been merged with the shipped defaults. They are reported read-only (a deployment sets them with
+            `HARNESS_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS`, `HARNESS_PROVIDER_FIRST_TOKEN_TIMEOUT_MS` or
+            `HARNESS_PROVIDER_STREAM_CHUNK_TIMEOUT_MS`, never with this document) so a client can explain a
+            `provider-timeout` failure with the number that actually expired instead of the constant. A value of
+            `0` means that bound is DISABLED, i.e. that leg waits forever, exactly as before the bounds existed.
+          required: [responseHeadTimeoutMs, firstTokenTimeoutMs, streamChunkTimeoutMs]
+          additionalProperties: false
+          properties:
+            responseHeadTimeoutMs:
+              type: integer
+              minimum: 0
+              description: Bound on the provider returning response headers for a chat request (`0` = no bound).
+            firstTokenTimeoutMs:
+              type: integer
+              minimum: 0
+              description: Bound on the FIRST streamed token after the head (`0` = no bound).
+            streamChunkTimeoutMs:
+              type: integer
+              minimum: 0
+              description: Bound between consecutive reads of an open stream (`0` = no bound).
+          example: { responseHeadTimeoutMs: 300000, firstTokenTimeoutMs: 300000, streamChunkTimeoutMs: 120000 }
         writable_fields:
           type: array
           description: The exact fields `PATCH /config` accepts, so a client cannot guess the allowlist.

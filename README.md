@@ -32,7 +32,7 @@ const writer = harness({
             model: 'merge/ds4-flash',
             instruction: 'You are a writer.',
             provider: {
-                baseURL: 'http://localhost:5500/providers/private/v1',
+                baseURL: 'http://localhost:6660/providers/private/v1',
                 apiKey: process.env.HARNESS_KEY!
             }
         })
@@ -2271,7 +2271,7 @@ The default transport is `openAICompatible()`, an SSE reader for
 agent({
     model: 'x',
     provider: {
-        baseURL: 'http://localhost:5500/providers/private/v1',
+        baseURL: 'http://localhost:6660/providers/private/v1',
         apiKey: () => rotateKey(),          // resolved per request
         headers: { 'x-title': 'writer' },
         sampling: { temperature: 0.8 }
@@ -2307,7 +2307,7 @@ A host reaches any other outbound field through one of three seams, widest first
 agent({
     model: 'x',
     provider: {
-        baseURL: 'http://localhost:5500/providers/private/v1',
+        baseURL: 'http://localhost:6660/providers/private/v1',
         extraBody: { stream_options: { include_usage: true } }
     }
 });
@@ -2378,7 +2378,7 @@ redaction rules as the chat transport.
 import { listModels, ModelListError } from '@underload/harness';
 
 const ids = await listModels({
-    baseURL: 'http://localhost:5500/providers/private/v1',
+    baseURL: 'http://localhost:6660/providers/private/v1',
     apiKey: () => rotateKey(),          // resolved per request
     signal: AbortSignal.timeout(10_000)
 });
@@ -2843,8 +2843,8 @@ the library.
 yarn cli --list                                     # the eight shipped presets
 yarn cli "Write an opening."                        # default preset: general (live)
 yarn cli --preset planner "Plan the release."       # plans, then delegates to its specialists
-yarn cli --preset workspace --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
-yarn cli --preset research --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
+yarn cli --preset workspace --model merge/ds4-flash --base-url http://localhost:6660/providers/private/v1
+yarn cli --preset research --model merge/ds4-flash --base-url http://localhost:6660/providers/private/v1
 yarn cli                                            # interactive General session (TTY)
 echo "Summarise this" | yarn cli                    # one task from stdin
 ```

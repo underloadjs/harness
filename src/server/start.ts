@@ -258,6 +258,12 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         // reports. Without this the dispatcher re-parses the environment and can state a
         // different execution model than the sessions are actually running under.
         runtime,
+        // T8 (AC4): the SAME resolved bounds the store's transport enforces, so the
+        // number `GET /config` reports is the number a stalled provider will fail on.
+        // Omitted it would re-parse the environment, which agrees today — but a host that
+        // resolves them once through `loadConfiguration()` and a dispatcher that parses
+        // separately is exactly the drift this option exists to forbid.
+        providerTimeouts: configuration.providerTimeouts,
         registry,
         catalogue,
         // T15 integration point: the dispatcher and the store publish through THIS hub and THIS

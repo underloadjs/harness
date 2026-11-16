@@ -468,7 +468,12 @@ export type HarnessStreamEvent =
     // custom transport is free never to set it. `agent()` reads it for one decision
     // only: a frame carrying `context-overflow` is not retried (an oversized retry
     // of an oversized request is the same rejection, paid for again).
-    | { type: 'error'; message: string; code?: string };
+    // `details` is the transport's STRUCTURED half of the same failure (T6): the
+    // redacted dial target, the failure class, the bound that expired. It is
+    // optional and ABSENT for every historical frame, and `agent()` carries it onto
+    // the `HarnessError` it throws, which is how a provider failure reaches the
+    // `retry` event with a machine-readable endpoint instead of prose to parse.
+    | { type: 'error'; message: string; code?: string; details?: unknown };
 
 // A transport is an async iterable of those events. Supplying one is how a
 // caller swaps the wire protocol; the default is `openAICompatible()`.
@@ -571,7 +576,7 @@ export type HarnessTransportOptions = {
 // `stream` is supplied to the agent.
 export type HarnessProviderConfiguration = {
     // Base URL without the /chat/completions suffix, e.g.
-    // 'http://localhost:5500/providers/private/v1'.
+    // 'http://localhost:6660/providers/private/v1'.
     baseURL: string;
     // A static key, or a getter so rotating credentials stay live per request.
     apiKey?: string | (() => string);
@@ -615,6 +620,32 @@ export type HarnessProviderConfiguration = {
     // A positive safe integer, validated when the transport-bearing agent is
     // constructed, so a typo fails where it was written.
     contextWindow?: number;
+    // ---------------------------------------------------------------------------
+    // (T6) Provider TIME bounds, in milliseconds. Each one resolves
+    // `this field` -> the named environment variable -> the shipped default, and
+    // `0` turns that single bound off (the pre-T6 "wait forever" behaviour, kept
+    // reachable for a provider that is legitimately slower than a default). They
+    // exist because before T6 NOTHING bounded the outbound provider call: a gateway
+    // that accepted the TCP connection and then said nothing kept the turn `running`
+    // forever, and an SSE body that opened and stopped delivering was never noticed.
+    // Bounds, defaults, and the operator variables are owned by
+    // ../transport/provider-timeouts.ts (5 min / 5 min / 2 min by default).
+    //
+    // All three are validated at TRANSPORT construction, so a typo fails on the line
+    // it was written rather than on the first provider hiccup.
+    // ---------------------------------------------------------------------------
+    // Bound on `fetch` resolving with a response HEAD (5 min default,
+    // `HARNESS_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS`). Cleared the moment the head
+    // arrives, so it can never cut off a stream that is delivering.
+    responseHeadTimeoutMs?: number;
+    // Bound on the FIRST streamed frame after the head (5 min default,
+    // `HARNESS_PROVIDER_FIRST_TOKEN_TIMEOUT_MS`). Generous on purpose: a
+    // large-context thinking model is legitimately silent before its first delta.
+    firstTokenTimeoutMs?: number;
+    // Bound BETWEEN consecutive reads of an open body (2 min default,
+    // `HARNESS_PROVIDER_STREAM_CHUNK_TIMEOUT_MS`). A streaming provider emits deltas
+    // sub-second apart, so a two-minute gap means the upstream died silently.
+    streamChunkTimeoutMs?: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -773,6 +804,10 @@ export type AgentStreamEvent =
           delayMs: number;
           // The failed attempt's error, preserved verbatim.
           error: HarnessErrorInfo;
+          // (T6) What the transport diagnosed. Present only for a classified provider
+          // failure (`provider-timeout` / `provider-connection`), and `maxAttempts`
+          // below is then that CLASS's attempt count, which is not the agent's.
+          provider?: HarnessProviderAttemptDiagnostics;
       }
     | { type: 'done'; message: HarnessAssistantMessage }
     | { type: 'error'; error: HarnessErrorInfo };
@@ -794,6 +829,31 @@ export type AgentRequestCommit = {
 // as data rather than as Error instances.
 export type HarnessErrorInfo = {
     message: string;
+};
+
+// (T6) What the transport knows about ONE failed provider attempt that a UI cannot
+// recover from prose. Emitted on the `retry` event as `provider`, and absent for
+// every failure the transport did not classify (an HTTP 4xx, a malformed frame), so
+// an ordinary run keeps the event shape it always had.
+//
+// `errorClass` is the transport's machine code — one of `provider-timeout` (a bound
+// expired; the agent does not re-send) or `provider-connection` (nothing answered the
+// dial; the agent spends a short, capped ladder) — and it is the same value as
+// `error.code` on the frame, spelled here so a consumer reads the diagnostics block
+// as one unit. `url` is the DIALLED endpoint, already redacted: origin and path with
+// no userinfo, query or fragment, so an API key can never be printed by a status
+// bar that renders it.
+export type HarnessProviderAttemptDiagnostics = {
+    errorClass: string;
+    url: string;
+    // The effective port of the dial (the explicit port, else the scheme default).
+    port?: number;
+    // For `provider-timeout`: which bound expired.
+    phase?: 'response-head' | 'first-token' | 'stream-chunk';
+    // For `provider-timeout`: the bound that expired, in milliseconds.
+    timeoutMs?: number;
+    // For `provider-connection`: the errno the platform reported, when it named one.
+    errno?: string;
 };
 
 // The brain. Owns history; performs one request per turn().
@@ -3281,6 +3341,11 @@ export type HarnessEvent =
           maxAttempts: number;
           delayMs: number;
           error: HarnessErrorInfo;
+          // (T6) Forwards the agent-level diagnostics of the same kind (redacted
+          // endpoint + failure class), and is absent for an unclassified failure — so
+          // the UI can name the provider and port that is blocking a thread instead
+          // of showing a spinner.
+          provider?: HarnessProviderAttemptDiagnostics;
           thread?: HarnessThread;
       }
     // One model request SUCCEEDED (R3). Everything streamed since the previous

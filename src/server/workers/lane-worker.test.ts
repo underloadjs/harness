@@ -122,6 +122,30 @@ const tempRoot = (label: string): string => {
     return root;
 };
 
+// T25: waits for a DEFERRED best-effort checkpoint to reach `state.json`. A lane commit that
+// lands outside a run is a core state change, and F1 made that observer a
+// `VIEW_CHECKPOINT_INTERVAL_MS` writer rather than a synchronous one (../sessions.ts
+// `noteStateChange` → `checkpoint`); ../sessions.ts `scheduleCheckpoint` commits the pending
+// document at the end of the window, and this polls the bytes until it has. The budget is that
+// bound with slack, counted in iterations (a mocked clock must not be able to expire it), and
+// running it out is the failure: it would mean the lane's commit never became durable at all.
+const waitForDurableDocument = async (
+    root: string,
+    settled: (document: unknown) => boolean,
+    budgetMs = 8_000
+): Promise<void> => {
+    const file = new HarnessPersistence(root).file;
+    const attempts = Math.ceil(budgetMs / 25);
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (fs.existsSync(file) && settled(JSON.parse(fs.readFileSync(file, 'utf8')))) return;
+
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    throw new Error(`state.json did not reach the expected shape within ${budgetMs} ms.`);
+};
+
 const storeOf = (): SessionStore => {
     // `general` is a shipped LIVE preset: its durable template record is what a worker rebuilds
     // (`presetFromRecord`), which is the whole point of the capability gate. The turns below are
@@ -1621,6 +1645,15 @@ describe('worker mode: an in-place lane commit becomes canonical state, is saved
 
         // 2. The DURABLE plane: the store writes on the `agent_message` notification the same seam
         //    an inline transcript write reports, so the document on disk carries both changes.
+        //
+        //    T25: that seam is now a CHECKPOINT-WINDOW writer (F1, ../sessions.ts
+        //    `noteStateChange` → `checkpoint`), so the bytes land when the window closes
+        //    (../sessions.ts `scheduleCheckpoint`) instead of inside the commit call. Waiting for
+        //    them keeps this pin about "the lane's effect is durable", which is what step 3 then
+        //    proves, and it pins the bound the coalescing trade-off promises. Both assertions
+        //    below are unchanged.
+        await waitForDurableDocument(root, (document) => JSON.stringify(document).includes('edited on the lane'));
+
         const persisted = new HarnessPersistence(root).load();
         const record = persisted?.sessions.find((entry) => entry.id === session.id);
 
