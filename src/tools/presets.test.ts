@@ -415,7 +415,9 @@ describe('file tools', () => {
             { path: 'multi-read/b.txt', content: 'b' }
         ]);
 
-        expect(await readResult(['multi-read/b.txt', 'multi-read/a.txt'])).toEqual({
+        const multi = await readResult(['multi-read/b.txt', 'multi-read/a.txt']);
+
+        expect(multi).toEqual({
             files: [
                 {
                     path: join(workdir, 'multi-read', 'b.txt'),
@@ -430,6 +432,13 @@ describe('file tools', () => {
                     nextByte: null,
                     bytes: 1,
                     sizeBytes: 1,
+                    // M7: a multi-path entry publishes the allowance it was GRANTED (both
+                    // files asked for the 16 384-byte default and the pool is smaller than
+                    // twice that, so this is a real answer, not the request echoed back).
+                    // The number embeds the absolute scratch path in every reserve, so it
+                    // moves with the checkout like `wireBytes` and `budgetPool` beside it;
+                    // the exact claim this file can make is the SPLIT, asserted below.
+                    budgetGranted: expect.any(Number),
                     lineCount: 1
                 },
                 {
@@ -445,6 +454,7 @@ describe('file tools', () => {
                     nextByte: null,
                     bytes: 1,
                     sizeBytes: 1,
+                    budgetGranted: expect.any(Number),
                     lineCount: 1
                 }
             ],
@@ -457,6 +467,22 @@ describe('file tools', () => {
             modelBytes: expect.any(Number),
             skipped: 0
         });
+
+        // THE SPLIT IS EXACT. Two files with identical demand share the pool byte for byte,
+        // and the whole pool is spent (neither is capped by its own `maxBytes`, which is
+        // what `limit: null` and `truncated: false` above already say). `budgetGranted`
+        // itself cannot be a literal here: `budgetPool` is the envelope minus per-entry
+        // reserves that each quote the absolute scratch path, so its PARITY - and therefore
+        // whether a rounding byte is left over - depends on the checkout.
+        const [first, second] = multi.files as Record<string, unknown>[];
+
+        expect(first.budgetGranted).toBe(second.budgetGranted);
+        expect((first.budgetGranted as number) + (second.budgetGranted as number)).toBeGreaterThanOrEqual(
+            (multi.budgetPool as number) - 1
+        );
+        expect((first.budgetGranted as number) + (second.budgetGranted as number)).toBeLessThanOrEqual(
+            multi.budgetPool as number
+        );
     });
 
     it('edits several files in one call', async () => {

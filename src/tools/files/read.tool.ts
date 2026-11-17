@@ -10,10 +10,10 @@
 //   - a 1-based line window per file: `startLine` (default 1) plus `maxLines`
 //     (default 2000 lines, an EXPLICIT value capped at 20000 — see "THE DEFAULT IS
 //     A CONTEXT BUDGET, NOT A MEMORY BUDGET" below);
-//   - a per-file allowance of 64 KiB of model-facing bytes by default, raisable per
+//   - a per-file allowance of 16 KiB of model-facing bytes by default, raisable per
 //     request with `maxBytes` up to the whole envelope (`FILE_READ_DEFAULT_MAX_BYTES`
 //     / `FILE_READ_MAX_BYTES`);
-//   - an aggregate budget of 256 KiB of SERIALIZED JSON across the whole batch
+//   - an aggregate budget of 32 KiB of SERIALIZED JSON across the whole batch
 //     (`FILE_READ_WIRE_BUDGET`), allocated by demand rather than by headcount;
 //   - a streaming read chunk and a hard stop as soon as the allowance is reached,
 //     so a single huge file or line is never pulled into memory wholesale;
@@ -177,7 +177,7 @@
 // ("a default read returns as much as the envelope holds").
 //
 // So the two governors are now separated:
-//   - DEFAULT: 2,000 lines and 64 KiB per file — the order of magnitude a file tool
+//   - DEFAULT: 2,000 lines and 16 KiB per file — the order of magnitude a file tool
 //     should hand a model unprompted (a mainstream agent tool of the same shape uses
 //     2,000 lines / 50 KiB for exactly this reason);
 //   - CEILING: 20,000 lines and 262,144 bytes, one explicit `maxLines` / `maxBytes`
@@ -297,9 +297,9 @@
 // THREE governors to tell apart:
 //   - "maxLines" — the request's line cap (the 2000 default or an explicit
 //     `maxLines`) stopped the window: raise `maxLines`, the bytes are not the problem;
-//   - "maxBytes" — the request's own byte allowance (the 64 KiB default or an
+//   - "maxBytes" — the request's own byte allowance (the 16 KiB default or an
 //     explicit `maxBytes`) stopped it: raise `maxBytes`, up to the ceiling;
-//   - "budget" — the batch's shared 256 KiB envelope ran out, so this file got a
+//   - "budget" — the batch's shared 32 KiB envelope ran out, so this file got a
 //     SMALLER share than its own allowance: raising `maxBytes` alone does nothing,
 //     the other paths in the call have to want less (or be read in their own call);
 //   - null — the window reached EOF, so `truncated` is false.
@@ -645,29 +645,36 @@ export const FILE_READ_DEFAULT_MAX_LINES = 2_000;
 export const FILE_READ_MAX_LINES = 20_000;
 
 // The per-file byte allowance, in the same units the budget is charged in (escaped
-// wire bytes, so the number a caller compares against `bytes`/`wireBytes`).
+// wire bytes, so the number a caller compares against `bytes`/`wireBytes`/`modelBytes`).
 //
-// 64 KiB is ~16k tokens of prose: enough for almost any real function, config or
-// document a model is reading in order to ACT on the next line, and small enough
-// that one default read cannot dominate a context window on its own. It is also the
-// size every OTHER file tool in this package caps a whole response at
-// (`FILE_GLOB_CONTENT_BUDGET`, `FILE_GREP_CONTENT_BUDGET`, and the old
-// `MODEL_TOOL_RESULT_BUDGET_BYTES`), so the number a caller has to remember is one
-// number across the package.
+// 16 KiB is ~4k tokens of prose — a function, a config, a document section, which is
+// what a model is reading in order to ACT on the next line. It used to be 64 KiB
+// (~16k tokens), and the run this number was re-derived for had THREE `read` messages
+// of 199-257 KB in a 200k-token conversation: the default was not a context budget, it
+// was a memory budget with a context bill (D11's own section, now measured).
+//
+// It also has to stay UNDER the batch envelope (`FILE_READ_WIRE_BUDGET`), or a
+// single-path call would report `limit: "budget"` — the label that tells the caller
+// "the OTHER paths are the problem" — when the only path is the one it asked for. The
+// per-file default is a half of the envelope for that reason, so one file can be cut
+// by its own allowance and still leave room for a sibling.
 //
 // `FILE_READ_MAX_BYTES` is the ceiling for one explicit `maxBytes`: the whole batch
 // envelope. Above it the request is rejected rather than clamped, like every other
 // range field here — a silent clamp is how `limit` stops being trustworthy.
-export const FILE_READ_DEFAULT_MAX_BYTES = 64 * 1024;
+export const FILE_READ_DEFAULT_MAX_BYTES = 16 * 1024;
 export const FILE_READ_MAX_BYTES = 256 * 1024;
 
-// The aggregate budget, charged against the SERIALIZED JSON of the result rather
-// than raw content. 256 KiB is roughly 64k tokens of English prose.
+// The aggregate budget, charged against the SERIALIZED JSON of the result AND against
+// the prose the model is handed (T3: `modelBytes` is now the escaped length of that
+// prose, not its raw length, so both views are measured in the currency the transcript
+// is billed in). 32 KiB is ~8k tokens of English prose.
 //
 // The old bug was two independent constants — read's content budget and the
 // harness's wire cap — both set to 64 KiB while describing the SAME response, so a
-// full-budget read was always over the cap and got destroyed. The fix is that read
-// now measures its own budget on the serialized form.
+// full-budget read was always over the cap and got destroyed. The fix was that read
+// measures its own budget on the serialized form; T3 lowered BOTH numbers to the
+// context share the harness now enforces.
 //
 // The value is written out rather than imported from ../../core/result-budget on
 // purpose: a relative import becomes a CAPTURED SOURCE DEPENDENCY of the compiled
@@ -675,8 +682,12 @@ export const FILE_READ_MAX_BYTES = 256 * 1024;
 // that shipped presets compile with `dependencies: []`), and it would make read
 // non-self-contained against its own "executable on its own" contract. The two
 // numbers are kept equal by an assertion in read.test.ts instead, which catches the
-// drift without changing how the tool compiles.
-export const FILE_READ_WIRE_BUDGET = 256 * 1024;
+// drift without changing how the tool compiles — that pin is `MODEL_TOOL_RESULT_BUDGET_
+// BYTES`, 32768, and it is the property this whole design rests on: a read that fills
+// its envelope survives the harness envelope byte for byte, because the harness counts
+// the same escaped bytes this budget spends (escaping is per character, so summing
+// per-entry escaped costs equals escaping the concatenation).
+export const FILE_READ_WIRE_BUDGET = 32 * 1024;
 
 // Back-compat alias for the aggregate budget's historical name. It now denotes
 // WIRE bytes; the result still reports it as `contentBudget` so existing callers
@@ -686,6 +697,86 @@ export const FILE_READ_CONTENT_BUDGET = FILE_READ_WIRE_BUDGET;
 // A batch cap as well as a content cap: without it, thousands of empty files
 // would still return thousands of metadata entries and blow the response up.
 export const FILE_READ_MAX_TARGETS = 100;
+
+// ---------------------------------------------------------------------------
+// HOW MANY PATHS ONE RESULT CAN ENUMERATE (T7 — the P-1/P-2 pair)
+// ---------------------------------------------------------------------------
+// `FILE_READ_MAX_TARGETS` bounds the REQUEST. It does not bound the RESULT, and
+// the run this file was re-derived for showed the two are not the same question:
+// every entry costs a fixed scaffolding whether it returns 40 KiB or nothing
+// (`ENTRY_SHELL` + the escaped path + the value allowance in the machine view, plus
+// its own header and continuation line in the model's copy — measured 660-730 bytes
+// per path for a realistic temporary-directory path, and 1 040 bytes for a FAILED one
+// (668 of entry JSON + 370 of prose: its ENOENT sentence quotes the path, and a name
+// under a MISSING parent folder adds the "nearest folder" clause, which is where the
+// 1.8-3.0 KiB figures come from — a 1 200-character name measures 4 503 bytes across
+// both views). Times 100 that is 66-104 KiB of scaffolding against a 32,768-byte
+// envelope: the batch is over-subscribed before one byte of file text is read.
+//
+// The previous answer was to clamp the content pool to 0 and let the one-code-point
+// floor (F1) emit one character per path — a 40 KiB file beside 99 6-byte neighbours
+// came back as ONE BYTE and 99 more, all of it metadata, and nothing said so. That
+// is the "1 byte" the T3 post-mortem measured, and it is not a bound: it is the
+// envelope spent entirely on bookkeeping.
+//
+// So the envelope decides how many paths one result ENUMERATES, and the rest are
+// declared rather than silently squeezed (P-1: a single tool result never costs more
+// than 4% of the context window, so batch width is what gets bounded; P-2: an
+// omission the caller cannot see is a wrong answer, not a bounded one). Three
+// numbers implement that, all of them reserves taken before the content is split:
+//
+//   - `FILE_READ_ERROR_ENTRY_MAX` + `FILE_READ_ERROR_ENTRY_BUDGET_BYTES`: how many
+//     individual FAILED entries the result names. A failure's message is the single
+//     most expensive entry this tool can produce and the least actionable in bulk
+//     (40 identical "no such file" sentences do not tell the caller 40 things it can
+//     act on), so failures get a quarter of the envelope and a hard count, and the
+//     remainder becomes one declared `+N more paths failed` line that says WHICH
+//     request paths were dropped and how to page them.
+//   - `FILE_READ_MIN_ENTRY_CONTENT_BYTES`: how much window a path has to be able to
+//     receive to be worth an entry at all. Enumerating a path costs ~670 bytes of
+//     scaffolding; spending it on one character is the trade this replaces.
+//
+// The fold is a PREFIX rule: the result enumerates the first `k` paths of the call,
+// in the caller's own order, and `omitted` counts the tail. That keeps the entry
+// order the contract already promises, makes "which ones are missing" derivable
+// without listing them (`files.length + omitted` is the request length, and the
+// missing ones are the last `omitted` of it), and makes the paging instruction exact.
+//
+// These are reserves, not targets: a batch whose whole scaffolding fits the envelope
+// is untouched by any of this and keeps every entry it always had.
+//
+// The most individual failed entries one result enumerates. Beyond this the entries
+// are folded into the declared line, however much room is left: 24 messages of any
+// wording is already more "not found" verdicts than a caller can act on per call.
+export const FILE_READ_ERROR_ENTRY_MAX = 24;
+
+// The most of the envelope the enumerated failed entries may take. A quarter, so a
+// batch that is entirely failures still cannot crowd the readable files out of the
+// result, and so 40 failures and 400 failures cost the SAME order of magnitude:
+// measured, a failed path costs 1 040 bytes across the two views (3 003 + 1 500 = 4 503
+// for a 1 200-character name), so this budget admits roughly 7 of them and the rest are
+// declared — a batch of 40 short missing paths enumerates 5 at `wireBytes` 3 485 and
+// folds the last 35 into one line, where the pre-fold tool spent 33 786 bytes (839 per
+// entry, 1 018 past the envelope) spelling every one out.
+export const FILE_READ_ERROR_ENTRY_BUDGET_BYTES = Math.floor(FILE_READ_WIRE_BUDGET / 4);
+
+// The smallest window a readable path is enumerated for. Below this the entry is
+// metadata with no answer in it, and the fold line says the same thing for less:
+// 1 KiB is ~256 tokens, the order of magnitude of a function or a config block —
+// the least a model can read and act on in the same turn. A path that needs LESS
+// than this (a 6-byte file, or a request whose own `maxBytes` is 8) is still worth
+// enumerating, because it can be answered COMPLETELY for what it costs: the reserve
+// for such a path is its own size, not this number (see `enumerableContentBytes`).
+export const FILE_READ_MIN_ENTRY_CONTENT_BYTES = 1_024;
+
+// A fold must survive the envelope it is declared inside, so the line that declares
+// it is priced into the walk that decides to fold — with margin, because the walk
+// cannot see a string it has not built yet. `foldLine` below is ASCII-only, carries
+// no quotes, no backslashes and no newlines, and its worst case (every number at its
+// widest, plus `FILE_READ_MAX_TARGETS = 32` path characters) is under 210 bytes, so
+// 256 covers the prose line AND the `"omitted":N,` field the same fold adds to the
+// machine view.
+export const FILE_READ_FOLD_LINE_MARGIN_BYTES = 256;
 
 // The budget above is the WHOLE call; FILE_READ_DEFAULT_MAX_BYTES is one file's
 // share of it by default. Both are ceilings; neither is a target. A batch of four
@@ -944,10 +1035,11 @@ export type FileReadEntry = {
     // WHY the window stopped, which is what makes `truncated` actionable (D5):
     // "maxLines" when this request's line cap (the 2000 default or an explicit
     // maxLines) stopped it — raise `maxLines`, the bytes are not the problem;
-    // "maxBytes" when this request's own byte allowance (the 64 KiB default or an
+    // "maxBytes" when this request's own byte allowance (the 16 KiB default or an
     // explicit maxBytes) stopped it — raise `maxBytes`, up to 262144; "budget" when
-    // the batch's shared 256 KiB envelope gave this file a smaller share than its
-    // allowance — raising `maxBytes` alone does nothing, the batch has to want less;
+    // the batch's shared 32 KiB envelope (`FILE_READ_WIRE_BUDGET`) gave this file a
+    // smaller share than its allowance — raising `maxBytes` alone does nothing, the
+    // batch has to want less;
     // and null when the window reached EOF. Never non-null while `truncated` is false.
     limit: 'maxLines' | 'maxBytes' | 'budget' | null;
     // The offset the window actually began at, when `startByte` was supplied and had
@@ -1029,7 +1121,7 @@ export type FileReadResult = {
     // on the real output rather than estimated.
     wireBytes: number;
     // The aggregate wire budget this call was subject to: the constant
-    // `FILE_READ_WIRE_BUDGET` (256 KiB), i.e. the ENVELOPE, not what was splittable.
+    // `FILE_READ_WIRE_BUDGET` (32 KiB), i.e. the ENVELOPE, not what was splittable.
     // `budgetPool` is the part that was actually left for content once every reserve was
     // taken, and `budgetGranted` is one file's share of it (M7).
     contentBudget: number;
@@ -1037,8 +1129,8 @@ export type FileReadResult = {
     // `contentBudget` minus the serialized scaffolding of the result and of every entry
     // (including the `note`'s worst case) minus the per-file headroom the one-code-point
     // floor can overshoot by (M7). Without this number a caller can see that its batch
-    // was cut and cannot tell WHY: 40 paths of a 256 KiB envelope is a pool of ~5 KiB per
-    // file, and the 64 KiB `maxBytes` it asked for is not the number it got.
+    // was cut and cannot tell WHY: 40 paths of a 32 KiB envelope is a pool of ~700 bytes
+    // per file, and the 16 KiB `maxBytes` it asked for is not the number it got.
     budgetPool: number;
     // Bytes of TEXT the model actually receives: the exact UTF-8 length of the prose
     // projection this result is delivered as (see "WHAT THE MODEL ACTUALLY RECEIVES"
@@ -1052,6 +1144,18 @@ export type FileReadResult = {
     modelBytes: number;
     // How many entries reported an `error` instead of content.
     skipped: number;
+    // How many of the requested paths this call could NOT answer at all, because the
+    // envelope cannot pay even one honest window for every path in the batch (see the
+    // constants section "THE BATCH-WIDTH ARITHMETIC"). The paths are enumerated in request
+    // order, so these are exactly the LAST `omitted` entries of the caller's `paths`
+    // array; `files.length + omitted` is always the number of paths requested.
+    //
+    // Present (and > 0) only when the batch folded, and its cost is charged in the walk
+    // that decides to fold — the invariant `wireBytes <= contentBudget` holds WITH the
+    // field, not by spending it. Absent, not `undefined`, for a batch that answered
+    // everything: a key that is always present on a tool that almost never folds would
+    // tax every read for a number that is always 0.
+    omitted?: number;
     // The prose advisory for a LARGE file whose window was cut — one short sentence per
     // affected file (path, `sizeBytes`, bytes returned, and the continuation to use),
     // first FILE_READ_NOTE_MAX_PATHS paths named and the remainder counted. Present ONLY
@@ -1688,8 +1792,24 @@ const projectionHeader = (entry: FileReadEntry): string => {
 const projectionChunks = (entry: FileReadEntry, numbered: boolean): ProjectionChunk[] => {
     const chunks: ProjectionChunk[] = [];
 
+    // T3: the projection is charged in ESCAPED wire bytes (`contentWireBytes`), the way
+    // the machine view has always been charged — not in the raw UTF-8 length it used to
+    // use. The reason is the one the whole file is written around: the two views are
+    // delivered to two consumers through ONE budget, and the consumer that pays for the
+    // prose is the transcript, which stores it as a JSON string value. Charging the
+    // prose at its raw length under-priced every quote, backslash and control character
+    // in the file (a `"` costs the transcript 2 bytes, a NUL-class control 6), so a
+    // batch that believed it had spent its envelope had in fact spent the envelope plus
+    // the escape factor — and the harness, which measures the escaped form, cut the
+    // prose in half and threw away the continuation footer along with it.
+    //
+    // Escaping is per character and context-free, so the per-chunk sums below add up to
+    // exactly the escaped length of the concatenated projection: the reserve, the
+    // allocator and the final `modelBytes` are all the same measurement of the same
+    // bytes, which is what lets `modelBytes <= contentBudget` imply that the harness
+    // will not touch this result.
     const add = (text: string): void => {
-        if (text.length > 0) chunks.push({ text, bytes: Buffer.byteLength(text, 'utf8') });
+        if (text.length > 0) chunks.push({ text, bytes: contentWireBytes(text) });
     };
 
     add(`${projectionHeader(entry)}\n`);
@@ -1785,6 +1905,94 @@ const renderProjection = (files: readonly FileReadEntry[], numbered: readonly bo
         .flatMap((entry, index) => projectionChunks(entry, numbered[index] === true))
         .map((chunk) => chunk.text)
         .join('');
+
+// ---------------------------------------------------------------------------
+// THE BATCH LINE — the aggregate no single entry can see (T3).
+//
+// WHY IT EXISTS. The context-explosion post-mortem this fix came out of quoted a tool
+// result that said `returned 87 bytes` and a transcript message that measured
+// 198,958 bytes, and read the gap as a 2287x escaping bug. It was not: the call had
+// asked for EIGHT windows and every one of them had printed its own honest
+// `returned N bytes`. The multiplication was per-entry reporting inside a per-call
+// message, and nothing the model was handed said how much the CALL had cost. Per-entry
+// footers cannot say it either: no entry knows the batch total, and the machine view's
+// `modelBytes`/`note` are invisible here, because for this tool the model reads the
+// prose and only the prose.
+//
+// So the bounded case gets one line that names the aggregate and the way out, and the
+// line is emitted ONLY when the aggregate is genuinely not visible from any one entry:
+//   - two or more windows were cut (each entry describes itself, none describes the
+//     sum), or
+//   - something was cut by the SHARED envelope (`limit: "budget"`), which no entry's
+//     own allowance explains and whose advice ("want less, or read it in its own call")
+//     is the opposite of "raise maxBytes".
+// A single window cut by its own `maxLines`/`maxBytes` already says everything it needs
+// in its own footer, so it pays nothing — that is why ordinary one-file reads stay
+// byte-for-byte what they were.
+//
+// The text is ASCII with no quotes and no backslashes, so its escaped cost equals its
+// raw cost and `PROJECTION_BATCH_MARGIN` below is exact rather than estimated.
+// ---------------------------------------------------------------------------
+
+// The reserve for one batch line: it can only be priced before the scan, like every
+// other part of the projection. 256 dominates the widest line the builder can emit
+// (`read: 100 windows, 32768 of 32768 model bytes, 100 cut (100 maxLines, 100 maxBytes,
+// 100 budget) - page a cut window with startByte = nextByte` is ~150 bytes, and every
+// number in it is capped by FILE_READ_MAX_TARGETS and by the envelope itself).
+const PROJECTION_BATCH_MARGIN = 256;
+
+// Which governors cut this batch, as the compact `N label` list the batch line quotes.
+const batchGovernors = (cut: readonly FileReadEntry[]): string => {
+    const counts = new Map<string, number>();
+
+    for (const entry of cut) {
+        const label = entry.limit ?? 'budget';
+        counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+
+    return [...counts].map(([label, count]) => `${count} ${label}`).join(', ');
+};
+
+// The line itself, or the empty string when the batch needs no aggregate.
+const batchLine = (files: readonly FileReadEntry[], proseBytes: number): string => {
+    const cut = files.filter((entry) => entry.truncated);
+
+    if (cut.length === 0) return '';
+
+    if (cut.length < 2 && !cut.some((entry) => entry.limit === 'budget')) return '';
+
+    return (
+        `read: ${files.length} windows, ${proseBytes} of ${FILE_READ_WIRE_BUDGET} model bytes, ` +
+        `${cut.length} cut (${batchGovernors(cut)}) - page a cut window with startByte = nextByte\n`
+    );
+};
+
+// The line that declares a FOLD (see the constants section "THE BATCH-WIDTH
+// ARITHMETIC"), or the empty string when this batch answered every path. It comes first
+// in the projection on purpose: it is the only line that explains why a path the caller
+// asked for is missing, and the batch line's `N windows` count would otherwise read as
+// "the tool ignored half my request".
+//
+// It names NO paths, and that is what makes its cost provable: a path can be 500
+// characters wide, so any list of them would need a margin proportional to
+// `FILE_READ_MAX_TARGETS * 500`. Instead it states the one fact that makes the omission
+// complete — the folded paths are the LAST `omitted` entries of the caller's own request
+// order — and the machine view carries `omitted` for the programmatic caller.
+//
+// ASCII, no quotes, no backslashes, no newlines, so its escaped cost equals its raw
+// cost — the same property `batchLine` relies on, and what lets
+// `FILE_READ_FOLD_LINE_MARGIN_BYTES` price it exactly rather than estimate it. Every
+// number in it is capped by `FILE_READ_MAX_TARGETS` (2 digits) or by the envelope
+// (5-6 digits), so the widest line this template can emit is ~210 bytes.
+const foldLine = (requestedCount: number, omittedCount: number): string => {
+    if (omittedCount === 0) return '';
+
+    return (
+        `read: folded - ${omittedCount} of ${requestedCount} requested paths were not read because this ` +
+        `${FILE_READ_WIRE_BUDGET}-byte envelope cannot answer them all; the omitted paths are the last ` +
+        `${omittedCount} in the order requested, re-request them in another call\n`
+    );
+};
 
 // What one entry's projection line costs, priced BEFORE the scan (the budget is split
 // before anything is read). A failed entry's message is known, so it is measured
@@ -4233,7 +4441,7 @@ export const FILE_READ_METADATA: PresetToolMetadata = {
     // "byte offset to SEEK to". Net +10, and the headroom stays positive. The ceiling did not
     // move.
     description:
-        'Read a BOUNDED window of UTF-8 text files. Per-file defaults startLine 1, startColumn 0, startByte null, maxLines 2000, maxBytes 65536 (escaped wire bytes, not raw) - this feeds a context window, not a pipe. Act on `truncated`/`limit` first: "maxLines" raise maxLines, "maxBytes" raise maxBytes, "budget" means the batch\'s 256 KiB envelope is full, null means EOF. The 256 KiB budget is measured on the SERIALIZED result and allocated by demand. A budget cut is explainable: `budgetPool` is what the batch had left to split, `budgetGranted` what this file got. A truncated entry\'s `nextByte` is its first unread byte, so paging cannot loop; continue with startByte = nextByte or { startLine: nextLine, startColumn: nextColumn } - `startColumn` counts bytes from the PHYSICAL start of `startLine`, so that pair is an absolute position and walks a line of any size. `sizeBytes` is null when the size is not a filesystem fact (a /proc file, FIFO, socket, device): never treat 0 or null as EOF; such a target answers startByte with ESPIPE. An unreadable path stays IN ORDER with `error: { code, rawCode?, message }`, costs no budget, and counts in `skipped`: ENOENT (names likely paths), EISDIR (previews entries), EACCES/EPERM/ENOTDIR/ELOOP/ENAMETOOLONG, EBINARY (`lossy: true` substitutes U+FFFD), ERANGE (names the size or line count), ESPIPE (no file offset - read it without startByte), EAGAIN (an empty FIFO: start the writer), ETIMEDOUT (that file missed the 10000ms I/O deadline; siblings unaffected), EIO with the untouched errno in `rawCode`. Files 65536 bytes or larger the budget cut are also named in `note`. Only a malformed request or a cancelled call (`ECANCELED`) rejects the call.\'',
+        'Read a BOUNDED window of UTF-8 text files. Per-file defaults startLine 1, startColumn 0, startByte null, maxLines 2000, maxBytes 16384. The 32 KiB budget is measured on the SERIALIZED result, not on `content`\'s raw length. 32768 model-facing bytes are shared by ALL the paths in one call, allocated by demand. Act on `truncated`/`limit` first: "maxLines" raise maxLines, "maxBytes" raise maxBytes, "budget" means the batch envelope is full (want less from the other paths), null means EOF. `budgetPool` is what the batch had left, `budgetGranted` what this file got. A truncated entry\'s `nextByte` is its first unread byte, so paging cannot loop; continue with startByte = nextByte or { startLine: nextLine, startColumn: nextColumn } - `startColumn` counts bytes from the PHYSICAL start of `startLine`, so that pair is absolute and walks a line of any size. `sizeBytes` is null when the size is not a filesystem fact (a /proc file, FIFO, socket, device): never treat 0 or null as EOF; such a target answers startByte with ESPIPE. An unreadable path stays IN ORDER with `error: { code, rawCode?, message }`, costs no content, and counts in `skipped`: ENOENT, EISDIR, EACCES/EPERM/ENOTDIR/ELOOP/ENAMETOOLONG, EBINARY (`lossy: true` substitutes U+FFFD), ERANGE, ESPIPE (no file offset - read it without startByte), EAGAIN (an empty FIFO), ETIMEDOUT (that file missed the 10000ms I/O deadline; siblings unaffected), EIO with the errno in `rawCode`. A batch wider than the envelope reads a prefix and declares `omitted` (the last N paths you asked for). Files 65536 bytes or larger the budget cut are also named in `note`. Only a malformed request or a cancelled call (`ECANCELED`) rejects the call.',
     tags: ['files', 'read', 'filesystem'],
     // R18: everyday file access is core — always declared, never discovered.
     visibility: 'core',
@@ -4283,7 +4491,7 @@ export const FILE_READ_METADATA: PresetToolMetadata = {
                                     minimum: 1,
                                     maximum: 262_144,
                                     description:
-                                        'Byte allowance for THIS file, charged in ESCAPED wire bytes (the unit `wireBytes` counts), not the raw bytes `bytes` reports: a newline costs 2 here and 1 there, a quote costs 2, and a non-ASCII character costs its raw UTF-8 length unless JSON escapes it. One character is always returned, up to 6 bytes over; a window can still stop with `bytes` well under this number. Default 65536; max 262144. The only knob that widens ONE file. A window cut by it reports limit: "maxBytes".'
+                                        'Byte allowance for THIS file, charged in the same serialized unit as `wireBytes`/`modelBytes` (a newline or a quote costs 2 here). One character is always returned, up to 6 bytes over. Default 16384, max 262144; the CALL shares one 32768-byte envelope across its paths, so a cut may report limit: "budget" instead, which raising this alone will not fix. A cut by this cap reports limit: "maxBytes".'
                                 },
                                 lossy: {
                                     type: 'boolean',
@@ -4558,26 +4766,156 @@ export const readFileBatch = async (
         throw error;
     }
 
-    // PHASE 2 — water-fill the budget across the readable files.
+    // PHASE 2 — decide which paths this envelope can answer AT ALL, then split what is
+    // left across exactly those.
     //
-    // Reserve the scaffolding of EVERY entry first, including the failed ones: an
-    // error message is part of the response and costs wire bytes too. What is
-    // left is content.
+    // Two reserves were added before T3 and then spent, and that is the arithmetic that
+    // broke the tool at a 32 KiB envelope:
+    //
+    //   reserve                          what it pays for
+    //   ---------------------------------------------------------------------------
+    //   slot.overhead                    the entry's JSON scaffolding, INCLUDING the
+    //                                    `error` object of a failed path (a 40-ENOENT
+    //                                    batch is ~33 KiB of message on its own)
+    //   slot.projectionReserve           the same path's line in the model's copy
+    //   noteReserve(slots)               the large-file advisory, machine view
+    //   PROJECTION_BATCH_MARGIN          the batch summary line in the model's copy
+    //   CODE_POINT_ESCAPE_CEILING_BYTES  the one-code-point floor every window can emit
+    //                                    over its share, plus a numbered window's gutter
+    //
+    //   budget 32,768 - the 40-path reserve above = NEGATIVE, i.e. nothing at all left for
+    //   content. The old code answered that with `Math.max(0, ...)` and went on to
+    //   enumerate every path anyway — so it spent what it had not reserved.
+    //
+    // THE RULE. A batch may only enumerate the paths whose reserves it can pay for
+    // WITH an honest body alongside: every enumerated entry gets at least
+    // `FILE_READ_MIN_ENTRY_CONTENT_BYTES` of content (or, for a small file, its whole
+    // remainder) and at most `request.maxBytes`, and failed entries pay their message in
+    // full up to `FILE_READ_ERROR_ENTRY_BUDGET_BYTES` and
+    // `FILE_READ_ERROR_ENTRY_MAX`. Paths past that ceiling are FOLDED: absent from
+    // `files`, counted in `omitted`, and named by a line at the top of the model's copy.
+    // Tolerating an oversized batch and answering it with a pool of 0 was the wrong
+    // trade; folding is the honest one (the ceiling is now the batch WIDTH, not the
+    // envelope).
+    //
+    // THE WALK. Prices each slot in request order and stops at the first one the envelope
+    // cannot afford; everything after it is folded. It runs a SECOND time holding back
+    // `FILE_READ_FOLD_LINE_MARGIN_BYTES` if the first pass had to fold anything, so the
+    // declaration of the fold is paid for rather than discovered. The second pass can only
+    // fold MORE paths (strictly more reserve, same needs), which is what keeps this
+    // monotone and terminating — the same fixed-point argument the `wireBytes` loop below
+    // makes about digit growth.
+    //
+    // WHY A PREFIX AND NOT A SELECTION: request order is the only order this tool
+    // promises (an unreadable path "stays IN ORDER" in the published description), and
+    // folding a prefix keeps `files.length + omitted === paths.length` and
+    // "the omitted paths are the last N you asked for" both exactly true.
+    const noteCharge = noteReserve(slots);
+
+    // The part of the reserve the walk owns, independent of which slots it enumerates.
+    // `PROJECTION_BATCH_MARGIN` is charged unconditionally here even though the real
+    // reserve below may find the batch line unnecessary: a walk that under-charges itself
+    // would enumerate paths the envelope cannot pay for, while the real reserve being
+    // SMALLER than the walk assumed only gives the pool back (see the bound note below).
+    const walkShell = RESULT_SHELL.length + noteCharge + PROJECTION_BATCH_MARGIN;
+
+    // What one slot costs in both views plus the cheapest body that is still an answer,
+    // or `null` when the batch can no longer afford to enumerate this slot at all (in
+    // which case everything from here on folds — a failed entry always pays its full
+    // message, so there is no cheaper version of it to keep enumerating).
+    const slotNeed = (slot: ScanSlot, errorSpend: number, errorCount: number): number | null => {
+        const shell = slot.overhead + slot.projectionReserve;
+
+        if (slot.handle === null) {
+            // A failed path: the message IS the answer, so it is priced in full (machine
+            // entry + its line in the model's copy), up to the batch-wide error budget and
+            // count. NO content floor: a failed entry emits zero content bytes, and
+            // charging one anyway is what made a 40-ENOENT batch fold at 3 paths while
+            // ~25 KiB of the envelope sat unspent — the reserve has to mirror what the
+            // response actually serializes, or the fold is a guess (measured: a 60-character
+            // missing path costs 662 bytes of entry JSON + ~370 bytes of projection line).
+            if (errorCount >= FILE_READ_ERROR_ENTRY_MAX) return null;
+            if (errorSpend + shell > FILE_READ_ERROR_ENTRY_BUDGET_BYTES) return null;
+
+            return shell;
+        }
+
+        // A readable path: the floor's escape headroom (same expression as `floorReserve`
+        // below, per slot) plus the smallest content worth enumerating for.
+        const floor = CODE_POINT_ESCAPE_CEILING_BYTES + (slot.request.numbered ? numberedGutterBytes(MAX_LINE_DIGITS) : 0);
+        // How much of this file the caller actually wants, bounded by what exists: a 40-byte
+        // file only needs 40 bytes to answer, which is what keeps a wide batch of small
+        // real files enumerable in full instead of folding paths that all fit. A pseudo-file
+        // (H3) has no trustworthy size, so its remainder is unknown and the full minimum
+        // applies.
+        const wanted = Math.min(FILE_READ_MIN_ENTRY_CONTENT_BYTES, slot.request.maxBytes);
+
+        if (slot.size.known === null) return shell + floor + wanted;
+
+        return shell + floor + Math.max(0, Math.min(wanted, slot.size.known - (slot.request.startByte ?? 0)));
+    };
+
+    const walk = (foldMargin: number): number => {
+        let spend = walkShell + foldMargin;
+        let errorSpend = 0;
+        let errorCount = 0;
+
+        for (let index = 0; index < slots.length; index += 1) {
+            const slot = slots[index];
+            const need = slotNeed(slot, errorSpend, errorCount);
+
+            if (need === null || spend + need > FILE_READ_WIRE_BUDGET) return index;
+
+            spend += need;
+
+            if (slot.handle === null) {
+                errorSpend += need;
+                errorCount += 1;
+            }
+        }
+
+        return slots.length;
+    };
+
+    const firstCut = walk(0);
+    // Only a batch that actually folded pays the declaration margin; a batch that did not
+    // fold keeps every byte of it for content.
+    const cut = firstCut === slots.length ? slots.length : walk(FILE_READ_FOLD_LINE_MARGIN_BYTES);
+
+    // Everything the response can spend on content lives on this list and nowhere else.
+    const enumerated = slots.slice(0, cut);
+    const omitted = slots.length - cut;
+
+    // THE BOUND, for the record. For every enumerated slot, `slotNeed` above is an upper
+    // bound on what that slot can serialize in EITHER view: its scaffolding is priced
+    // exactly, its body is capped at `min(FILE_READ_MIN_ENTRY_CONTENT_BYTES, maxBytes,
+    // remaining size)` and a share can only exceed that cap through the surplus pass,
+    // which re-scans against the recomputed allowance until the same fixed point the
+    // `wireBytes` loop below converges to holds. The walk guaranteed
+    // `Σ need <= budget - walkShell(-margin)` and the real `reserved` below is never
+    // LARGER than the walk's shell, so `wireBytes <= contentBudget` after the fold is the
+    // same theorem it was before — with the paths that did not fit removed from both sides.
+    //
+    // Reserve the scaffolding of EVERY enumerated entry first, including the failed ones:
+    // an error message is part of the response and costs wire bytes too. What is left is
+    // content.
     //
     // `noteReserve(slots)` is added to the same reserve (R4): the advisory is only
     // writable after the scan, but it is part of the response too, so a budget
     // spent without pricing it is a budget that overshoots `contentBudget` exactly
-    // when the note fires — the one case the wire-cap test covers.
+    // when the note fires — the one case the wire-cap test covers. It is priced over
+    // ALL slots rather than the enumerated ones because the note may only name a slot
+    // that was actually scanned, and the enumerated set is a subset (monotone in the
+    // candidate list, so pricing the superset can only over-charge, never under-charge).
     //
     // `projectionReserve` is charged for the same reason and by the same argument:
     // the model's copy of this result is the prose projection, delivered through
     // the same envelope the harness measures, so its fixed part has to be paid for
     // before the content is split, not discovered afterwards.
-    let reserved = RESULT_SHELL.length + noteReserve(slots);
-    for (const slot of slots) reserved += slot.overhead + slot.projectionReserve;
+    let reserved = RESULT_SHELL.length + noteCharge;
+    for (const slot of enumerated) reserved += slot.overhead + slot.projectionReserve;
 
-    const contentBudget = Math.max(0, FILE_READ_WIRE_BUDGET - reserved);
-    const readable = slots.filter((slot) => slot.entry === null);
+    const readable = enumerated.filter((slot) => slot.entry === null);
 
     // PHASE 2a — reserve the floor's headroom before the budget is split (F1).
     //
@@ -4594,12 +4932,34 @@ export const readFileBatch = async (
     // reserves are exactly what the pool gave up, so the total is at most
     // `contentBudget` — the bound the harness compares its own wire cap against. Without
     // the reservation, a 100-path batch at `maxBytes: 1` could let up to ~2.8 KiB of
-    // floor escape the budget it was measured against.
+    // floor escape the budget it was measured against. With the fold above, such a batch
+    // never enumerates all 100 paths in the first place.
     const floorReserve = readable.reduce(
         (total, slot) =>
             total + CODE_POINT_ESCAPE_CEILING_BYTES + (slot.request.numbered ? numberedGutterBytes(MAX_LINE_DIGITS) : 0),
         0
     );
+    // T3 — the batch line (see `batchLine`) is part of the model's copy, so it is
+    // priced before the split like every other part of the projection. It can appear
+    // when two windows may be cut (any multi-window call), when a window may be cut by
+    // the SHARED envelope rather than by its own allowance (an explicit `maxBytes` the
+    // envelope cannot honor, or an envelope so eaten by per-entry reserves that even the
+    // DEFAULT allowance does not fit in it — the long-path case, where the pool drops
+    // below the default and a single-path call really is a `limit: "budget"` cut).
+    // Over-reserving costs 256 bytes of a 32 KiB envelope; under-reserving is what
+    // lets `modelBytes` cross `contentBudget` and the harness cut the prose.
+    const batchPossible =
+        enumerated.length > 1 ||
+        readable.some((slot) => slot.request.maxBytes > FILE_READ_DEFAULT_MAX_BYTES) ||
+        FILE_READ_WIRE_BUDGET - reserved - readable.length * CODE_POINT_ESCAPE_CEILING_BYTES < FILE_READ_DEFAULT_MAX_BYTES;
+
+    if (batchPossible) reserved += PROJECTION_BATCH_MARGIN;
+
+    // The fold declaration, paid for by the margin the walk held back. Charging it here
+    // too would double-count it: the walk's `foldMargin` is what made `cut` stop where it
+    // did, so the bytes are already accounted for in the `spend` that produced it.
+    const contentBudget = Math.max(0, FILE_READ_WIRE_BUDGET - reserved);
+
     const pool = Math.max(0, contentBudget - floorReserve);
 
     try {
@@ -4668,7 +5028,9 @@ export const readFileBatch = async (
         openFiles.clear();
     }
 
-    const files = slots.map(
+    // Only the enumerated prefix is published (PHASE 2). A folded path is absent from
+    // `files` and counted in `omitted` below — never silently dropped.
+    const files = enumerated.map(
         (slot) => slot.entry ?? failedEntry(slot.request, 'EIO', `read failed to read "${slot.request.path}".`)
     );
 
@@ -4679,11 +5041,11 @@ export const readFileBatch = async (
     // The advisory, decided from the FINAL entries (see `buildReadNote`). Each entry
     // is paired with the line cap its OWN request applied, because the note must not
     // advise "raise maxLines" to a caller already at FILE_READ_MAX_LINES (F3); the
-    // pairing is by index and `files` is built from `slots` in the same order. Its
+    // pairing is by index and `files` is built from `enumerated` in the same order. Its
     // worst-case cost was already taken out of the content budget by `noteReserve`,
     // so adding it here cannot push `wireBytes` past `contentBudget`.
     const note = buildReadNote(
-        slots.map((slot, index) => ({
+        enumerated.map((slot, index) => ({
             entry: files[index],
             maxLines: slot.request.maxLines,
             maxBytes: slot.request.maxBytes
@@ -4698,8 +5060,26 @@ export const readFileBatch = async (
     // One flag per entry, index-aligned with `files` (M1). `requested.some(...)` made
     // the gutter a batch-wide property, so one caller asking for line numbers put a
     // gutter — and a gutter charge — on every other file in the call.
-    const projection = renderProjection(files, requested.map((item) => item.numbered));
-    const modelBytes = Buffer.byteLength(projection, 'utf8');
+    const body = renderProjection(files, enumerated.map((slot) => slot.request.numbered));
+
+    // The aggregate line, in front of the windows it summarizes (see `batchLine`). It
+    // quotes the bytes of the ENTRY prose — the windows themselves — because that is the
+    // figure the envelope bounds; the line's own ~100 bytes are added to `modelBytes`
+    // below, and they were reserved for up front, so the number stays honest in both
+    // directions.
+    const summary = batchLine(files, contentWireBytes(body));
+    // The fold declaration goes FIRST: a caller scanning the projection for an answer to
+    // its own path must not conclude the tool ignored it (P-2).
+    const fold = foldLine(slots.length, omitted);
+    const projection = `${fold}${summary}${body}`;
+
+    // `modelBytes` is now the ESCAPED length of the projection (T3): the exact number of
+    // bytes the transcript and the request body pay for this result, which is the number
+    // the harness compares against `MODEL_TOOL_RESULT_BUDGET_BYTES` and the number
+    // `FILE_READ_WIRE_BUDGET` is set equal to. Escaping is per character, so this equals
+    // the sum of the per-chunk charges the allocator spent — the reserve and the
+    // measurement cannot disagree.
+    const modelBytes = contentWireBytes(projection);
 
     // Measure the real serialized length rather than trusting the reserve: this
     // is the exact number the harness compares against its own cap, so a caller
@@ -4727,6 +5107,11 @@ export const readFileBatch = async (
             JSON.stringify({
                 ...(note === undefined ? {} : { note }),
                 files,
+                // Only present when the batch folded; `RESULT_SHELL` prices the shell
+                // WITHOUT it and the fold margin pays for the field, so a batch that did
+                // not fold pays nothing for it and one that did has already spent the
+                // margin that covers it (PHASE 2).
+                ...(omitted === 0 ? {} : { omitted }),
                 truncated,
                 bytes,
                 wireBytes: wire,
@@ -4758,6 +5143,7 @@ export const readFileBatch = async (
         {
             ...(note === undefined ? {} : { note }),
             files,
+            ...(omitted === 0 ? {} : { omitted }),
             truncated,
             bytes,
             wireBytes,

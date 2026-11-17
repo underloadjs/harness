@@ -12,8 +12,12 @@
 //
 //   1. BELOW the trigger: nothing happens at all (no park, no action, no transcript
 //      change); and the TRIGGER itself — the effective limit, `min(resolved limit, model
-//      window)` with NO headroom subtracted (the operator's 2026-11-10 one-number ruling:
-//      the limit IS the firing point) — including the `modelLimits` JSON map (per-model
+//      window)` MINUS the headroom buffer, where the buffer comes off WHICHEVER number binds
+//      (X2, F3 — a bare `contextLimit` gets exactly the same working room as a declared model
+//      window, because it is the operator's GUESS at that window and the summarize request
+//      (whole projection + the 1,752-byte instruction) has to fit under the model's real one;
+//      `headroomRatio: 0` is the documented opt-out, and every fixture here seeds it so each
+//      case measures its own rule) — including the `modelLimits` JSON map (per-model
 //      limit, per-model window, and every malformed input ignored in favour of the global
 //      limit);
 //   2. AT/ABOVE the trigger: park -> action (exactly once, with the SAME api and the SAME
@@ -37,15 +41,19 @@
 //      turns) stops being sent, the thread is un-parked, and a continuation nudge restarts
 //      the conversation on the compacted head — plus both finalize paths, the disobedient
 //      model, the failed-run park lift, the flag that survives the commit, the phase guard,
-//      and the restart persistence of everything the pass wrote.
+//      and the restart persistence of everything the pass wrote; and the same flow driven
+//      through the SHIPPED transport, where the size refusal is a gateway SSE frame rather
+//      than a scripted event, so the transport's classification, the one-attempt retry rule
+//      and the `run.failed` payload the reactive arm reads are all under test together.
 //
 // Two levels of test, deliberately: the guard factory is exercised with fakes, where the
 // token estimates are exact inputs and every control is observable; the shipped built-in
 // is then exercised through a REAL harness with a scripted transport, where the estimate
-// comes from the harness itself (core/context-estimate.ts, ceil(chars / 4)) and the
-// pause/resume are real `thread.paused` / `thread.resumed` events plus real roster
-// statuses. The integration numbers are derived from that documented formula, not
-// reverse-engineered from a run.
+// comes from the harness itself (core/payload-bytes.ts prices the serialized request,
+// core/context-estimate.ts divides it by 4, and src/harness.ts:12406-12410 + :12512-12533 fold in
+// the bytes of the declared tool schema — the `CATALOGUE` constant below) plus real
+// `thread.paused` / `thread.resumed` events and real roster statuses. The integration
+// numbers are derived from that documented pipeline, not reverse-engineered from a run.
 //
 // Cross-references:
 //   - ../plugins/context-compaction.plugin.ts — the implementation under test
@@ -62,7 +70,13 @@
 //                                               (exactly one pass withholds a superseded unit)
 //   - ../core/agent.ts                        — `registerAgentThreader` and the thread model
 //                                               sync that make `api.agents[name].model()`
-//                                               the model the run is about to send
+//                                               the model the run is about to send; and
+//                                               `isContextOverflowFailure`, the one-attempt rule
+//                                               the wire-level case below counts fetches against
+//   - ../transport/openai.ts                   — the in-stream error frame the wire-level case
+//     ../transport/provider-timeouts.ts        feeds the harness; `isContextOverflowSignal`
+//                                               (the ONE matcher, in the second file) is what
+//                                               puts `code: 'context-overflow'` on that frame
 //   - ../transport/models.ts                  — checked as a window source and REJECTED: it
 //                                               returns `string[]` (ids only), so the
 //                                               provider's per-model context length never
@@ -70,8 +84,14 @@
 //                                               map's `window` is the only one in this build
 //   - ../harness.plugin.test.ts               — the transport helpers mirrored below
 
-import { describe, expect, it } from 'vitest';
-import { agent, harness, tool } from '@underload/harness';
+import { describe, expect, it, vi } from 'vitest';
+// `CONTEXT_OVERFLOW_CODE` is imported rather than copied: these cases arm the machine with the
+// SAME spelling the transport and the agent's pre-request floor publish, so a drift between the
+// plugin's local literal and the shipped code fails here instead of silently un-arming it.
+// `openAICompatible` is for ONE case only — the end-to-end refusal below, which runs the real
+// wire transport so the gateway frame, the shared matcher, the retry ladder and the `run.failed`
+// payload are all in the frame together.
+import { CONTEXT_OVERFLOW_CODE, agent, harness, openAICompatible, tool } from '@underload/harness';
 import type {
     Agent,
     Harness,
@@ -102,7 +122,9 @@ import {
     isInternalAgent,
     metadata,
     parseModelLimits,
+    planCompactionRequest,
     planCompactionRetention,
+    resolveContextHeadroom,
     resolveContextTrigger,
     setup
 } from '../plugins/context-compaction.plugin';
@@ -153,6 +175,29 @@ const withoutIds = (value: unknown): unknown => {
 // swapped the array it was handed.
 const TURN_MESSAGES: readonly HarnessMessage[] = [{ role: 'user', content: 'question' }];
 
+// A projection that carries the weight a fake `estimatedTokens` CLAIMS — the honesty rule the
+// shrink ladder depends on (X1, 2026-11-17, the size-refusal deadlock).
+//
+// The pairing is not cosmetic. `beginSummarize` derives the request's irreducible FLOOR as
+// `max(0, estimatedTokens - measureBody(context.messages))` (X2, F1 — `measureRequestFloor` adds
+// the projection's media term back onto the harness figure before subtracting, so the currency
+// matches on both sides), and `turnBefore`'s dead-run guard
+// refuses a summarize pass when that floor is at or above the ceiling. A fake that hands over a
+// 2-token `'question'` projection and a hand-written `estimatedTokens: 400` is therefore a fake
+// whose request is 398 tokens of tool catalogue and 2 tokens of transcript — a request where no
+// amount of clipping can help, and the pass is (correctly) refused. Most cases in this file mean
+// the opposite: THE TRANSCRIPT IS THE REQUEST, which is exactly what a host with no tools and no
+// media measures, and that is what this helper states.
+//
+// The arithmetic is the estimator's own, not a guess: `transcriptChars` prices a plain user entry
+// at its `content` bytes and nothing else (no framing, no role text), so `tokens * 4` ASCII
+// characters is `tokens` tokens EXACTLY, and `floor` comes out 0. A case that genuinely wants a
+// catalogue-dominated request says so by passing `messages` explicitly with a projection far
+// below its estimate, and asserts the refusal (`turnBefore`'s `unreachable-target` report).
+const turnProjection = (tokens: number): HarnessMessage[] => [
+    { role: 'user', content: 'q'.repeat(tokens * 4) }
+];
+
 type FakeApi = {
     api: HarnessPluginApi;
     // Everything the api was asked to do, in order (settings reads included).
@@ -187,9 +232,11 @@ const fakeBrain = (model: unknown): Agent => ({ model }) as unknown as Agent;
 // action now reads four of them, and a test that wants `minTokens: 20` has to be able to
 // say so without also changing the limit.
 //
-// NO headroom is seeded, because there is none any more: the limit IS the firing point
-// (the operator's 2026-11-10 one-number ruling), so every trigger number in this file is
-// the stored `contextLimit` itself unless a `modelLimits` entry says otherwise.
+// NO headroom is seeded, and none is needed: the fake never declares a model WINDOW unless a
+// test names one in `modelLimits`, and the 2026-11-17 buffer is keyed on exactly that. So every
+// trigger number in this file is still the stored `contextLimit` itself unless a `modelLimits`
+// entry says otherwise — the one ruling (an operator budget is the firing point the operator
+// typed) that the buffer deliberately leaves alone.
 const createFakeApi = (
     limit: number,
     stored: Record<string, number | string | boolean | undefined> = {},
@@ -206,7 +253,23 @@ const createFakeApi = (
     // report — and that pass only runs in `exclude` mode now that `summarize` is the declared
     // default. A case that wants the summarize flow stores the mode explicitly, so the two
     // flows never measure each other.
-    const values: Record<string, unknown> = { mode: 'exclude', contextLimit: limit, ...stored };
+    //
+    // `headroomRatio: 0` is seeded for the same reason, since X2 (F3): the buffer now comes off
+    // EVERY binding ceiling, so a fixture that stores `contextLimit: 250` and no ratio fires at
+    // 125, not 250, and every hand-derived ceiling, `REGROWTH_RATIO` margin and "under the limit"
+    // premise in this file would have to be re-typed as half its value. Zero is the documented
+    // opt-out ("fire exactly at the number the operator typed"), which keeps each case a
+    // measurement of ITS OWN rule — the trigger rules, the ladder, the machine — rather than a
+    // measurement of the buffer. The buffer is pinned where it belongs, in the
+    // `resolveContextHeadroom` / `resolveContextTrigger` tables below, by cases that store the
+    // ratio they are talking about, and in the summarize-flow cases named
+    // `withHeadroom`/`summarizeAt` that run the declared 0.15 on purpose.
+    const values: Record<string, unknown> = {
+        mode: 'exclude',
+        headroomRatio: 0,
+        contextLimit: limit,
+        ...stored
+    };
 
     const skip = (name: string): never => {
         touches.push(name);
@@ -360,6 +423,18 @@ const createFakeTurn = (input: {
     // wanted to prove "the action measured with the estimator, not with this number" can
     // see them disagree.
     currentTokens?: number;
+    // THE REQUEST CAPTURE (2026-11-17, the shrink ladder). `setTranscript` and `replaceHistory`
+    // keep recording their names in `calls` — every existing sequence pin depends on that — but
+    // a case that measures WHAT went out (a shrunk summarize request, a canonical history that
+    // must stay whole) needs the arrays, and a case that does not pass these arrays changes
+    // nothing about the fake.
+    requests?: HarnessMessage[][];
+    histories?: HarnessMessage[][];
+    // THE PROJECTION this boundary sees. Default is the one-entry `TURN_MESSAGES` every
+    // action case uses; a shrink case names the transcript it wants cut, because the request
+    // the plugin builds is `messages + instruction` and the ladder's budget is measured over
+    // exactly that list.
+    messages?: readonly HarnessMessage[];
 }): HarnessTurnBeforeContext => {
     const entries = input.entries ?? [entryOf(0, { role: 'user', content: 'question' })];
 
@@ -372,12 +447,13 @@ const createFakeTurn = (input: {
         // shape a real root round has.
         actorKey: input.actorKey ?? input.agent ?? 'writer',
         ...(input.branchId === undefined ? {} : { branchId: input.branchId }),
-        messages: TURN_MESSAGES,
+        messages: input.messages ?? TURN_MESSAGES,
         estimatedTokens: input.estimatedTokens,
         signal: new AbortController().signal,
         api: input.api,
-        setTranscript: () => {
+        setTranscript: (messages) => {
             input.calls.push('setTranscript');
+            input.requests?.push(messages.map((message) => ({ ...message })));
         },
         // T3 — the second mutation control, recorded like the others so a compaction that
         // started editing entries becomes visible in the same call list.
@@ -422,8 +498,9 @@ const createFakeTurn = (input: {
         currentMessages: () => TURN_MESSAGES,
         // Context T5 — the live view of the same number.
         currentEstimatedTokens: () => input.currentTokens ?? input.estimatedTokens,
-        replaceHistory: () => {
+        replaceHistory: (messages) => {
             input.calls.push('replaceHistory');
+            input.histories?.push(messages.map((message) => ({ ...message })));
         },
         pause: async () => {
             input.calls.push('pause');
@@ -509,14 +586,20 @@ const TRIPLE = ['pause', 'action', 'resume'];
 //
 // `mode` is part of the sequence because the trigger has to know WHICH machine to hand the
 // turn to (summarize or exclude) before it can decide, and it is read after `modelLimits`
-// so a skipped round still stops at two reads. `minTokens` is deliberately NOT here: in
-// summarize mode it is a floor consulted only on a turn that is already over the limit, so
+// so a skipped round still stops at two reads. `headroomRatio` is read LAST in the group —
+// after the mode decision and the summarize phase guard — because it only feeds
+// `resolveContextTrigger`, and a round that returns early (a pass already in flight) must not
+// pay for it. It is a DECLARED row (see `metadata.settings`), and a fixture that does not seed
+// it lands on the declared default 0.15 — the SAME number the read-site fallback answers, which
+// is why no trigger figure in this file moves either way. `minTokens` is deliberately NOT here:
+// in summarize mode it is a floor consulted only on a turn that is already over the limit, so
 // an under-limit turn never pays for it (pinned by the floor case below).
 const TRIGGER_READS = [
     'settings.boolean:enabled',
     'settings.number:contextLimit',
     'settings.string:modelLimits',
-    'settings.string:mode'
+    'settings.string:mode',
+    'settings.number:headroomRatio'
 ];
 
 // `count` triples, built with a plain loop (no `Array.prototype.flat`, which the package's
@@ -550,18 +633,76 @@ const answer = (text: string): HarnessStreamEvent[] => [
     { type: 'done', stopReason: 'stop', toolCalls: [] }
 ];
 
-// No `instruction`, so the agent has no instruction blocks and the estimate is exactly
-// ceil(sum of message content chars / 4) (core/context-estimate.ts).
+// No `instruction`, so the agent has no instruction blocks and the transcript term of the
+// estimate is exactly ceil(sum of message content payload bytes / 4) (core/context-estimate.ts).
 const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', stream });
+
+// ---------------------------------------------------------------------------
+// THE TOOL-CATALOGUE FLOOR — the constant every HARNESS-LEVEL number here carries
+// ---------------------------------------------------------------------------
+// `turn.before`'s `estimatedTokens` prices the tool schemas of the request into the figure on
+// the UNANCHORED leg (src/harness.ts:12512-12533 passes `toolSchemaChars: toolSchemaBytes()`,
+// and `core/context-estimate.ts:421` `toolSchemaPayloadBytes` serializes them). A fixture that
+// never asks for a tool still declares the catalogue the harness preloads, so a harness-level
+// estimate is NEVER the transcript alone — it is `CATALOGUE + transcript`, and every token
+// literal below is written that way instead of as one magic number, so a future change to the
+// preset catalogue moves the constant and stays legible.
+//
+// THE FIGURE, derived rather than read back. `brain()` declares no tools and the harness is
+// built without `presets: false`, so the catalogue is the shipped preset set plus the runtime
+// set: 11 entries — `toolRequest` 2,366 B, `tasks` 10,222 B, `read` 4,247 B, `write` 2,200 B,
+// `edit` 5,292 B, `glob` 3,616 B, `grep` 5,415 B, `threadList` 3,816 B, `threadRead` 7,474 B,
+// `threadSend` 4,513 B, `threadDelete` 3,915 B = 53,088 serialized bytes
+// (`toolSchemaPayloadBytes(request.tools)` of a live request; probe
+// `Temp/coding-w1/probe-compaction-floor.ts`, reproduced by
+// `Temp/coding-w2/probe-delegation-floor.ts`). 53,088 / 4 = 13,272 tokens EXACTLY.
+//
+// THE OTHER MOVEMENT IN THE SAME DIRECTION, and every `+1`/`+9` delta below comes from it: since
+// T5 (2026-11-17) the estimator counts SERIALIZED PAYLOAD BYTES (`core/payload-bytes.ts`
+// `modelPayloadBytes`) rather than characters (`core/context-estimate.ts:378-495`). An all-ASCII
+// fixture is unchanged byte for byte, and a fixture whose text carries an escape is not: the clip
+// marker's `…` is 3 bytes (27 characters → 29 bytes), the 1,714-character `COMPACTION_INSTRUCTION`
+// is 1,752 bytes, a JSON `arguments` string pays one extra byte per quote, and an attachment's
+// `name` AND `mime` are both counted now (the `mimeType`/`mime` mismatch this file used to pin as
+// a bug is fixed at `core/context-estimate.ts:479-490`). Those figures are derived in the comment
+// that pins each one; they are arithmetic, not drift.
+//
+// WHY THE ADDITION IS EXACT, which is what lets a pin stay `CATALOGUE + n`. The catalogue byte
+// count is a multiple of 4, so `ceil((53088 + transcriptBytes) / 4)` = 13,272 +
+// `ceil(transcriptBytes / 4)`: the transcript figure every comment in this file already derives
+// keeps its exact value and simply rides on top of the constant. The same holds for the trigger
+// arithmetic, and that is what keeps the fixtures honest — the effective limit, the
+// `REGROWTH_RATIO` margin (`max(1, floor(effective * 0.05))`) and every "under the limit" premise
+// below are keyed on the SAME figure, so a case whose point is "this conversation is smaller than
+// the ceiling" states its ceiling as `CATALOGUE + <the transcript budget it was written against>`
+// and a case whose point is "this conversation crossed" keeps its transcript-scale ceiling and
+// moves only the reported estimate.
+//
+// TWO THINGS THIS CONSTANT IS SINCE X1 (2026-11-17), and both are why the wording above says
+// "the floor". It is also the number the shrink ladder measures AGAINST: `beginSummarize` derives
+// the request's irreducible size as `estimatedTokens − measureBody(messages)` (X2, F1 — the media
+// term the harness figure never priced is added back before the subtraction, see
+// `measureRequestFloor`), and `turnBefore` refuses a summarize pass when that figure is at or
+// above the ceiling — so a case whose ceiling is
+// BELOW `CATALOGUE` is a case where no compaction can ever run, and it measures the refusal rather
+// than a pass (the `minTokens` case at :4599 moved to `CATALOGUE + 100` for exactly that reason).
+// And it is the floor of the WRITER-ONLY ROSTER only: a roster with a delegating agent registers
+// the runtime's `delegate` tool as well, 7,396 more serialized bytes, so that harness's floor is
+// 60,484 bytes = 15,121 tokens (probe `Temp/coding-x1/probe-x6.ts`). The delegate case uses
+// `DELEGATE_FLOOR`, not this constant, and says so.
+const CATALOGUE = 13_272;
 
 // The settings an operator would type in the Plugins pane, as a stored document. Every key
 // this plugin reads may appear; anything it does NOT store falls back to its DECLARED
 // default, which is what the default-floor case below depends on.
 //
-// NO headroom is seeded, because there is none any more (the operator's 2026-11-10
-// one-number ruling): the limit IS the firing point, so a fixture that stores
-// `contextLimit: 100` compacts at an estimate of 100 — the scale every integration number
-// below is derived from.
+// `headroomRatio: 0` IS seeded, since X2 (F3) removed the window precondition: the buffer now
+// comes off EVERY binding ceiling, so a fixture that stores `contextLimit: 250` and says nothing
+// about the buffer fires at 125, and every hand-derived ceiling, `REGROWTH_RATIO` margin and
+// "under the limit" premise in this file would have to be re-typed as half its value. Zero is the
+// documented opt-out ("fire exactly at the number the operator typed"), which keeps each case a
+// measurement of ITS OWN rule. The buffer itself is pinned by the tables above and by the cases
+// that spell the ratio they are talking about (`withBuffer`, or a stored `headroomRatio`).
 //
 // `context-trimmer` (R5, the other shipped `turn.before` context pass) is seeded OFF here,
 // exactly as src/server/persistence.test.ts does for its compaction fixture. Its rule is a
@@ -571,7 +712,10 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // Turning it off keeps every case below a measurement of ONE plugin, which is what this
 // file's header claims; no expectation changes as a result.
 const settingsOf = (values: Record<string, number | string | boolean>): HarnessPluginSettingsProvider => {
-    const stored: Record<string, number | string | boolean> = { ...values };
+    // The same opt-out `createFakeApi` seeds, and for the same reason (X2, F3): every ceiling in
+    // this file is hand-derived against the number the operator typed. A case that wants the
+    // buffer uses `withBuffer` (or stores `headroomRatio` itself) and says so.
+    const stored: Record<string, number | string | boolean> = { headroomRatio: 0, ...values };
 
     return {
         get: (plugin, key) => {
@@ -584,6 +728,12 @@ const settingsOf = (values: Record<string, number | string | boolean>): HarnessP
 
 // The one-key spelling: just the limit.
 const limitAt = (value: number): HarnessPluginSettingsProvider => settingsOf({ contextLimit: value });
+
+// THE UN-OPTED-OUT SPELLING (X2, F3): the limit and NOTHING about the buffer, so the declared
+// 0.15 default applies and the firing point is the ceiling minus the buffer. Only the cases that
+// are ABOUT the buffer use this, and their expectations state the buffer's arithmetic.
+const withBuffer = (value: number): HarnessPluginSettingsProvider =>
+    settingsOf({ contextLimit: value, mode: 'exclude' });
 
 // The same, pinned to the OLD writer. Everything in this file that measures the prune
 // lifecycle (park -> `executeCompaction` -> un-park, the flag writes, the pass report) has to
@@ -622,11 +772,15 @@ describe('context-compaction metadata', () => {
         expect(metadata.hooks).toEqual(['turn.before', 'turn.after', 'thread.idle', 'run.finished', 'run.failed']);
 
         // T4.6: `enabled`, the limit, the savings floor, the horizon, and the mode, plus
-        // R4's per-model map beside the limit it modifies. The numbers below ARE the
-        // ratified answers (T0 Q2's floor, Q3's horizon, and the operator's 2026-11-10
-        // one-number ruling on the limit), and each default is duplicated as a fallback
-        // constant beside the plugin's own reads — a drift between the two changes one of
-        // the assertions in this file.
+        // R4's per-model map beside the limit it modifies, plus the 2026-11-17 `headroomRatio`
+        // row beside the window fact it reads (declared by T4 on 2026-11-17, so the Plugins pane
+        // shows it and a stored `0` is an operator-visible opt-out). The numbers below ARE the
+        // ratified answers (T0 Q2's floor, Q3's horizon, the operator's 2026-11-10 one-number
+        // ruling on the limit, and the 15%/16k/half-window buffer of the 2026-11-17 deadlock fix
+        // — `max: 0.5` is that last rule's own cap, and it is pinned row-for-row in
+        // ./manifest.test.ts, ../harness.plugin.test.ts and ../server/plugins-api.test.ts rather
+        // than in this 5-tuple), and each default is duplicated as a fallback constant beside the
+        // plugin's own reads — a drift between the two changes one of the assertions in this file.
         expect(
             metadata.settings?.map((setting) => [
                 setting.key,
@@ -638,6 +792,7 @@ describe('context-compaction metadata', () => {
         ).toEqual([
             ['contextLimit', 'number', 200000, 1000, 1000],
             ['modelLimits', 'string', '{}', undefined, undefined],
+            ['headroomRatio', 'number', 0.15, 0, 0.01],
             ['enabled', 'boolean', true, undefined, undefined],
             ['minTokens', 'number', 200, 0, 50],
             ['safetyTurns', 'number', 6, 0, 1],
@@ -683,7 +838,9 @@ describe('context-compaction metadata', () => {
         // They are named by TEST, not by line number, because lines move every time this file
         // grows and a stale number misroutes the next reader:
         //   - "the limit IS the firing point, no headroom"  -> the trigger table below,
-        //     `fires exactly at the global ceiling — the limit IS the firing point`
+        //     `fires exactly at the global ceiling — the limit IS the firing point` (an
+        //     operator ceiling; a declared model window gets the buffer, pinned by
+        //     `buffers a declared window by 15% with a 16k floor and a half-window cap`)
         //   - "a malformed modelLimits value is IGNORED"    -> `ignores malformed modelLimits
         //     JSON instead of throwing`
         //   - "annotate behaves as exclude"                 -> `degrades an unimplemented mode
@@ -710,48 +867,74 @@ describe('context-compaction metadata', () => {
 // Every expected number is computed by HAND from the ratified rule
 //
 //     resolved  = modelLimits[<model>].limit ?? contextLimit
-//     effective = window is declared ? min(resolved, window) : resolved
-//     trigger   = max(1, floor(effective))
+//     ceiling   = window is declared ? min(resolved, window) : resolved
+//     windowed  = window is declared AND window <= resolved   (the window BINDS)
+//     buffer    = windowed ? min(max(16000, floor(ceiling * 0.15)), floor(ceiling / 2),
+//                               ceiling - 1)
+//                 : 0
+//     trigger   = max(1, floor(ceiling) - buffer)
 //
-// rather than read back out of a run, so a change in the rule fails loudly here. There is
-// no headroom term any more (the operator's 2026-11-10 one-number ruling): the limit IS
-// the firing point, so a 200000 ceiling fires at exactly 200000 and a 512000 ceiling on a
-// 262144-token model fires at the window, 262144.
+// rather than read back out of a run, so a change in the rule fails loudly here.
+//
+// THE BUFFER IS THE 2026-11-17 HEADROOM RULE (the compaction deadlock). It exists so the
+// request that carries the ~430-token compaction instruction is not itself past the point the
+// provider refuses at — until it existed, the pass that was supposed to relieve the pressure
+// was the first thing refused. It applies ONLY when a declared model window is the BINDING
+// number: `contextLimit` and `modelLimits[model].limit` are operator budgets, i.e. firing
+// points somebody typed on purpose, and they still fire at exactly the number typed (the
+// `limit: 50`, `contextLimit: 100000` and `window: 1000000` rows below pin that half). The
+// buffer's floor is 16000 tokens of working room and its cap is half the window, so a small
+// declared window compacts at the midpoint instead of collapsing to 1 token.
+// `headroomRatio: 0` opts out and reproduces the one-number ruling byte-for-byte, which is
+// what the dedicated opt-out case below pins.
 // ---------------------------------------------------------------------------
 
 describe('context-compaction trigger math (parseModelLimits + resolveContextTrigger)', () => {
     // Shorthand for the common call: no per-model facts, no model in play.
     const globalOnly = (contextLimit: number) => resolveContextTrigger({ contextLimit, modelLimits: {} });
 
-    it('fires exactly at the global ceiling — the limit IS the firing point', () => {
-        // 200000 fires at 200000. The map names a DIFFERENT model: a window declared for one
+    it('buffers the global ceiling too — a bare `contextLimit` gets the same leeway (F3)', () => {
+        // 200000 fires at 170000. The map names a DIFFERENT model: a window declared for one
         // model must not cap another model's conversation, which is why `window` is absent
-        // from the answer.
+        // from the answer — and its absence no longer means "no buffer". X2 (F3) removed the
+        // windowed-only gate because the deployment that actually died declared no window at
+        // all and therefore fired at the ceiling EXACTLY, so the first crossing was the
+        // refusal. Here: max(16000, floor(200000 * 0.15) = 30000) = 30000, under the half-window
+        // cap of 100000, so the firing point is 170000.
         expect(
             resolveContextTrigger({
                 contextLimit: 200000,
                 modelLimits: parseModelLimits('{"other/model": {"window": 131072}}'),
                 modelId: 'openai/gpt-4o'
             })
-        ).toEqual({ limit: 200000, effective: 200000 });
+        ).toEqual({ limit: 200000, effective: 170000 });
 
-        // And the same identity at the smaller scales the lifecycle tests use.
-        expect(globalOnly(100000)).toEqual({ limit: 100000, effective: 100000 });
-        expect(globalOnly(1000)).toEqual({ limit: 1000, effective: 1000 });
+        // The 16000 floor binds below a 106667 ceiling, and the 50% cap takes over below 32000:
+        // these are the two shapes every small deployment lands on.
+        expect(globalOnly(100000)).toEqual({ limit: 100000, effective: 84000 });
+        expect(globalOnly(1000)).toEqual({ limit: 1000, effective: 500 });
+
+        // `headroomRatio: 0` is still the documented opt-out, and it restores the one-number
+        // ruling byte for byte — the behaviour every other fixture in this file seeds.
+        expect(
+            resolveContextTrigger({ contextLimit: 1000, modelLimits: {}, headroomRatio: 0 })
+        ).toEqual({ limit: 1000, effective: 1000 });
     });
 
     it('takes the per-model limit in place of the global ceiling', () => {
         const modelLimits = parseModelLimits('{"fast/small": {"limit": 50}}');
 
-        // The model named in the map gets its own ceiling...
+        // The model named in the map gets its own ceiling — and the same buffer over it,
+        // because since F3 the buffer is keyed on the BINDING ceiling, not on which settings key
+        // supplied it: 50 − min(max(16000, 7), min(25, 49)) = 50 − 25 = 25.
         expect(
             resolveContextTrigger({ contextLimit: 100000, modelLimits, modelId: 'fast/small' })
-        ).toEqual({ limit: 50, effective: 50 });
+        ).toEqual({ limit: 50, effective: 25 });
 
-        // ...and every other model keeps the global one, unchanged.
+        // ...and every other model keeps the global one, buffered as the global one is.
         expect(
             resolveContextTrigger({ contextLimit: 100000, modelLimits, modelId: 'big/model' })
-        ).toEqual({ limit: 100000, effective: 100000 });
+        ).toEqual({ limit: 100000, effective: 84000 });
     });
 
     it('caps the ceiling at the model window — the operator\'s 512k-on-a-256k-model case', () => {
@@ -762,47 +945,161 @@ describe('context-compaction trigger math (parseModelLimits + resolveContextTrig
             modelId: 'wide/model'
         });
 
-        // min(512000, 262144) = 262144, with no headroom subtracted: the window IS the
-        // firing point. (`window` is reported so a caller can see WHY the number moved.)
-        expect(resolved).toEqual({ limit: 512000, window: 262144, effective: 262144 });
+        // The window BINDS (262144 < 512000), so it is both the cap AND the number the headroom
+        // buffer is measured against: max(16000, floor(262144 * 0.15) = 39321) = 39321, capped
+        // at half the window (131072) — the cap does not bind — so the firing point is
+        // 262144 − 39321 = 222823. `window` is still reported so a caller can see WHY the
+        // number moved, and `limit` is still the un-capped ceiling.
+        expect(resolved).toEqual({ limit: 512000, window: 262144, effective: 222823 });
 
         // The same answer when the operator spells the ceiling on the entry as well: the
-        // window caps it either way.
+        // window caps it either way, and it is the cap that gets the buffer either way.
         expect(
             resolveContextTrigger({
                 contextLimit: 100000,
                 modelLimits: parseModelLimits('{"wide/model": {"limit": 512000, "window": 262144}}'),
                 modelId: 'wide/model'
             })
+        ).toEqual({ limit: 512000, window: 262144, effective: 222823 });
+
+        // And the pre-buffer rule, spelled: `headroomRatio: 0` is the documented opt-out, and
+        // it lands on exactly the number this case expected before the buffer existed.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 512000,
+                modelLimits,
+                modelId: 'wide/model',
+                headroomRatio: 0
+            })
         ).toEqual({ limit: 512000, window: 262144, effective: 262144 });
+    });
+
+    // The buffer rule on its own, so every clause of it has a row: the 16000 floor, the
+    // half-ceiling cap, the `ceiling - 1` clamp, the fact (X2, F3) that an operator budget is
+    // buffered exactly like a declared window, and the three ways a ratio says "no buffer".
+    it('buffers the binding ceiling by 15% with a 16k floor and a half-ceiling cap', () => {
+        // A real model window: the ratio is larger than the floor, so the ratio answers.
+        expect(resolveContextHeadroom({ ceiling: 262144, windowed: true })).toBe(39321);
+        expect(resolveContextHeadroom({ ceiling: 200000, windowed: true })).toBe(30000);
+        // A window the floor is generous for: 16000 of working room, not 4800.
+        expect(resolveContextHeadroom({ ceiling: 32000, windowed: true })).toBe(16000);
+        // A small window: the half-ceiling cap is what keeps the trigger off 1 token. Without
+        // it this would be `max(1, 8192 - 16000) = 1` — a conversation that compacts on every
+        // turn, i.e. the fix becoming the bug.
+        expect(resolveContextHeadroom({ ceiling: 8192, windowed: true })).toBe(4096);
+        expect(resolveContextHeadroom({ ceiling: 100, windowed: true })).toBe(50);
+        // A ceiling with room for nothing.
+        expect(resolveContextHeadroom({ ceiling: 1, windowed: true })).toBe(0);
+        expect(resolveContextHeadroom({ ceiling: 0, windowed: true })).toBe(0);
+        // THE FLAG IS NOT THE SWITCH (X2, F3). A `contextLimit` with no `modelLimits` entry is
+        // not an exact number: it is the operator's guess at the model's window, and the
+        // request the pass sends (transcript + the ~1,752-byte instruction) is measured against
+        // the provider's real window, so an undecorated budget needs the working room EXACTLY as
+        // much as a declared window does. 200000 buffers to 30000 either way, and the rows above
+        // keep naming `windowed: true` only because a caller that knows which number bound can
+        // say so.
+        expect(resolveContextHeadroom({ ceiling: 200000, windowed: false })).toBe(30000);
+        expect(resolveContextHeadroom({ ceiling: 200000 })).toBe(30000);
+        // The switch is the RATIO: `0` is the documented opt-out and restores "fire exactly at
+        // the limit". A ratio that cannot be trusted, or that says no, means no buffer too —
+        // never a guess.
+        expect(resolveContextHeadroom({ ceiling: 200000, windowed: true, ratio: 0 })).toBe(0);
+        expect(resolveContextHeadroom({ ceiling: 200000, windowed: true, ratio: -0.5 })).toBe(0);
+        expect(resolveContextHeadroom({ ceiling: 200000, windowed: true, ratio: Number.NaN })).toBe(0);
+        expect(
+            resolveContextHeadroom({ ceiling: 200000, windowed: true, ratio: Number.POSITIVE_INFINITY })
+        ).toBe(0);
+        // A ratio ABOVE the cap is the cap, not a runaway: 150% of 200000 is still half of it.
+        expect(resolveContextHeadroom({ ceiling: 200000, windowed: true, ratio: 1.5 })).toBe(100000);
+        // The floor is a knob a table row can name, including `0` ("pure ratio").
+        expect(resolveContextHeadroom({ ceiling: 32000, windowed: true, minTokens: 0 })).toBe(4800);
+        expect(resolveContextHeadroom({ ceiling: 32000, windowed: true, minTokens: 20000 })).toBe(16000);
+        // A non-finite floor falls back to the module floor rather than to 0.
+        expect(
+            resolveContextHeadroom({ ceiling: 32000, windowed: true, minTokens: Number.NaN })
+        ).toBe(16000);
+    });
+
+    // The trigger's own arithmetic with a hand-sized window, so the buffer is visible at the
+    // scale every lifecycle case in this file uses (the 262144 row above is the operator's
+    // scale; a 500-token conversation is the one a test can actually build).
+    it('moves the firing point below a small declared window, and only below that one', () => {
+        // 1000 ceiling, 500 window: the window binds, half of it is the cap, so the trigger
+        // fires at 250 — a 250-token conversation on a 500-token model is now compaction, and
+        // the same conversation against the operator's 1000-token budget is not.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 1000,
+                modelLimits: parseModelLimits('{"small/model": {"window": 500}}'),
+                modelId: 'small/model'
+            })
+        ).toEqual({ limit: 1000, window: 500, effective: 250 });
+
+        // The same window DECLARED but not binding (the operator budget is smaller): the budget
+        // is the ceiling, and since F3 the buffer comes off WHATEVER binds — the window fact is
+        // not a precondition. 300 is small enough that the half-ceiling cap answers: 150.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 300,
+                modelLimits: parseModelLimits('{"small/model": {"window": 500}}'),
+                modelId: 'small/model'
+            })
+        ).toEqual({ limit: 300, window: 500, effective: 150 });
+
+        // A per-model LIMIT (no window at all) is the same case from the other side: the model's
+        // own hard limit is the binding number, and F3 buffers it like any other ceiling — the
+        // summarize request still has to fit under it. 500 − 250 = 250.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 100000,
+                modelLimits: parseModelLimits('{"capped/model": {"limit": 500}}'),
+                modelId: 'capped/model'
+            })
+        ).toEqual({ limit: 500, effective: 250 });
+
+        // Equal halves: `window <= limit`, so the model fact is what stops the request and the
+        // buffer belongs to it.
+        expect(
+            resolveContextTrigger({
+                contextLimit: 500,
+                modelLimits: parseModelLimits('{"even/model": {"limit": 500, "window": 500}}'),
+                modelId: 'even/model'
+            })
+        ).toEqual({ limit: 500, window: 500, effective: 250 });
     });
 
     it('never lets a window RAISE the ceiling', () => {
         // A generous window on a conservative operator is still the operator's number — the
-        // window is a cap, not an override.
+        // window is a cap, not an override, and `limit` reports the un-capped ceiling either
+        // way. WHAT MOVES IS THE BUFFER: since F3 the headroom comes off the binding ceiling,
+        // and here the binding ceiling is the operator's 100000 (the window never binds), so the
+        // firing point is 100000 − min(max(16000, 15000), min(50000, 99999)) = 100000 − 16000 =
+        // 84000. The window's size is irrelevant to that arithmetic, which is the point.
         expect(
             resolveContextTrigger({
                 contextLimit: 100000,
                 modelLimits: parseModelLimits('{"huge/model": {"window": 1000000}}'),
                 modelId: 'huge/model'
             })
-        ).toEqual({ limit: 100000, window: 1000000, effective: 100000 });
+        ).toEqual({ limit: 100000, window: 1000000, effective: 84000 });
     });
 
     it('degrades to the global ceiling when the model is unknown or unresolved', () => {
         const modelLimits = parseModelLimits('{"known/model": {"limit": 1000}}');
 
-        // An id nobody declared simply misses the map.
+        // An id nobody declared simply misses the map. The number that BINDS is still the
+        // operator's 100 — that is what this case is about, and F3 does not move it; the 50% cap
+        // then takes half of a ceiling that small off it, which the buffer rows above pin.
         expect(
             resolveContextTrigger({ contextLimit: 100, modelLimits, modelId: 'other/model' })
-        ).toEqual({ limit: 100, effective: 100 });
+        ).toEqual({ limit: 100, effective: 50 });
 
         // And a turn whose model could not be read passes `undefined` — the guard's
         // "model unknown" answer, which must mean the global limit, never 0 and never a
         // crash.
         expect(
             resolveContextTrigger({ contextLimit: 100, modelLimits, modelId: undefined })
-        ).toEqual({ limit: 100, effective: 100 });
+        ).toEqual({ limit: 100, effective: 50 });
     });
 
     it('fires as early as it possibly can on a degenerate ceiling, and floors a fractional one', () => {
@@ -812,8 +1109,11 @@ describe('context-compaction trigger math (parseModelLimits + resolveContextTrig
         expect(globalOnly(0.5)).toEqual({ limit: 0.5, effective: 1 });
         expect(globalOnly(1)).toEqual({ limit: 1, effective: 1 });
 
-        // A fractional ceiling floors, so the trigger stays a whole token count.
-        expect(globalOnly(100.9)).toEqual({ limit: 100.9, effective: 100 });
+        // A fractional ceiling floors, so the trigger stays a whole token count: the ceiling is
+        // 100, the half-ceiling cap is 50, and the firing point is a whole 50 (an unfloored
+        // ceiling would leak the `.9` into the firing point). `limit` keeps the raw stored
+        // number, because the trigger's job is to report what the operator typed.
+        expect(globalOnly(100.9)).toEqual({ limit: 100.9, effective: 50 });
     });
 
     // The map comes from a free-text settings field, so EVERY bad shape has to land on "no
@@ -823,14 +1123,17 @@ describe('context-compaction trigger math (parseModelLimits + resolveContextTrig
             expect(parseModelLimits(raw)).toEqual({});
         }
 
-        // And the handler-relevant consequence: the global ceiling still fires the pass.
+        // And the handler-relevant consequence: the global ceiling still fires the pass —
+        // buffered like any other ceiling now that F3 removed the window precondition
+        // (100000 − 16000 = 84000); the point of this row is that a malformed map costs the
+        // per-model facts and NOTHING else.
         expect(
             resolveContextTrigger({
                 contextLimit: 100000,
                 modelLimits: parseModelLimits('{"openai/gpt-4o": {"window": 8192},}'),
                 modelId: 'openai/gpt-4o'
             })
-        ).toEqual({ limit: 100000, effective: 100000 });
+        ).toEqual({ limit: 100000, effective: 84000 });
     });
 
     it('keeps the usable halves of an entry and drops the unusable ones', () => {
@@ -890,7 +1193,7 @@ describe('context-compaction trigger math (parseModelLimits + resolveContextTrig
                 modelLimits: parseModelLimits('{"bad": {"limit": "text"}}'),
                 modelId: 'bad'
             })
-        ).toEqual({ limit: 100000, effective: 100000 });
+        ).toEqual({ limit: 100000, effective: 84000 });
     });
 
     it('refuses a non-string input rather than coercing it', () => {
@@ -910,7 +1213,1135 @@ describe('context-compaction trigger math (parseModelLimits + resolveContextTrig
                 modelLimits: parseModelLimits('{"real/model": {"limit": 10}}'),
                 modelId: 'constructor'
             })
-        ).toEqual({ limit: 100, effective: 100 });
+        ).toEqual({ limit: 100, effective: 50 });
+    });
+});
+
+// The marker `clipShrinkText` appends, spelled here rather than imported so a reword of the
+// plugin has to move this file too. 240 kept + `…` (1 char) + ` [truncated by compaction]`
+// (26 chars) = 267 characters per clipped string, which is where every token figure below
+// comes from.
+const CLIP = '\u2026 [truncated by compaction]';
+const clipHead = (text: string): string => `${text.slice(0, 240)}${CLIP}`;
+
+// ---------------------------------------------------------------------------
+// 2026-11-17 — THE SHRINK LADDER AND THE OVERFLOW-REACTIVE TRIGGER
+//
+// THE DEFECT THESE CASES PIN, in one paragraph: the trigger fired AT the ceiling, the
+// summarize request was the whole projection PLUS the ~430-token instruction, so the request
+// that was supposed to relieve the pressure was strictly larger than the request the provider
+// (or `core/agent.ts`'s own `maxPromptTokens` floor) had just refused — and the Rule-3
+// re-trigger memory, recorded before the action, muted the retry. Nothing in the machine knew
+// a refusal had happened. Three changes, pinned from three directions below: the headroom
+// buffer (the trigger-math table above), the overflow-reactive arming and cooldown release
+// (the passes block below), and the request shrink (the plan table below, plus one end-to-end
+// case in the T9 block that measures the bytes that actually leave).
+// ---------------------------------------------------------------------------
+
+describe('context-compaction shrink plan (planCompactionRequest)', () => {
+    // The request every case below builds by hand: three head entries (a user turn, an
+    // assistant turn that asked for a call and carries 600 characters of replayed thinking, and
+    // the tool result answering it) plus the two verbatim tail entries. The counts are the
+    // estimator's own — PAYLOAD BYTES, i.e. `content` + tool-call `name` + `arguments` +
+    // `reasoning` + result `name`, each priced by `core/payload-bytes.ts` `modelPayloadBytes` —
+    // so every expected token figure is derived, never read back:
+    //
+    //   e0  user      'a' × 1000                                     1000
+    //   e1  assistant '' + name 'read' (4) + arguments (1,015: the 1,011
+    //       characters of `{"path":"…"}` plus one byte for each of its 4
+    //       quotes) + reasoning 'c' × 600                           1619
+    //   e2  tool      'e' × 800 + name 'read' (4)                    804
+    //   e3  user      'answer me'                                      9
+    //   e4  user      'compact now'                                   11
+    //                                                              ─────
+    //       request total                                           3443  → 861 tokens
+    const ARGUMENTS = `{"path":"${'p'.repeat(1000)}"}`;
+    const headOf = (): HarnessMessage[] => [
+        { role: 'user', content: 'a'.repeat(1000) },
+        {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'c1', name: 'read', arguments: ARGUMENTS }],
+            reasoning: 'c'.repeat(600)
+        },
+        { role: 'tool', content: 'e'.repeat(800), toolCallId: 'c1', name: 'read' }
+    ];
+    const tailOf = (): HarnessMessage[] => [
+        { role: 'user', content: 'answer me' },
+        { role: 'user', content: 'compact now' }
+    ];
+    const requestOf = (): HarnessMessage[] => [...headOf(), ...tailOf()];
+
+    it('sends the request untouched when the budget already fits', () => {
+        // 40 characters is exactly 10 tokens, and 10 is the budget: a plan that has nothing to
+        // do reports the input back and says so, so the caller keeps the byte-identical request.
+        const messages: HarnessMessage[] = [{ role: 'user', content: 'x'.repeat(40) }];
+
+        expect(planCompactionRequest(messages, 10)).toEqual({
+            messages,
+            dropped: 0,
+            clipped: 0,
+            tokens: 10
+        });
+
+        // One token short of the budget cannot be answered either: the single entry IS the
+        // verbatim tail, and the ladder refuses to cut the request it is answering.
+        expect(planCompactionRequest(messages, 9)).toEqual({
+            messages,
+            dropped: 0,
+            clipped: 0,
+            tokens: 10
+        });
+    });
+
+    it('clips the head payload before it removes anything, and never touches the tail', () => {
+        const plan = planCompactionRequest(requestOf(), 400);
+
+        // 3,443 payload bytes → 861 tokens, over a 400 budget. Pass A alone answers it: every
+        // head entry is cut to 240 characters of text plus the 27-character clip marker, the
+        // assistant's 600 characters of replayed thinking are gone, its `arguments` are cut, and
+        // the tail rides verbatim. In the estimator's own currency the marker is NOT 27 bytes —
+        // its `…` is 3 of UTF-8 and its ASCII tail 26, so 29 — which is what makes a clipped
+        // entry cost 269 bytes, the assistant's clipped `arguments` 240 characters + 3 escaped
+        // quotes + the 29-byte marker = 272, and the tool result's `name` another 4:
+        //   269 + (272 + 4) + (269 + 4) + 9 + 11 = 838 → 210 tokens.
+        expect(plan).toEqual({
+            messages: [
+                { role: 'user', content: clipHead('a'.repeat(1000)) },
+                {
+                    role: 'assistant',
+                    content: '',
+                    // `reasoning` is DELETED, not emptied: the projection omits the key when the
+                    // thinking does not travel, and the estimator follows the key.
+                    toolCalls: [{ id: 'c1', name: 'read', arguments: clipHead(ARGUMENTS) }]
+                },
+                {
+                    role: 'tool',
+                    content: clipHead('e'.repeat(800)),
+                    toolCallId: 'c1',
+                    name: 'read'
+                },
+                { role: 'user', content: 'answer me' },
+                { role: 'user', content: 'compact now' }
+            ],
+            dropped: 0,
+            clipped: 3,
+            tokens: 210
+        });
+    });
+
+    it('drops whole pairable units, oldest first, behind one digest entry', () => {
+        // A budget pass A cannot reach (30 < 210), so the ladder moves to whole units. The
+        // assistant turn and the result answering `c1` go as ONE unit: an orphan tool result is
+        // a provider pairing error, and this is the one rule the request rewrite may never
+        // break. `dropped: 2` counts UNITS (the user turn, then the tool unit), not entries.
+        const plan = planCompactionRequest(requestOf(), 30);
+
+        // The excerpts are the ORIGINAL text of what went missing, cut to the same 240-character
+        // budget, oldest first and newest last.
+        expect(plan.messages.map((message) => String(message.content))).toEqual([
+            `[context compaction digest] The harness removed 2 earlier turns from this request ` +
+                `without a model to summarize them, because the request itself did not fit the ` +
+                `context window. The removed turns are still on the record; they are simply not ` +
+                `being sent. Oldest removed: ${'a'.repeat(240)} | Most recent removed: ${'e'.repeat(240)}`,
+            'answer me',
+            'compact now'
+        ]);
+        expect(plan.dropped).toBe(2);
+        expect(plan.clipped).toBe(3);
+        // What the surviving request weighs, by hand: the digest is 771 characters (291 of
+        // marker and prose + the two 240-character excerpts), and the two tail entries are 9 and
+        // 11 → 791 bytes (all ASCII, so bytes and characters are one number here) →
+        // ceil(791 / 4) = 198 tokens. The clipped head that pass A built (838 payload bytes) is
+        // what the drops replaced, so the figure falls as the ladder advances rather than being
+        // reported from the rung.
+        expect(plan.tokens).toBe(198);
+    });
+
+    it('keeps a leading system entry while it drops everything else', () => {
+        // A host that seeds a `system` entry stated a standing instruction, and
+        // `planCompactionRetention` refuses to silence one for the same reason. Under a budget
+        // that removes the whole head, the system entry is still the first thing sent.
+        const messages: HarnessMessage[] = [
+            { role: 'system', content: 'stay terse' },
+            ...headOf(),
+            ...tailOf()
+        ];
+
+        const plan = planCompactionRequest(messages, 1);
+
+        expect(plan.messages.map((message) => String(message.content))).toEqual([
+            'stay terse',
+            `[context compaction digest] The harness removed 2 earlier turns from this request ` +
+                `without a model to summarize them, because the request itself did not fit the ` +
+                `context window. The removed turns are still on the record; they are simply not ` +
+                `being sent. Oldest removed: ${'a'.repeat(240)} | Most recent removed: ${'e'.repeat(240)}`,
+            'answer me',
+            'compact now'
+        ]);
+        expect(plan.dropped).toBe(2);
+    });
+
+    it('stops at the verbatim tail rather than breaking the request it is answering', () => {
+        // `keepTail` is not a suggestion: with a budget of 1 the loop removes every head entry
+        // and then STOPS, because the last two entries are the turn being answered and the
+        // instruction. The plan reports the same size it started from, which is the signal the
+        // caller uses to keep the ordinary request instead of pretending a shrink happened.
+        const plan = planCompactionRequest(tailOf(), 1);
+
+        expect(plan).toEqual({
+            messages: tailOf(),
+            dropped: 0,
+            clipped: 0,
+            tokens: 5
+        });
+    });
+
+    // THE FLOOR ARGUMENT — every figure above prices a TRANSCRIPT, and the provider bills a
+    // REQUEST (X1, 2026-11-17, the size-refusal deadlock).
+    //
+    // `floorTokens` is the part of the request this ladder cannot remove: the tool catalogue, the
+    // agent instructions, the harness turns and the per-call overhead. The shipped caller derives
+    // it in `beginSummarize` as `max(0, estimatedTokens - measureShrink(context.messages))`, and
+    // `planCompactionRequest` now adds it to EVERY figure it compares, so the rung target and the
+    // returned `tokens` are the same quantity — the billed size. The arithmetic below is the
+    // rows above plus a constant: 861 transcript tokens and a 1,000-token floor is 1,861 billed,
+    // pass A's 210 becomes 1,210 and the digest-and-tail's 198 becomes 1,198.
+    //
+    // THE CONTRAST IS THE DEFECT. A 1,250-token rung against a 13,272-token catalogue and a
+    // 2,438-token transcript (the live session's shape, `Temp/d1/report.md`) used to read "the
+    // transcript is already under target", return the request UNCHANGED, and send the identical
+    // 400 out on every later turn of the session.
+    it('prices the request floor in every comparison, and never reports a rung below it', () => {
+        const request = requestOf(); // 3,443 payload bytes = 861 transcript tokens
+
+        // A. The legacy contract, byte-identical: no floor, budget above the transcript, so the
+        //    caller keeps the request it came with. Default `floorTokens` is what every call site
+        //    that has no host around it (and every case above) uses.
+        expect(planCompactionRequest(request, 900)).toEqual({
+            messages: request,
+            dropped: 0,
+            clipped: 0,
+            tokens: 861
+        });
+
+        // B. THE BUG'S SHAPE, and the fix. Billed 1,861 against a 1,250 rung: the pre-fix
+        //    transcript measure read 861 ≤ 1,250 and answered "nothing to do"; the request
+        //    measure reads 1,861 > 1,250 and answers with pass A — the clipped head pinned above,
+        //    210 transcript tokens plus the 1,000 the transcript pass cannot touch.
+        expect(planCompactionRequest(request, 1250, 2, 1000)).toEqual({
+            messages: [
+                { role: 'user', content: clipHead('a'.repeat(1000)) },
+                {
+                    role: 'assistant',
+                    content: '',
+                    toolCalls: [{ id: 'c1', name: 'read', arguments: clipHead(ARGUMENTS) }]
+                },
+                { role: 'tool', content: clipHead('e'.repeat(800)), toolCallId: 'c1', name: 'read' },
+                { role: 'user', content: 'answer me' },
+                { role: 'user', content: 'compact now' }
+            ],
+            dropped: 0,
+            clipped: 3,
+            tokens: 1210
+        });
+
+        // C. A target the floor alone beats is the OTHER no-op, and it is the case
+        //    `turnBefore`'s dead-run guard refuses to spend a pass on: 2,761 billed, 2,800 asked,
+        //    nothing the ladder could do about it.
+        expect(planCompactionRequest(request, 2800, 2, 1900)).toEqual({
+            messages: request,
+            dropped: 0,
+            clipped: 0,
+            tokens: 2761
+        });
+
+        // D. A target BELOW the floor: the ladder walks to the bottom and stops at the floor plus
+        //    the digest-and-tail it may not go under (1,900 + 198), instead of reporting a number
+        //    the provider could not have billed for a request that still carries the whole
+        //    catalogue. This is why the caller's adopt test is `plan.tokens < floor + full` and
+        //    not `plan.tokens < target`.
+        const bottomed = planCompactionRequest(request, 1250, 2, 1900);
+
+        expect(bottomed.dropped).toBe(2);
+        expect(bottomed.clipped).toBe(3);
+        expect(bottomed.tokens).toBe(2098);
+
+        // E. A hostile floor is "no floor", never `NaN`: the planner normalises it once, so a
+        //    caller that cannot price its own request still gets the transcript figure the rows
+        //    above pin.
+        expect(planCompactionRequest(request, 400, 2, Number.NaN).tokens).toBe(210);
+        expect(planCompactionRequest(request, 400, 2, -50).tokens).toBe(210);
+    });
+
+    it('measures with attachment bytes, the case the plain estimate calls small', () => {
+        // THE POINT OF THE OPT-IN FIGURE (../core/context-estimate.ts, "THE OPT-IN REQUEST
+        // WEIGHT"). The plain figure for this entry is 114 payload bytes = 29 tokens: 100 of text
+        // plus the attachment's `name` (5) plus its `mime` (9). The MIME term counts NOW: T5 fixed
+        // the `mimeType`/`mime` mismatch this file used to pin as a bug, so `mime` wins whenever it
+        // is a non-empty string and `mimeType` is the fallback, and exactly ONE of them is billed
+        // per attachment (../core/context-estimate.ts:479-490). The SAME entry is
+        // 114 + 53,333 characters of base64 = 53,447 once a 40,000-byte screenshot rides on it —
+        // base64 is pure ASCII, so its wire width IS its length (`attachmentWireBytes`,
+        // ../core/context-estimate.ts:282-305, and it prefers `data` over the `size` derivation):
+        // ceil(53447 / 4) = 13,362 tokens. A plugin that measured 29 would re-send the request
+        // that was just refused and report success.
+        const shot: HarnessMessage[] = [
+            {
+                role: 'user',
+                content: 'x'.repeat(100),
+                attachments: [
+                    {
+                        id: 'a1',
+                        kind: 'image',
+                        marker: '[Image 1]',
+                        name: 'a.png',
+                        mime: 'image/png',
+                        size: 40000,
+                        data: 'A'.repeat(53333)
+                    }
+                ]
+            }
+        ];
+
+        // Nothing removable (the single entry IS the verbatim tail), so the plan can only report
+        // the honest figure — and the honest figure is what makes the caller keep the request.
+        expect(planCompactionRequest(shot, 100)).toEqual({
+            messages: shot,
+            dropped: 0,
+            clipped: 0,
+            tokens: 13362
+        });
+
+        // The same request one token roomier: untouched, by construction.
+        expect(planCompactionRequest(shot, 13362).tokens).toBe(13362);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE OVERFLOW-REACTIVE TRIGGER — `run.failed` arms, the next boundary answers
+// ---------------------------------------------------------------------------
+
+describe('context-compaction overflow-reactive trigger', () => {
+    const runLifecycle = { threadId: 'thread-1', agent: 'writer', depth: 1, input: 'go' };
+
+    // The payload a refusal arrives with. `code` is the contract with the transport
+    // (`CONTEXT_OVERFLOW_CODE`, imported from the package root rather than copied, so these
+    // cases fail if the plugin's local spelling ever drifts from the published one) and the
+    // message is the agent's own pre-request floor text, which the plugin also recognises.
+    const refused = (message = 'provider said no'): never =>
+        ({ message, code: CONTEXT_OVERFLOW_CODE } as never);
+
+    const down = (message = 'provider down'): never => ({ message } as never);
+
+    // Every turn in this describe is a request whose size IS its transcript: no tool catalogue, no
+    // media, so the hand-passed `tokens` and the projection's measured weight are the same number
+    // and the plugin derives a floor of 0 (see `turnProjection`). A case that wants the opposite —
+    // a catalogue-dominated request the ladder cannot rescue — names its `messages` explicitly and
+    // asserts the `unreachable-target` refusal instead.
+    const summarizeTurn = (
+        fake: FakeApi,
+        tokens: number,
+        calls: string[],
+        extra: { requests?: HarnessMessage[][]; messages?: readonly HarnessMessage[] } = {}
+    ): HarnessTurnBeforeContext =>
+        createFakeTurn({
+            api: fake.api,
+            estimatedTokens: tokens,
+            currentTokens: tokens,
+            calls,
+            messages: turnProjection(tokens),
+            ...extra
+        });
+
+    it('arms on a refusal and compacts on the next boundary even under the trigger', async () => {
+        // Limit 250, a 100-token projection: Rule 2 refuses this turn twice in a row, and that
+        // is correct — until the provider says the request does not fit.
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+
+        await passes.turnBefore(summarizeTurn(fake, 100, calls));
+        expect(calls).toEqual([]);
+        expect(fake.diagnostics).toHaveLength(0);
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+
+        // The arm report, exactly — including the rung the next pass will send.
+        expect(fake.diagnostics).toHaveLength(1);
+        expect(fake.diagnostics[0].data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-1',
+            hook: 'run.failed',
+            stage: 'overflow',
+            rung: 1,
+            ladder: 4,
+            ratio: 0.85,
+            exhausted: false
+        });
+
+        const requests: HarnessMessage[][] = [];
+
+        await passes.turnBefore(summarizeTurn(fake, 100, calls, { requests }));
+
+        // THE PASS HAPPENED. Same projection, same settings, one refusal in between: the
+        // summarize machine parked the thread and committed its instruction (no `resume` — the
+        // park is held until the answer, which is the machine's existing shape).
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+
+        // The request is the projection plus the instruction. With one entry to work with there
+        // is nothing to cut, so NO shrink report is made — the ladder reported the same size and
+        // the caller kept the ordinary request rather than claiming a saving.
+        expect(requests).toEqual([
+            [...turnProjection(100), { role: 'user', content: COMPACTION_INSTRUCTION }]
+        ]);
+        expect(fake.diagnostics.filter((report) => (report.data as { stage?: string })?.stage === 'shrink')).toEqual([]);
+    });
+
+    it('cuts the summarize request to the rung, and says so with both numbers', async () => {
+        // A projection the ladder can actually cut: 5 × 400 characters of ASCII (2,000 bytes) =
+        // 500 tokens, and this fake has no tool catalogue, so 500 IS the estimate the request was
+        // refused at. The rung is 0.85 × 500 = 425 — and the rung is then CLAMPED to the 250
+        // ceiling (X1, 2026-11-17): 85% of an over-limit size is still over the limit, so an
+        // unclamped rung asks the ladder to stop at a number the provider would refuse. The
+        // request the pass builds adds the instruction: 2,000 + 1,752 = 3,752 PAYLOAD BYTES = 938
+        // billed tokens (the instruction is 1,714 characters but 1,752 bytes — the estimator
+        // prices the JSON escaping (`core/payload-bytes.ts`), and this text carries 20 newlines
+        // (2 bytes each as `\n`), 16 quotes (2 bytes each) and one em-dash (3 UTF-8 bytes), 38
+        // bytes over its length).
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const messages: HarnessMessage[] = [0, 1, 2, 3, 4].map((index) => ({
+            role: 'user' as const,
+            content: `t${index}${'x'.repeat(399 - String(index).length)}`
+        }));
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+
+        const calls: string[] = [];
+        const requests: HarnessMessage[][] = [];
+
+        await passes.turnBefore(
+            summarizeTurn(fake, 500, calls, { requests, messages })
+        );
+
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+
+        // Pass A (4 × 269 + 400 + 1,752 = 3,228 bytes → 807 tokens) does not reach 250 either, so
+        // the ladder moves to whole units and removes all four head entries behind ONE digest. The
+        // digest is the 291 characters of marker and prose pinned in the planner table above plus
+        // the oldest and newest 240-character excerpts of what went missing = 771 characters, all
+        // ASCII, so 771 + 400 + 1,752 = 2,923 bytes → 731 tokens. That is still over the 250
+        // ceiling — the tail and the instruction are the request, and the ladder may not cut them —
+        // which is why the report states both numbers instead of claiming a saving.
+        expect(requests[0].map((message) => String(message.content))).toEqual([
+            `[context compaction digest] The harness removed 4 earlier turns from this request ` +
+                `without a model to summarize them, because the request itself did not fit the ` +
+                `context window. The removed turns are still on the record; they are simply not ` +
+                `being sent. Oldest removed: t0${'x'.repeat(238)} | Most recent removed: t3${'x'.repeat(238)}`,
+            String(messages[4].content),
+            COMPACTION_INSTRUCTION
+        ]);
+
+        // THE CONTRACT OF THE WHOLE FIX, as a pair of numbers, in ONE currency: the request that
+        // goes out is smaller than the one that was refused (so the provider cannot refuse it for
+        // the same reason twice), and `to` is compared against a `target` that is a fraction of the
+        // same hard ceiling the provider bills against. With no catalogue in this fixture the floor
+        // is 0, so the billed figure and the transcript figure are the same number here — the
+        // floor-dominated pair lives in the next case.
+        const shrink = fake.diagnostics.find(
+            (report) => (report.data as { stage?: string })?.stage === 'shrink'
+        );
+
+        expect(shrink?.data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-1',
+            stage: 'shrink',
+            target: 250,
+            from: 938,
+            to: 731,
+            floorTokens: 0,
+            dropped: 4,
+            clipped: 4,
+            entries: 3
+        });
+    });
+
+    // ── R6 (2026-11-17): THE LADDER STOPS WHERE THE WINDOW ACTUALLY ENDS ────────────────
+    //
+    // THE DEFECT THESE THREE CASES SHARE. The boundary estimate the trigger compares is the
+    // transcript payload PLUS the request's irreducible floor — the serialized tool catalogue and
+    // the instruction blocks (`src/harness.ts:12512` hands the estimator `toolSchemaBytes()` on
+    // every round, and `measureRequestFloor` derives the residual from that same figure). The rung
+    // used to scale THAT whole number, so the budget it handed the planner was
+    //
+    //     floor(ladder × (floor + payload₀))  =  floor + ladder × payload₀  −  (1 − ladder) × floor
+    //
+    // — the cut the rung asked for, PLUS a second allowance measured in fractions of a catalogue
+    // the transcript pass cannot touch. Every rung therefore erased a slice of conversation the
+    // context window never asked for, and once that budget fell below `floor + the smallest request
+    // the transcript can build` it was unreachable, so the planner dropped EVERY droppable unit
+    // chasing a number no request of this harness could ever send. `rungBudget` in the plugin now
+    // scales the removable payload and adds the floor back unchanged, and `fitLine` states the one
+    // ceiling "fits" is measured against; these cases pin the exact budget each regime produces.
+    //
+    // THE FIXTURE, sized so the two halves of the sum are visible. 5 × 4,000 ASCII characters =
+    // 20,000 payload bytes = 5,000 transcript tokens, and `tokens` is the 25,000 the harness bills,
+    // so the floor this pass derives is exactly 20,000 (25,000 − 5,000) — a catalogue-dominated
+    // round, the shape that used to lose the ladder's footing. The request the pass builds carries
+    // the instruction on top: 20,000 + 1,752 payload bytes = 5,438 tokens, i.e. 25,438 billed,
+    // 4,438 over the 25,000 ceiling, so a cut IS required. What the ceiling requires and nothing
+    // more: clip the four head entries (4 × 269 + 4,000 + 1,752 = 6,828 bytes = 1,707 tokens),
+    // i.e. 21,707 billed. The pre-R6 budget of 21,250 was 3,000 tokens lower — exactly
+    // `0.15 × 20,000`, the rung's percentage of the catalogue — and that allowance is what pushed
+    // the planner past clipping into dropping all four head units to reach 21,631, buying 76 tokens
+    // of savings the ceiling never asked for with four turns of history (probe
+    // `Temp/orch/probe-ladder.ts`, both rows).
+    const heavyTranscript = (): HarnessMessage[] =>
+        [0, 1, 2, 3, 4].map((index) => ({
+            role: 'user' as const,
+            content: `t${index}${'x'.repeat(3999 - String(index).length)}`
+        }));
+
+    // Pass A's four clipped heads, spelled out rather than re-derived: `clipShrinkText` keeps the
+    // first 240 characters and appends the marker, so `t0` + 238 x's + `… [truncated by
+    // compaction]` (267 characters, 269 bytes — the ellipsis is 3 bytes of UTF-8).
+    const clippedHead = (index: number): string =>
+        `t${index}${'x'.repeat(238)}\u2026 [truncated by compaction]`;
+
+    // The one report all three regimes below produce, asserted whole so a moved budget cannot hide
+    // inside a `toMatchObject`. `target` 24,250 is `20,000 + floor(0.85 × 5,000)`; `to` 21,707 is
+    // `20,000 + 1,707`; `dropped: 0` is the whole point — the transcript units survive.
+    const RUNG_REPORT = {
+        mode: 'summarize',
+        threadId: 'thread-1',
+        stage: 'shrink',
+        target: 24_250,
+        from: 25_438,
+        to: 21_707,
+        floorTokens: 20_000,
+        dropped: 0,
+        clipped: 4,
+        entries: 6
+    };
+
+    // The request that budget selects: the four clipped heads, the verbatim tail entry the ladder
+    // may not cut (`SHRINK_KEEP_TAIL`), and the instruction. NO digest, because no unit went.
+    const clippedRequest = (messages: readonly HarnessMessage[]): HarnessMessage[] => [
+        ...[0, 1, 2, 3].map((index) => ({
+            role: 'user' as const,
+            content: clippedHead(index)
+        })),
+        { role: 'user' as const, content: String(messages[4].content) },
+        { role: 'user' as const, content: COMPACTION_INSTRUCTION }
+    ];
+
+    it('stops the shrink at the first budget that fits, keeping the history the ceiling never asked for', async () => {
+        const messages = heavyTranscript();
+        const fake = createFakeApi(25_000, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+        const requests: HarnessMessage[][] = [];
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        await passes.turnBefore(summarizeTurn(fake, 25_000, calls, { requests, messages }));
+
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+
+        // THE STOPPING POINT, byte for byte: pass A alone, every pairable unit still in the
+        // request. Under the pre-R6 budget the array below had THREE rows — a digest plus the
+        // tail plus the instruction — because the budget sat 3,000 tokens under this one.
+        expect(requests[0]).toEqual(clippedRequest(messages));
+
+        const shrink = fake.diagnostics.find(
+            (report) => (report.data as { stage?: string })?.stage === 'shrink'
+        );
+
+        expect(shrink?.data).toEqual(RUNG_REPORT);
+
+        // THE OTHER HALF OF THE PIN, in the two numbers the operator reads: the request that goes
+        // out is 21,707 billed against the 25,000 ceiling the provider refuses at — the cut was
+        // enough — and it is still 3,731 tokens of transcript the pass did NOT throw away compared
+        // with the 25,438 that would otherwise have gone out. None of that 3,731 was owed to the
+        // ceiling; the pre-R6 budget charged the transcript for 15% of the catalogue and then
+        // billed the difference in turns.
+    });
+
+    it('prices the refusal-armed rung and the at-window rung against one ceiling', async () => {
+        // THE SAME ROUND, TRIGGERED THE OTHER WAY. Nothing was refused here: a DECLARED model
+        // window equal to the ceiling makes the projection-at-the-window prevention path
+        // (`atWindow`, the branch the headroom buffer exists for) the reason this pass shrinks at
+        // all. Both branches read the one `fitLine` / `rungBudget` pair, so the budget, the sent
+        // request and every reported figure are the same numbers — "fits" means one thing, and a
+        // prevention pass does not compact harder than a reaction pass, or less.
+        const messages = heavyTranscript();
+        const fake = createFakeApi(
+            25_000,
+            {
+                mode: 'summarize',
+                minTokens: 0,
+                modelLimits: '{"wide/model": {"window": 25000}}'
+            },
+            { writer: fakeBrain(() => 'wide/model') }
+        );
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+        const requests: HarnessMessage[][] = [];
+
+        await passes.turnBefore(summarizeTurn(fake, 25_000, calls, { requests, messages }));
+
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        expect(requests[0]).toEqual(clippedRequest(messages));
+
+        expect(
+            fake.diagnostics
+                .filter((report) => (report.data as { stage?: string })?.stage === 'shrink')
+                .map((report) => report.data)
+        ).toEqual([RUNG_REPORT]);
+    });
+
+    it('keeps the ladder reachable when the floor sits inside the headroom band', async () => {
+        // THE REGIME THE FIT LINE EXISTS FOR. The same 25,000 ceiling with the DECLARED 0.15
+        // buffer: the ratio wants 3,750 and the floor wants 16,000, so the half-ceiling cap
+        // answers, `effective` is 12,500, and this round's 20,000-token floor sits UNDER THE
+        // FIRING POINT — while the dead-run guard has just established the pass is NOT dead,
+        // because the ceiling (25,000) is still reachable. Pre-R6 the budget was
+        // `min(12,500, 21,250) = 12,500`: below the floor, therefore unreachable by construction,
+        // therefore every droppable unit went. `fitLine` answers with the ceiling instead, the
+        // number the provider actually refuses at, so the rung keeps its 24,250 budget and stops
+        // at the same first request that fits it. The TRIGGER is untouched: this round still fires
+        // because 25,000 ≥ 12,500, and Rule 3's margin is still `effective`-scaled.
+        const messages = heavyTranscript();
+        const fake = createFakeApi(25_000, {
+            mode: 'summarize',
+            minTokens: 0,
+            headroomRatio: 0.15
+        });
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+        const requests: HarnessMessage[][] = [];
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        await passes.turnBefore(summarizeTurn(fake, 25_000, calls, { requests, messages }));
+
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        expect(requests[0]).toEqual(clippedRequest(messages));
+
+        expect(
+            fake.diagnostics
+                .filter((report) => (report.data as { stage?: string })?.stage === 'shrink')
+                .map((report) => report.data)
+        ).toEqual([RUNG_REPORT]);
+
+        // The park report still names the buffered firing point, unchanged in its semantics (the
+        // fix moved the ladder's fit line, not the trigger). It is the one report on this path
+        // that carries `effective`; the arm report carries `stage: 'overflow'` and the shrink
+        // report carries `target`/`from`/`to`.
+        const parked = fake.diagnostics.find(
+            (report) => (report.data as { effective?: number })?.effective !== undefined
+        );
+
+        expect(parked?.data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-1',
+            tokens: 25_000,
+            effective: 12_500,
+            // The canonical transcript the pass committed: the fake's one standing entry plus the
+            // compaction instruction this pass appended.
+            entries: 2
+        });
+    });
+
+    it('refuses a pass whose floor alone is over the ceiling, and sends the one that is not', async () => {
+        // THE DEAD RUN (X1, 2026-11-17 — the second half of the deadlock). A session whose tool
+        // catalogue and instructions are 1,000 tokens and whose ceiling is 1,000 cannot be rescued
+        // by clipping: the summarize request is `catalogue + transcript + instruction`, and the
+        // ladder only ever removes transcript. Under the old currency the pass fired anyway, sent a
+        // request the provider refused for the identical reason, and left the failed turn, the park
+        // and the re-armed pass sitting there for the NEXT turn to replay — which is the report
+        // this file's header calls a deadlock. Refusing it is an honest block: nothing is parked,
+        // nothing is rewritten, every entry stays in the request.
+        //
+        // THE FIXTURE STATES ITS FLOOR INSTEAD OF HIDING IT: `messages` is 500 tokens of
+        // transcript, `tokens` is the 1,500 the harness actually bills, so the derived floor is
+        // exactly 1,000 (1,500 − 500) and the two halves of the sum are the two halves the
+        // estimator priced.
+        const messages: HarnessMessage[] = [0, 1, 2, 3, 4].map((index) => ({
+            role: 'user' as const,
+            content: `t${index}${'x'.repeat(399 - String(index).length)}`
+        }));
+
+        const refusedRun = async (limit: number): Promise<FakeApi> => {
+            const fake = createFakeApi(limit, { mode: 'summarize', minTokens: 0 });
+            const passes = createContextCompactionPasses(fake.api);
+
+            passes.runFailed({ ...runLifecycle, error: refused() });
+
+            const calls: string[] = [];
+            const requests: HarnessMessage[][] = [];
+
+            await passes.turnBefore(summarizeTurn(fake, 1500, calls, { requests, messages }));
+
+            // The floor is the same in both arms (1,000), and so is the transcript (500). Only the
+            // ceiling moves, by ONE token.
+            return fake;
+        };
+
+        // ── Arm 1: floor == ceiling → no pass, one report, nothing touched ───────────────
+        const blocked = await refusedRun(1000);
+        const blockReports = blocked.diagnostics.filter(
+            (report) => (report.data as { stage?: string })?.stage === 'unreachable-target'
+        );
+
+        expect(blockReports.map((report) => report.data)).toEqual([
+            {
+                mode: 'summarize',
+                threadId: 'thread-1',
+                stage: 'unreachable-target',
+                tokens: 1500,
+                effective: 1000,
+                limit: 1000,
+                // X2, F6: `reported: true` marks the turn that actually printed the paragraph, so
+                // a log reader can tell "this is the one report" from "this turn was also dead and
+                // stayed quiet" (the latch below bounds the repeat, and `tokens` is what it tracks).
+                unreachableTarget: 1000,
+                transcriptTokens: 500,
+                reported: true,
+                armed: true,
+                rung: 0
+            }
+        ]);
+
+        // No park, no commit, no request rewrite, no display lane — and no shrink report either,
+        // because a pass that never started cannot report one.
+        expect(blocked.touches.filter((touch) => touch.startsWith('threads.'))).toEqual([]);
+        expect(
+            blocked.diagnostics.filter((report) => (report.data as { stage?: string })?.stage === 'shrink')
+        ).toEqual([]);
+
+        // ── Arm 2: the ceiling is ONE token higher → the ladder has work to do ───────────
+        // `effective` 1,001 is above the 1,000 floor, so the fit line IS `effective` and the rung
+        // budget — the floor plus the ratio across the 500 tokens of removable transcript,
+        // 1,000 + floor(0.85 × 500) = 1,425 — clamps to 1,001 and is reachable in principle.
+        // Billed 1,000 + 938 = 1,938 → pass A gives
+        // 1,000 + 807 = 1,807, still over, so the four head units go behind the digest:
+        // 1,000 + 731 = 1,731 — the floor plus the smallest request the ladder may send.
+        const fired = await refusedRun(1001);
+        const firedShrink = fired.diagnostics.find(
+            (report) => (report.data as { stage?: string })?.stage === 'shrink'
+        );
+
+        expect(
+            fired.diagnostics.filter((report) => (report.data as { stage?: string })?.stage === 'unreachable-target')
+        ).toEqual([]);
+        expect(firedShrink?.data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-1',
+            stage: 'shrink',
+            target: 1001,
+            from: 1938,
+            to: 1731,
+            floorTokens: 1000,
+            dropped: 4,
+            clipped: 4,
+            entries: 3
+        });
+
+        // THE BEFORE/AFTER, in one line: under the transcript-only measure this same fixture was a
+        // no-op — 938 transcript tokens already sat under the 1,001 target, so the ladder walked to
+        // the bottom, cut nothing the provider would notice, and re-sent the refused request.
+    });
+
+    it('says the dead-run refusal once, and leaves an exclude round alone', async () => {
+        // THE LATCH (X2, F6). Rule 3's regrowth memory bounds the UNARMED case, and the guard
+        // fires BEFORE that memory is written, so the bound lives in the guard itself: it stores
+        // the size it reported at and says nothing more until the size moves by the same
+        // `REGROWTH_RATIO` margin Rule 3 uses — 5% of the effective limit, so 1,500 → 1,500 is
+        // inside the margin and 1,600 is outside it (1,500 + floor(1,000 × 0.05) = 1,550). A
+        // session permanently over its window therefore states the problem ONCE and goes quiet,
+        // while a session that keeps growing keeps stating it, because each step is a request
+        // that still does not fit.
+        const fake = createFakeApi(1000, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+        // A 500-token transcript under a 1,500/1,600 estimate: the floor is 1,000/1,100 and the
+        // ceiling is 1,000, so every one of these turns is a dead run and the question is only how
+        // often the pass says so.
+        const deadMessages = turnProjection(500);
+        const reportsOf = (): number =>
+            fake.diagnostics.filter(
+                (report) => (report.data as { stage?: string })?.stage === 'unreachable-target'
+            ).length;
+
+        await passes.turnBefore(summarizeTurn(fake, 1500, calls, { messages: deadMessages }));
+        expect(reportsOf()).toBe(1);
+
+        // THE PARAGRAPH TELLS THE OPERATOR WHAT TO DO (X2, F6). The old wording blamed the
+        // shrink ladder ("the target was unreachable") for a condition that is about the request
+        // this harness SENDS, and named no lever; the ceiling here belongs to a `contextLimit` of
+        // 1,000 against a 1,000-token floor, and the only levers are the limit, the model's
+        // declared window, and the size of the tool set.
+        const refusal = fake.diagnostics.find(
+            (report) => (report.data as { stage?: string })?.stage === 'unreachable-target'
+        );
+
+        expect(String(refusal?.message)).toContain('is refusing to compact thread thread-1');
+        expect(String(refusal?.message)).toContain('floor is 1000 tokens against a 1000 ceiling');
+        expect(String(refusal?.message)).toContain('Raise `contextLimit` above 1000');
+        expect(String(refusal?.message)).toContain('`modelLimits`');
+
+        await passes.turnBefore(summarizeTurn(fake, 1500, calls, { messages: deadMessages }));
+        expect(reportsOf()).toBe(1);
+
+        await passes.turnBefore(summarizeTurn(fake, 1600, calls, { messages: deadMessages }));
+        expect(reportsOf()).toBe(2);
+        expect(calls).toEqual([]);
+
+        // `exclude` never re-sends the transcript, so the floor argument does not apply to it and
+        // the guard must not touch the mode: the same size fires the pruning pass as it always did.
+        const excluding = createFakeApi(1000, { mode: 'exclude', minTokens: 0 });
+        const guard = createContextCompactionHandler(excluding.api);
+        const excludeCalls: string[] = [];
+
+        guard(createFakeTurn({ api: excluding.api, estimatedTokens: 1500, calls: excludeCalls }));
+
+        expect(
+            excluding.diagnostics.filter(
+                (report) => (report.data as { stage?: string })?.stage === 'unreachable-target'
+            )
+        ).toEqual([]);
+    });
+
+    it('prices the media term the harness figure never saw into the floor (X2, F1)', async () => {
+        // THE CURRENCY BUG THIS PINS. The `estimatedTokens` on this boundary is the HARNESS
+        // figure, and `src/harness.ts` `emitTurnBefore` never passes `includeAttachmentBytes`, so
+        // a screenshot replayed on every turn is invisible in it; the plugin's own measurer
+        // (`measureShrink`) DOES price those wire bytes (core/context-estimate.ts, "THE OPT-IN
+        // REQUEST WEIGHT"). The floor used to be `estimatedTokens − measureShrink(messages)`:
+        // subtracting a media-inclusive number from a media-free one left the residual short by
+        // exactly the media term, so a request that was already past its ceiling read as
+        // rescuable and the pass spent a model turn to be refused again.
+        //
+        // THE FIGURES, from the estimator's own rules — the same entry the planner table pins at
+        // the `measures with attachment bytes` case above: the BODY is 100 text bytes + `name` 5
+        // + `mime` 9 = 114 bytes → ceil(114 / 4) = 29 tokens; the media term adds the 53,333
+        // base64 characters (ASCII, so its wire width IS its length) → 53,447 bytes →
+        // ceil(53,447 / 4) = 13,362 tokens. A harness estimate of 1,029 is therefore 29 transcript
+        // + 1,000 of catalogue and instructions with the media term UNCOUNTED, and the floor
+        // `measureRequestFloor` must derive is 1,029 + (13,362 − 29) − 13,362 = 1,000 — the
+        // ceiling EXACTLY, which is the dead run the guard refuses. The pre-fix derivation read
+        // max(0, 1,029 − 13,362) = 0 and fired.
+        const shot: HarnessMessage[] = [
+            {
+                role: 'user',
+                content: 'x'.repeat(100),
+                attachments: [
+                    {
+                        id: 'a1',
+                        kind: 'image',
+                        marker: '[Image 1]',
+                        name: 'a.png',
+                        mime: 'image/png',
+                        size: 40000,
+                        data: 'A'.repeat(53333)
+                    }
+                ]
+            }
+        ];
+
+        const fake = createFakeApi(1000, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+
+        await passes.turnBefore(summarizeTurn(fake, 1029, calls, { messages: shot }));
+
+        // No park, no instruction, no request — and the report states the floor in the currency
+        // the operator reads: `transcriptTokens` is the media-INCLUSIVE transcript (13,362), which
+        // is why 1,029 estimated tokens is not "small enough".
+        expect(calls).toEqual([]);
+        expect(
+            fake.diagnostics.filter(
+                (report) => (report.data as { stage?: string })?.stage === 'unreachable-target'
+            ).map((report) => report.data)
+        ).toEqual([
+            {
+                mode: 'summarize',
+                threadId: 'thread-1',
+                stage: 'unreachable-target',
+                tokens: 1029,
+                effective: 1000,
+                limit: 1000,
+                unreachableTarget: 1000,
+                transcriptTokens: 13362,
+                reported: true,
+                armed: true,
+                rung: 0
+            }
+        ]);
+    });
+
+    it('judges the dead run against the refusal point, not the buffered trigger (X2, F3)', async () => {
+        // THE BAND F3 CREATES, and the guard has to sit on the right side of it. A 1,000 ceiling
+        // with the DECLARED 0.15 ratio: the half-ceiling cap answers (min(max(16000, 150),
+        // min(500, 999)) = 500), so the trigger fires at 500 while the number that REFUSES stays
+        // 1,000. This request's floor is 700 — 1,200 estimated minus the 500 tokens of transcript
+        // the pass could take — so it sits between the two. A guard keyed on `effective` (the
+        // figure X1's dead-run guard compared against) would call this dead and withhold a pass
+        // that can still relieve 500 sendable tokens; on a small-`contextLimit` deployment that
+        // band is most of the working room, i.e. F3 would have made compaction unrunnable for
+        // exactly the installations F3 protects. The guard compares against what refuses.
+        const fake = createFakeApi(1000, { mode: 'summarize', minTokens: 0, headroomRatio: 0.15 });
+        const passes = createContextCompactionPasses(fake.api);
+        const calls: string[] = [];
+
+        await passes.turnBefore(summarizeTurn(fake, 1200, calls, { messages: turnProjection(500) }));
+
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        expect(
+            fake.diagnostics.filter(
+                (report) => (report.data as { stage?: string })?.stage === 'unreachable-target'
+            )
+        ).toEqual([]);
+    });
+
+    it('stops the ladder the first time a rung cannot come back smaller (X2, F2)', async () => {
+        // THE MEASURED FAILURE: four rung targets, four refused round trips, one identical request
+        // each time (`Temp/review-v2/probe-b.log` B3 — 41,399 / 34,093 / 24,352 / 17,046 all
+        // resolving to the same 206,159-token figure). The rung TARGETS strictly decrease, but a
+        // target below what the transcript pass can remove is reached by removing everything
+        // removable, so every deeper rung sends the same bytes and the give-up only arrived after
+        // the fourth refusal. Give-up is keyed on PROGRESS now: the second rung of this sequence
+        // is compared against the figure the first rung actually sent and was refused at, cannot
+        // beat it, and stops there — with no park, no instruction and no provider round trip.
+        //
+        // THE FIXTURE, sized so both rungs bottom out. 1,400 ceiling (`headroomRatio: 0`, so the
+        // trigger IS the ceiling), a 500-token transcript (five 400-character entries), and a
+        // 1,500 estimate → floor 1,000: over the trigger, under the ceiling, so the guard lets the
+        // sequence run. Rung 1 asks for 1,400 and rung 2 for 1,350 — the rung budget is the floor
+        // PLUS the ratio across the 500 tokens of transcript this pass can actually remove
+        // (1,000 + floor(0.85 × 500) = 1,425, clamped to the 1,400 fit line; 1,000 + floor(0.7 ×
+        // 500) = 1,350), because the ratio no longer reaches across the 1,000-token floor it cannot
+        // remove (R6, 2026-11-17) — and BOTH are below the smallest request this transcript can
+        // send, so both resolve to the all-removed request:
+        //   pass A (clip only) = 4 clipped heads × 269 bytes + the one verbatim projection entry
+        //            (400) + the instruction (1,752) = 3,228 bytes → 807 tokens → billed 1,807,
+        //            still over both targets, so the head units go:
+        //   digest = 291 characters of marker and prose + the oldest and newest 240-character
+        //            excerpts of what went missing = 771 bytes (all ASCII)
+        //   tail   = the one verbatim projection entry the ladder may not cut = 400 bytes — the
+        //            second `SHRINK_KEEP_TAIL` slot is the instruction itself, which is why the
+        //            request below has ONE transcript row (the same arithmetic the ladder case
+        //            above derives as 731 tokens with a 0 floor)
+        //   instruction = 1,752 bytes (the 1,714 characters of `COMPACTION_INSTRUCTION`, 38 of
+        //            them multi-byte — see the byte-audit note at the top of this file)
+        //   body   = ceil((771 + 400 + 1,752) / 4) = ceil(2,923 / 4) = 731 tokens
+        //   billed = floor + body = 1,000 + 731 = 1,731 tokens on rung 1 AND on rung 2.
+        const messages: HarnessMessage[] = [0, 1, 2, 3, 4].map((index) => ({
+            role: 'user' as const,
+            content: `t${index}${'x'.repeat(399 - String(index).length)}`
+        }));
+
+        const fake = createFakeApi(1400, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+        const requests: HarnessMessage[][] = [];
+        const first: string[] = [];
+
+        // Refusal #1 arms the ladder; the next boundary sends rung 1.
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        await passes.turnBefore(
+            summarizeTurn(fake, 1500, first, { messages, requests })
+        );
+
+        expect(first).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        expect(requests).toHaveLength(1);
+
+        // Refusal #2: the provider refused the 1,731-token request, so rung 2 (target 1,350) is
+        // asked whether it can send anything smaller. It cannot — the transcript has not moved,
+        // and a smaller target removes no less — so the sequence ends HERE, one round trip after
+        // the refusal rather than four.
+        const second: string[] = [];
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        await passes.turnBefore(
+            summarizeTurn(fake, 1500, second, { messages, requests })
+        );
+
+        expect(second).toEqual([]);
+        expect(requests).toHaveLength(1);
+
+        const stop = fake.diagnostics.find(
+            (report) => (report.data as { stage?: string })?.stage === 'no-progress'
+        );
+
+        expect(stop?.data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-1',
+            stage: 'no-progress',
+            rung: 2,
+            ladder: 4,
+            target: 1350,
+            from: 1731,
+            to: 1731,
+            floorTokens: 1000,
+            exhausted: true
+        });
+
+        // And the sequence is not bricked: the report above deleted the baseline, so a FRESH
+        // refusal starts a new ladder with a fresh baseline rather than being judged against a
+        // stale figure — the next boundary sends again. That is the bound this fix leaves, stated
+        // honestly: one shrunk attempt per pair of refusals (attempt, stop, attempt, stop) instead
+        // of one per rung, and the machine stays available for the case where the refusal WAS the
+        // transcript's fault and the transcript has since changed.
+        const third: string[] = [];
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        await passes.turnBefore(
+            summarizeTurn(fake, 1500, third, { messages, requests })
+        );
+
+        expect(third).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+        expect(requests).toHaveLength(2);
+    });
+
+    it('keeps the cooldown for an ordinary failure and clears it for a refusal', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        // A real pass first, so the Rule-3 memory exists: it records 400 BEFORE the action, and
+        // the margin is floor(250 × 0.05) = 12, so a turn at the same size is cooled.
+        let calls: string[] = [];
+
+        await passes.turnBefore(summarizeTurn(fake, 400, calls));
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+
+        calls = [];
+        await passes.turnBefore(summarizeTurn(fake, 400, calls));
+        expect(calls).toEqual([]);
+
+        passes.runFailed({ ...runLifecycle, error: down() });
+
+        // A provider that failed for a reason compaction cannot reach stays damped — otherwise
+        // every turn of a broken run buys another model round trip.
+        calls = [];
+        await passes.turnBefore(summarizeTurn(fake, 400, calls));
+        expect(calls).toEqual([]);
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+
+        // The SAME size, the SAME margin, one different error code: a refused request is
+        // answered with a SMALLER request, so muting the retry is the deadlock this fixes.
+        calls = [];
+        await passes.turnBefore(summarizeTurn(fake, 400, calls));
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+    });
+
+    it('walks the ladder and stops spending turns once it is spent', () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        // Five refusals: four rungs, then the give-up. The rung data is asserted below, so the
+        // loop only drives the machine.
+        const expected: unknown[] = [
+            { mode: 'summarize', threadId: 'thread-1', hook: 'run.failed', stage: 'overflow', rung: 1, ladder: 4, ratio: 0.85, exhausted: false },
+            { mode: 'summarize', threadId: 'thread-1', hook: 'run.failed', stage: 'overflow', rung: 2, ladder: 4, ratio: 0.7, exhausted: false },
+            { mode: 'summarize', threadId: 'thread-1', hook: 'run.failed', stage: 'overflow', rung: 3, ladder: 4, ratio: 0.5, exhausted: false },
+            { mode: 'summarize', threadId: 'thread-1', hook: 'run.failed', stage: 'overflow', rung: 4, ladder: 4, ratio: 0.35, exhausted: false },
+            // The give-up: `ratio: 0` and `exhausted: true` say the transcript is not the problem
+            // — a tool registry the estimate cannot see, or a window smaller than one turn.
+            { mode: 'summarize', threadId: 'thread-1', hook: 'run.failed', stage: 'overflow', rung: 4, ladder: 4, ratio: 0, exhausted: true }
+        ];
+
+        for (const _ of expected) {
+            passes.runFailed({ ...runLifecycle, error: refused() });
+        }
+
+        expect(fake.diagnostics.map((report) => report.data)).toEqual(expected);
+    });
+
+    it('stops reacting after the ladder is spent, and restarts it on a real answer', async () => {
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        passes.runFailed({ ...runLifecycle, error: refused() });
+        passes.runFailed({ ...runLifecycle, error: refused() });
+
+        // Spent: the same below-trigger boundary the arming case fired on now stays quiet.
+        let calls: string[] = [];
+
+        await passes.turnBefore(summarizeTurn(fake, 100, calls));
+        expect(calls).toEqual([]);
+
+        // One answered compaction resets the ladder — the provider answered a whole request, so
+        // the next refusal is a new emergency and starts again at rung 1.
+        await passes.turnBefore(summarizeTurn(fake, 400, calls));
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+
+        passes.turnAfter({
+            ...runLifecycle,
+            iteration: 2,
+            message: { role: 'assistant', content: 'SUMMARY' }
+        });
+
+        passes.runFailed({ ...runLifecycle, error: refused() });
+
+        // The LAST overflow report — not the last diagnostic, which is the existing park-lift
+        // report this failure also produces (`phase: 'finishing'`, unchanged above).
+        const reports = fake.diagnostics.filter(
+            (report) => (report.data as { stage?: string })?.stage === 'overflow'
+        );
+
+        expect(reports[reports.length - 1].data).toEqual({
+            mode: 'summarize',
+            threadId: 'thread-1',
+            hook: 'run.failed',
+            stage: 'overflow',
+            rung: 1,
+            ladder: 4,
+            ratio: 0.85,
+            exhausted: false
+        });
+    });
+
+    it('recognises a refusal that arrives as prose, the way a gateway relays one', async () => {
+        // No `code` at all: the fallback is the same one `core/agent.ts`
+        // `isContextOverflowFailure` applies, and the agent's own pre-request floor message
+        // starts with the code followed by a colon — pinned here so a relay that flattens the
+        // frame into text still arms the machine.
+        const fake = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const passes = createContextCompactionPasses(fake.api);
+
+        passes.runFailed({
+            ...runLifecycle,
+            error: {
+                message:
+                    'context-overflow: agent "writer" would send an estimated 900 tokens against a 512-token window'
+            } as never
+        });
+
+        const calls: string[] = [];
+
+        await passes.turnBefore(summarizeTurn(fake, 100, calls));
+        expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
+
+        // A lookalike that is not the prefix does NOT arm: the rule is a prefix match on the
+        // machine code, not a word search through English prose.
+        const other = createFakeApi(250, { mode: 'summarize', minTokens: 0 });
+        const otherPasses = createContextCompactionPasses(other.api);
+
+        otherPasses.runFailed({
+            ...runLifecycle,
+            error: { message: 'the provider mentioned a context window in its error page' } as never
+        });
+
+        const otherCalls: string[] = [];
+
+        await otherPasses.turnBefore(summarizeTurn(other, 100, otherCalls));
+        expect(otherCalls).toEqual([]);
     });
 });
 
@@ -1158,8 +2589,8 @@ describe('context-compaction trigger (createContextCompactionHandler)', () => {
 
     it('falls back to the declared default ceiling when the host stores nothing', async () => {
         // `contextLimit: undefined` means "the host has stored nothing", so the read falls
-        // back to the DECLARED default (200000) exactly as a fresh session's would — and
-        // with no headroom knob the fallback IS the firing point.
+        // back to the DECLARED default (200000) exactly as a fresh session's would — and with
+        // no window declared the fallback IS the firing point, buffer-free.
         const { api } = createFakeApi(0, { contextLimit: undefined });
         const calls: string[] = [];
         const { seen, action } = createRecordingAction(calls);
@@ -1217,12 +2648,18 @@ describe('context-compaction trigger (createContextCompactionHandler)', () => {
         expect(seen).toHaveLength(2);
     });
 
-    it('caps the trigger at the model window and scales the regrowth margin off the cap', async () => {
-        // The operator's example end to end: a 512000 ceiling on a 262144-token model —
-        // min(512000, 262144) = 262144, with no headroom subtracted.
+    it('buffers a declared window, and scales the regrowth margin off the buffered trigger', async () => {
+        // The operator's example end to end: a 512000 ceiling on a 262144-token model. The
+        // window caps the ceiling AND carries the headroom buffer, so the trigger is
+        // 262144 − 39321 = 222823 — the whole point of the buffer, which is that the request
+        // carrying the ~430-token compaction instruction fits under the window instead of
+        // arriving past the point the provider refuses at.
         const { api } = createFakeApi(
             512000,
-            { modelLimits: '{"wide/model": {"window": 262144}}' },
+            // The buffer ON for this case, spelled: the whole test is the buffer's arithmetic at
+            // the operator's scale, so it must not ride the fixture's `headroomRatio: 0` seed
+            // (X2, F3 moved that seed to the declared default's side of the rule).
+            { headroomRatio: 0.15, modelLimits: '{"wide/model": {"window": 262144}}' },
             { writer: fakeBrain(() => 'wide/model') }
         );
         const calls: string[] = [];
@@ -1233,28 +2670,69 @@ describe('context-compaction trigger (createContextCompactionHandler)', () => {
             await handler(createFakeTurn({ api, estimatedTokens, calls }));
         };
 
-        await run(262143);
+        // One token under the buffered trigger: nothing. This is the case the old numbers
+        // called "under the limit" at 262143, and the case the fix exists for — 262143 of
+        // projection plus the instruction is a request the 262144 window refuses.
+        await run(222822);
         expect(calls).toEqual([]);
 
-        await run(262144);
+        await run(222823);
         expect(calls).toEqual(TRIPLE);
 
-        // The re-trigger margin is 5% of the EFFECTIVE (capped) limit — floor(262144 * 0.05)
-        // = 13107 — not of the 512000 ceiling. Off the ceiling the margin would be 25600, half
-        // the window, and a conversation stuck just over the trigger would go unexamined for
-        // far longer than the rule intends.
-        await run(275250);
+        // The re-trigger margin is 5% of the EFFECTIVE (capped AND buffered) limit —
+        // floor(222823 * 0.05) = 11141 — not of the 262144 window (13107) and not of the
+        // 512000 ceiling (25600). Off the ceiling a conversation stuck just over the trigger
+        // would go unexamined for a quarter of a window.
+        await run(233963);
         expect(calls).toEqual(triples(1));
 
-        await run(275251);
+        await run(233964);
         expect(calls).toEqual(triples(2));
         expect(seen).toHaveLength(2);
 
         // Back under the trigger clears the cooldown, so the next crossing is fresh — the
-        // Rule 2 memory is keyed off the TRIGGER, not off the raw ceiling.
-        await run(262000);
-        await run(262144);
+        // Rule 2 memory is keyed off the TRIGGER, not off the raw ceiling or the raw window.
+        await run(222800);
+        await run(222823);
         expect(calls).toEqual(triples(3));
+    });
+
+    it('fires at the operator limit only when the buffer is opted out (X2, F3)', async () => {
+        // THE OPT-OUT, spelled: `headroomRatio: 0` means "fire exactly at the number the
+        // operator typed", so a conversation 5 tokens under 200000 is left exactly where the
+        // operator put it and the 200000th token fires. This is also why every other fixture in
+        // this file seeds that zero — its ceilings are hand-derived against the typed number.
+        const { api } = createFakeApi(200000);
+        const calls: string[] = [];
+        const { action } = createRecordingAction(calls);
+
+        const handler = createContextCompactionHandler(api, action);
+
+        await handler(createFakeTurn({ api, estimatedTokens: 199999, calls }));
+        expect(calls).toEqual([]);
+
+        await handler(createFakeTurn({ api, estimatedTokens: 200000, calls }));
+        expect(calls).toEqual(TRIPLE);
+
+        // THE DECLARED DEFAULT at handler level, with no window anywhere in the settings — the
+        // shape X2 (F3) is about. `contextLimit: 200000` is the operator's guess at the model's
+        // window, and the summarize request (the whole projection PLUS the 1,752-byte
+        // instruction) is scored against the model's REAL window by the provider, so the
+        // un-decorated budget needs the same working room a declared window gets: the firing
+        // point moves to 200000 − min(max(16000, 30000), min(100000, 199999)) = 170000. One
+        // token either side of that is the whole difference between this arm and the one above.
+        const buffered = createFakeApi(200000, { headroomRatio: 0.15 });
+        const bufferedCalls: string[] = [];
+        const bufferedHandler = createContextCompactionHandler(
+            buffered.api,
+            createRecordingAction(bufferedCalls).action
+        );
+
+        await bufferedHandler(createFakeTurn({ api: buffered.api, estimatedTokens: 169999, calls: bufferedCalls }));
+        expect(bufferedCalls).toEqual([]);
+
+        await bufferedHandler(createFakeTurn({ api: buffered.api, estimatedTokens: 170000, calls: bufferedCalls }));
+        expect(bufferedCalls).toEqual(TRIPLE);
     });
 
     it('degrades to the global ceiling when the per-model facts are unusable', async () => {
@@ -1435,19 +2913,22 @@ describe('context-compaction action (executeCompaction)', () => {
         expect(data.safetyTurns).toBe(0);
         expect(data.maxUnits).toBe(8);
         expect(data.consideredUnits).toBe(4);
-        // 236 tokens is the withheld unit: the 921-char result text (`Tool "read" failed: ` is
-        // 21 + 900 E's) plus its 4-char tool name, and the leader's 19 (4-char name + the 15
-        // raw argument characters) = 944 characters over the estimator's 4 chars/token, then
-        // the estimator's single rounding over the whole transcript before/after. The
-        // identical arithmetic is asserted from the estimator itself in
-        // src/core/context-pruning.test.ts, so this number is cross-checked, not read back.
-        expect(data.withheldTokens).toBe(236);
+        // 238 tokens is the withheld unit, counted in payload bytes: the 926-byte result (the
+        // 20-character `Tool "read" failed: ` prefix costs 22, because its two quotes double, plus
+        // the 900 E's, plus its 4-byte tool name) and the 23-byte leader (its 4-byte name plus the
+        // 15 characters of `{"path":"a.ts"}`, whose four quotes double to 19) = 949 bytes. The
+        // estimator rounds ONCE over the whole transcript, which measures 1,009 payload bytes
+        // (253 tokens) with the unit riding and 60 bytes (15 tokens) with it off, so the saving it
+        // reports is 253 − 15 = 238 — not `ceil(949 / 4)`. The identical arithmetic is asserted
+        // from the estimator itself in src/core/context-pruning.test.ts, so this number is
+        // cross-checked, not read back.
+        expect(data.withheldTokens).toBe(238);
         expect(data.units).toEqual([
             {
                 index: 1,
                 messageId: 'msg-2',
                 outcomes: ['failed'],
-                tokens: 236,
+                tokens: 238,
                 supersededBy: 'msg-4'
             }
         ]);
@@ -1597,7 +3078,7 @@ describe('context-compaction action (executeCompaction)', () => {
         expect(diagnostics).toHaveLength(1);
         expect(diagnostics[0].message).toContain('withheld nothing');
         expect(diagnostics[0].message).toContain('under the 5000 minTokens floor');
-        expect(diagnostics[0].data).toMatchObject({ minTokens: 5000, withheldTokens: 236 });
+        expect(diagnostics[0].data).toMatchObject({ minTokens: 5000, withheldTokens: 238 });
     });
 
     it('is idempotent: a second pass over the same transcript disables nothing new', async () => {
@@ -1644,27 +3125,29 @@ describe('context-compaction action (executeCompaction)', () => {
 
         // (d) THE SAVING IS WHAT WAS ACTUALLY WITHHELD. The report still NAMES the unit by its
         // leader — that is the identity an operator recognises, and the T4.5 "what answered it"
-        // half is unchanged — but the figure is 231, the result on its own, not the 236 the whole
-        // unit is worth (asserted byte-exact above). The leader's 5 tokens left the prompt on the
-        // trimmer's turn; claiming them here would bill the same text twice. 231 is the 944-char
-        // unit minus the leader's 19 characters: 925 chars of result (921 of text + the 4-char
-        // name) over the estimator's 4 chars/token, with its single rounding over the transcript.
+        // half is unchanged — but the figure is 232, the result on its own, not the 238 the whole
+        // unit is worth (asserted byte-exact above). The leader's 23 payload bytes left the prompt
+        // on the trimmer's turn; claiming them here would bill the same text twice. 232 is the
+        // 926-byte result (22 bytes for the escaped 20-character `Tool "read" failed: ` prefix +
+        // the 900 E's + the 4-byte name) through the estimator's single rounding over the
+        // transcript: 986 bytes (247 tokens) with the result riding, 60 bytes (15 tokens) without
+        // it, so 247 − 15 = 232.
         expect(diagnostics).toHaveLength(1);
         expect(diagnostics[0].message).toContain('withheld 1 superseded tool unit(s)');
-        expect(diagnostics[0].message).toContain('~231 estimated tokens');
+        expect(diagnostics[0].message).toContain('~232 estimated tokens');
         expect(diagnostics[0].message).toContain('#1 msg-2 [failed] answered by msg-4');
 
         const data = diagnostics[0].data as { withheldTokens: number; units: { tokens: number; index: number }[] };
 
-        expect(data.withheldTokens).toBe(231);
+        expect(data.withheldTokens).toBe(232);
         expect(data.units[0].index).toBe(1);
-        expect(data.units[0].tokens).toBe(231);
+        expect(data.units[0].tokens).toBe(232);
 
         // The floor judges the SAME figure, so the smaller saving is what an operator's `minTokens`
-        // has to beat: 232 refuses this pass, 231 takes it (`>=`).
+        // has to beat: 233 refuses this pass, 232 takes it (`>=`).
         for (const [minTokens, expected] of [
-            [232, []],
-            [231, ['setIncluded:2:false']]
+            [233, []],
+            [232, ['setIncluded:2:false']]
         ] as const) {
             const gated = createFakeApi(100, { minTokens, safetyTurns: 0 });
             const gatedCalls: string[] = [];
@@ -1866,9 +3349,14 @@ describe('context-compaction action (executeCompaction)', () => {
         expect(touches).toEqual([...TRIGGER_READS, ...POLICY_READS, 'report.diagnostic']);
     });
 
-    // The estimate is ceil(content chars / 4) (core/context-estimate.ts), and the agent
-    // has no instruction blocks, so these prompts are exact by construction:
+    // What a `turn.before` estimate is here, exactly: `CATALOGUE + ceil(payload bytes / 4)`
+    // (core/context-estimate.ts — the tool schemas of the request ride on the unanchored leg, see
+    // the constant above), and the agent has no instruction blocks, so the transcript term of
+    // these prompts is exact by construction:
     //   400 chars -> 100, 412 -> 103, 476 -> 119 against a limit of 100 (margin 5).
+    // The estimates below are therefore `CATALOGUE + 100`, `CATALOGUE + 103`, `CATALOGUE + 119`.
+    // The margin, and the crossing itself, are keyed on the OPERATOR's limit, which stays a
+    // transcript-scale number, so the regrowth arithmetic these cases measure is unchanged.
     const SHORT = 'go';
     const CROSSING = 'x'.repeat(400);
     const INSIDE_MARGIN = 'y'.repeat(10);
@@ -1881,7 +3369,11 @@ describe('context-compaction action (executeCompaction)', () => {
 
         const writer = harness({
             agents: { writer: brain(scripted([answer('ok')], seen)) },
-            pluginSettings: limitAt(100),
+            // The ceiling this case was written against is 100 TRANSCRIPT tokens; the request it
+            // judges also carries the catalogue, so the number an operator would type today is
+            // `CATALOGUE + 100`. The 2-character prompt is 1 transcript token, which sits 99
+            // tokens under that ceiling exactly as it did under 100.
+            pluginSettings: limitAt(CATALOGUE + 100),
             plugins: [probe(events, estimates)]
         });
 
@@ -1889,7 +3381,7 @@ describe('context-compaction action (executeCompaction)', () => {
         const message = await writer.sendThreadInput(thread.id, SHORT);
 
         expect(message.content).toBe('ok');
-        expect(estimates).toEqual([1]);
+        expect(estimates).toEqual([CATALOGUE + 1]);
         expect(events).toEqual([]);
         expect(writer.thread(thread.id)?.status).toBe('idle');
 
@@ -1915,23 +3407,27 @@ describe('context-compaction action (executeCompaction)', () => {
 
         const thread = writer.createThread('writer', { label: 'Over limit' });
 
-        // Turn 1: 400 chars = 100 tokens -> the limit is reached -> park + un-park.
+        // Turn 1: 400 chars = 100 transcript tokens, i.e. a `CATALOGUE + 100` boundary estimate
+        // -> the limit is reached -> park + un-park.
         expect((await writer.sendThreadInput(thread.id, CROSSING)).content).toBe('ok');
-        expect(estimates).toEqual([100]);
+        expect(estimates).toEqual([CATALOGUE + 100]);
         expect(events).toEqual(['paused', 'resumed']);
         // The run was never stranded by the park.
         expect(writer.thread(thread.id)?.status).toBe('idle');
 
         // Turn 2: 412 chars = 103 tokens — still over the limit, inside the 5% margin, so the
-        // conversation is not parked again for the same size.
+        // conversation is not parked again for the same size. (The margin is
+        // `max(1, floor(100 * 0.05)) = 5` on the LIMIT, and the catalogue is a constant, so the
+        // 3-token growth is inside it exactly as it was before the catalogue moved into the
+        // estimate.)
         expect((await writer.sendThreadInput(thread.id, INSIDE_MARGIN)).content).toBe('fine');
-        expect(estimates).toEqual([100, 103]);
+        expect(estimates).toEqual([CATALOGUE + 100, CATALOGUE + 103]);
         expect(events).toEqual(['paused', 'resumed']);
         expect(writer.thread(thread.id)?.status).toBe('idle');
 
         // Turn 3: 476 chars = 119 tokens, 19 past the last mark -> re-armed.
         expect((await writer.sendThreadInput(thread.id, PAST_MARGIN)).content).toBe('done');
-        expect(estimates).toEqual([100, 103, 119]);
+        expect(estimates).toEqual([CATALOGUE + 100, CATALOGUE + 103, CATALOGUE + 119]);
         expect(events).toEqual(['paused', 'resumed', 'paused', 'resumed']);
         expect(writer.thread(thread.id)?.status).toBe('idle');
 
@@ -1965,7 +3461,7 @@ describe('context-compaction action (executeCompaction)', () => {
         await writer.sendThreadInput(thread.id, CROSSING);
 
         // The estimate really did pass the (disabled) limit; the plugin just refused it.
-        expect(estimates).toEqual([100]);
+        expect(estimates).toEqual([CATALOGUE + 100]);
         expect(events).toEqual([]);
         expect(writer.thread(thread.id)?.status).toBe('idle');
     });
@@ -1985,7 +3481,7 @@ describe('context-compaction action (executeCompaction)', () => {
 
         expect(message.content).toBe('condensed');
         // Over the limit by the same margin the writer test used, yet skipped by name.
-        expect(estimates).toEqual([100]);
+        expect(estimates).toEqual([CATALOGUE + 100]);
         expect(events).toEqual([]);
         expect(writer.thread(thread.id)?.status).toBe('idle');
     });
@@ -2025,7 +3521,7 @@ describe('context-compaction action (executeCompaction)', () => {
         // Fail-open: the throwing handler was skipped by the bus, the run answered anyway,
         // and `finally` returned the thread to its run.
         expect(message.content).toBe('ok');
-        expect(estimates).toEqual([100]);
+        expect(estimates).toEqual([CATALOGUE + 100]);
         expect(events).toEqual(['paused', 'resumed']);
         expect(writer.thread(thread.id)?.status).toBe('idle');
         expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
@@ -2038,8 +3534,10 @@ describe('context-compaction action (executeCompaction)', () => {
     // T3/T4 through a real conversation: the flag is canonical state, the provider stops
     // seeing the pruned unit, and a multi-unit pass costs ONE persistence notification.
     //
-    // The numbers are derived, not observed: `brain()` has no instruction, so the estimate
-    // is ceil(content chars / 4) over the transcript (core/context-estimate.ts). A failed
+    // The numbers are derived, not observed: `brain()` has no instruction, so the TRANSCRIPT part of
+    // the estimate is ceil(payload bytes / 4) over the content (core/payload-bytes.ts +
+    // core/context-estimate.ts), and the boundary adds the `CATALOGUE` floor the header derives — so
+    // every `contextLimit` in this block is written as `CATALOGUE + <transcript number>`. A failed
     // result of `N` characters contributes (21 + N + 4) chars — 21 for `Tool "read" failed: `
     // and 4 for the tool name on the result — and its assistant entry 19 more (4 name + the
     // 15-character raw arguments). The floor and horizon settings are named explicitly so
@@ -2349,9 +3847,12 @@ describe('context-compaction action (executeCompaction)', () => {
     // `writer` brain is built with (see `brain` above), and the trigger reads it from the
     // live registry through `api.agents[context.agent].model()` — `context.agent` is the
     // registry key `writer` (src/harness.ts `emitTurnBefore` hands `brain.name`, and the
-    // harness overwrites that with the registry key on registration). The estimates are the
-    // harness's own ceil(chars / 4) over an agent with no instruction blocks, so every
-    // number below is derived from the documented formula, not from a run.
+    // harness overwrites that with the registry key on registration). The transcript term of
+    // the estimate is the harness's own ceil(payload bytes / 4) over an agent with no instruction
+    // blocks, and the request's 11-tool catalogue adds the constant above on top of it, so every
+    // number below is derived from the documented formula, not from a run. The ceilings stay
+    // TRANSCRIPT-scale, except where a case needs its ceiling ABOVE the estimate: that one is
+    // written `CATALOGUE + n`, because the estimate it must clear carries the floor.
     // -----------------------------------------------------------------------
 
     it('leaves the conversation alone when the per-model limit lifts the trigger past the estimate', async () => {
@@ -2360,12 +3861,13 @@ describe('context-compaction action (executeCompaction)', () => {
 
         const writer = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
-            // The global ceiling of 100 would fire at this 100-token estimate (every other
-            // test in this file does exactly that). This model's own ceiling of 1000 does
-            // not, and it is the model the run is actually on.
+            // The global ceiling of 100 would fire at this CATALOGUE + 100 estimate (every other
+            // test in this file does exactly that). This model's own ceiling — 1000 transcript
+            // tokens above the catalogue the request carries, i.e. 900 tokens of headroom over
+            // this conversation — does not, and it is the model the run is actually on.
             pluginSettings: settingsOf({
                 contextLimit: 100,
-                modelLimits: '{"merge/ds4-flash": {"limit": 1000}}'
+                modelLimits: `{"merge/ds4-flash": {"limit": ${CATALOGUE + 1000}}}`
             }),
             plugins: [probe(events, estimates)]
         });
@@ -2373,7 +3875,7 @@ describe('context-compaction action (executeCompaction)', () => {
         const thread = writer.createThread('writer', { label: 'Per-model ceiling' });
         expect((await writer.sendThreadInput(thread.id, CROSSING)).content).toBe('ok');
 
-        expect(estimates).toEqual([100]);
+        expect(estimates).toEqual([CATALOGUE + 100]);
         expect(events).toEqual([]);
         expect(writer.thread(thread.id)?.status).toBe('idle');
 
@@ -2392,10 +3894,16 @@ describe('context-compaction action (executeCompaction)', () => {
         const capped = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
             pluginSettings: settingsOf({
-                contextLimit: 1000,
-                // effective = min(1000, 100) = 100 — the declared window caps the ceiling, and
-                // with no headroom the cap IS the firing point — so this 100-token turn
-                // crosses it.
+                // The ceiling is written `CATALOGUE + 1000` in BOTH arms so they differ ONLY by
+                // the model id the map keys: with the catalogue priced into the estimate, a bare
+                // 1000 would fire in the control arm too (the request is CATALOGUE + 100).
+                contextLimit: CATALOGUE + 1000,
+                // effective = min(CATALOGUE + 1000, 100) = 100 — the declared window caps the
+                // ceiling, and because it BINDS it also carries the headroom buffer: the trigger
+                // is max(1, 100 − min(max(16000, floor(100 × 0.15)), floor(100 / 2), 99)) = 50 (the
+                // half-window cap is what keeps a 100-token fixture from collapsing to 1). This
+                // CATALOGUE + 100 request crosses either number by thousands, so the case
+                // measures the SAME thing it always did: the model-keyed lookup, not the buffer.
                 modelLimits: '{"merge/ds4-flash": {"window": 100}}',
                 // The pass this case watches is the prune (the events are the park of the
                 // `exclude` lifecycle), so the mode is named rather than inherited; the
@@ -2409,20 +3917,21 @@ describe('context-compaction action (executeCompaction)', () => {
         const cappedThread = capped.createThread('writer', { label: 'Window capped' });
         expect((await capped.sendThreadInput(cappedThread.id, CROSSING)).content).toBe('ok');
 
-        expect(estimates).toEqual([100]);
+        expect(estimates).toEqual([CATALOGUE + 100]);
         expect(events).toEqual(['paused', 'resumed']);
         expect(capped.thread(cappedThread.id)?.status).toBe('idle');
 
         // Identical settings except for the key the map names: a window declared for a model
-        // this run is NOT on caps nothing, so the global 1000 ceiling stands and the turn is
-        // left alone. One token estimate apart, the whole difference is the lookup.
+        // this run is NOT on caps nothing, so the global `CATALOGUE + 1000` ceiling stands — the
+        // CATALOGUE + 100 request is 900 transcript tokens under it — and the turn is left alone.
+        // 900 tokens of ceiling apart, the whole difference is the lookup.
         const uncappedEvents: string[] = [];
         const uncappedEstimates: number[] = [];
 
         const uncapped = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
             pluginSettings: settingsOf({
-                contextLimit: 1000,
+                contextLimit: CATALOGUE + 1000,
                 modelLimits: '{"other/model": {"window": 100}}',
                 mode: 'exclude'
             }),
@@ -2432,7 +3941,7 @@ describe('context-compaction action (executeCompaction)', () => {
         const uncappedThread = uncapped.createThread('writer', { label: 'Window elsewhere' });
         await uncapped.sendThreadInput(uncappedThread.id, CROSSING);
 
-        expect(uncappedEstimates).toEqual([100]);
+        expect(uncappedEstimates).toEqual([CATALOGUE + 100]);
         expect(uncappedEvents).toEqual([]);
     });
 
@@ -2441,8 +3950,11 @@ describe('context-compaction action (executeCompaction)', () => {
         const estimates: number[] = [];
 
         // No `pluginSettings` at all: the in-memory provider is seeded from the DECLARED
-        // defaults, so this is a fresh install — ceiling 200000, empty map, and no headroom:
-        // the firing point IS 200000, which a 100-token conversation is nowhere near.
+        // defaults, so this is a fresh install — ceiling 200000, an empty `modelLimits` map, and
+        // `headroomRatio` at its declared 0.15. No buffer moves the firing point here, because
+        // the buffer is keyed on a DECLARED window and none is declared: the firing point IS
+        // 200000, which a CATALOGUE + 100 request (13,372 tokens, the 100 of transcript plus the
+        // catalogue the request carries) is nowhere near.
         const writer = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
             plugins: [probe(events, estimates)]
@@ -2451,7 +3963,7 @@ describe('context-compaction action (executeCompaction)', () => {
         const thread = writer.createThread('writer', { label: 'Fresh install' });
         expect((await writer.sendThreadInput(thread.id, CROSSING)).content).toBe('ok');
 
-        expect(estimates).toEqual([100]);
+        expect(estimates).toEqual([CATALOGUE + 100]);
         expect(events).toEqual([]);
         expect(writer.thread(thread.id)?.status).toBe('idle');
     });
@@ -2462,16 +3974,21 @@ describe('context-compaction action (executeCompaction)', () => {
 //
 // Every number here is derived, never read back: the transcript is seeded with 2100
 // characters of one user turn (525 tokens) and the prompt `go` adds one more, so the live
-// projection at the first boundary is 526 against an effective limit of 520 — over, and
-// `minTokens: 0` so the floor cannot refuse the pass. After a successful compaction the
-// retained head (the instruction ~429 tokens, the answer, the nudge) measures ~479, i.e.
-// under 520, which is what makes "the context is small again" an assertion rather than a
-// hope. The seed and the limit are SIZED BY THE SHIPPED INSTRUCTION: the head is
-// instruction + answer + nudge, so the OpenCode checkpoint template (1714 characters of
-// instruction, adopted 2026-11-12) moved both numbers — a limit under ~480 tokens would sit
-// below the retained head alone and every continuation turn would re-trigger, which is a real
-// property of the design, not an artefact of this fixture. The instruction and the nudge are the EXPORTED strings, because a case that pasted
-// its own copy would keep passing after the protocol changed.
+// projection at the first boundary is `CATALOGUE + 526` — the 526 of transcript plus the tool
+// catalogue every request carries (see the constant above) — against an effective limit of
+// `CATALOGUE + 520`: over by the same 6 tokens it always was, and `minTokens: 0` so the floor
+// cannot refuse the pass. After a successful compaction the retained head (the instruction
+// 438 tokens, the answer, the nudge) measures 486, i.e. 34 under the limit, which is what makes
+// "the context is small again" an assertion rather than a hope. Because the floor is ADDITIVE
+// (`CATALOGUE` is a multiple-of-4 byte count, so it rides on top of the transcript term and on
+// top of the ceiling), this block writes its limit ONCE as `CATALOGUE + 520` and every
+// limit-vs-estimate comparison in it keeps the exact margin it had at transcript scale. The seed
+// and the limit are SIZED BY THE SHIPPED INSTRUCTION: the head is instruction + answer + nudge,
+// so the OpenCode checkpoint template (1,714 characters / 1,752 payload bytes of instruction,
+// adopted 2026-11-12) moved both numbers — a limit under ~490 transcript tokens would sit below
+// the retained head alone and every continuation turn would re-trigger, which is a real property
+// of the design, not an artefact of this fixture. The instruction and the nudge are the EXPORTED
+// strings, because a case that pasted its own copy would keep passing after the protocol changed.
 //
 // The continuation run is fire-and-forget from inside `thread.idle` (see the plugin's "WHY
 // THE NUDGE IS A SEND"), so it is still queued when the submission resolves; `settle` below
@@ -2482,7 +3999,53 @@ describe('context-compaction action (executeCompaction)', () => {
 describe('context-compaction summarize flow (T9)', () => {
     const SEED = 'x'.repeat(2100);
     const PROMPT = 'go';
-    const LIMIT = 520;
+
+    // THE LARGE TRANSCRIPT the two overflow-refusal cases seed, and what its size is for NOW.
+    //
+    // A rung's budget is `floor + ladder × (tokens − floor)` — the ratio across the REMOVABLE
+    // transcript with the irreducible floor added back (R6, 2026-11-17) — CLAMPED to the fit line
+    // (the effective ceiling, or the ceiling itself when the floor sits inside the headroom band).
+    // `tokens` is the BOUNDARY estimate — the transcript PLUS the catalogue floor
+    // (src/harness.ts:12512 passes `toolSchemaBytes()`) — and since X1 (2026-11-17) the ladder
+    // measures the same billed quantity: `floor + the request it is cutting` (see
+    // `planCompactionRequest`). A cut therefore needs
+    // `floor + transcript + 438 > min(fit line, floor + 0.85 × transcript)` — which an over-ceiling
+    // request satisfies, because its own estimate is over the ceiling. Two relations preceded that
+    // one: pre-X1 the rung was a fraction of `floor + transcript` while the measurement was the
+    // transcript alone, so a catalogue-dominant conversation could never satisfy it and every rung
+    // returned the request untouched (the deadlock that shipped); pre-R6 the ratio reached across
+    // the floor it cannot remove, so the transcript was billed a fraction of the catalogue on top
+    // and the budget fell under the smallest sendable request (pinned in the
+    // `overflow-reactive trigger` cases above).
+    //
+    // The 300,000-character BIG_SEED (75,441 transcript tokens against a 13,272-token floor) is
+    // kept because these two cases pin "the retry is strictly smaller", and a transcript that
+    // dwarfs the catalogue makes the number dramatic: 89,151 billed down to 13,905. At the 2,100-
+    // character `SEED` every other case here uses (526 transcript tokens) the ladder now cuts too —
+    // to 13,905 billed, the digest plus the verbatim tail — which is the same request either way
+    // where the provider is concerned, and the give-up line is what tells the operator the floor is
+    // the problem rather than the transcript.
+    const BIG_SEED = 'x'.repeat(300_000);
+
+    // 520 TRANSCRIPT tokens plus the catalogue floor the estimate is measured against — the one
+    // place this block adds the constant, so every margin in it (the 6-token crossing, and the
+    // 34-token headroom the retained head leaves) stays exactly the transcript-scale number the
+    // header derives.
+    const LIMIT = CATALOGUE + 520;
+
+    // THE DELEGATING ROSTER'S FLOOR, which is NOT `CATALOGUE`. A roster with a delegating agent
+    // registers one more runtime tool — the `delegate` entry, 7,396 serialized bytes = 1,849
+    // tokens — so every request that harness sends carries a 60,484-byte catalogue: 15,121 tokens
+    // EXACTLY (probe `Temp/coding-x1/probe-x6.ts`, the same method that derived `CATALOGUE`, which
+    // it reproduces at 53,088 bytes for a writer-only roster). The delegate case below caps its
+    // conversation with `DELEGATE_FLOOR + 520` so its transcript budget and its crossing margin
+    // stay the numbers every sibling case uses.
+    //
+    // WHY IT HAS TO MOVE AT ALL (X1, 2026-11-17): the pass now refuses to start when the request's
+    // irreducible size is at or above the ceiling, and a `CATALOGUE + 520` ceiling in a
+    // delegating harness sits 1,849 tokens UNDER its own floor — a request no amount of clipping
+    // could ever fit, so the pass there was a dead run by construction.
+    const DELEGATE_FLOOR = 15_121;
 
     // Scripted transport with a window INTO the request: `on` runs while the model turn is
     // in flight, which is the only moment a case can observe the roster status mid-pass, the
@@ -2609,8 +4172,9 @@ describe('context-compaction summarize flow (T9)', () => {
         ]);
 
         // Request 2 — THE PROOF THE CONTEXT IS SMALL AGAIN. The provider sees the instruction,
-        // the agent's own summary, and the nudge: 3 messages, ~479 tokens, and neither the
-        // 2100-character seed nor the prompt anywhere in it.
+        // the agent's own summary, and the nudge: 3 messages, 1,752 + 7 + 185 = 1,944 payload
+        // bytes → 486 tokens of transcript, i.e. CATALOGUE + 486 against the CATALOGUE + 520
+        // ceiling, and neither the 2100-character seed nor the prompt anywhere in it.
         expect(withoutIds(seen[1].messages)).toEqual([
             { role: 'user', content: COMPACTION_INSTRUCTION },
             { role: 'assistant', content: 'SUMMARY' },
@@ -2680,13 +4244,17 @@ describe('context-compaction summarize flow (T9)', () => {
         // the whole firing decision, and an operator reading the log has to be able to see WHY
         // the pass ran. `currentEstimatedTokens()` rather than `estimatedTokens` because the
         // latter is frozen at handler entry — a boundary that lands right after a compaction
-        // would otherwise still see the pre-compaction size and fire the pass again.
-        expect(diagnostics[0].message).toContain('~526 estimated tokens against an effective limit of 520');
+        // would otherwise still see the pre-compaction size and fire the pass again. The report
+        // carries the CATALOGUE floor on the estimate side (it is the request the provider bills),
+        // and the margin over the ceiling is still the 6 transcript tokens the header derives.
+        expect(diagnostics[0].message).toContain(
+            `~${CATALOGUE + 526} estimated tokens against an effective limit of ${CATALOGUE + 520}`
+        );
         expect(diagnostics[0].data).toEqual({
             mode: 'summarize',
             threadId,
-            tokens: 526,
-            effective: 520,
+            tokens: CATALOGUE + 526,
+            effective: CATALOGUE + 520,
             entries: 3
         });
 
@@ -2927,11 +4495,19 @@ describe('context-compaction summarize flow (T9)', () => {
         // regrowth margin since the last fire, and the retained prompt + instruction rows
         // ARE that growth (the old "it does not re-fire" claim assumed the failed pass had
         // spliced them out, so the retry measured the same size and stayed cooled).
+        // The retry is a 2,010-character prompt because of the size of that margin: the
+        // CATALOGUE + 520 ceiling this block runs under makes it
+        // `max(1, floor(13,792 × 0.05)) = 689` tokens, and the only rows that can grow the
+        // projection are the 438 tokens of instruction the failed pass left on the record plus
+        // the new prompt. The second boundary therefore measures CATALOGUE + 1,466
+        // (2,100 + 2 + 1,752 + 2,010 = 5,864 payload bytes) against the mark
+        // CATALOGUE + 526 + 689 = CATALOGUE + 1,215, and re-arms on 940 tokens of growth.
         // Re-captured from an actual run: the second instruction is in flight (still
         // included — it is what the model was just shown), and the block that pass compacted
         // (SEED, both prompts, the first instruction) is switched off by it. The answer is
         // the scripted 'later' either way, which is what keeps "usable" the contract here.
-        const next = await writer.sendThreadInput(thread.id, 'retry now');
+        const RETRY = `retry now ${'r'.repeat(2000)}`;
+        const next = await writer.sendThreadInput(thread.id, RETRY);
 
         expect(next.content).toBe('later');
         expect(writer.thread(thread.id)?.status).toBe('idle');
@@ -2939,10 +4515,375 @@ describe('context-compaction summarize flow (T9)', () => {
             { role: 'user', content: SEED, included: false },
             { role: 'user', content: PROMPT, included: false },
             { role: 'user', content: COMPACTION_INSTRUCTION, included: false },
-            { role: 'user', content: 'retry now', included: false },
+            { role: 'user', content: RETRY, included: false },
             { role: 'user', content: COMPACTION_INSTRUCTION },
             { role: 'assistant', content: 'later' }
         ]);
+    });
+
+    // THE DEADLOCK, END TO END (2026-11-17). The transport refuses the request with the code the
+    // transport and the agent's pre-request floor share (`CONTEXT_OVERFLOW_CODE` on an `error`
+    // frame — the shape the built-in transport actually emits, and the one that keeps the retry
+    // ladder out of it, so `retry: false` is not needed here); the run fails; the very next
+    // boundary answers with a request the provider cannot refuse for the same reason.
+    it('answers a size refusal with a strictly smaller compaction request on the next boundary', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const events: string[] = [];
+        const estimates: number[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: brain(
+                    flowStream(
+                        [
+                            [
+                                {
+                                    type: 'error',
+                                    message: 'this request exceeds the model context window',
+                                    code: CONTEXT_OVERFLOW_CODE
+                                }
+                            ] as HarnessStreamEvent[],
+                            answer('SUMMARY'),
+                            answer('resumed')
+                        ],
+                        seen
+                    )
+                )
+            },
+            pluginSettings: summarizeSettings(),
+            plugins: [probe(events, estimates)],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        const thread = writer.createThread('writer', { label: 'Refused, then smaller' });
+
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: BIG_SEED }]);
+
+        // REQUEST 1 — the ordinary pass, exactly as it has always been: the projection plus the
+        // instruction. Nothing was shrunk, because nothing had been refused yet, and that is the
+        // behaviour every case above pins.
+        await expect(writer.sendThreadInput(thread.id, PROMPT)).rejects.toThrow('context window');
+
+        expect(seen[0].messages.map((message) => String(message.content))).toEqual([
+            BIG_SEED,
+            PROMPT,
+            COMPACTION_INSTRUCTION
+        ]);
+
+        const refusedReport = diagnostics.find(
+            (report) => (report.data as { stage?: string })?.stage === 'overflow'
+        );
+
+        expect(refusedReport?.data).toEqual({
+            mode: 'summarize',
+            threadId: thread.id,
+            hook: 'run.failed',
+            stage: 'overflow',
+            rung: 1,
+            ladder: 4,
+            ratio: 0.85,
+            exhausted: false
+        });
+
+        // REQUEST 2 — the armed boundary. The transcript the failed pass left is BIG_SEED, the
+        // prompt and the instruction the provider never saw an answer to (issue 0036 R1 keeps
+        // them), and `retry now` is what the host is asking about now: 300,000 + 2 + 1,752 + 9 =
+        // 301,763 payload bytes = 75,441 transcript tokens, so the boundary estimate is
+        // CATALOGUE + 75,441 = 88,713 and the request the pass builds is one instruction larger,
+        // 303,515 bytes = 75,879 transcript tokens.
+        //
+        // THE RUNG IS NOW A BUDGET THE PROVIDER COULD ACTUALLY MEET, and that is the fix. Two
+        // things changed on 2026-11-17. The rung budget `13,272 + floor(0.85 × 75,441) = 77,396`
+        // — the floor, plus the ratio across the 75,441 tokens of transcript this pass can
+        // actually remove (R6 took the ratio off the catalogue it cannot remove) — is CLAMPED to
+        // the 13,792 fit line: 85% of an over-limit size is still over the limit, so an unclamped
+        // rung asks the ladder to stop at a number the provider would refuse. And the ladder
+        // measures the BILLED figure, catalogue and all: 13,272 + 75,879 = 89,151 over a 13,792
+        // budget, where the old transcript-only measure read 75,879 against a 75,406 target, walked
+        // the whole ladder, and sent the refused request out again byte-identical. Pass A
+        // (269 + 2 + 269 + 9 + 1,752 = 2,301 bytes = 576 transcript tokens, 13,848 billed) is still
+        // 56 over, so the ladder drops the three head units behind one digest: 771 + 9 + 1,752 =
+        // 2,532 bytes = 633 tokens, 13,905 billed — the smallest request it may send, 75,246 tokens
+        // under the one that was refused.
+        const next = await writer.sendThreadInput(thread.id, 'retry now');
+
+        expect(next.content).toBe('SUMMARY');
+        expect(await settle(writer, thread.id, 8)).toBe(true);
+
+        expect(seen[1].messages.map((message) => String(message.content))).toEqual([
+            `[context compaction digest] The harness removed 3 earlier turns from this request ` +
+                `without a model to summarize them, because the request itself did not fit the ` +
+                `context window. The removed turns are still on the record; they are simply not ` +
+                `being sent. Oldest removed: ${'x'.repeat(240)} | Most recent removed: ${COMPACTION_INSTRUCTION.slice(0, 240)}`,
+            'retry now',
+            COMPACTION_INSTRUCTION
+        ]);
+
+        const shrinkReport = diagnostics.find(
+            (report) => (report.data as { stage?: string })?.stage === 'shrink'
+        );
+
+        // All three figures are billed request size, and `floorTokens` is printed with them so the
+        // line answers "why did it stop at 13,905 when the ceiling is 13,792?" without a second
+        // tool: 13,272 of that request is the catalogue, the instructions and the harness turns,
+        // which no transcript pass can shrink.
+        expect(shrinkReport?.data).toEqual({
+            mode: 'summarize',
+            threadId: thread.id,
+            stage: 'shrink',
+            target: 13792,
+            from: 89151,
+            to: 13905,
+            floorTokens: CATALOGUE,
+            dropped: 3,
+            clipped: 2,
+            entries: 3
+        });
+
+        // REQUEST 3 — THE PROOF THE SHRINK COST NOTHING DURABLE. The continuation goes out with
+        // the instruction, the model's own summary and the nudge, exactly as the unshrunk pass
+        // above does: the digest and the clipped heads were never committed, and the summary —
+        // not the shrink — is what decided that SEED and both prompts stop being sent.
+        expect(seen).toHaveLength(3);
+        expect(withoutIds(seen[2].messages)).toEqual([
+            { role: 'user', content: COMPACTION_INSTRUCTION },
+            { role: 'assistant', content: 'SUMMARY' },
+            { role: 'user', content: CONTINUATION_NUDGE }
+        ]);
+
+        // Two parks, both lifted: the refusal stranded nothing, and neither pass left the thread
+        // 'paused'.
+        expect(events).toEqual(['paused', 'resumed', 'paused', 'resumed']);
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+    });
+
+    // THE OPERATOR'S FAILURE, END TO END THROUGH THE SHIPPED TRANSPORT (2026-11-17 — the
+    // coexistence check between the transport fix and this plugin).
+    //
+    // The case above SCRIPTS the stream event the transport emits. This one starts one level
+    // further out, at the bytes a gateway writes on a committed `200 text/event-stream`, and runs
+    // the chain with no scripted frame in it at all:
+    //
+    //   gateway error frame (`code: 'upstream_status'`, `status: 400`, the provider's own
+    //   "maximum context length" line)
+    //     -> `transport/openai.ts` in-stream arm, classified by the ONE matcher
+    //        (`transport/provider-timeouts.ts` `isContextOverflowSignal`, T2) and emitted as
+    //        `{ type: 'error', code: CONTEXT_OVERFLOW_CODE, … }`;
+    //   -> `core/agent.ts` `isContextOverflowFailure` keeps it out of the retry ladder, so the
+    //        gateway is asked EXACTLY ONCE per request (pinned by the fetch counts below);
+    //   -> `src/harness.ts` fails the run and emits `run.failed` as
+    //        `{ …runLifecycleContext(run), error: toErrorInfo(error) }` (harness.ts:14249), i.e.
+    //        `payload.error.code === 'context-overflow'` — the one field the plugin switches on;
+    //   -> this plugin arms rung 1 and the NEXT boundary sends a request the provider cannot
+    //        refuse for the same reason: 75,879 tokens cut to 576, measured on the wire body.
+    //
+    // WHY THE FETCH STUB IS WORTH IT: the two fixes live in different packages-of-concern and the
+    // ONLY contract between them is that payload field. A transport that stopped classifying, or
+    // a `toErrorInfo` that dropped the code, would un-arm this plugin SILENTLY — every case above
+    // hands the plugin the code directly and would keep passing. This case fails.
+    //
+    // It also pins the operator gap T4 reported: this brain declares NO `provider.contextWindow`
+    // and no `modelLimits` entry, so nothing in the build knows the model's window, the headroom
+    // buffer never binds, and the refusal-armed ladder is the entire recovery.
+    it('arms from a gateway size refusal on the shipped transport and sends a strictly smaller retry', async () => {
+        // The gateway's own frame shape: what `buildStreamErrorPayload` writes for a definite
+        // upstream status (packages/underload/service/src/server/start.ts:635-703, the frame
+        // pinned byte-for-byte by ../transport/openai.context-overflow.test.ts), including the
+        // `param: null` the producer sends and the absence of `errno`.
+        const providerLine =
+            "This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens";
+        const refusalFrame = {
+            error: {
+                message: `upstream localhost:6660/v1/chat/completions returned HTTP 400 before the first chunk: ${providerLine}`,
+                type: 'stream_error',
+                code: 'upstream_status',
+                status: 400,
+                param: null
+            }
+        };
+
+        const sseBody = (frames: readonly unknown[]): string =>
+            `${frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('')}data: [DONE]\n\n`;
+
+        // A normal completion in the shape `openAICompatible` parses: a content delta, a
+        // `finish_reason`, and the `[DONE]` sentinel the transport's truncation guard wants. NO
+        // `usage` block, so no hybrid anchor is taken and the estimate stays the payload-bytes
+        // heuristic every number in this file is derived from — the serialized request, the declared
+        // tool schema included, divided by 4 (compaction T5.4 anchors only on a reported count).
+        const completionBody = (text: string): string =>
+            sseBody([
+                { choices: [{ delta: { content: text } }] },
+                { choices: [{ delta: {}, finish_reason: 'stop' }] }
+            ]);
+
+        const streamBody = (text: string): ReadableStream<Uint8Array> => {
+            const encoder = new TextEncoder();
+
+            return new ReadableStream({
+                start(controller) {
+                    controller.enqueue(encoder.encode(text));
+                    controller.close();
+                }
+            });
+        };
+
+        // One response per provider REQUEST, in order: the refusal, the shrunk compaction answer,
+        // the continuation. A FOURTH request throws instead of replaying the last body — an
+        // overflow that walked the retry ladder would re-send the same bytes, which is the exact
+        // defect the transport half of this chain removes.
+        const responses = [
+            sseBody([refusalFrame]),
+            completionBody('SUMMARY'),
+            completionBody('resumed')
+        ];
+        // Every request BODY the wire actually carried: the provider's own view, which is the only
+        // place "strictly smaller" is a fact about the world rather than about a plugin's log.
+        const wire: Record<string, unknown>[] = [];
+
+        const fetchMock = vi.fn(async (_input: unknown, init?: { body?: string }) => {
+            wire.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+
+            const body = responses.shift();
+
+            if (body === undefined) {
+                throw new Error(
+                    `The provider was asked ${wire.length} times: a classified overflow must cost ` +
+                        `exactly one attempt per request.`
+                );
+            }
+
+            return new Response(streamBody(body), { status: 200 });
+        });
+
+        vi.stubGlobal('fetch', fetchMock);
+
+        const events: string[] = [];
+        const estimates: number[] = [];
+        const diagnostics: HarnessDiagnosticEvent[] = [];
+        const failures: Array<{ threadId: string | undefined; error: unknown }> = [];
+
+        // A HOST plugin on the SAME hook the built-in uses, so the payload asserted below IS the
+        // payload the built-in was handed, not a reconstruction of it.
+        const watcher: HarnessPlugin = {
+            name: 'overflow-watcher',
+            setup: (api) => {
+                api.on('run.failed', (payload) => {
+                    failures.push({ threadId: payload.threadId, error: payload.error });
+                });
+            }
+        };
+
+        const wireMessages = (index: number): string[] =>
+            (wire[index].messages as { content: string }[]).map((message) => message.content);
+
+        // The provider's byte count for one request — the comparison the operator reads as "it
+        // sent less the second time".
+        const wireChars = (index: number): number => JSON.stringify(wire[index].messages).length;
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    // The model of the measured session, with NO `provider.contextWindow`: no
+                    // window is declared anywhere, so the buffer and the first-rung pre-shrink
+                    // have nothing to bind to (see the operator gap in the memo above).
+                    model: 'local/basalt',
+                    stream: openAICompatible({ baseURL: 'http://localhost:6660/providers/private/v1' })
+                })
+            },
+            pluginSettings: summarizeSettings(),
+            plugins: [probe(events, estimates), watcher],
+            report: { diagnostic: (event) => void diagnostics.push(event) }
+        });
+
+        try {
+            const thread = writer.createThread('writer', { label: 'Refused on the wire' });
+
+            writer.setThreadMessages(thread.id, [{ role: 'user', content: BIG_SEED }]);
+
+            // REQUEST 1 — the ordinary pass (nothing had been refused yet), refused by the
+            // gateway. The frame is terminal on ONE attempt, and the thrown message leads with
+            // the machine code, which is what `toErrorInfo` turns into `error.code` below.
+            await expect(writer.sendThreadInput(thread.id, PROMPT)).rejects.toThrow('context-overflow: ');
+
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            expect(wireMessages(0)).toEqual([BIG_SEED, PROMPT, COMPACTION_INSTRUCTION]);
+
+            // THE RUN-LEVEL SIGNAL, read off the hook payload the built-in consumed. The key set
+            // is pinned exactly because `toErrorInfo` emits `{ message, code }` and nothing else,
+            // and the code is the ONE field the reactive arm matches (`code ===
+            // CONTEXT_OVERFLOW_CODE` in the plugin's `runFailed`). The prefix is the other half:
+            // it is the fallback the plugin (and `core/agent.ts`) apply to a relay that arrives
+            // without a code, so it has to stay in the message too.
+            expect(failures).toHaveLength(1);
+            expect(failures[0].threadId).toBe(thread.id);
+            expect(Object.keys(failures[0].error as object)).toEqual(['message', 'code']);
+            expect((failures[0].error as { code?: string }).code).toBe(CONTEXT_OVERFLOW_CODE);
+            expect(
+                String((failures[0].error as { message?: string }).message).startsWith(
+                    `${CONTEXT_OVERFLOW_CODE}: `
+                )
+            ).toBe(true);
+
+            // The arm itself, reported once for this thread with the rung the ladder picked.
+            expect(
+                diagnostics.filter((report) => (report.data as { stage?: string })?.stage === 'overflow')
+                    .length
+            ).toBe(1);
+
+            // REQUEST 2 — the armed boundary, one fetch. Same arithmetic the scripted case above
+            // pins (the transcript, the estimate and the rung are identical): BIG_SEED + PROMPT +
+            // the instruction the provider never saw an answer to + `retry now` = 301,763 payload
+            // bytes = 75,441 transcript tokens on top of the CATALOGUE floor = an 88,713 boundary
+            // estimate. The rung budget (13,272 + floor(0.85 × 75,441) = 77,396) is clamped to the
+            // 13,792 fit line, and the ladder measures
+            // 13,272 + 75,879 = 89,151 billed, so the ladder keeps going past pass A (13,848
+            // billed, 56 over) and drops the three head units behind one digest: 13,905 billed, the
+            // smallest request it may send and 75,246 under what the gateway refused.
+            const next = await writer.sendThreadInput(thread.id, 'retry now');
+
+            expect(next.content).toBe('SUMMARY');
+            expect(await settle(writer, thread.id, 8)).toBe(true);
+
+            expect(wireMessages(1)).toEqual([
+                `[context compaction digest] The harness removed 3 earlier turns from this request ` +
+                    `without a model to summarize them, because the request itself did not fit the ` +
+                    `context window. The removed turns are still on the record; they are simply not ` +
+                    `being sent. Oldest removed: ${'x'.repeat(240)} | Most recent removed: ${COMPACTION_INSTRUCTION.slice(0, 240)}`,
+                'retry now',
+                COMPACTION_INSTRUCTION
+            ]);
+
+            expect(
+                diagnostics.find((report) => (report.data as { stage?: string })?.stage === 'shrink')
+                    ?.data
+            ).toEqual({
+                mode: 'summarize',
+                threadId: thread.id,
+                stage: 'shrink',
+                target: 13792,
+                from: 89151,
+                to: 13905,
+                floorTokens: CATALOGUE,
+                dropped: 3,
+                clipped: 2,
+                entries: 3
+            });
+
+            // THE PROVIDER'S OWN MEASUREMENT of the contract: the second request is smaller than
+            // the one that was refused, on the bytes that left this process.
+            expect(wireChars(1)).toBeLessThan(wireChars(0));
+
+            // Three fetches for two submits and one continuation: the refusal cost ONE attempt,
+            // the shrunk pass ONE, the nudge ONE — no ladder anywhere.
+            expect(fetchMock).toHaveBeenCalledTimes(3);
+
+            // And the pass that recovered is a normal pass: two parks, both lifted.
+            expect(events).toEqual(['paused', 'resumed', 'paused', 'resumed']);
+            expect(writer.thread(thread.id)?.status).toBe('idle');
+        } finally {
+            vi.unstubAllGlobals();
+        }
     });
 
     it('never re-sends a turn an earlier pass already withheld, through both wholesale writes', async () => {
@@ -2971,10 +4912,11 @@ describe('context-compaction summarize flow (T9)', () => {
         expect((await writer.sendThreadInput(thread.id, PROMPT)).content).toBe('SUMMARY');
         expect(await settle(writer, thread.id, 7)).toBe(true);
 
-        // The trigger measured the PROJECTION, not the transcript: ~526 (the seed and the
-        // prompt), not ~829 with the already-withheld turn counted. A live estimate that read
-        // canonical history would fire compaction on conversations that are already compacted.
-        expect(diagnostics[0].data).toMatchObject({ tokens: 526, effective: 520 });
+        // The trigger measured the PROJECTION, not the transcript: `CATALOGUE + 526` (the 526 of
+        // the seed and the prompt, on top of the catalogue floor), not `CATALOGUE + 829` with the
+        // already-withheld turn counted. A live estimate that read canonical history would fire
+        // compaction on conversations that are already compacted.
+        expect(diagnostics[0].data).toMatchObject({ tokens: CATALOGUE + 526, effective: CATALOGUE + 520 });
 
         // And it stayed off: no request this pass produced — the compaction turn, the
         // continuation, or the follow-up — ever carried that text again.
@@ -3183,8 +5125,18 @@ describe('context-compaction summarize flow (T9)', () => {
         // entirely (a minimum SAVING, not a minimum conversation size), and this case would
         // then pass for the wrong reason.
         const stored: Record<string, number | string | boolean> = {
-            contextLimit: 100,
-            minTokens: 200,
+            // The ceiling has to be a figure a compaction pass could REACH, or the case would
+            // measure the wrong refusal: X1 (2026-11-17) added the dead-run guard, and a 100-token
+            // ceiling under a 13,272-token catalogue is unreachable by clipping no matter what
+            // `minTokens` says. `CATALOGUE + 100` puts the ceiling just above the floor, so the
+            // transcript is the term that crosses and the floor is the only thing that stops the
+            // pass — which is what this case is named for.
+            contextLimit: CATALOGUE + 100,
+            // The summarize floor judges the SAME figure the trigger does, so a 200-token floor
+            // would be beaten by any request that carries a catalogue: this fixture wants the
+            // floor ABOVE this conversation, which is `CATALOGUE + 200` — 97 tokens above the
+            // `CATALOGUE + 103` the first turn measures.
+            minTokens: CATALOGUE + 200,
             mode: 'summarize'
         };
 
@@ -3215,15 +5167,17 @@ describe('context-compaction summarize flow (T9)', () => {
                 return !content.startsWith(COMPACTION_INSTRUCTION) && !content.startsWith(CONTINUATION_NUDGE);
             });
 
-        // 412 chars = 103 tokens: over the 100 limit, so the trigger fires, and far under the
-        // 200 floor, so the round trip is refused as too small to be worth a summary.
+        // 412 chars = 103 transcript tokens, i.e. a `CATALOGUE + 103` boundary estimate: 3 tokens
+        // over the `CATALOGUE + 100` ceiling, so the trigger fires, and 97 tokens under the
+        // CATALOGUE + 200 floor, so the round trip is refused as too small to be worth a summary.
         expect((await writer.sendThreadInput(thread.id, 'x'.repeat(412))).content).toBe('ok');
         expect(seen).toHaveLength(1);
         expect(noInstruction(seen[0])).toBe(true);
 
-        // Same conversation, one and a half tokens larger, still refused. A RECORDED cooldown
-        // would have suppressed this turn on the margin alone, and the next turn proves
-        // nothing was recorded at all.
+        // The same conversation with a 5-character prompt (420 + 5 = 425 payload bytes = 107
+        // transcript tokens), still 95 tokens under the CATALOGUE + 200 floor, still refused. A
+        // RECORDED cooldown would have suppressed this turn on the margin alone, and the next
+        // turn proves nothing was recorded at all.
         writer.setThreadMessages(thread.id, [{ role: 'user', content: 'x'.repeat(420) }]);
         expect((await writer.sendThreadInput(thread.id, 'again')).content).toBe('fine');
         expect(seen).toHaveLength(2);
@@ -3231,8 +5185,10 @@ describe('context-compaction summarize flow (T9)', () => {
         expect(writer.thread(thread.id)?.status).toBe('idle');
 
         // The floor goes to 0 — the same live re-read every other setting gets — and the very
-        // next turn compacts. The size (107 → 108) is inside the 5% margin, so a cooldown
-        // recorded by either refusal would have held this turn back.
+        // next turn compacts. The size does not move past the margin (420 + 5 and 424 + 3 both
+        // measure 107 transcript tokens, and the regrowth margin at this ceiling is
+        // `max(1, floor(13,372 × 0.05)) = 668`), so a cooldown recorded by either refusal would
+        // have held this turn back.
         stored.minTokens = 0;
         writer.setThreadMessages(thread.id, [{ role: 'user', content: 'x'.repeat(424) }]);
 
@@ -3240,8 +5196,8 @@ describe('context-compaction summarize flow (T9)', () => {
         expect(String(seen[2].messages[seen[2].messages.length - 1].content)).toBe(COMPACTION_INSTRUCTION);
 
         // Out of the way for the continuation run: at this scale (the retained head alone is
-        // ~478 tokens against a limit of 100) the next boundary would compact again, which is
-        // correct behaviour but not what this case is measuring.
+        // `CATALOGUE + 486` against a `CATALOGUE + 100` ceiling) the next boundary would compact
+        // again, which is correct behaviour but not what this case is measuring.
         stored.contextLimit = 100000;
         expect(await settle(writer, thread.id, 6)).toBe(true);
 
@@ -3499,7 +5455,7 @@ describe('context-compaction summarize flow (T9)', () => {
                 writer: agent({ model: 'merge/ds4-flash', stream: writerStream }),
                 scout: agent({ model: 'merge/ds4-flash', stream: scoutStream })
             },
-            pluginSettings: summarizeSettings(),
+            pluginSettings: summarizeSettings({ contextLimit: DELEGATE_FLOOR + 520 }),
             plugins: [
                 {
                     name: 'scout-probe',
@@ -3655,10 +5611,10 @@ describe('context-compaction summarize flow (T9)', () => {
 
         // A conversation that trips BOTH passes on the first boundary: a `read` that failed
         // and was answered by a later `read` (a trim candidate), and enough text to cross the
-        // 520 limit — 2200 characters of failure text puts the projection at ~573 tokens, the
-        // same margin over the trigger the seed gives the other cases in this block. The
-        // trimmer has never seen this transcript, so its plan is non-empty exactly on the
-        // round the compactor parks.
+        // CATALOGUE + 520 limit — 2200 characters of failure text puts the projection at
+        // CATALOGUE + 573 tokens, 53 transcript tokens over the trigger, the same margin over the
+        // trigger the seed gives the other cases in this block. The trimmer has never seen this
+        // transcript, so its plan is non-empty exactly on the round the compactor parks.
         writer.setThreadMessages(thread.id, [
             { role: 'user', content: 'open both' },
             {
@@ -3769,6 +5725,7 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
                 api: fake.api,
                 estimatedTokens: 400,
                 currentTokens: 400,
+                messages: turnProjection(400),
                 calls,
                 threadId: 'thread-1'
             })
@@ -3841,6 +5798,7 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
                 api: fake.api,
                 estimatedTokens: 400,
                 currentTokens: 400,
+                messages: turnProjection(400),
                 calls,
                 threadId: 'thread-1'
             })
@@ -3920,6 +5878,7 @@ describe('context-compaction run-terminal nets (T11/D2)', () => {
                 api: fake.api,
                 estimatedTokens: 400,
                 currentTokens: 400,
+                messages: turnProjection(400),
                 calls: [],
                 threadId: 'thread-1'
             })
@@ -4076,6 +6035,7 @@ describe('context-compaction delegated in-run continuation (T12/F1)', () => {
                 api: fake.api,
                 estimatedTokens: 400,
                 currentTokens: 400,
+                messages: turnProjection(400),
                 calls: openCalls,
                 threadId: 'thread-2',
                 agent: 'researcher'
@@ -4131,6 +6091,7 @@ describe('context-compaction delegated in-run continuation (T12/F1)', () => {
                 api: fake.api,
                 estimatedTokens: 400,
                 currentTokens: 400,
+                messages: turnProjection(400),
                 entries,
                 calls,
                 threadId: 'thread-2',
@@ -4187,6 +6148,7 @@ describe('context-compaction delegated in-run continuation (T12/F1)', () => {
                 api: fake.api,
                 estimatedTokens: 400,
                 currentTokens: 400,
+                messages: turnProjection(400),
                 calls: [],
                 threadId: 'thread-2',
                 agent: 'researcher'
@@ -4273,6 +6235,12 @@ describe('context-compaction display lane (C1)', () => {
     // Every lane touch, in order — the assertions ask for this slice instead of comparing a
     // whole `touches` list, because the settings reads a trigger pays are not this feature's
     // business.
+    //
+    // WHY EACH TURN BELOW ALSO CARRIES `messages: turnProjection(N)` (X1, 2026-11-17): a lane
+    // bump only exists if a pass started, and a summarize pass only starts when clipping could
+    // actually help — so these fixtures state that the transcript IS the request they claim,
+    // rather than a 2-token projection riding on a hand-written 400-token estimate (which the
+    // dead-run guard reads as a catalogue-dominated request and refuses). See `turnProjection`.
     const laneTouches = (touches: readonly string[]): string[] =>
         touches.filter((entry) => entry.includes('ContextLane'));
 
@@ -4282,7 +6250,7 @@ describe('context-compaction display lane (C1)', () => {
         const calls: string[] = [];
 
         await passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls })
         );
 
         // The pass started: park, instruction into history AND into this request...
@@ -4306,7 +6274,7 @@ describe('context-compaction display lane (C1)', () => {
         const started: string[] = [];
 
         await passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: started })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls: started })
         );
         expect(fake.lanes.get('thread-1')).toBe(1);
 
@@ -4326,6 +6294,7 @@ describe('context-compaction display lane (C1)', () => {
                 api: fake.api,
                 estimatedTokens: 400,
                 currentTokens: 400,
+                messages: turnProjection(400),
                 calls: finalized,
                 entries: [
                     entryOf(0, { role: 'user', content: 'question' }),
@@ -4343,11 +6312,11 @@ describe('context-compaction display lane (C1)', () => {
         // A fresh crossing later in the same conversation (under the limit first, which clears
         // the cooldown, then over it) is a SECOND boundary, so it raises a second row.
         passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 10, currentTokens: 10, calls: [] })
+            createFakeTurn({ api: fake.api, estimatedTokens: 10, currentTokens: 10, messages: turnProjection(10), calls: [] })
         );
 
         await passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls: [] })
         );
         expect(fake.lanes.get('thread-1')).toBe(2);
     });
@@ -4357,7 +6326,7 @@ describe('context-compaction display lane (C1)', () => {
         const passes = createContextCompactionPasses(fake.api);
 
         await passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls: [] })
         );
         expect(fake.lanes.get('thread-1')).toBe(1);
 
@@ -4377,7 +6346,7 @@ describe('context-compaction display lane (C1)', () => {
         const passes = createContextCompactionPasses(fake.api);
 
         await passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls: [] })
         );
         passes.turnAfter({
             ...runLifecycle,
@@ -4390,7 +6359,7 @@ describe('context-compaction display lane (C1)', () => {
         const calls: string[] = [];
 
         passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls })
         );
 
         expect(calls).toEqual([]);
@@ -4402,7 +6371,7 @@ describe('context-compaction display lane (C1)', () => {
         const passes = createContextCompactionPasses(fake.api);
 
         await passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls: [] })
         );
         passes.turnAfter({
             ...runLifecycle,
@@ -4434,7 +6403,7 @@ describe('context-compaction display lane (C1)', () => {
         const calls: string[] = [];
 
         await passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls })
         );
 
         expect(calls).toEqual(['pause', 'replaceHistory', 'setTranscript']);
@@ -4451,7 +6420,7 @@ describe('context-compaction display lane (C1)', () => {
         const passes = createContextCompactionPasses(fake.api);
 
         await passes.turnBefore(
-            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, calls: [] })
+            createFakeTurn({ api: fake.api, estimatedTokens: 400, currentTokens: 400, messages: turnProjection(400), calls: [] })
         );
         expect(fake.lanes.get('thread-1')).toBe(1);
 
@@ -4488,6 +6457,7 @@ describe('context-compaction display lane (C1)', () => {
                 api: fake.api,
                 estimatedTokens: 400,
                 currentTokens: 400,
+                messages: turnProjection(400),
                 calls,
                 entries: prunableEntries()
             })
@@ -4774,11 +6744,14 @@ describe('context-compaction × context-trimmer overlap (uplift T9)', () => {
     };
 
     // The numbers, derived the way this file derives all of them (core/context-estimate.ts,
-    // ceil(chars / 4)): the failed unit is 944 characters — the 921-character result plus its
-    // 4-character tool name, and the leader's 19 (4 name + the 15 raw argument characters) — so
-    // 236 withheld tokens, the same figure the `executeCompaction` case above pins for this
-    // exact fixture. The whole transcript is ~256 tokens, far over the 100-token limit, so the
-    // compaction trigger fires on the first turn of both runs.
+    // ceil(payload bytes / 4), `core/payload-bytes.ts` for the escaping): the failed unit is 949
+    // payload bytes — the 926-byte result (922 of escaped text: the 20-character
+    // `Tool "read" failed: ` prefix costs 22 because its two quotes double, + the 900 E's, + its
+    // 4-byte tool name) and the leader's 23 (4-byte name + the 15 characters of `{"path":"a.ts"}`,
+    // whose four quotes double it to 19) — so 238 withheld tokens, the same figure the
+    // `executeCompaction` case above pins for this exact fixture. The whole transcript is 1,009
+    // payload bytes → 253 tokens, far over the 100-token limit (and the catalogue floor on top of
+    // it), so the compaction trigger fires on the first turn of both runs.
     const BOTH_PASS_SETTINGS = { contextLimit: 100, minTokens: 10, safetyTurns: 0, mode: 'exclude' };
 
     // THE PREMISE, pinned before the exactly-one cases: the two rules select the SAME unit, so
@@ -4890,10 +6863,10 @@ describe('context-compaction × context-trimmer overlap (uplift T9)', () => {
             expect(diagnostics).toHaveLength(1);
 
             if (order === 'compaction-first') {
-                // Byte-exact, and the `~236` figure is the one pinned for this fixture above.
+                // Byte-exact, and the `~238` figure is the one pinned for this fixture above.
                 expect(diagnostics[0].message).toBe(
                     'context-compaction withheld 1 superseded tool unit(s), ' +
-                        '~236 estimated tokens (mode exclude): #1 msg-2 [failed] answered by msg-4'
+                        '~238 estimated tokens (mode exclude): #1 msg-2 [failed] answered by msg-4'
                 );
             } else {
                 // The trimmer's shipped line shape: the unit, its outcomes, the names it called

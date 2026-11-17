@@ -8,8 +8,12 @@
 //     its right edge. It shows the full title on desktop and the thread code
 //     (`Researcher` -> `RR`) at small widths (CSS pinned separately in
 //     ui/compact-control-style.test.ts, since jsdom has no media queries);
-//   - R11: pressing the button opens the shared modal (never a cycle, never a
-//     chevron popover);
+//   - R11: pressing the button opens the shared modal — and since T1 what a PRESS means
+//     depends on the device: a desktop click/Enter still opens it, while a `Tab` in the
+//     field or a tap on a touch device moves the composer's PENDING agent and a press and
+//     hold opens it. The cycle itself (order, the pending selection, the commit at send) is
+//     `composer-agent-cycle.test.ts`; this file keeps the dialog half, on both devices, and
+//     the negative half of R11 (no cycle button, no chevron popover);
 //   - R12: the dialog selects a different primary, changes every agent's model, shows
 //     the instructions, and (T7b/R5) states the SCOPE a save writes: a saved conversation
 //     edits its own team, prompts and live models, and only its entry agent is fixed.
@@ -108,6 +112,52 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(
     const found = document.querySelector<HTMLElementTagNameMap[K]>(selector);
     if (found === null) throw new Error(`missing element ${selector}`);
     return found;
+};
+
+// T1/D7: the chip's press semantics follow the shell's ONE input-device axis, the
+// positive `(pointer: fine)` query `main.ts` reads at module scope. The stub therefore has
+// to be installed BEFORE `await import('./main')` (the MediaQueryList is created once), and
+// it knows only the two queries the shell actually asks — an unknown query throws, so a new
+// media axis here surfaces as a failure instead of reading as a desktop default. Same shape
+// as `composer-control.test.ts:205-241`.
+type MediaListener = (event: { matches: boolean }) => void;
+
+const stubMedia = (options: { fine?: boolean } = {}): void => {
+    const matches = new Map<string, boolean>([
+        ['(pointer: fine)', options.fine ?? false],
+        ['(max-width: 860px)', false]
+    ]);
+
+    vi.stubGlobal(
+        'matchMedia',
+        vi.fn((query: string) => {
+            if (!matches.has(query)) throw new Error(`unexpected media query: ${query}`);
+
+            const value = matches.get(query) as boolean;
+
+            return {
+                matches: value,
+                media: query,
+                addEventListener: (_type: string, _listener: MediaListener) => undefined,
+                removeEventListener: (_type: string, _listener: MediaListener) => undefined
+            };
+        })
+    );
+};
+
+// The press a finger produces. `pointerType: 'touch'` is what arms the gesture machine at
+// all (a mouse pointer on a touch-capable machine keeps the desktop click), and jsdom 29
+// builds real PointerEvents with it (the same fact `ui/rail-resize.test.ts:55` relies on).
+const FINGER = { pointerId: 5, pointerType: 'touch' as const, clientX: 40, clientY: 22 };
+
+const touchPress = (target: HTMLElement): void => {
+    target.dispatchEvent(
+        new PointerEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, ...FINGER })
+    );
+};
+
+const touchRelease = (): void => {
+    document.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, ...FINGER }));
 };
 
 // One PATCH handler shared by the fixtures: it answers with the server-confirmed
@@ -804,4 +854,82 @@ it('keeps the open dialog and the focused control across a live snapshot rebuild
     byClass('.new-session', 'button').click();
     await flush();
     expect(document.querySelector('.dialog')).toBeNull();
+});
+
+// --- T1/D7-D8-D10: the SAME control on a touch device ------------------------------
+//
+// The dialog contract survives the new press semantics; only WHICH press means
+// "settings" changes. A plain press now cycles, so:
+//   - the accessible name states both presses, and `aria-haspopup="dialog"` goes away
+//     (it would advertise a dialog this press does not open);
+//   - a press and hold opens the dialog, and the `data-hold` affordance spans the whole
+//     press — including the window after the hold has fired, while the finger is down;
+//   - the click the browser synthesises after the tap must open NOTHING. That click is
+//     hit-tested against the REPLACED chip (a cycle repaints the slot), which is why
+//     `ui/agent-control.ts` hands the debt to the fresh control — the assertion below
+//     reads the fresh node on purpose.
+it('opens the settings on a press-and-hold and cycles on a tap, on a touch device', async () => {
+    stubMedia({ fine: false });
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url === '/api') {
+                return json({
+                    rootPath: '/api',
+                    presets: [descriptor()],
+                    tools: [],
+                    defaults,
+                    sessions: [],
+                    agents
+                });
+            }
+            if (url === '/api/models') return json({ models: ['m1'] });
+
+            throw new Error(`unexpected request: ${url}`);
+        }, { root: '/api' }))
+    );
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    const button = byClass('.agent-control-button', 'button');
+    expect(button.getAttribute('aria-label')).toBe(
+        'Agent: Instruct. Tap to switch agent, press and hold for settings.'
+    );
+    // The dialog hint is false on this device, so it is gone rather than softened.
+    expect(button.hasAttribute('aria-haspopup')).toBe(false);
+    expect(button.disabled).toBe(false);
+
+    // TAP: one cycle, no dialog, and the affordance released with the finger.
+    touchPress(button);
+    expect(button.dataset.hold).toBe('armed');
+    touchRelease();
+    expect(button.dataset.hold).toBeUndefined();
+    expect(byClass('.agent-control-name', 'span').textContent).toBe('Researcher');
+
+    // The chip was REPLACED to paint the new agent, so the click the browser now
+    // synthesises lands on a node that never saw the press. It changes nothing.
+    const fresh = byClass('.agent-control-button', 'button');
+    expect(fresh).not.toBe(button);
+    fresh.click();
+    await flush();
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(byClass('.agent-control-name', 'span').textContent).toBe('Researcher');
+
+    // HOLD: the dialog opens at the threshold, while the finger is still down.
+    touchPress(fresh);
+    await new Promise((resolve) => setTimeout(resolve, 620));
+    expect(byClass('.agent-control-button', 'button').dataset.hold).toBe('held');
+    const dialog = byClass('.dialog', 'div');
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Instruct');
+
+    touchRelease();
+    await flush();
+    expect(byClass('.agent-control-button', 'button').dataset.hold).toBeUndefined();
+    // The hold did not also cycle: the chip still names the agent the tap picked.
+    expect(byClass('.agent-control-name', 'span').textContent).toBe('Researcher');
+    expect(document.querySelector('.dialog')).toBe(dialog);
 });

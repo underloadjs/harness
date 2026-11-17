@@ -103,7 +103,10 @@ const readAlphaExpected = () => ({
     truncated: false,
     bytes: 5,
     wireBytes: expect.any(Number),
-    contentBudget: 262_144,
+    // `FILE_READ_WIRE_BUDGET` (read.tool.ts:690): 32 KiB, pinned equal to
+    // `MODEL_TOOL_RESULT_BUDGET_BYTES` — 8192 tokens x 4 bytes for the built-in
+    // 200 000-token default window — not the old flat 256 KiB.
+    contentBudget: 32_768,
     // M7 (./files/read.tool.ts:1026-1032): `budgetPool` is what the batch actually had
     // left to split after every reserve was taken. Each reserve embeds the absolute
     // scratch path, so the figure moves with the checkout exactly like `wireBytes` and
@@ -164,14 +167,15 @@ describe('lazy preset tools', () => {
             'Read a BOUNDED window of UTF-8 text files',
             'startByte',
             'nextByte',
-            '256 KiB budget is measured on the SERIALIZED result',
+            '32 KiB budget is measured on the SERIALIZED result',
             'EBINARY',
-            // D11: the DEFAULT is now a context budget (2000 lines / 65536 bytes) with the
-            // old behaviour kept as an explicit ceiling, so the phrase that used to read
-            // "NO line cap" is gone. Pinning the numbers instead keeps this test doing its
-            // job — proving the full prose ships with the metadata — without re-pinning the
-            // whole sentence, and the numbers are the part a model cannot guess.
-            'maxLines 2000, maxBytes 65536',
+            // D11: the DEFAULT is now a context budget (2000 lines / 16384 bytes, both
+            // derived from the model's context window) with the old behaviour kept as an
+            // explicit ceiling, so the phrase that used to read "NO line cap" is gone.
+            // Pinning the numbers instead keeps this test doing its job — proving the full
+            // prose ships with the metadata — without re-pinning the whole sentence, and
+            // the numbers are the part a model cannot guess.
+            'maxLines 2000, maxBytes 16384',
             'limit'
         ]) {
             expect(presetTools.read.description).toContain(phrase);

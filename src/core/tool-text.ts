@@ -7,7 +7,8 @@
 // serializing the tool's return value (`serialize` in ../harness.ts). For most
 // tools that is the cheapest honest rendering available. For a tool that returns
 // a LARGE body of text inside a structured envelope it is not: `read` returns up
-// to 256 KiB of file text in `files[].content`, and serializing it
+// to 32 KiB of file text — its whole `FILE_READ_WIRE_BUDGET` envelope — in
+// `files[].content`, and serializing it
 //   - escapes every newline, quote, backslash and control character (measured on
 //     this package's own source: +2.1%, and +15.2% on quote-heavy code), and
 //   - pays the metadata of every entry in the same budget the content lives in.

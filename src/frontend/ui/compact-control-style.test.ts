@@ -1,11 +1,17 @@
 // Composer agent control + agent configuration dialog — CSS contract (T5 R9/R10/R11/
-// R12, T3 editable configuration).
+// R12, T3 editable configuration, T1 the press/cycle affordance).
 //
 // jsdom does not evaluate media queries, so the small-width behaviour is pinned here
 // against the stylesheet source: the single agent button collapses from the full
 // title to the two-letter thread code. The dialog's own rules live in
 // ui/agent-dialog.css (imported by styles.css), and the contract below pins the
 // dropdown form and the bottom-right single-writer action there.
+//
+// T1 changed what a PRESS on that button means (a click/Enter still opens the dialog; a
+// `Tab` in the field — or a tap on a touch device — moves the composer's PENDING agent,
+// and a press and hold opens the dialog), so this file also pins the two things the new
+// gesture needs from CSS: the touch input properties that let the page own the press at
+// all, and the hold affordance, which may only ever touch `background`.
 //
 // The dialog sizing fix lives in ui/dialog.css and is deliberately NOT asserted here;
 // dialog.test.ts owns it.
@@ -242,4 +248,70 @@ it('rounds every control with one shared token and keeps surfaces and circles on
     );
     expect(agentDialogRules).not.toContain('border-radius: 999px');
     expect(agentDialogRules).not.toContain('border-radius: 7px');
+});
+
+// --- T1: the press target, its hold affordance, and the cycle announcement ----------
+
+it('disarms the platform long-press so the page can own the press at all (T1 D9)', () => {
+    // On a touch device the chip is a PRESS target with a ~500 ms timer of its own
+    // (ui/press-hold.ts). Without these four declarations the platform gets there first:
+    // the double-tap-zoom delay delays `pointerup` (so a tap arrives too late to cycle),
+    // a hold selects the agent's name, and iOS raises a callout on top of the dialog the
+    // hold just opened. They are INPUT semantics, so not one desktop pixel changes.
+    const button = blockOf('.agent-control-button {');
+    expect(button).toContain('touch-action: manipulation');
+    expect(button).toContain('user-select: none');
+    expect(button).toContain('-webkit-user-select: none');
+    expect(button).toContain('-webkit-touch-callout: none');
+
+    // The same trade `styles.css` already makes for the rails, which are drag surfaces
+    // (`.rail-resizer`, styles.css:517) — this is the package's existing convention for a
+    // surface the page owns, not a new one.
+    expect(blockOf('.rail-resizer {')).toContain('touch-action: none');
+});
+
+it('paints the hold on background only, so it never erases identity or activity (T1 D8/D11)', () => {
+    // `ui/agent-control.ts` writes `data-hold="armed"` while the finger is down with the
+    // timer running and `data-hold="held"` after the hold has fired and until release.
+    const armed = blockOf(".agent-control-button[data-hold='armed'] {");
+    const held = blockOf(".agent-control-button[data-hold='held'] {");
+
+    expect(armed).toContain('background: color-mix(in srgb, var(--agent-color) 18%, transparent)');
+    expect(held).toContain('background: color-mix(in srgb, var(--agent-color) 32%, transparent)');
+
+    // `background` is the ONLY property either state may touch. `color` is the agent's
+    // IDENTITY tone (the rule above and ui/agent-color.ts) and `border-color` is the
+    // activity/hover STATE channel, so a hold would otherwise erase one of those two facts
+    // for as long as the finger is down — the reader would lose sight of the agent they are
+    // about to switch TO.
+    for (const block of [armed, held]) {
+        expect(block).not.toContain('border-color');
+        expect(declaresColor(block)).toBe(false);
+    }
+
+    // And the press state does not REPLACE the hover affordance: a device that can hover
+    // still gets the border, still without repainting the name in `--accent`.
+    const hover = blockOf('.agent-control-button:hover {');
+    expect(hover).toContain('border-color: var(--accent)');
+    expect(declaresColor(hover)).toBe(false);
+});
+
+it('gives the cycle a live region that is hidden, not gone (T1 D10)', () => {
+    // main.ts writes `Agent for the next message: Researcher` into a `role="status"`
+    // polite region beside the composer. The chip's OWN label changed, but a rebuilt node
+    // is not a live region, so the sentence needs a home — and that home has to be clipped
+    // rather than `display: none`, because an AT never announces a hidden element.
+    const live = blockOf('.agent-control-live {');
+    expect(live).toContain('position: absolute');
+    expect(live).toContain('width: 1px');
+    expect(live).toContain('height: 1px');
+    expect(live).toContain('overflow: hidden');
+    expect(live).toContain('clip-path: inset(50%)');
+    expect(live).not.toContain('display: none');
+    expect(rules).not.toMatch(/\.agent-control-live[^{]*\{\s*display:\s*none/);
+
+    // Same reason it lives OUTSIDE `.agent-slot`: that host is `replaceChildren`-rebuilt on
+    // every cycle, and a live region destroyed at the moment it has something to say is
+    // never read. The host's own rule must therefore not hide or clip the paragraph.
+    expect(blockOf('.composer-field .agent-slot {')).not.toContain('overflow: hidden');
 });

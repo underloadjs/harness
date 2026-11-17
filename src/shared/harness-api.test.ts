@@ -197,7 +197,11 @@ describe('harness contract published numbers', () => {
             pending_actions: 4,
             steer_records: 64,
             created_tools: 32,
-            tool_result_bytes: 262144,
+            // 32 KiB, not 256 KiB: the published cap is the byte envelope `boundToolValue`
+            // enforces — `MODEL_TOOL_RESULT_BUDGET_BYTES`, 8192 tokens x 4 bytes for the
+            // built-in 200 000-token default window, and pinned to that by the test below.
+            // A client that trusted the old 256 KiB would keep text the server truncates.
+            tool_result_bytes: 32768,
             page_limit_default: 25,
             page_limit_max: 100,
         });

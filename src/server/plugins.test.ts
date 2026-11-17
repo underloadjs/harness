@@ -421,7 +421,7 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
 
         expect(plugins.get('context-compaction', 'contextLimit')).toBeUndefined();
         expect(
-            // EVERY declared default (compaction's limit/model-map/switch/floor/horizon/
+            // EVERY declared default (compaction's limit/model-map/headroom/switch/floor/horizon/
             // mode, copied from src/plugins/context-compaction.plugin.ts), in the order the
             // descriptors are declared: this is the map the UI renders and the plugin reads
             // when the host has stored nothing.
@@ -429,6 +429,7 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
         ).toEqual({
             contextLimit: 200000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -484,10 +485,11 @@ describe('plugin settings store — the shipped built-in catalogue', () => {
         // `max` is undeclared, so any larger finite limit is a legitimate operator choice.
         // `update` answers with the FULL effective map, so a UI that re-renders the row after
         // a PATCH shows every declared setting at its effective value: the override for
-        // `contextLimit`, and the declared default for the other five.
+        // `contextLimit`, and the declared default for the other six.
         expect(plugins.update('context-compaction', { contextLimit: 250000 })).toEqual({
             contextLimit: 250000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,

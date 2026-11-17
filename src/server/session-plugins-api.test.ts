@@ -98,12 +98,14 @@ const COMPACTION = BUILTIN_PLUGIN_DESCRIPTORS.find((entry) => entry.name === 'co
 // not a derivation of it.
 const CATALOGUE = ['async-ping', 'context-compaction', 'context-trimmer'];
 
-// What compaction's `values` object holds while nothing is overridden — all SIX declared settings
-// (the five of compaction T4.6 plus R4's `modelLimits`). Hardcoded on purpose: it is the contract
-// the pane renders, and a new or renamed declared setting has to fail here loudly.
+// What compaction's `values` object holds while nothing is overridden — all SEVEN declared
+// settings (the five of compaction T4.6, R4's `modelLimits`, and the 2026-11-17 `headroomRatio`
+// buffer that is read only when a declared model window binds). Hardcoded on purpose: it is the
+// contract the pane renders, and a new or renamed declared setting has to fail here loudly.
 const COMPACTION_DEFAULT_VALUES = {
     contextLimit: 200000,
     modelLimits: '{}',
+    headroomRatio: 0.15,
     enabled: true,
     minTokens: 200,
     safetyTurns: 6,
@@ -495,6 +497,7 @@ describe('GET /v1/harness/sessions/{session_id}/plugins', () => {
         expect((row.settings as Record<string, any>[]).map((entry) => entry.key)).toEqual([
             'contextLimit',
             'modelLimits',
+            'headroomRatio',
             'enabled',
             'minTokens',
             'safetyTurns',
@@ -503,6 +506,7 @@ describe('GET /v1/harness/sessions/{session_id}/plugins', () => {
         expect((row.settings as Record<string, any>[]).map((entry) => entry.default)).toEqual([
             200000,
             '{}',
+            0.15,
             true,
             200,
             6,
@@ -727,7 +731,7 @@ describe('PATCH /v1/harness/sessions/{session_id}/plugins/{plugin_id}', () => {
             body: {
                 error: {
                     message:
-                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode.'
+                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, modelLimits, headroomRatio, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}

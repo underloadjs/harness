@@ -547,16 +547,19 @@ describe('R3 parity: the scripted demo factory forwards both deployment-wide swi
         // Off: the framework's gate reads `enabled` and the pass stops at its Rule 0, so no
         // policy knob is consulted at all - the hooks are not delivered.
         expect(await keysReadFor('context-compaction', { enabled: false })).toEqual(['enabled']);
-        // On: the same run consults the whole policy (the limit and the per-model map, which
-        // together ARE the firing point now that the headroom knob is gone, and the mode that
-        // decides WHICH writer the turn is handed to), which is what "the operator enabled it"
-        // has to mean on a replica. `minTokens`/`safetyTurns` are absent because this scripted
-        // conversation stays under the limit — those two are read on a turn that FIRES (and in
-        // summarize mode `minTokens` is a floor on the live estimate, read only when the
-        // conversation is already over the limit).
+        // On: the same run consults the whole policy (the limit and the per-model map, the
+        // headroom ratio that only comes off a ceiling a DECLARED model window makes binding —
+        // restored 2026-11-17 and scoped to declared windows, which is why the earlier "the
+        // headroom knob is gone" ruling no longer applies here — and the mode that decides WHICH
+        // writer the turn is handed to), which is what "the operator enabled it" has to mean on a
+        // replica. `minTokens`/`safetyTurns` are absent because this scripted conversation stays
+        // under the limit — those two are read on a turn that FIRES (and in summarize mode
+        // `minTokens` is a floor on the live estimate, read only when the conversation is already
+        // over the limit).
         expect(await keysReadFor('context-compaction', { enabled: true })).toEqual([
             'contextLimit',
             'enabled',
+            'headroomRatio',
             'mode',
             'modelLimits'
         ]);

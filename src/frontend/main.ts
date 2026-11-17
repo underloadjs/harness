@@ -36,7 +36,8 @@
 //                  composer is ONE bordered frame
 //                  with a notched routing label on its top border (R14), the single
 //                  agent button on its LEFT edge (R16, opens the shared agent dialog
-//                  — team, models and instructions) and stop/send on the right. The GLOBAL tools view (the
+//                  — team, models and instructions — and cycles which member of that
+//                  team runs the next message), and stop/send on the right. The GLOBAL tools view (the
 //                  full-width list of EVERY server tool — core entries included)
 //                  replaces this column when the icon-only Tools toggle on the harness
 //                  title row is pressed; activating one entry opens its manual runner in
@@ -268,6 +269,12 @@ import {
     // to seed the dialog's one box with the LIVE text).
     createSessionAgent,
     deleteSessionAgent,
+    // T1 (agent cycle): opens a conversation OWNED by one team member. Threads never
+    // change owner, so a thread created for the agent the composer has selected is
+    // exactly how a pending selection is committed at send (see `run`). Zero call
+    // sites before this feature; the server accepts any member of the frozen
+    // definition (src/server/api.ts:4921-4968).
+    createSessionThread,
     getSessionAgentInstruction,
     listSessionAgents,
     updateSessionAgent,
@@ -311,7 +318,7 @@ import {
 } from './contract';
 import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentControl } from './ui/agent-control';
-import type { AgentControl } from './ui/agent-control';
+import type { AgentControl, AgentControlDevice, AgentCycleDirection } from './ui/agent-control';
 // T4/R1-R3: the ONE place that teaches the page who the team is and which identity wears
 // an explicit colour. Every surface (composer button, dialog badges, transcript tiles)
 // reads the module state configured here, so the shell must configure it BEFORE it paints.
@@ -4350,6 +4357,16 @@ attachmentError.setAttribute('role', 'status');
 attachmentError.setAttribute('aria-live', 'polite');
 attachmentError.hidden = true;
 
+// T1 (agent cycle): the cycle announcement. A chip rebuild replaces the button, so the
+// region deliberately lives OUTSIDE `.agent-slot` (the funnel does
+// `agentSlot.replaceChildren(...)`) and is appended after the frame: it must survive every
+// chrome repaint or nothing announces. Visually hidden (`aria-live` regions are read, not
+// shown — see the `.panel-live` / `.context-bar-live` clip recipe in styles.css), polite,
+// and written with `textContent` so a repeated cycle cannot accumulate.
+const agentCycleLive = el('p', 'agent-control-live');
+agentCycleLive.setAttribute('role', 'status');
+agentCycleLive.setAttribute('aria-live', 'polite');
+
 // Routing line (R5/R6): WHERE the next submit goes — a new thread, a connected new
 // thread (the draft carries `#` references), or the focused thread (continue/steer).
 // It is the visible half of focus: the reader can always see that a focused thread
@@ -4455,7 +4472,11 @@ composerControls.append(stopAllButton, actionButton);
 // before the input in the reading order too.
 composerField.append(composerTarget, agentSlot, input, composerPopup, composerControls);
 // R14 (T7): the routing label moved INSIDE the frame; the body column now holds only
-// the (hidden unless there is a rejection) error line and the frame itself.
+// the (hidden unless there is a rejection) error line and the frame itself. The T1
+// cycle live region sits on the CENTRE column instead (see `center.append` below): both
+// this column and the frame have a closed child list pinned by composer-label-layout
+// and composer-control, and a polite region only has to be in the document, not beside
+// the chip, to be announced.
 composerBody.append(attachmentError, composerField);
 
 // R6: the attachment chooser (button + hidden file input) is deliberately gone:
@@ -5304,13 +5325,12 @@ const unfinishedReferenceCount = (
 
 // Paint the composer's routing line: where this draft will go if sent now. It reads
 // the SAME inputs as `run()` (focus + `#` reference chips + ready attachments)
-// through the same pure helper (`resolveSubmitTarget`), so the promise and the
-// request cannot disagree.
+// through the same pure helper (`resolveSubmitTarget`), AND the same agent plan
+// (`agentSendPlanOf`), so the promise and the request cannot disagree.
 const paintComposerTarget = (): void => {
     const instance = current;
     const references = referencesOfChips(editorChips(input));
-    const target = resolveSubmitTarget({
-        focus: instance?.view.focusedThread(),
+    const routing = {
         threads: instance?.threads ?? [],
         references: references.length,
         // Attachments are never steered, so their presence already turns a running
@@ -5320,14 +5340,26 @@ const paintComposerTarget = (): void => {
             0
         ),
         unfinishedReferences: unfinishedReferenceCount(instance?.records, references)
-    });
+    };
+    const target = resolveSubmitTarget({ focus: instance?.view.focusedThread(), ...routing });
+    // F2: the line must describe the destination `run()` will actually use. A pending
+    // selection that the send WILL commit means the message does NOT go to the focused
+    // conversation at all: `run()` mints a fresh thread for the selected agent
+    // (:15540-15545) and skips re-focusing the tile (:15600). So the paint drops the focus
+    // exactly the way the request does and re-derives the answer from the SAME pure helper
+    // — "New thread"/"New connected thread", which is what the POST really does — while the
+    // chip names the agent that thread will run. When the selection names the focused
+    // conversation's OWN agent (or the roster cannot say whose it is, F3), `commitAgent` is
+    // false and the line keeps promising the continuation the request performs.
+    const plan = agentSendPlanOf(instance, target.threadId);
+    const painted = plan.commitAgent ? resolveSubmitTarget({ ...routing, focus: undefined }) : target;
 
-    composerTarget.textContent = submitTargetLabel(target);
-    composerTarget.dataset.mode = target.mode;
+    composerTarget.textContent = submitTargetLabel(painted);
+    composerTarget.dataset.mode = painted.mode;
     // "New thread" is only worth saying when this session HAS threads to distinguish
     // from (or when a reference just turned it into a connected thread). A legacy
     // session therefore shows no label at all.
-    const showTarget = !(target.mode === 'new' && (instance?.threads.length ?? 0) === 0);
+    const showTarget = !(painted.mode === 'new' && (instance?.threads.length ?? 0) === 0);
     composerTarget.hidden = !showTarget;
 
     // R14 (T7): the routing line is the frame's notched label. These two writes keep
@@ -5535,7 +5567,13 @@ const leftPanels = createPanelHost('left');
 // R5/T7: `agentSlot` lives inside the `.composer-field` frame now (LEFT edge, R16),
 // NOT under the head. The centre keeps the head, the panel host, the stage and the
 // composer.
-center.append(mainHead, centerPanels.element, stage, composer);
+//
+// T1 (D10): the cycle announcement sits here, as the centre's last node — directly after
+// the composer in the reading order, but OUTSIDE the composer subtree, whose child lists
+// (`.composer` / `.composer-body` / `.composer-field` / `.composer-controls`) are all
+// pinned closed by the layout tests. It must also survive every chrome repaint, which the
+// `.agent-slot` host cannot (the paint funnel does `replaceChildren`).
+center.append(mainHead, centerPanels.element, stage, composer, agentCycleLive);
 
 // --- right rail: the tool scratch board, and nothing else ------------------
 //
@@ -5632,11 +5670,40 @@ const isPhoneLayout = (): boolean => phoneMedia?.matches ?? true;
 const finePointerMedia = window.matchMedia?.('(pointer: fine)');
 const hasFinePointer = (): boolean => finePointerMedia?.matches ?? false;
 
+// T1 (agent cycle): the SAME single query, read as a THREE-state answer for the composer's
+// agent control. `hasFinePointer` above answers "may Enter send?" and a plain boolean is
+// right for that; the chip needs to know whether the device is POSITIVELY NOT fine, because
+// only then does a tap cycle and a long press open a dialog (D7). No second query is
+// allowed (the shell's media axis is pinned by `composer-control.test.ts:198-241`, which
+// throws on an unknown query), so the answer is derived from this one:
+//
+//   - `(pointer: fine)`   -> `fine`: click / Enter opens the dialog, and `Tab` /
+//                            `Shift+Tab` in the field cycle the roster;
+//   - absent `matchMedia` (jsdom-less engines, very old browsers) -> `unknown`, i.e.
+//                            today's behaviour unchanged, because an environment that
+//                            cannot report an input device must not be handed a
+//                            destructive gesture;
+//   - anything else, i.e. `(pointer: coarse)` or `(pointer: none)` -> `coarse`. A
+//                            `(pointer: none)` machine has no touch surface at all, so the
+//                            gesture machine can never arm: it additionally requires a real
+//                            `PointerEvent` whose `pointerType` is `touch`/`pen`
+//                            (ui/press-hold.ts), exactly like `ui/rail-resize.ts:164`
+//                            branches on the event rather than on the media query.
+const pointerDevice = (): AgentControlDevice =>
+    finePointerMedia === undefined ? 'unknown' : finePointerMedia.matches ? 'fine' : 'coarse';
+
 // The Enter policy is read live on every keystroke, but the send button's shortcut
 // HINT is painted once per composer repaint. Repainting on a pointer change keeps them
 // in one state (a touchscreen laptop switching to finger input, or a phone gaining a
 // bluetooth keyboard, must not keep advertising a shortcut that no longer applies).
-finePointerMedia?.addEventListener?.('change', () => paintComposer());
+finePointerMedia?.addEventListener?.('change', () => {
+    paintComposer();
+    // T1: the agent chip's press semantics AND its accessible name follow this same axis,
+    // so the control repaints with it — a device switch must not leave "Tap to switch
+    // agent" on a screen the reader is now clicking. `paintAgentSlot` is the chip-only
+    // funnel: no header, dialog or board work happens for a pointer change.
+    if (current !== undefined) paintAgentSlot(current);
+});
 
 // Apply the platform-appropriate disclosure semantics to BOTH left-rail triggers (the
 // topbar brand and, R4, the "Harnesses" heading inside the drawer itself):
@@ -5902,6 +5969,13 @@ type Instance = {
     // Per-instance live activity set for the tile rings. Never a module global:
     // two harness views must not share who is busy.
     activity: Set<string>;
+    // T1 (agent cycle): the agent the composer has SELECTED for the next send, when it
+    // is not the team's entry agent. Pending state only — cycling sends nothing (D2) and
+    // the choice is committed by the next `run()` (D3). Cleared rather than carried
+    // whenever this card starts pointing at a different conversation, and ignored while
+    // it names an agent the roster no longer lists (`selectedAgentOf`), so a saved
+    // selection can never outlive the team it belonged to.
+    agentSelection?: string;
     // Tool-contributed panels for THIS instance/session (R21.3), keyed by
     // tool+panel id. Recomputed from the server's COMPILED state on every applied
     // view (reload, poll, session open, enqueue answer) and upserted live from the
@@ -6827,6 +6901,10 @@ const selectHarness = (
     selectedName = descriptor.name;
     currentTool = undefined;
     current = ensureInstance(descriptor);
+    // T1 (agent cycle): a harness switch is a navigation intent (R3), and an agent picked
+    // for the conversation being left says nothing about the one being opened — the chip
+    // the reader lands on states that team's entry agent again.
+    clearAgentSelection(current);
 
     for (const [key, button] of harnessButtons) {
         button.setAttribute('aria-pressed', key === name ? 'true' : 'false');
@@ -7205,32 +7283,54 @@ const renderHarnessChrome = (): void => {
 
     // A locked session renders the definition it started with; the live harness
     // may already have moved on. The composer button opens the shared agent dialog
-    // (R11), so there is no popover to restore here: only the BUTTON's own focus has
-    // to survive the rebuild, and an already-open dialog is refreshed from the new
-    // state (R12).
+    // (R11) and also cycles the pending agent (T1), so there is no popover to restore
+    // here: only the BUTTON's own focus has to survive the rebuild, and an already-open
+    // dialog is refreshed from the new state (R12).
+    paintAgentSlot(instance);
+};
+
+// The single funnel that rebuilds the composer's agent chip (T1). Two callers, and both
+// need the identical sequence:
+//   - `renderHarnessChrome` — a harness switch, a team edit, a promotion/model PATCH, an
+//     activity/snapshot frame;
+//   - `cycleAgentSelection` — the reader pressed `Tab` (or tapped the chip on a touch
+//     device), which changes ONLY what the composer will run next.
+// The order is load-bearing: `createAgentControl` paints the identity tone through
+// ui/agent-color.ts's MODULE state (T4/R4), so the palette must be taught this view's
+// colours BEFORE the button is built, or a rebuild leaves the previous conversation's hex
+// on screen. `paintComposerTarget` runs last for the same reason it ran here before: the
+// notched label's inline `left` is measured from the pill's width, and a cycle changes
+// that width (a longer name), so a stale `left` would leave the label sitting over the
+// previous agent's text column.
+const paintAgentSlot = (instance: Instance, fromGesture = false): void => {
     const hadAgentFocus = agentSlot.contains(document.activeElement);
     const view = agentViewOf(instance);
-    // T4: teach the palette THIS view's colours before the button is built — `createAgentControl`
-    // paints the primary's identity through the module state, so configuring afterwards would
-    // leave the previous conversation's hex on screen (R2/R4).
+    // T4: teach the palette THIS view's colours before the button is built —
+    // `createAgentControl` paints the painted agent's identity through the module state,
+    // so configuring afterwards would leave the previous conversation's hex on screen
+    // (R2/R4).
     configureAgentColorsFor(view);
     const control = renderAgentControl(view, instance);
+    // T1 (D8): a tap that cycled has ALREADY acted, and the browser still delivers that
+    // press's synthesised `click` — against the node being installed right now. Handing the
+    // debt to the fresh control is what stops the tap that switched the agent from also
+    // opening the settings dialog on top of the switch. A `Tab` repaint never owes one (no
+    // pointer was involved), and neither does a frame/dialog repaint.
+    if (fromGesture) control.oweClick();
     agentSlot.replaceChildren(control.element);
 
     // A keyboard user who was on the agent button must not be dropped to <body> when
-    // a snapshot/activity frame replaces it.
+    // a snapshot/activity frame — or their own `Tab` — replaces it.
     if (hadAgentFocus) control.focus();
 
     // Keep the open dialog truthful after a promotion/model PATCH/frame without
-    // closing it (unchanged state is a no-op inside refreshAgentDialog).
+    // closing it (unchanged state is a no-op inside refreshAgentDialog). A cycle is
+    // unchanged state for the DIALOG: it edits the team, not the composer's pending
+    // choice, so this is where a cycle costs nothing.
     refreshAgentDialog(view, instance);
 
-    // Issue B: this is the ONLY place the agent button is rebuilt, so it is the one
-    // funnel through which the pill's width changes (harness switch, agent promotion,
-    // a team edit, an activity/snapshot frame). The label's inline `left` is derived
-    // from that width, so the alignment has to be recomputed here — nothing else in
-    // this path repaints the composer, and a stale `left` would leave the notch label
-    // sitting over the previous agent's text column.
+    // Issue B: this is the place the agent button is rebuilt, so it is the one funnel
+    // through which the pill's width changes.
     paintComposerTarget();
 };
 
@@ -7533,17 +7633,232 @@ const agentModelSelectOf = (view: AgentView) => ({
     ...(view.locked ? { session: true } : {})
 });
 
-// The composer button (R11). One control, no cycling, no chevron: pressing it opens
-// the dialog. `hint` is the tooltip, not a disabled state — models and instructions
-// must stay reachable while the TEAM is locked.
-const renderAgentControl = (view: AgentView, instance: Instance): AgentControl =>
-    createAgentControl({
-        primary: view.primary,
+// The composer button (R11 + T1). ONE control, no chevron, no disclosure popover. Its
+// press semantics follow the device: a click/Enter opens the shared dialog, a `Tab` in
+// the field (or a tap on a touch device) moves the PENDING agent selection, and a press
+// and hold on a touch device opens the same dialog. `hint` is still the tooltip, never a
+// disabled state — models and instructions must stay reachable while the TEAM is locked.
+//
+// `primary` here is the RESOLVED selection, not `view.primary`: the chip, the routing
+// label and `run()` all read `selectedAgentOf` + `agentSendPlanOf`, which is the only thing
+// that can keep the promise the control makes ("the next message goes to this agent").
+const renderAgentControl = (view: AgentView, instance: Instance): AgentControl => {
+    const blocked = agentCycleBlockOf(view);
+
+    return createAgentControl({
+        primary: selectedAgentOf(instance),
         agents: agentLibrary,
         activity: [...instance.activity],
+        device: pointerDevice(),
+        ...(blocked === undefined ? {} : { cycleBlocked: blocked }),
         ...(view.hint === undefined ? {} : { hint: view.hint }),
+        // A gesture press always cycles FORWARD (a tap has no shift key), and it reports
+        // itself as gesture-caused so the repaint that shows the new agent can take over
+        // the press's synthesised click (see `paintAgentSlot`).
+        onCycle: (direction) => {
+            cycleAgentSelection(direction, true);
+        },
         onActivate: () => openAgentDialogForCurrent()
     });
+};
+
+// ---------------------------------------------------------------------------
+// The composer's pending agent selection (T1)
+// ---------------------------------------------------------------------------
+//
+// Cycling an agent is deliberately NOT a write. The team is what the server owns
+// (`primary` + `subagents`, or a session's own roster), and the R11 contract still holds:
+// one stray press must never promote an agent. What cycling changes is which MEMBER of
+// that team runs the NEXT message, and that is expressible with the wire that already
+// exists — threads never change owner, so a turn submitted into a thread owned by agent X
+// runs as X (src/server/sessions.ts:1545-1549). The selection therefore lives in the
+// browser until the send commits it (D2/D3), and there is nothing to roll back.
+
+// F4: the sentence a cycle speaks, and the ONE writer of the cycle region.
+//
+// The sentence carries the member's POSITION in the roster, not only its title, for two
+// reasons a title-only sentence cannot serve:
+//   - a live region handed a byte-identical string may not be re-announced at all by some
+//     assistive tech, and two roster members whose catalogue title is missing both read the
+//     neutral word `Agent` (`agentTitleOf`), so a title-only sentence CAN repeat exactly.
+//     The position cannot: `cycleAgentSelection` never returns the same member twice in a
+//     row. Same trick ui/context-bar.ts:759 uses for the segment under the keyboard, whose
+//     label carries `focused`/`total`;
+//   - the ORDER of the cycle is itself a promise (D1: entry agent first, then the subagents
+//     in the order the definition lists them), so "2 of 3" says how far along the team the
+//     reader is and that another `Tab` wraps around.
+//
+// `''` means "nothing is pending", and is written whenever the choice is spent or
+// invalidated: a sentence that keeps naming an agent the chip no longer shows is a lie, and
+// clearing first also makes the NEXT announcement byte-distinguishable from the last one.
+const agentCycleSentenceOf = (members: readonly string[], name: string): string => {
+    const index = members.indexOf(name);
+
+    return index < 0
+        ? `Agent for the next message: ${agentTitleOf(name)}.`
+        : `Agent for the next message: ${agentTitleOf(name)} (${index + 1} of ${members.length}).`;
+};
+
+// `textContent`, never `append`: a repeated cycle must not accumulate sentences.
+const agentCycleSay = (sentence: string): void => {
+    agentCycleLive.textContent = sentence;
+};
+
+// The roster the chip, the routing label and the send all walk, spelled exactly the way
+// `agentViewOf` spells it (that function derives `members` from `instance.frozen ??
+// instance.descriptor` at :7430 and `primary` from the same object at :7539). Deliberately
+// cheap: the routing label resolves it on EVERY keystroke, where building a whole
+// `AgentView` would be waste.
+const agentMembersOf = (instance: Instance): string[] => membersOf(instance.frozen ?? instance.descriptor);
+const agentPrimaryOf = (instance: Instance): string => primaryOf(instance.frozen ?? instance.descriptor);
+
+// The agent the next send will run: the pending selection while it still names a member
+// of THIS conversation's team, else the entry agent. A name the roster no longer carries (the
+// member was removed, the harness reloaded, a frozen definition that never listed it) is
+// dropped HERE rather than merely ignored, so the chip, the routing label and `run()`
+// cannot disagree with each other about a selection that no longer exists.
+const selectedAgentOf = (instance: Instance): string => {
+    const pending = instance.agentSelection;
+    if (pending === undefined) return agentPrimaryOf(instance);
+    if (agentMembersOf(instance).includes(pending)) return pending;
+
+    // F4: the announced agent no longer exists, so there is nothing left to announce.
+    instance.agentSelection = undefined;
+    agentCycleSay('');
+
+    return agentPrimaryOf(instance);
+};
+
+// A selection belongs to ONE conversation. Called wherever a card starts pointing at a
+// different one (a new session, a reopened session, a harness switch, a teardown): the
+// agent chosen for the conversation being left says nothing about the one being opened,
+// and a stale name would silently steer a later send.
+const clearAgentSelection = (instance: Instance): void => {
+    instance.agentSelection = undefined;
+    // F4: navigation is not a cycle, so nothing is announced INSTEAD — the stale sentence is
+    // simply un-said. The conversation being opened paints its own chip, and a region that
+    // kept naming the agent the reader left would be read out on every later focus pass.
+    agentCycleSay('');
+};
+
+// ---------------------------------------------------------------------------
+// The ONE plan a send executes (F2/F3)
+// ---------------------------------------------------------------------------
+//
+// `paintComposerTarget` paints this plan and `run()` executes it, so the routing line and
+// the POST cannot disagree — the promise the composer makes at :5326. Before this, the line
+// read focus + references + attachments only while the send ALSO honoured the pending agent
+// selection: cycle to `research`, then re-expand a tile owned by `instruct`, and the label
+// promised "Continuing IN1" while the request minted a fresh thread for the researcher.
+type AgentSendPlan = {
+    /** The agent the next send runs: the resolved selection, else this team's entry agent. */
+    selected: string;
+    /** True when answering this send costs the extra `POST /sessions/:id/threads`. */
+    commitAgent: boolean;
+};
+
+// The agent a send WOULD run with NO composer selection: the focused conversation's owner
+// when one is open (continue/steer keeps running that thread's agent), the team's entry
+// agent when nothing is focused (an unfocused submit opens a thread owned by the frozen
+// primary, src/server/sessions.ts:9379-9385), and `undefined` when a conversation IS focused
+// but this snapshot's roster does not describe its owner.
+//
+// That third case is F3, and `undefined` is the honest answer: `resolveSubmitTarget`
+// (ui/threads.ts:632-683) continues a focused id that a partial or legacy roster does not
+// list, because the id came from a turn record this session actually produced. That
+// conversation still receives the message, as whatever agent owns it, and the browser does
+// not know which one — so a pending selection must NOT mint a rival thread. The plan reads
+// `undefined` as "nothing to commit", which is also what makes the painted line agree.
+const defaultAgentOf = (instance: Instance, threadId?: string): string | undefined => {
+    if (threadId === undefined) return agentPrimaryOf(instance);
+
+    return instance.threads.find((thread) => thread.id === threadId)?.agent;
+};
+
+// `instance === undefined` is the no-conversation paint (a harness card with nothing open):
+// no selection can exist, so the line describes the bare routing decision.
+const agentSendPlanOf = (instance: Instance | undefined, threadId?: string): AgentSendPlan => {
+    if (instance === undefined) return { selected: '', commitAgent: false };
+
+    // Resolution FIRST: it can drop a selection the roster no longer carries, and a dropped
+    // selection is by definition not pending any more (see `selectedAgentOf`).
+    const selected = selectedAgentOf(instance);
+    const runsAs = defaultAgentOf(instance, threadId);
+
+    // A send only changes the WIRE when the reader actually cycled AND the focused
+    // conversation (if any) would not already run that agent.
+    return {
+        selected,
+        commitAgent: instance.agentSelection !== undefined && runsAs !== undefined && selected !== runsAs
+    };
+};
+
+
+// Why a press/`Tab` must NOT cycle (D6), or `undefined` when it may. Both reasons are
+// stated in the accessible name rather than left as a dead control:
+//   - one member: there is literally nothing to switch between, so `Tab` keeps moving
+//     focus (the browser's own behaviour) and a tap opens the dialog;
+//   - the Tools/Plugins views hide the slot (`agentSlot.hidden`), where the chip is on
+//     screen for the next chat but cannot be operated.
+const agentCycleBlockOf = (view: AgentView): string | undefined => {
+    if (view.members.length < 2) return 'This team has one agent, so there is nothing to switch between.';
+    if (agentSlot.hidden) return 'Agent switching is not available in this view.';
+
+    return undefined;
+};
+
+// The display title used by the announcement. Same fallback rule as ui/agent-control.ts
+// and ui/agents.ts `displayTitleOf`: a name the catalogue never carried reads the neutral
+// word, never the raw id.
+const agentTitleOf = (name: string): string => {
+    const title = agentLibrary.find((agent) => agent.name === name)?.title.trim() ?? '';
+
+    return title.length > 0 ? title : 'Agent';
+};
+
+// Move the pending selection through the roster in server-declared order (D1:
+// `membersOf` = entry agent first, then the subagents exactly as the definition lists
+// them — the same order the agent dialog's tabs use). Wrap-around in both directions.
+//
+// Returns true when the keystroke was CONSUMED, which is what tells the `Tab` leg below
+// whether to `preventDefault`; false means "leave it to the browser", and that is the
+// whole of D6's fall-through rule.
+const cycleAgentSelection = (direction: AgentCycleDirection, fromGesture = false): boolean => {
+    const instance = current;
+    if (instance === undefined || currentTool !== undefined) return false;
+
+    const view = agentViewOf(instance);
+    if (agentCycleBlockOf(view) !== undefined) return false;
+
+    const members = view.members;
+    const from = selectedAgentOf(instance);
+    const index = members.indexOf(from);
+    const offset = direction === -1 ? members.length - 1 : 1;
+    const next = members[(((index < 0 ? 0 : index) + offset) % members.length + members.length) % members.length];
+
+    if (next === from) return false;
+
+    // D5: a focused conversation owns the next send — it continues or steers THAT
+    // thread, and a thread runs its own agent, so focus outranks a composer choice.
+    // Selecting while a tile is open is the reader asking to talk to a different agent,
+    // so the focus is dropped explicitly: `View.clearFocus` is the board's own
+    // deliberate-unfocus transition (`collapse`, marked `explicitUnfocus`), which is what
+    // keeps a later stream frame from re-opening the tile behind the reader, and
+    // re-expanding the tile focuses it again — the change is fully reversible. The
+    // routing label repaints through the board's `onFocusChange` callback.
+    if (instance.view.focusedThread() !== undefined) instance.view.clearFocus();
+
+    instance.agentSelection = next;
+    paintAgentSlot(instance, fromGesture);
+
+    // D10: say it out loud. The chip's OWN label changed, but a rebuilt node is not a live
+    // region and a sighted-only swap would leave a screen reader on a stale name while focus
+    // is still in the text field. F4: the sentence names the roster position too, so a repeat
+    // cycle can never hand the region a byte-identical string.
+    agentCycleSay(agentCycleSentenceOf(members, next));
+
+    return true;
+};
 
 // Everything the dialog paints, derived from the same `AgentView`.
 const agentDialogOptionsOf = (view: AgentView, instance: Instance) => {
@@ -14322,6 +14637,13 @@ const releaseSessionState = (instance: Instance): void => {
     instance.compiled = undefined;
     instance.records = new Map<string, TurnSummary>();
     instance.threads = [];
+    // T1 (agent cycle): the pending agent selection is conversation state, and this is
+    // the one call every "this card is letting go of its conversation" path makes
+    // (`ensureSession`, `newSession`, `openSession`'s swap, a delete, the `Unknown
+    // session` recovery). An agent picked for the conversation being released says
+    // nothing about the one this card points at next, and a stale name would silently
+    // steer a later send into a conversation nobody chose.
+    clearAgentSelection(instance);
     instance.panelDetails.clear();
     instance.panelRequests.clear();
     instance.panels.clear();
@@ -14488,6 +14810,14 @@ const openSession = async (
         if (instance !== target && instance.sessionId === id) {
             instance.sessionId = undefined;
             releaseSessionState(instance);
+            // T1 (D5): a released card starts its next conversation from scratch, and a
+            // pending agent belongs to the conversation that was just let go. Without this
+            // the card could adopt a later message for an agent picked in the previous one.
+            // Routed through `clearAgentSelection` (F4) so the cycle sentence is un-said by
+            // the same call that drops the choice: the region is one node for the whole
+            // shell, and an announcement of a choice that no longer exists anywhere is a lie
+            // whether the card that held it is on screen or not.
+            clearAgentSelection(instance);
             instance.view.bindSession(undefined);
             instance.view.setThreads([]);
         }
@@ -14506,6 +14836,13 @@ const openSession = async (
         target.threadTombstones.clear();
         target.turnTombstones.clear();
         releaseSessionState(target);
+    } else if (target.sessionId !== id) {
+        // T1 (agent cycle): the card had NO conversation (or none released here), yet it
+        // is about to point at a different one than the selection was made for — the
+        // release above does not run, so drop the pending agent explicitly. Re-opening the
+        // conversation already on screen (`target.sessionId === id`) is not a change and
+        // keeps it.
+        clearAgentSelection(target);
     }
 
     // T21 R22: is this a LOAD of a conversation, as opposed to the same conversation
@@ -14983,6 +15320,10 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     // and the submit path creates it before the task is enqueued. An action card that
     // arrives with the run is only answerable against this id (`View.bindSession`).
     instance.view.bindSession(session.id);
+    // T1: this card now points at a brand-new conversation, so any agent picked for the
+    // one being left is dropped — `run()` reads `selectedAgentOf`, and a stale name would
+    // silently submit to a member this team may not even have.
+    clearAgentSelection(instance);
     instance.frozen = frozenTeamOf(session);
     // The creation answer carries this session's effective model map, which is also
     // the map a later PATCH /views/:id replaces (R2).
@@ -15134,6 +15475,50 @@ const run = async (): Promise<void> => {
         unfinishedReferences: unfinishedReferenceCount(instance.records, references)
     });
 
+    // T1/D3: WHICH AGENT this message runs, and whether that changes the request.
+    //
+    //   - the resolved selection IS the agent this send would run anyway (nobody cycled,
+    //     or the selection names the focused conversation's own owner) -> the request is
+    //     BYTE-IDENTICAL to the pre-feature body: one call, and no `thread_id` at all
+    //     unless a conversation is focused;
+    //   - the selection names another member -> the turn has to run as THAT agent. A
+    //     thread never changes owner and the server runs a turn as the thread's agent
+    //     (src/server/sessions.ts:1545-1549), so the whole mechanism is to submit into a
+    //     conversation the agent owns: `POST /sessions/:id/threads {agent}` and then
+    //     `POST /sessions/:id/tasks {…, thread_id}`. No new protocol field, no contract
+    //     change, and the harness TEMPLATE is untouched (this writes no PATCH).
+    //
+    // The decision is taken BEFORE the optimistic tile exists, because a created thread is
+    // not in the roster yet: binding the tile to it would be a claim the board cannot
+    // paint. The receipt's `thread_id` and the stream's `turn.upsert` are what introduce
+    // the new conversation, exactly as an ordinary new-thread submit does.
+    // F2/F3: the plan is the ONE derivation the composer needs, and it is the same object
+    // `paintComposerTarget` just painted, so the line above cannot promise a destination this
+    // POST will not use.
+    //
+    // A send only changes the WIRE when the reader actually cycled. `agentSelection` is the
+    // proof of that: it is set by `cycleAgentSelection` and cleared by `selectedAgentOf` when
+    // the name is no longer a member of the roster, so an unset selection means "nobody
+    // touched the chip" and the request stays byte-identical to the pre-feature body. That
+    // gate matters whenever a conversation is focused: its owner is often a SUBAGENT while the
+    // team's entry agent is not, and comparing the two alone would read an untouched composer
+    // as a switch and open a stray thread (the focused thread already runs that agent).
+    const plan = agentSendPlanOf(instance, target.threadId);
+    const selectedAgent = plan.selected;
+    const commitAgent = plan.commitAgent;
+    // F1: the name THIS message consumes, captured before the flight starts. The receipt
+    // below spends exactly this name — and nothing else — so a `Tab`/tap the reader makes
+    // while the request is in flight (the window :15583 → :15771, session create + thread
+    // create + task POST) survives as the choice for the NEXT message instead of being
+    // silently reverted. Two names can collide only if the reader cycles all the way back to
+    // the one just sent, in which case spending it is a no-op: that name is the team's entry
+    // agent, or the focused thread's owner, and the next send would run it anyway.
+    const spentAgent = instance.agentSelection;
+    // The conversation this send lands in: the focused one when continuing/steering, the
+    // created one when committing a selection, nothing otherwise (the server opens a
+    // thread for the entry agent).
+    let sendThreadId = target.threadId;
+
     const draftSnapshot = editorSnapshot(input);
     setAttachmentError(undefined);
 
@@ -15146,7 +15531,12 @@ const run = async (): Promise<void> => {
     // authority — ui/turns.ts `placementThreadIdOf` puts the row in the conversation
     // the RECORD names, so a thread-less server command turn (a `/…` line this same
     // path submits) reads at board level live exactly as it does after a reload.
-    const turn = instance.view.begin(prompt, validated, target.threadId);
+    //
+    // T1: while a pending agent selection is being committed the binding is `undefined`
+    // on purpose: the conversation this message lands in does not exist yet, and a tile
+    // bound to an id the roster has never seen is a claim the board cannot paint. The
+    // receipt's `thread_id` places the row, as it does for any new-thread submit.
+    const turn = instance.view.begin(prompt, validated, commitAgent ? undefined : target.threadId);
     // `submitting` is set BEFORE the field is cleared so the chip MutationObserver
     // does not mistake this programmatic clear for a user deletion.
     submitting = true;
@@ -15169,6 +15559,17 @@ const run = async (): Promise<void> => {
         // boot with zero sessions, or a `+` whose create failed (R3).
         sessionId = await ensureSession(instance);
 
+        // T1/D3: the ONE request a cycle ever costs, and it is paid at send, never on
+        // `Tab`/tap (D2). A failure here throws into the catch below — the task is NOT
+        // submitted as some other agent behind the reader's back, the optimistic tile
+        // becomes `error`, the notice states the reason, and the draft is restored (the
+        // `catch` already owns all three). No message is lost and nothing is silently
+        // downgraded to the entry agent.
+        if (commitAgent) {
+            const thread = await createSessionThread(sessionId, { agent: selectedAgent });
+            sendThreadId = thread.id;
+        }
+
         // 202 on the canonical wire: a TASK RECEIPT, never a document. The row the receipt
         // names is merged into the document this browser already paints, the session figures it
         // states are patched in place, and everything else — the running row, the tally, the
@@ -15183,9 +15584,42 @@ const run = async (): Promise<void> => {
             validated,
             references.length === 0 ? undefined : references,
             // Absent for a new thread: the server decides the new thread's id and reports it on
-            // the row; the roster learns it from the stream's `turn.upsert`.
-            target.threadId
+            // the row; the roster learns it from the stream's `turn.upsert`. T1: when a pending
+            // agent selection is being committed this is the id `POST /sessions/:id/threads`
+            // just minted, i.e. the conversation the SELECTED agent owns.
+            sendThreadId
         );
+
+        // T1 (D2/D3): the choice is SPENT. It covered exactly this message, so the chip
+        // falls back to the team's entry agent and the routing label with it — a chip that
+        // kept advertising the cycled agent would promise a second message the reader never
+        // asked for. This is the point the server ACCEPTED the message (not the thread
+        // create above): a submit that failed keeps the pending agent, so a retry runs as
+        // the same agent instead of quietly dropping back to the entry agent mid-retry.
+        // `current === instance` because `agentSlot` is one node for the whole shell — a
+        // background card's send must not repaint the conversation on screen, and a live
+        // region speaks over whatever the reader is actually looking at.
+        //
+        // F1: the clear is gated on the name this send actually carried (`spentAgent`,
+        // captured at :15500 before the flight). A `Tab`/tap DURING the flight is the reader
+        // addressing the NEXT message — on a touch device it is the only way to do it — and
+        // an ungated clear reverted it silently: the chip painted "Researcher", the region
+        // announced it, and the receipt then put "Instruct" back with no word said. Gating
+        // on identity spends the choice that was consumed and leaves the newer one pending,
+        // which is also what keeps the two semantics the tests pin: a spent choice still
+        // cannot leak into an unrelated later send, and a FAILED send still keeps its agent.
+        if (spentAgent !== undefined && instance.agentSelection === spentAgent) {
+            instance.agentSelection = undefined;
+
+            if (current === instance) {
+                paintAgentSlot(instance);
+                // F4: say the fallback too. The chip's label is a rebuilt node, so without
+                // this a screen reader stays on the sentence for an agent that is no longer
+                // selected, and the region would still be holding that stale string when the
+                // reader cycles back to it later.
+                agentCycleSay(agentCycleSentenceOf(agentMembersOf(instance), agentPrimaryOf(instance)));
+            }
+        }
 
         // Steering answers with the OWNING row (same id, `steered: true`) instead of a
         // new one: the optimistic steering row must not survive as an unbound queued
@@ -15206,7 +15640,10 @@ const run = async (): Promise<void> => {
         // Keep the steering target visible on the conversation that received the
         // message: continuing/steering must not silently move focus elsewhere.
         // R3c: the reader pressed send, so keeping that conversation in view is their call.
-        if (target.threadId !== undefined) instance.view.focusThread(target.threadId, true);
+        // T1: skipped while a selection is committed — the message went to a BRAND-NEW
+        // conversation, so re-focusing the tile the reader had open would pull the board
+        // back to the one that did not receive it.
+        if (!commitAgent && target.threadId !== undefined) instance.view.focusThread(target.threadId, true);
 
         // The receipt's own merge: rows, pending flag, session figures, directory row.
         applyReceiptRow(instance, record, receipt);
@@ -15352,6 +15789,17 @@ composer.addEventListener('submit', (event) => {
 //                         wins over the popup, so a reader can queue the task without
 //                         picking a suggestion, and on a touch keyboard it is the only
 //                         keyboard send.
+//   Tab (T1/D1)        -> CYCLE the composer's pending agent forward, with wrap-around,
+//                         whenever a cycle is available (a team of two or more, the slot
+//                         visible, no tool open, no dialog owning the keystroke). The
+//                         cycle is local state and sends nothing; the choice is committed
+//                         by the next send. Consumed only when it actually happened —
+//                         otherwise `Tab` is the browser's focus move, unchanged.
+//   Shift+Tab (T1/D1)  -> the same cycle BACKWARDS.
+//   Tab while a modal dialog is open -> the dialog's own capture-phase Tab trap consumes
+//                         the keystroke first, so `event.defaultPrevented` makes this
+//                         handler decline entirely (the trap keeps cycling the modal).
+//   Ctrl/Cmd/Alt+Tab   -> untouched: browser and OS tab-switching chords.
 //   IME composition    -> ignored entirely: the Enter that confirms a candidate
 //                         belongs to the input method, so it must not submit and must
 //                         not be prevented (`isComposing`, plus keyCode 229 for older
@@ -15466,9 +15914,36 @@ input.addEventListener('keydown', (event) => {
             // R3: the open suggestion list owns Enter. When there is nothing to pick yet
             // (no match, or the @ lookup is still in flight) a bare Enter stays a native
             // newline on EVERY device, so the T1 desktop send can never fire in the
-            // middle of a mention. Tab deliberately falls through to the browser.
-            if (event.key === 'Enter') return;
+            // middle of a mention. Tab deliberately falls through to the browser — and it
+            // returns HERE rather than reaching the agent-cycle leg below: while a
+            // suggestion list is open the list owns Tab, and cycling an agent in the
+            // middle of a mention would silently drop nothing while surprising the reader.
+            return;
         }
+    }
+
+    // T1/D1: `Tab` in the field cycles the composer's pending agent — the desktop half of
+    // the same semantic a tap performs on a touch device. It sits here on purpose:
+    //   - AFTER the popup branch, so an open `@`/`#` list keeps picking its row and a list
+    //     with nothing to pick keeps the browser's focus move (criterion 3);
+    //   - BEFORE the `Enter`-only early return below, which is where every other key is
+    //     left to the browser;
+    //   - `event.defaultPrevented` is checked EXPLICITLY (this handler never did before):
+    //     an open modal dialog runs its own Tab trap on `document` in CAPTURE phase
+    //     (ui/dialog.ts:551-570), so by the time a Tab that a dialog owns reaches this
+    //     bubble listener the dialog has already consumed it and moved focus inside
+    //     itself. Cycling an agent on top of that would change the app while the reader
+    //     is filling the modal.
+    // Ctrl/Cmd/Alt+Tab are browser and OS chords (next tab, next window) and are left
+    // completely alone; `Shift+Tab` is the reverse cycle (D1).
+    if (event.key === 'Tab' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        if (event.defaultPrevented) return;
+
+        if (cycleAgentSelection(event.shiftKey ? -1 : 1)) event.preventDefault();
+
+        // Not consumed (a one-agent team, a hidden slot, no instance, a Tools-view tool
+        // open): fall through, so `Tab` still moves focus exactly as it did before.
+        return;
     }
 
     // Only Enter is a send candidate here; every other key (including Tab out of a popup

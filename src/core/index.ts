@@ -137,13 +137,25 @@ export type {
     ToolSourceRecord
 } from './tool-source';
 export {
+    DEFAULT_MODEL_CONTEXT_TOKENS,
+    MODEL_TOKEN_BYTES,
     MODEL_TOOL_RESULT_BUDGET_BYTES,
+    MODEL_TOOL_RESULT_BUDGET_SHARE,
+    MODEL_TOOL_RESULT_BUDGET_TOKENS,
     MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES,
+    MODEL_TOOL_RESULTS_PER_TURN_BUDGET_SHARE,
+    MODEL_TOOL_RESULTS_PER_TURN_BUDGET_TOKENS,
     boundToolResult,
     createToolResultTurnBudget,
+    toolResultBudgetsForContextTokens,
     utf8ByteLength
 } from './result-budget';
 export type { BoundedToolResult, ToolResultBoundOptions, ToolResultSource, ToolResultTurnBudget } from './result-budget';
+// T3 — the byte measure every model-facing budget is enforced with. `result-budget`
+// re-exports it too; this is the canonical module for a caller that only wants the
+// measurement (see ./payload-bytes.ts for why the payload figure, not the text figure,
+// is the one a cap has to count).
+export { modelPayloadBytes } from './payload-bytes';
 export {
     MAX_CREATED_SCHEMA_BYTES,
     MAX_CREATED_SCHEMA_DEPTH,
@@ -295,14 +307,20 @@ export type {
     UnitFacts
 } from './context-pruning';
 // The context estimator (issue 0004): the one "will this transcript fit?" number the
-// product already measures with — `ceil(chars / 4)`, the SAME convention as the
+// product already measures with — `ceil(serialized-payload bytes / 4)`, i.e. the bytes a
+// field occupies once the transport serializes it as a JSON string value (escapes at
+// their escaped width, non-ASCII at its UTF-8 width), the SAME convention as the
 // frontend's context bar and the shipped `context-compaction` plugin's `contextLimit`
-// (../plugins/context-compaction.plugin.ts). Published through the root barrel so a
-// host that trims its own history gets the same figure as the pre-request guard in
-// ./agent.ts and as the UI, instead of inventing a second heuristic that disagrees
-// with both. Only the plain estimator is public: the provider-anchored hybrid
-// (`estimateContextTokensHybrid`) and its `ContextTokenAnchor` stay internal, because
-// issue 0004's proposal publishes the one helper a host needs and nothing else.
+// (../plugins/context-compaction.plugin.ts). It was `ceil(chars / 4)` until T5
+// (2026-11-17), which is the change the provider size refusal forced: escaped and
+// multibyte text is 1.1-1.8x larger on the wire than in memory, and the shortfall was in
+// the direction that hides an overflow (../core/context-estimate.ts "THE WIRE MEASURE").
+// Published through the root barrel so a host that trims its own history gets the same
+// figure as the pre-request guard in ./agent.ts and as the UI, instead of inventing a
+// second heuristic that disagrees with both. Only the plain estimator is public: the
+// provider-anchored hybrid (`estimateContextTokensHybrid`) and its `ContextTokenAnchor`
+// stay internal, because issue 0004's proposal publishes the one helper a host needs and
+// nothing else.
 export { estimateContextTokens } from './context-estimate';
 // Background tool scheduling (T3): one board per harness. Internal to the
 // package surface (the harness is the only owner), exported here so the harness

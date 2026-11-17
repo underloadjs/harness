@@ -2,7 +2,38 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-17 for the roster-identity and interrupted-run-display
+> **Last verified:** 2026-11-17 (X2, the context-compaction correctness pass) for SIX behaviour
+> fixes on the summarize path, each pinned where it is observable. THE FLOOR IS ONE CURRENCY:
+> `measureRequestFloor` adds the projection's media term back onto the harness figure before
+> subtracting (X1 subtracted a media-INCLUSIVE body from a media-FREE estimate), so an attachment
+> replayed on every turn can no longer make the floor read ~1.5 M tokens low; the residual a dead
+> run reports is the estimator's UPPER bound — on an anchored round it carries the
+> `ANCHOR_GROWTH_MARGIN` premium — and NOT a catalogue measurement (44,597 measured on `Temp/d1`
+> round 21 against ≈31,700 of real serialized catalogue plus system prompt). GIVE-UP IS KEYED ON
+> PROGRESS, not on the rung counter: `overflowBest` holds the billed figure a shrink sequence last
+> actually SENT, and a rung that cannot come back strictly smaller than it ends the ladder with
+> `stage: 'no-progress'`, no park and no provider round trip (the measured failure was four rung
+> targets — 41,399 / 34,093 / 24,352 / 17,046 — all resolving to one identical 206,159-token
+> request). THE HEADROOM BUFFER NO LONGER REQUIRES A DECLARED WINDOW: a bare `contextLimit` is the
+> operator's GUESS at that window and the summarize request (whole projection plus the 1,752-byte
+> instruction) is scored against the model's REAL one, so the 15% / 16,000-floor / half-ceiling rule
+> now comes off WHICHEVER ceiling BINDS, the dead-run guard compares a request against the REFUSAL
+> point (`floor >= ceiling`) rather than the buffered firing point, and `headroomRatio: 0` is the
+> documented opt-out — the declared-window rows of the table stay byte-identical (4096→2048,
+> 8192→4096, 32768→16768, 128000→108800, 200000→170000). THE DEAD-RUN REPORT states the real cause
+> and the levers (`contextLimit`, `modelLimits`, the tool set) instead of blaming the ladder, prints
+> ONCE PER SIZE STEP (its latch re-arms on Rule 3's own 5% margin and `reported: true` marks the
+> turn that printed), and the ServiceInfo / `tool_result_bytes` prose that called the cap
+> window-scaled now says what it is — a FIXED byte count — regenerated into
+> `src/shared/harness-api.ts` from `src/server/harness.swagger.yaml`. Plus the fourth door of the
+> DOOR SHAPE rule below: a compaction note also used to cross the delegation door through the
+> STREAMING lane (`isCompactionAnswerStream`, a position test on a content-free placeholder turn,
+> makes an abort mid-summary fall through to `lastSubstantiveText`). Pinned in
+> `src/plugin/context-compaction.test.ts`, `src/harness.delegation-context-relief.test.ts` and
+> `scripts/generate-harness-contract.test.ts`; the two harness-level compaction fixtures
+> (`src/harness.compaction-delegation.test.ts`, `src/harness.delegation-context-relief.test.ts`)
+> seed `headroomRatio: 0` and say why, because their ceilings are hand-derived against the typed
+> limit. Then 2026-11-17 for the roster-identity and interrupted-run-display
 > documentation pass — the identity TRIPLE the host/UI roster row now publishes
 > (`ThreadSummary.invocation_id` / `invocation_ids` / `epoch`, its emit rule, the two sources behind
 > `invocation_ids`, the 64-id cap that keeps the OLDEST, the bare-id strip, and the key order), the
@@ -3861,6 +3892,56 @@ descriptors (22 runtime entries).
   AFTER the invocation record exists, and `runAgent`'s `finally` keeps its release
   block as an idempotent backstop (event ORDER is preserved — only the STATE moves
   earlier).
+- **Spawner-side context relief is REQUEST-ONLY, and the answer door carries the
+  task answer (2026-11-17, T6; `src/harness.delegation-context-relief.test.ts`
+  pins both rules as facts a parent can OBSERVE — D-1 and D-3).** A delegation
+  costs the spawner context in two places and only one of them is relieveable.
+  (a) THE ANSWER LEG: a fan-out spawner parks in `waitForWork` while its children
+  work, so NO `turn.before` boundary runs during the wait and every answer of the
+  round lands in ONE step function the estimate could not price — each in-flight
+  call projects a ~200-byte `status: 'pending'` placeholder, so the pile is
+  invisible until it is already owed. At the boundary of the request that would
+  carry it, `relieveDeliveryWeight` (`src/harness.ts:9571`, wired into `requestOf`
+  at :12620) measures the `tool` entries inserted since `run.deliveryMark` and
+  takes the excess out of THAT REQUEST with the shipped planner
+  (`planCompactionRequest`, `src/plugins/context-compaction.plugin.ts`).
+  REQUEST-ONLY means: nothing is deleted, no inclusion flag moves, the canonical
+  transcript keeps every byte, and the newest round — the answers the run just
+  delegated — stays verbatim. The ceiling that sizes the relief scales with the
+  bound model's WINDOW through `toolResultBudgetsForContextTokens` (published from
+  the `src/harness.ts` barrel 2026-11-17), never with the operator's
+  `contextLimit`. (b) THE REQUEST LEG is not relieveable and relief is
+  spawner-side only: a spawner's task text IS its request, so rewriting it re-asks
+  the question, and a child shrinks its own transcript and its own answer — never
+  the request that spawned it. (c) THE DOOR SHAPE: what crosses to the spawner is
+  the child's TASK answer, never one of the child's own context-relief artifacts.
+  A summarize pass commits a tool-free prose turn (the structured summary the
+  compaction instruction asked for), byte-for-byte the shape the run loop exits
+  terminally on, so three doors used to hand that prose upward — the blank-turn
+  rescue (`resolveRunAnswer`), the answer-so-far recording, and the cancellation
+  report (`run.partialContent` → `lastSubstantiveText`); each now skips a
+  compaction entry. THE CANCELLATION REPORT HAS TWO LANES and X2 (F4) closed the
+  second: `partialContent` PREFERS the in-flight stream buffer over the committed
+  walk ("the FRESHER evidence wins", issue 0020), and the skip had only ever been
+  applied to the walk — so a stop between the instruction commit and the summary's
+  `done` frame put the HALF-STREAMED summary in the buffer and the spawner read a
+  relief note as the answer the child had in hand. `src/harness.ts` now asks the
+  plugin (`isCompactionAnswerStream`, which appends a content-free placeholder turn
+  and runs the transcript POSITION test `isCompactionAnswerTurn` — the streamed text
+  never enters the decision) and, when the turn being streamed IS the compaction
+  answer, falls through to `lastSubstantiveText`: an interrupted child reports its
+  last TASK sentence, or no partial at all. Pinned with an issue-0020 CONTROL
+  (`src/harness.delegation-context-relief.test.ts`) that proves the buffer still
+  wins when the cut is not a compaction answer, so the exclusion pin cannot go
+  vacuous. The ENTRY stays in the child's own transcript, where
+  `threadRead` / `agentResult` still answer for it: the parent has no business
+  seeing that its child compacted. The rule that makes a mid-task child compaction
+  reachable at all is pinned in `src/harness.compaction-delegation.test.ts` (a
+  child of a host-thread parent is `depth >= 2`, the only case whose in-run turn
+  can carry the continuation nudge). NOT claimed: a delegation that ENDS as an
+  answer is not re-priced when its parent runs — that re-pricing stays on the
+  deferred list, see `## Context and history` for what a run's context actually is
+  and `## Delegation cost and resume accounting` for what a spawner pays at resume.
 
 ---
 
@@ -5731,7 +5812,14 @@ as their own entries.
   panels' rows, disclosures and filter survive the toggle untouched, while their read
   and their realtime registration are released until it opens again (see
   [Live shell panels](#live-shell-panels-harnesstasks-harnessrecords)).
-  `src/frontend/rail-toggle.test.ts` pins the DOM of this contract.
+  `src/frontend/rail-toggle.test.ts` pins the DOM of this contract. The composer's agent chip
+  deliberately does NOT follow this width: its press semantics branch on the primary pointing
+  device — the single positive `(pointer: fine)` claim, `main.ts` `finePointerMedia` — so a
+  700px-wide desktop window still cycles with `Tab` and a landscape phone past 860px still taps
+  and press-and-holds; `src/frontend/composer-control.test.ts` and
+  `src/frontend/composer-agent-cycle.test.ts` stub the `(max-width: 860px)` and
+  `(pointer: fine)` queries independently so neither can leak into the other. See
+  [Task queue and presentation](#task-queue-and-presentation-r4r5) → **Composer agent chip**.
   Above the phone breakpoint each rail is **resizable**. A `role="separator"` seam sits in
   its own 6px grid track between the rail and the chat (`src/frontend/ui/rail-resize.ts`),
   and a drag writes `--rail-left-width` / `--rail-right-width` on `.shell` — the two
@@ -6136,6 +6224,83 @@ Retired SSE frames (history only — these routes answer `404` now):
   (`src/frontend/main.ts:3591-3602`) is never disabled by pending work — it is only
   `hidden` while no conversation is open — and switching away just unsubscribes, because
   the work is server-owned.
+- **Composer agent chip (T1).** The chip inside the composer frame (`.agent-control-button`,
+  `src/frontend/ui/agent-control.ts`) is still ONE button — no chevron, no popover — and what is
+  device-split is what a PRESS means. The axis is the PRIMARY POINTER, never width: the shell
+  re-reads the ONE existing positive `(pointer: fine)` query as three states (`main.ts`
+  `finePointerMedia` → `pointerDevice`) and adds no second query. **Fine pointer, and `unknown`
+  (no `matchMedia`):** click / `Enter` / `Space` opens the shared agent dialog (R11, unchanged)
+  and `Tab` / `Shift+Tab` IN THE FIELD walks the team forward / backwards with wrap-around;
+  unknown keeps that half verbatim, because an engine that cannot report its pointer must not be
+  handed a gesture that changes routing. **`coarse`:** a tap cycles forward and a press-and-hold
+  opens that SAME dialog, because a finger owns no modifier key with which to ask for settings.
+  The machine is `src/frontend/ui/press-hold.ts`: `PRESS_HOLD_MS` 500 ms, `PRESS_SLOP_PX` 10 px,
+  and a move past that slop, `pointercancel`, `lostpointercapture`, `blur` or the node leaving
+  the DOM ends the press with NO action; the `click` the browser synthesises after a gesture is
+  swallowed exactly once, so a tap can never open a dialog on top of its own cycle. It arms only
+  for a real `touch`/`pen` `PointerEvent`, which is how a `(pointer: none)` machine keeps
+  plain-activation semantics.
+  The cycle set is the SESSION ROSTER in server-declared order (`contract.ts` `membersOf`: entry
+  agent first, then `subagents` exactly as the definition lists them — the order the dialog's own
+  tabs use), and a cycle is CLIENT-ONLY: it writes the per-conversation pending choice
+  (`Instance.agentSelection`, resolved by `main.ts` `selectedAgentOf`) and costs ZERO requests, so
+  one stray press never promotes an agent (R11). The next send COMMITS it on the wire that already
+  exists: while the selection is the agent that send would have run anyway (`main.ts`
+  `defaultAgentOf` — the focused conversation's owner WHEN the loaded roster describes it, the entry
+  agent when nothing is focused, and `undefined` when a conversation IS focused but the roster
+  cannot say whose it is; unknown means "send it THERE, change nothing", so the continuation wins
+  and NO thread is minted (`src/frontend/composer-agent-cycle.test.ts:957` — "continues a focused
+  conversation the roster does not describe instead of minting a stray thread")) the body is the
+  byte-identical pre-feature `POST /sessions/:id/tasks`; when it names another member the shell
+  first creates a conversation THAT agent owns,
+  `POST /sessions/:id/threads {agent}` (`api.ts` `createSessionThread`), and posts the task INTO
+  it, `POST /sessions/:id/tasks {…, thread_id}` (`view-shell.ts` `submitViewTask`) — a thread
+  never changes owner, so submitting into an agent-owned thread IS the mechanism
+  (`src/server/sessions.ts:1545-1549` `runAgentOf`). Nothing calls the template write —
+  `PATCH /harnesses/:name` (`api.ts` `updateHarness`) — and no protocol field was added, so the
+  harness TEMPLATE — and a frozen saved-session definition — stay untouched: the chip only ever
+  promised which EXISTING member answers next. A cycle is refused for a one-member team or a
+  view that hides the slot, and the reason sits in the accessible name and the tooltip instead of a
+  silently dead control (`main.ts` `agentCycleBlockOf`). The spoken half of that contract is the
+  polite live region (`main.ts` `agentCycleLive` / `agentCycleSay` / `agentCycleSentenceOf`,
+  `styles.css` `.agent-control-live`): an sr-only `role="status"` `aria-live="polite"` node that
+  states the agent WITH ITS ROSTER POSITION — "Agent for the next message: Researcher (2 of 3)." —
+  goes silent when the roster drops the chosen name and on navigation, and SPEAKS THE FALLBACK when
+  the choice is spent, so the region is never left naming an agent the chip no longer shows. It is
+  mounted deliberately OUTSIDE the rebuilt `.agent-slot` (that host is `replaceChildren`-ed on every
+  paint, and a region destroyed at the moment it has something to say is never announced). Tab
+  OWNERSHIP is settled before any wire question: the field's `Tab`/`Shift+Tab` cycle leg sits
+  AFTER the `@`/`#` suggestion-list branch of the composer keydown handler (`main.ts`), so an
+  open list with a pickable row keeps `Tab` and picks it, and one with nothing pickable leaves
+  `Tab` to the browser — a plain focus move, no cycle (`src/frontend/composer-control.test.ts`
+  — "picks the active suggestion row on Tab instead of moving focus out of the field", "leaves
+  Tab to the browser when the open suggestion list has nothing to pick"); an open modal keeps its
+  own `Tab` focus trap, registered on `document` in CAPTURE phase (`src/frontend/ui/dialog.ts`),
+  which is exactly why the cycle leg bails on `event.defaultPrevented` — that guard is the
+  mechanism that makes the two rules coexist (`src/frontend/composer-agent-cycle.test.ts` —
+  "leaves Tab to the dialog trap while the agent settings dialog is open"); and a locked cycle
+  (a one-member team, a view that hides the chip host) falls through the same way, so `Tab` still
+  leaves the field. ONE
+  resolver decides whether a send changes the wire at all — `main.ts` `agentSendPlanOf`, gated on
+  `Instance.agentSelection` being set AND the focused conversation not already running that agent —
+  and BOTH `paintComposerTarget` and `run()` call it, precisely so the routing line and the POST
+  cannot disagree. When they would, THE CHIP WINS: cycle to the researcher, re-expand a conversation
+  owned by another agent, and the label reads `New thread` with `dataset.mode === 'new'` while the
+  send mints THAT agent's conversation (`src/frontend/composer-agent-cycle.test.ts:891` — "promises
+  the conversation the send will actually use when a choice and a focus disagree"); the continuation
+  only wins when the choice names the focused conversation's OWN agent, or the roster cannot
+  describe whose it is. `cycleAgentSelection` itself releases the board's focus (its explicit
+  unfocus). The hold affordance is an ATTRIBUTE like every other state here
+  (`.agent-control-button[data-hold='armed'|'held']`, `styles.css`), and that same
+  `.agent-control-button` block disarms the platform's own long-press around it
+  (`touch-action: manipulation`, `user-select: none`, `-webkit-touch-callout: none`) — input
+  semantics, no desktop pixel changes. The painted label, `title` and `aria-label` are the ONLY
+  pre-gesture hints, and at phone width the chip's visible label collapses to the two-letter code
+  (`styles.css:7403-7411`): the implementer logged that as a known discoverability limitation for
+  the hold gesture. Proofs: `src/frontend/composer-agent-cycle.test.ts` (roster order at zero
+  requests; the two-route commit IN THAT ORDER; an entry-agent send costing no thread request at
+  all), `src/frontend/ui/press-hold.test.ts` (each action exactly once, every cancel leg silent) and
+  `src/frontend/ui/agent-control.test.ts` (the per-device press table).
 - **Configuration scope follows the pointer.** The Tools and Plugins pane toggles are hidden
   while no session is bound (`harnessTitleTools.hidden = toolsToggle.hidden =
   pluginsToggle.hidden = !bound`, `src/frontend/main.ts` `paintControls`, pinned by

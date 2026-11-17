@@ -95,6 +95,50 @@ const readBoth = async (paths: Parameters<typeof readTool>[0]) => {
     return { result: unwrapped.content, text: unwrapped.text as string };
 };
 
+// The unit `maxBytes`, the batch pool, and `wireBytes` are all charged in: raw UTF-8 bytes
+// PLUS one extra byte for every character `JSON.stringify` must escape (M2 - "a newline or
+// a quote costs 2 here"). Every fixture the full-envelope assertions below use is ASCII
+// lines, where the only escaped character is `\n`, so the charge is exactly
+// `raw + newlines` and the arithmetic of "the envelope was filled" can be checked instead
+// of asserted. (`content.match` counts, rather than `split`, so a trailing empty segment is
+// never counted as a newline that is not there.)
+const chargedBytes = (content: string): number => Buffer.byteLength(content, 'utf8') + (content.match(/\n/g) ?? []).length;
+
+// Follows a cut window's own cursor to EOF and returns the concatenation of every page.
+//
+// WHY IT EXISTS. Under the old 256 KiB envelope, "the continuation the note names is
+// correct" could be proved by ONE follow-up call, because the remainder of a 261 KiB file
+// still fitted one page. Under a 32 KiB envelope it takes six, so every test that proves a
+// cursor is byte-exact now has to page — which is what a real caller does anyway, and what
+// makes the assertion stronger: it checks EVERY boundary, not just the first one.
+//
+// The two inline assertions are the paging contract itself, not scaffolding: a page that
+// errors, or that returns nothing while still claiming to be truncated, is an infinite loop
+// for the caller that trusts the cursor.
+const pageToEof = async (
+    path: string,
+    first: FileReadEntry
+): Promise<{ text: string; last: FileReadEntry; pages: number }> => {
+    let collected = first.content;
+    let entry = first;
+    let pages = 0;
+
+    for (; entry.truncated && entry.nextByte !== null && pages < 32; pages += 1) {
+        const page = await read([
+            { path, startByte: entry.nextByte as number, maxBytes: FILE_READ_MAX_BYTES, maxLines: FILE_READ_MAX_LINES }
+        ]);
+
+        entry = page.files[0];
+        expect(entry.error, `page at byte ${entry.startLine}`).toBeUndefined();
+        expect(entry.bytes, 'the cursor makes progress').toBeGreaterThan(0);
+        collected += entry.content;
+    }
+
+    expect(entry.truncated, 'paging reached EOF').toBe(false);
+
+    return { text: collected, last: entry, pages };
+};
+
 // THE TEST SEAM H2 needs (deadline + cancellation). `read`'s `execute` passes the
 // published limits and the harness's own signal; `readFileBatch` takes them as
 // arguments — the same shape `./grep.tool.ts:626-639` publishes — so a test can ask for
@@ -229,10 +273,12 @@ const linesUpTo = (count: number): string =>
 
 const LINES_1300 = linesUpTo(1300);
 const LINES_5100 = linesUpTo(5100);
-// 11 bytes per line (`line 5100\n`), so 5100 lines are 56_100 bytes: inside the 64 KiB
-// per-file byte default. A default read of this file is therefore cut by the LINE cap
-// and reports `limit: "maxLines"`, which is exactly the diagnosis a byte cut is not.
-const LINES_5100_BYTES = 56_100;
+// `line N\n` is 6 bytes plus the digits of N, so 5100 lines are
+// 63 + 720 + 8100 + 4101*10 = 49_893 bytes (measured, not asserted from the comment —
+// the old 56_100 figure assumed 11 bytes for every line and no longer matches the
+// fixture). The number only ever appears in `toBeLessThan` bounds, but a stale constant
+// makes the window math below unreadable.
+const LINES_5100_BYTES = 49_893;
 
 // The `maxLines` CEILING fixture: 20 001 lines of 7-11 bytes, so a request for exactly
 // FILE_READ_MAX_LINES (20 000) is cut by the LINE cap rather than by the byte budget
@@ -319,7 +365,15 @@ describe('read', () => {
                     sizeBytes: 5,
                     // A file ending with a newline holds exactly one line per
                     // terminator — the `wc -l` count the entry's own `endLine` uses.
-                    lineCount: 1
+                    lineCount: 1,
+                    // A two-path batch splits the 32 KiB envelope into a ~16 KiB share per
+                    // path, which is BELOW the 16384 default the caller was told, so M7's
+                    // `budgetGranted` is published on every entry of every multi-path read.
+                    // Its exact value is a function of the absolute temp paths this test
+                    // runs under, so it is shape-checked here;
+                    // `read > publishes what the batch actually granted, and only when the
+                    // batch was the limit (M7)` pins the arithmetic itself.
+                    budgetGranted: expect.any(Number)
                 },
                 {
                     path: join(workdir, 'a.txt'),
@@ -334,7 +388,8 @@ describe('read', () => {
                     nextByte: null,
                     bytes: 6,
                     sizeBytes: 6,
-                    lineCount: 1
+                    lineCount: 1,
+                    budgetGranted: expect.any(Number)
                 }
             ],
             truncated: false,
@@ -369,7 +424,10 @@ describe('read', () => {
                         nextByte: null,
                         bytes: 6,
                         sizeBytes: 6,
-                        lineCount: 1
+                        lineCount: 1,
+                        // See the note on the first test: a multi-path read always runs
+                        // under the 16384 default, so every entry says what it was granted.
+                        budgetGranted: expect.any(Number)
                     },
                     {
                         path: resolve('nested/c.txt'),
@@ -384,7 +442,8 @@ describe('read', () => {
                         nextByte: null,
                         bytes: 5,
                         sizeBytes: 5,
-                        lineCount: 1
+                        lineCount: 1,
+                        budgetGranted: expect.any(Number)
                     }
                 ],
                 truncated: false,
@@ -418,7 +477,9 @@ describe('read', () => {
                     nextByte: null,
                     bytes: 10,
                     sizeBytes: 10,
-                    lineCount: 2
+                    lineCount: 2,
+                    // See the note on the first test.
+                    budgetGranted: expect.any(Number)
                 },
                 {
                     path: join(workdir, 'empty.txt'),
@@ -433,7 +494,11 @@ describe('read', () => {
                     nextByte: null,
                     bytes: 0,
                     sizeBytes: 0,
-                    lineCount: 0
+                    lineCount: 0,
+                    // An empty file still had an allowance; publishing it here is what
+                    // lets a caller tell "this file is empty" from "this file was starved"
+                    // (M7), which is exactly the ambiguity `budgetGranted` exists for.
+                    budgetGranted: expect.any(Number)
                 }
             ],
             truncated: false,
@@ -477,66 +542,110 @@ describe('read', () => {
         });
     });
 
-    it('cuts the 2000-line default window and says so, and an explicit maxLines walks past it', async () => {
-        // D11 replaced the "no default line cap" contract. This file — 5,100 lines of
-        // 11 bytes, 56 100 bytes, a fifth of the byte envelope — is exactly the shape
-        // that made the old default dangerous: it FIT the budget, so a default read
-        // handed the caller all 5,100 lines (≈15k tokens) and the caller only learned
-        // afterwards that the tool had volunteered them.
+    it('cuts the default window at the byte allowance and says so, and an explicit maxLines walks past it', async () => {
+        // D11 replaced the "no default line cap" contract. This file — 5,100 lines, 49 893
+        // bytes, a fifth of the OLD byte envelope — is exactly the shape that made the old
+        // default dangerous: it FIT the budget, so a default read handed the caller all
+        // 5,100 lines (≈15k tokens) and the caller only learned afterwards that the tool
+        // had volunteered them. Under the context-derived defaults it is also the shape
+        // that shows WHICH governor fired: 2000 lines of this file cost 18 893 bytes, more
+        // than the 16 384-byte default, so `limit` names `maxBytes` rather than `maxLines`,
+        // and that is the diagnosis that tells the caller what to raise.
         const result = await read([join(workdir, 'many-lines.txt')]);
         const entry = result.files[0];
 
         expect(entry.startLine).toBe(1);
-        expect(entry.endLine).toBe(FILE_READ_DEFAULT_MAX_LINES);
+        // T3 re-derived the defaults from the context window (`maxBytes` is 8192 MODEL
+        // TOKENS = 16384 serialized bytes), and that is BELOW what this file's 2000-line
+        // default window costs (18,893 bytes of `line N` text), so on this fixture the
+        // BYTE allowance is the governor and the 2000-line cap never fires. The numbers
+        // are exact for this fixture and path-independent: the window is bounded by the
+        // 16384 default, not by the batch pool, so 1590 whole lines plus the first byte of
+        // line 1591 is the largest prefix that fits. `read > applies an explicit maxLines
+        // and names it as the reason` pins the line-governed side of the same contract.
+        expect(entry.endLine).toBe(1591);
         expect(entry.truncated).toBe(true);
-        // Bytes are NOT the governor here — the file is well inside the byte default —
-        // so `limit` names the line cap, which is the answer that tells the caller to
-        // raise maxLines rather than accept a smaller window.
-        expect(entry.limit).toBe('maxLines');
-        expect(entry.nextLine).toBe(FILE_READ_DEFAULT_MAX_LINES + 1);
-        expect(entry.nextColumn).toBe(0);
+        expect(entry.limit).toBe('maxBytes');
+        expect(entry.bytes).toBe(14_794);
+        // A byte-axis cut may stop INSIDE a line, which is exactly why the continuation is
+        // a (line, column, byte) triple rather than a line number: line 1591 is the line it
+        // stopped in, column 1 the byte of it it stopped at, and `nextByte` the absolute
+        // offset paging resumes from.
+        expect(entry.nextLine).toBe(1591);
+        expect(entry.nextColumn).toBe(1);
         expect(entry.nextByte).toBe(entry.bytes);
         // A cut window never claims to know the file's total.
         expect(entry.lineCount).toBeUndefined();
+        expect(entry.bytes).toBeLessThanOrEqual(FILE_READ_DEFAULT_MAX_BYTES);
         expect(entry.bytes).toBeLessThan(LINES_5100_BYTES);
-        // The whole point: a default call is now a bounded window, not the envelope.
-        expect(result.wireBytes).toBeLessThan(FILE_READ_DEFAULT_MAX_BYTES);
+        // The whole point: a default call is a bounded window, not the envelope. The
+        // ENVELOPE is the ceiling the wire has to respect; the window is what the default
+        // bought, and the entry's own scaffolding (13 fields, the path, the prose line) sits
+        // on top of it, which is why `wireBytes` sits a little over 16 384 while `bytes`
+        // does not.
+        expect(result.wireBytes).toBeLessThan(result.contentBudget);
 
-        // The other half of the contract: the cap is a DEFAULT, not a ceiling. Asking
-        // explicitly still gets the whole file, with the total now known.
+        // The other half of the contract: the caps are DEFAULTS, not ceilings, and asking
+        // explicitly still buys everything the envelope can hold. It cannot buy the whole
+        // 49 893-byte file any more — a 32 KiB result is 4% of the smallest context window
+        // the harness sizes itself against, and that is the number the envelope exists to
+        // protect. What the ask DOES buy is every byte of the pool: `entry.bytes` and
+        // `budgetPool` are the same number, so the caller can see the envelope was filled
+        // rather than the file being cut short by a policy it never asked for.
         const asked = await read([
             { path: join(workdir, 'many-lines.txt'), maxLines: FILE_READ_MAX_LINES, maxBytes: FILE_READ_MAX_BYTES }
         ]);
         const whole = asked.files[0];
 
-        expect(whole.content).toBe(LINES_5100);
-        expect(whole.endLine).toBe(5100);
-        expect(whole.truncated).toBe(false);
-        expect(whole.limit).toBeNull();
-        expect(whole.lineCount).toBe(5100);
-        expect(asked.wireBytes).toBeLessThan(FILE_READ_WIRE_BUDGET);
+        expect(whole.content).toBe(LINES_5100.slice(0, whole.bytes));
+        expect(whole.truncated).toBe(true);
+        // The envelope, not the line cap and not the per-file ask, is what stopped it —
+        // which is precisely the answer that tells the caller to ask for LESS next time
+        // instead of raising a cap that was never the governor.
+        expect(whole.limit).toBe('budget');
+        // A cut window never claims to know the file's total.
+        expect(whole.lineCount).toBeUndefined();
+        // The pool is charged in SERIALIZED bytes - one extra per `\n` (M2) - so a window
+        // that spent the whole envelope is the pool minus its newlines, give or take the
+        // one line that did not fit (11 raw + 1 escaped on this fixture).
+        expect(chargedBytes(whole.content)).toBeLessThanOrEqual(asked.budgetPool);
+        expect(asked.budgetPool - chargedBytes(whole.content)).toBeLessThan(12);
+        expect(whole.bytes).toBeGreaterThan(FILE_READ_DEFAULT_MAX_BYTES);
+        expect(whole.bytes).toBeLessThan(LINES_5100_BYTES);
+        expect(asked.wireBytes).toBeLessThanOrEqual(asked.contentBudget);
     });
 
     it('applies an explicit maxLines and names it as the reason', async () => {
         // An EXPLICIT cap still cuts, and `limit` says so — that is the whole point of
         // the field: a caller reading `truncated: true` must know whether raising
         // `maxLines` would help (it would, here) or not (it never does for "budget").
-        const first5000 = linesUpTo(5000);
-        const bytes = Buffer.byteLength(first5000, 'utf8');
+        //
+        // 500 lines, not the 5000 this test used before the envelope moved: 5000 lines of
+        // this file are 48 893 bytes, which no 32 KiB envelope can hand back, so that
+        // request would be cut by the budget and prove nothing about the line cap. 500
+        // lines are 4 392 bytes — inside the envelope, outside the cap — which is the only
+        // shape where `limit: "maxLines"` is the honest answer.
+        const first500 = linesUpTo(500);
+        const bytes = Buffer.byteLength(first500, 'utf8');
 
-        const result = await read([{ path: join(workdir, 'many-lines.txt'), maxLines: 5000 }]);
+        expect(bytes).toBe(4_392);
+
+        const result = await read([{ path: join(workdir, 'many-lines.txt'), maxLines: 500 }]);
         const entry = result.files[0];
 
-        expect(entry.content).toBe(first5000);
+        expect(entry.content).toBe(first500);
         expect(entry.startLine).toBe(1);
-        expect(entry.endLine).toBe(5000);
+        expect(entry.endLine).toBe(500);
         expect(entry.bytes).toBe(bytes);
         expect(entry.truncated).toBe(true);
         expect(entry.limit).toBe('maxLines');
-        expect(entry.nextLine).toBe(5001);
+        expect(entry.nextLine).toBe(501);
         expect(entry.nextColumn).toBe(0);
-        // nextByte is the absolute offset of line 5001, i.e. exactly the bytes read.
+        // nextByte is the absolute offset of line 501, i.e. exactly the bytes read.
         expect(entry.nextByte).toBe(bytes);
+        // A window the LINE cap stopped still had the whole envelope available, so the
+        // batch pool was never the governor and M7 says nothing about a grant.
+        expect(entry.budgetGranted).toBeUndefined();
         expect(result.truncated).toBe(true);
     });
 
@@ -771,18 +880,26 @@ describe('read', () => {
         });
     });
 
-    it('returns a 70 KB single line whole when asked, and a 64 KiB window when not', async () => {
-        // The 256 KiB envelope is unchanged; what changed (D11) is that reaching it is
-        // now an explicit ask. `giant.txt` — one 70 000-byte line — sits just past the
-        // default, so it demonstrates both halves of the new contract with one fixture.
+    it('fills the envelope for a 70 KB single line when asked, and the default window when not', async () => {
+        // What changed (D11) is that reaching the envelope is an explicit ask. `giant.txt`
+        // — one 70 000-byte line — sits just past the default, so it demonstrates both
+        // halves with one fixture. It no longer demonstrates "the whole file on request":
+        // a 32 KiB result is 4% of the smallest context the harness sizes itself against,
+        // so 70 000 bytes cannot come back in one page however the caps are set. What the
+        // ask DOES buy is the whole pool, and the entry can prove it: `bytes` and
+        // `budgetPool` are the same number when one path is the only claimant.
         const result = await read([{ path: join(workdir, 'giant.txt'), maxBytes: FILE_READ_MAX_BYTES }]);
 
-        expect(result.files[0].bytes).toBe(70_000);
-        expect(result.files[0].truncated).toBe(false);
-        expect(result.files[0].nextByte).toBeNull();
-        // One line, unterminated: the count is exactly one, which is also what the
-        // projection's header says.
-        expect(result.files[0].lineCount).toBe(1);
+        expect(result.files[0].bytes).toBe(result.budgetPool);
+        expect(result.files[0].bytes).toBeGreaterThan(FILE_READ_DEFAULT_MAX_BYTES);
+        expect(result.files[0].truncated).toBe(true);
+        // The envelope stopped it, not the 64 KiB ask - which is the answer that tells the
+        // caller to page rather than to raise a cap that was never the governor.
+        expect(result.files[0].limit).toBe('budget');
+        expect(result.files[0].nextByte).toBe(result.files[0].bytes);
+        // One line, cut inside it: the count is not knowable, so it is not published.
+        expect(result.files[0].lineCount).toBeUndefined();
+        expect(result.wireBytes).toBeLessThanOrEqual(result.contentBudget);
 
         const defaulted = await read([join(workdir, 'giant.txt')]);
 
@@ -799,8 +916,13 @@ describe('read', () => {
 
         expect(entry.truncated).toBe(true);
         expect(entry.nextLine).toBe(1);
-        expect(entry.bytes).toBeGreaterThan(200_000);
+        // The ask was 262 144 bytes and the envelope is 32 768, so the pool is what comes
+        // back — that is the whole point of `limit: "budget"`, and the pool being fully
+        // spent is what makes the number checkable without knowing this test's path.
+        expect(entry.bytes).toBe(result.budgetPool);
+        expect(entry.bytes).toBeGreaterThan(FILE_READ_DEFAULT_MAX_BYTES);
         expect(entry.bytes).toBeLessThanOrEqual(FILE_READ_MAX_BYTES);
+        expect(entry.bytes).toBeLessThanOrEqual(result.contentBudget);
         expect(entry.nextByte).toBe(entry.bytes);
 
         // The whole file is reconstructed by paging with startByte, with no byte
@@ -858,19 +980,42 @@ describe('read', () => {
         expect(tail.files[0].content).toBe('\nB\nC\n');
     });
 
-    it('allocates by demand: a 40 KiB file beside 99 tiny ones is returned in full', async () => {
+    it('allocates by demand: one big file beside 99 tiny ones takes the pool, and the folded rest is declared', async () => {
         // The regression this pins: the old split was budget/N, so this file was cut
         // to roughly 1/100th of the budget while 99 six-byte neighbours stranded the
-        // rest. It now fits entirely, because their surplus is handed to it.
-        const paths = [join(workdir, 'one-big.txt'), ...Array.from({ length: 99 }, () => join(workdir, 'a.txt'))];
+        // rest. It still takes the pool, because their surplus is handed to it — what
+        // changed with the 32 KiB envelope is that 100 paths no longer FIT in it at all,
+        // so the batch now answers the prefix it can pay for and names the rest instead
+        // of answering all 100 with a share of nothing.
+        const paths = [
+            { path: join(workdir, 'one-big.txt'), maxBytes: FILE_READ_MAX_BYTES },
+            ...Array.from({ length: 99 }, () => ({ path: join(workdir, 'a.txt') }))
+        ];
 
         const result = await read(paths);
 
-        expect(result.files).toHaveLength(100);
-        expect(result.files[0].bytes).toBe(40_000);
-        expect(result.files[0].truncated).toBe(false);
-        expect(result.files[0].content).toBe('a'.repeat(40_000));
+        // Every enumerated entry answers its path: no errors, and each tiny neighbour
+        // complete at its 6 bytes.
         expect(result.skipped).toBe(0);
+        expect(result.files.slice(1).every((entry) => entry.bytes === 6 && entry.truncated === false)).toBe(true);
+        // The big file's share is the point: more content than all its neighbours put
+        // together, which an even split of this batch could never produce, and the
+        // envelope is what stopped it — raising `maxBytes` would not help.
+        const neighbours = result.files.slice(1).reduce((total, entry) => total + entry.bytes, 0);
+
+        expect(result.files[0].bytes).toBeGreaterThan(neighbours);
+        expect(result.files[0].truncated).toBe(true);
+        expect(result.files[0].limit).toBe('budget');
+        // The fold: `files` plus the declared omission is exactly the request, and the
+        // omission is more than nothing (100 paths of ~500 bytes of reserve each cannot
+        // fit a 32 768-byte envelope) but leaves a useful batch behind.
+        expect(result.files.length + (result.omitted ?? 0)).toBe(100);
+        expect(result.omitted).toBeGreaterThan(0);
+        expect(result.files.length).toBeGreaterThan(30);
+        // The envelope holds WITH the fold declaration in it.
+        expect(result.wireBytes).toBeLessThanOrEqual(result.contentBudget);
+        // And the model's copy says what happened, ahead of the windows it does return.
+        expect(await projection(paths)).toContain(`read: folded - ${result.omitted} of 100`);
     });
 
     it('still splits evenly when every file wants more than its share', async () => {
@@ -887,6 +1032,93 @@ describe('read', () => {
         // wire budget rather than overshooting it.
         expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThan(64);
         expect(result.wireBytes).toBeLessThanOrEqual(FILE_READ_WIRE_BUDGET);
+    });
+
+    it('holds the envelope for a batch WIDER than the envelope, and declares what it folded', async () => {
+        // THE BATCH-WIDTH INVARIANT (the half of the context explosion the per-path caps
+        // cannot answer). Eight paths of 1.9 KiB of error message each was 15 KiB of the
+        // old 64 KiB result; forty paths of the same message is 76 KiB, and no per-path
+        // cap can fix that, because the cost is per ENTRY and the entries are the request.
+        // The envelope stays at 32 768 bytes (4% of the context the harness sizes against),
+        // so what is bounded instead is how many paths one call may enumerate.
+        //
+        // Three shapes, all wider than the envelope in reserve alone:
+        const shortMissing = Array.from(
+            { length: 40 },
+            (_, index) => join(workdir, 'fold', `missing-${String(index).padStart(2, '0')}.txt`)
+        );
+        const wideMissing = Array.from(
+            { length: 100 },
+            (_, index) => join(workdir, 'fold', `gone-${String(index).padStart(3, '0')}.txt`)
+        );
+        const tiny = await Promise.all(
+            Array.from({ length: 100 }, (_, index) => seed(`fold/tiny-${String(index).padStart(3, '0')}.txt`, `t${index}\n`))
+        );
+
+        const cases: { label: string; paths: { path: string }[] }[] = [
+            // 1. forty unreadable paths with SHORT names (the short "no such file" message:
+            //    the parent directory exists, so there is no did-you-mean or preview clause);
+            { label: '40 ENOENT, short paths', paths: shortMissing.map((path) => ({ path })) },
+            // 2. a hundred of them;
+            { label: '100 ENOENT, short paths', paths: wideMissing.map((path) => ({ path })) },
+            // 3. and a hundred READABLE three-byte files, which is the shape that used to
+            //    return 100 entries with a content pool of 0.
+            { label: '100 readable tiny files', paths: tiny.map((path) => ({ path })) }
+        ];
+
+        for (const { label, paths } of cases) {
+            const result = await read(paths);
+            const text = await projection(paths);
+
+            // The envelope, in the unit the harness compares against its cap. `wireBytes`
+            // is first pinned as the REAL serialized length, so the bound below cannot be
+            // satisfied by an under-reported number.
+            const serialized = JSON.stringify(result);
+
+            expect(Buffer.byteLength(serialized, 'utf8'), `${label}: wireBytes is honest`).toBe(result.wireBytes);
+            expect(result.wireBytes, `${label}: machine view fits`).toBeLessThanOrEqual(result.contentBudget);
+            expect(result.wireBytes, `${label}: machine view fits the harness cap`).toBeLessThanOrEqual(
+                MODEL_TOOL_RESULT_BUDGET_BYTES
+            );
+            // The prose the transcript actually commits, in the payload unit
+            // `boundToolResult` measures - the OTHER view of the same call, and the one an
+            // under-reserved fold would cut.
+            expect(result.modelBytes, `${label}: prose fits`).toBeLessThanOrEqual(result.contentBudget);
+            expect(boundToolResult(text).truncated, `${label}: the harness does not cut the prose`).toBe(false);
+            expect(boundToolResult(text).content, `${label}: prose is delivered intact`).toBe(text);
+            // Nothing is silently dropped: `files` plus the declared omission is exactly the
+            // request, in the request's own order.
+            expect(result.files.length + (result.omitted ?? 0), `${label}: the request is accounted for`).toBe(
+                paths.length
+            );
+            // And every path the batch DID answer is an answer: an error object, or content.
+            // A zero-content success entry - the old "1 byte of a 100-path batch" shape - is
+            // the thing the fold replaces, so none may appear.
+            expect(
+                result.files.every((entry) => entry.error !== undefined || entry.bytes >= 1),
+                `${label}: every enumerated path carries something`
+            ).toBe(true);
+            // If it folded, the fold is the FIRST thing the model reads, and it names the
+            // same count the machine view declares.
+            if ((result.omitted ?? 0) > 0) {
+                expect(text.split('\n')[0], `${label}: the fold is declared first`).toContain(
+                    `read: folded - ${result.omitted} of ${paths.length} requested paths were not read`
+                );
+            } else {
+                expect(text).not.toContain('read: folded');
+            }
+        }
+
+        // THE OMISSION IS THE TAIL, EXACTLY. The fold line claims the omitted paths are the
+        // LAST `omitted` of the request; that is only an honest claim if re-asking the prefix
+        // reproduces it byte for byte. The 100-tiny-file batch is the case with readable
+        // content on both sides of the cut.
+        const wide = await read(tiny.map((path) => ({ path })));
+        const prefix = await read(tiny.slice(0, wide.files.length).map((path) => ({ path })));
+
+        expect(prefix.omitted, 'a request the envelope can afford in full declares nothing').toBeUndefined();
+        expect(prefix.files.length).toBe(wide.files.length);
+        expect(prefix.files).toEqual(wide.files);
     });
 
     it('never exceeds the harness wire cap, so the continuation fields survive', async () => {
@@ -1239,22 +1471,25 @@ describe('read', () => {
         expect(byLines.files[0].truncated).toBe(true);
         expect(byLines.files[0].limit).toBe('maxLines');
 
-        // 2. The same file, no caps at all: it now FITS everything the tool allows —
-        //    under the 20 000-line ceiling and under the 256 KiB envelope — so nothing
-        //    was cut and `limit` stays null, with the whole-file count published because
-        //    the scan ran to EOF.
-        const fits = await read([{ path: manyLines, maxLines: FILE_READ_MAX_LINES, maxBytes: FILE_READ_MAX_BYTES }]);
+        // 2. A file that FITS both caps and the envelope: 1 000 lines of ~7 bytes is under
+        //    the 2 000-line default, under the 20 000-line ceiling and inside the 32 KiB
+        //    envelope, so nothing was cut, `limit` stays null, and the whole-file count is
+        //    published because the scan ran to EOF. (The 19 000-line file above cannot show
+        //    this any more: 133 000 bytes is four envelopes, so it is truncated by the
+        //    budget however the caps are set — case 4's shape.)
+        const fitsFile = await seed('limit-fits.txt', Array.from({ length: 1_000 }, (_, i) => `l${i}`).join('\n'));
+        const fits = await read([{ path: fitsFile, maxLines: FILE_READ_MAX_LINES, maxBytes: FILE_READ_MAX_BYTES }]);
         expect(fits.files[0].truncated).toBe(false);
         expect(fits.files[0].limit).toBeNull();
-        expect(fits.files[0].lineCount).toBe(19_000);
+        expect(fits.files[0].lineCount).toBe(1_000);
 
-        // 3. The DEFAULT of the same file: 19 000 lines over the 2000-line default, well
-        //    under the 64 KiB allowance (13 KB), so the LINE governor is what stopped it —
-        //    and "raise maxLines" is the right advice here.
+        // 3. The DEFAULT of the 19 000-line file: 2 000 lines of ~7 bytes is 14 000 bytes,
+        //    inside the 16 384-byte default allowance, so the LINE governor is what stopped
+        //    it — and "raise maxLines" is the right advice here.
         expect((await read([{ path: manyLines }])).files[0].limit).toBe('maxLines');
 
         // 4. The SHARED envelope: 15 000 lines of 21 bytes is 315 000 bytes, more than
-        //    262 144 and fewer than 20 000 lines, so with both caps at their ceilings the
+        //    32 768 and fewer than 20 000 lines, so with both caps at their ceilings the
         //    batch budget is the only thing left that can bind. Raising either cap on this
         //    path would achieve nothing, which is what the label tells the caller.
         const byBudget = await read([
@@ -1299,16 +1534,17 @@ describe('read', () => {
     it('names the size, the bytes returned, and the exact continuation for a cut large file', async () => {
         const path = join(workdir, 'big-multiline.txt');
         const full = await readFile(path, 'utf8');
-        // `maxBytes` at the ceiling, deliberately: this test is about the SHARED 256 KiB
+        // `maxBytes` at the ceiling, deliberately: this test is about the SHARED 32 KiB
         // envelope and the note reserve priced against it, which is what the F1/F2
-        // regressions were about. Under the 64 KiB DEFAULT the file would be cut by its
-        // own allowance (`limit: "maxBytes"`) and never reach the envelope, so the
-        // default-cut case is pinned separately and this one keeps asking for the whole.
+        // regressions were about. Under the 16 384-byte DEFAULT the file is cut by its own
+        // allowance (`limit: "maxBytes"`) and never reaches the envelope, so the default-cut
+        // case is pinned separately and this one keeps asking for the whole.
         const result = await read([{ path, maxBytes: FILE_READ_MAX_BYTES, maxLines: FILE_READ_MAX_LINES }]);
         const entry = result.files[0];
 
         // The premise, in exact bytes: 4500 lines of 58 is 261 000 raw, and 265 500
-        // SERIALIZED (a `\n` costs two), so the 262 144-byte envelope must cut it.
+        // SERIALIZED (a `\n` costs two), so the 32 768-byte envelope must cut it — by a
+        // factor of eight, which is the regime this test now lives in.
         expect(Buffer.byteLength(full, 'utf8')).toBe(261_000);
         expect(entry.sizeBytes).toBe(261_000);
         expect(entry.truncated).toBe(true);
@@ -1317,9 +1553,14 @@ describe('read', () => {
         // returned - the value the note quotes as the resume offset.
         expect(entry.nextByte).toBe(entry.bytes);
         expect(entry.bytes).toBeLessThan(261_000);
-        // The note costs a few hundred bytes of a 262 144-byte budget, never a sizeable
-        // share of it (the bound a caller needs to trust the reserve).
-        expect(entry.bytes).toBeGreaterThan(253_000);
+        // The window is nearly the whole envelope, so the note costs a few hundred bytes of
+        // a 32 768-byte budget and never a sizeable share of it (the bound a caller needs to
+        // trust the reserve). Stated in the charge unit rather than as a raw byte count,
+        // because the pool - and therefore the window - is what this test's path length
+        // moves: a full envelope of 58-byte terminated lines is the pool minus one byte per
+        // newline, within the slack of the line that did not fit.
+        expect(chargedBytes(entry.content)).toBeLessThanOrEqual(result.budgetPool);
+        expect(result.budgetPool - chargedBytes(entry.content)).toBeLessThan(60);
 
         // The sentence itself, asserted whole. The `{ startLine, startColumn }` half is
         // spelled out only when the cut actually landed inside a line (which it does
@@ -1333,10 +1574,9 @@ describe('read', () => {
         );
 
         // And the advice is correct rather than decorative: what the note names as the
-        // continuation rebuilds the file exactly, with nothing duplicated or dropped.
-        const rest = await read([{ path, startByte: entry.nextByte as number }]);
-        expect(rest.files[0].truncated).toBe(false);
-        expect(entry.content + rest.files[0].content).toBe(full);
+        // continuation rebuilds the file exactly, with nothing duplicated or dropped —
+        // followed page by page, because a 261 KiB file is six pages of this envelope.
+        expect((await pageToEof(path, entry)).text).toBe(full);
     });
 
     it('keeps a large-file read with its note inside the wire budget', async () => {
@@ -1406,22 +1646,31 @@ describe('read', () => {
         expect(result.wireBytes).toBeLessThanOrEqual(FILE_READ_WIRE_BUDGET);
         expect(result.wireBytes).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
 
-        // End to end, with the module that actually does the cutting: an under-reserved
-        // response comes back `truncated: true` with an envelope instead of `files`,
-        // which is the failure this test exists for.
-        const bounded = boundToolResult(serialized);
+        // End to end, with the module that actually does the cutting - and in the unit that
+        // module measures. `boundToolResult` bounds the TEXT the harness commits to the
+        // transcript, and for this tool that is the prose projection, priced in REQUEST-BODY
+        // payload bytes (`modelPayloadBytes` in ../../core/result-budget.ts) - the same unit
+        // `modelBytes` reports. Feeding it the machine view instead measures a scenario the
+        // harness never builds for a `toolText` result: re-serializing a JSON string escapes
+        // every one of the JSON's own quote characters again, so a result that exactly fills
+        // the envelope pays ~250 more bytes for quotes than its `wireBytes` counted. Both
+        // figures are pinned, and so is the fact that the continuation survives in the copy
+        // the model reads - which is the failure this test exists for.
+        const text = await projection([{ path, maxBytes: FILE_READ_MAX_BYTES, maxLines: FILE_READ_MAX_LINES }]);
+        const bounded = boundToolResult(text);
 
         expect(bounded.truncated).toBe(false);
-        expect(bounded.content).toBe(serialized);
-        expect(bounded.originalBytes).toBe(result.wireBytes);
-        expect((JSON.parse(bounded.content).files[0] as { nextByte: number }).nextByte).toBe(entry.nextByte);
+        expect(bounded.content).toBe(text);
+        expect(result.modelBytes).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(bounded.content).toContain(`continue from startByte ${entry.nextByte}`);
+        // The machine view, for the consumer that gets it (the server's manual-execute
+        // response and any caller threading `nextByte`), is inside its own budget too.
+        expect(result.wireBytes).toBeLessThanOrEqual(result.contentBudget);
 
         // And the continuation the note names is correct under the non-ASCII path too,
-        // so the advice is not just affordable - it resumes the file exactly.
-        const rest = await read([{ path, startByte: entry.nextByte as number }]);
-
-        expect(rest.files[0].truncated).toBe(false);
-        expect(entry.content + rest.files[0].content).toBe(full);
+        // so the advice is not just affordable - it resumes the file exactly. Paged to EOF,
+        // because the 230 000-byte remainder is more than one page of a 32 KiB envelope.
+        expect((await pageToEof(path, entry)).text).toBe(full);
     });
 
     // `"` and `\` are illegal in a Windows file name (and `\` is its separator), so the
@@ -1459,9 +1708,12 @@ describe('read', () => {
         expect(entry.limit).toBe('budget');
         expect(entry.nextByte).toBe(entry.bytes);
         // The 484-byte penalty is paid out of CONTENT, not out of the cap: the reserve is
-        // a few hundred bytes of a 262 144-byte budget, which is the bound a caller needs
-        // in order to keep trusting it (the same shape the ASCII large-file case pins).
-        expect(entry.bytes).toBeGreaterThan(253_000);
+        // a few hundred bytes of a 32 768-byte budget (~1.5%), which is the bound a caller
+        // needs in order to keep trusting it (the same shape the ASCII large-file case
+        // pins). Stated in the charge unit, because the window is what moves with this
+        // test's path length - not the ~484 bytes of double-escaped path.
+        expect(chargedBytes(entry.content)).toBeLessThanOrEqual(result.budgetPool);
+        expect(result.budgetPool - chargedBytes(entry.content)).toBeLessThan(60);
 
         // The amplification itself, asserted as arithmetic rather than assumed: the single
         // pass prices one escaped character as 2 bytes (`\"`), and the outer pass escapes
@@ -1510,27 +1762,29 @@ describe('read', () => {
         expect(slackPenalty).toBeGreaterThanOrEqual(Math.floor(unpriced / 2));
         expect(slackPenalty).toBeLessThanOrEqual(unpriced);
 
-        // End to end, through the module that actually does the cutting: an escape-heavy
-        // path survives intact, with every continuation field still parseable.
-        const bounded = boundToolResult(serialized);
+        // End to end, through the module that actually does the cutting, in the unit it
+        // measures (the prose projection, as the transcript receives it - see the CJK case
+        // above for why the machine view is the wrong input here): an escape-heavy path
+        // survives intact, and the continuation it advertises is still in the copy the model
+        // reads, where the reserve was supposed to put it.
+        const text = await projection([{ path, maxBytes: FILE_READ_MAX_BYTES, maxLines: FILE_READ_MAX_LINES }]);
+        const bounded = boundToolResult(text);
 
         expect(bounded.truncated).toBe(false);
-        expect(bounded.content).toBe(serialized);
-        expect(bounded.originalBytes).toBe(result.wireBytes);
-
-        const parsed = JSON.parse(bounded.content) as { files: { nextByte: number; nextLine: number }[] };
-
-        expect(parsed.files[0].nextByte).toBe(entry.nextByte);
-        expect(parsed.files[0].nextLine).toBe(entry.nextLine);
+        expect(bounded.content).toBe(text);
+        expect(result.modelBytes).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(result.wireBytes).toBeLessThanOrEqual(result.contentBudget);
+        expect(bounded.content).toContain(`continue from startByte ${entry.nextByte}`);
+        expect(bounded.content).toContain(`startLine ${entry.nextLine}`);
 
         // And the continuation the note names rebuilds the file exactly under that path,
         // so the reserve did not just buy room — it bought room for advice that works.
-        const rest = await read([{ path, startByte: entry.nextByte as number }]);
+        // Paged to EOF: 261 000 bytes is six pages of a 32 768-byte envelope.
+        const paged = await pageToEof(path, entry);
 
-        expect(rest.files[0].truncated).toBe(false);
-        expect(entry.content + rest.files[0].content).toBe(full);
-        // The tail is a complete read, so it needs no advisory of its own.
-        expect(rest.note).toBeUndefined();
+        expect(paged.text).toBe(full);
+        // EOF has no continuation to name, which is what tells a caller the paging is over.
+        expect(paged.last.nextByte).toBeNull();
     });
 
     it('advises raise-maxLines when a large file stops at the caller line cap', async () => {
@@ -1559,42 +1813,64 @@ describe('read', () => {
         // `limit: "maxLines"` note, including the one a caller already at
         // FILE_READ_MAX_LINES received - and that advice throws, because `readMaxLines`
         // rejects 20001 with "read maxLines must be an integer between 1 and 20000". At
-        // the ceiling the continuation is the only usable remedy, so the clause names the
-        // ceiling it hit instead of a raise that cannot happen.
+        // the ceiling the continuation is the only usable remedy, so the note must name the
+        // ceiling it hit rather than a raise that cannot happen.
+        //
+        // The envelope moved, and with it the reachability of that branch: 20 000 lines
+        // cost at least 2 bytes of SERIALIZED allowance each (one byte of text plus an
+        // escaped `\n`), so the line ceiling needs 40 000 charged bytes and the envelope
+        // hands out ~31 200 of them. The byte budget is therefore ALWAYS the governor at
+        // the ceiling - which serves the same guarantee by a shorter route: a note that
+        // says `limit: budget` cannot advise raising `maxLines` at all. Both halves are
+        // pinned: the label, and the absence of the impossible advice.
         const path = await seed('ceiling.txt', LINES_20001);
         const result = await read([{ path, maxLines: FILE_READ_MAX_LINES, maxBytes: FILE_READ_MAX_BYTES }]);
         const entry = result.files[0];
 
-        // The window is exactly the cap, and every number is derivable from the fixture:
-        // 20 001 lines are 208 905 bytes, the first 20 000 are 208 894 of them, and the
-        // next unread byte is the start of line 20 001. The file is over the 65 536-byte
-        // gate, so the note IS published - it just cannot promise an impossible raise.
+        // 20 001 lines are 208 905 bytes, over the 65 536-byte gate, so the note IS
+        // published - and it is cut by the envelope long before the line ceiling it cannot
+        // reach. The byte figures are stated as a relation to the pool, which is what this
+        // test's own path length moves.
         expect(entry.truncated).toBe(true);
-        expect(entry.limit).toBe('maxLines');
         expect(entry.sizeBytes).toBe(208_905);
-        expect(entry.bytes).toBe(208_894);
-        expect(entry.nextByte).toBe(208_894);
-        expect(entry.nextLine).toBe(20_001);
-        expect(entry.nextColumn).toBe(0);
+        expect(entry.limit).toBe('budget');
+        expect(chargedBytes(entry.content)).toBeLessThanOrEqual(result.budgetPool);
+        expect(result.budgetPool - chargedBytes(entry.content)).toBeLessThan(12);
+        expect(entry.nextByte).toBe(entry.bytes);
+        // Well under 20 000 lines came back, so the line ceiling never fired.
+        expect(entry.endLine).toBeLessThan(FILE_READ_MAX_LINES);
+
+        const column = entry.nextColumn === 0 ? '' : `, startColumn: ${entry.nextColumn}`;
 
         expect(result.note).toBe(
-            `read: ${JSON.stringify(entry.path)} is 208905 bytes; returned 208894 ` +
-                '(limit: maxLines at the 20000 ceiling) - continue at startByte 208894, or { startLine: 20001 }.'
+            `read: ${JSON.stringify(entry.path)} is 208905 bytes; returned ${entry.bytes} (limit: budget) - ` +
+                `continue at startByte ${entry.nextByte}, or { startLine: ${entry.nextLine}${column} }.`
         );
+        // The advice a caller at the ceiling must NOT get, asserted directly rather than
+        // left to the shape of the sentence above.
+        expect(result.note).not.toContain('maxLines');
 
-        // One line below the ceiling the free remedy really is available, and the note
-        // says so - which is what keeps the ceiling wording an exception rather than a
-        // blanket rewrite of the clause.
+        // One line BELOW the ceiling changes nothing, and that is the point: the line cap
+        // is now out of reach for this fixture either way - 19 999 lines of 10-11 bytes cost
+        // ~220 000 charged bytes against a 31 200-byte pool - so the byte envelope governs
+        // both reads and neither note can offer a `maxLines` raise, at the ceiling or below
+        // it. The free remedy is still pinned where it is real:
+        // `read > advises raise-maxLines when a large file stops at the caller line cap`,
+        // which cuts the same class of file at `maxLines: 3` and gets the
+        // `(limit: maxLines at 3 - raise maxLines)` clause verbatim.
         const below = await read([
             { path, maxLines: FILE_READ_MAX_LINES - 1, maxBytes: FILE_READ_MAX_BYTES }
         ]);
 
-        expect(below.files[0].limit).toBe('maxLines');
-        expect(below.files[0].bytes).toBe(208_883);
+        expect(below.files[0].limit).toBe('budget');
+        expect(chargedBytes(below.files[0].content)).toBeLessThanOrEqual(below.budgetPool);
         expect(below.note).toBe(
-            `read: ${JSON.stringify(below.files[0].path)} is 208905 bytes; returned 208883 ` +
-                '(limit: maxLines at 19999 - raise maxLines) - continue at startByte 208883, or { startLine: 20000 }.'
+            `read: ${JSON.stringify(below.files[0].path)} is 208905 bytes; returned ${below.files[0].bytes} ` +
+                `(limit: budget) - continue at startByte ${below.files[0].nextByte}, or { startLine: ${below.files[0].nextLine}${
+                    below.files[0].nextColumn === 0 ? '' : `, startColumn: ${below.files[0].nextColumn}`
+                } }.`
         );
+        expect(below.note).not.toContain('maxLines');
 
         // The advice the ceiling case removed was not just unhelpful, it was rejected -
         // pinned here so the note can never send a caller into that error again.
@@ -1646,18 +1922,21 @@ describe('read', () => {
         // `'note' in result` stays meaningful.
         expect('note' in small).toBe(false);
 
-        //   2. a 150 KB file on ONE line - bigger than the gate, but nothing was
-        //      withheld (asked for the whole envelope, and no newline to escape, so it
-        //      fits), which is why this case deliberately gets no sentence: an advisory
-        //      that says "continue" where there is nothing to continue teaches a model to
-        //      doubt a complete answer. `sizeBytes` already reports the size;
-        const singleLine = await read([
-            { path: join(workdir, 'big-singleline.txt'), maxBytes: FILE_READ_MAX_BYTES }
-        ]);
+        //   2. a file that IS cut but sits BELOW the size gate - the advisory's own
+        //      threshold, not the envelope's. A 40 000-byte single line cannot fit a 32 KiB
+        //      envelope, so it is a real byte-envelope cut (`limit: "budget"`), and the
+        //      per-entry fields carry it without a sentence. Under the OLD 256 KiB envelope
+        //      this slot held the opposite shape - a 150 KB file returned COMPLETE, the one
+        //      read that must not be narrated - and that case is now unreachable: the 64 KiB
+        //      gate is above the envelope, so no file the note may name can ever be
+        //      complete. The "complete reads say nothing" half is case 1.
+        const belowGate = await seed('below-gate-singleline.txt', 'q'.repeat(40_000));
+        const singleLine = await read([{ path: belowGate, maxBytes: FILE_READ_MAX_BYTES }]);
 
-        expect(singleLine.files[0].sizeBytes).toBe(150_000);
-        expect(singleLine.files[0].bytes).toBe(150_000);
-        expect(singleLine.files[0].truncated).toBe(false);
+        expect(singleLine.files[0].sizeBytes).toBe(40_000);
+        expect(singleLine.files[0].bytes).toBeLessThan(40_000);
+        expect(singleLine.files[0].truncated).toBe(true);
+        expect(singleLine.files[0].limit).toBe('budget');
         expect(singleLine.note).toBeUndefined();
         expect('note' in singleLine).toBe(false);
 
@@ -1864,18 +2143,33 @@ describe('read', () => {
         );
         const batch = await read(files.map((path) => ({ path, maxBytes: 1 })));
 
+        // The batch cannot answer all 100 paths inside 32 768 bytes: each entry costs ~460
+        // bytes of scaffolding in the two views BEFORE it carries anything, so 100 of them
+        // is ~46 KiB of reserve alone. It answers the prefix it can pay for, and `omitted`
+        // accounts for the rest. The old behaviour this test replaced was 100 entries and a
+        // pool of 0 - a response that spent everything on metadata and called it a read.
         expect(batch.files.every((entry) => entry.error === undefined)).toBe(true);
-        // One code point each, in caller order — the first character of each file.
-        expect(batch.files.map((entry) => entry.content)).toEqual(files.map((_, index) => String(index)[0]));
-        expect(batch.files.map((entry) => entry.bytes)).toEqual(files.map(() => 1));
-        // The envelope holds with the floors included, and the accounting is exact.
-        // The envelope holds with the floors included: `bytes` is exactly the 100 code
-        // points the floor emitted, and the rest of the wire is the fixed metadata.
-        expect(batch.bytes).toBe(100);
+        expect(batch.files.length).toBeLessThan(100);
+        expect(batch.files.length + (batch.omitted ?? 0)).toBe(100);
+        expect(batch.omitted).toBeGreaterThan(0);
+        // One code point each, in caller order — the first character of each file, and the
+        // prefix is exactly the first `files.length` paths.
+        expect(batch.files.map((entry) => entry.content)).toEqual(
+            files.slice(0, batch.files.length).map((_, index) => String(index)[0])
+        );
+        expect(batch.files.map((entry) => entry.bytes)).toEqual(batch.files.map(() => 1));
+        // The envelope holds with the floors included: `bytes` is exactly the code points
+        // the floor emitted, and the rest of the wire is the fixed metadata.
+        expect(batch.bytes).toBe(batch.files.length);
         expect(batch.wireBytes).toBeLessThanOrEqual(FILE_READ_WIRE_BUDGET);
         expect(batch.wireBytes).toBeGreaterThan(batch.bytes);
         // And every cursor moved, so paging from any of them is progress, not a loop.
         expect(batch.files.every((entry) => entry.truncated && entry.nextByte === 1)).toBe(true);
+        // The omission is declared in the copy the model reads, not only in a field the
+        // model never sees: this is the whole point of folding rather than starving.
+        const text = await projection(files.map((path) => ({ path, maxBytes: 1 })));
+
+        expect(text.split('\n')[0]).toContain(`read: folded - ${batch.omitted} of 100 requested paths were not read`);
     });
 
     it('refuses a NUL only on the page that contains it', async () => {
@@ -1889,15 +2183,24 @@ describe('read', () => {
         body.writeUInt8(0x00, 100_000); // one stray NUL, 100 001 bytes into the file
         const nulled = await seedBytes('windowed-nul.txt', body);
 
-        // The default window stops 36 KiB short of the NUL, so it is TEXT.
+        // The default window stops 84 KiB short of the NUL, so it is TEXT. (Under the old
+        // 64 KiB default it stopped 36 KiB short; the number moved with the context-derived
+        // default, and the contract did not.)
         const before = (await read([{ path: nulled }])).files[0];
 
         expect(before.error).toBeUndefined();
-        expect([before.bytes, before.truncated, before.nextByte]).toEqual([65_536, true, 65_536]);
+        expect([before.bytes, before.truncated, before.nextByte]).toEqual([
+            FILE_READ_DEFAULT_MAX_BYTES,
+            true,
+            FILE_READ_DEFAULT_MAX_BYTES
+        ]);
 
-        // The page that walks over it is EBINARY, and so is the read that covers the file.
+        // The page that walks over it is EBINARY, and so is the same page asked for the
+        // whole ceiling. "The read that covers the file" is no longer a thing one call can
+        // ask for - 100 001 bytes is three envelopes - so the ceiling ask is pinned on the
+        // page that DOES contain the NUL, which is the case that matters.
         expect((await read([{ path: nulled, startByte: 99_000, maxBytes: 2_048 }])).files[0].error?.code).toBe('EBINARY');
-        expect((await read([{ path: nulled, maxBytes: 262_144 }])).files[0].error?.code).toBe('EBINARY');
+        expect((await read([{ path: nulled, startByte: 99_000, maxBytes: 262_144 }])).files[0].error?.code).toBe('EBINARY');
 
         // The chunk half, in both directions: `0xFF` at byte 50 000 is INSIDE the chunk a
         // window at byte 0 decodes, so that window is refused even though its 10 bytes are
@@ -2136,13 +2439,13 @@ describe('read', () => {
         });
     });
 
-    it('reads a file whose share the per-entry reserves ate instead of reporting EIO', async () => {
+    it('folds a batch the per-entry reserves cannot fit instead of reporting EIO', async () => {
         // Zero allowance. The allocation passes used to be guarded by `allowance > 0`, so
         // a batch whose per-entry reserves exceeded the envelope (here: 95 unreadable
-        // paths with long names, each of whose error message is reserved up front) ran NO
-        // pass at all, the readable file kept `entry: null`, and the fallback called it
-        // `EIO` — an I/O failure for a file that was never read. A 0-byte allowance is
-        // just the tightest allowance there is.
+        // paths with 1 200-character names, each of whose error message is reserved up
+        // front) ran NO pass at all, the readable file kept `entry: null`, and the fallback
+        // called it `EIO` — an I/O failure for a file that was never read. A 0-byte
+        // allowance is just the tightest allowance there is.
         const lines = join(workdir, 'lines.txt');
         const missing = Array.from(
             { length: 95 },
@@ -2153,33 +2456,47 @@ describe('read', () => {
 
         // `EIO` is back to meaning "this handle could not be read": it appears nowhere.
         expect(starved.files.some((entry) => entry.error?.code === 'EIO')).toBe(false);
-        expect(starved.files.filter((entry) => entry.error !== undefined)).toHaveLength(95);
+        // What happens instead of the starvation: ONE error entry. Measured on this
+        // fixture, a 1 200-character missing path costs 3 003 bytes of entry JSON (the
+        // path appears three times — `path`, and twice inside the ENOENT sentence — and
+        // every one of them is escaped) plus 1 500 bytes of prose line = 4 503 bytes of
+        // per-slot reserve. The batch-wide error budget is a QUARTER of the envelope
+        // (8 192 of 32 768), because an error message is an answer but it is not the point
+        // of a read: two of these would cost 9 006, so the walk stops at one and folds the
+        // other 95 paths — including the readable one, because request order is the only
+        // order this tool promises.
+        expect(starved.files).toHaveLength(1);
+        expect(starved.files[0].error?.code).toBe('ENOENT');
+        expect(starved.skipped).toBe(1);
+        expect(starved.omitted).toBe(95);
+        expect(starved.files.length + (starved.omitted ?? 0)).toBe(96);
+        // The envelope holds with the fold declaration in it — the invariant that lets the
+        // harness skip its own truncation, which is what `EIO` was a symptom of.
+        expect(starved.wireBytes).toBeLessThanOrEqual(starved.contentBudget);
+        // And it is declared in the copy the model reads, ahead of every window.
+        expect(await projection([...missing, { path: lines }])).toContain(
+            'read: folded - 95 of 96 requested paths were not read'
+        );
 
-        // The readable file got the smallest window the floor allows — one code point,
-        // cut by the batch, with a cursor that moves — so a caller paging from a share of
-        // nothing still makes progress instead of looping on an empty page.
-        expect(starved.files[95]).toEqual({
+        // THE OTHER HALF, and the reason the fold is not just a smaller lie: with one error
+        // entry instead of 95, the same readable file is enumerated and reads COMPLETE —
+        // 11 893 bytes, no truncation, no cursor. The old batch handed it one character and
+        // called the envelope full; the new one hands it the file and says which paths it
+        // could not answer.
+        const small = await read([missing[0], { path: lines }]);
+
+        expect(small.omitted).toBeUndefined();
+        expect(small.files).toHaveLength(2);
+        expect(small.files[0].error?.code).toBe('ENOENT');
+        expect(small.files[1]).toMatchObject({
             path: lines,
-            content: 'l',
-            startLine: 1,
-            endLine: 1,
-            truncated: true,
-            limit: 'budget',
-            startByteAligned: null,
-            nextLine: 1,
-            nextColumn: 1,
-            // > the offset the window started at (0): the C2 floor, applied to a share of
-            // nothing rather than to a small `maxBytes`.
-            nextByte: 1,
-            bytes: 1,
-            sizeBytes: Buffer.byteLength(LINES_1300, 'utf8'),
-            // M7: this is the case `budgetGranted` exists for. The batch share that bound
-            // this file was 0 bytes — the 95 error reservations ate the envelope — and a
-            // caller that raises `maxBytes` to 262144 and gets the SAME one-character
-            // window can now see why instead of guessing. `limit: "budget"` says which
-            // governor cut it; this says what that governor was worth.
-            budgetGranted: 0
+            bytes: Buffer.byteLength(LINES_1300, 'utf8'),
+            truncated: false,
+            limit: null,
+            nextByte: null,
+            lineCount: 1_300
         });
+        expect(small.wireBytes).toBeLessThanOrEqual(small.contentBudget);
     });
 
     // -----------------------------------------------------------------------
@@ -2208,7 +2525,7 @@ describe('read', () => {
         expect(both.result.files[0].content).toBe('alpha\n');
         // `modelBytes` is the real byte length of THAT text, measured the way the
         // harness will measure it going into the transcript - not an estimate.
-        expect(both.result.modelBytes).toBe(Buffer.byteLength(text, 'utf8'));
+        expect(both.result.modelBytes).toBe(Buffer.byteLength(JSON.stringify(text), 'utf8') - 2);
     });
 
     it('numbers the model\'s copy without touching the bytes the machine reads', async () => {
@@ -2309,12 +2626,17 @@ describe('read', () => {
         // ordering of the two views (F4) — it is that the machine view fits the budget it
         // names. Both views also carry the same fixture path, so the path-independent
         // costs are what the numbers pin: the entry's fixed fields and the escaped
-        // content outweigh the 73-byte prose window by 108 bytes (379 against 271). The
-        // wire also pays M7's `budgetPool` field, whose cost is its own digits. Either
-        // way the wire is inside `contentBudget`, which is what keeps the continuation
-        // from being cut.
-        expect(capped.result.wireBytes).toBe(379 + serializedPathBytes(lines) + poolWire(capped.result));
-        expect(capped.result.modelBytes).toBe(271 + pathBytes(lines));
+        // content outweigh the 73-byte prose window by 97 bytes (378 against 281). The
+        // wire also pays M7's `budgetPool` field, whose cost is its own digits, and the
+        // 32 768-byte `contentBudget` it now reports is one digit shorter than the
+        // 262 144 it used to — that is the byte the old base counted. Either way the wire
+        // is inside `contentBudget`, which is what keeps the continuation from being cut.
+        expect(capped.result.wireBytes).toBe(378 + serializedPathBytes(lines) + poolWire(capped.result));
+        // +10 against the pre-T3 base of 271: `modelBytes` is now the ESCAPED length of the
+        // projection (the unit `boundToolResult` measures and the request body pays), and
+        // this window's prose holds exactly ten newlines - eight window lines, the entry
+        // header and the truncation footer - each of which costs 2 there and 1 raw.
+        expect(capped.result.modelBytes).toBe(281 + pathBytes(lines));
         expect(capped.result.wireBytes).toBeLessThanOrEqual(capped.result.contentBudget);
 
         // One steady gutter across the 999 -> 1000 boundary — the alignment is the
@@ -2341,8 +2663,15 @@ describe('read', () => {
         // carry this fixture's path, so the pinned bases carry the direction on their own.
         expect(numbered.result.files[0].content).toBe('x\ny\n');
         expect(numbered.result.files[0].bytes).toBe(4);
-        expect(numbered.result.wireBytes).toBe(307 + serializedPathBytes(pair) + poolWire(numbered.result));
-        expect(numbered.result.modelBytes).toBe(82 + pathBytes(pair));
+        // The −1 against the pre-T3 base is `contentBudget`: 32 768 is one digit shorter
+        // than the 262 144 the result used to report. `poolWire` absorbs the digits of
+        // `budgetPool` itself, so nothing else here moves with the fixture's path.
+        expect(numbered.result.wireBytes).toBe(306 + serializedPathBytes(pair) + poolWire(numbered.result));
+        // +3 against the pre-T3 base of 82, for the same reason as the gutter case: the
+        // prose of a complete two-line numbered window is the entry header plus two lines,
+        // i.e. three newlines, and `modelBytes` counts each of them at its PAYLOAD cost of
+        // 2 bytes rather than its raw 1.
+        expect(numbered.result.modelBytes).toBe(85 + pathBytes(pair));
 
         // Direction 2 — the one the old invariant ruled out. The gutter lives only in the
         // prose, yet it is charged against the machine allowance, so a large numbered window
@@ -2355,9 +2684,20 @@ describe('read', () => {
         expect(whole.result.files[0].endLine).toBe(1_300);
         expect(whole.result.files[0].bytes).toBe(Buffer.byteLength(LINES_1300, 'utf8'));
         // Pinned exactly, path included. The larger number is the PROSE — the asymmetry
-        // the header documents rather than a bug in it.
-        expect(whole.result.wireBytes).toBe(13_516 + serializedPathBytes(lines) + poolWire(whole.result));
-        expect(whole.result.modelBytes).toBe(19_779 + pathBytes(lines));
+        // the header documents rather than a bug in it. The bases moved with T3: −1 on the
+        // wire for the one-digit-shorter `contentBudget`, and +1,301 on the prose because
+        // `modelBytes` now counts the payload cost of every newline the model's copy
+        // carries (the header line plus all 1,300 window lines) rather than its raw cost.
+        // The extra `fieldWire` term is M7's `budgetGranted`: this shape asks for 65 536
+        // and the batch can only grant the pool, so the grant is published on the entry
+        // even though the file ended before it was spent — and its cost is its own digits.
+        expect(whole.result.wireBytes).toBe(
+            13_515 +
+                serializedPathBytes(lines) +
+                poolWire(whole.result) +
+                fieldWire('budgetGranted', whole.result.files[0].budgetGranted as number)
+        );
+        expect(whole.result.modelBytes).toBe(21_080 + pathBytes(lines));
 
         // What the guarantee actually is, on both shapes: the machine view — the part the
         // harness envelope would have to fit — always fits the budget it names, so the
@@ -2431,7 +2771,7 @@ describe('read', () => {
             const both = await readBoth(request as never);
             const label = JSON.stringify(request).slice(0, 80);
 
-            expect(both.result.modelBytes, label).toBe(Buffer.byteLength(both.text, 'utf8'));
+            expect(both.result.modelBytes, label).toBe(Buffer.byteLength(JSON.stringify(both.text), 'utf8') - 2);
             expect(both.result.modelBytes, `${label} fits where the JSON fits`).toBeLessThanOrEqual(both.result.wireBytes);
             expect(both.result.wireBytes, `${label} within budget`).toBeLessThanOrEqual(both.result.contentBudget);
 
@@ -2699,8 +3039,14 @@ describe('read', () => {
         // enough that "omit the argument" is never the same sentence as "want less".
         expect(FILE_READ_DEFAULT_MAX_LINES).toBe(2_000);
         expect(FILE_READ_MAX_LINES).toBe(20_000);
-        expect(FILE_READ_DEFAULT_MAX_BYTES).toBe(64 * 1024);
-        expect(FILE_READ_MAX_BYTES).toBe(FILE_READ_WIRE_BUDGET);
+        expect(FILE_READ_DEFAULT_MAX_BYTES).toBe(16 * 1024);
+        expect(FILE_READ_MAX_BYTES).toBe(256 * 1024);
+        // The ceiling is deliberately ABOVE the envelope (8x). Asking for more than the
+        // envelope can deliver is allowed and answered with the envelope as the binding
+        // limit, which `limit: "budget"` and the aggregate projection line both report.
+        // Equality here would make the ceiling a second name for the budget and hide
+        // which of the two cut a window.
+        expect(FILE_READ_MAX_BYTES).toBe(8 * FILE_READ_WIRE_BUDGET);
         // The default must be the thing that bites first on a plain call: if the ceiling
         // were the binding number, the default would be a label and not a policy.
         expect(FILE_READ_DEFAULT_MAX_LINES).toBeLessThan(FILE_READ_MAX_LINES);
@@ -2713,7 +3059,7 @@ describe('read', () => {
         expect(FILE_READ_WIRE_BUDGET).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
         expect(FILE_READ_WIRE_BUDGET).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
         expect(FILE_READ_CONTENT_BUDGET).toBe(FILE_READ_WIRE_BUDGET);
-        expect(FILE_READ_WIRE_BUDGET).toBe(256 * 1024);
+        expect(FILE_READ_WIRE_BUDGET).toBe(32 * 1024);
     });
 
     it('keeps the declaration inside its context budget', () => {
@@ -2762,7 +3108,18 @@ describe('read', () => {
         // budget a model cannot infer from the field names. `src/tools/laziness.test.ts:160`
         // pins the same phrase; the assertion below is what stops a future trim from silently
         // breaking it from this side.
-        expect(descriptionBytes).toBe(1_695);
+        // T3 paid for two new facts inside this ceiling (the envelope is a shared,
+        // model-facing budget, and it is measured on the SERIALIZED form) by dropping the
+        // parentheticals that only restated the schema. Re-measured, not estimated.
+        //
+        // T7's fold fact (a batch wider than the envelope answers a PREFIX and declares
+        // `omitted`) costs 104 bytes, paid for inside the same ceiling by dropping the two
+        // diagnostic glosses ", `modelBytes` what this call put in the transcript,
+        // `wireBytes` what the machine result costs" (93 bytes): those two field names say
+        // what they are, and neither changes what the next call should ask for, whereas a
+        // caller that cannot see the omission asks for nothing. Re-measured: 1 694 against
+        // the 1 700 ceiling.
+        expect(descriptionBytes).toBe(1_694);
         // Every code this tool can publish is named in the description, because a model that
         // is not told a code exists cannot branch on one (H5 made the set closed and
         // enumerable, which is what makes this assertion possible).
@@ -2782,7 +3139,7 @@ describe('read', () => {
             'budgetGranted',
             'skipped',
             'sizeBytes',
-            '256 KiB budget is measured on the SERIALIZED result',
+            '32 KiB budget is measured on the SERIALIZED result',
             String(FILE_READ_IO_DEADLINE_MS),
             'null as EOF'
         ]) {

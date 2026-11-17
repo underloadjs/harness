@@ -26,9 +26,12 @@
 //
 // Determinism note: every expected value below is hand-derived from the fixture — indices
 // from the layout, outcomes from the messages, tokens from `estimateContextTokens`'
-// documented `ceil(chars / 4)` rule over the withheld messages' content plus the tool
-// names and raw arguments (./context-estimate.ts `messageChars`). Nothing here reads
-// production output back in and calls it expected.
+// documented `ceil(serialized-payload bytes / 4)` rule over the withheld messages' content
+// plus the tool names and raw arguments, each field counted the way the request serializes
+// it (./context-estimate.ts `messagePayloadBytes`, ./payload-bytes.ts `modelPayloadBytes`).
+// T5 (2026-11-17) moved that currency from characters to payload bytes, and every token pin
+// in this file moved with it; the byte totals are written next to each pin. Nothing here
+// reads production output back in and calls it expected.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -464,14 +467,14 @@ describe('planContextPruning — the exact set a pass disables', () => {
                 keys: [readKey],
                 resolverIndex: 3,
                 resolverMessageId: 'msg-4',
-                tokens: 12
+                tokens: 13
             }
         ]);
 
         // The doc's own phrasing of this case: `[0]` disabled and `[1]` enabled — i.e. the
         // unit that asked (index 1) is the one named, and the answering unit is untouched.
         expect(plan.candidates.map((candidate) => candidate.leaderIndex)).toEqual([1]);
-        expect(plan.withheldTokens).toBe(12);
+        expect(plan.withheldTokens).toBe(13);
         expect(plan.belowFloor).toBe(false);
         expect(plan.consideredUnits).toBe(4);
     });
@@ -480,13 +483,22 @@ describe('planContextPruning — the exact set a pass disables', () => {
         const entries = entriesOf(FAILED_THEN_ANSWERED);
         const messages = entries.map((entry) => entry.message);
 
-        // 12 = ceil(46 / 4): the withheld unit is the assistant entry (0 content + `read` 4
-        // + the raw `{"path":"a.ts"}` 15 = 19) plus its result (23 content + `read` 4 = 27).
+        // 13 = the withheld unit's SERIALIZED-PAYLOAD bytes / 4, measured as a removal from
+        // the whole transcript (the estimator rounds ONCE over the list it is handed):
+        //   - the assistant entry: 0 content + the call name `read` (4) + the raw
+        //     `{"path":"a.ts"}`, which is 15 characters but 19 PAYLOAD bytes, because 4 of
+        //     them are `"` that the request escapes to `\"`  -> 23 bytes;
+        //   - its result: `Tool "read" failed: EIO`, 23 characters -> 25 payload bytes (two
+        //     escaped quotes) + the pairing name `read` (4) -> 29 bytes;
+        //   - withheld 52 bytes, and the estimator removes them from the WHOLE list: 110
+        //     bytes -> ceil(110 / 4) = 28, the remaining 58 bytes -> ceil(58 / 4) = 15, so
+        //     the saving is 13. (Under the old character currency these were 46 characters
+        //     and 12 tokens.)
         // Cross-checked against the estimator over the whole transcript minus the unit.
         expect(
             estimateContextTokens(messages) -
                 estimateContextTokens(messages.filter((_, index) => index !== 1 && index !== 2))
-        ).toBe(12);
+        ).toBe(13);
 
         // A bigger result moves the number, so the account is not a constant in disguise.
         const wide = planOf([
@@ -504,11 +516,12 @@ describe('planContextPruning — the exact set a pass disables', () => {
             { result: { id: 'c2', name: 'read', content: 'ok' } }
         ]);
 
-        // 400 chars of result text + 4 of result name + the leader's 19 (4 name + 15 raw
-        // arguments) = 423 chars, minus the 400 that stay in the transcript's other numbers:
-        // asserted as an exact token count so a fixture edit that changes the SIZE fails
-        // here rather than quietly moving the floor.
-        expect(wide.withheldTokens).toBe(106);
+        // 400 bytes of result text + 4 of result name + the leader's 23 payload bytes (4 name
+        // + the 19-byte escaped `{"path":"a.ts"}`) = 427 withheld bytes of a 462-byte
+        // transcript: ceil(462 / 4) = 116, the 35 bytes that stay -> ceil(35 / 4) = 9, so the
+        // saving is 107 (106 in characters). Asserted as an exact token count so a fixture
+        // edit that changes the SIZE fails here rather than quietly moving the floor.
+        expect(wide.withheldTokens).toBe(107);
     });
 
     it('prunes several units of one transcript in one pass, oldest first', () => {
@@ -884,25 +897,32 @@ describe('planContextPruning — the per-member write set (a request-trimmed uni
 
 describe('planContextPruning — the guards', () => {
     it('refuses the WHOLE pass when the saving is under minTokens', () => {
-        const plan = planOf(FAILED_THEN_ANSWERED, [], { minTokens: 13 });
+        const plan = planOf(FAILED_THEN_ANSWERED, [], { minTokens: 14 });
 
-        // The candidate existed (14 tokens) but 14 < 15, so NOTHING is proposed — the caller
+        // The candidate existed (13 bytes-derived tokens: 52 withheld payload bytes, see the
+        // estimator case above) but 13 < 14, so NOTHING is proposed — the caller
         // therefore writes nothing, notifies nothing and saves nothing.
+        //
+        // WHY BOTH FLOOR LITERALS MOVED BY ONE (T5): the currency, not the fixture. The unit
+        // is one token bigger under `ceil(payload bytes / 4)` — the withheld `{"path":"a.ts"}`
+        // and the quoted failure text cost 6 more bytes once the request escapes them — and
+        // this case deliberately sits on the boundary, so its two probes (floor = tokens + 1,
+        // floor = tokens) moved with the measured figure rather than being loosened.
         expect(plan.candidates).toEqual([]);
         expect(plan.belowFloor).toBe(true);
-        expect(plan.withheldTokens).toBe(12);
+        expect(plan.withheldTokens).toBe(13);
         expect(plan.consideredUnits).toBe(4);
 
         // At the floor it goes through: the comparison is `>=`, not `>`.
         expect(
-            planOf(FAILED_THEN_ANSWERED, [], { minTokens: 12 }).candidates.map(
+            planOf(FAILED_THEN_ANSWERED, [], { minTokens: 13 }).candidates.map(
                 (c) => c.leaderIndex
             )
         ).toEqual([1]);
     });
 
     it('measures the floor over the whole batch, not per unit', () => {
-        // Two 3-token candidates that together clear the floor must not be refused twice —
+        // Two 4-token candidates that together clear the floor must not be refused twice —
         // the Q5 argument in one assertion: one cache invalidation for both, none for either.
         const specs: readonly Spec[] = [
             { user: 'go' },
@@ -918,13 +938,17 @@ describe('planContextPruning — the guards', () => {
 
         const each = planOf(specs, [], { minTokens: 0 });
 
-        // Each unit alone is worth 3 tokens; removed together they are worth 7, because the
-        // estimator rounds ONCE over the transcript. The batch number is the authoritative
-        // one, which is exactly why the floor is measured over the batch.
-        expect(each.candidates.map((candidate) => candidate.tokens)).toEqual([3, 3]);
-        expect(each.withheldTokens).toBe(7);
-        expect(planOf(specs, [], { minTokens: 8 }).candidates).toEqual([]);
-        expect(planOf(specs, [], { minTokens: 7 }).candidates.map((c) => c.leaderIndex)).toEqual([
+        // Each unit alone is worth 4 bytes-derived tokens — 15 payload bytes: the call name
+        // `r` (1) plus the 9-byte escaped `{"p":1}` (7 characters, 2 of them quotes) on the
+        // request side, and `boom` (4) plus `r` (1) on the result side, so ceil(15 / 4) = 4 —
+        // and removed together they are worth 8, because the estimator rounds ONCE over the
+        // transcript: 58 bytes -> 15, the 28 that stay -> 7. The batch number is the
+        // authoritative one, which is exactly why the floor is measured over the batch.
+        // (In characters these were 3 and 7; both floor literals below moved with them.)
+        expect(each.candidates.map((candidate) => candidate.tokens)).toEqual([4, 4]);
+        expect(each.withheldTokens).toBe(8);
+        expect(planOf(specs, [], { minTokens: 9 }).candidates).toEqual([]);
+        expect(planOf(specs, [], { minTokens: 8 }).candidates.map((c) => c.leaderIndex)).toEqual([
             1,
             5
         ]);

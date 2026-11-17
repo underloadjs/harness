@@ -415,7 +415,12 @@ describe('live Node descriptor catalogue (T24)', () => {
             truncated: false,
             bytes: 5,
             wireBytes: expect.any(Number),
-            contentBudget: 262144,
+            // The entry's own `FILE_READ_WIRE_BUDGET`, restated in the result as
+            // `contentBudget`. T5 lowered that envelope from 256 KiB to the harness's
+            // per-result model budget — 32 KiB, asserted equal in ./files/read.test.ts —
+            // and this row of the compiled body's output follows the constant, which is the
+            // point: the manifest row and the compiled body are ONE source revision.
+            contentBudget: 32768,
             // M7 (./files/read.tool.ts:1026-1032): the bytes actually left to split. It
             // is `contentBudget` minus the serialized scaffolding of the result and of
             // every entry, so it embeds the per-run scratch path and cannot be a literal

@@ -931,14 +931,18 @@ describe('agent structured output (issue 0001)', () => {
 
 // The refusal message, spelled out in full. The exact numbers come from the exact
 // inputs below: a 100-character instruction plus a 300-character prompt is 400
-// characters, and `ceil(400 / 4)` is 100 tokens, one over a 99-token window.
+// characters, and `ceil(400 / 4)` is 100 tokens, one over a 99-token window. The text
+// is plain ASCII with no escapes, so the T5 switch from characters to
+// SERIALIZED-PAYLOAD BYTES does not move the number here — what moves is the published
+// wording, which now names the currency the estimator really charges (../core/agent.ts
+// `CONTEXT_OVERFLOW_CODE` throw; the two are edited in lockstep).
 const OVERFLOW_MESSAGE =
     'context-overflow: agent "writer" would send an estimated 100 tokens against a 99-token ' +
-    'window, so the request was not sent and is not retried. The estimate is ceil(chars / 4) ' +
-    'over the transcript about to be sent (core/context-estimate.ts), the same number the UI ' +
-    'context bar shows; attachment bytes and the request\'s tool schemas are not counted. Send ' +
-    'less — a turn.before handler may replace the transcript, and the shipped context-compaction ' +
-    'plugin owns that policy — or raise maxPromptTokens / provider.contextWindow.';
+    'window, so the request was not sent and is not retried. The estimate is ceil(payload bytes / 4) ' +
+    'over the transcript about to be sent (core/context-estimate.ts), counting each field as the request ' +
+    'serializes it — the same number the UI context bar shows; attachment bytes and the request\'s tool ' +
+    'schemas are not counted. Send less — a turn.before handler may replace the transcript, and the ' +
+    'shipped context-compaction plugin owns that policy — or raise maxPromptTokens / provider.contextWindow.';
 
 // A transport that replays one frame list PER REQUEST and records the requests it was
 // actually handed. A working floor means this list is never read at all.
@@ -1140,6 +1144,33 @@ describe('agent context window floor (issue 0004)', () => {
         expect(events).toStrictEqual([
             { type: 'error', error: { message: overflowFrame.message, code: 'context-overflow' } }
         ]);
+    });
+
+    it('never retries a transport that signals the overflow only through its diagnostics', async () => {
+        // (2026-11-17) The second source the retry owner reads. A HOST transport is allowed
+        // to classify without setting a `code` — the built-in one does exactly that for
+        // `provider-transit` — so `details.errorClass` is checked through
+        // `providerDiagnosticsOf` (transport/provider-timeouts.ts), the same shape-checking
+        // reader ../harness.ts trusts for the terminal record. Before that, a frame whose
+        // only machine statement was its diagnostics class was codeless HERE and spent the
+        // whole ladder, while the UI and the session layer already read it as an overflow:
+        // one answer, two readers, two decisions.
+        const overflowByClass: HarnessStreamEvent = {
+            type: 'error',
+            message: 'the prompt is too large for this model',
+            details: { errorClass: CONTEXT_OVERFLOW_CODE, url: 'http://localhost:6660/v1/chat/completions' }
+        };
+
+        const { stream, calls } = scriptedStream([[overflowByClass], OK_FRAMES]);
+
+        const brain = agent({ name: 'writer', model: 'm', stream, retry: { maxRetries: 3, baseDelayMs: 1 } });
+
+        const events = await collect(brain.stream('go'));
+
+        expect(calls).toHaveLength(1);
+        // NO `retry` event, and NO `code` on the payload: the failure is terminal through
+        // its diagnostics, and `toErrorInfo` still reports exactly what the frame carried.
+        expect(events).toStrictEqual([{ type: 'error', error: { message: 'the prompt is too large for this model' } }]);
     });
 
     it('still retries an ordinary transport failure, with no code on its payloads', async () => {

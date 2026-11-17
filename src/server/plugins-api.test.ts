@@ -441,13 +441,29 @@ describe('GET /v1/harness/plugins', () => {
                 },
                 // R4 added this BEFORE `enabled` (declared order is the row order the pane
                 // renders, so both position and value are pinned): the per-model JSON
-                // override map. There is no headroom setting any more — the limit IS the
-                // firing point (the operator's 2026-11-10 one-number ruling).
+                // override map.
                 {
                     key: 'modelLimits',
                     label: 'Per-model limits (JSON)',
                     type: 'string',
                     default: '{}'
+                },
+                // The headroom row (2026-11-17), filed directly under the entry it reads: the
+                // buffer only ever comes off a ceiling that a DECLARED model window makes
+                // binding, so an operator budget (`contextLimit`, `modelLimits[...].limit`)
+                // is still the one-number firing point of the 2026-11-10 ruling, and only a
+                // model fact gets leeway. `max: 0.5` is the plugin's own half-window cap,
+                // restated at the write edge so the pane cannot accept a value the runtime
+                // would silently clamp; `0` is the documented opt-out. Like every other
+                // compaction row it declares NO help paragraph (pinned by the loop below).
+                {
+                    key: 'headroomRatio',
+                    label: 'Headroom before a declared window (ratio)',
+                    type: 'number',
+                    default: 0.15,
+                    min: 0,
+                    max: 0.5,
+                    step: 0.01
                 },
                 {
                     key: 'enabled',
@@ -481,6 +497,7 @@ describe('GET /v1/harness/plugins', () => {
             values: {
                 contextLimit: 200000,
                 modelLimits: '{}',
+                headroomRatio: 0.15,
                 enabled: true,
                 minTokens: 200,
                 safetyTurns: 6,
@@ -869,15 +886,16 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(patched.status).toBe(200);
         expect(Object.keys(patched.body)).toEqual(['plugin']);
         expect(patched.body.plugin.name).toBe('context-compaction');
-        // `values` is the projection of EVERY declared key (six as of the 2026-11-10
-        // one-number ruling: the limit, the per-model map, and the four policy knobs), not
-        // just the one that was written. The same six-key map is what every later read below
-        // re-asserts, because the store answers stored value -> declared default per key and
-        // a partial projection would let a new setting ship without ever being exposed on the
-        // contract.
+        // `values` is the projection of EVERY declared key (seven as of the 2026-11-17
+        // headroom row: the limit, the per-model map, the headroom ratio, and the four policy
+        // knobs), not just the one that was written. The same seven-key map is what every later
+        // read below re-asserts, because the store answers stored value -> declared default per
+        // key and a partial projection would let a new setting ship without ever being exposed on
+        // the contract.
         expect(patched.body.plugin.values).toEqual({
             contextLimit: 200000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -900,6 +918,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(reload.body.items[1].values).toEqual({
             contextLimit: 200000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -932,6 +951,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(patched.body.plugin.values).toEqual({
             contextLimit: 150000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -950,6 +970,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
         expect(reset.body.plugin.values).toEqual({
             contextLimit: 200000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -985,7 +1006,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             body: {
                 error: {
                     message:
-                        'Unknown setting "context_limit" for plugin "context-compaction". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode.'
+                        'Unknown setting "context_limit" for plugin "context-compaction". Allowed settings: contextLimit, modelLimits, headroomRatio, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}
@@ -1223,7 +1244,7 @@ describe('PATCH /v1/harness/plugins/{plugin_id}', () => {
             body: {
                 error: {
                     message:
-                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, modelLimits, enabled, minTokens, safetyTurns, mode.'
+                        'Unknown setting "pruneMode" for plugin "context-compaction". Allowed settings: contextLimit, modelLimits, headroomRatio, enabled, minTokens, safetyTurns, mode.'
                 }
             },
             headers: {}
@@ -1579,6 +1600,7 @@ describe('plugin settings survive a restart', () => {
         expect(second.store.pluginSettings.values('context-compaction')).toEqual({
             contextLimit: 200000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -1592,6 +1614,7 @@ describe('plugin settings survive a restart', () => {
         expect(page.body.items[1].values).toEqual({
             contextLimit: 200000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -1638,6 +1661,7 @@ describe('plugin settings survive a restart', () => {
         expect(page.body.items[1].values).toEqual({
             contextLimit: 4000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
@@ -1682,17 +1706,22 @@ describe('plugin settings survive a restart', () => {
         expect(fourth.store.pluginSettings.values('context-compaction')).toEqual({
             contextLimit: 200000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,
             mode: 'summarize'
         });
         expect((await call(fourth, 'GET', `${MOUNT}/plugins`)).body.items[1].values).toEqual({
-            // Back on every declared default — and "declared" now means all six settings
-            // (five as of compaction T4.6, plus R4's `modelLimits`; the R4 headroom knob was
-            // removed by the 2026-11-10 one-number ruling), not just the limit.
+            // Back on every declared default — and "declared" now means all seven settings
+            // (five as of compaction T4.6, plus R4's `modelLimits`, plus the 2026-11-17
+            // `headroomRatio` row — the R4 headroom knob that the 2026-11-10 one-number ruling
+            // removed came BACK on 2026-11-17, but scoped: it only ever comes off a ceiling a
+            // DECLARED model window makes binding, so an operator budget is still the exact
+            // number typed), not just the limit.
             contextLimit: 200000,
             modelLimits: '{}',
+            headroomRatio: 0.15,
             enabled: true,
             minTokens: 200,
             safetyTurns: 6,

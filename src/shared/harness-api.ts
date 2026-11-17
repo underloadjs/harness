@@ -225,7 +225,7 @@ export const HARNESS_SERVICE_LIMITS = {
     pending_actions: 4,
     steer_records: 64,
     created_tools: 32,
-    tool_result_bytes: 262144,
+    tool_result_bytes: 32768,
     page_limit_default: 25,
     page_limit_max: 100,
 } satisfies ServiceLimits;
@@ -434,10 +434,15 @@ export interface ServiceLimits {
      */
     created_tools: number;
     /**
-     * Model-facing text bound for one tool result: 262,144 bytes (256 KiB). It is set to match the `read`
-     * tool's own output budget, so a full-budget read survives the wire instead of being cut into the
-     * truncation envelope; it is PER RESULT with no aggregate guard, so parallel calls can each commit up to
-     * this many bytes in one turn. Detail routes answer verbatim recorded bytes.
+     * Model-facing text bound for one tool result: 32,768 bytes, the 8192-token share of the built-in
+     * 200,000-token default context window at 4 bytes per token. The figure is FIXED: it is declared once for
+     * that default window and the runtime applies this same number on every model, whatever window a session's
+     * model declares - nothing in the request path re-derives the cap from the model, so this published number
+     * is the number in force and a caller may size against it without asking which model answered. It is set to
+     * match the `read` tool's own output budget, so a full-budget read survives the wire instead of being cut
+     * into the truncation envelope. It is PER RESULT, and a turn's parallel calls are additionally bounded by a
+     * 98,304-byte aggregate (24,576 tokens): a call past that budget is cut to the bytes the turn has left, and
+     * its truncation note says so. Detail routes answer verbatim recorded bytes.
      */
     tool_result_bytes: number;
     page_limit_default: number;
@@ -2259,8 +2264,8 @@ export interface SessionToolSourceResponse {
      * reports the whole entry file as the kernel read it from disk, so the text can be longer than anything an
      * HTTP body could have uploaded. The write side is bounded differently: `module_text` on the create and
      * update bodies has no length bound either, so only this route's 1,000,000-byte body cap applies to it. The
-     * 262,144-byte figure elsewhere in this contract is the model-facing tool RESULT bound and has nothing to
-     * do with source text in either direction.
+     * 32,768-byte figure elsewhere in this contract is the model-facing tool RESULT bound and has nothing to do
+     * with source text in either direction.
      */
     module_text?: string;
     /**
@@ -2749,14 +2754,14 @@ export interface SessionUsageResponse {
 
 /**
  * One conversation as a roster row: identity, ownership, lifecycle, the invocation identity of its latest run,
- * and transcript SIGNALS. The committed transcript - every tool result verbatim, each bounded at 262,144 bytes
- * (256 KiB) of model-facing text - is deliberately absent, which is what makes a 256-conversation roster a
- * bounded read. `message_count` and `has_transcript` say whether a transcript read is worth asking for. This is
- * also the shape a stream `thread.upsert` row carries, and it is the ONLY place `preview` appears: a REST
- * roster row and a REST create/identified read never send it. `invocation_id`/`invocation_ids` + `epoch` are
- * the OTHER exception to "no invocation roster here": the row names its runs WITHOUT naming any turn, which is
- * what lets a client join a recorded frame to the conversation that ran it (see the two fields below for the
- * rule).
+ * and transcript SIGNALS. The committed transcript - every tool result verbatim, each bounded at the fixed
+ * 32,768-byte model-facing cap (the same number on every model, whatever window it declares) - is deliberately
+ * absent, which is what makes a 256-conversation roster a bounded read. `message_count` and `has_transcript`
+ * say whether a transcript read is worth asking for. This is also the shape a stream `thread.upsert` row
+ * carries, and it is the ONLY place `preview` appears: a REST roster row and a REST create/identified read
+ * never send it. `invocation_id`/`invocation_ids` + `epoch` are the OTHER exception to "no invocation roster
+ * here": the row names its runs WITHOUT naming any turn, which is what lets a client join a recorded frame to
+ * the conversation that ran it (see the two fields below for the rule).
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface ThreadSummary {
@@ -3041,9 +3046,10 @@ export interface TranscriptMetadataResponse {
  * filter, so a client can page a filtered view and still know the conversation's size. `revision` is the
  * transcript's own counter (`TranscriptMetadata.revision`), the same figure the `transcript` and
  * `transcript_messages` kinds of `StreamResourceKind` report, so paging and replacing never present two numbers
- * to compare. A tool entry's `content` is recorded text bounded at the model-facing 262,144 bytes (256 KiB per
- * result, with no aggregate cap across a turn's parallel calls), which is precisely why this route is paged
- * rather than embedded in a session read.
+ * to compare. A tool entry's `content` is recorded text bounded at the model-facing 32,768 bytes per result - a
+ * FIXED byte count, not a window-scaled one, so the same figure holds on every model (with a further
+ * 98,304-byte cap across one turn's parallel calls), which is precisely why this route is paged rather than
+ * embedded in a session read.
  */
 export type TranscriptMessagePage = PageMeta
     & {

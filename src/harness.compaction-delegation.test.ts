@@ -69,10 +69,13 @@
 //
 // The child overflows its own context with a TOOL RESULT rather than with the delegation input:
 // keeping the 2100-character seed out of the parent's transcript matters, because the token
-// estimate counts tool-call arguments too, and an input-sized seed makes the PARENT cross the
-// limit as well and turns the repro into two overlapping summarize passes. With the seed inside
-// the child's conversation, exactly ONE summarize pass runs in this harness and it runs on the
-// subthread, which is what the report is about.
+// estimate counts tool-call arguments too, and an input-sized seed would make the PARENT's fold
+// carry 2,100 characters of payload it never produced. With the seed inside the child's
+// conversation, the overflow that parks a thread is the CHILD's, the pass is the one that has to
+// resume inside the delegated run, and every park/answer pin below is child-scoped — which is what
+// the report is about. (The parent's own turn.before estimate crosses the same limit from ITS
+// catalogue floor, so a parent pass runs at its first boundary as well; see the sizing block. That
+// is a property of pricing the catalogue into the estimate, not of this fixture.)
 //
 // The scripted replies make "healthy" unambiguous: the compaction pass gets a scripted SUMMARY
 // (a tool-free prose answer — the compaction answer the instruction asked for) and the child's
@@ -84,11 +87,13 @@
 // answered?" an OBSERVATION rather than a hang.
 //
 // Fixtures mirror the accepted coverage map rather than inventing new ones:
-//   - src/plugin/context-compaction.test.ts:2482-2531 (SEED 2100 chars / LIMIT 520, the
-//     summarize settings, the bounded `settle` waiter) and :572-582 (`settingsOf`, which turns
-//     the OTHER shipped `turn.before` pass — `context-trimmer` — OFF, mandatory so this measures
-//     exactly one plugin); the awaited-gate-inside-a-request window at :3446-3463 and the
-//     lineage-correct child at :3520-3523
+//   - src/plugin/context-compaction.test.ts, the T9 block (SEED 2100 chars, the summarize
+//     settings, the bounded `settle` waiter; its LIMIT is now `CATALOGUE + 520` because the tool
+//     catalogue is priced into every boundary estimate — the same reason this file's LIMIT is
+//     derived off the child's catalogue floor below) and its `settingsOf` helper, which turns the
+//     OTHER shipped `turn.before` pass — `context-trimmer` — OFF, mandatory so this measures
+//     exactly one plugin; also its awaited-gate-inside-a-request case (the park window) and its
+//     lineage-correct child case
 //   - src/harness.thread-park-queue.test.ts:132-163 (`flush`, and the bounded `waitStatus` shape
 //     that fails rather than hangs)
 //   - src/harness.delegation.test.ts:821-851 (a parent that calls `delegate` and gets only the
@@ -126,13 +131,41 @@ import type {
 import { COMPACTION_INSTRUCTION, CONTINUATION_NUDGE } from './plugins/context-compaction.plugin';
 
 // ---------------------------------------------------------------------------
-// Sizing (derived from the documented estimator, core/context-estimate.ts: ceil(chars / 4))
+// Sizing (derived from the documented estimator: core/payload-bytes.ts prices the serialized
+// request, core/context-estimate.ts divides those bytes by 4, and src/harness.ts:12406-12410 +
+// :12512-12533 add the bytes of the thread's declared tool schema to every `turn.before` estimate)
 // ---------------------------------------------------------------------------
 
-// 2100 characters = 525 estimated tokens, above the 520 limit on its own, and the same seed the
-// single-thread summarize fixture uses. It lands in the CHILD's transcript as a tool result.
+// 2100 characters = 526 transcript-only tokens (1,920 real + 2 escaped newlines + 4 quotes), the
+// same seed the single-thread summarize fixture uses. It lands in the CHILD's transcript as a tool
+// result, and it is what carries the child's estimate past the limit on round 2 (see the sizing
+// block below: the limit now sits above the child's catalogue floor, so no single turn crosses it by
+// itself any more).
 const SEED = 'x'.repeat(2100);
-const LIMIT = 520;
+// The tool catalogue is now INSIDE every unanchored `turn.before` estimate (harness.ts:12406-12410
+// serializes each declared tool and 12512-12533 hands those bytes to the estimator;
+// core/payload-bytes.ts prices them and core/context-estimate.ts:392-418 adds them to the payload
+// before the /4), so a limit can
+// no longer sit below a thread's catalogue floor. With `presets: false` the floors are exactly
+// divisible by 4, and `turn.before` carries `toolSchemaBytes` (the parent's own catalogue) while the
+// delegated child prices ITS OWN catalogue, so the two floors differ:
+//   parent catalogue = 39,785 serialized bytes / 4 = 9,947 tokens
+//   child  catalogue = 32,379 serialized bytes / 4 = 8,095 tokens
+// probe: Temp/coding-w2/probe-delegation-floor.ts
+// The fixture is therefore sized off the CHILD's floor: the child must stay under the limit while
+// its round-1 estimate (floor + 7 = 8,102) and cross it when the seed tool result lands (round 2 =
+// floor + 534 = 8,629), and the parent still crosses the same limit from its own floor (9,947 + 115
+// = 10,062 on its first request).
+// THE DEAD-RUN GUARD (./plugins/context-compaction.plugin.ts `turnBefore`) is what keeps this case
+// to ONE pass: the PARENT's summarize pass is refused outright — its 9,946-token floor is above the
+// 8,625 ceiling, so no ladder rung could build a request the provider would take — and reported once
+// as `stage: 'unreachable-target'`, while the CHILD's floor (8,095) sits under the ceiling, so its
+// clipped compaction request fits and its pass runs. The two boundaries the case walks, sampled from
+// the guard:
+//   writer     9 947 = floor 9 946 + transcript 1    → refused (floor >= ceiling)
+//   researcher 8 629 = floor 8 095 + transcript 534  → the pass, the only one in the case
+const CHILD_CATALOGUE = 8_095;
+const LIMIT = CHILD_CATALOGUE + 530;
 const MODEL = 'merge/ds4-flash';
 
 const BRIEF_TASK = 'dig into the seeded report';
@@ -174,10 +207,21 @@ const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] 
 // The summarize settings, spelled out (the limit, the savings floor off, the mode), plus
 // `context-trimmer` OFF — the other shipped `turn.before` context pass, whose rule is a superset
 // of compaction's and would otherwise run its own pass on these transcripts.
+// `headroomRatio: 0` is the documented opt-out (X2, F3 took the headroom buffer off the "declared
+// window only" gate, so it now comes off EVERY binding ceiling), and this file needs it: the whole
+// sizing block above derives `LIMIT` against the plain number the operator typed — the child's
+// seeded round (8,629) crosses it and its opening round (8,102) does not, which is what makes the
+// overflow THIS case is about a TOOL RESULT rather than the delegation input. Left on the declared
+// 0.15 the child would compact on its opening turn instead, and the scenario would stop being the
+// one this file describes (the request-count-keyed transport, the AC7 inclusion table, and the
+// "the seed round is what pushed the child over" narrative below all move with it). Where the
+// buffer itself is pinned: the `resolveContextHeadroom` / `resolveContextTrigger` tables and the
+// handler-level F3 case in ./plugin/context-compaction.test.ts.
 const summarizeSettings = (): HarnessPluginSettingsProvider => {
     const stored: Record<string, number | string | boolean> = {
         contextLimit: LIMIT,
         minTokens: 0,
+        headroomRatio: 0,
         mode: 'summarize'
     };
 
@@ -453,9 +497,11 @@ describe('context compaction across a delegation (T6 repro)', () => {
             }
         };
 
-        // The child's own route past the limit: a tool whose result is the 2100-character seed.
-        // Nothing about the seed reaches the PARENT's transcript, so the parent's estimate stays
-        // under the limit and exactly one summarize pass runs in this harness.
+        // THE CHILD'S OWN ROUTE PAST THE LIMIT: a tool whose result is the 2100-character seed,
+        // which lands in the CHILD's transcript and is what lifts the child's round-2 estimate over
+        // the limit. Nothing about the seed reaches the PARENT's transcript, so the parent's fold
+        // never carries it — the parent's own boundary estimate crosses the limit from its catalogue
+        // floor (see the sizing block), which is the harness pricing the tool schema, not this seed.
         const seedTool = tool({
             description: 'Return the oversized report body.',
             tags: ['test'],

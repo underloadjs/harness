@@ -52,46 +52,180 @@
 //      the last delivery of an over-budget turn still pays its envelope
 //      overhead: the per-turn total is a soft bound, exceeded by at most one
 //      envelope (~a few hundred bytes) per result past the line.
+//   4. It bounds one RESULT and one TURN, not the conversation. Nothing in this
+//      module can: the transcript replays every past result on every later
+//      request, so N turns of a budget-sized result cost N x the budget however
+//      carefully each turn was bounded. That is what the context trimmer and the
+//      compaction plugin own; the numbers below only have to be small enough that
+//      a handful of turns does not spend the window (see the token sizing).
+//
+// WHAT T3 CHANGED, AND WHY (2026-11-17)
+// -------------------------------------
+// A context-explosion post-mortem (session `6a94b896-…`) measured 843,987 bytes of
+// `tool`-role messages in a root thread — 88.9% of the conversation, 73.4% of it a
+// single tool — with three messages of 257,074 / 228,928 / 198,958 bytes. Every one
+// of those messages was INSIDE the cap that was supposed to stop it, and the fix had
+// to be made in the two places the cap was wrong rather than in the tool:
+//
+//   1. The cap was measured on the wrong number. `boundToolResult` compared
+//      `utf8ByteLength(content)` — the text's own bytes — against the budget, while
+//      the number the provider bills is that text after JSON escaping, because a
+//      tool result becomes `HarnessMessage.content` and `content` is serialized as a
+//      JSON string. The gap is the escape table in ./payload-bytes.ts: measured on
+//      this very failure, +11,458 bytes (+4.7%) on a big `read` message and +10,458
+//      (+4.8%) on an escape-heavy one, up to 6x per character for control bytes. A
+//      "262144-byte" cap therefore authorized ~274 KB of body. The cap is now
+//      measured with `modelPayloadBytes` — the final serialized payload — so the
+//      declared budget and the billed bytes are the same number.
+//   2. The cap was 2022-sized. 256 KiB per result is ~64k tokens and 512 KiB per
+//      turn ~128k tokens, against a shipped context limit of 200,000 tokens
+//      (`CONTEXT_LIMIT_DEFAULT`, ../plugins/context-compaction.plugin.ts). A single
+//      tool result was allowed a third of the window, so three ordinary turns of one
+//      result each ended the session without any cap ever firing. The defaults are
+//      now stated in TOKENS and derived from that limit (see `MODEL_TOKEN_BYTES` and
+//      `toolResultBudgetsForContextTokens`), and they stay per-call parameters, so an
+//      operator with a bigger window raises the fraction, not a magic byte count.
+//
+// One thing the post-mortem did NOT turn out to be, recorded because the hypothesis
+// cost someone a detour: the "357x / 2287x escaping multiplication" was not escaping.
+// `read` answers a BATCH of paths in one message, and the byte figure the tool prints
+// is PER ENTRY (`returned 87 bytes` was one of 27 windows). One level of JSON escaping
+// on those inputs costs 1.08x (multibyte) to 1.5x (quote/backslash-heavy), and the
+// whole message measured 1.01x-1.08x of the bytes the tool emitted. The mass was
+// simply N windows times a per-window allowance, under an aggregate cap nobody could
+// see in the transcript. `read` now charges its model projection in this module's
+// currency and prints the aggregate it spent (see its `batchSummary`), so the mass is
+// both bounded and visible.
 //
 // Cross-references:
 //   - ../harness.ts    — applies the per-turn ledger to every tool result and tool error
+//   - ./payload-bytes.ts — the byte measures this module enforces with
 //   - ./tool-ui.ts     — the separate panel bounds
 //   - ../types         — the tool_result event whose `content` is this text
 
-// The default budget: 256 KiB of UTF-8 bytes per model-facing tool result or
-// tool error. 256 KiB is roughly 64k tokens of English prose.
+// The two byte measures, from the one module that owns them:
+//   - `utf8ByteLength`    — the TEXT's own cost. Used for the numbers the envelope's
+//     note quotes ("cut 64071 of 300000 bytes"), because those describe the tool's
+//     text, and for nothing that gates a cut.
+//   - `modelPayloadBytes` — the cost of that text once it is serialized into the
+//     request body. THIS is the budget currency (T3, see the header): the cap and the
+//     shrink loops below compare against it, so `content` never exceeds the budget the
+//     caller declared no matter how much escaping the payload needs.
+// `utf8ByteLength` is re-exported from here because it always was this module's
+// public measure (./command-builtins.ts and ./index.ts import it by name).
+import { modelPayloadBytes, utf8ByteLength } from './payload-bytes';
+
+export { modelPayloadBytes, utf8ByteLength };
+
+// The convention every model-facing byte budget in this package converts with. The
+// whole codebase sizes context as `ceil(chars / 4)` (see ./context-estimate.ts:24-28
+// and ../frontend/ui/turns.ts), so 4 BYTES is one token wherever a byte figure has to
+// become a token figure. Written down once so the two conventions cannot drift.
+export const MODEL_TOKEN_BYTES = 4;
+
+// The context window the shipped defaults are sized against. It MIRRORS
+// `CONTEXT_LIMIT_DEFAULT` in ../plugins/context-compaction.plugin.ts (200000), and it
+// is a literal rather than an import on purpose: core/ may not depend on the plugin
+// tree, and a plugin default is an operator setting, not a kernel fact. If that
+// default moves, the two numbers have to move together — `result-budget.test.ts`
+// pins this one so the drift is loud.
+export const DEFAULT_MODEL_CONTEXT_TOKENS = 200_000;
+
+// The token figures are the decision; every byte number in this module is derived
+// from them. The per-turn number is a whole multiple of the per-result number on
+// purpose, so "how many full results fit in one turn?" has one answer for every
+// window: `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_TOKENS / MODEL_TOOL_RESULT_BUDGET_TOKENS`
+// = 3.
 //
-// It is 4x the previous 64 KiB for one specific reason: `read` budgets its own
-// output at the same order of magnitude, and the two numbers MUST agree. When
-// both were 64 KiB, a read that exactly filled its content budget was always
-// over this wire cap (JSON escaping adds 2-15%), so the harness cut the result
-// mid-string and replaced the whole object with its envelope — destroying the
-// `nextLine`/`nextColumn` fields an agent needs in order to continue. `read`
-// now measures its own budget on the serialized form and reports `wireBytes`,
-// and this cap is set to match, so a full-budget read survives intact.
+// These are the T3 numbers. The defaults before it (256 KiB and 512 KiB) were written
+// when "a big context" meant 8k-32k tokens and were never re-derived against the
+// 200,000-token window this harness ships with: they allowed one result a third of the
+// window and one turn two thirds of it. The module's own comment conceded the
+// aggregate was unreachable — "512 KiB is ~128k tokens of prose: more than any
+// realistic context window can give a single turn" — and that is an argument for
+// lowering it, not for keeping it.
 //
-// The honest cost of raising it used to be: "the cap is PER RESULT and there is
-// no aggregate guard, so N parallel tool calls can now commit up to N x 256 KiB
-// in one turn." That is what `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES` below
-// closes; a single result is still bounded separately, which is what protects
-// the session from the one-unbounded-output-kills-the-context-window failure
-// this module exists for.
-export const MODEL_TOOL_RESULT_BUDGET_BYTES = 256 * 1024;
+//   - ~4% of the window for one result: 8,192 tokens. A `read` window, a grep body, a
+//     build-log tail. Big enough to answer a question about a file, small enough that
+//     a result which does fit is a result the model can still act on the same turn.
+//   - ~12% for one turn: 24,576 tokens, i.e. three full results. A turn is what the
+//     model pays for a round trip, and a parallel block of tool calls is exactly the
+//     shape that used to commit N x 256 KiB in one step.
+export const MODEL_TOOL_RESULT_BUDGET_TOKENS = 8_192;
+export const MODEL_TOOL_RESULTS_PER_TURN_BUDGET_TOKENS = 24_576;
+
+// The same two decisions expressed as RATIOS of the shipped window, so
+// `toolResultBudgetsForContextTokens` sizes a different window by the same rule and
+// cannot drift from the defaults: applied to `DEFAULT_MODEL_CONTEXT_TOKENS` it returns
+// the byte constants below exactly (0.04096 ~= 4%, 0.12288 ~= 12%).
+export const MODEL_TOOL_RESULT_BUDGET_SHARE = MODEL_TOOL_RESULT_BUDGET_TOKENS / DEFAULT_MODEL_CONTEXT_TOKENS;
+export const MODEL_TOOL_RESULTS_PER_TURN_BUDGET_SHARE = MODEL_TOOL_RESULTS_PER_TURN_BUDGET_TOKENS / DEFAULT_MODEL_CONTEXT_TOKENS;
+
+// The smallest budgets the sizing will hand out, whatever the window: a caller sizing
+// against a 2,000-token window would otherwise get an 80-byte per-result budget, below
+// the spill envelope's own overhead (~250 bytes), which means an envelope that cannot
+// contain its own note. Both floors sit above `SPILL_MIN_BUDGET_BYTES`, so a bounded
+// result always keeps a head, a tail and a note.
+const RESULT_BUDGET_MIN_BYTES = 4 * 1024;
+const TURN_BUDGET_MIN_BYTES = 8 * 1024;
+
+// One result's budget, in the units the cap is enforced in: the model-facing
+// (JSON-escaped) bytes of the text that becomes `HarnessMessage.content`.
+//
+// 32 KiB is ~8k tokens of prose and 4% of the shipped 200k window. The number is
+// DERIVED below from the token figures rather than written out, because the token
+// figure is the decision and the byte figure is its consequence.
+//
+// It is 8x SMALLER than the number it replaces, and the two consequences have to be
+// read together:
+//   - a tool result that used to arrive whole is now envelope-cut at 32 KiB, which is
+//     the whole point — a 250 KB result that "arrives whole" is a result the model
+//     cannot afford to have read;
+//   - `read` caps its own output at this number (see FILE_READ_WIRE_BUDGET in
+//     ../tools/files/read.tool.ts), so a full-budget read still survives the harness
+//     envelope byte for byte, which is the property that number exists to keep.
+//
+// KEEP THIS IN SYNC with `tool_result_bytes` in ../shared/harness-api.ts, the number
+// the HTTP boot document publishes: the manual tool route bounds its response with
+// `boundToolResult(text)` at THIS default and `src/server/api.test.ts` asserts the two
+// are equal, so raising one without the other makes the published contract lie.
+export const MODEL_TOOL_RESULT_BUDGET_BYTES =
+    MODEL_TOOL_RESULT_BUDGET_TOKENS * MODEL_TOKEN_BYTES;
 
 // The aggregate sibling of the cap above (compaction T5.2): the most TOTAL
-// tool-result text one turn may commit, summed over every call the model asked
+// tool-result payload one turn may commit, summed over every call the model asked
 // for in one assistant message.
 //
-// It is 2x the per-result cap on purpose. One full-budget `read` (256 KiB) plus
-// one more large result still fit UNCHANGED — the case the 256 KiB number was
-// raised for — while a turn that fires eight big reads, a build-log dump and a
-// web page can no longer spend 2 MiB of the window in one round. In token
-// terms 512 KiB is ~128k tokens of prose: more than any realistic context
-// window can give a single turn, so tripping it is always the right thing to
-// do, and a conversation that trips it on every turn is one the compaction
-// plugin (../plugins/context-compaction.plugin.ts) is going to have to prune
-// anyway.
-export const MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES = 512 * 1024;
+// 96 KiB is ~24k tokens and 12% of the shipped window: three full results. Two
+// numbers used to be needed to explain why 512 KiB was right ("one full-budget read
+// plus one more large result still fits UNCHANGED"); with a per-result budget of
+// 32 KiB the same sentence is "three results", and the arithmetic fits in a turn.
+export const MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES =
+    MODEL_TOOL_RESULTS_PER_TURN_BUDGET_TOKENS * MODEL_TOKEN_BYTES;
+
+// The two budgets for a window the operator configured differently, sized from the
+// same shares the shipped defaults use. A host whose model has a 32k window gets
+// 1.3k/3.9k-token budgets instead of inheriting a number sized for 200k, and a host
+// with a 1M window is not punished for it.
+//
+// `contextTokens` is the window in TOKENS (the unit `contextLimit` is set in). A
+// non-finite or non-positive value falls back to the shipped default rather than
+// returning a degenerate budget: callers pass an operator number here, and an
+// operator who typed `0` means "use the default", the same reading
+// `createToolResultTurnBudget` gives a disabled aggregate.
+export const toolResultBudgetsForContextTokens = (
+    contextTokens: number = DEFAULT_MODEL_CONTEXT_TOKENS
+): { perResultBytes: number; perTurnBytes: number } => {
+    const tokens = Number.isFinite(contextTokens) && contextTokens > 0 ? contextTokens : DEFAULT_MODEL_CONTEXT_TOKENS;
+
+    const perResult = Math.max(RESULT_BUDGET_MIN_BYTES, Math.floor(tokens * MODEL_TOKEN_BYTES * MODEL_TOOL_RESULT_BUDGET_SHARE));
+    const perTurn = Math.max(TURN_BUDGET_MIN_BYTES, Math.floor(tokens * MODEL_TOKEN_BYTES * MODEL_TOOL_RESULTS_PER_TURN_BUDGET_SHARE));
+
+    // The per-turn aggregate must always be able to hold at least one full result,
+    // or the ledger would spill a result that fits on its own — a budget the model
+    // cannot satisfy by behaving better.
+    return { perResultBytes: perResult, perTurnBytes: Math.max(perTurn, perResult) };
+};
 
 // The floor for an aggregate spill (see `ToolResultTurnBudget`). Once a turn's
 // aggregate headroom is down to a handful of bytes, spilling to exactly that
@@ -123,6 +257,12 @@ const TAIL_KEY = 'tail';
 // The result of applying the budget. `content` is what goes on the wire;
 // `truncated` and `originalBytes` let a caller (the server, a test) report that
 // a cap was applied without re-measuring the string.
+//
+// `originalBytes` is UTF-8 bytes of the TEXT (the figure the envelope's note quotes
+// and the figure `src/server/api.test.ts` pins). The budget it was compared against is
+// NOT in that unit: it counts serialized payload bytes, so the two numbers answering
+// "how big was it" and "how big is allowed" are deliberately different — see the note
+// on `spillNote` and the T3 section of this file's header.
 export type BoundedToolResult = {
     content: string;
     truncated: boolean;
@@ -149,18 +289,6 @@ export type ToolResultBoundOptions = {
 // the note, so the two different caps that can bound one result are never
 // confused by the model that reads the envelope.
 type SpillReason = 'cap' | 'aggregate';
-
-// UTF-8 byte length. The budget is expressed in bytes because the wire cost of a
-// transcript is bytes, not code points — one emoji is four of them. `TextEncoder`
-// is a standard global in Node and in every browser this package runs in; the
-// fallback keeps a hostile/older runtime from throwing and over-counts instead of
-// under-counting (`length` <= bytes is the wrong direction, so we take the max).
-const encoder = typeof TextEncoder === 'undefined' ? undefined : new TextEncoder();
-
-export const utf8ByteLength = (value: string): number => {
-    if (encoder) return encoder.encode(value).length;
-    return Math.max(value.length, 0);
-};
 
 // Drop a trailing lone high surrogate. Slicing by code unit can split a
 // surrogate pair; leaving half of one in the envelope would make JSON.stringify
@@ -196,6 +324,15 @@ const sourcePhrase = (source?: ToolResultSource): string => {
 // The honest line: what was dropped, which cap did it, and where the rest is.
 // Numbers only — no prose that could drift with a locale — because a model
 // parses this and a test asserts it byte for byte.
+//
+// THE UNITS, stated because a byte figure that means two things means nothing: the
+// three numbers this line quotes (`omittedBytes`, `originalBytes`, and the two
+// preview sizes) are UTF-8 BYTES OF THE TOOL'S TEXT — that is what a reader is
+// reasoning about when it asks "how much of the file did I not get". The
+// `${budgetBytes}` figure beside them is a PAYLOAD budget, i.e. the escaped bytes the
+// model is charged (T3). They differ by the escape factor, and the envelope's JSON
+// number `budgetBytes` is machine-readable for exactly that reason: a client asserts
+// on it (`src/server/api.test.ts`) and does not read it as prose.
 const spillNote = (
     originalBytes: number,
     budgetBytes: number,
@@ -258,6 +395,15 @@ const envelope = (
 };
 
 // Shared implementation behind `boundToolResult` and the per-turn ledger.
+//
+// THE CURRENCY (T3): `budgetBytes` is a PAYLOAD budget. Every comparison below — the
+// early return, both shrink loops, and the ledger's tally — is against
+// `modelPayloadBytes`, the number of bytes this text occupies once it is serialized
+// into the model request, because that is the number the provider bills and the only
+// one a declared budget can honestly bound. `utf8ByteLength` is still what the note
+// QUOTES (a model reading "cut 64071 of 300000 bytes" is reading about the tool's
+// text, not about a JSON encoding it never sees), which is why both measures appear
+// here and only one of them gates anything.
 const boundWithReason = (
     content: string,
     budgetBytes: number,
@@ -267,24 +413,34 @@ const boundWithReason = (
 ): BoundedToolResult => {
     const originalBytes = utf8ByteLength(content);
 
-    // Small outputs are EXACT: no re-encoding, no normalization, no marker.
-    if (originalBytes <= budgetBytes) return { content, truncated: false, originalBytes };
+    // Small outputs are EXACT: no re-encoding, no normalization, no marker. The test
+    // is the payload measure, so a 640-byte quote-heavy window that escapes to 962
+    // bytes is now compared as 962 against the budget — the direction that was
+    // previously 357 bytes of unbudgeted drift per such result.
+    if (modelPayloadBytes(content) <= budgetBytes) return { content, truncated: false, originalBytes };
 
-    // One code unit can never encode to less than one byte, so a code-unit slice
-    // of `budgetBytes` is an upper bound on a preview pair that fits. JSON
-    // escaping of the previews only makes the envelope longer, hence the shrink
-    // loops below.
+    // One code unit can never encode to less than one byte — after escaping either:
+    // the widest escape JSON produces (`\u00XX`, `\udXXX`) is 6 bytes and the
+    // narrowest real character is 1 — so a code-unit slice of `budgetBytes` is still
+    // an upper bound on a preview pair that fits. Escaping of the previews only makes
+    // the envelope longer, hence the shrink loops below.
     let keep = Math.min(content.length, budgetBytes);
     let bounded = envelope(content, keep, originalBytes, budgetBytes, reason, aggregateBytes, source);
 
     // Geometric shrink, then exact shrink: at most O(log n) + a few iterations,
-    // and it terminates because every step strictly reduces `keep`.
-    while (utf8ByteLength(bounded) > budgetBytes && keep > 0) {
+    // and it terminates because every step strictly reduces `keep`. Both measure the
+    // ENVELOPE as it will be serialized: the envelope is itself JSON text, so its own
+    // quotes are escaped on the wire, and a quote inside a PREVIEW has already been
+    // escaped once by `JSON.stringify` building the envelope — `"x"` becomes `\"x\"`
+    // here and `\\\"x\\\"` in the request body, four bytes for one byte of the tool's
+    // text. Measuring the final string is the only way to know which of the two the
+    // caller is paying, and it is never an under-count.
+    while (modelPayloadBytes(bounded) > budgetBytes && keep > 0) {
         keep = Math.floor(keep * 0.9);
         bounded = envelope(content, keep, originalBytes, budgetBytes, reason, aggregateBytes, source);
     }
 
-    while (utf8ByteLength(bounded) > budgetBytes && keep > 0) {
+    while (modelPayloadBytes(bounded) > budgetBytes && keep > 0) {
         keep -= 1;
         bounded = envelope(content, keep, originalBytes, budgetBytes, reason, aggregateBytes, source);
     }
@@ -335,7 +491,13 @@ export const boundToolResult = (
 // settled first — bounded, stated, and never a correctness problem because
 // every result still arrives, just possibly spilled.
 export type ToolResultTurnBudget = {
-    /** Bytes committed into this turn so far (envelope included, UTF-8). */
+    /**
+     * Model-facing bytes committed into this turn so far (envelope included), counted
+     * with `modelPayloadBytes` — the same currency `aggregateBytes()` is declared in
+     * (T3). Counting the turn in text bytes while capping each result in payload bytes
+     * would let the tally under-report what the request actually carries by the escape
+     * factor of every result in it.
+     */
     committedBytes(): number;
     /** The aggregate this ledger enforces (`0` = no aggregate guard). */
     aggregateBytes(): number;
@@ -378,7 +540,11 @@ export const createToolResultTurnBudget = (
                     : perResult;
 
             const capped = boundWithReason(content, requested, 'cap', undefined, options.source);
-            const size = utf8ByteLength(capped.content);
+            // T3: the turn is tallied in the same payload bytes the aggregate is
+            // declared in. `utf8ByteLength` here under-reported a quote-heavy turn by
+            // ~5% per result, which is how a turn of "512 KiB" reached ~540 KiB of
+            // body without ever looking over budget.
+            const size = modelPayloadBytes(capped.content);
 
             if (aggregate === 0 || committed + size <= aggregate) {
                 committed += size;
@@ -402,7 +568,8 @@ export const createToolResultTurnBudget = (
             }
 
             const spilled = boundWithReason(content, spillBudget, 'aggregate', aggregate, options.source);
-            committed += utf8ByteLength(spilled.content);
+            // Same currency as `size` above (T3).
+            committed += modelPayloadBytes(spilled.content);
 
             return spilled;
         }

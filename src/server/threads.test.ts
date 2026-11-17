@@ -399,22 +399,38 @@ const laneFixture = (): {
 // a transcript long enough to cross the trigger — so the pass's own extra model request and
 // its fire-and-forget continuation turn happen for real, uncontrolled by the test.
 //
-// THE NUMBERS, derived before the run rather than read off it:
-//   - `contextLimit: 520` is the firing point (the operator's one-number ruling —
-//     ../plugins/context-compaction.plugin.ts resolves the trigger with no headroom);
-//   - the estimate is `ceil(chars / 4)` of the projected request (../core/context-estimate.ts),
-//     so the 2 100-character prompt alone is 525 tokens, plus the 3-character `sys`
-//     instruction: over 520 on the very first boundary, and the pass must therefore fire on
-//     the FIRST submit and on nothing after it — the retained head it leaves (the OpenCode
-//     checkpoint instruction ~429 tokens, the 8-character answer, the nudge) measures ~479,
-//     under 520. The limit and the prompt are SIZED BY THAT INSTRUCTION: it is the shipped
-//     plugin's own constant (1714 characters since 2026-11-12), so a fixture whose limit sat
-//     below it would re-fire on every continuation and paint a third row;
+// THE NUMBERS, derived before the run rather than read off it (re-derived 2026-11-17 after
+// the estimator started pricing the TOOL CATALOGUE in an unanchored round — see
+// ../core/context-estimate.ts `constantAllowanceBytes`; the estimate that used to read 528 for
+// this transcript reads 12 330 now, and a fixture sized by the old figure simply never fires):
+//   - `contextLimit: 9 700` is the firing point (the operator's one-number ruling —
+//     ../plugins/context-compaction.plugin.ts resolves the trigger with no headroom, and this
+//     preset declares no model window, so there is no 15 % buffer either);
+//   - the harness estimate prices the whole billed request, so it has TWO parts here. The
+//     FLOOR — the tool catalogue, the agent instructions, the harness turns and the per-call
+//     overhead — measures 8 079 tokens for this preset and does not move with the transcript.
+//     The prompt does: `x` repeated 17 000 times is 17 000 ASCII bytes = 4 250 tokens, plus
+//     the 3-character `sys` instruction = 4 251, so the first boundary projects 12 330 —
+//     over 9 700, so the pass fires on the FIRST submit. With the 1 714-character compaction
+//     instruction on top (438 tokens, 4 689 in total) the request the pass sends is 12 768
+//     billed tokens with 4 689 of removable transcript in it;
+//   - the limit is SIZED BY THE FLOOR, in both directions. Above it: 8 079 + 438 = 8 517 is
+//     the smallest request this pass can ever build, so a limit under that is a limit no
+//     compaction can ever satisfy — the dead-run guard in
+//     ../plugins/context-compaction.plugin.ts refuses the pass outright (clipping cannot close
+//     an overage that belongs to the catalogue) and the two stacked rows this case exists to
+//     paint never appear. Below it: the retained head the pass leaves — the committed
+//     transcript, the 8-character answer and the continuation nudge, plus that same 8 079
+//     floor — measures 8 566, and the next two boundaries are 8 566 and 8 570. Both sit under
+//     9 700, so exactly ONE pass runs and no third row is painted. Those three margins
+//     (8 517 → 9 700 → 8 566) are what the constants are sized by; if the catalogue grows
+//     past them the case fails LOUDLY, in the frame count or in `fixture.prompts`, rather
+//     than by painting rows for the wrong reason;
 //   - `minTokens: 0` keeps the summarize floor from refusing the pass by accident;
 //   - `context-trimmer.enabled: false` is the same isolation the producer half uses, so
 //     exactly one withheld unit shows up in the folded bar.
-const COMPACTION_LIMIT = 520;
-const COMPACTING_PROMPT = 'x'.repeat(2100);
+const COMPACTION_LIMIT = 9_700;
+const COMPACTING_PROMPT = 'x'.repeat(17_000);
 
 const compactionFixture = (): { preset: HarnessPreset; prompts: string[] } => {
     // The LAST user message of every provider request the harness sends, in order. It is the
@@ -5453,7 +5469,7 @@ describe('display lane (C1)', () => {
         // fired — the second submit's request is asserted below.
         expect(fixture.prompts).toEqual([COMPACTION_INSTRUCTION, CONTINUATION_NUDGE]);
 
-        // THE BAR, from the store's own fold: the instruction and the 2 100-character prompt
+        // THE BAR, from the store's own fold: the instruction and the 17 000-character prompt
         // sit on row 0, and both answers the pass produced sit on row 1. `chars` is pinned
         // alongside the lane because it is what proves the split is a compaction boundary and
         // not just two runs: the row-0 pair is the oversized prompt, the row-1 pair is eight
@@ -5464,7 +5480,7 @@ describe('display lane (C1)', () => {
             boundaryContext.map((block) => [block.id, block.name, block.lane, block.chars])
         ).toEqual([
             ['0-system-instructions', 'instructions', undefined, 3],
-            ['0-user-prompt', 'prompt', undefined, 2_100],
+            ['0-user-prompt', 'prompt', undefined, 17_000],
             ['0-assistant-1', 'answer', 1, 8],
             ['0-assistant-4', 'answer', 1, 8]
         ]);
@@ -5491,7 +5507,7 @@ describe('display lane (C1)', () => {
         ]);
 
         // ONE ROW, entirely on the raised lane — and the prompt block is FIVE characters now,
-        // which is the compacted head the pass left behind rather than the 2 100-character
+        // which is the compacted head the pass left behind rather than the 17 000-character
         // prompt the first turn carried.
         const continuationContext =
             store.getView(created.id).displays[continuation.id].sections[0].context ?? [];
@@ -5507,9 +5523,10 @@ describe('display lane (C1)', () => {
         expect(lanesOf(continuationContext)).toEqual([1]);
 
         // EXACTLY ONE PASS for the whole session: the third request is this submit's answer,
-        // not a second compaction. The retained head measures ~479 against the 520 limit, so the
-        // is not what stopped it — the estimate did — and the bar above stays one row because
-        // nothing raised a lane 2.
+        // not a second compaction. The head the pass leaves measures 8 566 estimated tokens —
+        // 8 079 of irreducible catalogue plus the retained transcript — against the 9 700
+        // limit, so the context-trimmer is not what stopped it (the estimate is), and the bar
+        // above stays one row because nothing raised a lane 2.
         expect(fixture.prompts).toEqual([COMPACTION_INSTRUCTION, CONTINUATION_NUDGE, 'again']);
 
         // The turn the compaction happened IN keeps the lane it STARTED on (absent = row 0),

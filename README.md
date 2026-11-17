@@ -4208,6 +4208,23 @@ an unrelated stream frame cannot destroy an in-progress repair.
   unsubscribes the observer, and the header cycler is never disabled by pending work.
   There is no Reset button to lock: starting over is New session, and
   `POST /v1/harness/sessions/:id/reset` remains a server route for other clients.
+- **The agent name inside the composer frame is the "who answers next" switch, and it is local
+  until you send.** On a keyboard, `Tab` and `Shift+Tab` while you type step through the team's
+  agents (forward, backward, wrapping at both ends), while clicking that name — or `Enter`/`Space`
+  on it — opens the agent settings dialog exactly as before. With a thumb, a tap switches to the
+  next agent and a press-and-hold (about half a second; a finger that slides off it cancels the
+  press instead) opens that same dialog. Which half you get follows the INPUT device, not the
+  window width, so a narrow desktop window keeps the keyboard rules and a wide landscape phone
+  still taps. Cycling costs no request and writes nothing: the name in the frame is the only
+  thing that changes, and the choice belongs to the conversation you are in, so switching
+  conversations or starting a new one forgets it. Your next send commits it — that
+  message runs the agent you picked, in a conversation that agent owns, and the name then falls
+  back to the team's entry agent for the message after — and nothing about the harness definition
+  changes: no promotion, no team edit, no `PATCH`. A team with one agent, or a Tools/Plugins view
+  that hides the name, leaves `Tab` as the plain focus move it always was, and the button states
+  the reason. Switching agent while a conversation is expanded releases that focus, because each
+  conversation runs its own agent, so the routing line above the field reads `New thread` and your
+  message really does go to the agent you picked.
 - **Reload and switching recover from the record.** Selecting a session that still
   has work opens one `GET /v1/harness/stream` observer (a submit also opens or reopens
   it); a lost socket is re-opened with its

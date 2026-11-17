@@ -134,9 +134,14 @@ info:
     action requests per session, and at most 64 steered-submit audit records on one turn. At most 32
     tools created per harness lifetime, and going past that answers 400 naming the budget - a
     registration is refused, not conflicted, because the caller's fix is to reuse a name rather than to
-    wait for state to change. A model-facing tool result is bounded to 262,144 bytes of text (256 KiB,
+    wait for state to change. A model-facing tool result is bounded to 32,768 bytes of text (the
+    8192-token share of the built-in 200,000-token default context window, at 4 bytes per token —
     sized to match the `read` tool's own output budget so a full-budget result survives the wire
-    intact); the detail routes answer recorded bytes verbatim and state the cap they were measured
+    intact); the bound is a FIXED byte count, declared once for the default window and applied
+    identically whatever model a session runs — the server does not re-derive it from a model's
+    context window, so the published number is the number in force. One turn's results also share a
+    98,304-byte aggregate (24,576 tokens), and a call past it is cut to what the turn has left;
+    the detail routes answer recorded bytes verbatim and state the cap they were measured
     against. Stream limits are stated on the stream operation itself.
 
 
@@ -285,7 +290,10 @@ paths:
                   pending_actions: 4
                   steer_records: 64
                   created_tools: 32
-                  tool_result_bytes: 262144
+                  # The default-window figure: 8192 tokens x 4 bytes of the built-in
+                  # 200 000-token window. The number is FIXED: sized in tokens for that
+                  # default window, and applied on every model. Per-turn aggregate is 98304 bytes.
+                  tool_result_bytes: 32768
                   page_limit_default: 25
                   page_limit_max: 100
                 links:
@@ -2771,7 +2779,8 @@ paths:
         the first entry to return, so a client can jump to an end (`cursor` past the last entry answers an
         empty page plus `total`) or stream forward from a known point without re-reading. Every entry is a
         verbatim `HarnessMessage` in the shape the harness manipulates, and a tool entry may carry tool
-        result text up to the model-facing 262,144-byte bound (256 KiB per result) - which is exactly why this
+        result text up to the model-facing 32,768-byte bound (a per-result envelope that is a FIXED byte
+        count, the same on every model) - which is exactly why this
         is a paged route.
         An unreadable transcript answers a valid placeholder list plus `transcript_state: unreadable`; the
         broken stored value is on the document route, never here.
@@ -4315,10 +4324,17 @@ components:
           type: integer
           minimum: 1
           description: >-
-            Model-facing text bound for one tool result: 262,144 bytes (256 KiB). It is set to match the
-            `read` tool's own output budget, so a full-budget read survives the wire instead of being cut
-            into the truncation envelope; it is PER RESULT with no aggregate guard, so parallel calls can
-            each commit up to this many bytes in one turn. Detail routes answer verbatim recorded bytes.
+            Model-facing text bound for one tool result: 32,768 bytes, the 8192-token share of the
+            built-in 200,000-token default context window at 4 bytes per token. The figure is FIXED:
+            it is declared once for that default window and the runtime applies this same number on
+            every model, whatever window a session's model declares - nothing in the request path
+            re-derives the cap from the model, so this published number is the number in force and a
+            caller may size against it without asking which model answered. It is set to match the
+            `read` tool's own output budget, so a full-budget read survives the wire instead of
+            being cut into the truncation envelope. It is PER RESULT, and
+            a turn's parallel calls are additionally bounded by a 98,304-byte aggregate (24,576 tokens):
+            a call past that budget is cut to the bytes the turn has left, and its truncation note says
+            so. Detail routes answer verbatim recorded bytes.
         page_limit_default:
           type: integer
           minimum: 1
@@ -6771,7 +6787,7 @@ components:
             reports the whole entry file as the kernel read it from disk, so the text can be longer than anything
             an HTTP body could have uploaded. The write side is bounded differently: `module_text` on the create
             and update bodies has no length bound either, so only this route's 1,000,000-byte body cap applies to
-            it. The 262,144-byte figure elsewhere in this contract is the model-facing tool RESULT bound and has
+            it. The 32,768-byte figure elsewhere in this contract is the model-facing tool RESULT bound and has
             nothing to do with source text in either direction.
         source:
           type: string
@@ -7501,7 +7517,8 @@ components:
       description: >-
         One conversation as a roster row: identity, ownership, lifecycle, the invocation identity of its
         latest run, and transcript SIGNALS. The committed
-        transcript - every tool result verbatim, each bounded at 262,144 bytes (256 KiB) of model-facing text -
+        transcript - every tool result verbatim, each bounded at the fixed 32,768-byte model-facing
+        cap (the same number on every model, whatever window it declares) -
         is deliberately absent, which is what makes a 256-conversation roster a bounded read. `message_count` and
         `has_transcript` say whether a transcript read is worth asking for. This is also the shape a stream
         `thread.upsert` row carries, and it is the ONLY place `preview` appears: a REST roster row and a REST
@@ -7906,8 +7923,10 @@ components:
         `role` filter, so a client can page a filtered view and still know the conversation's size. `revision` is
         the transcript's own counter (`TranscriptMetadata.revision`), the same figure the `transcript` and
         `transcript_messages` kinds of `StreamResourceKind` report, so paging and replacing never present two
-        numbers to compare. A tool entry's `content` is recorded text bounded at the model-facing 262,144 bytes
-        (256 KiB per result, with no aggregate cap across a turn's parallel calls), which is precisely why this
+        numbers to compare. A tool entry's `content` is recorded text bounded at the model-facing
+        32,768 bytes per result - a FIXED byte count, not a window-scaled one, so the same figure holds on
+        every model (with a further 98,304-byte cap across
+        one turn's parallel calls), which is precisely why this
         route is paged rather than embedded in a session read.
       allOf:
         - $ref: '#/components/schemas/PageMeta'
@@ -9414,7 +9433,8 @@ components:
             content:
               type: string
               description: >-
-                The model-facing result text, bounded at 262,144 bytes (256 KiB) by the record itself; the step
+                The model-facing result text, bounded at 32,768 bytes (a FIXED per-result cap, the same
+                figure on every model) by the record itself; the step
                 detail route answers the recorded bytes from the durable event rather than this projection.
             toolCallId:
               type: string

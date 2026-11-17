@@ -127,6 +127,18 @@ describe('plugin auto-discovery', () => {
                 type: 'string',
                 default: '{}'
             },
+            // The 2026-11-17 headroom row, declared right after the `modelLimits` entry it
+            // depends on (the buffer only comes off a ceiling a declared window makes binding),
+            // with the plugin's own half-window cap restated as the descriptor's `max`.
+            {
+                key: 'headroomRatio',
+                label: 'Headroom before a declared window (ratio)',
+                type: 'number',
+                default: 0.15,
+                min: 0,
+                max: 0.5,
+                step: 0.01
+            },
             {
                 key: 'enabled',
                 label: 'Compact conversations',
@@ -292,8 +304,17 @@ describe('turn.before interception', () => {
         // The hook sees EXACTLY what the provider was about to receive: the committed
         // transcript projected for this turn, before any rewrite.
         expect(hooks[0].messages).toEqual([{ role: 'user', content: 'ABCDEFGH' }]);
-        // 8 characters at ~4 chars/token (core/context-estimate.ts) = 2.
-        expect(hooks[0].estimatedTokens).toBe(2);
+        // 8 bytes of projected transcript, PLUS the tool catalogue this round declares: a
+        // default harness (`presets` on, no explicit tool switches) offers 7 declarations,
+        // and `toolSchemaPayloadBytes` of the request's own `tools` is 33,366 serialized
+        // payload bytes — a constant 8,342-token floor the transcript can never show. The
+        // round has no `usage` anchor yet, so it is priced blind at
+        // ceil((8 + 33,366) / 4) = 8,344; it read 2 while the estimate counted the
+        // transcript alone, which is the number the measured provider refusal proved wrong
+        // (../core/context-estimate.ts "THE TOOL-CATALOGUE FLOOR", src/harness.ts
+        // `toolSchemaBytes`). Re-derive with:
+        //   Math.ceil((8 + toolSchemaPayloadBytes(seen[0].tools)) / 4).
+        expect(hooks[0].estimatedTokens).toBe(8344);
         expect(hooks[0].iteration).toBe(1);
         expect(hooks[0].agent).toBe('writer');
         // The callable root runs in the primary's DEFAULT conversation.

@@ -381,6 +381,98 @@ export const connectionFailureOf = (
 };
 
 // ---------------------------------------------------------------------------
+// Context overflow (issue 0004) — ONE matcher, BOTH failure paths
+// ---------------------------------------------------------------------------
+//
+// WHY THIS BLOCK MOVED OUT OF ./openai.ts (2026-11-17, the provider-transit
+// context-limit report). The reported failure is a prompt that does not fit: the
+// gateway (`packages/underload/service`) answers `200 OK` + `text/event-stream`
+// BEFORE it generates (`src/server/start.ts:286-288`), so a context-length refusal
+// can no longer arrive as an HTTP status — it arrives as ONE SSE error frame on an
+// open stream. The transport already named that refusal precisely when it came as a
+// 400/413 response, but the in-stream path had a DIFFERENT classifier
+// (`providerWireFailureOf` below) that read only the wire `code`/`status`, so the
+// same provider answer reached `agent()` as a codeless `provider-transit` failure
+// and walked the whole 11-attempt ladder on deterministic bytes — ~3 minutes of
+// backoff for a refusal that cannot change. One question ("do these bytes not fit?")
+// had two answers because it had two matchers; this is now the ONE matcher, called
+// by the HTTP path (./openai.ts) and by the in-stream path (`providerWireFailureOf`).
+//
+// IT STILL DECIDES ONLY HOW A FAILURE IS NAMED, never what it says, and it is a
+// RECOGNISER, never a status guess: the worst case of a miss is the exact frame we
+// emitted before issue 0004, and the worst case of a false hit is a refusal that
+// would have been terminal anyway being called by a more actionable name.
+export const CONTEXT_OVERFLOW_CODE = 'context-overflow';
+
+// Providers do not agree on one wording, so recognition is an explicit list of the
+// phrasings real endpoints actually emit — never a status guess and never a bare
+// number. Every entry is a phrase only a size rejection uses:
+//   - `maximum context length` / `context_length_exceeded` — OpenAI and the
+//     gateways that relay it ("This model's maximum context length is 8192 tokens.
+//     However, your messages resulted in 9000 tokens…");
+//   - `prompt is too long` — Anthropic and the gateways that pass its text through;
+//   - `input is too long`, `too many tokens`, `context window`,
+//     `token limit exceeded` — the vLLM / Ollama / OpenRouter phrasings;
+//   - `request|payload|body too large` — the plain proxy-layer rejection, which on
+//     a chat-completions POST can only mean the prompt.
+//
+// Deliberately NOT matched: `max_tokens` on its own (a sampling-field complaint —
+// "Invalid value for max_tokens" is a broken request, not an oversized one), a bare
+// `length`, or any number. And a 400 that matches nothing keeps its raw detail:
+// this classifier decides only how a failure is NAMED, never what it says, so the
+// worst case is the pre-0004 frame, not a wrong diagnosis.
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+    /maximum context length/i,
+    /context[ _-]?length[ _-]?exceeded/i,
+    /context[ _-]?window/i,
+    /prompt[ _-]?is[ _-]?too[ _-]?long/i,
+    /input[ _-]?(?:is[ _-]|was[ _-])?too[ _-]?long/i,
+    /too[ _-]?many[ _-]?tokens/i,
+    /token[ _-]?limit[ _-]?exceeded/i,
+    /(?:request|payload|body)[ _-]?too[ _-]?large/i
+];
+
+// Does this text say "too long"? Exposed because the in-stream path needs the wording
+// half WITHOUT the HTTP status half (a gateway frame usually has no status to quote),
+// and because a host on a custom transport should classify from the same list rather
+// than copy it. Never call this alone to name a NON-400/413 answer: use
+// `isContextOverflowSignal`, whose status gate is what stops a dead 502 whose error
+// page happens to link the provider's context docs from being read as a size problem.
+export const isContextOverflowWording = (detail: string): boolean =>
+    CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(detail));
+
+// THE ONE MATCHER. `status` is the HTTP status of the response (the HTTP path always
+// has one) or the status the gateway quotes on its error frame (the in-stream path
+// usually has NONE, because `buildStreamErrorPayload` attaches `status` only to its
+// own `upstream_status` class — packages/underload/service/src/server/start.ts:660-668).
+//
+// THE GATE, stated because every arm is a judgement call:
+//   - `413`, whatever it says: on a chat-completions POST the only thing that can be
+//     too large is the request body, and a proxy that caps body size means the same
+//     thing by it. Unchanged from issue 0004.
+//   - `400` + the wording: a 400 is otherwise "your request is malformed", so the
+//     wording is what earns the size diagnosis. A 400 with NO wording stays the plain
+//     refusal it always was.
+//   - any OTHER status (`401`, `403`, `404`, `408`, `429`, `5xx`), whatever it quotes:
+//     never an overflow. That is the pre-existing rule for the HTTP path, kept verbatim,
+//     and it now also protects the in-stream path — an upstream 504 whose prose quotes
+//     the provider's context docs is still a 504, and its remedy is time, not a smaller
+//     prompt. An upstream 413 was codeless transit before and is an overflow now; that
+//     is the one widening, and it only names more precisely a frame that the SAME
+//     provider would have answered 413 without a gateway in front of it.
+//   - NO status at all: the wording alone decides, and this is the arm that exists for
+//     the reported failure. Absence of a status is NOT evidence of an unrelated status
+//     — it is the gateway telling us it never saw one — so a frame whose prose says
+//     "prompt is too long" is the provider's own refusal, relayed.
+export const isContextOverflowSignal = (status: number | undefined, detail: string): boolean => {
+    if (status === undefined) return isContextOverflowWording(detail);
+    if (status === 413) return true;
+    if (status !== 400) return false;
+
+    return isContextOverflowWording(detail);
+};
+
+// ---------------------------------------------------------------------------
 // Deterministic HTTP refusals (T8, AC3)
 // ---------------------------------------------------------------------------
 
@@ -450,25 +542,47 @@ export const isTerminalProviderStatus = (status: number): boolean =>
 // src/transport/openai.provider-wire-codes.test.ts `keeps a frame with NO code at all`),
 // so it is kept on purpose and never "fixed" away.
 //
-// NOTHING HERE READS THE MESSAGE. Classification comes from `code`, with `status` and
-// `errno` as secondary inputs, because the producer's prose is endpoint-specific (the
-// private relay names `upstream <origin+pathname>`, other endpoints name
-// `endpoint <folder>`) and the `unknown` class keeps the byte-identical legacy sentence
-// `Upstream stream terminated`. The message is forwarded verbatim for a codeless frame
-// and quoted for a coded one; it is never a classifier.
+// NOTHING HERE READS THE MESSAGE — with ONE named exception (2026-11-17). Classification
+// comes from `code`, with `status` and `errno` as secondary inputs, because the producer's
+// prose is endpoint-specific (the private relay names `upstream <origin+pathname>`, other
+// endpoints name `endpoint <folder>`) and the `unknown` class keeps the byte-identical
+// legacy sentence `Upstream stream terminated`. The message is forwarded verbatim for a
+// codeless frame and quoted for a coded one; it is never a classifier — EXCEPT for the
+// single class where the prose is the only signal that exists: a CONTEXT-LENGTH REFUSAL.
+// `isContextOverflowSignal` (above) is consulted for the arms that would otherwise be
+// codeless or `provider-rejected`, and only there; a definite gateway verdict (`timeout`,
+// `connection`, `aborted`) is never overridden by prose. WHY that one exception is sound:
+// the phrases in the list are not endpoint-specific — "maximum context length",
+// "prompt is too long", "input is too long" are what the MODEL SERVERS say, and a gateway
+// relays them — and the class it produces is terminal, so a false hit can only rename a
+// refusal that would already have stopped the ladder.
+//
+// THE OVERFLOW ARM IS NOT A WIDENING OF THE LADDER, IT IS AN EXIT FROM IT. Before it, a
+// gateway-relayed size refusal was the codeless `provider-transit` case below: eleven
+// attempts and ~3 minutes of backoff on bytes that cannot change, which is the defect this
+// file's header calls "a ladder buys a delay and nothing else". `agent()`
+// (../core/agent.ts) keeps `context-overflow` out of every ladder, so the run fails on the
+// first attempt and the compaction policy above it (the `context-overflow` consumer) gets a
+// machine answer instead of a sentence to re-derive.
 //
 //   wire `timeout`        → `provider-timeout`      (the bounded timeout ladder)
 //   wire `connection`     → `provider-connection`   (the short 3-attempt dial ladder)
 //   wire `aborted`        → `provider-aborted`      (never retried: a cancel is not a blip)
-//   wire `upstream_status`→ classified by `status` through `isTerminalProviderStatus`:
-//                          a refusal status (400/401/403/404) is `provider-rejected`
-//                          (terminal), anything else — including a frame with no usable
-//                          status, which cannot be classified — is the codeless class.
+//   wire `upstream_status`→ FIRST, `isContextOverflowSignal(status, message)`: an upstream
+//                          413, or a 400 whose prose is a size refusal, is
+//                          `context-overflow` (terminal, and actionable by compaction).
+//                          Otherwise `status` through `isTerminalProviderStatus`: a refusal
+//                          status (400/401/403/404) is `provider-rejected` (terminal),
+//                          anything else — including a frame with no usable status, which
+//                          cannot be classified — is the codeless class.
 //   wire `decode` /
 //       `unknown` /
-//       no code at all    → codeless, the generic transient ladder. UNCHANGED on purpose:
-//                          a body we could not decode or a provider that names nothing is
-//                          exactly the case the exponential ladder exists for.
+//       no code at all    → `context-overflow` when the frame's prose is a size refusal
+//                          (the gateway forwarded no status, so prose is all there is);
+//                          otherwise codeless, the generic transient ladder. UNCHANGED on
+//                          purpose for everything the prose does not name: a body we could
+//                          not decode or a provider that names nothing is exactly the case
+//                          the exponential ladder exists for.
 //
 // `decode` is deliberately NOT terminal: a provider that fails to decode ITS upstream's
 // reply is an upstream that will probably answer properly on the next dial, and the
@@ -512,6 +626,11 @@ export const PROVIDER_TRANSIT_CLASS = 'provider-transit';
 // What one gateway error frame means in OUR vocabulary. `code` absent = codeless
 // transient ladder; `errorClass` is always set, because the diagnosis is emitted even
 // when the retry class is generic (see `PROVIDER_TRANSIT_CLASS`).
+//
+// `code` is one of the four provider classes OR `CONTEXT_OVERFLOW_CODE` (2026-11-17): the
+// last is the one class this translator can reach from prose alone, and only on the arms
+// that would otherwise be codeless or `provider-rejected` — a definite `timeout` /
+// `connection` / `aborted` verdict is never rewritten.
 export type ProviderWireFailure = {
     code?: string;
     errorClass: string;
@@ -552,7 +671,13 @@ export const providerWireFailureOf = (raw: unknown): ProviderWireFailure => {
     // type test — never by `'status' in frame`, which would treat an omitted key (what
     // BOTH gateway writers send, the copy in repository/agentic too) and a `null`
     // differently for no reason.
-    const record = (raw ?? {}) as { code?: unknown; status?: unknown; errno?: unknown; param?: unknown };
+    const record = (raw ?? {}) as {
+        code?: unknown;
+        status?: unknown;
+        errno?: unknown;
+        param?: unknown;
+        message?: unknown;
+    };
 
     // Case- and space-insensitive: `Timeout`, `TIMEOUT ` and `timeout` are the same
     // gateway answer, and a spelling we fail to match silently downgrades the ladder.
@@ -568,6 +693,14 @@ export const providerWireFailureOf = (raw: unknown): ProviderWireFailure => {
     // sends `null` (the common case) yields absence rather than the word "null".
     const paramRaw = typeof record.param === 'string' ? record.param.trim() : '';
     const param = paramRaw.length > 0 ? paramRaw : undefined;
+
+    // (2026-11-17, the provider-transit context-limit report) The ONE place this
+    // translator consults prose, for the ONE class where prose can be the only signal:
+    // a context-length refusal relayed by a gateway that had no HTTP status to attach
+    // (see the exception in the header block above). Total: a frame whose `message` is
+    // an object, a number or absent yields the empty string, which matches nothing.
+    const messageText = typeof record.message === 'string' ? record.message : '';
+    const overflow = isContextOverflowSignal(status, messageText);
 
     if (wire === PROVIDER_WIRE_TIMEOUT) {
         return {
@@ -591,6 +724,22 @@ export const providerWireFailureOf = (raw: unknown): ProviderWireFailure => {
     }
 
     if (wire === PROVIDER_WIRE_UPSTREAM_STATUS) {
+        // (2026-11-17) A size refusal is checked BEFORE the status table, because it is a
+        // MORE SPECIFIC fact about the same answer: an upstream 400 that says "prompt is
+        // too long" and an upstream 400 that says "unknown field `foo`" are both refusals
+        // this request caused, but only the first has a fix (send less), and only the
+        // first may be acted on by the compaction policy that switches on this code. It
+        // is also terminal either way, so this arm changes the NAME and the recovery
+        // route, never the retry count.
+        if (overflow) {
+            return {
+                code: CONTEXT_OVERFLOW_CODE,
+                errorClass: CONTEXT_OVERFLOW_CODE,
+                ...(status === undefined ? {} : { status }),
+                ...(param === undefined ? {} : { param })
+            };
+        }
+
         // Only a status we can READ can be a refusal; a frame that claims
         // `upstream_status` without one is the codeless case, never a guess at 500.
         //
@@ -615,7 +764,25 @@ export const providerWireFailureOf = (raw: unknown): ProviderWireFailure => {
         };
     }
 
-    // `decode`, `unknown`, an absent code, and any future gateway spelling: codeless.
+    // (2026-11-17, THE REPORTED FAILURE) `decode`, `unknown`, an absent code, and any
+    // future gateway spelling reach here, and the gateway's own sentence for the
+    // `unknown` class is the byte-frozen constant `Upstream stream terminated`
+    // (packages/underload/service/src/server/start.ts:341) with NO status attached — so
+    // for a relayed context refusal this arm is the ONLY place the provider's words are
+    // still on the wire. If they name a size rejection, this is the answer; if they do
+    // not (and the frame is the constant, it never does), the frame stays exactly what it
+    // always was: codeless, the generic transient ladder, plus the transit diagnosis.
+    if (overflow) {
+        return {
+            code: CONTEXT_OVERFLOW_CODE,
+            errorClass: CONTEXT_OVERFLOW_CODE,
+            ...(status === undefined ? {} : { status }),
+            ...(errno === undefined ? {} : { errno }),
+            ...(param === undefined ? {} : { param })
+        };
+    }
+
+    // Nothing recognised: codeless, unchanged.
     return {
         errorClass: PROVIDER_TRANSIT_CLASS,
         ...(status === undefined ? {} : { status }),
@@ -648,6 +815,20 @@ const wireAdviceOf = (code: string): string => {
     return ' The upstream refused this request itself, so re-sending the same bytes would be refused again.';
 };
 
+// The size-refusal sentence is its own because its REMEDY is its own. Every other coded
+// wire failure points at the endpoint or at the bytes in transit; this one points at OUR
+// TRANSCRIPT, and it names the two owners of the fix — a `turn.before` handler and the
+// shipped context-compaction plugin — exactly like the HTTP-path frame in ./openai.ts, so
+// an operator reading either frame learns the same thing from the same code. It also says
+// plainly that the ladder was skipped, which is the half the eleven-attempt walk used to
+// hide behind `Upstream stream terminated`.
+const overflowWireSentenceOf = (url: string, statusPart: string): string =>
+    `${CONTEXT_OVERFLOW_CODE}: the provider reported a context-length refusal on the stream from ` +
+    `${url}${statusPart}. The prompt does not fit the model's context window, so re-sending the same ` +
+    'bytes would be refused again — this turn failed after one attempt instead of walking the retry ' +
+    'ladder. Send less: a `turn.before` handler may replace the transcript, and the shipped ' +
+    'context-compaction plugin does exactly that.';
+
 export const providerWireMessage = (input: {
     code: string;
     url: string;
@@ -666,7 +847,14 @@ export const providerWireMessage = (input: {
     // and this text is replayed to the model on every later request.
     const quoted = detail.trim().length === 0 ? '' : ` The provider said: "${detail.trim().slice(0, 400)}"`;
 
-    return `${code}: the provider reported a failure on the stream from ${url}${statusPart}.${wireAdviceOf(code)}${paramPart}${quoted}`;
+    // The overflow class gets its own lead (above); every other class keeps the sentence
+    // it has always had, byte-for-byte, which is what its tests pin.
+    const lead =
+        code === CONTEXT_OVERFLOW_CODE
+            ? overflowWireSentenceOf(url, statusPart)
+            : `${code}: the provider reported a failure on the stream from ${url}${statusPart}.${wireAdviceOf(code)}`;
+
+    return `${lead}${paramPart}${quoted}`;
 };
 
 // ---------------------------------------------------------------------------

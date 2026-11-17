@@ -44,20 +44,34 @@
 //
 // THE TRIGGER POINT — ONE NUMBER (the operator's 2026-11-10 ruling)
 // -----------------------------------------------------------------
-// `contextLimit` IS the firing point. There is no second number beside it: when a turn's
-// `estimatedTokens` is at or above the effective limit, the pass fires on THAT turn. The
+// `contextLimit` is the CEILING, and the firing point is that ceiling minus the headroom
+// buffer below: when a turn's `estimatedTokens` is at or above the effective limit, the pass
+// fires on THAT turn. "One number" still holds in the sense the ruling meant — there is no
+// SECOND input beside the limit; the buffer is a ratio OF the limit, not a knob next to it. The
 // effective limit is resolved per turn from the same inputs as before, minus the headroom:
 //
 //     resolved  = modelLimits[<current model>].limit ?? contextLimit
-//     effective = model window is declared ? min(resolved, window) : resolved
-//     trigger   = max(1, floor(effective))
+//     ceiling   = model window is declared ? min(resolved, window) : resolved
+//     buffer    = min(max(16000, floor(ceiling * headroomRatio)),
+//                     floor(ceiling / 2), ceiling - 1)
+//     trigger   = max(1, floor(ceiling) - buffer)
+//
+// The `buffer` line is the 2026-11-17 headroom rule. It first shipped gated on a DECLARED
+// model window being the binding number; X2 (2026-11-17, F3) removed that gate, because the
+// measured failure session declared NO window at all and therefore got zero leeway — see
+// "THE HEADROOM BUFFER…" beside `HEADROOM_RATIO_DEFAULT` for both halves, and
+// `resolveContextHeadroom` for the table. The declared-window rows are byte-identical across
+// that change (4096→2048, 8192→4096, 32768→16768, 128000→108800, 200000→170000); what moved is
+// every operator who sets only `contextLimit`, whose trigger is now the SAME formula run over
+// their own ceiling.
 //
 // Each surviving input answers a different question:
-//   - `contextLimit` is what the operator is WILLING to pay for, globally — and the exact
-//     size compaction starts at, with no leeway subtracted. A former `gapTokens` headroom
-//     (fire N tokens early because the answer grows the context) was removed at the
-//     operator's request: one number, reached exactly, is the whole rule. What keeps a
-//     blank pass from parking the same conversation every turn is the Rule-3 cooldown, not
+//   - `contextLimit` is what the operator is WILLING to pay for, globally, and since X2 (F3) it
+//     is also the ceiling the headroom buffer is measured against when nothing else binds — the
+//     firing point is the limit minus the buffer, exactly as it always was for a declared window.
+//     A former `gapTokens` headroom (a SECOND number, fire N tokens early because the answer grows
+//     the context) was removed at the operator's request: one number, and one rule over it. What
+//     keeps a blank pass from parking the same conversation every turn is the Rule-3 cooldown, not
 //     a headroom.
 //   - `modelLimits[...].limit` is what the operator is willing to pay for ONE model, so a
 //     1M-token model and an 8k one stop sharing one ceiling.
@@ -69,8 +83,9 @@
 // The model id comes from the live agent registry (`api.agents[context.agent].model()`), so
 // an operator switching models changes the ceiling on the NEXT turn with no restart. When
 // the lookup yields nothing (no registered brain, a host stub, a throwing accessor) the
-// plugin does not guess: it degrades to "model unknown" — global limit, no window — and
-// compacts at the limit itself. Malformed `modelLimits` JSON and unusable entries are
+// plugin does not guess: it degrades to "model unknown" — global limit as the ceiling, no
+// window fact — and the buffer is measured over that ceiling like any other. Malformed
+// `modelLimits` JSON and unusable entries are
 // ignored the same way, so a typo in a settings field can never stop compaction altogether.
 //
 // THE TRIGGER RULES (each one exists for a concrete failure mode)
@@ -369,6 +384,13 @@
 // module, not from the barrel: this file is auto-discovered by the manifest scanner and
 // stays a leaf that depends on nothing but core + types.
 import { planContextPruning } from '../core/context-pruning';
+// The same estimator the harness, the UI context bar and the `maxPromptTokens` floor use
+// (../core/context-estimate.ts), imported for ONE job: measuring a SHRUNK compaction request
+// before sending it. The trigger itself keeps comparing the harness's own
+// `estimatedTokens`/`currentEstimatedTokens()` — one number, one meaning, everywhere — and
+// only the shrink plan asks for the conservative, attachment-aware figure (see
+// `planCompactionRequest`).
+import { estimateContextTokens } from '../core/context-estimate';
 import type {
     Agent,
     HarnessLifecycleHandler,
@@ -435,6 +457,28 @@ Keep each section terse: single-line bullets, not prose. Preserve exact file pat
             label: 'Per-model limits (JSON)',
             type: 'string',
             default: '{}'
+        },
+        // THE HEADROOM ROW (2026-11-17, declared 2026-11-17 by T4). Filed directly under
+        // `modelLimits` because it is meaningless without it: the buffer only ever comes off a
+        // ceiling that a DECLARED MODEL WINDOW makes binding (see `resolveContextHeadroom`), so
+        // the row an operator reads is "how much of the window above do I keep free". `max: 0.5`
+        // is not a UI preference — it is the plugin's own `HEADROOM_MAX_RATIO` rule stated at the
+        // write edge, where a refusal is actionable: a larger ratio could only ever be clamped to
+        // half the window, and a value the runtime cannot express is a value the pane should not
+        // accept. `0` is legal and is the documented opt-out (fire exactly at the limit).
+        //
+        // No `description`, in line with the 2026-11-12 settings-pane ruling this plugin's other
+        // five rows follow (`src/plugin/context-compaction.test.ts` pins that no compaction
+        // descriptor carries a paragraph); the label carries the UNIT, and the decision it encodes
+        // stays pinned as behaviour in that same file.
+        {
+            key: 'headroomRatio',
+            label: 'Headroom before a declared window (ratio)',
+            type: 'number',
+            default: 0.15,
+            min: 0,
+            max: 0.5,
+            step: 0.01
         },
         {
             key: 'enabled',
@@ -518,7 +562,16 @@ export const COMPACTION_MODES: readonly string[] = [MODE_SUMMARIZE, MODE_EXCLUDE
 // is plumbing rather than something a person typed — the role has to be `user`, because
 // the instruction arrives at a boundary where a `system` entry mid-transcript would be a
 // shape the transports are not promised (types/index.ts, `HarnessMessage`).
-const COMPACTION_MARKER = '[context compaction]';
+//
+// EXPORTED (T6, 2026-11-17, D-1). The harness kernel has to recognise this plumbing for one
+// decision that is NOT compaction policy: the answer a DELEGATED run hands back to its spawner
+// must be the task answer, never a compaction turn's reply. Rather than have `src/harness.ts`
+// re-paste the marker (a second spelling of an identity is how two files drift), the kernel
+// imports the predicates built on it — `isCompactionAnswerTurn` below — so this module stays
+// the single owner of the protocol strings. The import is one-directional (this plugin imports
+// only `../core` and `../types`), and `src/plugin/manifest.ts` already pulls this module into
+// the harness graph, so no cycle and no new dependency appears.
+export const COMPACTION_MARKER = '[context compaction]';
 
 // The instruction the plugin commits into the transcript at the trigger. Since 2026-11-12 it
 // asks for the OpenCode checkpoint shape (adopted from OpenCode v2.2.5's compaction prompt,
@@ -581,6 +634,105 @@ const MAX_UNITS_PER_PASS = 8;
 // actually being held to (5% of a 512000 ceiling would never re-fire inside a 262144 window).
 const REGROWTH_RATIO = 0.05;
 
+// ---------------------------------------------------------------------------
+// THE HEADROOM BUFFER, THE OVERFLOW CODE, AND THE SHRINK LADDER (2026-11-17)
+// ---------------------------------------------------------------------------
+//
+// WHY A BUFFER EXISTS AT ALL (the bug this removes). The trigger used to fire at the
+// ceiling ITSELF, so the request that carried the compaction instruction was the whole
+// transcript PLUS the ~430-token instruction — a request strictly larger than the one the
+// agent's own `maxPromptTokens` / `provider.contextWindow` floor (../core/agent.ts:1066-1090)
+// or the provider had just refused. The pass that was supposed to relieve the pressure was
+// therefore the first thing refused, and the re-trigger memory below muted the retry. The
+// buffer moves the firing point BELOW the hard reject point, by enough that the instruction
+// and one more turn still fit.
+//
+// WHY THE BUFFER IS KEYED ON THE BINDING CEILING — INCLUDING A BARE `contextLimit` (X2, F3).
+// `modelLimits[model].window` is a FACT ABOUT THE MODEL — the point past which the provider
+// answers 400. `contextLimit` and `modelLimits[model].limit` are OPERATOR CHOICES, and the
+// original rule therefore ran the buffer off the window ONLY, on the grounds that an operator
+// who sets 100000 on a 1-M token model is budgeting rather than reporting a hard limit and
+// "fire 15% before my budget" moves a number they set deliberately and read directly.
+//
+// That reasoning is what the measured failure disproved. The session that died
+// (`Temp/d1`, reproduced by the reviewer's probes in `Temp/review-v2/`) declares NO model
+// window at all, so with a bare `contextLimit` its trigger was the ceiling EXACTLY: the first
+// crossing WAS the refusal, and prevention depended on the estimate happening to cross the
+// limit before the provider's true count did — which it did not (the estimate read 193,428 for
+// a request billed 225,612). Zero headroom on the one deployment shape that has no model fact
+// to lean on is the whole bug, so the SAME formula now runs over EVERY binding ceiling: same
+// `headroomRatio`, same `min(max(HEADROOM_MIN_TOKENS, ratio·ceiling), floor(ceiling/2))` shape,
+// same caps. The declared-window rows are unchanged byte for byte (the formula never moved);
+// what moved is that an operator who sets only `contextLimit` now compacts EARLIER, which is
+// the intended prevention. The two anti-futility brakes stay exactly where they were: the
+// `minTokens` floor refuses a pass whose saving is smaller than a round trip, and the dead-run
+// guard below refuses a pass whose request floor already exceeds the ceiling — a small
+// `contextLimit` dominated by the tool catalogue fires nothing at all rather than burning a
+// model turn per turn (see `HEADROOM_MAX_RATIO` for why the 50% cap is what makes a small
+// ceiling survivable).
+//
+// Like every other default in this file, the number is written TWICE: once as the
+// `metadata.settings` row the Plugins pane renders and the store seeds (row 3, `headroomRatio`),
+// and once here as the argument fallback a host that reuses the guard without declaring the row
+// reads. The scanner cannot read a computed literal, so BOTH places move together —
+// src/plugin/manifest.test.ts and src/plugin/context-compaction.test.ts pin the row, and the
+// buffer table pins this number's behaviour.
+const HEADROOM_RATIO_DEFAULT = 0.15;
+
+// The floor of the buffer: a summary, the continuation nudge, one fresh turn and the estimate's
+// own error. Below this, "headroom" is a rounding artifact rather than working room, which is
+// why a 4k-token model gets a proportionally larger slice (the cap below bounds it).
+const HEADROOM_MIN_TOKENS = 16000;
+
+// The ceiling of the buffer, as a fraction of the binding ceiling: a buffer may never eat more
+// than half of the window it guards. Without it, a small declared window (a test fixture, a
+// 8k model, the 100-token ceilings every lifecycle case in the test file uses) would collapse
+// to `max(1, window - 16000) = 1` and compact on every turn — the buffer would become the bug.
+const HEADROOM_MAX_RATIO = 0.5;
+
+// The machine code the transport puts on a size refusal (`transport/openai.ts`
+// `CONTEXT_OVERFLOW_CODE`, re-exported and published from the package root) and the
+// `core/agent.ts` pre-request floor reuses for a transcript it refuses to send at all. It is
+// spelled HERE, as a literal, on purpose: this plugin is a leaf (the manifest scanner
+// discovers it and it depends on nothing but ../core and ../types), and importing the
+// transport for one string would break that rule for a constant that has been stable since
+// issue 0004. `src/plugin/context-compaction.test.ts` pins the two spellings agree.
+const CONTEXT_OVERFLOW_CODE = 'context-overflow';
+
+// The shrink ladder: each rung is the fraction of the REMOVABLE transcript (the boundary figure
+// minus the request's irreducible floor — see `rungBudget` in `turnBefore`) a summarize request is
+// cut to, in the order the rungs are tried. The floor is added back unchanged, because the
+// transcript pass cannot cut it and scaling across it used to charge the transcript for a fraction
+// of the tool catalogue (R6, 2026-11-17). Four rungs, each decisively smaller (0.85 → 0.35),
+// because the point of a rung is that the provider CANNOT refuse it for the same reason as the
+// rung above; after four refusals the problem is not the transcript (huge tool schemas, a tiny
+// configured window, a provider counting something else entirely) and the pass stops rather than
+// spending one model turn per turn forever. Strictly decreasing, every value < 1, so a rung
+// request is always smaller than the request that was refused.
+const SHRINK_LADDER: readonly number[] = [0.85, 0.7, 0.5, 0.35];
+
+// How many entries at the END of the request the shrink never touches. The last two are, on the
+// shipped path, "the turn the model is answering" and "the compaction instruction" — the pair
+// that makes the request the request. Snapping (see `shrinkUnitEnd`) keeps the entry BEFORE them
+// pairable, so a result is never left without the call that asked for it.
+const SHRINK_KEEP_TAIL = 2;
+
+// Per-entry text budget once the shrink reaches pass A (see `planCompactionRequest`). 240
+// characters is a deliberate blunt instrument: it keeps "what this turn was about" legible and
+// throws the payload away, which is exactly the trade a size refusal forces. Measured against
+// the ladder's targets (a 200k removable transcript at rung 0 is a 170k budget before the floor
+// is added back — see `rungBudget`), it is the LAST lever to move before whole units go, not the
+// first.
+const SHRINK_CLIP_CHARS = 240;
+
+// The digest entry the shrink prepends when it drops whole units (see
+// `planCompactionRequest`). Its marker deliberately does NOT start with
+// `COMPACTION_MARKER`: `[context compaction]` is the anchor `planCompactionRetention` scans the
+// CANONICAL transcript for, and this entry is REQUEST-ONLY (it never reaches
+// `replaceHistory`), so sharing the marker would put a second anchor in front of a finalize that
+// is looking for exactly one.
+const SHRINK_DIGEST_MARKER = '[context compaction digest]';
+
 // Agents this plugin never compacts. `summarizer` is the delegated condenser the shipped
 // profiles already use (src/agents/summarizer.ts) — i.e. the agent a future compactor is
 // most likely to spawn for its summary.
@@ -632,9 +784,10 @@ export type HarnessContextTrigger = {
     limit: number;
     // Present only when a usable window was declared for this model.
     window?: number;
-    // max(1, floor(min(limit, window) when windowed, limit otherwise)) — the number
-    // `estimatedTokens` is compared to. With no window it is the ceiling itself: the limit
-    // IS the firing point, with no headroom subtracted.
+    // max(1, floor(min(limit, window) when windowed, limit) − headroom) — the number
+    // `estimatedTokens` is compared to. The headroom buffer (see `resolveContextHeadroom`) is
+    // subtracted from EVERY binding ceiling, declared window or operator budget alike (X2, F3);
+    // `headroomRatio: 0` is the only spelling that makes the trigger the ceiling exactly.
     effective: number;
 };
 
@@ -694,9 +847,55 @@ export const parseModelLimits = (raw: unknown): Record<string, HarnessContextMod
     return result;
 };
 
+// The headroom buffer, split out so the table in the test file can pin every row (see the
+// block "THE HEADROOM BUFFER…" above `HEADROOM_RATIO_DEFAULT` for what the buffer is for and
+// for why it now guards EVERY binding ceiling). Total: every unusable input answers `0`, i.e.
+// "fire at the ceiling", which is the behaviour this build had before the buffer existed and the
+// behaviour `headroomRatio: 0` restores on purpose.
+export const resolveContextHeadroom = (input: {
+    // The BINDING ceiling — `min(limit, window)` when a window was declared, otherwise the
+    // operator's resolved limit — already floored to a whole token count.
+    ceiling: number;
+    // Whether the binding number is a declared model window rather than an operator budget.
+    // SINCE X2 (F3) this no longer decides APPLICABILITY: the buffer guards both. The field
+    // stays because it is a published input and because a caller that knows which number bound
+    // can say so; a caller that does not know simply omits it and gets the same buffer.
+    windowed?: boolean;
+    // The `headroomRatio` setting. `0` opts out and restores "fire exactly at the limit"; a
+    // corrupt (non-finite) value opts out too, because a number this file cannot trust must
+    // not silently move a threshold an operator reads off the context bar.
+    ratio?: number;
+    // The buffer floor, spelled out for the same reason as `ratio` — a table row names it.
+    minTokens?: number;
+}): number => {
+    const ratio = input.ratio === undefined ? HEADROOM_RATIO_DEFAULT : input.ratio;
+
+    if (!Number.isFinite(ratio) || ratio <= 0) return 0;
+
+    const ceiling =
+        Number.isFinite(input.ceiling) && input.ceiling > 1 ? Math.floor(input.ceiling) : 0;
+
+    if (ceiling <= 1) return 0;
+
+    const floor =
+        input.minTokens !== undefined && Number.isFinite(input.minTokens) && input.minTokens >= 0
+            ? Math.floor(input.minTokens)
+            : HEADROOM_MIN_TOKENS;
+
+    // The ratio wants at least `floor`; the window allows at most half of itself, and never
+    // the whole of it (an effective limit of 0 would fire on an empty conversation). The
+    // order matters: the floor is what makes a big window's buffer meaningful, the caps are
+    // what keep a small window's buffer from becoming the new bug.
+    const wanted = Math.max(floor, Math.floor(ceiling * ratio));
+    const cap = Math.min(Math.floor(ceiling * HEADROOM_MAX_RATIO), ceiling - 1);
+
+    return Math.max(0, Math.min(wanted, cap));
+};
+
 // Resolves the number this turn's estimate is compared against. See the header section
 // "THE TRIGGER POINT — ONE NUMBER" for what each input means and for why an unknown model
-// degrades to the global limit instead of guessing.
+// degrades to the global limit instead of guessing, and `resolveContextHeadroom` for the
+// buffer that now sits below EVERY binding ceiling (X2, F3).
 export const resolveContextTrigger = (input: {
     // The global `contextLimit` setting. The caller has already refused a non-finite or
     // non-positive value (Rule 1: the plugin is off), so this is a real ceiling.
@@ -705,6 +904,11 @@ export const resolveContextTrigger = (input: {
     modelLimits: Record<string, HarnessContextModelLimits>;
     // The model this conversation is running, when it is known (see `currentModelId`).
     modelId?: string;
+    // The `headroomRatio` setting, passed through to `resolveContextHeadroom`. Omitted is the
+    // declared default; `0` is "no buffer", which is what every pre-buffer fixture seeds.
+    headroomRatio?: number;
+    // The buffer floor (see `resolveContextHeadroom`).
+    headroomMinTokens?: number;
 }): HarnessContextTrigger => {
     // An OWN-key lookup, not a bare index: a model id like `constructor` or `valueOf` would
     // otherwise hit the prototype chain and read as a usable-looking entry. `undefined` for a
@@ -724,12 +928,26 @@ export const resolveContextTrigger = (input: {
     // the operator's request.
     const resolved = window === undefined ? limit : Math.min(limit, window);
 
-    // The firing point is the ceiling itself — no headroom subtracted. `max(1, ...)` is the
+    // Whether the BINDING number is the model fact or the operator's budget — the one question
+    // `resolveContextHeadroom` asks. `<=` and not `<`: when the two agree, the window is what
+    // stops the request, so the buffer belongs to it. The caller can re-derive this from the
+    // `limit`/`window` this returns, which is why the answer is not a field of its own.
+    const windowed = window !== undefined && window <= limit;
+
+    // The firing point is the ceiling MINUS the headroom buffer (0 unless a window binds — see
+    // `resolveContextHeadroom` for the rule and for why the buffer exists). `max(1, ...)` is the
     // only clamp: a ceiling so small it floors below one token (the test-suite's limit of
     // 100 is fine, but a host that stores 0.5 is not refused by Rule 1) fires at 1 token
     // rather than never. Flooring keeps the trigger an integer token count, matching the
     // estimate.
-    const effective = Math.max(1, Math.floor(resolved));
+    const headroom = resolveContextHeadroom({
+        ceiling: Math.floor(resolved),
+        windowed,
+        ...(input.headroomRatio === undefined ? {} : { ratio: input.headroomRatio }),
+        ...(input.headroomMinTokens === undefined ? {} : { minTokens: input.headroomMinTokens })
+    });
+
+    const effective = Math.max(1, Math.floor(resolved) - headroom);
 
     return {
         limit,
@@ -1017,6 +1235,526 @@ const isContinuationNudge = (message: HarnessMessage): boolean =>
     message.role === 'user' &&
     String((message as { content?: unknown }).content ?? '') === CONTINUATION_NUDGE;
 
+// True for the assistant entry at `index` that IS the reply to a compaction instruction — the
+// "compaction ANSWER" `planCompactionRetention` names with `answerIndex`, judged from the
+// transcript rather than from a hook payload, so a reader that only has entries can ask the
+// question.
+//
+// WHY THE KERNEL NEEDS IT (T6, 2026-11-17, D-1). A delegated run's answer is chosen in
+// `src/harness.ts` from the run's own assistant turns (`run.answer` recording, the blank-turn
+// rescue `resolveRunAnswer`, and the `partialContent` scan `lastSubstantiveText`). A summarize
+// pass puts a tool-free prose turn into exactly that lane, so the summary could be selected as
+// the answer the spawner is handed — the defect this excludes. The kernel does not own the
+// marker, so the test lives HERE, next to the strings it reads, and the kernel imports it.
+//
+// THE RULE, stated the way the retention rule states it:
+//   - the entry must be a tool-free `assistant` turn (the same test `isAnswerMessage` uses, so
+//     the two can never disagree about which turn ended a compaction);
+//   - scanning backwards past the intermediate rounds a disobedient model spent on tools (an
+//     `assistant` entry WITH calls and every `tool` entry answering calls), the nearest entry
+//     that is neither must be a compaction INSTRUCTION — which is why the disable range
+//     `[instruction, answer)` is described as it is at `planCompactionRetention`;
+//   - a `CONTINUATION_NUDGE` does NOT qualify (the `isContinuationNudge` exclusion above, and
+//     for the same reason): it shares the marker, and the turn that answers it is the model
+//     getting back to its TASK, which is precisely the answer D-1 wants to keep.
+//   - anything else (a host message, a `system` entry, the start of the transcript) stops the
+//     scan and answers `false`, so an ordinary final answer that merely FOLLOWS a compacted
+//     stretch is never mistaken for plumbing.
+//
+// The scan is bounded by the entries it walks, not by the whole transcript: it stops at the
+// first entry that is not an intermediate round.
+export const isCompactionAnswerTurn = (
+    messages: readonly HarnessMessage[],
+    index: number
+): boolean => {
+    if (!Array.isArray(messages) || index < 0 || index >= messages.length) return false;
+
+    if (!isAnswerMessage(messages[index])) return false;
+
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+        const entry = messages[cursor];
+
+        // Intermediate rounds of the same compaction pass: the results, and the assistant turn
+        // that asked for them. A model that obeyed "do not call tools" hits the instruction on
+        // the very first step, which is the plain case.
+        if (entry.role === 'tool') continue;
+        if (entry.role === 'assistant' && !isAnswerMessage(entry)) continue;
+
+        return isInstructionMessage(entry) && !isContinuationNudge(entry);
+    }
+
+    // The transcript begins before any instruction: not a compaction answer.
+    return false;
+};
+
+// THE SAME QUESTION ONE TURN EARLIER: is the assistant turn this harness is STREAMING right now
+// going to commit as a compaction answer? X2 (F4, 2026-11-17), for the one lane the answer rules
+// still read the summary through — `src/harness.ts` reports an aborted run's in-flight buffer as
+// `partialContent` (issue 0020, "interrupted with an answer in hand"), and an abort in the middle
+// of a compaction answer would otherwise hand the spawner the relief note as "the answer it had".
+//
+// THE ANSWER IS INDEPENDENT OF THE TEXT. `isCompactionAnswerTurn` reads only the entry's ROLE and
+// TOOL-CALL list plus the entries above it, so the placeholder below carries no content and the
+// caller passes nothing but the transcript: what is being judged is the position of the turn, not
+// what it says. The one shape the transcript cannot see is a turn that is streaming prose AND
+// tool calls at once; when it commits it will have calls and will not be a compaction answer, and
+// this helper will have called it one. That is the deliberate direction — an aborted in-flight
+// preamble is worth strictly less to a spawner than the last thing the child actually committed,
+// and the failure mode being prevented is the summary crossing the spawner boundary.
+export const isCompactionAnswerStream = (messages: readonly HarnessMessage[]): boolean => {
+    if (!Array.isArray(messages)) return false;
+
+    // The placeholder needs only the fields `isAnswerMessage` reads. A CAST rather than a full
+    // `HarnessAssistantMessage`, because inventing a model id, a stop reason and a usage block
+    // for a turn that has not ended would put facts in a shape that claims to be committed state.
+    const inFlight = { role: 'assistant', content: '', toolCalls: [] } as unknown as HarnessMessage;
+
+    return isCompactionAnswerTurn([...messages, inFlight], messages.length);
+};
+
+// ---------------------------------------------------------------------------
+// THE SHRINK PLAN — a summarize request the provider cannot refuse for size
+// ---------------------------------------------------------------------------
+//
+// WHAT THIS IS FOR (2026-11-17, the compaction deadlock). A summarize pass answers a size
+// problem by sending the WHOLE transcript plus the compaction instruction. When the transcript
+// is already at the provider's hard limit, that request is strictly larger than the one that
+// was just refused — so the compaction cannot run, and (before the headroom buffer and the
+// overflow-reactive trigger below) nothing retried it. This function is the one that makes the
+// compaction request SMALLER than the request that failed, with no model turn and no
+// summarization: it is the emergency path, not the policy.
+//
+// IT IS REQUEST-ONLY, AND THAT IS THE WHOLE DESIGN. The caller hands the result to
+// `context.setTranscript` (request-only, wins over the round's re-projection) while
+// `context.replaceHistory` keeps the FULL canonical transcript. So nothing is deleted, no
+// inclusion flag moves, and the model's own summary — the durable half of compaction — still
+// replaces everything the digest stood in for. A shrink that never lands costs one model turn;
+// a shrink that overwrites the record would lose conversation.
+//
+// THE LADDER, IN ORDER, EACH STEP MEASURED BEFORE THE NEXT (deterministic: no clock, no
+// random, no provider call, so the table in the test file pins every row):
+//   A. CLIP — every head entry keeps its first `SHRINK_CLIP_CHARS` characters of `content`,
+//      drops its replayed `reasoning`, and clips each tool call's `arguments`. Payload goes,
+//      shape stays, provider pairing is untouched.
+//   B. DROP — whole PAIRABLE UNITS from the oldest end of the head (an assistant turn plus the
+//      results answering its calls: `shrinkUnitEnd`), replaced by ONE `user` digest entry that
+//      says how much went missing and carries the first and last excerpt. A leading `system`
+//      entry is never dropped: a host that seeded one stated a standing instruction.
+// The last `keepTail` entries are never touched by either step — on the shipped path that is
+// "the turn being answered" plus "the compaction instruction", the pair that makes the request
+// what it is.
+//
+// WHY EVERY FIGURE HERE IS `floorTokens + body` (the currency bug this planner had). The
+// provider bills the WHOLE request — tool catalogue, instructions, harness turns, per-call
+// overhead, transcript — and a rung target is a budget on that same billed total
+// (`floor + ladder × the removable transcript`, clamped to the fit line — see `rungBudget` in
+// `turnBefore`). When the measurement was the transcript body alone, the two sides of every
+// comparison were different quantities: a default-preset harness's catalogue alone is 53,088
+// payload bytes / 13,272 tokens, so a 2,438-token transcript asked to reach 13,353 was ALREADY
+// under target at every rung, the ladder walked to the bottom, nothing improved, and the request
+// came back UNCHANGED — an emergency path that was a no-op, and the session replayed the same 400
+// every turn. `floorTokens` is the constant the messages cannot show (everything outside the
+// transcript this pass rewrites), and `billedFigure` is the single measurer that adds it to
+// every comparison, so `from`, `to`, `tokens` and the target are all the number the provider
+// scores. Pass A's per-entry counter is the one body-only measurement in the function: the
+// floor is the same on both sides of `next` vs `entry`, so adding it there would only cost two
+// extra serializations per entry.
+//
+// WHY THE CALLER DERIVES THE FLOOR FROM `context.messages`. It is the transcript this function
+// rewrites, and the figure the harness was billing when the request was refused, so
+// `estimate - measure(messages)` is the residual by construction. `currentMessages()` would be
+// the same figure when nothing was withheld this round, and can be SMALLER when the other
+// `turn.before` pass clipped entries: taking the messages we are about to replace is the
+// pairing that keeps the two halves of the sum the same two halves the harness measured. If a
+// handler rewrote the projection after that estimate, the floor is understated by exactly that
+// rewrite — which makes the ladder LESS aggressive, the safe direction (the `safety` re-check
+// and the overflow-reactive re-arm still catch an underestimate on the next round). The
+// subtraction is written ONCE, in `measureRequestFloor`, and both the guard and this planner read
+// it from there — the X2 (F1) fix for the place where the two sides of that subtraction were
+// priced by two different estimators.
+//
+// WHY THE MEASURE ASKS FOR ATTACHMENT BYTES. `estimateContextTokens` with
+// `includeAttachmentBytes` is the conservative figure (../core/context-estimate.ts, "THE
+// OPT-IN REQUEST WEIGHT"): a 6 MB screenshot replayed on every turn is the case where a
+// transcript the plain estimate calls small still gets a 400, and a shrink that measured the
+// plain figure would send it again unchanged. Tool SCHEMAS are deliberately not added here:
+// the plugin does not serialize them, and the provider-anchored hybrid the harness estimates
+// with already absorbs whatever the last request's `usage` reported. That anchoring is why the
+// estimator's ANCHORED leg prices media as GROWTH rather than as allowance (the constant half of
+// the allowance stays out, because it is inside `anchor.tokens` — see
+// ../core/context-estimate.ts "THE OPT-IN REQUEST WEIGHT"): the shrink and the trigger must
+// price the SAME request in the SAME currency, or the two numbers this pass compares are not
+// comparable. THE HALF THE PLUGIN HAS TO CLOSE ITSELF (X2, F1): the shipped producer records the
+// anchor from `transcriptChars(sent, instructions)` WITHOUT the media option
+// (../core/context-estimate.ts "THE ONE ASYMMETRY A CALLER CAN CLOSE", src/harness.ts
+// `pendingRequestChars`), so the trigger figure this plugin is handed contains no media term at
+// all while every figure here contains it — `measureRequestFloor` therefore adds the projection's
+// own media term back onto the trigger figure before subtracting, which is what makes
+// `floor + measureShrink(projection) === tokens` hold instead of falling short by the media. The
+// one known over-count that stays is a media entry that was already inside the anchored request;
+// it lands in both terms, which is the UPPER-BOUND direction the option publishes, and the escape
+// hatch for a caller that wants it once is in the same section.
+export type HarnessCompactionShrink = {
+    // THE REQUEST to send: never larger than what came in, and the `messages` the caller hands
+    // to `setTranscript`.
+    messages: HarnessMessage[];
+    // Pairable units step B removed (0 when clipping alone was enough).
+    dropped: number;
+    // Head entries step A rewrote.
+    clipped: number;
+    // THE BILLED SIZE of the request being sent: the floor the caller supplied plus the
+    // conservative estimate of `messages` (`includeAttachmentBytes`, see "WHY THE MEASURE ASKS
+    // FOR ATTACHMENT BYTES" above). This is the figure the next trigger comparison and the
+    // shrink diagnostic both report, and it is the figure `targetTokens` is compared against —
+    // one currency on both sides, which is what makes a rung reachable at all. The bare
+    // transcript figure is `tokens - floorTokens`, and the caller has the floor.
+    tokens: number;
+};
+
+// One entry's text, cut to the budget with a marker the model can read. A string `content`
+// only: an odd restored shape (a number, an object) is left exactly as it is, because the
+// estimator counts its stringify and this function has no business inventing a serialization.
+const clipShrinkText = (value: unknown, budget: number): unknown => {
+    if (typeof value !== 'string') return value;
+    if (value.length <= budget) return value;
+
+    // The marker is part of the budget arithmetic ONLY in the sense that it rides along: the
+    // estimate of a clipped entry is the estimate of the clipped text, so the ladder's next
+    // measurement already includes it.
+    return `${value.slice(0, budget)}\u2026 [truncated by compaction]`;
+};
+
+// The exclusive end of the PAIRABLE block starting at `index`: an assistant turn that asked for
+// tool calls plus every `tool` entry that answers one of them. Strictly CONTIGUOUS (the shape
+// the runtime writes, and what `transport/openai.ts` requires to stay pairable), so a result
+// reordered elsewhere simply ends the scan rather than being swallowed by it.
+const shrinkUnitEnd = (messages: readonly HarnessMessage[], index: number): number => {
+    const calls = (messages[index] as { toolCalls?: unknown }).toolCalls;
+
+    if (!Array.isArray(calls) || calls.length === 0) return index + 1;
+
+    const ids = new Set<string>();
+
+    for (const call of calls) {
+        if (call === null || typeof call !== 'object') continue;
+        const id = (call as { id?: unknown }).id;
+        if (typeof id === 'string' && id.length > 0) ids.add(id);
+    }
+
+    if (ids.size === 0) return index + 1;
+
+    let end = index + 1;
+
+    while (end < messages.length) {
+        const next = messages[end] as { role?: unknown; toolCallId?: unknown };
+        if (next.role !== 'tool') break;
+        if (typeof next.toolCallId !== 'string' || !ids.has(next.toolCallId)) break;
+        end += 1;
+    }
+
+    return end;
+};
+
+// One clipped head entry: text cut, replayed thinking dropped (it is the single largest
+// replayed payload and the model cannot use it under a size refusal), tool-call `arguments` cut
+// (a 2 MB file written through a tool call is the case this exists for). `name` and `toolCalls`
+// ids stay: pairing is the one thing a request-only rewrite may never break.
+const clipShrinkEntry = (entry: HarnessMessage, budget: number): HarnessMessage => {
+    const clipped = { ...entry } as HarnessMessage & Record<string, unknown>;
+
+    // Every role of the union declares `content: string`, and `clipShrinkText` passes a
+    // non-string through untouched, so the assignment cannot introduce a new shape — the cast
+    // states exactly that (the estimator's own `textOf` keeps counting whatever survives).
+    clipped.content = clipShrinkText(clipped.content, budget) as string;
+    delete clipped.reasoning;
+
+    const calls = clipped.toolCalls;
+
+    if (Array.isArray(calls)) {
+        clipped.toolCalls = calls.map((call) => {
+            if (call === null || typeof call !== 'object') return call;
+            const entry2 = { ...call } as Record<string, unknown>;
+            entry2.arguments = clipShrinkText(entry2.arguments, budget);
+            return entry2;
+        });
+    }
+
+    return clipped as HarnessMessage;
+};
+
+// The request-weight measure, in ONE place so the ladder and its diagnostic cannot disagree.
+// This is the CONSERVATIVE figure: serialized payload bytes plus the wire bytes an attachment
+// puts in the body (see "WHY THE MEASURE ASKS FOR ATTACHMENT BYTES" above).
+const measureShrink = (messages: readonly HarnessMessage[]): number =>
+    estimateContextTokens(messages, undefined, { includeAttachmentBytes: true });
+
+// THE SAME TRANSCRIPT WITHOUT THE MEDIA TERM, i.e. in the currency the HARNESS estimates in:
+// `src/harness.ts` `emitTurnBefore` calls `estimateContextTokensHybrid(messages, instructions,
+// anchor, { toolSchemaChars })` and never passes `includeAttachmentBytes`, so the number the
+// trigger hands this plugin has never seen an attachment byte (X1/X2 currency audit, F1).
+const measureBody = (messages: readonly HarnessMessage[]): number =>
+    estimateContextTokens(messages, undefined);
+
+// THE FLOOR of the request the summarize pass is about to send — the part of its billed size the
+// transcript pass cannot remove — derived in ONE CURRENCY on both sides of the subtraction.
+//
+// THE BUG THIS REPLACES (`tokens − measureShrink(messages)`, the same expression under a
+// comment that claimed "one currency"): the left side is the harness figure, which prices
+// payload bytes WITHOUT media, and the right side prices payload bytes WITH media, so the
+// residual was short by exactly the media term of the projection. A 6 MB screenshot replayed on
+// every turn made the floor read ~1.5 M tokens low, `plan.tokens` understated the request the
+// provider scores, and the ladder stopped cutting on a request it believed was already small
+// enough — the same shape of bug the planner's own header says it exists to prevent.
+//
+// THE FIX: hand the harness figure the media term it never counted, then subtract the same
+// media-inclusive body the ladder measures every candidate with:
+//
+//     media = measureShrink(m) − measureBody(m)              // the projection's own media term
+//     floor = max(0, tokens + media − measureShrink(m))      // == max(0, tokens − measureBody(m))
+//
+// so `floor + measureShrink(m) === tokens + media`: the UNSHRUNK candidate measures exactly the
+// harness figure plus the media term, because the projection prices identically on both sides.
+// That is the property every comparison in `planCompactionRequest` needs — the ladder's
+// `billedFigure` is `floor + measureShrink(candidate)` and `target` is the rung budget
+// `floor + ladder × (tokens − floor)` clamped to the fit line (see `rungBudget` in `turnBefore`),
+// so the floor is added exactly once and `to <= target` is a claim about the request the provider
+// receives, and it is conservative by exactly `media`: a screenshot costs wire bytes in a request
+// body whether or not the harness figure counted them, and the ladder is the side that must not
+// understate.
+//
+// WHAT THE NUMBER IS *NOT*, stated because an operator reads it in the diagnostic and a reader
+// must not "fix" it into a catalogue measurement. It is the request's irreducible billed figure
+// AS THE ESTIMATOR PRICES IT, and on an anchored round it therefore carries two real,
+// deliberate conservatisms of the provider-anchored estimate (../core/context-estimate.ts): the
+// `ANCHOR_GROWTH_MARGIN` premium on the growth since the last reported `usage`, and the
+// difference between the provider's own token density and the estimator's 4-bytes-per-token
+// rule for the anchored prefix. Measured on `Temp/d1` round 21 that premium is the difference
+// between the 44,597 this derivation reports and the ≈31,700 the serialized catalogue and system
+// prompt actually cost — an UPPER bound, in the direction a "will this be refused?" check wants.
+// Nothing here compares it to a provider limit any more (X2, F6): the dead-run guard asks a
+// question about CANDIDATE REQUESTS, and this figure only ever sets what a rung counts as
+// "already reached". The clamp at 0 covers the other direction, which the estimator's own
+// rounding (a rewrite between the trigger's estimate and here) can produce.
+const measureRequestFloor = (
+    messages: readonly HarnessMessage[],
+    tokens: number
+): number => {
+    const billed = measureShrink(messages);
+    const media = billed - measureBody(messages);
+
+    return Math.max(0, (tokens || 0) + media - billed);
+};
+
+// THE WHOLE SHRINK DECISION OF ONE SUMMARIZE PASS, computed BEFORE the pass parks anything
+// (X2, F2), because the no-progress gate below has to be able to answer "would this pass send
+// anything smaller than the request that was just refused?" without committing the instruction,
+// paying for a `pause()`, or spending a model turn. Pure over `context.messages` — the entry-time
+// projection, which is the array `request` is built from and never moves inside a handler — so
+// computing it in `turnBefore` and consuming it in `beginSummarize` is byte-identical to
+// computing it inside the commit, and it is paid for exactly once per pass.
+//
+// `sent` / `sentTokens` make the ACCEPTANCE rule explicit rather than implicit: the plan is
+// adopted only when it is strictly smaller than the request that would otherwise go out,
+// measured with the same measurer on both sides (`floor + body`, one currency), and when it is
+// not adopted the figures report the ordinary request. `sentTokens` is the number the
+// no-progress gate compares against the last refused figure.
+export type HarnessSummarizePlan = {
+    // The projection plus the compaction instruction — the request an UNSHRUNK pass sends.
+    request: HarnessMessage[];
+    // The irreducible part of this request's billed figure (see `measureRequestFloor`).
+    floor: number;
+    // The whole unshrunk request's transcript weight.
+    full: number;
+    // The shrink, or `undefined` for an ordinary (non-emergency) pass.
+    plan: HarnessCompactionShrink | undefined;
+    // THE REQUEST THIS PASS SENDS: the plan's messages when the plan was strictly smaller, the
+    // ordinary request otherwise.
+    sent: HarnessMessage[];
+    // THE BILLED FIGURE of `sent`, in the same currency as `tokens` and `target`.
+    sentTokens: number;
+};
+
+const planSummarizeRequest = (
+    messages: readonly HarnessMessage[],
+    tokens: number,
+    shrinkTo: number | undefined
+): HarnessSummarizePlan => {
+    // THE FLOOR of this request — the part of the size the shrink cannot remove — derived in one
+    // currency by `measureRequestFloor` (see that helper for the two estimators it reconciles and
+    // for what the residual is NOT). It comes from `context.messages`, the same array `request`
+    // below is built from, so both halves of every sum the planner compares are measured on the
+    // one projection this pass rewrites.
+    const floor = measureRequestFloor(messages, tokens);
+
+    // THIS request: the projection exactly as measured, plus the instruction. The committed
+    // history and the request are written by two different calls on purpose — `setTranscript` is
+    // request-only and wins over the round's re-projection (src/harness.ts `requestOf`), while
+    // `replaceHistory` alone would leave this request re-projected from the pre-commit list.
+    const request = [...messages, { role: 'user' as const, content: COMPACTION_INSTRUCTION }];
+
+    const plan =
+        shrinkTo === undefined
+            ? undefined
+            : planCompactionRequest(request, shrinkTo, SHRINK_KEEP_TAIL, floor);
+
+    const full = measureShrink(request);
+    const shrunk = plan !== undefined && plan.tokens < floor + full;
+
+    return {
+        request,
+        floor,
+        full,
+        plan,
+        sent: shrunk ? plan!.messages : request,
+        sentTokens: shrunk ? plan!.tokens : floor + full
+    };
+};
+
+// Builds the shrunk request. `targetTokens` is the budget the caller wants the BILLED REQUEST
+// under — the rung budget `turnBefore` derives as `floor + ladder × (tokens − floor)` (the ratio
+// across the removable payload, the irreducible floor added back) clamped to the fit line, the
+// effective ceiling or the ceiling itself when the floor sits inside the headroom band; `keepTail`
+// is the verbatim tail (see `SHRINK_KEEP_TAIL`); `floorTokens` is the part of the request this
+// ladder cannot remove (tool catalogue, agent instructions, harness turns, per-call overhead),
+// measured once by the caller — see "WHY EVERY FIGURE HERE IS `floorTokens + body`" above. The
+// helper NEVER subtracts that floor at the call site and never adds it twice: the caller passes
+// one billed number, and `billedFigure` below is the only place the floor is added, which is what
+// makes `to <= target` a claim about the request the provider receives. The default of 0 keeps the
+// helper's standalone contract (a bare transcript, no host around it) byte-identical, which is
+// what the table in src/plugin/context-compaction.test.ts pins.
+//
+// Total, and monotone in the amount it removes: the returned `tokens` is never larger than the
+// figure that went in, and `messages` is never longer.
+export const planCompactionRequest = (
+    messages: readonly HarnessMessage[],
+    targetTokens: number,
+    keepTail: number = SHRINK_KEEP_TAIL,
+    floorTokens: number = 0
+): HarnessCompactionShrink => {
+    // Normalised ONCE, here: a non-finite or negative floor is "no floor", and every figure
+    // below adds the same number, so the two sides of every comparison cannot drift into
+    // different currencies again.
+    const floor = Number.isFinite(floorTokens) && floorTokens > 0 ? Math.floor(floorTokens) : 0;
+
+    // THE one measurer: `floor + body`, the size the provider bills for the request this ladder
+    // is building. The bare body is what this function used to measure, and on a session whose
+    // catalogue outweighs its transcript that made every rung read "already under target" —
+    // 13,272 catalogue tokens plus a 2,438-token body against a 13,353-token target — so the
+    // ladder walked to the bottom, cut nothing that counted, and the refused request went out
+    // again unchanged. Everything that is COMPARED lives here; the per-entry counter below is
+    // the only body-only measurement, because a constant cancels out of it.
+    const billedFigure = (list: readonly HarnessMessage[]): number => floor + measureShrink(list);
+
+    const full = Array.isArray(messages) ? messages.slice() : [];
+    const start = billedFigure(full);
+
+    // Nothing to do — the ladder's first rung is already roomy enough. Reported as a no-op so
+    // the caller can keep the request byte-identical instead of rebuilding it. The floor also
+    // makes this branch answer the question the dead-run guard asks: a target at or below the
+    // floor is reached immediately, and a target BELOW the floor can never be reached, which is
+    // exactly the request `turnBefore` now refuses to send.
+    const target = Number.isFinite(targetTokens) && targetTokens > 0 ? Math.floor(targetTokens) : 1;
+
+    if (start <= target) {
+        return { messages: full, dropped: 0, clipped: 0, tokens: start };
+    }
+
+    const tailSize = Math.max(0, Math.min(Math.floor(keepTail) || 0, full.length));
+    const split = full.length - tailSize;
+
+    // ── Pass A: clip the head's payload, keep every entry ───────────────────────────────
+    let clipped = 0;
+    const head = full.slice(0, split).map((entry) => {
+        const next = clipShrinkEntry(entry, SHRINK_CLIP_CHARS);
+
+        // Counted only when the rewrite actually removed characters, so "clipped: 0" means the
+        // pass changed nothing rather than "the pass ran". Body-only on purpose: `floor` is the
+        // same on both sides of this comparison, so adding it would only buy two more
+        // serialisations per entry.
+        if (measureShrink([next]) < measureShrink([entry])) clipped += 1;
+
+        return next;
+    });
+
+    const tail = full.slice(split);
+    let tokens = billedFigure([...head, ...tail]);
+
+    if (tokens <= target) {
+        return { messages: [...head, ...tail], dropped: 0, clipped, tokens };
+    }
+
+    // ── Pass B: drop the oldest pairable units, oldest first ────────────────────────────
+    // Leading `system` entries are lifted out and always retained (the standing-instruction
+    // rule `planCompactionRetention` follows for the same reason).
+    const leading: HarnessMessage[] = [];
+    let cursor = 0;
+
+    while (cursor < head.length && head[cursor].role === 'system') {
+        leading.push(head[cursor]);
+        cursor += 1;
+    }
+
+    const excerpts: string[] = [];
+    let dropped = 0;
+
+    // The digest costs characters too, so it is measured INSIDE the loop: a ladder step that
+    // stops the moment the budget is met without pretending the digest is free.
+    const build = (from: number): HarnessMessage[] => {
+        const kept = head.slice(from);
+
+        if (dropped === 0 || from === 0) return [...leading, ...kept, ...tail];
+
+        // A unit can carry no text at all (a tool-call turn whose every result is a file), so
+        // the excerpts are optional — a digest that printed `undefined` for the excerpt would
+        // cost characters and tell the model nothing.
+        const excerptsOf =
+            excerpts.length === 0
+                ? ''
+                : excerpts.length === 1
+                  ? ` Oldest removed: ${excerpts[0]}`
+                  : ` Oldest removed: ${excerpts[0]} | Most recent removed: ${excerpts[excerpts.length - 1]}`;
+
+        return [
+            ...leading,
+            {
+                role: 'user',
+                content:
+                    `${SHRINK_DIGEST_MARKER} The harness removed ${dropped} earlier ${
+                        dropped === 1 ? 'turn' : 'turns'
+                    } from this request without a model to summarize them, because the request itself ` +
+                    `did not fit the context window. The removed turns are still on the record; they are ` +
+                    `simply not being sent.${excerptsOf}`
+            },
+            ...kept,
+            ...tail
+        ];
+    };
+
+    let queue = build(cursor);
+
+    tokens = billedFigure(queue);
+
+    while (tokens > target && cursor < head.length) {
+        const unitEnd = shrinkUnitEnd(head, cursor);
+        const unit = head.slice(cursor, unitEnd);
+
+        // Excerpts for the digest: the entry's own text, cut to the same budget the clip used,
+        // so the digest cannot grow with the transcript.
+        for (const entry of unit) {
+            const text = typeof entry.content === 'string' ? entry.content.trim() : '';
+            if (text.length === 0) continue;
+            excerpts.push(text.slice(0, SHRINK_CLIP_CHARS));
+        }
+
+        dropped += 1;
+        cursor = unitEnd;
+        queue = build(cursor);
+        tokens = billedFigure(queue);
+    }
+
+    return { messages: queue, dropped, clipped, tokens };
+};
+
 // The disable rule BOTH finalize paths share (`setIncluded` on a live run, a canonical
 // rewrite on an idle one). Everything before the instruction goes, because the summary
 // replaced it; everything strictly between the instruction and the final answer goes too,
@@ -1135,6 +1873,76 @@ export const createContextCompactionPasses = (
     // long-running conversations must not share one cooldown.
     const triggered = new Map<string, number>();
 
+    // THE DEAD-RUN LATCH (X2, F6) — threadId -> the estimate the guard last REPORTED at. The
+    // guard's report is operator-facing prose ("raise `contextLimit`"), and an armed overflow
+    // skips Rule 3 by design, so without a latch a conversation that is permanently bigger than
+    // its ceiling printed the same paragraph once per rung per run. The latch holds the size it
+    // reported at and re-arms on exactly Rule 3's margin (one report per `REGROWTH_RATIO` of
+    // growth), plus a full clear the moment the request stops being dead (see the guard in
+    // `turnBefore`) — so a session that stays dead says it once, a session that keeps growing
+    // says it once per step, and a session that becomes dead AGAIN after the operator raised the
+    // limit or shed a tool is free to say it again.
+    const deadRunReported = new Map<string, number>();
+
+    // -----------------------------------------------------------------------
+    // THE OVERFLOW LADDER (2026-11-17, the deadlock this plugin used to cause)
+    // -----------------------------------------------------------------------
+    //
+    // WHAT IT IS FOR. The transport and the agent's pre-request floor both answer a request
+    // that does not fit with the SAME machine code (`CONTEXT_OVERFLOW_CODE`): a provider 400
+    // relayed off the wire, and the harness refusing to send at all. When that reaches
+    // `run.failed`, this plugin knows two things and can guess nothing else: the request was
+    // too big, and the transcript is what it controls. So the failure ARMS a pass — the next
+    // boundary runs whether or not the estimate crossed the trigger, and the summarize request
+    // goes out cut to the next rung of `SHRINK_LADDER`.
+    //
+    // WHY A MAP OF RUNGS RATHER THAN A COUNTER. The rung IS the state: `0` means "the next
+    // pass sends 85% of the transcript it can remove, on top of the floor it cannot", and an
+    // absent key means "nothing was refused". One key per conversation, bounded by the ladder's
+    // length, and it dies with the harness like the two maps beside it.
+    //
+    // WHY THE WATERMARK IS CLEARED ON AN OVERFLOW AND ON NOTHING ELSE (the second half of the
+    // bug). Rule 3 records the size BEFORE the action, so a failed pass is damped until the
+    // conversation grows by `REGROWTH_RATIO` — the right call for a provider that failed for a
+    // reason compaction cannot fix, and the reason a refused compaction used to be retried
+    // never. An overflow is different in kind: the NEXT attempt is a strictly smaller request,
+    // so damping it is what re-creates the deadlock. A pass that died of anything else keeps
+    // its damping, byte for byte (the failed-run case in the test file pins both halves).
+    //
+    // `overflowSpent` is the give-up: after `SHRINK_LADDER.length` refusals the transcript is
+    // not the problem (a huge tool registry, a window smaller than one turn, a provider
+    // counting something else), and one model turn per turn forever is a worse failure than a
+    // reported one. The set is cleared by a SUCCESSFUL compaction (`turn.after`, the same edge
+    // that resets the rung) or by a fresh overflow after the transcript changed size.
+    const overflowRung = new Map<string, number>();
+
+    // threadIds whose ladder is spent — reactive passes stopped, with a report saying so.
+    const overflowSpent = new Set<string>();
+
+    // THE NO-PROGRESS BASELINE (X2, F2) — threadId -> the BILLED figure of the shrink request
+    // this overflow sequence last actually SENT.
+    //
+    // WHY A BASELINE AND NOT A RUNG COUNT. `SHRINK_LADDER` is strictly decreasing, so its
+    // TARGETS are strictly decreasing — but a rung whose target sits below what the transcript
+    // pass can remove produces the SAME request as the rung above it: the planner clips every
+    // head entry and drops every droppable pairable unit and still cannot reach the target, so
+    // it returns the all-removed request and every deeper rung returns that same request again.
+    // The measured case (`Temp/review-v2/probe-b.log` B3, a floor-dominated round) is four rung
+    // targets — 41,399 / 34,093 / 24,352 / 17,046 — all resolving to one identical
+    // 206,159-token request: four provider round trips of exactly the size the provider had just
+    // refused, and only the fourth was allowed to report the give-up. Give-up is therefore keyed
+    // on PROGRESS, not on the rung counter: a rung that cannot come back strictly smaller than
+    // the figure already refused cannot be improved by a deeper rung either (`planCompactionRequest`
+    // is monotone in its target — a smaller target removes no less, so the sequence has already
+    // reached its floor), and sending it again spends a model turn to re-learn a refusal. The
+    // ladder stops there, with `stage: 'no-progress'` in the existing report plane.
+    //
+    // Same lifetime as the two maps above: cleared when a compaction succeeds (`turnAfter`, the
+    // edge that resets the rung), when a sequence is spent, and when the no-progress gate ends
+    // a sequence, so the NEXT refusal re-arms with a fresh baseline rather than being judged
+    // against a figure from a conversation that has since changed size.
+    const overflowBest = new Map<string, number>();
+
     // threadId -> the in-flight pass. Bounded by the number of conversations a harness
     // ever had, exactly like the cooldown map above: the only way an entry outlives its
     // thread is a thread purged mid-pass, which leaves one stale key in a map nothing
@@ -1239,7 +2047,6 @@ export const createContextCompactionPasses = (
         }
     };
 
-
     // `modelLimits` is free text an operator edits rarely, and this handler runs on
     // EVERY turn, so parsing it per turn is waste. Keyed by the exact stored string: the
     // compare is one reference/length check, and any change from the UI re-parses on the
@@ -1279,10 +2086,26 @@ export const createContextCompactionPasses = (
     // into the CANONICAL transcript, and hand THIS request the projection plus that
     // instruction. The answer arrives on the model turn this returns into, which is why the
     // pass cannot finish here (see "THE PHASE MAP").
+    //
+    // `shrinkTo` (2026-11-17) is the budget of an EMERGENCY request — one sent because a size
+    // refusal says the full projection will not fit. It applies to the REQUEST ONLY
+    // (`setTranscript`, via `planCompactionRequest`); the canonical history is still written in
+    // full, so a shrink costs nothing durable and the model's own summary remains the thing
+    // that decides what stops being sent. Omitted is the ordinary pass: the projection exactly
+    // as measured, plus the instruction, byte-identical to what this function sent before.
+    //
+    // `planned` (X2, F2) is that decision, computed by the CALLER before this function parks
+    // anything: `turnBefore` has to be able to refuse a no-progress rung without a park, without
+    // a committed instruction, and without a model turn, and the plan it needs is exactly the one
+    // this commit would make. It is pure over `context.messages`, which never moves inside a
+    // handler, so pre-computing it changes no figure — it only moves the cost to before the
+    // point of no return.
     const beginSummarize = async (
         context: HarnessTurnBeforeContext,
         effective: number,
-        tokens: number
+        tokens: number,
+        shrinkTo: number | undefined,
+        planned: HarnessSummarizePlan
     ): Promise<void> => {
         const threadId = context.threadId;
 
@@ -1310,15 +2133,15 @@ export const createContextCompactionPasses = (
                 { role: 'user', content: COMPACTION_INSTRUCTION }
             ]);
 
-            // THIS request: the projection exactly as measured, plus the instruction. The
-            // committed history and the request are written by two different calls on
-            // purpose — `setTranscript` is request-only and wins over the round's
-            // re-projection (src/harness.ts `requestOf`), while `replaceHistory` alone would
-            // leave this request re-projected from the pre-commit list.
-            context.setTranscript([
-                ...context.messages,
-                { role: 'user', content: COMPACTION_INSTRUCTION }
-            ]);
+            // THE PLAN, taken from the caller's pre-computed decision (see `planSummarizeRequest`
+            // for the derivation of every figure here, including the one-currency floor). The
+            // committed history and the request are written by two different calls on purpose —
+            // `setTranscript` is request-only and wins over the round's re-projection
+            // (src/harness.ts `requestOf`), while `replaceHistory` alone would leave this request
+            // re-projected from the pre-commit list.
+            const { request, floor, full, plan, sent } = planned;
+
+            context.setTranscript(sent);
 
             // DISPLAY LANE (C1): the boundary exists the moment the instruction is in the
             // canonical transcript, so the lane moves HERE — after the commit that could
@@ -1336,6 +2159,50 @@ export const createContextCompactionPasses = (
                     `The next model turn carries the compaction instruction.`,
                 data: { mode: MODE_SUMMARIZE, threadId, tokens, effective, entries: canonical.length + 1 }
             });
+
+            // The SECOND report of an emergency pass, kept separate rather than folded into the
+            // one above: the park report is the shape every existing case pins, and a shrink is
+            // an addition to it, not a change in it. It is also the operator-facing half of the
+            // deadlock fix — the line that says "the request that was refused has now been
+            // out-sized", with both numbers, so a ladder that is not making progress is visible
+            // rather than inferred from four identical refusals.
+            //
+            // THE CURRENCY of all three numbers: billed request size, not transcript size.
+            // `from` and `to` are `floor + body` and `plan.tokens` (which is the same thing for
+            // the shrunk request), and `target` is the rung budget against that same hard limit —
+            // the floor plus the ratio across the removable transcript, clamped to the fit line —
+            // so `to <= target` is the claim the provider can check. The floor is reported too,
+            // because the number an operator needs when the ladder looks idle is "how much of
+            // this request could not be shrunk at all" — stated that way, and not as "the tool
+            // catalogue", because the figure is a RESIDUAL of the estimator's own round figure
+            // (see `measureRequestFloor`: on an anchored round it carries the provider-anchored
+            // premium as well, so it is an upper bound on the catalogue and the instruction
+            // blocks rather than a measurement of them).
+            if (plan !== undefined && sent !== request) {
+                api.report.diagnostic({
+                    message:
+                        `context-compaction is asking thread ${threadId} to compact itself from a request the ` +
+                        `provider could not refuse: ~${floor + full} billed estimated tokens were cut to ~` +
+                        `${plan.tokens} (target ${shrinkTo}, of which ${floor} is this request's irreducible floor ` +
+                        '— the serialized tool schemas and instruction blocks the transcript pass cannot touch, ' +
+                        'counted in the same currency the trigger figure was estimated in) by withholding ' +
+                        `${plan.dropped} earlier ${plan.dropped === 1 ? 'turn' : 'turns'} and clipping ` +
+                        `${plan.clipped} ${plan.clipped === 1 ? 'entry' : 'entries'} from the request only — the ` +
+                        'record is intact.',
+                    data: {
+                        mode: MODE_SUMMARIZE,
+                        threadId,
+                        stage: 'shrink',
+                        target: shrinkTo,
+                        from: floor + full,
+                        to: plan.tokens,
+                        floorTokens: floor,
+                        dropped: plan.dropped,
+                        clipped: plan.clipped,
+                        entries: plan.messages.length
+                    }
+                });
+            }
         } catch (error) {
             // A commit that failed has nothing to finalize. Drop the phase and lift the
             // park — a stranded park is the one failure this plugin may never cause — and
@@ -1557,10 +2424,26 @@ export const createContextCompactionPasses = (
             }
         }
 
-        const { effective } = resolveContextTrigger({
+        // The headroom ratio. Read HERE, after the mode decision and before the trigger is
+        // resolved, so a round skipped by Rules 1/4/5 still stops at two settings reads and the
+        // pinned read sequences in the test file stay honest.
+        //
+        // It IS a declared `metadata.settings` row (row 3, filed under the `modelLimits` entry it
+        // depends on), so an operator can see and edit it in the Plugins pane and a stored `0` is
+        // a documented opt-out rather than a folklore setting. The DECLARED default now outranks
+        // the argument below (plugin/settings.ts `resolve`: stored value → declared default →
+        // argument fallback), so this read answers 0.15 for a fresh install two ways at once; the
+        // argument stays because a host plugin that reuses this guard WITHOUT declaring the row
+        // still has to get the buffer rather than `0`, exactly like the other fallback constants
+        // above. The two spellings are the same number on purpose — see
+        // `HEADROOM_RATIO_DEFAULT` for the duplication rule.
+        const headroomRatio = api.settings.number('headroomRatio', HEADROOM_RATIO_DEFAULT);
+
+        const { effective, limit: ceiling, window } = resolveContextTrigger({
             contextLimit: limit,
             modelLimits: limitsMap,
-            modelId: currentModelId(api, context.agent)
+            modelId: currentModelId(api, context.agent),
+            headroomRatio
         });
 
         // Rule 2: under the limit — clear the cooldown so the next crossing is fresh, and
@@ -1568,7 +2451,23 @@ export const createContextCompactionPasses = (
         // always measured; `summarize` measures the live one (see `liveEstimate`).
         const tokens = summarize ? liveEstimate(context) : context.estimatedTokens;
 
-        if (tokens < effective) {
+        // THE OVERFLOW RUNG (see the map above). A refusal outranks Rule 2 (the estimate may
+        // well read low — the estimate is an estimate, and the provider just measured the real
+        // thing) and Rule 3 (the next attempt is a strictly smaller request, so the growth that
+        // the re-trigger memory waits for is exactly the growth that already failed).
+        const rung = overflowRung.get(context.threadId);
+        const armed = rung !== undefined && !overflowSpent.has(context.threadId);
+
+        // Whether a DECLARED model window is the number that binds (the same test
+        // `resolveContextTrigger` uses for the headroom buffer, re-derived from what it returns
+        // rather than returned again as a second field). When it does, a projection already AT
+        // the window will be refused with the instruction on top of it: the round trip we can
+        // see coming is worth skipping, so such a pass goes out shrunk from its first rung.
+        // Without a declared window there is nothing to be under, and the refusal-armed path
+        // above carries the whole load.
+        const atWindow = window !== undefined && window <= ceiling && tokens >= window;
+
+        if (!armed && tokens < effective) {
             triggered.delete(context.threadId);
             return undefined;
         }
@@ -1577,30 +2476,293 @@ export const createContextCompactionPasses = (
         // round trip costs more than the context it saves. Read only on a turn that is
         // already over the limit, so the hot path never pays for it — and NOT recorded in
         // the cooldown, so raising the floor back down re-arms the pass on the next turn.
+        //
+        // An ARMED overflow respects it too, and that is a decision rather than an oversight:
+        // a transcript below the floor that still got refused is being refused by something
+        // compaction does not own (tool schemas, a window smaller than one turn), and spending
+        // a model turn per turn to re-learn that is the loop the ladder exists to bound. The
+        // give-up report below is the operator's signal, not a silent silence.
+        //
+        // The local is named `minTokens`, not `floor`, because "the floor" now means something
+        // else in this file — a request's irreducible size, see `planCompactionRequest` — and
+        // the dead-run guard below needs both words in the same function.
         if (summarize) {
-            const floor = api.settings.number('minTokens', MIN_TOKENS_DEFAULT);
+            const minTokens = api.settings.number('minTokens', MIN_TOKENS_DEFAULT);
 
-            if (Number.isFinite(floor) && tokens < floor) return undefined;
+            if (Number.isFinite(minTokens) && tokens < minTokens) return undefined;
         }
 
         // Rule 3: at or above the limit. Fire on a fresh crossing, or once the conversation
         // has grown by at least REGROWTH_RATIO of the effective limit since the last fire.
         // `max(1, ...)` keeps a margin for a limit so small that 5% rounds to 0 — otherwise an
-        // unchanged estimate would fire on every turn again.
-        const previous = triggered.get(context.threadId);
-        const margin = Math.max(1, Math.floor(effective * REGROWTH_RATIO));
+        // unchanged estimate would fire on every turn again. An armed overflow skips the rule
+        // entirely (see above).
+        if (!armed) {
+            const previous = triggered.get(context.threadId);
+            const margin = Math.max(1, Math.floor(effective * REGROWTH_RATIO));
 
-        if (previous !== undefined && tokens < previous + margin) {
-            return undefined;
+            if (previous !== undefined && tokens < previous + margin) {
+                return undefined;
+            }
+        }
+
+        // THE DEAD RUN GUARD (2026-11-17, the size-refusal deadlock) — why a summarize pass can
+        // be refused even on a round the provider just refused for size. The request this pass
+        // sends is the whole transcript plus the compaction instruction, and the ladder can
+        // only remove transcript: the request's FLOOR (tool catalogue, agent instructions,
+        // harness turns, per-call overhead) rides along on every rung. So when the floor alone
+        // is at or above the ceiling the overage is not the transcript's, clipping cannot close
+        // it, and firing buys a guaranteed second refusal on a turn that was going to be
+        // blocked anyway: `planCompactionRequest` reaches no target it cannot reach, the
+        // transport rejects the request for the same reason, and the session walks the rest of
+        // the ladder plus the give-up with the transcript intact either way. Not firing leaves
+        // every entry in the request and says so once — an honest block instead of four
+        // no-progress turns.
+        //
+        // WHY `>=` IS THE RIGHT EDGE: at `floor == ceiling` the smallest request the pass can
+        // build is exactly at the figure the ceiling treats as unsendable, so it has nothing to
+        // gain; one point below, and a clipped request can fit. The table in
+        // src/plugin/context-compaction.test.ts pins both sides (a 13,272-token catalogue
+        // blocks at a 13,272 ceiling and fires at 13,273 — the row RE-DERIVED for X2, because
+        // both the floor derivation and the trigger moved under F1/F3) so this stays a boundary
+        // rather than a clamp.
+        //
+        // WHY THE COMPARISON IS AGAINST THE CEILING AND NOT THE EFFECTIVE TRIGGER (X2, F3).
+        // `ceiling` is the number that refuses — the declared window, or the operator's budget
+        // when no window is declared. The headroom buffer now comes off BOTH of them, so
+        // `effective` is strictly below the refusal point on every deployment; a guard that
+        // compared an irreducible request against the FIRING point would suppress compaction on
+        // every deployment whose floor sits between the two — exactly the small-`contextLimit`
+        // installations F3 exists to protect (a 25,000 ceiling with a 15,000 floor has an
+        // `effective` of 12,500 and could still relieve 10,000 tokens of transcript). The pass
+        // is dead only when nothing it can send would be sendable.
+        //
+        // WHY THE FULL TRANSCRIPT AND NOT THE PROJECTION: the transcript figure below is the
+        // most a pass could ever take off, so a refusal cannot be caused by the other
+        // `turn.before` pass withholding entries this round. The floor comes from
+        // `measureRequestFloor`, the same derivation `beginSummarize` uses, so the guard and the
+        // ladder cannot disagree about what is irreducible, and this reads no new setting. An
+        // `exclude` round is untouched: it never re-sends the transcript, so the floor argument
+        // does not apply to it.
+        //
+        // The local is named `floor`, not the `minTokens` from the gate above: that one lives
+        // inside its own `if (summarize)` block, so reading it down here would be a block-
+        // scoping `ReferenceError` swallowed by the plugin hook's fail-open (a silent missing
+        // pass), and "the floor" in this file means the request's irreducible size.
+        //
+        // It is hoisted ABOVE the guard (R6, 2026-11-17) rather than measured inside it, because
+        // TWO readers now need the one figure: the guard below reports it as
+        // `unreachableTarget`, and the shrink ladder prices its rung against it (see
+        // `rungBudget`). One measurement per round either way — it is the same
+        // `measureRequestFloor` derivation `planSummarizeRequest` runs on the same projection —
+        // and an `exclude` round still pays nothing for it (`0`, since that mode never re-sends a
+        // transcript).
+        const floor = summarize ? measureRequestFloor(context.messages, tokens) : 0;
+
+        if (summarize) {
+            // The transcript figure only feeds the guard's report ("how much could this pass have
+            // taken off"), so it stays where the report is made.
+            const transcript = measureShrink(context.messages);
+
+            if (floor >= ceiling) {
+                // ONE REPORT PER SIZE, not one per run (X2, F6). Rule 3's regrowth margin already
+                // bounds the UNARMED case to one report per 5% of growth, but an ARMED overflow
+                // deliberately skips Rule 3, so a session permanently over its window used to
+                // print this on every rung of every run — the report the reviewer measured as
+                // repeating per turn. The latch therefore stores the size it reported at and
+                // re-arms on the SAME margin Rule 3 uses, which keeps both truths: a conversation
+                // stuck at one size says it once, a conversation that keeps growing keeps saying
+                // it (each 5% step is new information about a request that still cannot fit), and
+                // the moment the request STOPS being dead the else below clears the latch so a
+                // later dead run is free to state it again.
+                const reported = deadRunReported.get(context.threadId);
+                const margin = Math.max(1, Math.floor(effective * REGROWTH_RATIO));
+
+                if (reported === undefined || tokens >= reported + margin) {
+                    deadRunReported.set(context.threadId, tokens);
+
+                    api.report.diagnostic({
+                        message:
+                            `context-compaction is refusing to compact thread ${context.threadId}: its request ` +
+                            `floor is ${floor} tokens against a ${ceiling} ceiling, so the transcript this pass ` +
+                            `could still withhold is only ${transcript} of the ${tokens} estimated tokens on the ` +
+                            `round. That floor is the part of EVERY request this harness sends that compaction ` +
+                            `does not own — the serialized tool schemas of the agent's tool set and the agent's ` +
+                            `instruction blocks — and it is already at or above the ceiling on its own, so no ` +
+                            `amount of clipping can get a compaction request sendable and the pass would buy a ` +
+                            `second refusal for the same reason while leaving every entry in the request anyway. ` +
+                            `Raise \`contextLimit\` above ${floor}, or give the model a larger window in ` +
+                            '`modelLimits` ' +
+                            '(`modelLimits: {"<model id>": {"window": <tokens>}}`), or use a preset that ' +
+                            'registers fewer tools.',
+                        data: {
+                            mode: MODE_SUMMARIZE,
+                            threadId: context.threadId,
+                            stage: 'unreachable-target',
+                            tokens,
+                            effective,
+                            limit: ceiling,
+                            unreachableTarget: floor,
+                            transcriptTokens: transcript,
+                            reported: true,
+                            ...(armed ? { armed: true, rung } : {})
+                        }
+                    });
+                }
+
+                return undefined;
+            }
+
+            // The request is sendable after all, so the one-report latch is re-armed.
+            deadRunReported.delete(context.threadId);
         }
 
         // Recorded BEFORE the action: a failing action must not be retried on the very
-        // next turn, and the value stored is the size this pass was asked about.
+        // next turn, and the value stored is the size this pass was asked about. An overflow
+        // failure clears this again in `runFailed` — the asymmetry is the point.
         triggered.set(context.threadId, tokens);
 
-        return summarize
-            ? beginSummarize(context, effective, tokens)
-            : pass(context);
+        if (!summarize) return pass(context);
+
+        // THE BUDGET this pass sends its request under, or `undefined` for "send the ordinary
+        // request". `SHRINK_LADDER` is strictly decreasing, so the fourth refusal sends 35% of
+        // the transcript this pass can remove and the fifth reports the give-up instead of
+        // spending another turn.
+        const ladder = SHRINK_LADDER[armed ? Math.min(rung ?? 0, SHRINK_LADDER.length - 1) : 0];
+
+        // THE RUNG, PRICED IN ONE CURRENCY (R6, 2026-11-17 — the over-compaction the operator
+        // reported as "it erased more than the window asked for", twice as often as it needed to).
+        //
+        // WHAT MOVED. `tokens` is the BOUNDARY estimate, and that figure is not the transcript:
+        // it is the transcript payload PLUS the request's irreducible floor (the serialized tool
+        // catalogue, the agent's instruction blocks, the harness turns — everything
+        // `measureRequestFloor` has just said this pass cannot remove; src/harness.ts:12512 passes
+        // `toolSchemaBytes()` into the very estimator this number comes from). Scaling THAT number
+        // by the rung therefore asked the transcript to absorb the rung's percentage of the
+        // CATALOGUE too. Re-arranged, the payload budget the old expression produced was
+        //
+        //     ladder × (floor + payload₀) − floor  =  ladder × payload₀  −  (1 − ladder) × floor
+        //
+        // i.e. the cut the rung actually asked for PLUS a second allowance the size of a fraction
+        // of the floor — 1,991 tokens of extra history per rung at the shipped 0.85 against the
+        // 13,272-token catalogue of a writer-only roster, and the whole ladder compounds it. That
+        // is the double subtraction the acceptance note names: the floor is removed once by the
+        // `− floor` that turns a billed target into a payload budget inside `planCompactionRequest`
+        // and once again by the ratio that was taken across it.
+        //
+        // THE SECOND, WORSE HALF: once that target dropped below `floor + the smallest request this
+        // transcript can build`, it was unreachable BY CONSTRUCTION — every candidate was over it,
+        // `planCompactionRequest` walked to the bottom of its pass B, and the pass withheld EVERY
+        // droppable unit chasing a number no request of this harness could ever send. That is the
+        // measured `Temp/review-v2/probe-b.log` B3 shape (four targets 41,399 / 34,093 / 24,352 /
+        // 17,046 against a 44,597-token floor, all four resolving to one identical 206,159-token
+        // request). The user-visible cost is conversation erased that the context window never
+        // asked for, which is what "the size refusal should never have happened" is about: the
+        // prevention is the headroom buffer, and a pass that over-cuts spends history instead.
+        //
+        // THE FIX: scale the part the transcript pass owns and add the floor back unchanged, so
+        // the budget the loop is handed and the `floor + body` figure it stops on are the SAME
+        // currency with ONE subtraction. `floor` cancels out of the ratio, which keeps a
+        // catalogue-free round (`floor = 0`, every fake-api case that does not name a floor)
+        // byte-identical to `max(1, floor(tokens × ladder))`, and it puts the target ABOVE the
+        // floor on a catalogue-dominated round — the regime where a candidate can exist at all, so
+        // the loop stops at the FIRST message budget whose true request fits instead of emptying
+        // the transcript. The rung stays strictly decreasing in `payload₀`, and monotone in the
+        // amount it removes, so the `no-progress` gate keeps the semantics it was accepted with:
+        // a rung that cannot come back strictly smaller than the figure this sequence already sent
+        // still ends the ladder, and `overflowBest` still baselines on `planned.sentTokens`.
+        const rungBudget = floor + Math.max(1, Math.floor(Math.max(0, tokens - floor) * ladder));
+
+        // THE FIT LINE — the one figure a summarize request is held to, shared with the trigger
+        // above and the dead-run guard above that. It is `effective` on BOTH branches (an over-limit
+        // round and a headroom round): the firing point the headroom buffer sits below, and the
+        // figure the clamp below was already using before this fix — which is why every
+        // catalogue-free case (`floor = 0`, all the fake-api tests) and every small-catalogue case
+        // (X1: a 18,844 floor under a 24,250 line) keeps the exact numbers it shipped with.
+        //
+        // The one case that CANNOT use `effective` is a floor at or above it: a catalogue that sits
+        // inside the buffer band of its own ceiling, which the guard immediately above has just
+        // established is NOT a dead pass because the CEILING is still reachable (X2, F3). No request
+        // this pass can build is under `effective` — `floor + 1 char` already misses it — so chasing
+        // it walks pass B to the bottom, which is the over-cut this fix is about, with a different
+        // number printed on the report. What decides a refusal on that deployment is the ceiling, so
+        // the ceiling is the honest line there: the ladder stops at the first request that actually
+        // fits it. NOTHING about the trigger changes — Rules 2 and 3 still compare this turn's
+        // estimate against `effective`, headroom and all.
+        const fitLine = effective > floor ? effective : ceiling;
+
+        // THE CLAMP, unchanged in its reason: on an over-limit round the rung fraction of the
+        // refused size is above the ceiling BY DEFINITION — 85% of 121% of the limit is still over
+        // the limit — so clamping is what makes the target one the provider could actually answer.
+        // `rungBudget`, `fitLine` and the ladder's `floor + body` measurements are one currency
+        // (billed request size), which is the claim every figure in the shrink report makes.
+        const shrinkTo = armed || atWindow ? Math.min(fitLine, rungBudget) : undefined;
+
+        // THE PLAN, computed BEFORE the pass parks anything (see `planSummarizeRequest`): the
+        // no-progress gate below has to know what this rung would actually send before it is
+        // allowed to spend a model turn on it, and `beginSummarize` consumes the same object, so
+        // the measurement is paid for exactly once either way.
+        const planned = planSummarizeRequest(context.messages, tokens, shrinkTo);
+
+        // THE NO-PROGRESS GATE (X2, F2). An armed round exists because the provider refused a
+        // request for size, so its whole purpose is to send a SMALLER one. The rung targets come
+        // down strictly (`SHRINK_LADDER`), but a target below what the transcript pass can remove
+        // is reached by removing everything removable — and then every deeper rung reaches ITS
+        // target the same way and sends the IDENTICAL request. That is the measured failure: four
+        // rungs, four refused round trips, one identical 206,159-token figure each
+        // (`Temp/review-v2/probe-b.log` B3), with the give-up arriving only after the fourth. The
+        // gate therefore keys give-up on PROGRESS: once a rung cannot come back strictly smaller
+        // than the figure this sequence already sent and was refused at, no deeper rung can either
+        // (a smaller target removes no less), so the ladder stops here rather than at the rung
+        // counter, and it stops WITHOUT a park, WITHOUT a committed instruction and WITHOUT the
+        // provider round trip — one refusal now costs one shrunk attempt, not four.
+        //
+        // The baseline is per sequence and is recorded the moment a shrunk request is actually
+        // sent (below), so the FIRST rung of a sequence is never judged against anything: the
+        // figure that was refused belongs to the ordinary run request, which this pass never
+        // measured. `atWindow` passes (prevention, not reaction) are outside the gate: nothing has
+        // been refused, and the ordinary request is what was going to go out anyway.
+        if (shrinkTo !== undefined && armed) {
+            const refused = overflowBest.get(context.threadId);
+
+            if (refused !== undefined && planned.sentTokens >= refused) {
+                overflowRung.delete(context.threadId);
+                overflowSpent.add(context.threadId);
+                overflowBest.delete(context.threadId);
+
+                api.report.diagnostic({
+                    message:
+                        `context-compaction stopped the shrink ladder on thread ${context.threadId} at rung ` +
+                        `${(rung ?? 0) + 1} of ${SHRINK_LADDER.length}: this rung's request measures ` +
+                        `~${planned.sentTokens} billed estimated tokens against the ~${refused} the provider just ` +
+                        `refused for size, so the planner is already at the smallest request this transcript can ` +
+                        `send (${planned.floor} of those tokens is the request's irreducible floor) and no deeper ` +
+                        `rung of the ladder could send anything smaller. Compaction stops rather than spending a ` +
+                        `model turn per rung to re-learn the same refusal; it reacts again as soon as a pass ` +
+                        `succeeds or a fresh refusal arrives with a different transcript.`,
+                    data: {
+                        mode: MODE_SUMMARIZE,
+                        threadId: context.threadId,
+                        stage: 'no-progress',
+                        rung: (rung ?? 0) + 1,
+                        ladder: SHRINK_LADDER.length,
+                        target: shrinkTo,
+                        from: refused,
+                        to: planned.sentTokens,
+                        floorTokens: planned.floor,
+                        exhausted: true
+                    }
+                });
+
+                return undefined;
+            }
+
+            // The rung IS smaller than anything this sequence has been refused at, so it earns the
+            // round trip — and becomes the baseline the next rung is judged against.
+            overflowBest.set(context.threadId, planned.sentTokens);
+        }
+
+        return beginSummarize(context, effective, tokens, shrinkTo, planned);
     };
 
     // The edge that ends `compacting`: a tool-free assistant turn IS the compaction answer
@@ -1616,6 +2778,17 @@ export const createContextCompactionPasses = (
         if (!isAnswerMessage(payload.message)) return undefined;
 
         phases.set(threadId, 'finishing');
+
+        // THE LADDER RESETS HERE, not at the finalize: the provider ANSWERED a request that
+        // arrived whole, which is the whole definition of "the overflow is resolved". The next
+        // refusal — possibly the very next turn — starts again at rung 1, and a thread that has
+        // spent its ladder stops being spent by one good request.
+        overflowRung.delete(threadId);
+        overflowSpent.delete(threadId);
+        // The no-progress baseline belongs to the sequence that just succeeded (X2, F2): the
+        // next refusal starts a fresh ladder with a fresh baseline, measured against whatever the
+        // next request actually is.
+        overflowBest.delete(threadId);
 
         // Load-bearing, not cosmetic: `thread.idle` fires only on a real transition to idle
         // (src/harness.ts ~10227), and the idle-path finalize below needs that transition.
@@ -1871,6 +3044,72 @@ export const createContextCompactionPasses = (
         const threadId = payload.threadId;
 
         if (threadId === undefined) return undefined;
+
+        // THE OVERFLOW ARM (2026-11-17, the deadlock). BEFORE the phase guard, because the
+        // refusal this reacts to is usually not a compaction failure at all: it is the
+        // conversation's own request being refused, on a thread that never started a pass
+        // (no phase), or the summarize request being refused before the model ever answered.
+        // Both cases need the same answer — the next boundary sends less — and neither of them
+        // gets the park-lifting below, which a thread with no phase has nothing to lift.
+        //
+        // The code is the contract with the transport and the agent's pre-request floor
+        // (`transport/openai.ts` `CONTEXT_OVERFLOW_CODE`, reused by `core/agent.ts` when it
+        // refuses to send at all); the message prefix is the same fallback
+        // `core/agent.ts` `isContextOverflowFailure` applies for a relay that cannot carry a
+        // code, so a gateway that flattens the frame into prose is still recognised here.
+        const code = (payload.error as { code?: unknown } | undefined)?.code;
+        const reason = (payload.error as { message?: unknown } | undefined)?.message;
+        const overflow =
+            code === CONTEXT_OVERFLOW_CODE ||
+            (typeof reason === 'string' && reason.startsWith(`${CONTEXT_OVERFLOW_CODE}:`));
+
+        if (overflow) {
+            const next = (overflowRung.get(threadId) ?? -1) + 1;
+            const spent = next >= SHRINK_LADDER.length;
+
+            if (spent) {
+                overflowRung.delete(threadId);
+                overflowSpent.add(threadId);
+                // The sequence is over (X2, F2), so the baseline goes with it — a fresh refusal
+                // after this one starts a new ladder and must not be judged against a figure
+                // measured on a transcript that has since changed size.
+                overflowBest.delete(threadId);
+            } else {
+                overflowRung.set(threadId, next);
+                overflowSpent.delete(threadId);
+            }
+
+            // The other half of the fix: an overflow is the ONE failure this plugin can answer
+            // with a DIFFERENT request, so the Rule-3 re-trigger watermark must not mute the
+            // retry. Every other failure keeps its damping (the pass would otherwise repeat on
+            // every turn of a run that is failing for a reason compaction cannot reach).
+            triggered.delete(threadId);
+
+            const ratio = spent ? 0 : SHRINK_LADDER[Math.min(next, SHRINK_LADDER.length - 1)];
+
+            api.report.diagnostic({
+                message: spent
+                    ? `context-compaction thread ${threadId} was refused for size (code ${CONTEXT_OVERFLOW_CODE}) ` +
+                      `for the ${SHRINK_LADDER.length}th time: the transcript is not what exceeds the window — a ` +
+                      `tool registry the estimate cannot see, or a window smaller than one turn — so compaction ` +
+                      `stops reacting until a pass succeeds rather than spending a model turn per turn.`
+                    : `context-compaction thread ${threadId} was refused for size (code ${CONTEXT_OVERFLOW_CODE}). ` +
+                      `The re-trigger cooldown is cleared and the next boundary compacts regardless of the ` +
+                      `estimate, sending the request cut to ${Math.round(ratio * 100)}% of the projection ` +
+                      `(shrink rung ${next + 1} of ${SHRINK_LADDER.length}) so the provider cannot refuse it for ` +
+                      `the reason it just refused a larger one.`,
+                data: {
+                    mode: MODE_SUMMARIZE,
+                    threadId,
+                    hook: 'run.failed',
+                    stage: 'overflow',
+                    rung: spent ? SHRINK_LADDER.length : next + 1,
+                    ladder: SHRINK_LADDER.length,
+                    ratio,
+                    exhausted: spent
+                }
+            });
+        }
 
         const phase = phases.get(threadId);
 

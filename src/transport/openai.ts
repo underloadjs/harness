@@ -37,7 +37,13 @@
 // generic `HTTP <status>: <raw body>` dump, and `agent()` treats it as non-retriable
 // (see ../core/agent.ts, where the pre-request guard raises the same code before any
 // fetch). Every other non-2xx keeps its historical frame byte-for-byte, and a 400
-// that matches none of the patterns still answers with its raw detail.
+// that matches none of the patterns still answers with its raw detail. The SAME
+// matcher (`isContextOverflowSignal`, in ./provider-timeouts.ts) also runs on the
+// gateway's in-stream error frame, because a gateway that proxies another provider
+// commits `200 OK` + SSE before it generates and a size refusal from that upstream
+// therefore has no HTTP status left to wear — without that arm the identical
+// provider answer reached `agent()` codeless and spent the whole retry ladder
+// re-sending bytes that cannot change.
 //
 // Tool calls: the provider streams `tool_calls` as indexed fragments whose
 // `function.arguments` arrive as partial JSON. They are accumulated here and
@@ -66,6 +72,12 @@ import {
     PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV,
     PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
     PROVIDER_TIMEOUT_CODE,
+    // (2026-11-17, the provider-transit context-limit report) The ONE overflow matcher,
+    // now shared by the HTTP path below and by the in-stream classifier in
+    // ./provider-timeouts.ts. `CONTEXT_OVERFLOW_CODE` is imported to be RE-EXPORTED (the
+    // public name has always been published from this module).
+    CONTEXT_OVERFLOW_CODE,
+    isContextOverflowSignal,
     // (2026-11-17) The gateway's in-stream error vocabulary and its one translator, plus
     // the diagnostics class of a codeless provider-transit failure (a truncated body).
     PROVIDER_TRANSIT_CLASS,
@@ -1201,42 +1213,16 @@ const requireBuiltBody = (body: unknown): Record<string, unknown> => {
 // Provider context overflow (issue 0004)
 // ---------------------------------------------------------------------------
 
-// ONE machine name for "this prompt does not fit", shared with the pre-request
-// guard in ../core/agent.ts and published from the root barrel. A host switches on
-// it instead of parsing prose, and it sees the same name whether the harness
-// refused the request before sending it or the provider refused it after. It
-// follows the `HarnessError` code convention (../util/errors.ts): the code is also
-// the FIRST TOKEN of the message, because `harness.ts` renders a thrown error as
-// `Tool "…" failed: <message>` and only the message reaches the model.
-export const CONTEXT_OVERFLOW_CODE = 'context-overflow';
-
-// Providers do not agree on one wording, so recognition is an explicit list of the
-// phrasings real endpoints actually emit — never a status guess and never a bare
-// number. Every entry is a phrase only a size rejection uses:
-//   - `maximum context length` / `context_length_exceeded` — OpenAI and the
-//     gateways that relay it ("This model's maximum context length is 8192 tokens.
-//     However, your messages resulted in 9000 tokens…");
-//   - `prompt is too long` — Anthropic and the gateways that pass its text through;
-//   - `input is too long`, `too many tokens`, `context window`,
-//     `token limit exceeded` — the vLLM / Ollama / OpenRouter phrasings;
-//   - `request|payload|body too large` — the plain proxy-layer rejection, which on
-//     a chat-completions POST can only mean the prompt.
-//
-// Deliberately NOT matched: `max_tokens` on its own (a sampling-field complaint —
-// "Invalid value for max_tokens" is a broken request, not an oversized one), a bare
-// `length`, or any number. And a 400 that matches nothing keeps its raw detail:
-// this classifier decides only how a failure is NAMED, never what it says, so the
-// worst case is the pre-0004 frame, not a wrong diagnosis.
-const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
-    /maximum context length/i,
-    /context[ _-]?length[ _-]?exceeded/i,
-    /context[ _-]?window/i,
-    /prompt[ _-]?is[ _-]?too[ _-]?long/i,
-    /input[ _-]?(?:is[ _-]|was[ _-])?too[ _-]?long/i,
-    /too[ _-]?many[ _-]?tokens/i,
-    /token[ _-]?limit[ _-]?exceeded/i,
-    /(?:request|payload|body)[ _-]?too[ _-]?large/i
-];
+// The ONE machine name and the ONE matcher live in ./provider-timeouts.ts, the leaf BOTH
+// failure paths already import — the HTTP path below, and the in-stream path
+// (`providerWireFailureOf`, which is where a gateway-relayed size refusal actually
+// arrives). They moved there on 2026-11-17 because one question ("do these bytes not
+// fit?") had two classifiers and therefore two answers: a provider 400 was named
+// `context-overflow`, the SAME provider answer relayed on an SSE frame was codeless
+// `provider-transit` and spent the whole retry ladder. It is re-exported here because it
+// has always been published from this module (../index.ts → ./transport/index.ts), and a
+// public name must not move just because its implementation did.
+export { CONTEXT_OVERFLOW_CODE };
 
 // How much of the provider's own line survives in the frame. The provider's number
 // is the actionable half ("your messages resulted in 9000 tokens"), so the detail
@@ -1252,20 +1238,6 @@ const overflowDetailOf = (detail: string): string => {
     if (text.length <= OVERFLOW_DETAIL_CHARS) return text;
 
     return `${text.slice(0, OVERFLOW_DETAIL_CHARS)}…`;
-};
-
-// Is this non-2xx an input-too-long answer? A 413 needs no pattern: on a
-// chat-completions POST the only thing that can be too large is the request body,
-// and a proxy that caps body size means the same thing by it. A 400 is the case
-// that needs the wording, because a 400 is otherwise "your request is malformed" —
-// every other status (401, 404, 429, 5xx) is never an overflow, whatever its body
-// says, so a broken credential that quotes the provider's own context docs cannot
-// be misread as a size problem.
-const isContextOverflowResponse = (status: number, detail: string): boolean => {
-    if (status === 413) return true;
-    if (status !== 400) return false;
-
-    return CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(detail));
 };
 
 // ---------------------------------------------------------------------------
@@ -1605,7 +1577,14 @@ export const openAICompatible = (
                 // message leads with that same name instead of pasting a raw body. An
                 // unrelated 400, and every other status, keeps the historical frame
                 // byte-for-byte — including the absence of the `code` key.
-                if (isContextOverflowResponse(response.status, detail)) {
+                //
+                // (2026-11-17) The matcher is `isContextOverflowSignal` from
+                // ./provider-timeouts.ts — the SAME one the in-stream path calls, so a 400
+                // that the provider says "too long" is called `context-overflow` whether it
+                // reached us as this response or as one SSE frame on an open stream. Here
+                // `response.status` is always present, which is the arm with the strictest
+                // gate: 413 always, 400 on the wording, nothing else whatever it quotes.
+                if (isContextOverflowSignal(response.status, detail)) {
                     const providerSaid = overflowDetailOf(detail || response.statusText);
 
                     // The provider's own line is the actionable half (it usually quotes
@@ -1707,6 +1686,19 @@ export const openAICompatible = (
                 // published on `details` either way. An unrecognised or absent code stays
                 // CODELESS — the ladder the frame has always had — so a scripted provider
                 // error is retried exactly as src/core/agent.retry.test.ts pins it.
+                //
+                // (2026-11-17, the provider-transit context-limit report) THE ONE
+                // EXCEPTION to "never reads the prose": a CONTEXT-LENGTH REFUSAL. This
+                // gateway class answers `200 OK` + SSE before it generates
+                // (packages/underload/service/src/server/start.ts:286-288), so a provider
+                // that says "the prompt is too long" can only reach us HERE, as a frame
+                // whose wire `code` is `unknown`/`decode`/`upstream_status` and whose
+                // status is often absent. The translator now runs the same
+                // `isContextOverflowSignal` the HTTP response above runs, and returns
+                // `context-overflow` for it, which is what takes the failure out of the
+                // 11-attempt ladder (../core/agent.ts) and gives the compaction policy a
+                // code to act on. Every other shape of this frame is UNCHANGED, message
+                // included; the sentence for this one is chosen by `providerWireMessage`.
                 if (chunk.error) {
                     // The producer's key set is exactly `{ message, type, code, status?,
                     // errno?, param: null }`: `status` and `errno` are OMITTED (never sent

@@ -14,22 +14,32 @@
 //   wire `timeout`         → `provider-timeout`     (the agent's bounded 4-attempt ladder)
 //   wire `connection`      → `provider-connection`  (the short 3-attempt dial ladder)
 //   wire `aborted`         → `provider-aborted`     (terminal, never retried)
-//   wire `upstream_status` → `provider-rejected` for 400/401/403/404, CODELESS otherwise
+//   wire `upstream_status`→ `context-overflow` for an upstream 413 or a 400 whose prose is
+//                            a size refusal (2026-11-17, the provider-transit
+//                            context-limit report); otherwise `provider-rejected` for
+//                            400/401/403/404, CODELESS otherwise
 //                            — an upstream 408 / 429 / 5xx (504 included, which the
 //                            producer deliberately reports HERE and not as `timeout`)
 //                            keeps the generic transient ladder
 //   wire `decode` /
 //       `unknown` /
-//       NO code at all     → codeless transient ladder, message byte-for-byte
+//       NO code at all     → `context-overflow` when the frame's PROSE is a size refusal
+//                            (2026-11-17: the one case where prose is the only signal,
+//                            because the gateway attaches `status` to its
+//                            `upstream_status` class only); otherwise codeless transient
+//                            ladder, message byte-for-byte
 //
 // A codeless frame keeps its historical message VERBATIM (`Upstream stream terminated`
 // is the legacy constant the producer keeps for the `unknown` class, and a frame with no
 // `code` at all is a defensive/legacy INPUT shape — both gateway writers emit a coded
 // envelope, the copy at repository/agentic/src/server/start-server.ts:294-303 and
-// :599-669 included, where `code` is a required key), and classification NEVER reads the
-// prose — the sentence is endpoint-specific on purpose. What joins such a frame is the
-// `details` block with `errorClass: 'provider-transit'`, so the diagnosis is structured
-// while the ladder stays generic.
+// :599-669 included, where `code` is a required key), and classification reads the prose
+// for ONE class only — a CONTEXT-LENGTH REFUSAL (2026-11-17: a gateway that commits
+// `200 OK` + SSE BEFORE it generates leaves the provider's own words as the only signal
+// that a prompt is too long; the arms are pinned in ./openai.context-overflow.test.ts, and
+// a definite `timeout` / `connection` / `aborted` verdict is NEVER rewritten by prose).
+// What joins a prose-less frame is the `details` block with `errorClass:
+// 'provider-transit'`, so the diagnosis is structured while the ladder stays generic.
 //
 // Run: yarn vitest run src/transport/openai.provider-wire-codes.test.ts
 
@@ -286,6 +296,37 @@ describe('providerWireFailureOf (the one translator)', () => {
             errorClass: 'provider-transit',
             status: 503
         });
+
+        // (2026-11-17, the provider-transit context-limit report) THE CONTEXT-LENGTH ARMS,
+        // and they sit BESIDE the no-message rows above, which are their counterparts: a
+        // `upstream_status` 400 with no prose stays `provider-rejected`, and a `decode` /
+        // `unknown` frame with no prose stays codeless transit. A size refusal is what
+        // changes: an upstream 413 needs no wording at all, a 400 earns the name only from
+        // the provider's own line, and a status-less frame is decided by prose alone
+        // (absence of a status is absence of evidence, not evidence of an unrelated
+        // status). All three used to be `provider-rejected` or codeless transit — i.e.
+        // eleven attempts at bytes that cannot change. `errorClass` is the code, like every
+        // other coded class, so `harness.ts` and the UI read one answer from both fields.
+        expect(providerWireFailureOf({ code: 'upstream_status', status: 413, message: 'Payload Too Large' })).toEqual({
+            code: 'context-overflow',
+            errorClass: 'context-overflow',
+            status: 413
+        });
+
+        expect(
+            providerWireFailureOf({
+                code: 'upstream_status',
+                status: 400,
+                message: 'prompt is too long: 210000 tokens > 200000 maximum'
+            })
+        ).toEqual({ code: 'context-overflow', errorClass: 'context-overflow', status: 400 });
+
+        expect(
+            providerWireFailureOf({
+                message: "This model's maximum context length is 8192 tokens",
+                code: 'unknown'
+            })
+        ).toEqual({ code: 'context-overflow', errorClass: 'context-overflow' });
 
         expect(providerWireFailureOf({ code: 'decode' })).toEqual({ errorClass: 'provider-transit' });
 

@@ -17,6 +17,12 @@
 //   (pointer: none) / no matchMedia      -> NEWLINE: an undetected device never sends
 //   Ctrl/Cmd+Enter                      -> sends on every device (unchanged, R3)
 //   IME Enter (isComposing / keyCode 229) -> ignored everywhere (unchanged)
+//   Tab / Shift+Tab                    -> T1's agent cycle, and ONLY when the team has
+//                                        another member to move to. Every fixture in this
+//                                        file is `subagents: []`, so Tab must still be the
+//                                        browser's focus move here — the cycle itself lives
+//                                        in composer-agent-cycle.test.ts
+//   Ctrl/Cmd/Alt+Tab                   -> left alone (browser / OS chords)
 //   Enter on a focused chip x           -> left to native button activation (T3/D1): the
 //                                          field claims nothing, so no whole-draft send
 // T15/R6: the composer has NO attachment accessory. Clipboard paste, drag/drop and
@@ -103,7 +109,13 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
 // `taskError` makes the task POST fail (500) so the send-failure path is observable.
 type Server = { tasks: number; cancels: unknown[]; cancelled: boolean };
 
-const stubServer = (taskError?: string, restored?: SessionSnapshot): Server => {
+// `restored` is what the DIRECTORY holds (the bootstrap + `GET /sessions` list);
+// `applied` is what `GET /sessions/s1` describes once the card is open. They are separate
+// knobs because the detail route has always answered its own RUNNING snapshot, and tests
+// that assert pending/cancel states depend on that. A test that needs BLOCKS on screen
+// (the `#` reference list) must pass the same conversation to BOTH, or the detail read
+// replaces the restored turns and the list is empty.
+const stubServer = (taskError?: string, restored?: SessionSnapshot, applied?: SessionSnapshot): Server => {
     const server: Server = { tasks: 0, cancels: [], cancelled: false };
 
     vi.stubGlobal(
@@ -148,12 +160,15 @@ const stubServer = (taskError?: string, restored?: SessionSnapshot): Server => {
 
             if (url === '/api/sessions/s1' && method === undefined) {
                 return json({
-                    session: server.cancelled
-                        ? snapshot({
-                              status: 'idle',
-                              turns: [turn({ prompt: 'task 1', status: 'cancelled' })]
-                          })
-                        : snapshot({ status: 'running', turns: [turn()] })
+                    session:
+                        applied === undefined || server.cancelled
+                            ? server.cancelled
+                                ? snapshot({
+                                      status: 'idle',
+                                      turns: [turn({ prompt: 'task 1', status: 'cancelled' })]
+                                  })
+                                : snapshot({ status: 'running', turns: [turn()] })
+                            : applied
                 });
             }
 
@@ -534,6 +549,48 @@ it('sends on a bare Enter with a hardware keyboard, keeping Shift+Enter and Alt+
     expect(input.value).toBe('');
 });
 
+it('leaves Tab to the browser, because every fixture here is a one-agent team', async () => {
+    stubServer();
+    stubMedia({ fine: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+
+    // T1/D6: `Tab` in the field is the composer's agent-cycle keystroke — but only when
+    // there is a second member to cycle to. This file's team has one agent, so the
+    // keystroke has to fall through: the default is NOT taken (focus still moves, which is
+    // what a keyboard reader is using here) and nothing is sent.
+    //
+    // G7: the `Tab`-with-a-suggestion-list-open cases are pinned BELOW this one, in "picks
+    // the active suggestion row on Tab…" and "leaves Tab to the browser when the open
+    // suggestion list has nothing to pick". (The comment here used to point at an "earlier
+    // case above" for that, which was wrong twice over: the case was below, and it was an
+    // ENTER case, so nothing in this file exercised `Tab` against an open popup at all.)
+    for (const shift of [false, true]) {
+        const tab = new KeyboardEvent('keydown', {
+            key: 'Tab',
+            shiftKey: shift,
+            bubbles: true,
+            cancelable: true
+        });
+
+        input.dispatchEvent(tab);
+        await flush();
+
+        expect(tab.defaultPrevented).toBe(false);
+    }
+
+    // Ctrl/Cmd/Alt+Tab are browser and OS chords: the cycle never claims them.
+    for (const modifier of [{ ctrlKey: true }, { metaKey: true }, { altKey: true }]) {
+        const chord = new KeyboardEvent('keydown', { key: 'Tab', ...modifier, bubbles: true, cancelable: true });
+
+        input.dispatchEvent(chord);
+        await flush();
+
+        expect(chord.defaultPrevented).toBe(false);
+    }
+});
+
 it('keeps every existing send guard on the Enter path, so an unsendable draft is refused', async () => {
     const server = stubServer();
     stubMedia({ fine: true });
@@ -601,6 +658,109 @@ it('never sends while the suggestion list owns Enter, even with a hardware keybo
     expect(ctrlEnter.defaultPrevented).toBe(true);
     expect(server.tasks).toBe(1);
     expect(input.value).toBe('');
+});
+
+// --- `Tab` and the `@`/`#` suggestion list (G7) ---------------------------------
+//
+// G7: the two `Tab`-with-a-popup-open cases were unpinned repo-wide. The case above this
+// block is an ENTER case (its comment used to claim it covered `Tab` too), and the one
+// `Tab`-in-a-popup claim in this file was prose.
+//
+// Why these are falsifiable HERE, on a one-agent team: the agent-cycle leg (main.ts:15939)
+// bails on a one-member roster, so the only branch in this file that can answer `Tab` with
+// `preventDefault` is the popup branch (main.ts:15906-15919). The flag therefore reports the
+// popup branch alone — and in the second case the flag reports the branch's deliberate
+// `return` (without it the keystroke would fall through to the cycle leg and the composer
+// action would also be claimed).
+//
+// The field is the contentEditable surface (main.ts:4399), typed as `'div'` on purpose: the
+// `value` / `setSelectionRange` writes below are the textarea-compatibility façade
+// ui/editor.ts:756-800 installs on it, not a `<textarea>` — this file's older cases cast it
+// as `'textarea'`, which is a type-level lie the façade happens to tolerate.
+
+it('picks the active suggestion row on Tab instead of moving focus out of the field', async () => {
+    // A restored conversation with ONE settled turn whose events produced a real answer block:
+    // `#` references point at BLOCKS (ui/references.ts:44 keeps `done`/`running`/`queued`), so
+    // a turn with no events leaves the list open but empty — the state the case below pins.
+    const referenceable = turn({
+        status: 'done',
+        prompt: 'first question',
+        events: [
+            { type: 'start', agent: 'instruct', model: 'm1' },
+            { type: 'text', agent: 'instruct', delta: 'first answer' }
+        ] as SessionTurn['events']
+    });
+    // BOTH knobs carry the same conversation (see `stubServer`'s note): the detail read is
+    // what paints the board, and the `#` list reads the board's blocks.
+    const conversation = snapshot({ status: 'idle', turns: [referenceable] });
+    const server = stubServer(undefined, conversation, conversation);
+    stubMedia({ fine: true });
+    localStorage.setItem(SESSION_KEY, 's1');
+    await mount();
+
+    const input = byClass('.composer-input', 'div');
+    const popup = byClass('.composer-popup', 'div');
+
+    // A `#` trigger with a SETTLED turn in this conversation: the list is open and has a row
+    // to pick, which is exactly the state in which a browser would move focus.
+    input.value = 'continue #';
+    input.setSelectionRange(10, 10);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    await flush();
+
+    expect(popup.hidden).toBe(false);
+    expect(input.getAttribute('aria-expanded')).toBe('true');
+    // An ACTIVE row — the precondition for `selectComposerPopup` claiming the keystroke. If
+    // the list opened with nothing pickable, this case would silently become the one below.
+    expect(input.getAttribute('aria-activedescendant')).not.toBeNull();
+
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+    input.dispatchEvent(tab);
+    await flush();
+
+    // The list owned the keystroke: consumed, the row became a reference chip, and the mention
+    // is no longer pending. Nothing was sent, and no agent cycle happened (this team has one
+    // agent, and the popup branch returns before the cycle leg anyway).
+    expect(tab.defaultPrevented).toBe(true);
+    expect(popup.hidden).toBe(true);
+    // The row was PICKED: the mention became a real reference chip bound to that turn, and the
+    // text carries the label the server resolves (references-main.test.ts pins the same pick
+    // through Enter; this case is the `Tab` half of it).
+    const chip = byClass('.composer-input', 'div').querySelector<HTMLElement>('[data-chip="reference"]');
+    expect(chip?.dataset.referenceTurn).toBe('t1');
+    expect(chip?.dataset.referenceLabel).toBe('IT1');
+    expect(input.value).toBe('continue #IT1');
+    expect(server.tasks).toBe(0);
+});
+
+it('leaves Tab to the browser when the open suggestion list has nothing to pick', async () => {
+    const server = stubServer();
+    stubMedia({ fine: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'div');
+    const popup = byClass('.composer-popup', 'div');
+
+    // The same open list, no pickable row (nothing in this conversation is referenceable yet,
+    // so the popup says so instead of listing rows).
+    input.value = 'ask #';
+    input.setSelectionRange(5, 5);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(popup.hidden).toBe(false);
+    expect(input.getAttribute('aria-activedescendant')).toBeNull();
+
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+    input.dispatchEvent(tab);
+    await flush();
+
+    // R3/D6: the list keeps the keystroke only when it can act on it. Here the branch returns
+    // WITHOUT claiming it, so the keystroke stays the browser's focus move — and the agent
+    // cycle never sees it either, so the draft is untouched and nothing was sent.
+    expect(tab.defaultPrevented).toBe(false);
+    expect(popup.hidden).toBe(false);
+    expect(input.value).toBe('ask #');
+    expect(server.tasks).toBe(0);
 });
 
 it('ignores an IME Enter on a hardware keyboard, ahead of the Enter-to-send policy', async () => {

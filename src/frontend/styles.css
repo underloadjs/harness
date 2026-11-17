@@ -2482,9 +2482,13 @@ body.is-resizing-rail {
     background: transparent;
 }
 
-/* ONE control (R11). The old pair (cycle button + model chevron) and its popover are
-   removed: pressing the agent's name opens the shared dialog, so there is no cycle
-   behaviour to confuse with a team change and no chevron beside the send control. */
+/* ONE control (R11 + T1). The old pair (a cycle button + a model chevron) and its
+   popover are still gone: there is one pressable box, no chevron beside the send
+   control, and no disclosure popover. What changed since R11 is what a PRESS means:
+   a click/Enter still opens the shared dialog, while a `Tab` in the field — or a tap
+   on a touch device — moves the composer's PENDING agent (a local choice, committed at
+   send, never a team change), and a press and hold on a touch device opens the same
+   dialog. See ui/agent-control.ts and ui/press-hold.ts. */
 .agent-control {
     display: flex;
     flex: 0 0 auto;
@@ -2521,6 +2525,18 @@ body.is-resizing-rail {
     font-size: 11.5px;
     white-space: nowrap;
     cursor: pointer;
+    /* T1 (D9): on a touch device this box is a PRESS target, so the platform's own
+       long-press behaviour has to be disarmed before the page can own the gesture:
+       `touch-action: manipulation` drops the double-tap-zoom delay (a tap then arrives
+       with the pointerup the cycle waits for), and `user-select: none` plus
+       `-webkit-touch-callout: none` stop a hold from selecting the agent's name or
+       raising the iOS callout on top of the dialog the hold already opened. None of it
+       changes a desktop pixel — they are input semantics, and the sheet already makes
+       the same trade for the rails at styles.css:517. */
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
 }
 
 /* Hover is the border appearing (the box has no border at idle), so the press target is
@@ -2533,6 +2549,41 @@ body.is-resizing-rail {
 .agent-control-button:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+}
+
+/* T1 (D8/D11): the press-and-hold affordance, painted by ui/agent-control.ts through the
+   `data-hold` attribute (`armed` = the finger is down and the timer is running, `held` =
+   the hold has already fired and the finger has not left yet).
+   `background` is deliberately the ONLY property these two states touch: `border-color`
+   is the activity/hover STATE channel (see the two rules above and
+   `[data-activity='active']` below) and the label's `color` is the agent's IDENTITY tone
+   (T5/R4), so a hold would otherwise erase one of those two facts for as long as the
+   finger is down. The tint is the agent's own hue, so what the reader is about to switch
+   TO stays the thing they are looking at. */
+.agent-control-button[data-hold='armed'] {
+    background: color-mix(in srgb, var(--agent-color) 18%, transparent);
+}
+
+.agent-control-button[data-hold='held'] {
+    background: color-mix(in srgb, var(--agent-color) 32%, transparent);
+}
+
+/* T1 (D10): the sentence spoken when the composer's agent changes. The node sits as the
+   LAST child of the centre column, right after the composer form and OUTSIDE
+   `.agent-slot`, because that host is rebuilt (`replaceChildren`) on every cycle, and a
+   live region that is destroyed at the moment it has something to say is never
+   announced. Visually hidden, never `display: none` — the same clip recipe this package
+   uses for every announced-but-unseen line (`.status-detail`, `.context-bar-live`). */
+.agent-control-live {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
 }
 
 .agent-control-name {

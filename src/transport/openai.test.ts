@@ -1688,8 +1688,11 @@ describe('provider context overflow (issue 0004)', () => {
     });
 
     it('recognizes every documented overflow wording and nothing else', async () => {
-        // The list mirrors CONTEXT_OVERFLOW_PATTERNS in openai.ts, one live phrasing
-        // per entry. A new gateway means a new entry here AND a new pattern there.
+        // The list mirrors CONTEXT_OVERFLOW_PATTERNS in ./provider-timeouts.ts (it moved
+        // there on 2026-11-17 so the HTTP path here and the gateway-frame path
+        // (`providerWireFailureOf`) share ONE matcher), one live phrasing per entry. A new
+        // gateway means a new entry here AND a new pattern there — and the frame-side copy
+        // in ./openai.context-overflow.test.ts.
         const wordings = [
             'This model\'s maximum context length is 8192 tokens',
             'context_length_exceeded',

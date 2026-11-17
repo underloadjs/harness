@@ -2700,10 +2700,11 @@ describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
     // src/plugin/context-compaction.test.ts).
     //
     // R4's per-model map is deliberately NOT listed, i.e. it takes its declared default:
-    // `modelLimits` stays `{}` (no per-model ceiling). There is no headroom knob any more —
-    // the operator's 2026-11-10 one-number ruling removed it — so the 100-token limit IS the
-    // firing point, and this fixture still crosses it on the very first turn, exactly as it
-    // did before the headroom existed.
+    // `modelLimits` stays `{}` (no per-model ceiling). The 2026-11-17 headroom row is NOT listed
+    // either, and nothing moves: its 0.15 default only ever comes off a ceiling a DECLARED model
+    // window makes binding, and this fixture declares none — so the operator's 100-token limit IS
+    // the firing point (the 2026-11-10 one-number ruling), exactly as it was before the headroom
+    // existed, and this fixture still crosses it on the very first turn.
     // `mode: 'exclude'` is part of the operator's numbers here because this case measures the
     // PRUNE pass's durability — the flag writes a shared store turns into document saves. The
     // default moved to `summarize` with the 2026-11-10 context-compaction ruling, so a fixture

@@ -642,6 +642,44 @@ const providerTimeoutDelayOf = (policy: RetryPolicy, attempt: number): number =>
 const providerTimeoutDeadlineOf = (): number => Date.now() + PROVIDER_TIMEOUT_RETRY_DEADLINE_MS;
 
 // ---------------------------------------------------------------------------
+// The ONE overflow question the retry loop asks
+// ---------------------------------------------------------------------------
+
+// Is this thrown failure a context-length refusal? `context-overflow` is the machine
+// name for it, and it is terminal for EVERY caller of this file, so the answer lives in
+// one predicate instead of beside one `catch`.
+//
+// TWO SOURCES, in that order, and both are structured — nothing here matches prose:
+//   1. `error.code` — what the built-in transport puts on the frame
+//      (transport/openai.ts for a 400/413 response, and, since 2026-11-17,
+//      transport/provider-timeouts.ts `providerWireFailureOf` for a size refusal
+//      relayed on a gateway's SSE error frame, which is how the reported failure
+//      actually arrived), and what this file's own pre-request floor throws.
+//   2. `details.errorClass` — read through `providerDiagnosticsOf`, the same shape-
+//      checking reader ../harness.ts trusts for the terminal record. A HOST transport is
+//      allowed to classify without setting a `code` (the built-in one does exactly that
+//      for `provider-transit`), and a frame it diagnosed as a context overflow must not
+//      walk the ladder either. Checking the diagnostics block keeps "what the UI renders"
+//      and "what the retry owner trusts" one answer, which is the rule
+//      transport/provider-timeouts.ts states for diagnostics generally.
+//
+// WHY THE ANSWER IS TERMINAL AND NOT A ONE-ATTEMPT LADDER. "Compact and retry" is the
+// right recovery, and it is NOT expressible here: this loop re-sends the SAME bytes, so a
+// second attempt is the same oversized request and the same refusal — the ladder cannot
+// change the one input the refusal is about. The transcript has to shrink first, and
+// shrinking it is policy ABOVE an agent request (the `turn.before` hook and the shipped
+// context-compaction plugin, which replace the transcript and re-ask). A bounded retry
+// inside this loop would therefore be a paid re-send that cannot succeed, which is exactly
+// the defect the sibling classes were carved out to stop. So the class keeps ZERO retries
+// — no named cap constant, because a cap of zero is this predicate, not a ladder the
+// `retry` policy could stretch.
+const isContextOverflowFailure = (error: unknown): boolean => {
+    if (isInstanceOf(error, HarnessError) && error.code === CONTEXT_OVERFLOW_CODE) return true;
+
+    return providerDiagnosticsOf(error)?.errorClass === CONTEXT_OVERFLOW_CODE;
+};
+
+// ---------------------------------------------------------------------------
 // Pre-request context floor (issue 0004)
 // ---------------------------------------------------------------------------
 
@@ -1003,8 +1041,9 @@ const createAgent = (
         // about to receive — the harness's projection when one was handed in, so a
         // `turn.before` compaction pass has ALREADY had its chance to shrink the
         // transcript, and this only refuses what is still too big after policy ran —
-        // and with the published estimator, i.e. the same `ceil(chars / 4)` the UI
-        // context bar and the compaction plugin use.
+        // and with the published estimator, i.e. the same
+        // `ceil(serialized-payload bytes / 4)` the UI context bar and the compaction
+        // plugin use.
         //
         // What the floor therefore cannot see is the SAME list the estimator cannot
         // see: the serialized tool schemas, the message framing, and attachment bytes.
@@ -1032,11 +1071,12 @@ const createAgent = (
                 throw new HarnessError(
                     `${CONTEXT_OVERFLOW_CODE}: agent "${self.name}" would send an estimated ` +
                         `${estimatedTokens} tokens against a ${contextWindow}-token window, so the ` +
-                        `request was not sent and is not retried. The estimate is ceil(chars / 4) ` +
-                        `over the transcript about to be sent (core/context-estimate.ts), the same ` +
-                        `number the UI context bar shows; attachment bytes and the request's ` +
-                        `tool schemas are not counted. Send less — a turn.before handler may replace ` +
-                        `the transcript, and the shipped context-compaction plugin owns that policy — ` +
+                        `request was not sent and is not retried. The estimate is ceil(payload bytes / 4) ` +
+                        `over the transcript about to be sent (core/context-estimate.ts), counting each ` +
+                        `field as the request serializes it — the same number the UI context bar shows; ` +
+                        `attachment bytes and the request's tool schemas are not counted. Send less — a ` +
+                        `turn.before handler may replace the transcript, and the shipped ` +
+                        `context-compaction plugin owns that policy — ` +
                         `or raise maxPromptTokens / provider.contextWindow.`,
                     {
                         code: CONTEXT_OVERFLOW_CODE,
@@ -1216,17 +1256,47 @@ const createAgent = (
                     // AN OVERFLOW IS NOT A TRANSIENT FAILURE EITHER (issue 0004). A
                     // request the provider rejected for being too long re-sends the
                     // same oversized bytes and answers the same way, so the backoff
-                    // ladder buys nothing — the code the transport put on the frame
-                    // (transport/openai.ts classifies a 413 and a documented 400
-                    // wording) is what ends the sequence here, on the first attempt,
-                    // with the ORIGINAL error rethrown unchanged. Classified through
-                    // `isInstanceOf`, the total guard for `instanceof` on a hostile
-                    // thrown value (../util/errors.ts); nothing matches on prose. The
-                    // agent's own pre-request refusal never reaches this branch at
-                    // all — it throws before the loop starts.
-                    if (isInstanceOf(error, HarnessError) && error.code === CONTEXT_OVERFLOW_CODE) {
-                        throw error;
-                    }
+                    // ladder buys nothing — the code the transport put on the frame is
+                    // what ends the sequence here, on the FIRST attempt, with the
+                    // ORIGINAL error rethrown unchanged. Classified by
+                    // `isContextOverflowFailure` above (a machine code, or the
+                    // transport's structured diagnostics); nothing here matches on
+                    // prose. The agent's own pre-request refusal never reaches this
+                    // branch at all — it throws before the loop starts.
+                    //
+                    // (2026-11-17, the provider-transit context-limit report) The class
+                    // now also covers a refusal the transport found on a GATEWAY SSE
+                    // FRAME, not on a response status: a gateway that commits
+                    // `200 OK` + `text/event-stream` before generating can only report
+                    // its upstream's "prompt is too long" mid-stream, and until the
+                    // shared matcher was wired into `providerWireFailureOf` that frame
+                    // reached THIS catch codeless and burned all eleven attempts
+                    // (`attempt 1..11 of 11 failed`, ~3 minutes) on bytes that cannot
+                    // change. The retry math is the whole fix here: ONE attempt, the
+                    // same error, no `retry` event.
+                    //
+                    // WHAT THE CALLER GETS (the signal the compaction policy consumes,
+                    // in order of proximity):
+                    //   1. `turn()` REJECTS with this same `HarnessError` — `code ===
+                    //      CONTEXT_OVERFLOW_CODE`, `name` set to it by the class itself
+                    //      (../util/errors.ts), and `details` whatever the transport
+                    //      published (`errorClass`/`url`/`port` for a wire frame);
+                    //   2. `stream()` yields `{ type: 'error', error: toErrorInfo(error) }`
+                    //      — i.e. `{ message, code: 'context-overflow' }` — below, at the
+                    //      `catch` of `stream()`;
+                    //   3. ../harness.ts turns the same thrown error into the run's
+                    //      terminal record and emits the `run.failed` hook as
+                    //      `{ ...runLifecycleContext(run), error: toErrorInfo(error) }`,
+                    //      so a plugin branch is `payload.error.code === 'context-overflow'`;
+                    //   4. `classifyRunStopReason` (../harness.ts) reads that same code and
+                    //      reports `api-error` (or `retries-exhausted`, if the run had
+                    //      already spent a `retry` frame on an earlier turn) — NOT
+                    //      `provider-network`: a refusal is not a network death, and the
+                    //      auto-resume streak built on `provider-network` must not fire on
+                    //      deterministic bytes. Before the in-stream arm existed this frame
+                    //      was codeless + `provider-transit`, so it stopped as
+                    //      `provider-network`; that change of stop reason is deliberate.
+                    if (isContextOverflowFailure(error)) throw error;
 
                     const code = isInstanceOf(error, HarnessError) ? error.code : undefined;
 

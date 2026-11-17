@@ -3325,7 +3325,10 @@ describe('manual tool execution', () => {
                     // wireBytes is the serialized length of the response, which embeds
                     // the absolute fixture path, so it is matched rather than hardcoded.
                     wireBytes: expect.any(Number),
-                    contentBudget: 262144,
+                    // `FILE_READ_WIRE_BUDGET` (./tools/files/read.tool.ts), pinned equal
+                    // to `MODEL_TOOL_RESULT_BUDGET_BYTES`: 8192 tokens x 4 bytes for the
+                    // built-in 200 000-token default window, not the old flat 256 KiB.
+                    contentBudget: 32768,
                     // M7 (./tools/files/read.tool.ts:1026-1032): `contentBudget` is the
                     // envelope, `budgetPool` is what was left to split after every
                     // reserve — and each reserve embeds the absolute fixture path, so the
@@ -3401,7 +3404,7 @@ describe('manual tool execution', () => {
         expect(bounded.content.startsWith('zzz')).toBe(true);
         expect(bounded.tail.endsWith('zzz')).toBe(true);
         expect(bounded.note).toBe(
-            "Cut 64071 of 300000 bytes from the middle by a 262144-byte cap; kept a 176946-byte head and a 58983-byte tail. The full text is not in this transcript: re-run the tool call with narrower arguments to fetch it."
+            "Cut 270509 of 300000 bytes from the middle by a 32768-byte cap; kept a 22118-byte head and a 7373-byte tail. The full text is not in this transcript: re-run the tool call with narrower arguments to fetch it."
         );
 
         // The envelope itself fits the published cap, which is the guarantee a client
@@ -3425,7 +3428,7 @@ describe('manual tool execution', () => {
             await writeTextFile(path, 'x'.repeat(300_000), 'utf8');
 
             // `maxBytes` at the ceiling, so this really is the FULL-BUDGET case the title
-            // names: under the 64 KiB per-file DEFAULT the same file stops at its own
+            // names: under the 16 KiB per-file DEFAULT the same file stops at its own
             // allowance and never reaches the envelope (that default cut is pinned in
             // ./tools/files/read.test.ts).
             const read = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('read'), {

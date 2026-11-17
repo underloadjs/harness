@@ -397,15 +397,49 @@ import type {
     HarnessMaybeAsync,
     HarnessMergedHookResult
 } from './plugin/hooks';
+// THE COMPACTION PROTOCOL, read by the kernel for two decisions it cannot make without it
+// (T6, 2026-11-17 — D-1 and D-3).
+//
+//   1. `isCompactionAnswerTurn` — the answer a DELEGATED run hands its spawner must be the
+//      answer that COMPLETED the task, never the prose a summarize pass produced for the
+//      child's own relief (D-1). The kernel owns answer selection (`run.answer`,
+//      `resolveRunAnswer`, `lastSubstantiveText`); the plugin owns the marker the plumbing is
+//      stamped with, so the kernel imports the predicate instead of re-pasting the string.
+//   2. `planCompactionRequest` — the one request-only shrink the runtime already ships (clip
+//      the payload, then drop whole pairable units behind a digest entry). `turn.before` is the
+//      only interception point a request has, and this is the lever it already uses, so the
+//      spawner's delivery relief reuses it rather than inventing a second shrink or a new hook.
+//
+// Direction: this plugin imports only `./core` and `./types`, and `./plugin/manifest.ts`
+// already pulls it into this module's graph, so these two imports add no cycle and no layering
+// inversion the package did not already have.
+import {
+    isCompactionAnswerStream,
+    isCompactionAnswerTurn,
+    planCompactionRequest
+} from './plugins/context-compaction.plugin';
 // Rough transcript sizing for the per-agent context limit (`turn.before`), plus the
 // T5.4 hybrid: the provider's reported `usage.input` anchors the prefix and only the
-// text appended since that request is still extrapolated at chars/4.
+// text appended since that request is still extrapolated, at payload-bytes/4.
+// `toolSchemaPayloadBytes` is the ONE serializer-independent measure of the tool
+// catalogue that rides in the same request body, so the estimate handed to
+// `turn.before` can price the catalogue floor in the SAME currency as the transcript
+// (see `toolSchemaBytesForRound` in `emitTurnBefore` for why that matters on round 1).
 import {
     anchorFromUsage,
     estimateContextTokensHybrid,
+    estimateTokensFromChars,
+    toolSchemaPayloadBytes,
     transcriptChars,
     type ContextTokenAnchor
 } from './core/context-estimate';
+// The currency the model-facing budgets are declared in, read here for ONE figure: the weight a
+// run may newly receive from background deliveries between two model requests before the next
+// request is shrunk for it (T6 / D-3). Direct-module import, the same convention as
+// `./core/context-estimate` above — the harness takes the two published constants and no part of
+// the budget engine itself (that stays `core/result-budget.ts`, whose per-result and per-turn
+// caps keep applying durably).
+import { MODEL_TOKEN_BYTES, MODEL_TOOL_RESULT_BUDGET_TOKENS } from './core/result-budget';
 // The single context-inclusion normalizer (core/agent.ts). Direct module import,
 // the same convention as `./core/context-estimate` above: the projection needs it
 // and must not pay for the whole core barrel to get one helper.
@@ -573,6 +607,27 @@ const DEFAULT_MAX_ITERATIONS = Number.POSITIVE_INFINITY;
 // meaning while the plugin owns the timer. Validated at construction like every other
 // numeric bound, so a typo fails before a run starts.
 const DEFAULT_WAKE_INTERVAL_MS = 600_000;
+
+// THE PER-DELIVERY-WINDOW ALLOWANCE (T6 / D-3, 2026-11-17), stated in the SAME unit
+// `core/context-estimate.ts` measures a request in. UNIT NOTE: since T5 that file counts BYTES
+// (`BYTES_PER_TOKEN`), and its published helpers still carry their `…Chars` names
+// (`transcriptChars`/`estimateTokensFromChars` keep the alias `CHARS_PER_TOKEN = BYTES_PER_TOKEN`,
+// ../core/context-estimate.ts:223) — so this allowance is 16384 BYTES, and the `…CHARS` name below
+// is the request-facing currency, not literal characters. The two figures are identical for the
+// payload that matters here: a delegated answer page is model text in a JSON envelope, and the
+// relief's arithmetic is a DELTA inside one request, so ASCII payloads measure the same either way.
+//
+// WHY THIS NUMBER AND NOT A NEW KNOB. It is HALF the per-result budget the durable budget engine
+// already enforces (`MODEL_TOOL_RESULT_BUDGET_TOKENS`, restated in request units with the published
+// `MODEL_TOKEN_BYTES`), so the request-side rule says: one model request may newly receive, from
+// background deliveries, up to half of one full-size result page UNRELIEVED, and anything above
+// that is what the next request gives back by digesting older history. One delegated answer at the
+// default page size (8000 chars of `content` plus the identity fields) sits under the allowance,
+// so an ordinary single delegation is never shrunk for it; a fan-out of several settled children
+// is. Both constants belong to `core/result-budget.ts` (owned elsewhere), and nothing here edits
+// them — this is a consumer of the published figures, which is why no new setting appears.
+const DELIVERY_RELIEF_ALLOWANCE_CHARS =
+    (MODEL_TOOL_RESULT_BUDGET_TOKENS / 2) * MODEL_TOKEN_BYTES;
 
 // Bound on the enabled SEARCHABLE set. The old toolRequest capped a single call at
 // five and accumulated forever; selection is now uncapped and this configured
@@ -4855,6 +4910,59 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         };
     };
 
+    // T6 (work item 4, 2026-11-17) — THE SENTENCE A CANCELLED CHILD IS REPORTED WITH.
+    //
+    // THE MEASUREMENT THIS ANSWERS. In the fan-out session the evidence was gathered from, the
+    // spawner was interrupted at 971 s with four delegations in flight. Two of its calls were
+    // answered with a structured envelope whose `error` was the RAW abort string the child's row
+    // holds — `"This operation was aborted"` — and two were answered with the synthesized
+    // interruption line and no envelope at all. Adequate for "did the call come back?", useless
+    // for "what do I do next?": the string names no actor and no cause, while the very record the
+    // envelope is built from already carries the classified cause in `stopReason` (IT19 R3,
+    // `classifyRunStopReason`) plus the surviving work in `partialContent`.
+    //
+    // `releasedDelegateResultOf` learned this for the `toolCancel` door and stopped printing the
+    // raw string ("the record holds the raw `\"This operation was aborted\"`, which cannot be
+    // classified"). This door — the child rejected while the calling call was still live: a
+    // stopped child thread, a caller abort that loses the race with the child's own death, a
+    // provider failure inside the child — was still printing it.
+    //
+    // THE RULE, and its limit. Raise a harness sentence ONLY when BOTH facts hold: the record's
+    // own `error` is an unclassifiable abort string, and the record carries a classified
+    // `stopReason`. Anything else — a child that failed with a real message, a row written before
+    // the field existed — keeps the message byte-for-byte, because replacing a specific error with
+    // a generic one loses information. No status, no identity and no answer is ever invented here:
+    // the sentence restates fields the envelope already reports.
+    const ABORT_ONLY_ERROR_TEXT =
+        /^(this operation was aborted|the operation was aborted|operation aborted|abort(?:error)?|signal aborted)$/i;
+
+    const unfinishedDelegateErrorOf = (
+        record: AgentInvocationRecord,
+        target: string,
+        error: unknown
+    ): string => {
+        const detail = record.error ?? toErrorInfo(error).message;
+
+        if (record.stopReason === undefined || !ABORT_ONLY_ERROR_TEXT.test(detail.trim())) {
+            return detail;
+        }
+
+        return (
+            `Delegation to "${target}" ended before the child answered: its run stopped with reason ` +
+            `"${record.stopReason}"${
+                record.cancelledAtMessage === undefined
+                    ? ''
+                    : ` after committing ${record.cancelledAtMessage} message(s)`
+            }. ` +
+            (record.partialContent === undefined
+                ? 'It had produced no answer text, so there is no partial to report'
+                : 'What it had produced is in this envelope as partialContent') +
+            (record.threadId === undefined
+                ? '.'
+                : `, and its conversation stays readable with threadRead "${record.threadId}".`)
+        );
+    };
+
     // D2 (2026-11-14, issues 0021/0019) — WHAT A LIVE `delegate` CALL LEAVES FOR THE DELIVERY
     // LAYER.
     //
@@ -5308,7 +5416,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 startedAt,
                 timedOut
                     ? `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
-                    : (record.error ?? toErrorInfo(error).message)
+                    : unfinishedDelegateErrorOf(record, target, error)
             );
         } finally {
             // No timer means nothing was armed; the disarm closure is a no-op for the
@@ -5743,6 +5851,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // window covers exactly the deliveries of one turn (the loop drains the
         // mailbox before the next request). See core/result-budget.ts.
         turnResultBudget: ToolResultTurnBudget;
+        // T6 (D-3, 2026-11-17) — THE DELIVERY WINDOW THE NEXT REQUEST IS RELIEVED FOR.
+        //
+        // `turnResultBudget` above bounds each result DURABLY, at insert time, and resets per
+        // request; it cannot bound what a spawner RECEIVES when several background calls settle
+        // while the run is parked in `waitForWork` (no boundary runs there at all). That is the
+        // step function D-3 is about: N delegated answers land between two provider calls and the
+        // spawner's next request carries all of them.
+        //   - `deliveryMark`    — transcript length at the last model request, i.e. the start of
+        //     the window. The window's weight is MEASURED from these entries at the next boundary
+        //     (never accumulated in a parallel bookkeeper that could drift from the transcript).
+        //   - `deliveryRelief`  — the hot-path flag the delivery seam raises AFTER the canonical
+        //     insert and BEFORE the wake: "weight arrived since the last request". A boundary that
+        //     sees it false pays one boolean read; a boundary that sees it true measures the window
+        //     and, if it is over the allowance, shrinks THIS request only.
+        // Both are per-run, like `turnResultBudget`, and request-only in effect: no inclusion flag
+        // moves and no committed entry changes, so a branch run's rollback and a thread run's
+        // retention are untouched either way (invariant 1).
+        deliveryMark: number;
+        deliveryRelief: boolean;
         // T5.4 — hybrid context estimate bookkeeping, per run.
         // `tokenAnchor`: the provider's own prompt-token count for a prefix of THIS
         // conversation, committed when that request's `usage` frame arrived.
@@ -9412,6 +9539,104 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const boundDelivery = (run: RunState, call: HarnessToolCall, content: string): string =>
         run.turnResultBudget.commit(content, { source: { name: call.name, callId: call.id } }).content;
 
+    // T6 (D-3, 2026-11-17) — REQUEST-ONLY RELIEF FOR THE WEIGHT A RUN RECEIVED BETWEEN REQUESTS.
+    //
+    // THE DEFECT THIS EXISTS FOR. A spawner that fans out to N children parks in `waitForWork`
+    // while they work (src/harness.ts `runAgentCore`, the `pending.length > 0` branch), so NO
+    // `turn.before` boundary runs while the work is in flight, and the projection it did build
+    // priced each in-flight call at its ~200-byte `status:'pending'` placeholder. The children
+    // then settle and every answer is inserted at once — a step function the estimate could not
+    // see coming, and nothing in the durable layer bounds the SUM of a turn's deliveries:
+    // `turnResultBudget` resets at every request, so each window gets a fresh aggregate.
+    //
+    // WHAT THE RELIEF DOES, and what it does NOT. At the boundary of the request that would
+    // carry the pile, the window's real weight is MEASURED from the committed entries inserted
+    // since the last request (`run.deliveryMark`), and whatever exceeds the allowance is taken
+    // back out of THIS REQUEST with the shrink the runtime already ships
+    // (`planCompactionRequest` in ./plugins/context-compaction.plugin.ts — clip the head's
+    // payload, then drop the oldest pairable units behind one digest entry). Request-only means
+    // exactly what the compaction plugin's own emergency shrink means: nothing is deleted, no
+    // inclusion flag moves, the canonical transcript still holds every byte, and the next request
+    // re-projects it. This is prevention at the boundary, not classification of a provider error,
+    // and it stays inside the controls `turn.before` already owns — no new hook, no transport
+    // change, no durable write outside `turn.before` (invariants 1-3).
+    //
+    // WHY THE FRESH ANSWERS ARE NEVER THE CUT. `keepTail` protects the newest round: the last
+    // assistant turn that ASKED for work plus every result and pending placeholder after it. The
+    // deliveries being relieved are exactly those entries, so the spawner keeps reading the
+    // answers it delegated, and what gets digested is its OWN older history — the same trade the
+    // compaction plugin makes, one notch gentler because it is transient.
+    //
+    // WHEN IT IS A NO-OP, honestly: the flag is cleared whether or not a shrink was possible, so
+    // one pressure episode costs at most one relief attempt and a transcript whose entire content
+    // is the fresh round cannot be cut further (the planner returns unchanged and the original
+    // request goes out). Durable growth of the transcript across many rounds is the compaction
+    // plugin's job, not this one.
+    const relieveDeliveryWeight = (
+        run: RunState,
+        brain: Agent,
+        request: HarnessMessage[]
+    ): HarnessMessage[] => {
+        // The hot-path guard: `turn.before` runs on every request, and only a run that actually
+        // received a background delivery since its last one pays for the scan below.
+        if (!run.deliveryRelief) return request;
+
+        run.deliveryRelief = false;
+
+        const mark = Math.max(0, Math.min(run.deliveryMark, brain.messages.length));
+        // UNIT: serialized-payload BYTES, not characters. `transcriptChars` kept its name
+        // across T5 while its numerator became the escaped byte weight
+        // (../core/context-estimate.ts "THE WIRE MEASURE"), and the allowance it is compared
+        // against below is declared in the same bytes, so `windowChars` is a byte total and
+        // the `excess` computed below is unit-consistent. A delivered tool page is JSON
+        // string text, so this is precisely what the next request newly carries.
+        let windowChars = 0;
+
+        // Only `tool` entries count: that is what a delivery inserts. Assistant turns, steering
+        // text and a committed compaction instruction are this run's own words, not incoming
+        // payload, and counting them would let a long turn trigger relief for its own prose.
+        for (let index = mark; index < brain.messages.length; index += 1) {
+            const entry = brain.messages[index];
+            if (entry.role !== 'tool') continue;
+
+            windowChars += transcriptChars([entry]);
+        }
+
+        const excess = windowChars - DELIVERY_RELIEF_ALLOWANCE_CHARS;
+
+        if (excess <= 0) return request;
+
+        // The newest round stays verbatim (see the header). A request with no tool-calling
+        // assistant turn keeps the planner's own default of two entries.
+        let keepTail = 2;
+
+        for (let index = request.length - 1; index >= 0; index -= 1) {
+            const calls = (request[index] as { toolCalls?: unknown[] }).toolCalls;
+
+            if (Array.isArray(calls) && calls.length > 0) {
+                keepTail = request.length - index;
+                break;
+            }
+        }
+
+        // Both figures are the unanchored payload-bytes/4 estimate, deliberately: the relief
+        // is a DELTA inside one request, and an anchor would make the amount removed depend on
+        // what a provider happened to report for a prefix it cannot see change. Neither figure
+        // carries the `toolSchemaChars` allowance either: the catalogue is a CONSTANT of this
+        // conversation, identical in the request as it stands and the request as it would be
+        // after the shrink, so it cancels out of `full - target` and only the removed text
+        // should move the number.
+        const full = estimateTokensFromChars(transcriptChars(request, brain.instructions));
+        const target = Math.max(1, full - estimateTokensFromChars(excess));
+        const plan = planCompactionRequest(request, target, keepTail);
+
+        // A plan that removed nothing (a transcript that is all verbatim tail) leaves the request
+        // byte-identical rather than trading it for an equal-sized rewrite.
+        if (plan.messages.length === 0 || plan.tokens >= full) return request;
+
+        return [...plan.messages];
+    };
+
     // Deliver one settled task. Runs inside the agent's mailbox, so the insert and
     // the event are one serialized step. A task whose run has already ended (or
     // was aborted) is discarded: the transcript it would touch was rolled back.
@@ -9644,6 +9869,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (!insertToolMessage(brain, call, content, run.branch === undefined, media, outcome)) {
             recordOwedDelivery(run, call);
         }
+
+        // T6 (D-3) — THE PRESSURE SEAM. Raised HERE, between the canonical insert and the wake,
+        // because this is the one moment that knows weight just entered a transcript whose next
+        // request was priced WITHOUT it: the boundary that built the current projection saw this
+        // call as a ~200-byte `status:'pending'` placeholder, and while the run sat parked waiting
+        // for it there was no boundary at all. The flag is a hint, not an account — the boundary
+        // measures the real bytes from the transcript (`relieveDeliveryWeight`) — so it stays
+        // cheap here and cannot drift, and it is raised for a DECLINED insert too: that account is
+        // re-paid at the top of the parent's next turn (`deliverOwedAccounts`), still before the
+        // next request is priced, and relief must not miss it.
+        run.deliveryRelief = true;
 
         // The outcome is CANONICAL at this point (P1-A). Wake the loop BEFORE the
         // reporter runs: a slow progress callback must not be able to keep
@@ -11550,7 +11786,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     const emitTurnBefore = (
         run: RunState,
-        projection: readonly HarnessMessage[]
+        projection: readonly HarnessMessage[],
+        // THE TOOL CATALOGUE THIS REQUEST DECLARES (context T5, 2026-11-17). Handed in rather
+        // than re-derived here: `offerDeclarations` already ran for this request
+        // (`requestTurn`), and the catalogue is the answer to "what else is in this body
+        // besides the transcript?" — the one large constant the estimator cannot see in the
+        // messages. `undefined` means "no catalogue was computed for this round", which the
+        // estimator reads as a 0 allowance.
+        tools?: readonly HarnessStreamTool[]
     ): HarnessMaybeAsync<TurnBeforeOutcome> => {
         if (!hookBus.has('turn.before')) {
             return { sync: true, value: { transcript: projection as HarnessMessage[] } };
@@ -12143,6 +12386,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // would otherwise move the number underneath a frozen projection.
             const anchorAtEntry = run.tokenAnchor;
 
+            // THE TOOL-CATALOGUE FLOOR FOR THIS ROUND (context T5, 2026-11-17 — the
+            // provider size refusal). The catalogue is not in `messages`, so the
+            // estimator cannot see it, and on the measured session it was the LARGEST
+            // single term of a request: 31,693 billed tokens for a first round whose
+            // transcript the estimator scored at 464 (`Temp/d1/report.md`, session
+            // 6a94b896). From round 2 on the provider ANCHOR carries it (its
+            // `usage.input` is the whole request), so the only blind request is the one
+            // with no anchor — round 1, and every round of a usage-blind provider — and
+            // that is exactly the request a compaction policy has to size blind.
+            //
+            // WHY IT IS MEMOIZED. `context()` is rebuilt once per registered handler, and
+            // each build serializes the catalogue. The catalogue is fixed for a round
+            // (`offerDeclarations` ran once, before the hook), so one pass per round is the
+            // honest cost; the lazy form also keeps it free for the rounds nobody observes.
+            //
+            // WHY AN EMPTY CATALOGUE IS 0 AND NOT `utf8ByteLength('[]')`. A round with no
+            // declared tools puts no schema in the body; the two delimiter bytes of an
+            // empty JSON array are framing, not payload, and charging them would move a
+            // published no-tools number by a token with nothing behind it.
+            let toolSchemaBytesForRound: number | undefined;
+
+            const toolSchemaBytes = (): number => {
+                toolSchemaBytesForRound ??=
+                    tools === undefined || tools.length === 0 ? 0 : toolSchemaPayloadBytes(tools);
+
+                return toolSchemaBytesForRound;
+            };
+
             // THE LIVE REQUEST VIEW, in one place, so `currentMessages()` and
             // `currentEstimatedTokens()` (context T5) can never answer about two
             // different lists: the explicit override an earlier handler set wins, then
@@ -12219,12 +12490,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                     return entriesForThisHandler;
                 },
-                // The same ~4 chars/token convention as the UI context bar
+                // The same ~4 bytes/token convention as the UI context bar
                 // (core/context-estimate.ts) when the provider has said nothing yet,
                 // and the provider's OWN count once this run has a `usage` frame to
                 // anchor on (T5.4). Plus the agent's leading instruction blocks: those
                 // occupy the provider's context window too, and a limit that ignored
                 // them would compact later than the operator expected.
+                //
+                // Plus THE TOOL CATALOGUE, but only where the estimate still has to guess
+                // it (T5, the size refusal): `toolSchemaChars` is the serialized weight of
+                // exactly the `tools` this round declares, and the hybrid applies that
+                // allowance ONLY on the unanchored leg — an anchor already contains it, and
+                // adding it again would bill the same constant twice. That is the whole
+                // shape of the fix: an anchored round is unchanged byte for byte, and the
+                // blind round stops claiming a transcript of 464 tokens for a request the
+                // provider bills at 31,693.
                 //
                 // Deliberately NOT a getter: `context-compaction` compares this value
                 // against its limit and its cooldown map, and a mid-handler flag write
@@ -12233,18 +12513,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // size of the projection this handler was ENTERED with (`messagesAtEntry`
                 // — which already includes every earlier handler's writes, because the
                 // context is rebuilt for each handler).
-                estimatedTokens: estimateContextTokensHybrid(messagesAtEntry, brain.instructions, anchorAtEntry),
+                estimatedTokens: estimateContextTokensHybrid(
+                    messagesAtEntry,
+                    brain.instructions,
+                    anchorAtEntry,
+                    { toolSchemaChars: toolSchemaBytes() }
+                ),
                 // THE LIVE VIEW OF THE SAME NUMBER (context T5). `estimatedTokens` above
                 // stays entry-time on purpose — the shipped compactor's limit and cooldown
                 // checks must not move underneath the transcript they measured — so this is
                 // how a handler sees what ITS OWN writes just saved: the same estimator
                 // (`core/context-estimate.ts`) with the SAME anchor this handler entered
                 // with, over exactly what `currentMessages()` returns, plus the same
-                // leading instruction blocks. The two numbers agree whenever nothing has
-                // been written, which is the property a minimum-savings floor needs, and
-                // after the round both are frozen to what the round decided.
+                // leading instruction blocks, plus the same catalogue allowance. The two
+                // numbers agree whenever nothing has been written, which is the property a
+                // minimum-savings floor needs, and after the round both are frozen to what
+                // the round decided.
                 currentEstimatedTokens: (): number =>
-                    estimateContextTokensHybrid(currentRequestMessages(), brain.instructions, anchorAtEntry),
+                    estimateContextTokensHybrid(
+                        currentRequestMessages(),
+                        brain.instructions,
+                        anchorAtEntry,
+                        { toolSchemaChars: toolSchemaBytes() }
+                    ),
                 signal: run.signal ?? alwaysActiveSignal,
                 api: api ?? hostPluginApi,
                 setTranscript: (messages): void => {
@@ -12320,7 +12611,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // the cache starts as that exact reference and only a flag write
                 // replaces it, so the default path keeps its byte-identical IDENTITY as
                 // well as its value, with no rebuild at all.
-                return currentProjection() as HarnessMessage[];
+                //
+                // T6/D-3: the delivery relief is applied to THIS branch only, and it is the last
+                // thing that touches the request before it goes out. A round in which a plugin
+                // named the transcript to send (`setTranscript` or a returned `{ transcript }`)
+                // has already taken responsibility for that request's size — the shipped
+                // compaction pass does exactly that, and its own emergency shrink is ladder-
+                // paced — so core must not stack a second shrink on top of a policy that just
+                // sized the request on purpose. On the projection path nobody has, and the run
+                // that just swallowed N background answers is precisely the one with no policy
+                // looking at it.
+                return relieveDeliveryWeight(run, brain, currentProjection() as HarnessMessage[]);
             }
 
             // A hook hands back a readonly array; `turn()` expects the request's own
@@ -12529,7 +12830,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // here with zero microtasks, and only a genuinely asynchronous handler
             // yields. Awaiting unconditionally moved an observer-visible event frame in
             // src/server/queue.test.ts.
-            const before = emitTurnBefore(run, projection);
+            const before = emitTurnBefore(run, projection, declarationsForRequest);
             const { transcript: requestTranscript, decision } = before.sync ? before.value : await before.promise;
 
             // T5.4 — remember the character weight of EXACTLY what this request sends
@@ -12543,6 +12844,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // between this request and the next one is what the model will newly
             // receive, and that total is what the per-turn cap bounds.
             run.turnResultBudget.reset();
+
+            // T6/D-3 — the SAME boundary opens the delivery window the request-side relief
+            // measures: everything committed from here to the next request is what the next
+            // request will newly receive from the background. Stamped AFTER the request body was
+            // decided (so the request just built is never relieved for bytes it already contains)
+            // and BEFORE anything can be appended by a delivery.
+            run.deliveryMark = brain.messages.length;
 
             // T2 — the run-level decision, consumed on the SAME tick the request was
             // decided and BEFORE a single provider byte is sent. `stop` throws here, so
@@ -12779,10 +13087,45 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             if (message.role !== 'assistant') continue;
             if (typeof message.content !== 'string') continue;
             if (message.content.trim().length === 0) continue;
+
+            // T6 (D-1) — compaction plumbing is not an answer. A summarize pass commits a
+            // tool-free prose turn of its own (the structured summary the instruction asked for),
+            // and a child cut off right after one would otherwise report THAT to its spawner as
+            // `partialContent` — the parent then reads a note its child wrote to relieve its own
+            // context as if it were the result of the task. The entry is still in the child's
+            // transcript (and `threadRead`/`agentResult` still answer for it); it is simply not
+            // the last thing the child SAID about the work.
+            if (isCompactionAnswerTurn(messages, index)) continue;
+
             return message.content;
         }
 
         return undefined;
+    };
+
+    // T6 (D-1, 2026-11-17) — IS THIS MESSAGE THE CHILD'S COMPACTION REPLY?
+    //
+    // The predicate is the plugin's (`isCompactionAnswerTurn`, ./plugins/context-compaction.plugin.ts);
+    // this wrapper only ADDRESSES the entry, because "the message we are holding" is not the same
+    // question as "the entry at the end of the array": an async delivery inserted between the
+    // commit and this read appends a `tool` entry after it, and a positional guess would then
+    // evaluate the wrong turn. Identity is safe here — the committed entry IS the object the loop
+    // is holding (`agent.turn()` commits the message it returns, the same fact `assertToolCallIds`
+    // above relies on when it reads `brain.messages.slice(0, -1)`), and scanning from the end
+    // resolves the newest occurrence. An entry this run did not commit (a restored or copied
+    // shape the identity scan cannot find) answers `false`, so a message the runtime cannot place
+    // is never silently demoted from being an answer.
+    const isCompactionAnswerOf = (
+        messages: readonly HarnessMessage[],
+        message: HarnessMessage
+    ): boolean => {
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+            if (messages[index] !== message) continue;
+
+            return isCompactionAnswerTurn(messages, index);
+        }
+
+        return false;
     };
 
     // Resolve the message a DELEGATED run hands back (T2/R1). Only the exact
@@ -12808,6 +13151,30 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (message.stopReason !== 'stop') return message;
         // Defensive: the terminal path below only calls this for tool-free turns.
         if (message.toolCalls.length > 0) return message;
+
+        // T6 (D-1) — THE ANSWER THAT CROSSES BACK IS THE TASK ANSWER, NOT THE RELIEF NOTE.
+        //
+        // A summarize pass answers the compaction instruction with a tool-free prose turn, which
+        // is EXACTLY the shape the loop's terminal branch exits on (`toolCalls.length === 0`,
+        // nothing pending → `done` → here). Two doors made that prose the spawner's answer:
+        //   1. the run ends on the summary because the plugin could not queue its continuation
+        //      into this run (a `steer` refusal, ../plugins/context-compaction.plugin.ts
+        //      `turnAfter`) — the shape that diagnostic already names "the delegate tool result
+        //      stays the summary"; and
+        //   2. the run's real answer was produced but never recorded, because the only substantive
+        //      tool-free turn the run had was the summary, so the blank-turn rescue below had
+        //      nothing else to hand back.
+        // Both are the reported defect: a green, "finished" child whose parent was answered with
+        // meta-text. The user's rule governs it — the parent gets the final answer of the delegated
+        // TASK, and it has no business knowing that the child compacted — so a compaction turn is
+        // passed over in favour of the task answer this run already produced (which the gate in the
+        // loop records, and which now cannot itself BE a compaction turn).
+        //
+        // `?? message` keeps the honest last resort: a child that compacted before it ever said
+        // anything about the task has no task answer to return, and inventing one would be worse
+        // than returning the only prose it produced.
+        if (isCompactionAnswerOf(run.agent.messages, message)) return run.answer ?? message;
+
         if (message.content.trim().length > 0) return message;
 
         return run.answer ?? message;
@@ -13221,11 +13588,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // post-return transcript scan and cannot see a queued follow-up's
                 // turns. `length` responses are excluded: a truncated answer is not
                 // a better answer than the blank terminal turn.
+                //
+                // T6 (D-1): a compaction reply is excluded on the same grounds the `length`
+                // exclusion sits on — it is not a better answer than the task answer the run
+                // already gave, it is the child's own relief note. Without this line the summary
+                // OVERWRITES a real answer recorded earlier in the same run, and every door that
+                // reads `run.answer` (the blank-turn rescue here, and `finishInvocation`'s
+                // `partialContent` fallback on a cancelled child) then hands the spawner the
+                // compaction text.
                 if (
                     run.delegateAnswer &&
                     message.toolCalls.length === 0 &&
                     message.stopReason === 'stop' &&
-                    message.content.trim().length > 0
+                    message.content.trim().length > 0 &&
+                    !isCompactionAnswerOf(brain.messages, message)
                 ) {
                     run.answer = message;
                 }
@@ -13355,9 +13731,30 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // (no synthetic empty string), which is what keeps the snapshot reader's
             // `min: 1` guard meaningful: a present `partialContent` always says the
             // child did say something.
+            //
+            // X2 (F4, 2026-11-17) — THE COMPACTION EXCLUSION APPLIES TO THE BUFFER TOO. The
+            // rule above is "the FRESHER evidence wins", and the rule beside it (T6/D-1, see
+            // `lastSubstantiveText` and `resolveRunAnswer`) is "compaction plumbing is not an
+            // answer". The second rule was never applied to the FIRST: a summarize pass commits
+            // its instruction into the transcript (../plugins/context-compaction.plugin.ts
+            // `beginSummarize`), the model then streams the structured summary, and an abort
+            // halfway through that stream put the SUMMARY in `run.streamedText` — so the buffer
+            // that "wins" was the relief note, reported to the spawner as an answer in hand.
+            // That is exactly what the user's ruling forbids (the parent thread gets the final
+            // answer of the delegated TASK and has no business learning the child compacted), and
+            // it is the same defect D-1 closed on the committed lane, left open on the streaming
+            // one. So: ask the plugin whether the turn being streamed IS the compaction answer
+            // (`isCompactionAnswerStream`, the position test, content-independent), and when it
+            // is, fall through to `lastSubstantiveText` — which already skips every committed
+            // compaction turn — so an interrupted child reports its last TASK sentence, or no
+            // partial at all, and never the summary.
+            const streamedInFlight = run.streamedText;
+            const streamedIsRelief =
+                streamedInFlight.trim().length > 0 && isCompactionAnswerStream(brain.messages);
+
             run.partialContent =
-                run.streamedText.trim().length > 0
-                    ? run.streamedText
+                streamedInFlight.trim().length > 0 && !streamedIsRelief
+                    ? streamedInFlight
                     : lastSubstantiveText(brain.messages, commitIndex);
             run.streamedText = '';
 
@@ -13961,6 +14358,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // aggregate cap. Created per run so two concurrent threads never
                 // spend one another's budget.
                 turnResultBudget: createToolResultTurnBudget(),
+                // T6/D-3: the delivery window starts empty and is stamped with the real
+                // transcript length by `requestTurn` before the first request goes out, so a
+                // run's own root prompt is never counted as a delivery.
+                deliveryMark: 0,
+                deliveryRelief: false,
                 waiters: [],
                 // T2/R3: empty at launch; the batch gate fills it as sync calls are
                 // scheduled and drains it as their outcomes are delivered.
@@ -16233,7 +16635,8 @@ export type {
 // already backs the UI context bar, the `context-compaction` plugin's `contextLimit`
 // check and the `agent({ maxPromptTokens })` floor, so a host that trims its own
 // history measures with the SAME number instead of inventing a second heuristic that
-// disagrees with all three. An ESTIMATE — `ceil(chars / 4)` over the counted text,
+// disagrees with all three. An ESTIMATE — `ceil(serialized-payload bytes / 4)` over the
+// counted text (escapes at their escaped width, non-ASCII at its UTF-8 width, since T5),
 // total, dependency-free (core/context-estimate.ts states what it counts and why no
 // tokenizer ships).
 export { estimateContextTokens } from './core';
@@ -16251,12 +16654,22 @@ export { HARNESS_SNAPSHOT_VERSION } from './core';
 // helper (the manual path and the model path both use it); the schema helpers
 // let a host validate arguments before a run. DEFAULT_CREATED_TOOLS_LIMIT is the
 // lifetime toolCreate budget.
+// `toolResultBudgetsForContextTokens` is the token-derived form of the two caps above:
+// it restates the per-result and per-turn budgets for a model that declares a smaller
+// context window, so a host configuring its own caps reads the SAME rule the harness
+// applies instead of hand-scaling the constants (./core/result-budget.ts).
+// `modelPayloadBytes` is the byte measure every model-facing budget in this package is
+// charged in — the bytes a string occupies INSIDE the JSON request body, escapes
+// included — so a host that bounds its own tool output measures what the provider bills
+// rather than what its JavaScript string happens to length (./core/payload-bytes.ts).
 export {
     MODEL_TOOL_RESULT_BUDGET_BYTES,
     MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES,
     boundToolResult,
     createToolResultTurnBudget,
+    toolResultBudgetsForContextTokens,
     utf8ByteLength,
+    modelPayloadBytes,
     resolveToolParameters,
     validateSchemaValue,
     checkToolSchemaComplexity,

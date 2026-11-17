@@ -1752,29 +1752,40 @@ describe('context-trimmer economy knobs (T5)', () => {
     it('the economy gates apply to the duplicate rule as well, and never to thinking', () => {
         const settings = settingsWith({ dropDuplicateCalls: true, dropSupersededToolCalls: false, trimInvalidTools: false });
 
-        // Same estimator, same gates, third rule. `Temp/T45/probe2.ts` measured this unit at 7
-        // estimated tokens, so the floor's edge is 7 vs 8 — the same one-token edge as the tool rule.
-        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, minTokens: 7 })))).toEqual([1]);
-        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, minTokens: 8 })))).toEqual([]);
+        // Same estimator, same gates, third rule. The duplicate write set [1,2] is 35
+        // serialized payload bytes — the leader's 4-byte name plus its 19-byte escaped
+        // `{"path":"a.ts"}`, and the 8-byte `contents` result plus its 4-byte pairing name —
+        // out of a 76-byte transcript, so ceil(76/4) = 19 minus ceil(41/4) = 11 is 8 estimated
+        // tokens (7 in characters). The floor's edge is therefore 8 vs 9 — the same one-token
+        // edge as the tool rule, and both literals moved with the re-measured figure rather
+        // than the fixture being nudged off it: this case EXISTS to pin the boundary.
+        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, minTokens: 8 })))).toEqual([1]);
+        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, minTokens: 9 })))).toEqual([]);
         expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, safetyUnits: 4 })))).toEqual([]);
         expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(DUPLICATE_SUCCESS), settingsWith({ ...settings, maxUnits: 1 })))).toEqual([1]);
     });
 
     it('bills a pass for the members it WITHHOLDS, never for the whole unit (T10)', () => {
-        // THE FIGURE IS THE WRITE SET'S. `Temp/opencode-t10-trimmer/tokens3.ts` measured this fixture
-        // with the SAME estimator the context bar uses: the whole failed unit is 13 estimated tokens,
-        // its REQUEST alone is 5 and its RESULT alone is 8. So once the truncate axis has taken the
-        // request on an earlier turn, the pass that finishes the unit is worth EIGHT — billing it the
-        // unit's 13 would count the same 5 tokens twice, once on the turn the request left and again on
-        // the turn that only withholds the answer.
+        // THE FIGURE IS THE WRITE SET'S, in serialized-payload BYTES (T5 re-measured every
+        // number below with the same estimator the context bar uses): the whole failed unit
+        // is 14 estimated tokens (55 bytes: the leader's 4-byte name plus its 19-byte escaped
+        // `{"path":"a.ts"}`, and `Tool "read" failed: EACCES` — 26 characters, 28 payload
+        // bytes once its two quotes escape — plus its 4-byte pairing name), its REQUEST alone
+        // is 6 and its RESULT alone is 8. So once the truncate axis has taken the request on
+        // an earlier turn, the pass that finishes the unit is worth EIGHT — billing it the
+        // unit's 14 would count the same 6 tokens twice, once on the turn the request left
+        // and again on the turn that only withholds the answer. (In characters these were
+        // 13 / 5 / 8; the result's 8 is the one figure the escape tax did not move, because
+        // 32 bytes is an exact multiple of 4.)
         const requestGone = entriesFrom(TRIMMABLE, [1]);
 
-        // The fresh unit: the floor passes AT 13 and rejects the whole plan one token above it.
-        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ minTokens: 13 })))).toEqual([1]);
-        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ minTokens: 14 })))).toEqual([]);
+        // The fresh unit: the floor passes AT 14 and rejects the whole plan one token above it.
+        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ minTokens: 14 })))).toEqual([1]);
+        expect(leaderIndexesOf(planTrimmedUnits(entriesFrom(TRIMMABLE), settingsWith({ minTokens: 15 })))).toEqual([]);
 
-        // The SAME unit after its request left: the edge moved down by exactly the request's 5 tokens,
-        // which is only possible because the plan measures the surviving result and nothing else.
+        // The SAME unit after its request left: the edge moved down by exactly the request's 6
+        // tokens, which is only possible because the plan measures the surviving result and
+        // nothing else.
         expect(leaderIndexesOf(planTrimmedUnits(requestGone, settingsWith({ minTokens: 8 })))).toEqual([1]);
         expect(leaderIndexesOf(planTrimmedUnits(requestGone, settingsWith({ minTokens: 9 })))).toEqual([]);
 
@@ -1812,16 +1823,18 @@ describe('context-trimmer economy knobs (T5)', () => {
         ).toBeUndefined();
         expect(handlerCalls).toEqual([]);
 
-        // 13 tokens is the fixture's whole saving, so the floor's edge is one token: at 13 the pass
-        // writes and reports, at 14 it does not exist.
-        const atFloor = createFakeApi({ minTokens: 13 });
+        // 14 tokens is the fixture's whole saving in serialized-payload bytes (55 withheld
+        // bytes of a 107-byte transcript — see the T10 case above for the byte terms; it was
+        // 13 in characters), so the floor's edge is one token: at 14 the pass writes and
+        // reports, at 15 it does not exist.
+        const atFloor = createFakeApi({ minTokens: 14 });
         const atFloorCalls: string[] = [];
 
         await executeTrimming(atFloor.api, createFakeTurn({ api: atFloor.api, calls: atFloorCalls, entries: entriesFrom(TRIMMABLE) }));
         expect(atFloorCalls).toEqual(['setIncluded:1:false', 'setIncluded:2:false']);
         expect(atFloor.diagnostics).toHaveLength(1);
 
-        const above = createFakeApi({ minTokens: 14 });
+        const above = createFakeApi({ minTokens: 15 });
         const aboveCalls: string[] = [];
 
         await executeTrimming(above.api, createFakeTurn({ api: above.api, calls: aboveCalls, entries: entriesFrom(TRIMMABLE) }));
@@ -5338,8 +5351,10 @@ describe('context-trimmer truncate tool requests (planTruncatedRequests)', () =>
     });
 
     // THE FLOOR IS THE SILENT HALF of the headline toggle (2026-11-13 review). `minTokens` runs PER
-    // AXIS, and the figures below are the shipped estimator's own over THIS transcript: the truncate
-    // write set [1,3] is worth 10 tokens and the whole-unit write set [1,2] is worth 13. Context
+    // AXIS, and the figures below are the shipped estimator's own over THIS transcript, in
+    // serialized-payload bytes (T5 re-measured them; they were 10 and 13 in characters): the
+    // truncate write set [1,3] is 46 bytes of a 107-byte transcript, so 27 - 16 = 11 tokens, and
+    // the whole-unit write set [1,2] is 55 bytes, so 27 - 13 = 14 tokens. Context
     // Compacting ships its floor at 200 — a scale a trimmer operator copies without thinking — and at
     // that value a short conversation's truncate pass writes NOTHING while the switch stays on.
     it('a realistic `minTokens` floor silences the truncate axis while the switch stays on', () => {
@@ -5349,22 +5364,22 @@ describe('context-trimmer truncate tool requests (planTruncatedRequests)', () =>
             trimInvalidTools: false
         });
 
-        // THE EXACT BOUNDARY of this axis's own saving: 10 is at the floor, 11 is under it, and
+        // THE EXACT BOUNDARY of this axis's own saving: 11 is at the floor, 12 is under it, and
         // under it the WHOLE pass is rejected (no candidate, so no flag, no notification, no save,
         // no diagnostic line).
         expect(
-            planTruncatedRequests(entriesFrom(TRIMMABLE), { ...truncateOnly, minTokens: 10 }).map(
+            planTruncatedRequests(entriesFrom(TRIMMABLE), { ...truncateOnly, minTokens: 11 }).map(
                 (candidate) => candidate.leaderIndex
             )
         ).toEqual([1, 3]);
-        expect(planTruncatedRequests(entriesFrom(TRIMMABLE), { ...truncateOnly, minTokens: 11 })).toEqual([]);
+        expect(planTruncatedRequests(entriesFrom(TRIMMABLE), { ...truncateOnly, minTokens: 12 })).toEqual([]);
         expect(planTruncatedRequests(entriesFrom(TRIMMABLE), { ...truncateOnly, minTokens: 200 })).toEqual([]);
 
-        // PER AXIS, not shared, and the two axes can disagree at the SAME settings: at 11 the truncate
-        // write set (10 tokens) is refused while the whole-unit write set (13 tokens) still goes.
+        // PER AXIS, not shared, and the two axes can disagree at the SAME settings: at 12 the truncate
+        // write set (11 tokens) is refused while the whole-unit write set (14 tokens) still goes.
         // (Both plans are called standalone here, so neither sees the other's `trimmedEntries` — the
         // precedence is `planOf`'s, and the point being pinned is the floor, not the precedence.)
-        const bothOn = settingsWith({ minTokens: 11 });
+        const bothOn = settingsWith({ minTokens: 12 });
 
         expect(planTrimmedUnits(entriesFrom(TRIMMABLE), bothOn).map((candidate) => candidate.members)).toEqual([
             [1, 2]

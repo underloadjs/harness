@@ -147,6 +147,20 @@ describe('plugin manifest parity', () => {
                         type: 'string',
                         default: '{}'
                     },
+                    // The headroom row (2026-11-17), declared in the plugin directly under the
+                    // `modelLimits` entry it depends on: the buffer only ever comes off a ceiling
+                    // that a DECLARED model window makes binding, so the pane shows the knob beside
+                    // the fact it reads. `max: 0.5` is the plugin's own `HEADROOM_MAX_RATIO` cap
+                    // restated at the write edge, and `0` is the documented opt-out.
+                    {
+                        key: 'headroomRatio',
+                        label: 'Headroom before a declared window (ratio)',
+                        type: 'number',
+                        default: 0.15,
+                        min: 0,
+                        max: 0.5,
+                        step: 0.01
+                    },
                     {
                         key: 'enabled',
                         label: 'Compact conversations',
