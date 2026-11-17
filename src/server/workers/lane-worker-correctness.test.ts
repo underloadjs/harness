@@ -12,6 +12,11 @@
 //   M8  host shutdown settles an in-flight turn instead of leaving the caller hanging;
 //   M9  `maxLaneWorkers` is enforced, not advertised;
 //   S9  these assertions run against the SOURCE worker, never a stale `dist/` bundle.
+//   T-W8 (2026-11-17)  A LANE FRAME NAMES THE LANE'S PROCESS: every run identity the worker mints
+//       carries `HarnessThread.epoch` (../../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`), the
+//       worker's OWN — the coordinator records those frames without rewriting them, so a lane and a
+//       parent that both end up naming invocation `513` can never be folded into one row
+//       (../turn-projector.ts `isEpochBoundary`).
 //
 //   #6  (stress report, 2026-11-14) A LANE-ARCHIVED RESULT BELONGS TO ITS CONVERSATION: the
 //       `result:archive` operation names the conversation the lane writes, so deleting that
@@ -35,6 +40,11 @@ import { createHarnessRegistry } from '../harnesses';
 import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-support';
 import { DEFAULT_RUNTIME_CONFIGURATION } from '../config';
 import type { ServerRuntimeConfiguration } from '../config';
+// T-W8: the coordinator's OWN process epoch, asserted ONLY to prove a lane frame never names it
+// (../../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped onto every run identity the runtime
+// mints). The value is random by design, so the lane's epoch is pinned by shape + inequality, not
+// by a literal.
+import { HARNESS_PROCESS_EPOCH } from '../../core/agent-limits';
 import type { LaneAuthority } from './lane-authority';
 import type { SessionSnapshot, SessionTurn } from '../protocol';
 import { SessionStore } from '../sessions';
@@ -371,6 +381,55 @@ describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => 
 
         expect(own?.thread?.id).toBe(ownThread);
     }, 300_000);
+
+    // T-W8 (2026-11-17) — THE EPOCH IS THE WORKER'S, NEVER THE COORDINATOR'S.
+    //
+    // `HarnessThread.epoch` (../../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`) is minted once per
+    // PROCESS, and a lane is a real `node:worker_threads` worker with its own module registry
+    // (./lane-host.ts, ./worker-boot.mjs) — so a lane's run ids carry the LANE's epoch. That is the
+    // case the fold cannot decide any other way: a lane and its parent can BOTH mint invocation id
+    // `513` for different runs (the lane leases a range, the coordinator counts from 1), and
+    // ./turn-projector.ts `isEpochBoundary` is what keeps those runs in separate rows.
+    it('names the LANE WORKER process on every frame it records, never the coordinator (T-W8)', async () => {
+        const store = storeOf();
+        const session = await store.create('general');
+
+        const submit = await store.dispatch(session.id, 'lane epoch turn');
+        const turn = await settle(store, session.id, submit.turn.id);
+
+        expect(turn.status).toBe('done');
+
+        // The frames the store recorded, with the identity the WORKER minted: the recorder forwards
+        // what the lane streamed (../sessions.ts stamps nothing — it is not a mint site).
+        const frames = turn.events as unknown as { type: string; thread?: { id: string; epoch?: string } }[];
+        const named = frames.filter((frame) => frame.thread !== undefined);
+
+        // EVERY recorded frame of a lane run carries the identity, and they all name ONE run:
+        // invocation `513`, the first id of the range the lane leased (see the note above
+        // `archivedRecords` — the coordinator counts from `1`, the lane continues the leased range).
+        expect(named).toHaveLength(frames.length);
+        expect([...new Set(named.map((frame) => frame.thread?.id))]).toEqual(['513']);
+
+        // The frame sequence that carries identity, in recorded order (the deltas in between are the
+        // scripted provider's pacing, which this assertion deliberately does not pin).
+        expect([...new Set(named.map((frame) => frame.type))]).toEqual([
+            'start',
+            'text',
+            'tool_call',
+            'attempt_commit',
+            'tool_result',
+            'done'
+        ]);
+
+        const epochs = named.map((frame) => frame.thread?.epoch);
+
+        // One epoch for the whole turn (one worker is one process), in the mint's own format, and
+        // NOT this process's — the coordinator reads the lane's frames without rewriting them, so a
+        // lane run and a coordinator run that share an id can never share a row.
+        expect([...new Set(epochs)]).toHaveLength(1);
+        expect(epochs[0]).toMatch(/^[0-9a-z]+-[0-9a-z]+$/);
+        expect(epochs[0]).not.toBe(HARNESS_PROCESS_EPOCH);
+    }, 300_000);
 });
 
 describe('worker mode: the lane worker bound and shutdown (T10 M8/M9)', () => {
@@ -498,7 +557,11 @@ describe('worker mode: a deleted conversation keeps its lane-archived results (s
                 kind: 'root',
                 status: 'completed',
                 content: ANSWER,
-                threadId: 'thread-1'
+                threadId: 'thread-1',
+                // W19: a lane-archived row names the ledger generation that minted its invocation id
+                // (../types `HarnessAgentResultSnapshot.epoch`), so the row survives a restart that
+                // re-mints `513` instead of being overwritten by it.
+                epoch: HARNESS_PROCESS_EPOCH
             },
             {
                 invocationId: '514',
@@ -509,7 +572,8 @@ describe('worker mode: a deleted conversation keeps its lane-archived results (s
                 kind: 'root',
                 status: 'completed',
                 content: ANSWER,
-                threadId: 'thread-1'
+                threadId: 'thread-1',
+                epoch: HARNESS_PROCESS_EPOCH
             }
         ]);
     }, 300_000);
@@ -558,6 +622,11 @@ describe('worker mode: a stopped lane run archives its forensic pair (review #5,
             'agent',
             'completedOrder',
             'content',
+            // W19 (2026-11-17): the ONE key a lane-archived row gains — a plain, separate
+            // ledger-generation stamp (never a composite `id\0epoch` string), and the key that lets a
+            // restart keep this row beside the row of a re-minted id. It is not in `archiveDigestOf`,
+            // so the lane receipt the stopped lane re-derives is byte-unchanged.
+            'epoch',
             'invocationId',
             'kind',
             'role',

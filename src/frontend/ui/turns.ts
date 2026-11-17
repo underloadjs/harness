@@ -266,6 +266,8 @@ import type { ReasoningCard, ToolCallCard, ToolState } from './tools';
 // must never be joined — see ui/threads.ts for both contracts.
 import {
     invalidThreadsOf,
+    revivedThreadIdsOf,
+    rosterDeletionsOf,
     threadLabelOf,
     threadNameOf,
     threadTitleOf,
@@ -1533,6 +1535,16 @@ type ThreadEntry = {
     // Fork/autoanswer rows also carry their branch identity for branch_end.
     kind: 'delegation' | 'fork' | 'autoanswer' | undefined;
     branchId: string | undefined;
+    // T-W10 — the PROCESS that minted this row's invocation id (`HarnessThread.epoch`,
+    // ../../types/index.ts:3042; the server folds the same field at
+    // ../../server/turn-projector.ts `isEpochBoundary`). `thread.id` is a per-process
+    // counter, so a restarted harness re-mints the SAME id for a DIFFERENT run; the epoch
+    // is the one recorded fact that separates them. ROW STATE ONLY: it is never a display
+    // figure (it rides `data-run-epoch` for inspectability, nothing renders it), and the
+    // first known value wins — a later process can never rewrite it. `undefined` means
+    // "the producer said nothing" (every turn recorded before this field existed, every
+    // un-adopted placeholder), which decides NOTHING: see `isEpochBoundary`.
+    epoch?: string;
     // Tiny header tag (`fork` / `auto`), created only for a branch kind. It is a
     // narrow label, not the removed oversized role badge (R3).
     kindTag: HTMLElement | undefined;
@@ -1601,6 +1613,66 @@ const steerKeyOf = (turnId: string, index: number): string => `${turnId}\u0000${
 const flowHasSteer = (flow: HTMLElement, key: string): boolean =>
     [...flow.querySelectorAll<HTMLElement>('.turn-steer')].some((node) => node.dataset.steerKey === key);
 
+// T-W10 (2026-11-17) — THE CLIENT HALF OF THE RUN DISCRIMINATOR.
+//
+// The browser folds streamed events into one row per invocation on its own (this file:
+// `entryFor`, `entryForMeta`, and the `.thread-row` `data-thread-id` dedupe at
+// `createThread`), keyed by `thread.id`. The server's projector folds the SAME events into
+// one SECTION per RUN. A restarted process re-mints the invocation counter (and a spawn
+// `callId` with it), so a post-restart run wearing a recycled id used to merge into the dead
+// run's row on the client while the server's cold fold minted two rows — the live board and
+// the reload disagreed (user-visible: one row streaming the output of two different runs).
+//
+// `isEpochBoundary` is the SAME definition the accepted server rule uses
+// (../../server/turn-projector.ts:599 — copied rather than imported because the browser
+// bundle must not depend on the server module). It is deliberately the weakest-looking,
+// strongest rule: it fires ONLY when BOTH sides name an epoch and they differ. An absent
+// epoch — every turn recorded before `HarnessThread.epoch` existed (../../types/index.ts:3042),
+// every un-adopted placeholder, every hand-written reporter — says nothing, and the fold then
+// behaves EXACTLY as it did before, so a legacy session cannot move a single row.
+const isEpochBoundary = (knownEpoch: string | undefined, incomingEpoch: string | undefined): boolean =>
+    knownEpoch !== undefined && incomingEpoch !== undefined && knownEpoch !== incomingEpoch;
+
+// The map key of ONE RUN: an epoch-less row keeps the bare invocation id (that is what every
+// pre-change key, every `data-thread-id` assertion and every synthesized `call:<id>` /
+// `inline:<agent>` / section-id key already is), and a row that knows its process is keyed
+// `id\0epoch`. The separator is the same NUL the board already uses for composite keys
+// (`steerKeyOf`), so a runtime id can never collide with a qualified key by construction.
+//
+// WHY THE FIRST FRAME'S SHAPE DECIDES THE KEY, AND WHY THAT IS STILL DETERMINISTIC: the key is
+// a pure function of the frames folded SO FAR, and both doors of the fold — a live SSE stream
+// and a reload that replays `SessionTurn.events` — see the same frames in the same order, so
+// they mint the same key. The bare-id fallback is not a special case: `resolveRunEntry` checks
+// the qualified key first and the bare id second, which is what lets a run that started
+// epoch-less (its first frames predate the field) keep its single row when a later frame of
+// the SAME run arrives carrying the epoch — a one-sided comparison must merge, never split.
+const runKeyOf = (invocationId: string, epoch: string | undefined): string =>
+    epoch === undefined ? invocationId : `${invocationId}\u0000${epoch}`;
+
+// T-W15 (2026-11-17) — THE CARD PLANE OF THE SAME RULE.
+//
+// `runKeyOf` split the ROWS, and `settledCalls`/`pendingTools` (the raw fold's tool-card
+// plane, see `appendTool`/`resolveTool`) were still keyed by the BARE `callId`. A restarted
+// process re-mints the call-id counter exactly as it re-mints the invocation counter
+// (`../core/agent-limits.ts` mints both per process), so after the row split the NEW run's
+// row got its own card, and that card's `tool_result` was thrown away as a DUPLICATE of the
+// dead run's settled call: the row was right and the chip inside it hung `running` forever.
+//
+// THE RULE, in one sentence: a call is identified by `(process epoch, callId)` — the same
+// NUL-joined shape and the same bare-id-when-epoch-less fallback as `runKeyOf`, so the row
+// plane, the placeholder-lookup plane (`findThreadByCallId`) and the card plane agree on one
+// keying rule, and a runtime id can never collide with a qualified key.
+//
+// It is deliberately `runKeyOf` itself rather than a second copy of the join: three planes
+// that each re-implemented the separator is how they drift apart.
+const callKeyOf = (callId: string, epoch: string | undefined): string => runKeyOf(callId, epoch);
+
+// T-W15 — does a settled/pending KEY belong to this call id, in ANY process? A qualified key
+// is `callId\0epoch` and a bare key IS the callId, so equality plus the NUL-terminated prefix
+// is exact: `call-1` never matches `call-12`, because the separator cannot appear in a bare key.
+const isKeyOfCall = (key: string, callId: string): boolean =>
+    key === callId || key.startsWith(`${callId}\u0000`);
+
 // The visible user-guidance surface. Shared by the tile flow (root/child invocation)
 // and the roster-only focus panel, so a steer reads the same wherever its target
 // conversation is shown.
@@ -1631,6 +1703,13 @@ type PendingTool = {
     entry: ThreadEntry;
     name: string;
     callId: string | undefined;
+    // T-W15: the PROCESS that minted `callId` (`threadOf(event)?.epoch` of the `tool_call`
+    // frame), or undefined when that frame named no process. Together with `callId` it is
+    // the card's identity (`callKeyOf`), because a restarted runtime re-mints call ids: two
+    // runs can hold two live cards under one bare id, and only the process separates which
+    // `tool_result` answers which call. Undefined is NOT "the current process" — it is "the
+    // recording said nothing", which is the pre-change key and must keep pre-change behavior.
+    epoch: string | undefined;
     startedAt: number | undefined;
 };
 
@@ -2742,6 +2821,35 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // only preserves a join for an OLD payload whose roster advanced the single
     // invocation slots without sending the historical list.
     const learnedThreads = new Map<string, string>();
+    // T-W3/F7: conversations the SERVER reports as deleted (a soft delete keeps the row
+    // in `core.threads` with `inactive`, and `threadRoster` — src/server/sessions.ts:4651-
+    // 4656 — hides it from the roster, so the transcript's turns and invocation rows stay).
+    // The ids are remembered ACROSS the roster frame that dropped them, because the row
+    // cache (`learnedThreads`) is pruned at that same moment and cannot also answer
+    // "which id did I just lose". BOARD-scoped, like `learnedThreads`: a session switch
+    // drops it, since thread ids are only unique per session.
+    const deletedThreads = new Set<string>();
+    // A roster that arrives while the ledger is empty (a first bind, or right after a
+    // session switch/board clear) is a BASELINE, not a comparison: an id it omits was
+    // never seen, so nothing it omits is evidence of a deletion. Set by `bindSession`
+    // and the board teardown, consumed by `setThreads` (see `syncDeletedThreads`).
+    let rosterIsBaseline = true;
+    // The session the ledger and the baseline flag were derived FOR. Both are ROSTER state,
+    // not DOM state: `clear()` (which `hydrate` and `hydrateView` call before rebuilding the
+    // rows) destroys the rows but the roster itself survives it, and so must what was
+    // concluded from it — a soft delete witnessed before a rebuild would otherwise be
+    // forgotten on the next paint, and the baseline flag would restart the removal join from
+    // zero. `ledgerSession` is therefore the only guard this needs: thread ids are minted
+    // per session, so a ledger whose session changed is dropped wholesale — which also
+    // covers an embedder that swaps views without ever calling `bindSession`.
+    let ledgerSession: string | undefined;
+    // The one question a card asks: does its persistent conversation belong to the
+    // server's deleted set? `undefined` (an invocation with no known conversation, a
+    // legacy payload) is NEVER deleted — that is the placeholder case the board
+    // legitimately renders, and the per-invocation duplicates of a LIVE conversation
+    // (R3: one row per run) stay for exactly the same reason.
+    const isConversationDeleted = (threadId: string | undefined): boolean =>
+        threadId !== undefined && deletedThreads.has(threadId);
     // The roster-only conversation surface (a runtime child with no turn of its own).
     let focusPanel: HTMLElement | undefined;
     // The focus panel is rebuilt whenever focus changes; its toolbar must leave
@@ -4284,6 +4392,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // is a DUPLICATE (retried event, replay overlap) and is ignored: it must not
         // add a second card or overwrite the first answer. Cleared with the
         // projection.
+        // T-W15: the entries are CALL KEYS (`callKeyOf(callId, epoch)`), not bare ids — a
+        // post-restart run wearing a re-minted id is a DIFFERENT call and its result must not
+        // be thrown away as this tile's duplicate. Every epoch-less recording keys exactly as
+        // before, because a bare id IS the key when no process is named.
         const settledCalls = new Set<string>();
         // N3 action cards rendered by THIS tile, keyed by requestId. A rebuilt
         // projection destroys them so a replayed action_request cannot leave a
@@ -4354,7 +4466,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
                         // Remember the id so a late/duplicate result is ignored
                         // instead of producing a second, resolved card.
-                        if (tool.callId !== undefined) settledCalls.add(tool.callId);
+                        // T-W15: under the CALL KEY, and taken from the ENTRY's process
+                        // (`ToolCallCard` carries no epoch of its own). The qualification is what
+                        // lets a card the NEW process mints under a re-minted id still settle
+                        // here: an abandoned E1 card marks only `id\0E1`, so the F5 resume — the
+                        // same conversation continuing in E2 with a recycled call id — gets its
+                        // own settled card instead of being swallowed as E1's duplicate.
+                        if (tool.callId !== undefined) settledCalls.add(callKeyOf(tool.callId, entry.epoch));
                     }
                 }
 
@@ -4710,6 +4828,44 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 if (entry.row === undefined) continue;
 
                 const persistent = persistentIdOf(entry);
+                // T-W3/F7: the conversation this card belongs to, resolved BEFORE the
+                // marker below rewrites it. `persistentIdOf` is the live join — and it is
+                // emptied for a conversation the roster dropped (`forgetRemovedThreads`
+                // runs first, and that pruning IS the deletion evidence), so it cannot
+                // also be what remembers the id that was just dropped. The two surviving
+                // sources are the server's own word on the wire section
+                // (`TurnSection.threadId`, R18) and the marker this very function painted
+                // on the previous pass. They answer the deletion question ONLY: a row that
+                // is not deleted still paints its marker from the live join, so nothing
+                // here re-asserts a join the server stopped naming.
+                const conversation =
+                    persistent ?? entry.compiledSection?.threadId ?? entry.row.dataset.persistentThread;
+
+                if (isConversationDeleted(conversation)) {
+                    // The server reports this conversation deleted, so its invocation row
+                    // stops rendering. HIDDEN, not removed: the compiled ops plane still
+                    // addresses this section (a late `section:set` would re-mint a removed
+                    // row), the record still holds the run, `data-deleted` keeps the
+                    // verdict inspectable, and a RESUME puts the conversation back in the
+                    // roster — at which point the same row has to come back, with the
+                    // transcript the reader had open. An open card is collapsed first so a
+                    // hidden card can never leave a body on screen, and it gives up the
+                    // child focus: the composer must not keep addressing a conversation the
+                    // server says is gone.
+                    if (entry.expanded) setThreadExpanded(entry, false);
+                    if (focusedChildKey === entry.key) clearThreadFocus();
+
+                    if (conversation !== undefined) entry.row.dataset.persistentThread = conversation;
+                    entry.row.dataset.deleted = 'true';
+                    entry.row.hidden = true;
+                    entry.row.classList.remove('is-persistent-focused');
+                    syncThreadTranscriptAction(entry);
+                    continue;
+                }
+
+                entry.row.hidden = false;
+                delete entry.row.dataset.deleted;
+
                 if (persistent === undefined) {
                     delete entry.row.dataset.persistentThread;
                     entry.row.classList.remove('is-persistent-focused');
@@ -5019,15 +5175,60 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry.meta.finish(at, origin === 'recorded');
         };
 
+        // T-W10 — THE ROW A FRAME BELONGS TO, given the process that minted its invocation id.
+        // Resolution order is fixed: the exact run (`id\0epoch`), then the bare id (a row
+        // minted before its first epoch-carrying frame, or any pre-change row). The CALLER
+        // decides merge-vs-split with `isEpochBoundary`, so this stays a lookup, not a rule.
+        const resolveRunEntry = (invocationId: string, epoch: string | undefined): ThreadEntry | undefined => {
+            const qualified = epoch === undefined ? undefined : threads.get(runKeyOf(invocationId, epoch));
+
+            return qualified ?? threads.get(invocationId);
+        };
+
+        // T-W10 — the KEY a parent reference has to resolve to. A child's `parentId` names the
+        // parent's bare invocation id, while the parent's row is keyed `id\0epoch` once its
+        // process is known (both were minted by the same process, so the child's own epoch
+        // identifies the parent's key). Without this, an epoch-split parent would silently
+        // re-parent its children to the turn root and the row set would disagree with the
+        // server's nesting. An unknown parent keeps the bare id, exactly as before.
+        const parentKeyOf = (parentId: string | undefined, epoch: string | undefined): string | undefined => {
+            if (parentId === undefined) return undefined;
+            if (threads.has(parentId)) return parentId;
+            if (epoch === undefined) return parentId;
+
+            const qualified = runKeyOf(parentId, epoch);
+
+            return threads.has(qualified) ? qualified : parentId;
+        };
+
         // The placeholder created when an `delegate` tool call was observed,
         // matched by its spawning call id. Explicit metadata uses it to adopt (never
         // duplicate) the entry the user is already looking at.
-        const findThreadByCallId = (callId: string): ThreadEntry | undefined => {
+        //
+        // T-W10: the call id is matched against the CALLER's process epoch (the epoch of the
+        // frame naming it) because the counter that mints call ids is per process too — a
+        // restarted runtime re-mints them, so the same call id can name two runs. Prefer the
+        // row of the SAME process; fall back to a row that names no process (an un-adopted
+        // placeholder, whose epoch is undefined by construction, or any pre-change row).
+        // A frame that names a process and finds only ANOTHER process's row resolves to
+        // nothing: that is a re-minted call id, and pointing at the dead run's row is exactly
+        // the merge this rule exists to stop. A frame with NO epoch behaves as it always did
+        // (first row carrying that call id).
+        const findThreadByCallId = (callId: string, epoch?: string): ThreadEntry | undefined => {
+            let firstMatch: ThreadEntry | undefined;
+            let epochlessMatch: ThreadEntry | undefined;
+
             for (const entry of threads.values()) {
-                if (entry.row !== undefined && entry.callId === callId) return entry;
+                if (entry.row === undefined || entry.callId !== callId) continue;
+
+                if (firstMatch === undefined) firstMatch = entry;
+                if (epoch !== undefined && entry.epoch === epoch) return entry;
+                if (epoch !== undefined && entry.epoch === undefined && epochlessMatch === undefined) {
+                    epochlessMatch = entry;
+                }
             }
 
-            return undefined;
+            return epoch === undefined ? firstMatch : epochlessMatch;
         };
 
         // Oldest not-yet-started placeholder for an agent. Legacy child `start`
@@ -5058,6 +5259,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             state: ThreadState;
             kind?: 'delegation' | 'fork' | 'autoanswer';
             branchId?: string;
+            // T-W10: the process that minted `explicitId` (see `ThreadEntry.epoch`). Passed
+            // through by the metadata doors; a synthesized placeholder and a compiled-plane
+            // row (keyed by the server's `section.id`, already unique per run) pass none.
+            epoch?: string;
         }): ThreadEntry => {
             const existing = threads.get(options.key);
             if (existing !== undefined) return existing;
@@ -5067,7 +5272,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             const threadRow = el('div', 'thread-row');
             threadRow.dataset.depth = String(place.depth);
+            // T-W10: the row's identity is the RUN key, not the bare invocation id — two rows
+            // may legitimately share one `thread.id` once a process re-mints it (the server's
+            // cold fold mints one section per run), so anything that de-duplicates or selects
+            // a row by this attribute must see the disambiguated key. The process is painted
+            // beside it (`data-run-epoch`) for inspection and for a test to assert the split
+            // without parsing a NUL-joined attribute; nothing renders it.
             threadRow.dataset.threadId = options.key;
+            if (options.epoch !== undefined) threadRow.dataset.runEpoch = options.epoch;
             // Same painting rule as the tile: an unnamed/placeholder agent writes NO
             // `data-agent` (not `data-agent=""`) so every block shares one neutral
             // semantics and `[data-agent]` only matches a real identity.
@@ -5215,6 +5427,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 explicitId: options.explicitId,
                 kind: options.kind,
                 branchId: options.branchId,
+                // First evidence wins and is never rewritten (the same rule the server's
+                // projector applies when it binds a row's epoch).
+                ...(options.epoch === undefined ? {} : { epoch: options.epoch }),
                 kindTag,
                 started: options.started,
                 state: options.state,
@@ -5515,26 +5730,42 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // parent (explicit metadata wins).
         const adoptPlaceholder = (entry: ThreadEntry, meta: HarnessThreadInfo): void => {
             const previousKey = entry.key;
+            // T-W10: bind the process FIRST, then take the canonical key from it — the run key
+            // (`id\0epoch` once the process is known), because the invocation id alone no
+            // longer identifies one run: the server's cold fold mints one section per RUN, and
+            // a placeholder adopted twice (once per process) must end up as two addressable
+            // rows, not one. `entry.epoch` is `undefined` on a placeholder by construction (the
+            // parent's `delegate` call opens it, and the row's process is only known when the
+            // child's own frame arrives), which is also why adoption itself is never gated by
+            // the epoch — the same ordering the accepted server rule uses.
+            if (entry.epoch === undefined) entry.epoch = meta.epoch;
+
+            const nextKey = runKeyOf(meta.id, entry.epoch);
+
             threads.delete(previousKey);
-            entry.key = meta.id;
+            entry.key = nextKey;
             entry.explicitId = meta.id;
-            entry.row?.setAttribute('data-thread-id', meta.id);
-            threads.set(meta.id, entry);
+            entry.row?.setAttribute('data-thread-id', nextKey);
+            if (entry.epoch !== undefined) entry.row?.setAttribute('data-run-epoch', entry.epoch);
+            threads.set(nextKey, entry);
 
             // The reader's expansion follows the entry to its canonical key.
-            if (expandedThreads.delete(previousKey)) expandedThreads.add(meta.id);
+            if (expandedThreads.delete(previousKey)) expandedThreads.add(nextKey);
 
             // Descendants (synthetic nested metadata, or a grandchild that started
             // before the parent's explicit record) follow the rekey so depth
             // recomputation and future nesting keep pointing at this entry.
             for (const child of threads.values()) {
-                if (child.parentKey === previousKey) child.parentKey = meta.id;
+                if (child.parentKey === previousKey) child.parentKey = nextKey;
             }
 
             if (meta.callId !== undefined) entry.callId = meta.callId;
             setThreadInput(entry, meta.input);
             setThreadKind(entry, meta.kind, meta.branchId);
-            if (meta.parentId !== entry.parentKey) reparentThread(entry, meta.parentId);
+            // T-W10: `parentId` names the parent's invocation id; the parent's ROW answers to
+            // its run key, so the reference is canonicalized before it is stored.
+            const nextParentKey = parentKeyOf(meta.parentId, meta.epoch);
+            if (nextParentKey !== entry.parentKey) reparentThread(entry, nextParentKey);
 
             entry.started = true;
             setThreadState(entry, 'streaming');
@@ -5553,31 +5784,61 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // Resolve an explicit `thread` record to its entry. The first record for an
         // id is the child `start` (full record); later events may carry only `id`,
         // so an unknown id is created defensively instead of dropping content.
+        //
+        // T-W10 — RULE (0), the SAME order the accepted server fold uses
+        // (../../server/turn-projector.ts `route`, `isRunBoundary`): a KNOWN epoch that differs
+        // from the row's is a NEW RUN, decided before the id match, before the shape test and
+        // before the "row is still open" rule. Every weaker case is untouched: equal epochs,
+        // either side absent (a pre-change record, a hand-written reporter), and every frame of
+        // a run that never names a process fold exactly as they did before this field existed.
         const entryForMeta = (meta: HarnessThreadInfo, event: HarnessEvent): ThreadEntry => {
-            const existing = threads.get(meta.id);
-            if (existing !== undefined) return existing;
+            const existing = resolveRunEntry(meta.id, meta.epoch);
+
+            if (existing !== undefined && !isEpochBoundary(existing.epoch, meta.epoch)) {
+                // A row minted by an epoch-less frame takes the epoch of the first frame that
+                // names one (first evidence wins, never rewritten), so a later process wearing
+                // this id can be told apart from the run this row belongs to.
+                if (existing.epoch === undefined && meta.epoch !== undefined) existing.epoch = meta.epoch;
+
+                return existing;
+            }
 
             // A placeholder for this spawning call is the entry the user already
             // sees: adopt it rather than adding a second row (R3, no duplicates).
             if (meta.callId !== undefined) {
-                const placeholder = findThreadByCallId(meta.callId);
+                const placeholder = findThreadByCallId(meta.callId, meta.epoch);
+
                 if (placeholder !== undefined && placeholder.explicitId === undefined) {
                     adoptPlaceholder(placeholder, meta);
                     return placeholder;
                 }
+
+                // T-W10: the boundary above refused the row this (recycled) invocation id
+                // named, but a frame that names a spawn `callId` whose row was ALREADY adopted
+                // still belongs to that row — under the process this frame names. Without it a
+                // post-restart child whose invocation id another flow has taken over would mint
+                // one row per frame. A row of a DIFFERENT process is excluded by
+                // `findThreadByCallId`, so a re-minted call id cannot resurrect the dead run.
+                const claimed = placeholder;
+
+                if (claimed !== undefined && claimed.explicitId !== undefined) return claimed;
             }
 
             return createThread({
-                key: meta.id,
+                // T-W10: the row's key is the RUN key, so two rows may share one invocation id
+                // (`inv-16` before the restart and `inv-16` after it) without the map, the
+                // `data-thread-id` dedupe, or a selector collapsing them into one card.
+                key: runKeyOf(meta.id, meta.epoch),
                 agent: event.agent,
                 input: meta.input,
                 callId: meta.callId,
-                parentKey: meta.parentId,
+                parentKey: parentKeyOf(meta.parentId, meta.epoch),
                 explicitId: meta.id,
                 started: true,
                 state: 'streaming',
                 ...(meta.kind === undefined ? {} : { kind: meta.kind }),
-                ...(meta.branchId === undefined ? {} : { branchId: meta.branchId })
+                ...(meta.branchId === undefined ? {} : { branchId: meta.branchId }),
+                ...(meta.epoch === undefined ? {} : { epoch: meta.epoch })
             });
         };
 
@@ -5650,21 +5911,48 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const meta = threadOf(event);
             if (meta !== undefined) {
                 // An already-known invocation id owns its frame, even when later
-                // frames carry only `{id}` (the runtime sends the full record once).
-                const known = threads.get(meta.id);
-                if (known !== undefined) return known;
+                // frames carry only `{id}` (the runtime sends the full record once) —
+                // UNTIL rule (0) says otherwise: two known epochs that differ are two
+                // runs, so the dead run's row must not absorb the new process's frames
+                // (that merge is the client half of the recycled-id defect; the server's
+                // cold fold had already split them, so live and reload disagreed).
+                const known = resolveRunEntry(meta.id, meta.epoch);
+
+                if (known !== undefined && !isEpochBoundary(known.epoch, meta.epoch)) {
+                    if (known.epoch === undefined && meta.epoch !== undefined) known.epoch = meta.epoch;
+
+                    return known;
+                }
 
                 if (isConversationRoot(meta)) {
                     const root = threads.get(ROOT_KEY);
                     if (root === undefined) {
                         rootSection(event.agent);
-                        return threads.get(ROOT_KEY) as ThreadEntry;
+                        const created = threads.get(ROOT_KEY) as ThreadEntry;
+                        // The conversation's own flow gets its process from the first frame
+                        // that names an invocation (the tile mints the root threadless).
+                        if (created.epoch === undefined) created.epoch = meta.epoch;
+
+                        return created;
                     }
 
                     // Same agent as the turn's root: this is another frame of the
                     // host-thread run, NOT a child. A DIFFERENT agent with no parent
                     // is a legacy/incomplete child record; keep the old row path.
-                    if (root.agent === event.agent) return root;
+                    // A root-shaped frame belongs to the conversation's own card whichever
+                    // way rule (0) answered, which is what keeps a resumed conversation on
+                    // its own row across a process restart.
+                    if (root.agent === event.agent) {
+                        // T-W10: bind a root row that was minted THREADLESS (a legacy run, or
+                        // the entry agent's threadless stream) the first time a frame of ITS OWN
+                        // agent names an invocation, so a later process wearing this
+                        // conversation's id is comparable — first evidence wins, never rewritten,
+                        // exactly as the server does in the same-agent branch of `route`
+                        // (../../server/turn-projector.ts).
+                        if (root.epoch === undefined) root.epoch = meta.epoch;
+
+                        return root;
+                    }
                 }
 
                 return entryForMeta(meta, event);
@@ -5872,6 +6160,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // Replace one agent's pending snapshot with a server-supplied array. Only a
         // PRESENT array reaches here; absence must leave the line alone (the runtime
         // omits `pending` when nothing remains, so absence is not a drain signal).
+        //
+        // T-W15 — why THIS map stays keyed by the bare `callId` while the card plane moved to
+        // `(epoch, callId)`: it is not an identity map, it is a wholesale copy of the server's
+        // authoritative snapshot for this agent, replaced on every frame that carries one
+        // (`clear()` then set), so an entry of a DEAD process cannot survive the first array the
+        // new process sends — there is nothing to disambiguate. Its keys also have to stay the
+        // server's own spelling, because `noteSettled` (below) prunes by the id a settling frame
+        // names: qualifying one side and not the other would strand a line the server already
+        // dropped. And it is per-section, which after T-W10 is per-run for every row.
         const paintPending = (section: AgentSection, pending: readonly HarnessPendingTool[]): void => {
             section.pendingCalls.clear();
             for (const tool of pending) section.pendingCalls.set(tool.callId, tool);
@@ -6345,11 +6642,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
         };
 
+        // T-W15: `epoch` is the process the CALLING frame names (`threadOf(event)?.epoch`),
+        // carried down to the pending entry so the card's identity is `(epoch, callId)`. It is
+        // read from the FRAME, never from `entry.epoch`: the root entry is deliberately shared
+        // by two processes (a resumed conversation stays on its own row), so entry state cannot
+        // tell which run minted this call, while the stamped frame can. A threadless frame
+        // therefore says nothing and the card keeps the bare-id key of today.
         const appendTool = (
             entry: ThreadEntry,
             name: string,
             rawArguments: string,
             callId: string | undefined,
+            epoch: string | undefined,
             at: number | undefined,
             origin: ApplyOrigin
         ): void => {
@@ -6378,7 +6682,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             trackNode(section, card.element);
             // A new call must appear ABOVE the pending summary line, never below it.
             if (section.pending !== undefined) section.flow.append(section.pending);
-            const pendingEntry: PendingTool = { card, section, entry, name, callId, startedAt };
+            const pendingEntry: PendingTool = { card, section, entry, name, callId, epoch, startedAt };
             pendingTools.push(pendingEntry);
             toolCount += 1;
             // Record the card (and its own pending entry) as THIS attempt's output,
@@ -6424,40 +6728,140 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // invocation's block clock (R1).
         type ResolvedTool = { entry: ThreadEntry; section: AgentSection; callId: string | undefined };
 
+        // T-W15 — the two call-id decisions `resolveTool` makes, split out so the process rule
+        // is stated ONCE (in the terms the row plane already uses) and the frame semantics of
+        // `resolveTool` stay readable.
+
+        // Which pending card THIS frame answers. The precedence mirrors the accepted row rule
+        // (`findThreadByCallId` above, and `resolveRunEntry`'s qualified-then-bare lookup):
+        //   1. same `(epoch, callId)` — authoritative, and the ONLY door that may settle a card
+        //      whose process is known: a frame naming E2 must never settle E1's card, which is
+        //      the "card of a run the frame does not belong to" case the requirement names;
+        //   2. a frame that names a process meeting a card that names NONE — one-sided evidence
+        //      merges (the same door that lets a run whose first frames predate the field keep
+        //      ONE row), so such a result settles its own card instead of minting a phantom
+        //      result-only chip;
+        //   3. a frame that names NO process — today's bare-id rule: the oldest running card
+        //      with that id, whichever process it belongs to. A legacy or hand-written reporter
+        //      cannot regress, because that is exactly what the old `tool.callId === callId`
+        //      predicate did.
+        // A frame with no `callId` at all keeps the name+oldest fallback: without an id there is
+        // no call to key, and no process question to answer.
+        const indexOfCall = (
+            name: string,
+            callId: string | undefined,
+            epoch: string | undefined
+        ): number => {
+            const running = (index: number): boolean => pendingTools[index].card.state() === 'running';
+
+            if (callId === undefined) {
+                // Legacy name matching (unchanged, R3): oldest first, no id involved.
+                for (let index = 0; index < pendingTools.length; index += 1) {
+                    if (pendingTools[index].name === name && running(index)) return index;
+                }
+
+                return -1;
+            }
+
+            // (1) exact process match — also the door for a fully legacy pair, where BOTH sides
+            // are `undefined` and the comparison is therefore trivially equal.
+            for (let index = 0; index < pendingTools.length; index += 1) {
+                if (pendingTools[index].callId === callId && pendingTools[index].epoch === epoch && running(index)) {
+                    return index;
+                }
+            }
+
+            // (2) the frame names a process; only a card that named none may still absorb it.
+            if (epoch !== undefined) {
+                for (let index = 0; index < pendingTools.length; index += 1) {
+                    if (pendingTools[index].callId === callId && pendingTools[index].epoch === undefined && running(index)) {
+                        return index;
+                    }
+                }
+
+                return -1;
+            }
+
+            // (3) the frame names no process: the bare-id rule of today.
+            for (let index = 0; index < pendingTools.length; index += 1) {
+                if (pendingTools[index].callId === callId && running(index)) return index;
+            }
+
+            return -1;
+        };
+
+        // A result for a call this tile already settled — resolved ok/error, or abandoned when
+        // the turn went terminal — is a DUPLICATE/late frame. Ignoring it is what keeps one call
+        // to one card: it must not add a second card, overwrite the first answer, or (after a
+        // cancel) resurrect a card the runtime already detached.
+        //
+        // T-W15: "already settled" is a claim about ONE RUN, so the lookup is the CALL KEY
+        // (`callKeyOf(callId, epoch)`) — a `tool_result` from a restarted process wearing a
+        // re-minted id is a different call and must settle its own card. For a recording that
+        // names no process the key IS the bare id, which is why legacy replay is untouched.
+        //
+        // The extra doors exist ONLY for a frame that names no process, and their whole purpose
+        // is to answer what today's single `settledCalls.has(callId)` answers for such a frame:
+        // a threadless frame cannot say which run it answers, so it is a duplicate when nothing
+        // is still waiting for that id anywhere and SOME process has settled it (the abandoned/
+        // late case), and otherwise it takes the oldest running card, as it always did.
+        const isSettledCall = (callId: string, epoch: string | undefined): boolean => {
+            if (settledCalls.has(callKeyOf(callId, epoch))) return true;
+            if (epoch !== undefined) return false;
+
+            // Something in SOME run is still waiting on this id: not a duplicate, and the
+            // caller's `indexOfCall` decides which card it belongs to.
+            for (const tool of pendingTools) {
+                if (tool.callId === callId && tool.card.state() === 'running') return false;
+            }
+
+            for (const settled of settledCalls) {
+                if (isKeyOfCall(settled, callId)) return true;
+            }
+
+            return false;
+        };
+
+        // Record the call as settled under the CARD's key — the card is the thing that settled,
+        // and a later frame of that same process must see it as a duplicate.
+        //
+        // When the two sides named different things (one named a process, the other did not),
+        // BOTH spellings are recorded: the match above already decided they are one call, and
+        // only the frame's spelling or only the card's spelling would leave the other door open
+        // to a phantom second card for the third copy of the same recorded frame.
+        const markCallSettled = (tool: PendingTool, frameEpoch: string | undefined): void => {
+            if (tool.callId === undefined) return;
+
+            settledCalls.add(callKeyOf(tool.callId, tool.epoch));
+
+            if (tool.epoch !== frameEpoch) settledCalls.add(callKeyOf(tool.callId, frameEpoch));
+        };
+
         const resolveTool = (
             name: string,
             content: string,
             outcome: HarnessToolOutcome,
             callId: string | undefined,
+            // T-W15: the process this `tool_result` names (`threadOf(event)?.epoch`). Undefined
+            // means the frame said nothing about its process, which is the pre-change world.
+            epoch: string | undefined,
             at: number | undefined,
             origin: ApplyOrigin,
             durationMs: number | undefined
         ): ResolvedTool | undefined => {
-            // A result for an id this tile already settled — resolved ok/error, or
-            // abandoned when the turn went terminal — is a DUPLICATE/late frame.
-            // Ignoring it is what keeps one call to one card: it must not add a
-            // second card, overwrite the first answer, or (after a cancel) resurrect
-            // a card the runtime already detached.
-            if (callId !== undefined && settledCalls.has(callId)) return undefined;
+            if (callId !== undefined && isSettledCall(callId, epoch)) return undefined;
 
             // The call id is authoritative. The name+oldest fallback is only for a
             // legacy frame that carries no id: with concurrent same-name calls it
             // cannot tell the siblings apart, so using it when an id IS present could
             // settle the wrong sibling.
-            const index =
-                callId !== undefined
-                    ? pendingTools.findIndex(
-                          (tool) => tool.callId === callId && tool.card.state() === 'running'
-                      )
-                    : pendingTools.findIndex(
-                          (tool) => tool.name === name && tool.card.state() === 'running'
-                      );
+            const index = indexOfCall(name, callId, epoch);
 
             const finishedAt = at ?? (origin === 'live' ? Date.now() : undefined);
 
             if (index >= 0) {
                 const [tool] = pendingTools.splice(index, 1);
-                if (tool.callId !== undefined) settledCalls.add(tool.callId);
+                if (tool.callId !== undefined) markCallSettled(tool, epoch);
                 // Prefer the server's authoritative span: with concurrent calls the
                 // wall-clock gap between this browser's call/result frames includes
                 // time spent waiting behind other work, which is not this call's
@@ -9114,8 +9518,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // A metadata-only HOST root frame belongs to the tile's root
                 // section (it has no child row); its usage is the root's.
                 if (info !== undefined) {
-                    const known = threads.get(info.id);
-                    if (known !== undefined) return known;
+                    // T-W10: same run-resolution as the two routing doors, so a `usage` frame
+                    // from a restarted process wearing a recycled id is not attributed to the
+                    // dead run's row. Read-only by design: a metadata frame that resolves to
+                    // nothing falls through to the root/legacy rules below rather than binding
+                    // an identity the row has not earned from a content frame.
+                    const known = resolveRunEntry(info.id, info.epoch);
+
+                    if (known !== undefined && !isEpochBoundary(known.epoch, info.epoch)) return known;
 
                     return isConversationRoot(info) ? threads.get(ROOT_KEY) : undefined;
                 }
@@ -9250,11 +9660,25 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 }
 
                 case 'tool_call':
-                    appendTool(route(), event.call.name, event.call.arguments, event.call.id, at, origin);
+                    // T-W15: the frame's process travels with the call, so the card it mints is
+                    // keyed `(epoch, callId)`; a threadless frame mints the bare-id card of today.
+                    appendTool(
+                        route(),
+                        event.call.name,
+                        event.call.arguments,
+                        event.call.id,
+                        threadOf(event)?.epoch,
+                        at,
+                        origin
+                    );
                     break;
 
                 case 'tool_result': {
                     const callId = callIdOf(event);
+                    // T-W10/T-W15: the process this frame names. It keys the CARD it settles
+                    // (see `resolveTool`) and picks which row of a re-minted spawn call is
+                    // ending (see `findThreadByCallId` below) — one recorded fact, read once.
+                    const frameEpoch = threadOf(event)?.epoch;
                     // R1: `outcome` is authoritative when present. An older recorded
                     // event (or a hand-written reporter) has only `isError`, which is
                     // the same value's boolean projection.
@@ -9265,6 +9689,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         event.content,
                         outcome,
                         callId,
+                        frameEpoch,
                         at,
                         origin,
                         toolDurationOf(event)
@@ -9298,7 +9723,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     // so its row reads "cancelled" rather than "error"; only a
                     // failed/rejected call is an error.
                     if (callId !== undefined) {
-                        const child = findThreadByCallId(callId);
+                        // T-W10: the settling frame's own process identifies which run of this
+                        // (possibly re-minted) call id is the one ending. A frame with no
+                        // `thread` block names no process and keeps today's first-match rule.
+                        const child = findThreadByCallId(callId, frameEpoch);
                         if (child !== undefined) {
                             const preview = plainPreview(event.content, 200);
                             // Completed -> done; cancelled -> the dedicated
@@ -9904,6 +10332,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // session resolve to a thread of the previous one (ids are opaque and only
         // unique per session).
         learnedThreads.clear();
+        // F7: deliberately NOT reset here. `clear` is the rebuild `hydrate`/`hydrateView`
+        // run before repainting the rows of the SAME session, and the deleted-conversation
+        // ledger is derived from the ROSTER (which survives this call), not from the rows it
+        // destroys: dropping it here meant a soft delete was witnessed on one roster frame,
+        // forgotten at the next rebuild, and the rows of a deleted conversation came back.
+        // The session guard in `syncDeletedThreads` (and `bindSession` on a real switch) is
+        // what retires the ledger.
         // T12b: the conversation containers are structural, not turn-owned; drop
         // every shell so a rebuild starts from a clean board.
         for (const host of conversationHosts.values()) host.remove();
@@ -10471,6 +10906,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // else stays an invocation-only card instead of pointing at a foreign thread.
         if (boundSession !== undefined) learnedThreads.clear();
 
+        // F7: same rule for the deleted-conversation ledger, whose ids come from that
+        // roster. The next session's first roster becomes the baseline again.
+        if (boundSession !== undefined) {
+            deletedThreads.clear();
+            rosterIsBaseline = true;
+            // Re-arm the guard so the NEXT roster frame re-derives the ledger for the new
+            // id instead of trusting one that was already emptied.
+            ledgerSession = undefined;
+        }
+
         // T3 (R3): the followed set and the transcript documents belong to the conversation
         // being LEFT — ids are minted per session, and the next session may mint the same
         // one. Clearing the reported set here is also what forces a FRESH report for the
@@ -10543,13 +10988,45 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
     };
 
+    // T-W3/F7: re-derive the deleted-conversation ledger from a roster frame. The
+    // evidence, and what deliberately is NOT evidence, are stated once in
+    // ./threads.ts `rosterDeletionsOf` (the server's soft-delete marker, and a NON-EMPTY
+    // roster dropping an id it used to name — the same evidence `forgetRemovedThreads`
+    // already accepts for the join cache). The ledger ACCUMULATES because the roster
+    // filter reports a deletion on one frame and merely omits the id afterwards, and it
+    // RETRACTS ids this frame names live again (a resumed conversation).
+    const syncDeletedThreads = (previous: readonly SessionThreadEntry[]): void => {
+        // A ledger belongs to the session its roster came from. `clear()` keeps it across a
+        // rebuild, so this is where a session CHANGE is caught — by identity, which covers an
+        // embedder that swaps views without calling `bindSession` (thread ids are minted per
+        // session, so a stale ledger could otherwise hide a live conversation whose id the
+        // previous session happened to use).
+        if (ledgerSession !== boundSession) {
+            ledgerSession = boundSession;
+            deletedThreads.clear();
+            rosterIsBaseline = true;
+        }
+
+        // A first roster (or the first one after a session switch) is a baseline: an id
+        // it omits was never on screen, so its absence means nothing. A roster that
+        // ships the row WITH the server's marker is still evidence on such a frame —
+        // that is the only case a reload can learn about a deleted conversation.
+        for (const id of rosterDeletionsOf(rosterIsBaseline ? [] : previous, roster)) deletedThreads.add(id);
+        for (const id of revivedThreadIdsOf(roster, deletedThreads)) deletedThreads.delete(id);
+
+        if (roster.length > 0) rosterIsBaseline = false;
+    };
+
     const setThreads = (entries: readonly SessionThreadEntry[]): void => {
         // T3: the compact roster carries no transcript messages (./threads.ts:89-104), so a
         // row that arrived without them keeps the document THIS board was given for that
         // conversation. Before the per-thread loader, the only way a row ever had messages
         // was the all-threads raw fan-out; now they arrive on demand and must survive every
         // streamed roster update.
+        const previousRoster = roster;
+
         roster = [...entries].map(withStoredTranscript);
+        syncDeletedThreads(previousRoster);
 
         // R7 snapshot semantics: an open transcript is a snapshot of the latest
         // applied authority. Every snapshot frame already calls this method, so

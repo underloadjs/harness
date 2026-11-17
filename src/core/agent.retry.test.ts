@@ -2,7 +2,10 @@
 //
 // Pinned contract:
 //   - ONE initial attempt plus TEN retries by default, with doubling waits of
-//     1000 * 2 ** n ms for n = 0..9 (1s .. 512s);
+//     1000 * 2 ** n ms for n = 0..5, then the 60 s ceiling (`RETRY_MAX_DELAY_MS`,
+//     src/core/agent-limits.ts) for n = 6..9. The cap replaced the uncapped
+//     1 s … 512 s tail, whose exhausted ladder cost 1023 s (~17 min) of sleeping;
+//     the attempt COUNT is unchanged at 1 + 10.
 //   - every failure shape is retried: a returned `error` frame (any HTTP status),
 //     a thrown network error, and a stream that throws mid-flight;
 //   - a successful attempt ends the sequence immediately;
@@ -50,8 +53,12 @@ const withoutIds = (value: unknown): unknown => {
     return value;
 };
 
-// The documented default sequence: ten retries after the initial attempt.
-const DEFAULT_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 512_000];
+// The documented default sequence: ten retries after the initial attempt, with every
+// wait capped at `RETRY_MAX_DELAY_MS` (60 s, src/core/agent-limits.ts). Uncapped doubling
+// put 128 s / 256 s / 512 s in these slots and made an exhausted ladder cost 1023 s
+// (~17 min) of sleeping; the attempt COUNT is unchanged, only the tail is flat, so the
+// ladder now costs at most 1+2+4+8+16+32+60+60+60+60 = 303 s.
+const DEFAULT_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000, 60_000];
 
 const done = (): HarnessStreamEvent => ({ type: 'done', stopReason: 'stop', toolCalls: [] });
 
@@ -162,7 +169,7 @@ describe('agent model-request retries', () => {
         ]);
     });
 
-    it('uses the exact default delay sequence 1000 * 2 ** n for n = 0..9', async () => {
+    it('uses the exact default delay sequence 1000 * 2 ** n for n = 0..5, capped at 60 s for the rest', async () => {
         vi.useFakeTimers();
 
         const seen: HarnessStreamRequest[] = [];
@@ -183,7 +190,12 @@ describe('agent model-request retries', () => {
                 error: { message: `failure ${index + 1}` }
             }))
         );
-        expect(DEFAULT_DELAYS).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000, 512_000]);
+        // The capped sequence, spelled out: doubling up to the 32 s wait, then the
+        // 60 s ceiling (`RETRY_MAX_DELAY_MS`, src/core/agent-limits.ts) for the last
+        // four. Before the ceiling these slots read … 64 000 / 128 000 / 256 000 /
+        // 512 000 and the whole ladder cost 1023 s of sleeping (~17 min); it now costs
+        // 303 s (~5 min) for the same eleven attempts.
+        expect(DEFAULT_DELAYS).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000, 60_000]);
         // Ten retries plus the successful attempt.
         expect(seen).toHaveLength(11);
     });

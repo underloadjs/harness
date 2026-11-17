@@ -2,7 +2,122 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-17 for the records-receipt, change-window and running-row-age
+> **Last verified:** 2026-11-17 for the roster-identity and interrupted-run-display
+> documentation pass — the identity TRIPLE the host/UI roster row now publishes
+> (`ThreadSummary.invocation_id` / `invocation_ids` / `epoch`, its emit rule, the two sources behind
+> `invocation_ids`, the 64-id cap that keeps the OLDEST, the bare-id strip, and the key order), the
+> fact that a `thread.upsert` frame carries the SAME keys because it is the same producer, the
+> model-facing `threadList` page still STRIPPING the epoch while the host plane declares the pair —
+> the two planes now differ by decision — and what the pair is FOR (the transcript join's two doors:
+> the recorded run key, then unioned process evidence, never a guess between two claimants naming one
+> process); plus the interrupted-run DISPLAY rule `settle()` now applies on THREE planes (rows end at
+> their own `lastStamp` and state `'cancelled'` when the turn settles `done`, cards and context-bar
+> segments end at the call's own last frame from ONE shared computation, the root row stays the
+> turn's), with the measured before/after figures read off the recorded run's own folds; every value
+> was re-derived at source from `src/server/api-reads.ts` (`threadRowOf`, `rosterInvocationIdsOf`,
+> `uniqueInvocationIds`, `MAX_ROSTER_INVOCATIONS`), `src/server/harness.swagger.yaml`,
+> `src/shared/harness-api.ts`, `src/shared/harness-stream.ts`, `src/shared/run-identity.ts`,
+> `src/server/protocol.ts`, `src/server/turn-projector.ts` (`interruptedStateOf`,
+> `interruptedEndedAtOf`, `abandonedEndedAtOf`, `settle`), `src/server/journal.ts`,
+> `src/harness.ts` (`classifyRunStopReason`, `modelThreadRosterOf`, `runSequence`),
+> `src/core/agent-limits.ts`, `src/core/agent.ts`, `src/server/config.ts`,
+> `src/transport/{openai,provider-timeouts}.ts`, `src/transport/openai.provider-wire-codes.test.ts`,
+> `src/frontend/{view-model,view-api}.ts` and `src/frontend/ui/thread-transcript.ts`, and the
+> display figures were re-read from `Temp/orch-plan/{w23,w24,w25}/{before,after}.txt` rather than
+> restated; this pass corrected prose that had gone STALE AGAIN — the classifier note still required
+> `RunState.sawRetryFrame` for a codeless transit death, which `src/harness.ts` removed on
+> 2026-11-17, and README plus `.env.example` still called that removed gate "a stream that died in
+> transit after a retry"; the over-trigger it accepts (a codeless transit frame, a
+> `decode`/`unknown`/absent code, or an `upstream_status` 408/429/5xx reaching the whole resume
+> ceiling) and the UNCHANGED restart policy ("mark interrupted, never replay", no startup
+> auto-resume) are now stated explicitly because both are deliberate boundaries a reader can
+> otherwise "fix" away; TWO stale comments were fixed IN CODE, comment text only and both pinned by
+> their own test file — `src/server/turn-projector-abandoned-card.test.ts` (which still claimed the
+> context-bar plane "still reports the turn's close", closed by T-W25) and the W22 plane enumeration
+> in `src/types/index.ts` (which stopped short of the ids W26 published beside the epoch) — and
+> `.env.example`'s worker-entry line was corrected from "the built bundles under `dist/`" to what
+> `lane-host.ts` / `io-client.ts` actually resolve (TypeScript SOURCE, no build step); the
+> interrupted-run rule named above is documented IN THE BODY (the `### Task queue and presentation`
+> bullet "An interrupted run reports its OWN span, on THREE planes", with the per-plane anchors and
+> the three pin files), because the register alone was claiming it; and the epoch-carrier prose W26
+> made OVER-BROAD was qualified in the three places that still said the epoch rides nothing but the
+> recorded event payload — "The epoch is row state, never a TURN wire field" here, and the two
+> clauses in README (the `thread` note under Progress events, and the restart-policy bullet) — since
+> `SessionThread.epoch` (`src/server/protocol.ts:610`), `SessionThreadView.epoch` (`:719`) and
+> `ThreadSummary.epoch` (`src/shared/harness-api.ts:2821`, hence a `thread.upsert` frame,
+> `src/shared/harness-stream.ts:766`) DO carry the token, while the display TURN records
+> (`TurnSection` / `TurnSummary`) and the `turn.*` ops still carry none; the drift this
+> pass found but did NOT touch is reported, not rewritten — `src/harness.ts:6167` cites
+> `harness.invocation-run-key.test.ts` / `tools/runtime/threadList.tool.ts` as the proof of the
+> model-page epoch strip and NEITHER names `epoch` (there is no `threadList` test file),
+> `src/server/config.ts:148` anchors `DEFAULT_MAX_RETRIES` to `../core/agent-limits.ts` while the
+> constant lives at `src/core/agent.ts:552`, `src/server/config.ts:485` still calls the lane
+> entry a "shipped bundle", and `src/server/turn-projector.ts:856` cites the `'0ms'` pin of
+> `./turn-projector-settle-interrupted.test.ts` at `:459` while the test file has since moved it to
+> `:461` (neither file is this pass's to edit); the one TEXT defect in an owned file was fixed —
+> `.env.example:10` carried a mojibake em dash (`â€”`) where the file's own style is `—`;
+> the ONLY test executed for this pass is
+> `yarn vitest run src/server/turn-projector-abandoned-card.test.ts` (8 passed / 8, after the comment
+> edit), the full suite being run by a verifier in parallel, and no behaviour file, test assertion or
+> generated contract was modified — and
+> 2026-11-17 for the run-identity EPOCH documentation pass — the
+> per-process epoch every run identity now carries (`HARNESS_PROCESS_EPOCH`,
+> `src/core/agent-limits.ts`: ONE opaque string minted at module load, never re-minted, and
+> legal only for equality), `src/server/api-events.ts` `HARNESS_RUNTIME_EPOCH` becoming an
+> ALIAS of it instead of minting its own, `HarnessThread.epoch` as the OPTIONAL payload field
+> that rides EVERY frame of a non-root run (`threadIdentity`) while root runs stay thread-less,
+> the fold's RULE (0) that makes two KNOWN-but-different epochs the strongest run boundary
+> (`isEpochBoundary`, `src/server/turn-projector.ts`) and an epoch-less record fold
+> byte-identically to before, and WHY the field exists at all: invocation ids are per PROCESS,
+> so a restarted process and a lane WORKER (its own module registry, its own counters) recycle
+> them — `reserveIdentity` cannot prevent it because it only ever RAISES a leased counter — and
+> the gateway error-frame vocabulary now has TWO producers (`packages/underload/service/src/server/
+> start.ts` and `repository/agentic/src/server/start-server.ts`, one closed vocabulary
+> deliberately duplicated across the two, each side pinned by its own frame test) so a codeless
+> frame is a build that predates them, not a different gateway; and the browser fold now applies
+> the same rule itself (T-W10 — `src/frontend/ui/turns.ts` `runKeyOf` keys a row by `id` +
+> `epoch`, falling back to the bare id while the row has none) while nothing renders the value;
+> every statement was cross-checked at source level against `src/core/agent-limits.ts`,
+> `src/types/index.ts`, `src/harness.ts`, `src/server/{api-events,turn-projector,journal}.ts`,
+> `src/transport/{openai,provider-timeouts}.ts`, `src/frontend/contract.ts`,
+> `src/frontend/ui/turns.ts`,
+> `packages/underload/service/src/server/start.ts` and `repository/agentic/src/server/
+> start-server.ts`, with the epoch's real format confirmed by one `yarn vite-node` probe rather
+> than assumed; this pass touched NO `.ts` file and NO test, and the stale statements it found
+> IN CODE are REPORTED rather than rewritten — the run-identity notes in `src/transport/openai.ts`
+> and `src/transport/provider-timeouts.ts` (and the comments in their tests) still call the
+> second SSE writer the codeless one, which the patched `repository/agentic` writer disproves,
+> and the `src/server/sessions.ts` `clearNetworkStreak` drift is RESOLVED by T-W14 — its comment
+> LISTS `markDeletedThread` (`:10831-10835`) and the calls now include the deletion path
+> (`:12315`, "streak leaves with the conversation"), `done` (`:10858`), revival (`:5270`) — and
+> 2026-11-17 for the provider-failure, durable-auto-recovery and
+> rollback-evidence documentation pass — the `provider-network` run stop reason and the exact
+> classification rule behind it (a network-class machine code, OR an exhausted CODELESS
+> `provider-transit` ladder — never a prose match), the closed resumable-stop set it joins,
+> the per-delay ceiling that now caps EVERY retry ladder and the two short class ladders
+> (`provider-connection` unchanged at 3 attempts; `provider-timeout` moved from TERMINAL to its
+> own bounded 4-attempt ladder under a 900 s wall-clock deadline), `retry: false` /
+> `maxRetries: 0` as a hard opt-out for EVERY class including the class ladders, the gateway's
+> in-stream error codes (`timeout`/`connection`/`aborted`/`upstream_status`/`decode`/`unknown`)
+> and the one translator that turns them into our retry classes, the `code` + `provider`
+> diagnostics a TERMINAL `error` record now carries beside its message, the DURABLE
+> per-conversation network-failure streak and the ceiling that stops auto-resuming it
+> (`networkResumeLimit`, default **10**, `HARNESS_PROVIDER_NETWORK_RESUME_LIMIT`, `0` = off —
+> with the restart policy itself UNCHANGED, still "mark interrupted, never replay"), the
+> journal's third line kind `rollback` plus a compaction that re-emits EVERY turn's records and
+> keeps the header's original `createdAt`, and the `inactive_thread_ids` / `inactiveThreads`
+> field that carries a soft-deletion BESIDE the roster that still hides those rows; every
+> statement was cross-checked at source level against `src/core/agent.ts`,
+> `src/core/agent-limits.ts`, `src/core/snapshot.ts`, `src/types/index.ts`, `src/harness.ts`,
+> `src/transport/openai.ts` + `src/transport/provider-timeouts.ts`,
+> `src/server/{config,journal,protocol,sessions,persistence,api-reads}.ts`,
+> `src/server/harnesses/types.ts` and `src/tools/runtime/{threadSend,threadList}.tool.ts` —
+> cited by SYMBOL, not by line anchor, because the code this pass describes was just rewritten;
+> the ONE source line this pass touched is the stale resumable-stop enumeration in the
+> `src/tools/runtime/threadSend.tool.ts` header comment (guarded by
+> `yarn vitest run src/core/tool-discovery.test.ts`), and no behaviour code and no test file was
+> changed — and
+> 2026-11-17 for the records-receipt, change-window and running-row-age
 > documentation pass — the three id receipts `addedIds` / `changedIds` / `noopIds` (one per kind
 > of write, present at ANY count and independently of each other, with `noopIds`' single producer
 > at a tool door being the patch whose named fields already held those values), the change-feed
@@ -263,7 +378,12 @@ src/
                         bounds, and snapshot/restore (`readRecordsStoreState`)
     action.ts           strict actionRequest parameters/choice parsing + limits (N3)
     agent.ts            the brain
-    agent-limits.ts     the R3 inspection bounds a tool DECLARES and the runtime ENFORCES
+    agent-limits.ts     the R3 inspection bounds a tool DECLARES and the runtime ENFORCES,
+                        plus the per-process EPOCH (`HARNESS_PROCESS_EPOCH`, T-W8) that every
+                        run identity is stamped with — it lives HERE because it is a
+                        dependency-free leaf the runtime (`harness.ts`) and the server
+                        (`server/api-events.ts`) may BOTH value-import, and `harness.ts` may
+                        not reach into `src/server`
     argument-fingerprint.ts  canonical tool-argument fingerprint (compaction T2.1/T2.2)
     branch.ts           fork identity, tool-id materialization, incorporation, bounds (N3)
     chapter.ts          the `chapters` COLLECTION SPEC (summaries, status, order, body only from get)
@@ -478,13 +598,30 @@ src/server/
   package-root.ts       package root discovered by walking to package.json (build-layout free)
   static.ts             src/frontend/dist serving
   api-errors.ts         the ONE HttpError the dispatcher and every helper throw (T13)
-  api-events.ts         the server-side event hub + the single home of per-process EPOCH and
-                        RESOURCE REVISIONS (T13)
+  api-events.ts         the server-side event hub + the home of RESOURCE REVISIONS (T13). Its
+                        `HARNESS_RUNTIME_EPOCH` is now an ALIAS of `core/agent-limits.ts`
+                        `HARNESS_PROCESS_EPOCH` (T-W8), NOT its own mint — the point is that the
+                        epoch in a REST cursor/header and the epoch on a recorded run frame are
+                        the SAME string, so they name the same process
   api-paging.ts         the one paging helper every paginated canonical route shares (T13)
   api-reads.ts          the bounded read model behind the canonical REST surface (T13)
-  journal.ts            the per-step durable journal beside the checkpoint (R4)
+  journal.ts            the per-step durable journal beside the checkpoint (R4) — THREE line
+                        kinds now, one file: `header` (line 1; its `createdAt` is the log's
+                        BIRTH and a compaction re-emits it unchanged instead of re-dating the
+                        file), `event` (one recorded step, addressed by `(turnId, index)`), and
+                        `rollback` (F4, 2026-11-17 — the durable witness of an ABANDONED
+                        attempt: the events a resume spliced out of a turn, including that
+                        attempt's terminal `error` frame; EVIDENCE, never a step, so the
+                        restore merge ignores it and the reader's per-turn gap check cannot
+                        fire on it)
   turn-projector.ts     the fold from one turn's HarnessEvent stream to a TurnDisplay tree
-                        (the work the browser used to do)
+                        (the work the browser used to do) — one section per RUN, decided by
+                        `isRunBoundary`: rule (0) is the per-process EPOCH (two KNOWN epochs
+                        that differ are two runs, whatever their ids say, T-W8), then the
+                        identity-SHAPE rule, then "an OPEN row still owns its run", then "only a
+                        `start` recorded after the closing stamp opens another one"; an absent
+                        epoch on either side decides NOTHING and falls through, so a record
+                        written before the epoch exists folds exactly as it did
   plugins.ts            the runtime plugin-settings layer: the TEMPLATE value a built-in
                         plugin's setting has, plus the per-session store forked from it
                         (`copyPluginSettingsStore`) that that session's harness really
@@ -617,7 +754,10 @@ src/frontend/
                         tokens, tools, turns, usage-summary (+ highlight-core.d.ts)
   ui/turns.ts           linear turn timeline: completed grey, active green, queued neutral;
                         one independently expandable entry per delegated invocation,
-                        nested depth-first outside every collapsible body
+                        nested depth-first outside every collapsible body, and the entry is
+                        keyed by the RUN (`runKeyOf` = invocation id + `epoch`, bare id while
+                        the row has none — T-W10; the epoch rides `data-run-epoch`, rendered
+                        nowhere)
   ui/markdown.ts        safe GFM (marked + DOMPurify) + highlight.js fenced code (R5)
   ui/action-request.ts  interactive owner-question card; read-only non-root card (N3)
   ui/thread-transcript.ts  one conversation's lossless JSON document AND its editor
@@ -633,13 +773,45 @@ of the turn root, 2 for a grandchild, …), and that row owns its own body and i
 children host. The nesting rule (`.thread-children { padding-left }`) gives one
 indent step per level and depth-first sibling order; because descendants live
 outside the parent body, neither tile collapse nor entry collapse can hide them.
-Every entry is tracked by invocation id (runtime `thread.id`, or a synthesized
-`call:<callId>` for legacy records), and only the parent's `tool_result` for the
-spawning `callId` — or the root turn's terminal status — closes it for good;
-`done.pending` is a pause, not a finish. A `threadFork`/autoanswer branch reuses
+Every entry is keyed by the RUN, not merely by its id: runtime `thread.id`, or a synthesized
+`call:<callId>` where a record offers no id to adopt (the same spellings the server fold uses
+for its section keys, `src/server/turn-projector.ts` `newSection`). Because `thread.id` is a
+per-process counter and a restarted server re-mints the SAME number for a DIFFERENT run, the
+rule on both surfaces is: a row whose KNOWN epoch differs from an incoming frame's starts a NEW
+entry, a one-sided comparison (either side epoch-less) MERGES, and an epoch-less record behaves
+exactly as it did before. The server enforces it as rule (0) of `isRunBoundary` via
+`isEpochBoundary`; the browser fold enforces the SAME definition — its own `isEpochBoundary`
+(a copy, because the bundle must not import the server module), `runKeyOf` (id joined to the
+epoch with the board's existing NUL separator, bare id while the row has no epoch),
+`resolveRunEntry` (qualified key first, bare id second, which is what makes the merge case
+merge) and `parentKeyOf` (so a split parent keeps its children). The value rides the row as
+`data-run-epoch` and renders nowhere. An epoch-less legacy record therefore keeps the fold every
+pre-change fixture pins, where the id and the spawn `callId` are all the record says. Only the
+parent's `tool_result` for the spawning `callId` — or the root turn's terminal status — closes an
+entry for good; `done.pending` is a pause, not a finish. A
+`threadFork`/autoanswer branch reuses
 this same nested row shape (`thread.kind` plus `branchId`) rather than inventing a
 second presentation; only the small kind tag differs. The layout is pure DOM/CSS,
 so the `main.ts` stream/snapshot routing needs no per-agent case.
+
+**The same keying rule owns a THIRD plane: the tool cards inside a row (T-W15, 2026-11-17).**
+`runKeyOf` split the ROWS, but the fold's tool-card state was still keyed by the BARE `callId`
+(`pendingTools` `src/frontend/ui/turns.ts:4389`, `settledCalls` `:4399`), and the call-id
+counter is per process exactly like the invocation counter — `src/core/agent-limits.ts:224-243`
+states the per-process counter universe that `HARNESS_PROCESS_EPOCH` (`:282`) exists to name. So
+after the row split the NEW run's row got its own card while that card's `tool_result` was thrown
+away as a DUPLICATE of the dead run's settled call: the row was right and the chip inside it hung
+`running` forever. A call is therefore identified by `(process epoch, callId)` through `callKeyOf`
+(`:1668`), which the two card writers use — `appendTool` (`:6651`) and `resolveTool` (`:6840`) —
+and it is deliberately `runKeyOf` itself rather than a second copy of the NUL join, so the row
+plane, the placeholder lookup (`findThreadByCallId`, `:5217`) and the card plane cannot each
+re-implement the separator and drift. `isKeyOfCall` (`:1673`) answers "does this key name this
+call id, in ANY process" as exact equality plus a NUL-terminated prefix, which is why `call-1`
+never matches `call-12`. A call that knows no epoch keeps the bare id, so every pre-change key,
+every `data-thread-id` assertion and every legacy record folds exactly as before — nothing to
+migrate on restore. Pinned by `src/frontend/ui/turns-run-epoch.test.ts:444` ("the epoch splits the
+tool-card plane"); the browser's contract reader keeps `epoch` on the event copy for exactly this
+consumer, because dropping it loses a settled CARD, not just a row (`src/frontend/contract.ts:485-492`).
 
 `src/server` and `src/server/cli` import `src/harness.ts` relatively (they are
 inside the package) and re-use the public harness surface. `src/frontend` imports
@@ -878,18 +1050,70 @@ const brain = agent({ model, instruction, provider });   // name optional
 - `turn(options?)` — run one turn against the current history, **no user append
   and no rollback**. Throws on failure. This is the primitive the harness
   re-requests with after a tool result.
-- **Retries (R1).** The agent is the single retry owner for model calls. Default:
-  one initial attempt plus ten retries, waiting `1000 * 2 ** n` ms (n = 0..9, so
-  1s … 512s) between them. A successful attempt ends the sequence; when the last
-  retry also fails, that attempt's own error is what the caller sees. Every
+- **Retries (R1, as re-shaped on 2026-11-17).** The agent is the single retry owner
+  for model calls. Default: one initial attempt plus ten retries (`DEFAULT_MAX_RETRIES`
+  / `DEFAULT_RETRY_BASE_DELAY_MS`, `src/core/agent.ts`), waiting
+  `min(baseDelayMs * 2 ** (n - 1), RETRY_MAX_DELAY_MS)` — 1s, 2s, 4s, 8s, 16s, 32s,
+  then **60 000 ms flat** for every later retry. The ceiling is not decoration:
+  uncapped doubling made an exhausted ladder sleep 1+2+4+…+512 s = **1023 s (~17 min)**,
+  which is longer than most provider outages, so the tail is now flattened and the
+  same exhausted default ladder waits at most **303 s (~5.05 min)**. The attempt COUNT
+  is untouched — a host that asked for `maxRetries: 10` still gets eleven chances —
+  and there is deliberately **no jitter** (one client re-sending one request gains
+  nothing from spreading, and a published `delayMs` must be a fact a test can pin; a
+  host that wants jitter varies `retry.baseDelayMs` per agent). A successful attempt
+  ends the sequence; when the last retry also fails, that attempt's own error is what
+  the caller sees. Every TRANSIENT
   model-call failure is retried — a returned `error` frame (any HTTP status, a
   provider error on a `200` stream, a malformed or truncated stream), a thrown
-  network error, and a mid-stream throw. **Cancellation is never retried.**
-  `retry: false` disables retries; `retry: { maxRetries, baseDelayMs }` tunes them.
+  network error, and a mid-stream throw — and the classes that are NOT retried are
+  named below, so "transient" is the ladder's word, not a guess about the error text.
+  **Cancellation is never retried.**
   A retry re-sends ONLY the current request, and the failed attempt's partial
   text/reasoning/tool calls are discarded, so nothing from it is committed and no
   tool it named can run. The `retry` event reports `attempt`, `maxAttempts`,
-  `delayMs` and the failed attempt's `error`.
+  `delayMs` and the failed attempt's `error` (`HarnessErrorInfo`: `message`, plus
+  `code` and — for a provider-classified attempt — `provider`).
+  - **Three ladders, not one** (`src/core/agent-limits.ts`, applied by the class
+    switch in `src/core/agent.ts`). The generic transient ladder above;
+    `provider-connection` (nothing answered the dial) gets its OWN short ladder of
+    **3 attempts** with 250 ms / 500 ms waits — 750 ms of waiting total, unchanged
+    since T6; and `provider-timeout` (a bound expired, OR the provider reported a
+    timeout on an open stream) got one on 2026-11-17: **4 attempts** (1 +
+    `PROVIDER_TIMEOUT_MAX_RETRIES` = 3) with waits of 2 s / 4 s / 8 s, each capped at
+    `PROVIDER_TIMEOUT_RETRY_MAX_DELAY_MS` = **30 000 ms**, under a
+    `PROVIDER_TIMEOUT_RETRY_DEADLINE_MS` = **900 000 ms** wall clock measured from the
+    START of the first attempt and INCLUDING the provider time each attempt consumed.
+    This class used to be TERMINAL — one attempt, zero `retry` frames, a conversation
+    permanently marked interrupted because a gateway went silent mid-stream — and the
+    reasoning that killed it ("re-sending into a provider that missed a five-minute
+    bound buys another five minutes") was right about the LADDER and wrong about the
+    CONCLUSION: what it rules out is the 1 s → 60 s transient ladder, not retrying.
+    Worst case with the shipped bounds is ~494 s (four attempts at the 120 s stream
+    bound plus 14 s of backoff), which is why the deadline only bites the pathological
+    shape — a host that raised `HARNESS_PROVIDER_*_TIMEOUT_MS` to minutes. The
+    deadline is checked BEFORE the `retry` frame is emitted and before the wait starts,
+    so an expired sequence neither promises a retry nor sleeps for it; one deadline is
+    captured per model request, so the next turn owns a fresh budget.
+    `retry.maxRetries` does NOT stretch either class ladder (widening the transient
+    ladder says "my provider blips", not "dial my dead port eleven times"), and
+    `retry.baseDelayMs` only ever RAISES the timeout ladder's 2 s base
+    (`max(baseDelayMs, 2000)`, still capped at 30 s) — it never lowers it.
+  - **Terminal classes.** `context-overflow` (the pre-request floor the request would
+    breach — issue 0004, never worth re-sending), `provider-rejected` (an HTTP
+    400/401/403/404 refusal),
+    `provider-aborted` (the gateway's own in-stream `aborted` answer — a cancel that
+    did NOT come from our signal, so a re-send would be a request nobody waits for)
+    and an abort from the caller's own `AbortSignal` end the sequence on the spot. A
+    LOCAL stop never reaches `provider-aborted`: the `isAbortError` short-circuit runs
+    first, so a user stop keeps its historical identity.
+  - **`retry: false` (and `retry: { maxRetries: 0 }`) is a HARD opt-out for every
+    class** (the `maxRetries === 0` gate in `src/core/agent.ts`, ahead of the class
+    switch). The class ladders ignore a NON-ZERO `maxRetries`, but zero is a different
+    promise — the published contract says one attempt, and a host passes it exactly
+    when a re-send is unwanted rather than merely bounded (scripted fixtures, a
+    non-idempotent endpoint, a test on its own clock). Before this gate a
+    `provider-timeout` spent four dials and 14 s under `retry: false`.
 - `options.tools` forwards tool declarations to the transport. The agent never
   executes them; standalone callers do.
 - `messages` is the live array (not a copy).
@@ -1965,10 +2189,21 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   a delegated/ctx.run child; a fork/autoanswer uses its `branchId`. The harness
   records roots, delegations, forks, and autoanswer branches in a bounded
   registry (`AGENT_RESULT_RETENTION` = 64 completed records, active runs are never
-  evicted) and persists every TERMINAL record as the OPTIONAL `agentResults` array
-  of snapshot v1. Restoring advances the run, completion, and branch-id counters to
-  the archived high-water marks, so a future run cannot reuse/overwrite an archived
-  invocation id. Old snapshots without the field restore an empty registry, and
+  evicted) and persists every TERMINAL record as the OPTIONAL `agentResults` array of
+  the EXISTING snapshot v2 — an additive optional key, deliberately NOT a version bump
+  (`src/core/snapshot.ts`), so every pre-feature file still validates. Restoring advances
+  the run, completion, and branch-id counters to
+  the archived high-water marks (`src/harness.ts` — `Math.max` over the restored rows'
+  `sequence`, which IS the run id, plus the `branch-N` marks), so a run started in a
+  restored harness cannot reuse or overwrite an invocation id THIS snapshot still
+  archives. That is a RESTORE guarantee, not a global one: the counters are per PROCESS, so
+  an invocation id is unique only inside one (the `HarnessThread` contract in
+  `src/types/index.ts` states exactly that, and `HarnessThread.epoch` exists to make the
+  recycling visible on a recorded frame), a lane worker mints from its OWN counters, and a
+  snapshot that carries no `agentResults` array leaves them at 0 while the session journal
+  still holds the ids that came before — so a caller treats `invocationId` as a handle into
+  THIS harness's retained registry, never as a permanent id through history.
+  Old snapshots without the field restore an empty registry, and
   `reset()` clears it with the conversation.
 - **An unfinished run keeps its partial on disk (2026-11-14, issue 0033).** The live
   envelope of a cancelled or failed run reports the assistant TEXT it had in hand when it was
@@ -3349,7 +3584,11 @@ descriptors (22 runtime entries).
   MARKED, not destroyed (IT19 R2, 2026-11-15): `purgeThread` sets `inactive`/`inactiveAt` and
   the record, its transcript and its invocation rows are RETAINED, so the roster and `actOn`
   stop naming it while a host can still read it by id, and every AGENT door refuses it with its
-  own sentence rather than the "never created, or it was deleted" wording. The row also carries
+  own sentence rather than the "never created, or it was deleted" wording. That omission is
+  UNCHANGED for the tool (2026-11-17): what moved is the HOST side, where a soft-deletion now
+  travels as its own field instead of being inferred from a roster that stopped naming an id —
+  `SessionResource.inactive_thread_ids` and `SessionSnapshot.inactiveThreads` /
+  `SessionView.inactiveThreads` (see [API](#api)). The row also carries
   `stopReason` (R3/R5) — see the `threadSend` bullet for which stopped rows an agent send may
   continue.
   - **The fields, exactly.** `origin` has TWO values (`HarnessThreadOrigin`,
@@ -3362,6 +3601,20 @@ descriptors (22 runtime entries).
     wall clock, so the order is stable across a restore and under tests
     (`HarnessThreadRecord`, `src/types/index.ts`; `threadRoster` sorts by it).
     `status`/`ownerThreadId`/`invocationId`/`label` carry their record values.
+    **`epoch` is STRIPPED here and nowhere else (W19/W22, 2026-11-17).** The runtime record pairs
+    `invocationId` with the process that minted it, and every plane that resolves a run reads that
+    pair — except the model page, which `modelThreadRosterOf` (`src/harness.ts:6169-6178`) narrows
+    back to the bare ids it has always published. The reason is a parameter the tool does not have:
+    the `threadList` schema has no epoch argument, so handing the model a token it could never send
+    back would widen a contract the model reads for no benefit, and the page stays byte-identical
+    to the pre-W19 roster. The HOST/UI planes DO carry the pair
+    (`SessionThread.epoch` / `SessionThreadView.epoch` / `ThreadSummary.epoch`) — see
+    [Persistent threads in the UI](#persistent-threads-in-the-ui-t5--r5-r7) for the identity triple
+    and why the two planes are allowed to differ. `src/harness.ts:6167` cites
+    `./harness.invocation-run-key.test.ts` and `./tools/runtime/threadList.tool.ts` as the proof of
+    the strip, and NEITHER mentions `epoch` (there is no `threadList` test file at all) — the strip
+    is therefore an observed behaviour of `modelThreadRosterOf`, not a pinned contract; reported
+    here rather than papered over.
   - **Fork branches are absent from the roster on purpose.** A `threadFork` branch is an
     INVOCATION with an ephemeral transcript, not a thread slot, so it never enters
     `threadStates` and never appears here; its `branch-N` id is still readable through
@@ -3462,7 +3715,8 @@ descriptors (22 runtime entries).
   hint; a threadless (host) caller is unscoped and keeps every candidate.
   A STOPPED thread is no longer uniformly host-revive-only (IT19 R3/R5, 2026-11-15): the
   record's `stopReason` decides. A run that was cut short — `caller-released`, `timeout`,
-  `turn-cap`, `budget-exhausted`, `api-error`, `retries-exhausted` or `parent-closed` — takes an
+  `turn-cap`, `budget-exhausted`, `api-error`, `retries-exhausted`, `provider-network` or
+  `parent-closed` — takes an
   agent `threadSend`, and that send reports `"resumed"` because the retained turns continue the
   same conversation instead of opening a fresh one. A thread the HOST stopped (`user-stopped`),
   one a plugin parked (`plugin-parked`), and one stopped with NO recorded cause are refused —
@@ -3801,11 +4055,16 @@ threadFork({ input: string; label?: string; timeoutMs?: number })
   autoanswer it is emitted before `action_request`.
 - `branch_end`: `{ agent, branchId, status, error?, thread? }`; `error` is present
   for `failed`/`cancelled` and absent for `completed`.
-- `HarnessThread` = `{ id, parentId?, callId?, input?, kind?, branchId? }`. `kind`
+- `HarnessThread` = `{ id, parentId?, callId?, input?, kind?, branchId?, epoch? }`. `kind`
   is `'delegation' | 'fork' | 'autoanswer'`; a branch's `id` IS its `branchId`, and
   the branch's own frames carry that same `thread`, so `branch_start`/`branch_end`,
   the branch frames, `harness.branch(id)`, and the transcript's nested entry use
-  one naming scheme. `input` is the branch/child task.
+  one naming scheme. `input` is the branch/child task. `epoch` (T-W8) is the per-process
+  epoch that minted `id` — a `branch-N` id is recycled across a restart exactly like an
+  invocation id, so `branchThreadOf` stamps the epoch on the audit frames too (they BYPASS
+  `emit` and go straight to `progress`, where nothing else would put the process identity),
+  and one branch row therefore never sees two epochs for one run. See "HarnessEvent" for the
+  full identity contract.
 
 ### Server broker and UI
 
@@ -3892,8 +4151,10 @@ await writer('tell me about new year');
   (IT19 R1, 2026-11-15 — `runAgentCore`'s catch no longer splices a conversation's turns; a
   forked BRANCH run still splices, because it owns no thread state of its own) and the record
   says WHY it halted (`stopReason`, R3). Whether an AGENT may continue a stopped conversation
-  now follows that reason: a run cut short (`caller-released`, `timeout`, `turn-cap`,
-  `budget-exhausted`, `api-error`, `retries-exhausted`, `parent-closed`) takes an agent
+  now follows that reason, and the set of reasons that allow it is CLOSED and kept in ONE
+  table — `RESUMMABLE_RUN_STOP_REASONS` (`src/harness.ts`): `caller-released`, `timeout`,
+  `turn-cap`, `budget-exhausted`, `api-error`, `retries-exhausted`, `provider-network`,
+  `parent-closed`. A run cut short for one of those takes an agent
   `threadSend`, which reports `"resumed"`; a thread the HOST stopped (`user-stopped`), one a
   plugin parked (`plugin-parked`), and one stopped with no recorded cause stay host-only — a
   host `sendThreadInput` revives those, and it revives the others too. An INACTIVE (deleted)
@@ -3903,6 +4164,56 @@ await writer('tell me about new year');
   and runs the turn (`src/harness.ts` `sendThreadInput`; the server's `reactivateThreadRow` plus the
   `resumeThread` route drive it). So "host-reviveable" covers reads, restores AND an explicit host
   turn; only the SESSION being deleted takes the thread away.
+  - **`provider-network` (2026-11-17) names a NETWORK death instead of a refusal**
+    (`HarnessRunStopReason`, `src/types/index.ts`; produced by `classifyRunStopReason`,
+    `src/harness.ts`; accepted on restore by `HARNESS_RUN_STOP_REASONS`,
+    `src/core/snapshot.ts`, which is the READER half of the union — a new member must join
+    that table in the same change that adds its producer, or a document carrying it is
+    refused). The classifier runs AFTER the abort/stamp rules (an abort is an ACTOR, a
+    network failure is a CAUSE, and an aborted run's cause is the actor that stopped it) and
+    BEFORE the exhausted-ladder rule, and answers `provider-network` when, and only when, one
+    of these holds: **(1)** the failure's machine `code` is `provider-timeout` (a bound
+    expired, or the provider reported a timeout on the stream) or `provider-connection`
+    (nothing answered the dial) — network-class BY CLASS, whether or not a retry was spent,
+    which is the whole point, since the reported defect died with ZERO `retry` frames and
+    would otherwise have persisted as `api-error`; or **(2)** the failure is CODELESS and the
+    transport diagnosed the dying bytes as `provider-transit` (`details.errorClass`, read
+    through the SAME `providerDiagnosticsOf` the `retry` frame uses).
+    - **THE `sawRetryFrame` REQUIREMENT IS GONE (2026-11-17, accepted explicitly).** Rule (2)
+      used to ALSO demand that the run had spent at least one retry (`RunState.sawRetryFrame`),
+      so a transit failure on the FIRST attempt stayed `api-error` — with no streak and no
+      auto-resume. The proof was never the ladder: the transport's own `provider-transit`
+      diagnosis says the bytes died in the WIRE rather than in the request, so a transit death
+      that spent ZERO retries now raises the consecutive-failure streak and auto-resumes like any
+      other network class (`src/harness.ts` `classifyRunStopReason`;
+      `src/harness.provider-network-stop.test.ts`).
+    - **THE ACCEPTED OVER-TRIGGER — written out because it reads like a bug and is not.** What
+      lands on the codeless `provider-transit` class is decided by the TRANSPORT, and it is wider
+      than "the network died": a gateway mid-stream frame whose code is `decode`, `unknown`,
+      absent, or `upstream_status` carrying a status that is NOT a refusal — which is exactly
+      408 / 429 / any 5xx, 504 included, because `isTerminalProviderStatus` names only
+      400/401/403/404 (`src/transport/provider-timeouts.ts:418-419`) — plus any body that closed
+      without reporting a completion (`src/transport/openai.ts`, the truncation guard). Each of
+      those is CODELESS **with** the transit diagnosis, so each is a `provider-network` death,
+      raises the streak, and can therefore consume the WHOLE resume ceiling on an endpoint that is
+      merely truncated or merely rate limiting its own upstream. That is the accepted trade: the
+      reported failure mode was a network death answering `api-error` and never resuming at all,
+      and the ceiling bounds what the over-trigger can cost.
+    - **What still isolates a NON-network failure**: the failure must be codeless **and** carry the
+      transit diagnosis — an HTTP 4xx/5xx RESPONSE BODY, a malformed stream frame and a
+      schema/validation throw carry no such class — so `retries-exhausted` still means "a
+      NON-network ladder ran out" and `api-error` still means a genuine first-attempt failure, and
+      a user stop / turn cap / plugin park stays an ACTOR.
+    WHY the member exists at all: the session layer has to
+    answer "is this conversation interrupted because the endpoint is unhealthy, or because
+    the request itself was refused?" before it counts consecutive network failures against a
+    threshold (see the auto-recovery note under [CLI, server, and UI](#cli-server-and-ui)),
+    and neither `api-error` nor `retries-exhausted` is safe to branch on. **The restart
+    policy is NOT moved by this member**: such a run is still marked interrupted and never
+    replayed automatically — the difference is only that a caller can tell WHY from a field.
+    Its membership in the resumable set is about a PEER'S `threadSend`, not about
+    auto-recovery: the turns are retained, and a message is a legitimate way to put the
+    conversation back to work.
 - **Concurrency lives in the runtime, not in the provider stream.** Each agent has
   one serialized model stream; its tool calls are async work scheduled together.
   An agent's `done` event is one RESPONSE: it may list `pending` calls still running
@@ -4446,8 +4757,54 @@ const stream = openAICompatible(
 - Failures become `error` events: non-2xx (`HTTP <status>: <body>`), a
   `chunk.error` on a 200 stream, a malformed frame, a TRUNCATED stream (a body that
   closes without `[DONE]` and without a `finish_reason`), or a connection failure.
-  The agent retries every one of those (see "agent" — R1); the transport itself
-  never retries, so there is exactly one retry owner.
+  The agent retries whatever its class allows (see "agent" — R1 and the three
+  ladders); the transport itself never retries, so there is exactly one retry owner.
+- **A gateway error frame is read STRUCTURALLY (2026-11-17).** A proxy in front of
+  another provider does not fail the HTTP request when ITS upstream dies: it answers
+  200, streams a while, and attaches `{"error":{"code":…,"status":…,"errno":…}}` to
+  one SSE frame. This reader used to take `error.message` and drop the rest, so every
+  mid-stream provider failure reached `agent()` codeless. `providerWireFailureOf`
+  (`src/transport/provider-timeouts.ts`) is now the ONE translator between the
+  gateway's vocabulary and ours, so a provider-side change lands in one function:
+  `timeout` → `provider-timeout` (the bounded timeout ladder, `phase: 'stream-chunk'`
+  because an in-stream frame can only mean the stream was open), `connection` →
+  `provider-connection` (the short 3-attempt dial ladder), `aborted` →
+  `provider-aborted` (never re-sent), `upstream_status` → `provider-rejected` ONLY
+  when the frame carries a usable status AND `isTerminalProviderStatus` names it
+  (400/401/403/404 — a refusal must be OUR request's fault, so the producer's 408 /
+  429 / 5xx answers, a 504 included, stay codeless), and `decode` / `unknown` / an
+  absent or unrecognised code → **codeless**, the generic transient ladder, unchanged
+  on purpose. Nothing classifies on the MESSAGE: the producer's prose is
+  endpoint-specific, and the legacy `Upstream stream terminated` /
+  `Provider reported an error` sentences stay byte-identical for the codeless case, so
+  a scripted provider error is retried exactly as `src/core/agent.retry.test.ts`
+  pins it. The reading is total (`null`, a string, or a frame whose fields are objects
+  all answer), keys are never tested with `in`, and "absent", `null` and `undefined`
+  are the same answer, because a frame with NO `code` is legal input and keeps the
+  codeless ladder (that shape is pinned in `src/transport/openai.provider-wire-codes.test.ts`
+  and `src/transport/openai.test.ts`). That vocabulary now has TWO producers — the primary
+  gateway (`packages/underload/service/src/server/start.ts`) and a second SSE writer
+  (`repository/agentic/src/server/start-server.ts`, an INLINED copy of the same classifier
+  and payload builder, called out at its `start-server.ts:275-292` and pinned by its own
+  `start-server-stream-error.test.ts`) — both emitting the same six codes, the same frame
+  keys in the same insertion order and the same legacy `unknown` sentence, so a codeless
+  frame is a build that predates the coded envelope rather than a different gateway. A coded
+  frame leads with its code and names the endpoint, the status, what happens next and
+  the provider's own quoted line (`providerWireMessage`, bounded like the other coded
+  messages, with the OpenAI `param` the provider blamed quoted when it named one).
+- **Diagnostics ride on every classified frame.** Each such `error` carries
+  `details` (`errorClass`, redacted `url`, effective `port`, and `phase` / `errno`
+  when the class has them) and, when the wire code resolved to one, `code` — the
+  frozen `HarnessProviderAttemptDiagnostics` shape, published from the ONE reader
+  `providerDiagnosticsOf`, which both the agent's `retry` frames and the harness's
+  TERMINAL `error` record use, so the two can never disagree. The
+  DIAGNOSTICS-ONLY class `provider-transit` (`PROVIDER_TRANSIT_CLASS`) covers a
+  codeless network death — a codeless gateway frame, and the truncated stream above —
+  where the retry policy stays generic but the diagnosis is still a fact a consumer
+  reads from a field; it is a `details.errorClass` value and a stop-reason
+  discriminator, NEVER a published `error.code`, because a code promises a retry
+  policy. `timeoutMs` is deliberately OMITTED when the provider reported the timeout:
+  no local bound expired, so quoting one would invent it.
 
 ---
 
@@ -4493,17 +4850,27 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 | { type: 'usage';         agent: string; usage: HarnessUsage }
 | { type: 'done';           agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
 | { type: 'wakeup';         agent: string; reason: 'pending-tools'; pending: HarnessPendingTool[] }
-| { type: 'retry';          agent: string; attempt: number; maxAttempts: number; delayMs: number; error: { message: string } }
+| { type: 'retry';          agent: string; attempt: number; maxAttempts: number; delayMs: number; error: HarnessErrorInfo; provider?: HarnessProviderAttemptDiagnostics }
 | { type: 'attempt_commit'; agent: string; attempt: number; maxAttempts: number }
 | { type: 'action_request'; agent: string; callId: string; request: HarnessActionRequest }
 | { type: 'action_answer';  agent: string; requestId: string; answer: HarnessActionAnswer }
 | { type: 'branch_start';   agent: string; branch: HarnessBranchSummary }
 | { type: 'branch_end';     agent: string; branchId: string; status: HarnessBranchTerminalStatus; error?: HarnessErrorInfo }
-| { type: 'error';          agent: string; error: { message: string } }
+| { type: 'error';          agent: string; error: HarnessErrorInfo }
 
 // EVERY variant also carries `thread?: HarnessThread` for a non-root run.
+// HarnessErrorInfo = { message: string; code?: string; provider?: HarnessProviderAttemptDiagnostics }
+//   — `code` is the machine class of the failure (`provider-timeout`, `context-overflow`,
+//     …) whenever the throwing `HarnessError` carried one, and `provider` is the
+//     transport's diagnosis of the attempt that ENDED the run (additive, 2026-11-17, and
+//     absent for an unclassified failure). Both are DECLARED members now: `toErrorInfo`
+//     (`src/util/errors.ts`) has emitted `code` beside the message for a long time and the
+//     type simply did not say so, which is why every consumer read it defensively or
+//     regexed the class back out of the prose.
 // HarnessPendingTool = { callId: string; name: string; elapsedMs: number }
-// HarnessThread = { id; parentId?; callId?; input?; kind?: 'delegation'|'fork'|'autoanswer'; branchId? }
+// HarnessThread = { id; parentId?; callId?; input?; kind?: 'delegation'|'fork'|'autoanswer'; branchId?; epoch? }
+//   — `epoch` (T-W8, 2026-11-17) is the per-process epoch that MINTED `id`; see the run-identity
+//   paragraph below for why an id alone cannot say which run a frame belongs to.
 ```
 
 Delivered through `report.progress`, which is **awaited** for every step, so a
@@ -4525,6 +4892,64 @@ currently only `read`) adds **no** event field either: it replaces the `content`
 model reads — the transcript carries the tool's own prose instead of that result object's
 serialized JSON — while the machine value stays reachable through `unwrapToolResult`.
 
+`thread` is a NON-ROOT run's invocation identity, and since T-W8 (2026-11-17) it also names
+the PROCESS that minted it. `thread.id` is the runtime's `runSequence` counter, and that
+counter is per PROCESS: a restarted harness starts it again (a restore raises it only as far as
+the archived agent-result rows it retained — a bounded raise, not a global one, and a snapshot
+with no such array leaves it at 0), and a lane worker mints from its
+OWN counter (`reserveIdentity`, `src/harness.ts` — it only ever RAISES a leased mark, it never
+mints an identity), so an invocation id is unique only INSIDE one process and the same `id`
+can name two unrelated runs inside one `events.jsonl`. Every mint therefore stamps
+`epoch: HARNESS_PROCESS_EPOCH` (`src/core/agent-limits.ts` — ONE opaque string minted at
+module load, never re-minted, a base36 timestamp plus a random suffix, e.g.
+`mwk24rfs-222y0t4w3p13`, and legal only for the question "is this the same epoch as that
+one?"; the REST epoch `HARNESS_RUNTIME_EPOCH` that rides the boot document, every response
+header and every stream cursor is the SAME value, aliased in `src/server/api-events.ts`, so a
+cursor and a recorded frame naming one epoch name one process), and `threadIdentity`
+(`src/harness.ts`) copies it onto EVERY frame of the run — copied off the run's own thread,
+never re-read from the module constant, so a frame can never claim an epoch other than the one
+its run was born with. The mint sites are `run.thread` for a branch run, for a child of
+another run, and for a HOST-THREAD run (`src/harness.ts`), plus `branchThreadOf` for the branch
+audit frames; the host-thread mint is the load-bearing one, because a host conversation's own
+run is ROOT-SHAPED (no parent, no spawn call, no kind, no branch), so the shape test cannot
+separate the run a turn started with from the run a restarted process continues it with — and
+the two can carry the SAME recycled id, which is exactly what the live artifact did: it filed a
+resumed conversation under a dead child's id. Root runs are unchanged: they still emit no
+`thread` at all. Three consequences a consumer has to respect:
+
+- **A KNOWN epoch that differs is a run boundary, full stop.** The server's fold makes it rule
+  (0) of `isRunBoundary` (`src/server/turn-projector.ts`), ahead of the identity-shape test and
+  ahead of "the row is still open": a dead run's row cannot absorb a frame from a process that
+  never ran it, however similar the two runs look. This is the defect it closes — the F5
+  residual, where two runs of the SAME shape whose spawn `callId` was ALSO recycled were
+  unseparable from the recorded lines, so unrelated runs merged into one turn-projection row
+  (the same defect family F5 reported as a main conversation stuck at "thinking" while its
+  answer sat in the record).
+- **An absent `epoch` says NOTHING, and that is the contract, not a gap.** Every turn recorded
+  before 2026-11-17, every un-adopted placeholder row and every hand-written reporter has none,
+  so a reader must fall through to the shape and post-terminal-`start` rules rather than treat a
+  missing epoch as a mismatch — that asymmetry is what keeps a pre-change session folding
+  BYTE-IDENTICALLY. `snapshot()`/`restore()` deliberately carry no epoch either (they move the
+  counters, not the process), so a restored replica is a NEW minting context — which is exactly
+  the case the discriminator is there to catch.
+- **The epoch is row state, never a TURN wire field.** It is a PAYLOAD-level field: the journal writes
+  the event record verbatim (`JournalEventRecord.event` is a plain `HarnessEvent`, and the
+  store's `copyEvent` is a JSON round trip), so no line schema and no snapshot version moved —
+  and the recorded frames are the ONLY place the value survives a restart, which is why the fold
+  can still read it after a reload. No DISPLAY TURN record carries it: `TurnSection` / `TurnSummary`
+  gained no key and the display ops name no such field, so a consumer that needs the epoch of a RUN
+  reads the recorded `event.thread`. The browser keeps it as its own row state and stamps it on the
+  row as `data-run-epoch` (`src/frontend/ui/turns.ts:5282`) for inspection — nothing renders it.
+  CORRECTED IN PLACE 2026-11-17 (W26): this bullet's heading used to read "never a wire field", and
+  that is true only of the TURN planes. The same process token IS published on the CONVERSATION
+  planes, beside the run ids it discriminates — `SessionThread.epoch` (`src/server/protocol.ts:610`),
+  `SessionThreadView.epoch` (`:719`, the compact row the browser renders) and `epoch` on
+  `ThreadSummary` (`src/server/harness.swagger.yaml:7544-7595` → `src/shared/harness-api.ts:2821`),
+  which is also what a `thread.upsert` frame carries because the live row is the same producer
+  (`WsUpdateThreadUpsert.thread: ThreadSummary`, `src/shared/harness-stream.ts:766`). The token is
+  BARE there too, and the model-facing `threadList` page still strips it. See "THE ROSTER ROW
+  CARRIES AN IDENTITY TRIPLE" under "Persistent threads in the UI".
+
 The three concurrency fields are additive, and a client must fall back to its
 pre-concurrency rendering when they are absent (old persisted turns):
 
@@ -4545,7 +4970,22 @@ pre-concurrency rendering when they are absent (old persisted turns):
   boundary (`start`/`retry`/`attempt_commit`/`done`) belong to the FAILED attempt: a
   client discards them (the UI truncates back to its attempt boundary) because the
   agent never commits them. `attempt` is the failed attempt (1-based) and
-  `maxAttempts` its budget (11 by default), so "2 of 11" needs no guessing.
+  `maxAttempts` its budget, so "2 of 11" needs no guessing — and the budget is the
+  CLASS's, not one constant: **11** for the generic transient ladder, **3** for
+  `provider-connection`, **4** for `provider-timeout` (2026-11-17 — that class used to
+  emit NO `retry` frame at all, because it was terminal). `delayMs` is the capped,
+  jitter-free wait the ladder publishes (see "agent" — Retries), and `provider`
+  carries the redacted endpoint, effective port and failure class of THAT attempt
+  when the transport classified it.
+- A terminal `error` frame carries the SAME machine-readable half since 2026-11-17:
+  `error.code` plus `error.provider` (the diagnosis of the attempt that ended the run),
+  emitted through the same `providerDiagnosticsOf` reader, so a failure that was
+  terminal BY DESIGN — a `provider-rejected`, `provider-aborted` or `provider-transit`
+  death, or an exhausted ladder whose last attempt never got a `retry` frame — no
+  longer reaches a UI, a journal row or the session layer as a sentence to parse. An
+  unclassified failure still carries neither key, so every historical recording keeps
+  the `{ message }` payload it always had and `src/frontend/provider-diagnostics.ts`
+  keeps its prose fallback for exactly those rows.
 - `attempt_commit` (R3) is the SUCCESS end of one model request: the answer is in
   history, so everything streamed since the previous boundary is final and a later
   `retry` (a NEWER request) must not discard it. It exists because `done` is not
@@ -5095,6 +5535,84 @@ as their own entries.
   an assistant tool call and its result, restore appends explicit interrupted tool
   results for the unmatched ids (no re-execution), so the next provider request is
   coherent.
+  **Durable network-failure auto-recovery (F1, 2026-11-17) — which does NOT touch the restart
+  policy above.** A persistent conversation that keeps dying on the network no longer just
+  rests: the store keeps a DURABLE per-conversation streak of consecutive NETWORK-CLASS run
+  failures (`Session.networkFailures`, persisted as the additive
+  `HarnessSessionRecord.networkFailures`; entries at 0 are pruned, so a healthy session's
+  document keeps its exact key set) and, while that streak is STRICTLY BELOW the session's
+  ceiling, calls its OWN resume path — `resumeThread`, the same one
+  `POST …/threads/:threadId/resume` serves, which is what keeps the recovery honest about the
+  status gates, the in-place requeue, the lane pump, the durability fence and the journal. The
+  rule is written ONCE (`src/server/sessions.ts`, beside `INTERRUPTED_MESSAGE`) and implemented
+  by `observeTerminalTurn` (bookkeeping, BEFORE the terminal checkpoint, so the number a resume
+  or a restart reads is the one this run decided) and `autoResumeAfterNetworkFailure` (the
+  resume, at the very END of `executeTurn` and synchronous up to the requeue's first await, so a
+  `waitForIdle()` caller sees one continuous run of work instead of an idle window). `done`
+  clears the streak; `error` on a network-class reason raises it, saturating AT the ceiling so a
+  client rendering "n/10" never sees a number that lies about what is in control; a
+  `cancelled`/`aborted` row touches NOTHING — a stop by intent is neither proof the network
+  recovered nor a failure to count against it.
+  - **What counts as network-class** is exactly the run stop reason `provider-network` — plus
+    ONE bounded legacy allowance: `api-error` counts ONLY when the reason was carried in from
+    disk (`Session.legacyNetworkReasons`, seeded at restore from the rows the document
+    actually carried) AND the conversation's streak is still 0, so a record written before this
+    vocabulary buys AT MOST ONE auto-resume per conversation per process, and the moment a run
+    of this build terminalizes that row the allowance is gone for good. `retries-exhausted`
+    never counts (it is a NON-network exhausted ladder) and neither does `timeout` — that
+    reason is the host's own wall clock being enforced, an operator policy, not a connection
+    dying; a provider bound that is missed arrives as a provider failure class and reaches this
+    rule as `provider-network`. **What that class deliberately WIDENS, stated because a reader
+    will otherwise narrow it back:** the transport's codeless `provider-transit` diagnosis is what
+    the classifier trusts, and it covers a gateway frame the producer routes as `upstream_status`
+    with a NON-refusal status (408 / 429 / any 5xx — `isTerminalProviderStatus` refuses to call an
+    upstream's own 504 our request's fault, `src/transport/provider-timeouts.ts:418-419`), a
+    `decode`/`unknown`/absent code, and a body that closed without reporting a completion. Each of
+    those is a network death that raises this streak, so a merely truncated or merely
+    upstream-throttled endpoint can consume the FULL ceiling before the conversation rests — an
+    over-trigger accepted on purpose, because the failure this work was asked to fix was a network
+    death that counted as nothing and never resumed at all. An HTTP 4xx/5xx RESPONSE body, a
+    malformed frame and a schema throw carry no such class and still land on `api-error` /
+    `retries-exhausted`, which do NOT raise it.
+  - **The ceiling** is `Session.networkResumeLimit`, resolved once per session by
+    `networkResumeLimitOf` in one order: the per-provider `settings.networkResumeLimit`
+    (`RunnerSettings`, `src/server/harnesses/types.ts` — a PROVIDER field, because it bounds
+    what a flaky provider costs; validated in `mergeSettings`, so a bad value is a 400 naming
+    the field rather than a silent coercion into an off-by-default feature), else the
+    deployment runtime's `networkResumeLimit` (`HARNESS_PROVIDER_NETWORK_RESUME_LIMIT`, digits
+    only, 0–1000, refused at startup by `resolveNetworkResumeLimit` naming the variable, and
+    `0` = auto-recovery OFF — the honest spelling of "turn it off", not "resume once"), else
+    `DEFAULT_NETWORK_RESUME_LIMIT` = **10** (`src/server/config.ts`). A ceiling read back from a
+    hand-edited document outside that range is CLAMPED, not refused (a session the operator can
+    still run beats one that fails to load). Both numbers are reported READ-ONLY on the
+    snapshot pair — `SessionSnapshot.networkFailures` + `networkFailureLimit` and the same on
+    `SessionView` (`src/server/protocol.ts`), omitted while no conversation is in a streak — and
+    the per-conversation count rides on each roster row (`SessionThread.networkFailures` /
+    `SessionThreadView.networkFailures`, absent at 0), so a host can render "n/10" without
+    hard-coding the ceiling. Those are the SESSION DOCUMENTS (the store snapshot and the `/views`
+    surface): the bounded canonical read `GET /v1/harness/sessions/:id` answers a `SessionResource`
+    and carries NONE of them, so a REST-only client cannot see a streak and must not go looking for
+    one there (`src/server/api-reads.ts`). The shipped shell does not read these fields yet — they
+    exist for
+    the client that will. A `reset()` clears every streak with the conversation it ends, and
+    the abandoned-attempt evidence beside it; a host `…/resume` does NOT clear one — only an
+    answered run does.
+  - **Two runaway guards.** The durable streak is the primary bound; on top of it
+    `Session.autoResumeClaims` caps how many auto-resumes the store will START for ONE turn row
+    (in-memory by design — a restart is a fresh budget), and a disposed session, a store that is
+    shutting down, or one still restoring is refused outright, so a restart never spends
+    provider time by itself. A refusal here is deliberately silent: every one of them is a state
+    the store already states correctly, and the conversation keeps its `stopReason` plus its
+    streak, which is the honest explanation of why it is resting.
+  - **What did NOT change, said because the two features are easy to conflate:** the restart
+    policy is still **"mark interrupted, never replay"**. A turn that was running when the
+    process died comes back `error` with its recorded events intact and is NOT re-run
+    automatically, and a restored streak only COUNTS — `autoResumeAfterNetworkFailure` refuses
+    while the store is loading, so the auto-resume door is the terminal path of a LIVE run
+    (plus an explicit host `POST …/resume`), never the restore pass. The resumed attempt is
+    requeued IN PLACE, so the evidence of the attempt it abandons is preserved by the journal's
+    `rollback` line and the checkpoint's `turnRollbacks` map (see
+    [IO workers](#io-workers-ioexecution-worker)).
   The loader's permissive CORS means no request header is a boundary there — and the
   standalone `X-Harness-Client: ui` gate is gone as well (T15,
   `src/server/handler.ts:8-13`), so the header is an inert marker on both hosts.
@@ -5265,7 +5783,7 @@ table.
 | `POST /v1/harness/sessions/:id/tools/:toolId/executions` | Same body, executed through THIS session's registry (`SessionStore.callTool`, `src/server/api.ts:4605-4620`): a replaced preset, a created tool and a session-owned core tool all run what the session holds. `404` a name the session does not list, `409` a busy session, `403` a name whose execution scope is not manual. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `POST /api/tools/:name/call` alias |
 | `POST /v1/harness/models` | `{ settings? }` → `{ models, observed_at }` (the generated `ModelIndex`); server-side `listModels`. CORRECTED IN PLACE 2026-11-11: the old answer was the bare `{ models: string[] }`, and `observed_at` is now part of the contract (`src/server/models.test.ts:16-18`) |
 | `POST /v1/harness/sessions` | `{ harness, title?, settings?, messages? }` → `201 { session }`. The harness NAME is the only requirement (`src/server/api.ts:2979-2983`), and `messages` is the optional seeded transcript, validated BEFORE anything exists (`src/server/api.ts:2985-3012`). Session creation is its own operation, not a side effect of a first task: the id is the server's `randomUUID()` (`src/server/sessions.ts:2298`), the session's plugin-settings store is copied from the template at this moment (`:2268`), and the record is written before the answer — a failed write deletes the in-memory entry so a retry cannot observe a phantom (`:2358-2366`). A client holding a `201` may therefore `POST /sessions/:id/tasks` immediately with no retry loop, which is exactly what the UI's `+` relies on (`src/frontend/main.ts:6308` `ensureSession`) |
-| `GET /v1/harness/sessions`, `GET /v1/harness/sessions/:id` | BOUNDED reads, never a snapshot: the list is paged (`limit`/`cursor`, plus `status`/`harness` filters) and one session is its metadata + live `agent_models` + counters. CORRECTED IN PLACE 2026-11-11: this row used to promise "always including `turns` (with `eventTimes`) and the frozen `harnessDefinition`" — turns (`/turns`), threads (`/threads`), the queue (`/queue`), the frozen definition (`/definition`) and the display trees (`/turns/:turnId/display`) are each their own route, and no route assembles a session aggregate (`src/server/api.ts:22-23`). The old additive `invalidThreads` roster is not a session field on this contract either: an unreadable conversation is reported on the transcript read (`transcript_state: 'unreadable'` + `unreadable_reason`, `src/shared/harness-api.ts:2934,2950`) |
+| `GET /v1/harness/sessions`, `GET /v1/harness/sessions/:id` | BOUNDED reads, never a snapshot: the list is paged (`limit`/`cursor`, plus `status`/`harness` filters) and one session is its metadata + live `agent_models` + counters. CORRECTED IN PLACE 2026-11-11: this row used to promise "always including `turns` (with `eventTimes`) and the frozen `harnessDefinition`" — turns (`/turns`), threads (`/threads`), the queue (`/queue`), the frozen definition (`/definition`) and the display trees (`/turns/:turnId/display`) are each their own route, and no route assembles a session aggregate (`src/server/api.ts:22-23`). The old additive `invalidThreads` roster is not a session field on this contract either: an unreadable conversation is reported on the transcript read (`transcript_state: 'unreadable'` + `unreadable_reason`, `src/shared/harness-api.ts:2934,2950`). **F7 (2026-11-17) does add one session field: `inactive_thread_ids`** on the identified read (`SessionResource.inactive_thread_ids`, `src/shared/harness-api.ts`; emitted by `sessionResourceOf`, `src/server/api-reads.ts`) — the ids of this session's SOFT-DELETED conversations, ADDITIVE and ABSENT while it never deleted one, sorted by id so a repaint is byte-stable. WHY IT EXISTS: the roster (`GET /sessions/:id/threads`) HIDES those rows and so does the turns page — the right listing rule for a client that WATCHED the delete — but after a RELOAD the client never saw it, and "the roster stopped naming this id" is not evidence: it is indistinguishable from a conversation that never existed, which is exactly why the board painted a retired conversation's sections again. Widening the roster filter is the wrong remedy (it is the single place every roster comes from — `threadRoster` feeds `snapshot()`, `viewOf()` and `viewSummaryOf()`, and `threadRecordsOf` mirrors it for REST — and the gate several routes lean on), so the deletion fact travels BESIDE it and the roster keeps meaning exactly "the conversations this session can still run". The predicate is the one the turns page already hides with: `retiredThreadIdsOf` = the durable `Session.inactiveThreads` ledger UNION the `inactive: true` marks on the retained rows (both restored from the shard), and the in-process twins are `SessionSnapshot.inactiveThreads` / `SessionView.inactiveThreads` (`src/server/protocol.ts`, filled by `SessionStore.inactiveThreadIdsOf` from the same two sources — the WIDE answer, so a ledger that missed one hydration cannot under-report a deletion while the roster filter keeps its narrow one) |
 | `PATCH /v1/harness/sessions/:id` | `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key against the session's agents and every value as a model id (400 with nothing applied), rejects `{}` as a no-op, is allowed while the session is busy (no abort/rebuild), and leaves the frozen definition untouched. The current request keeps the model it started with; the next request uses the new one. CORRECTED IN PLACE 2026-11-11: the body field is `agent_models`, not `agentModels` |
 | `POST /v1/harness/sessions/:id/tasks` | `{ input, attachments?, references?, thread_id? }` → `202` **`TaskReceipt`** (`{ session_id, turn_id, status, thread_id, … }`, `src/shared/harness-api.ts:2280`) — a task receipt, never the mutated document. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); queued turns are durable with a database root and paused after a restart. An `input` starting with `/` is a **slash command**: `dispatch()` runs it in this process through `harness.executeCommand`, never calls the model, never enters a lane, and returns the ALREADY-TERMINAL turn (`status: 'done' \| 'error'`, events `start`/`tool_call`/`tool_result`, no `usage`); `attachments`/`references` are `400` and `thread_id` is accepted and ignored. A `thread_id` that is RUNNING steers instead of queueing. CORRECTED IN PLACE 2026-11-11: the old answer was `202 { session, turn }` and the field was camelCase `threadId` |
 | `GET /v1/harness/sessions/:id/threads/:threadId/transcript` | `{ transcript }` = the transcript's cheap HEAD: `transcript_state`, `message_count`, `chars`, `bytes`, `role_counts`, `revision` (plus `unreadable_reason`/`stored_type` when it could not be parsed) — NO content. The messages are the paged `…/transcript/messages` read and the editor's JSON document is `…/transcript/document` (`src/shared/harness-api.ts:2930-2956`, `src/server/api.ts:4899-4911`, messages `:4913-4959`, document `:4961-4985`). `404` unknown session/thread. CORRECTED IN PLACE 2026-11-11: this row described the retired `{ threadId, agent, messages, raw, invalid? }` document |
@@ -5700,13 +6218,84 @@ Retired SSE frames (history only — these routes answer `404` now):
     is ignored, so a retried/late frame cannot add a second card. The CLI mirrors
     the duration/pending/wake/done **lines** in `src/server/cli/render.ts`; card
     closure is a browser-only state.
+- **An interrupted run reports its OWN span, on THREE planes (T-W23/W24/W25, 2026-11-17).**
+  `settle` (`src/server/turn-projector.ts:3575`) is a FORCE-close: the turn ended over every row,
+  card and context-bar segment it still reaches, so each must now report only what its OWN frames
+  recorded. Before this pass all three carried the TURN's end stamp, and on the user's recorded run
+  one interrupted `delegate` call was simultaneously a `64m04s` context-bar segment, a `64m04s`
+  card, and a `3,844,6xx ms / done` ROW — the row claiming it had finished.
+  - **Rows** (`:3604-3632`) end at `record.lastStamp`, the stamp of the last frame ROUTED to that
+    row (`interruptedEndedAtOf`, `:804-812` — written by `apply` at `:3514` from frame stamps only,
+    never a wall-clock read), and state is `'cancelled'` where the turn settled `done`
+    (`interruptedStateOf`, `:794-795`). `'cancelled'` is an EXISTING vocabulary value
+    (`src/shared/turn-display.ts:195`), so the wire enum (`src/server/harness.swagger.yaml:8298`),
+    the client's terminal-state sets (`src/frontend/view-state.ts:907`, `:962-963`, `:975-976`) and
+    the detail's settled test (`src/frontend/view-detail.ts:261-263`) are all unchanged — nothing to
+    migrate on restore. The alternatives were rejected on the record: `'done'` is the
+    lie, `'error'` claims a failure the record does not hold (this projector stamps a section
+    `error` only beside a recorded `error` frame, `:3314`), and `'streaming'`/`'open'` would keep
+    the agent in the live "active agents" set after the turn closed
+    (`src/frontend/view-state.ts:963, :976`). A turn that settled `error`/`cancelled` maps its rows
+    exactly as before, so only
+    the CLAIM of success changed.
+  - **The root row is the one thing `settle` does NOT force-close** (`:3604-3613`): the turn's own
+    card never mints a terminal frame of its own, so the root's end and state ARE the turn's — the
+    same pair the turn tile prints off `TurnSummary.startedAt`/`updatedAt`
+    (`src/frontend/ui/turns.ts:9346-9355`). Truncating the root row would only make the section
+    disagree with the tile above it.
+  - **Cards** (`:3641-3666`) and the **context-bar segments** of those same calls (`:3668-3694`)
+    share ONE end computation (`abandonedEndedAtOf`, `:877-892`) so the two planes cannot drift. A
+    still-`running` card has been written by exactly ONE frame — the `tool_call`/`action_request`
+    that MINTED it, because the only later writer, `setStep`, has just the two settling call sites
+    (`tool_result` `:2941`, `action_answer` `:3380`) and both move the card out of `running` — so
+    its end is that mint stamp and its span lands on **0 ms**. That is the honest figure, not a
+    bug: an ABSENT `endedAt` makes the compiled card tick from `startedAt` to NOW
+    (`src/frontend/ui/turns.ts:8240-8246`), the same absurdity with a moving number. Reusing the
+    helper one plane down is sound because `segment.at === step.startedAt` for exactly these
+    segments (`:2806` writes `step.startedAt` at `:2831` and the segment's `at` at `:2857` from the
+    SAME stamp). What did NOT move: the card's STATE (`abandonedStateOf`, `:814` — `'error'` for a
+    call that failed to return, `'cancelled'` only when the turn itself settled `cancelled`), its
+    preview, and the segment's CONTENT (`chars`, `argsChars`, `included`, `eventTo`, which the
+    detail reads depend on). A segment whose call got its own `tool_result` never enters the loop.
+  - **Legacy records fold byte-identically on every plane**: a record with no `eventTimes` at all
+    (`DISPLAY_NO_TIMESTAMP`) keeps the settle stamp, and the recorded start is the FLOOR, because
+    `elapsedBetween` (`src/frontend/ui/time.ts:36`) returns `undefined` for a negative span — and
+    the context bar prints NO duration label when the span is `undefined`
+    (`contextBlockDurationOf`, `src/frontend/view-context.ts:338-346`, which prefers a measured
+    `durationMs` and falls back to `endedAt - at`).
+  - **Measured on the recorded run** (`Temp/orch-plan/{w23,w24,w25}/{before,after}.txt`): the three
+    interrupted delegated rows went from `3,844,6xx ms / done` (64m04s) to `185,9xx ms / cancelled`
+    (3m05s); the 5 abandoned cards from a widest `3,844,657 ms` to `0 ms`; and the context bar's
+    `totalDurationMs` from **23489076** (391m29s) to **4637688** (77m17s) — still inflated, because
+    the surviving spans are honest waits, not a projector bug. The root row is UNCHANGED at
+    **3,993,309 ms** (66m33s, `done`): it genuinely spans that wall time — pre-restart run, resumed
+    post-restart on the same row, then waiting on its own recorded pending work.
+  - **Pins:** `src/server/turn-projector-settle-interrupted.test.ts` (8 — the row plane, including
+    the `'0ms'` floor at `:461`), `src/server/turn-projector-abandoned-card.test.ts` (8 — the card
+    plane, with state/preview/detail asserted whole),
+    `src/server/turn-projector-abandoned-segment.test.ts` (10 — the segment plane and the shared
+    computation) and the shared pin `src/server/turn-projector.test.ts:1706`, whose `endedAt` was
+    MOVED on purpose from the settle stamp `5_000` to the call's own `1_010` — that move is the
+    segment rule, not a regression.
+  - **The line numbers above are the CURRENT tree's.** The in-file comments of
+    `src/server/turn-projector.ts` still cite the pre-W24 positions of these same sites —
+    `apply`'s `lastStamp` write at `:3436`, the settling `tool_result` at `:2863`, `action_answer`
+    at `:3302`, the section `error` patch at `:3235`, and the `'0ms'` pin at
+    `turn-projector-settle-interrupted.test.ts:459` — all of which have since moved to `:3514`,
+    `:2941`, `:3380`, `:3314` and `:461`. The rules those comments describe are unchanged; only the
+    anchors drifted, so do not "correct" this bullet back to the comment numbers.
 
 ### Persistent threads in the UI (T5 / R5-R7)
 
 Two identities exist and must never be conflated:
 
 - `HarnessThread` (`event.thread`, `AgentResultBlock.threadId`) = ONE invocation.
-  Its id changes on every run and it is what a `#` reference binds to.
+  Its id changes on every run and it is what a `#` reference binds to — and it is a
+  per-PROCESS id, unique only inside the process that minted it (a restarted harness starts
+  the counter again and a lane worker mints from its own), so a `#` handle names an
+  invocation in the harness that is answering, not one archived before a restart;
+  `event.thread.epoch` (T-W8) is the field that says WHICH process minted it. See
+  "HarnessEvent" for the identity contract.
 - `SessionTurn.threadId` and `SessionSnapshot.threads[]` = ONE persistent runtime
   conversation. Its id is stable for the thread's life, and repeated turns of it
   are the same conversation (one `RR2` badge in the transcript). R8: the id is opaque;
@@ -5716,6 +6305,65 @@ Two identities exist and must never be conflated:
   `SessionThread.label`, never minted per invocation. A host-thread ROOT frame has a
   metadata-only `thread` record (no parent/callId/kind/branch): it belongs to the
   tile's root block and must never render as an indented `T<n>` wrapper.
+
+**THE ROSTER ROW CARRIES AN IDENTITY TRIPLE (W22 + W26, 2026-11-17).** The two bullets above are
+why a conversation row needs a discriminator; this is what the HOST/UI roster row actually
+publishes — `invocation_id`, `invocation_ids` and `epoch`. It used to publish NONE of them: the
+row was id-free by the R1 compact-roster decision, and W22 published only the PROCESS, which left
+the token unpairable exactly where the join needs it.
+
+- **The wire shape** is `ThreadSummary` (`src/server/harness.swagger.yaml:7544-7595` → the
+  generated `src/shared/harness-api.ts:2793` `invocation_id`, `:2805` `invocation_ids`
+  (`maxItems: 64`), `:2821` `epoch`). All three are OPTIONAL and their values are **BARE** —
+  never `id\0epoch`. The store's persisted join is keyed by the RUN (`src/shared/run-identity.ts`),
+  and `invocationIdOfRunKey` strips the epoch at this boundary, so a client can post a reported id
+  straight back to the transcript routes and compose `id + U+0000 + epoch` itself if it wants the
+  run key; the composite never crosses the wire.
+- **The emit rule** (`threadRowOf`, `src/server/api-reads.ts:693-767`): `invocation_id` exactly
+  when the conversation's own record names a non-empty `thread.invocationId`; `invocation_ids`
+  exactly when that record-slot ∪ the store's `record.invocationThreads` join is non-empty;
+  `epoch` exactly when the record pairs an id with a non-empty epoch. A conversation that never
+  ran names NONE of the three (never `[]`, never an empty string), and a document whose runs
+  predate the epoch field gains the two id keys and stays epoch-free, so a legacy row projects
+  byte-identically. Key order is `invocation_id` → `invocation_ids` → `epoch`, after
+  `label`/`owner_thread_id` and before `transcript_state`.
+- **`invocation_ids` has TWO sources that are not interchangeable** (`rosterInvocationIdsOf`,
+  `src/server/api-reads.ts:788-801`): the durable join map first — its iteration order is
+  OBSERVATION order, so a card's original run precedes the continuations that advanced the
+  record's single slot — then the runtime record's own slot, appended only when the join does not
+  already name it, because a conversation can hold a run its durable join never names (a `reset()`
+  clears the map, and the scan that writes the join is one-sided when the record carries no epoch —
+  the residual `src/server/sessions.epoch-discrimination.test.ts` D2 pins). Deduped by BARE id (one
+  conversation that ran in two processes can hold the same id once under each epoch), capped at
+  `MAX_ROSTER_INVOCATIONS` = **64** (`src/server/api-reads.ts:865`), keeping the OLDEST 64 — so on
+  a conversation with more recorded work the NEWEST ids are the ones missing, which is precisely
+  why the latest id rides separately in `invocation_id`.
+- **A `thread.upsert` frame carries the same keys**, because the live row is the SAME producer
+  (`threadRowForStream` → `threadRowOf`, `src/server/api.ts:1306-1316`, called at `:1505` and
+  published as `payload.thread` at `:1511-1515`; `WsUpdateThreadUpsert.thread: ThreadSummary`,
+  `src/shared/harness-stream.ts:766`). A live repaint and a reload therefore cannot disagree about
+  which run a row names.
+- **The model plane and the host plane now differ DELIBERATELY.** The model-facing `threadList`
+  page still strips the epoch (`modelThreadRosterOf`, `src/harness.ts:6169-6178`) — its schema has
+  no epoch parameter, so the model could never send the token back and its contract stays
+  byte-identical. The host/UI planes declare the pair: `SessionThread.epoch`
+  (`src/server/protocol.ts:610`), `SessionThreadView.epoch` (`:719`, the compact row the browser
+  renders) and `ThreadSummary.epoch`, and the browser's render model renames it at the boundary
+  (`ThreadRow.epoch`, `src/frontend/view-model.ts:81`, mapped by `src/frontend/view-api.ts:295`).
+- **What it is for** is the invocation → conversation join in `src/frontend/ui/thread-transcript.ts`
+  (`attributedThreadOf`, `:450-491`), and ONLY when the bare id is CONTESTED (two roster rows claim
+  it) and the frame names a process — otherwise the roster's answer stands, which is what keeps a
+  legacy document resolving exactly as before. Door 1 (`recordedRuns`, `:357-378`) rebuilds
+  `invocationRunKeyOf(id, epoch)` from the two bare wire fields and takes the row that recorded
+  exactly that pair — a recorded fact, not an inference. Door 2 (`:466-490`) unions the process
+  evidence the document offers (the W19 fingerprint plus the row's own `epoch` via `rowEpochs`) and
+  takes a single candidate; two candidates naming ONE process is a genuine ambiguity, and the join
+  refuses to guess between them. `threadEpochOf` (`:226-230`) is the single reader of the row's
+  token.
+  Tests: `src/server/sessions.epoch-discrimination.test.ts` (D1–D6: the store's join AND the wire
+  page across a restart), `src/frontend/ui/thread-transcript-run-join.test.ts` (F1–F7: the browser
+  join, including the export plane) and
+  `src/server/api-thread-roster-invocation-ids.test.ts` (the row shape over HTTP).
 
 `src/frontend/ui/threads.ts` owns the decisions; `main.ts` owns the POSTs and the
 DOM. The contract it is written against is optional/additive, so a server that does
@@ -5915,7 +6563,22 @@ conversation, in its head exchange, stable while other entries are pressed, targ
 conversation's thread; no second bar for a delegated card or a continuation routed inside
 one; the child's own bar when the CHILD is the focused surface), and
 `ui/turns-navigation.test.ts` (T4/R1 with R3a/R3c: which press reveals which entry, and
-which re-render is silent).
+which re-render is silent), and the ROSTER IDENTITY triple above —
+`src/server/sessions.epoch-discrimination.test.ts` (D1–D6: the store's invocation join across a
+restart — a dead generation cannot claim the live run's join (D1), the documented epoch-less
+residual (D2), a wholly epoch-less document unchanged (D3) — plus its WIRE halves: `epoch` beside
+`invocation_id` in both generations (D4), no `epoch` key for an epoch-less record while its live
+successor emits one (D5), and an epoch-less document naming its runs with bare ids and no `epoch`
+anywhere (D6)),
+`src/server/api-thread-roster-invocation-ids.test.ts` (the `ThreadSummary` row shape over HTTP, five
+shapes: W26-1 a conversation that RAN — exact key order, both ids bare, `epoch` only beside
+`invocation_id`; W26-2 one that NEVER RAN — no identity block at all, byte-identical to the old row;
+W26-3 a SOFT-DELETED conversation — hidden from the page, identity kept on the projected read;
+W26-4 the LEGACY document — the two id keys arrive and the `epoch` key stays absent; W26-5 the
+JOIN-CLEARED document — the row still names the run its own record carries), and
+`ui/thread-transcript-run-join.test.ts` (F1–F7: the browser's invocation → conversation join — a
+recycled id split along each frame's epoch, the legacy door, the no-guess rule, the descendant
+chain, the W22 pair, the both-claimants-name-one-process decline, and the export/roster-PAGE plane).
 
 - **One action bar per conversation SURFACE, anchored at its top (T4/R2).** The bar
   belongs to the CONVERSATION, not to the expanded entry: `ui/turns.ts`
@@ -6090,6 +6753,13 @@ The three load-bearing decisions:
   carries the digest it read, and a terminal invocation
   carries an authority-leased identity — a collision is a REFUSAL naming the
   canonical value, never an overwrite.
+- **A lane's run frames carry the LANE's epoch (T-W8).** `HARNESS_PROCESS_EPOCH` is minted
+  per PROCESS, and a lane is a real `node:worker_threads` worker with its own module registry
+  (`lane-host.ts`), so the ids a lane mints are stamped with the LANE's epoch even when
+  `reserveIdentity` has leased it a range: the lease stops two replicas minting the SAME
+  identity for different work, and the epoch says which process actually wrote the frame — a
+  fold reading one recorded stream needs the second fact, and it cannot be inferred from the
+  id, because `reserveIdentity` only ever RAISES a leased counter and never mints an identity.
 - **The authority intercepts the replica's own `harness.runtime` object** (the same
   reference `src/harness.ts` builds at ~2415 and the core tool sources call), not the
   `harness.runtime` property. That is what makes the interception total: harness
@@ -6320,6 +6990,60 @@ Invariants, in priority order:
   `:1288-1292`) — one oversized conversation
   stops being cloned without freezing the other sessions' writes
   (`io-client.ts:44-49`).
+- **ABANDONED-ATTEMPT EVIDENCE SURVIVES A RESUME — AND THE NEXT COMPACTION (F4, 2026-11-17).**
+  A resume re-runs a turn IN PLACE: `requeueTurnInPlace` splices every event after the last
+  `attempt_commit` out of the turn record and then compacts the log. Both halves were correct
+  about the resumed row and both were destroying the evidence — the abandoned attempt's streamed
+  steps AND its terminal `error` frame left the record and the file in the same instant, which
+  is why a `provider-timeout` could appear ZERO times in an `events.jsonl` whose run died of
+  exactly that. It now writes the evidence BEFORE the truncation, in two copies that are
+  deliberately different sizes: `recordRollback` appends ONE journal `rollback` line holding the
+  FULL dropped tail in order (each entry keyed by the index it held in the abandoned attempt,
+  plus the `boundary` — the index of the last kept `attempt_commit`, or `-1` when the attempt
+  committed nothing — and the `reason`, read out of the tail's own `error` frame before it
+  leaves), and it keeps a BOUNDED summary in the session shard (`Session.rollbacks` → the
+  additive `HarnessSessionRecord.turnRollbacks` → `SessionSnapshot.turnRollbacks` /
+  `SessionView.turnRollbacks`): boundary, count, reason capped at `ROLLBACK_REASON_LIMIT`
+  (240 chars, because a shard is re-read on every restore) and the dropped `error` frames
+  verbatim — the last `TURN_ROLLBACK_LIMIT` of them, since every other frame survives there only
+  as the `droppedEvents` count. Caps: `JOURNAL_ROLLBACK_LIMIT` = 64 journal lines per session and
+  `TURN_ROLLBACK_LIMIT` = 10 records per turn, and in both cases the OLDEST evidence goes first —
+  the newest abandoned attempt is the one an operator debugs. A refused append is NOTED, never
+  thrown: a resume is the user's
+  recovery action and must not fail because the evidence copy could not be written, and
+  `undoRollback` reverses both copies when the persist that follows fails.
+  - **`compactJournal` no longer writes only the turn being re-run.** The old rewrite took a
+    `turnIds` filter and silently dropped every OTHER conversation's event lines (they survived
+    only in the shard, so a journal rebuild could no longer see them), and it ran BEFORE the
+    in-memory rollback while the recorder had already written the abandoned attempt's frames
+    into the live row — so it re-published the very tail it meant to remove. It now emits the
+    live event records of EVERY turn of EVERY conversation plus one `rollback` line per
+    registered abandonment (`session.journalRollbacks`), and `HarnessJournal.read` returns the
+    rollback lines on their own channel (`JournalReadResult.rollbacks`) that
+    `mergeJournal` loads only to keep them durable — folding them would resurrect a step whose
+    indices belong to an attempt that no longer exists.
+  - **The header's `createdAt` survives a compaction.** `rewrite` used to stamp
+    `Date.now()`, so the one file whose whole purpose is being the durable per-step record of a
+    session claimed to have been BORN the moment its first resume compacted it. `open` now
+    captures the original value from the first 4 KiB of the file (a bounded read, because a real
+    journal is megabytes of token deltas and a stamp must not pay a full read) and `rewrite`
+    re-emits it; a log whose header cannot be read honestly means "now". The value is exposed as
+    `HarnessJournal.createdAt`.
+  - **Why the worker mode needs the shard copy.** `rewrite`'s payload widened from
+    `JournalEventRecord[]` to `JournalRewriteRecord[]`, and each record keeps its OWN `type` —
+    the old writer forced `'event'` on every line, which would have rewritten a rollback line
+    into a bogus step. The discriminator is `=== 'rollback'`, NOT `=== 'event'`, because the IO
+    worker's `journal.rewrite` frame carries `IoJournalRewriteRecord`s WITHOUT the `type`/`v`
+    stamps (the writer adds them), and an event-test would send every worker compaction down the
+    rollback arm — 0 events back from `read()`. The coordinator's rewrite channel still carries
+    EVENT records only, so in `ioExecution: 'worker'` the shard summary is the ONLY copy that
+    mode gets (`recordRollback`'s append is inline-only — the coordinator holds no journal handle
+    for a session the client owns), and the rewrite the worker performs republishes every live
+    event record and no rollback line. Inline mode has both copies: the coordinator owns the
+    append handle, and `compactJournal` hands it the live events plus
+    `session.journalRollbacks` in one call — which is also why that in-memory list exists at all,
+    since `read` returns the lines the file holds and `mergeJournal` re-arms the list from them
+    (`slice(-JOURNAL_ROLLBACK_LIMIT)`) so a restart does not let the next rewrite forget them.
 
 `SessionStore` opens the client in its constructor when the resolved runtime says
 `ioExecution: 'worker'` (or when a host injects `options.io`), and the strict path is

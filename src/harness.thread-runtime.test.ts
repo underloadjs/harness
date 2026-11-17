@@ -82,6 +82,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
+// W19 (2026-11-17): a roster record's process epoch is written in the same statement as its
+// `invocationId` (../harness.ts `markThreadEpoch`, the pairing pinned in
+// ./harness-thread-epoch-authority.test.ts), so every record pin below that names an invocation id
+// names the generation that minted it too. It is the imported constant, never a literal: the token is
+// random per process, and one per test file.
+import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
 import type {
     Agent,
     Harness,
@@ -679,7 +685,8 @@ describe('steering (R5)', () => {
             origin: 'agent',
             status: 'running',
             sequence: 1,
-            invocationId: '1'
+            invocationId: '1',
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         expect(writer.steerThread('agent:writer', 'focus root')).toEqual({
@@ -1075,7 +1082,8 @@ describe('host-parent delegation (R4)', () => {
                 origin: 'host',
                 status: 'idle',
                 sequence: 3,
-                invocationId: '1'
+                invocationId: '1',
+                epoch: HARNESS_PROCESS_EPOCH
             },
             {
                 id: 'thread-2',
@@ -1084,7 +1092,8 @@ describe('host-parent delegation (R4)', () => {
                 status: 'idle',
                 sequence: 4,
                 ownerThreadId: 'thread-1',
-                invocationId: '2'
+                invocationId: '2',
+                epoch: HARNESS_PROCESS_EPOCH
             }
         ]);
         expect(textOf(writer.threadMessages('thread-2'))).toEqual(['child one', 'one facts']);
@@ -1100,7 +1109,8 @@ describe('host-parent delegation (R4)', () => {
             status: 'idle',
             sequence: 4,
             ownerThreadId: 'thread-1',
-            invocationId: '3'
+            invocationId: '3',
+            epoch: HARNESS_PROCESS_EPOCH
         });
         expect(textOf(writer.threadMessages('thread-2'))).toEqual([
             'child one',
@@ -1176,7 +1186,8 @@ describe('host-parent delegation (R4)', () => {
             status: 'idle',
             sequence: 4,
             ownerThreadId: 'thread-1',
-            invocationId: '3'
+            invocationId: '3',
+            epoch: HARNESS_PROCESS_EPOCH
         });
         expect(textOf(restored.threadMessages('thread-2'))).toEqual([
             'child one',
@@ -1193,7 +1204,8 @@ describe('host-parent delegation (R4)', () => {
             status: 'idle',
             sequence: 4,
             ownerThreadId: 'thread-1',
-            invocationId: '6'
+            invocationId: '6',
+            epoch: HARNESS_PROCESS_EPOCH
         });
         expect(textOf(restored.threadMessages('thread-2'))).toEqual([
             'child one',
@@ -1626,7 +1638,8 @@ describe('cross-thread chat and delegation links (R4)', () => {
             status: 'idle',
             sequence: 2,
             ownerThreadId: 'agent:lead',
-            invocationId: '2'
+            invocationId: '2',
+            epoch: HARNESS_PROCESS_EPOCH
         });
         expect(writer.thread('agent:lead')?.invocationId).toBe('1');
 
@@ -1792,6 +1805,7 @@ describe('delete release and snapshot durability', () => {
                 sequence: 2,
                 label: 'kept',
                 invocationId: '1',
+                epoch: HARNESS_PROCESS_EPOCH,
                 messages: [
                     { role: 'user', content: 'remember this' },
                     { role: 'assistant', content: 'stored' }
@@ -1816,7 +1830,8 @@ describe('delete release and snapshot durability', () => {
             status: 'idle',
             sequence: 2,
             label: 'kept',
-            invocationId: '1'
+            invocationId: '1',
+            epoch: HARNESS_PROCESS_EPOCH
         });
         expect(withoutIds(target.threadMessages('thread-1'))).toEqual([
             { role: 'user', content: 'remember this' },
@@ -2678,7 +2693,8 @@ describe('a stopped thread is revived by a host only (policy 2026-11-09 T6)', ()
             status: 'idle',
             sequence: 2,
             label: 'Cut short',
-            invocationId: '3'
+            invocationId: '3',
+            epoch: HARNESS_PROCESS_EPOCH
         });
         expect(withoutIds(writer.threadMessages(interrupted.id))).toEqual([
             { role: 'user', content: 'work in hand' },
@@ -2704,6 +2720,7 @@ describe('a stopped thread is revived by a host only (policy 2026-11-09 T6)', ()
             sequence: 3,
             label: 'Host stopped',
             invocationId: '2',
+            epoch: HARNESS_PROCESS_EPOCH,
             stopReason: 'user-stopped'
         });
         expect(withoutIds(writer.threadMessages(halted.id))).toEqual([
@@ -3032,7 +3049,8 @@ describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
             origin: 'host',
             status: 'stopped',
             sequence: 3,
-            invocationId: '1'
+            invocationId: '1',
+            epoch: HARNESS_PROCESS_EPOCH
         });
         expect(withoutIds(writer.threadMessages(beta.id))).toEqual([
             { role: 'user', content: 'beta work' },

@@ -225,7 +225,11 @@ import { describeHarness } from './harnesses/descriptor';
 // added at runtime and a member a restart rebuilds cannot disagree about the prompt, the
 // model, or the provider transport. `effectiveAgentProfile`/`agentInstruction` are the two
 // halves of clearing an override back to the deployment's current text.
-import { agentConfigurationForCustom, agentConfigurationFromProfile, customAgentInstruction } from './harnesses/toolbox';
+import {
+    agentConfigurationForCustom,
+    agentConfigurationFromProfile,
+    customAgentInstruction
+} from './harnesses/toolbox';
 import { effectiveAgentProfile } from './harnesses/agent-state';
 import { agentInstruction, isAgentProfileName } from '../agents';
 import {
@@ -237,7 +241,11 @@ import {
     presetToRecord
 } from './harnesses/registry';
 import type { HarnessRegistry } from './harnesses/registry';
-import { mergeSettings } from './config';
+// R19/Part C: `resolveNetworkResumeLimit` is NOT imported here. The store reads the ceiling from
+// the resolved runtime configuration (`DEFAULT_RUNTIME_CONFIGURATION` / `RunnerSettings`), and the
+// parser itself is exercised where it is owned — ./config.test.ts pins its literal default and its
+// env grammar, and ./network-resume.test.ts pins the precedence through the store.
+import { DEFAULT_NETWORK_RESUME_LIMIT, mergeSettings, NETWORK_RESUME_LIMIT_MAX } from './config';
 import type { ServerRuntimeConfiguration } from './config';
 import { DEFAULT_RUNTIME_CONFIGURATION } from './config';
 // T5 (R1): lane-worker execution. Imported through the subsystem barrel so the session layer
@@ -263,7 +271,13 @@ import { openHarnessIoClient } from './workers';
 import type { HarnessIoClient, IoCloseSummary } from './workers';
 import { HarnessPersistenceError } from './persistence';
 import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persistence';
-import type { HarnessDatabase, HarnessGlobalSettingsRecord, HarnessInvalidThreadRecord, HarnessPersistence, HarnessSessionRecord } from './persistence';
+import type {
+    HarnessDatabase,
+    HarnessGlobalSettingsRecord,
+    HarnessInvalidThreadRecord,
+    HarnessPersistence,
+    HarnessSessionRecord
+} from './persistence';
 // T5 (R2/R3): the runtime-level plugin settings store. The store OWNS it (one per SessionStore,
 // hence one per HarnessRuntime / standalone listener) because it is durable registry-adjacent
 // state written through the same document-header commit (`index.json`, ./persistence.ts:2329)
@@ -278,6 +292,7 @@ import type {
     HarnessUsage,
     SessionInvalidThread,
     SessionPluginDiagnostic,
+    SessionRollbackRecord,
     SessionSnapshot,
     SessionStatus,
     SessionStreamItem,
@@ -296,7 +311,18 @@ import type {
 // T1.5's last mile: the shared cap on one session's plugin-diagnostic journal. Imported as a
 // VALUE because `notePluginDiagnostic` trims the journal with it, and ./persistence.ts honours
 // the same bound when it restores one (the constant lives in ./protocol.ts for that reason).
-import { PLUGIN_DIAGNOSTIC_LIMIT } from './protocol';
+//
+// R19 (2026-11-17): the same file owns the INVOCATION RUN KEY rule, because the roster's
+// `invocationIds` wire shape (bare ids) and the store's join keys are the two ends of one
+// contract. `invocationRunKeyOf` is what `noteInvocationThread` writes with, and
+// `invocationIdOfRunKey` is what strips a run key back to the id a client can join.
+import { invocationIdOfRunKey, invocationRunKeyOf, PLUGIN_DIAGNOSTIC_LIMIT } from './protocol';
+// W19 (2026-11-17): the same-leaf helper `invocationRunKeyOf` came from. `noteInvocationThread` needs
+// `isRunEpochMismatch` — the one-sided rule that decides whether a runtime record's slot belongs to the
+// run being joined (V5 defect 2), and the reason an epoch-less record still binds instead of losing its
+// join. `./protocol.ts` re-exports the key builders; this one is used server-internally only, so it is
+// imported from its leaf rather than widening the published wire surface.
+import { isRunEpochMismatch } from '../shared/run-identity';
 // R1/R3/R4: the compiled display surface. The fold is SERVER-only (the browser
 // imports the types from ../shared/turn-display.ts and never this runtime), and the
 // journal is the per-step durable log the compiled memory is rebuilt from.
@@ -309,8 +335,10 @@ import type {
     TurnProjector
 } from '../shared/turn-display';
 import { createTurnProjector, refoldTurn, steerBlockKeyOf, steerBlockKeysOf, steerSubmitList } from './turn-projector';
-import { HarnessJournal } from './journal';
-import type { JournalEventRecord, JournalProblem } from './journal';
+import { HARNESS_JOURNAL_VERSION, HarnessJournal } from './journal';
+// Part C: `JournalRewriteRecord` is not imported here any more — the session layer never reads a
+// journal rewrite record, and the name is the journal's own business (./journal.ts).
+import type { JournalEventRecord, JournalProblem, JournalRollbackEntry, JournalRollbackRecord } from './journal';
 
 const MAX_INPUT_LENGTH = 200_000;
 
@@ -370,8 +398,7 @@ const ACTION_CANCELLED_MESSAGE =
     'The action request was cancelled before the owner answered. Ask again only if the question is still required.';
 const ACTION_RUN_ENDED_MESSAGE =
     'The run ended before the action request was answered. Ask again if the question is still required.';
-const ACTION_SESSION_GONE_MESSAGE =
-    'The session was removed before the action request was answered.';
+const ACTION_SESSION_GONE_MESSAGE = 'The session was removed before the action request was answered.';
 const ACTION_DUPLICATE_MESSAGE = 'An action request with this requestId is already pending.';
 
 // The release text of a reference park that THIS turn's stop interrupted (Fix 1).
@@ -393,7 +420,10 @@ const DELETION_ABORT_SETTLE_MS = 2_000;
  * guess: cancel wording is `cancelled`, a run that finished without an answer is `ended`, and
  * everything else (a removed session, a stale promise) is `expired`.
  */
-const actionClosedReason = (outcome: { ok: boolean; error?: unknown }): 'answered' | 'expired' | 'cancelled' | 'ended' => {
+const actionClosedReason = (outcome: {
+    ok: boolean;
+    error?: unknown;
+}): 'answered' | 'expired' | 'cancelled' | 'ended' => {
     if (outcome.ok) return 'answered';
 
     const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error ?? '');
@@ -436,9 +466,7 @@ type PendingAction = {
 };
 
 // What settles one pending action: either an accepted choice or a rejection.
-type HarnessActionOutcome =
-    | { ok: true; choice: HarnessActionChoice }
-    | { ok: false; error: Error };
+type HarnessActionOutcome = { ok: true; choice: HarnessActionChoice } | { ok: false; error: Error };
 
 type Emit = (item: SessionStreamItem) => void | Promise<void>;
 
@@ -658,6 +686,58 @@ export type Session = {
     // conversation name raises `labelHighWater` (so it can never be re-minted as a
     // block label). Allocation reads the HIGHEST of both.
     threadLabelHighWater: Map<string, number>;
+    // F1 (2026-11-17): consecutive NETWORK-CLASS run failures per conversation, keyed by
+    // thread id. Raised when a turn settles `error` on a network-class stop reason and cleared
+    // by a turn that settles `done`; while it is below `networkResumeLimit` the store
+    // auto-resumes the conversation (see the rule at the top of this file, next to
+    // `INTERRUPTED_MESSAGE`). Entries are pruned at 0, so an empty map is the common case and
+    // the durable field stays absent.
+    //
+    // DURABLE (./persistence.ts `HarnessSessionRecord.networkFailures`): the whole point is
+    // that a provider still down across a restart does not buy the conversation a fresh set of
+    // resumes. Read-only for a host — it is projected onto the snapshot, never accepted.
+    //
+    // ITS KEYS ARE CONVERSATION-LIFETIME (T-W14): a deletion retires the entry with the
+    // conversation (`markDeletedThread`), a revival re-arms it at 0 (`reactivateThreadRow`), a reset
+    // clears the map, and a restore drops every entry the document still carries for a conversation
+    // it names no more or marks retired (`pruneRestoredNetworkStreaks`). Without those, the map is
+    // write-mostly: it keeps an id forever after the conversation is gone, and a revived conversation
+    // inherits the number its retired life left behind.
+    networkFailures: Map<string, number>;
+    // F1: the ceiling THIS session enforces, resolved once at creation/restore:
+    // the per-provider `settings.networkResumeLimit`, else the deployment runtime's
+    // `networkResumeLimit` (`HARNESS_PROVIDER_NETWORK_RESUME_LIMIT`), else
+    // `DEFAULT_NETWORK_RESUME_LIMIT`. Stored rather than derived per read because all three
+    // inputs are fixed for a session's life, and every surface (the streak rule, the snapshot,
+    // the REST resource) must state the SAME number.
+    networkResumeLimit: number;
+    // F1: the live runaway guard — auto-resumes STARTED for one turn row, keyed by turn id.
+    // Never persisted (a restart is a fresh budget) and never consulted for anything but the
+    // guard; see the note above `JOURNAL_ROLLBACK_LIMIT`.
+    autoResumeClaims: Map<string, number>;
+    // F1: conversations whose stop reason was read off the RESTORED document rather than
+    // written by a run in this process. This is what bounds the legacy `api-error` acceptance:
+    // only a stale row qualifies, and only while the streak is 0 (one shot per conversation).
+    // In-memory by design — a restart re-arms the one shot, and a live run of this build
+    // removes the entry permanently by rewriting the record's reason.
+    legacyNetworkReasons: Set<string>;
+    // F4 (2026-11-17): the ROLLBACK lines this session's journal holds, kept in memory so a
+    // compaction can re-emit them (`compactJournal` rewrites the whole file, and a rewrite
+    // that dropped the evidence lines would delete an abandoned attempt a second time). Loaded
+    // from the file at restore (`mergeJournal`) and appended in the file's own order.
+    //
+    // Inline only: in `ioExecution: 'worker'` the coordinator holds no journal handle and the
+    // rewrite frame carries event records alone, so the durable copy there is
+    // `Session.rollbacks` below.
+    journalRollbacks: JournalRollbackRecord[];
+    // F4: the checkpoint-side copy of every abandoned attempt, keyed by turn id (bounded by
+    // `TURN_ROLLBACK_LIMIT` per turn). This is the copy that makes "what did the rolled-back
+    // attempt die of" answerable after the resume removed its events from `turns[].events`,
+    // and the only one that survives a worker-mode compaction.
+    //
+    // DURABLE (./persistence.ts `HarnessSessionRecord.turnRollbacks`); projected read-only
+    // onto `SessionSnapshot.turnRollbacks` / `SessionView.turnRollbacks`.
+    rollbacks: Map<string, SessionRollbackRecord[]>;
     // Invocation id recorded by each THREAD turn's root run, keyed by turn id. The
     // roster exposes it as originInvocationId and it survives a restart.
     turnInvocations: Map<string, string>;
@@ -671,10 +751,27 @@ export type Session = {
     // then emits NO system segment rather than guessing one from today's catalogue.
     turnInstructionSources: Map<string, TurnInstructionSource[]>;
     // F6: every invocation observed in a persistent conversation, mapped to that
-    // thread (invocation id → persistent thread id). A child conversation can run
-    // many times; the runtime record keeps only the LATEST invocation id, so this
-    // map is what lets deletion purge EVERY persisted agent-result record the
-    // runtime removes. Persisted, because a restart must still purge correctly.
+    // thread. A child conversation can run many times; the runtime record keeps only
+    // the LATEST invocation id, so this map is what lets deletion purge EVERY persisted
+    // agent-result record the runtime removes. Persisted, because a restart must still
+    // purge correctly.
+    //
+    // R19 (2026-11-17): THE KEY IS AN INVOCATION RUN, NOT AN ID — `id + "\0" + epoch` when the
+    // `start` frame names the process that minted the id, the BARE id when it does not
+    // (./protocol.ts `invocationRunKeyOf`, mirroring the client fold's `runKeyOf`,
+    // ../frontend/ui/turns.ts:1649). WHY: `id` comes from a per-process counter (../harness.ts
+    // `runSequence`:8268, raised — never reset — at restore:8153 and by `reserveIdentity`:8235),
+    // so a restarted harness mints `15` again for a DIFFERENT conversation and first-write-wins
+    // on a bare-id key silently binds the new run to the old conversation. Measured in the
+    // operator's own document: `invocationThreads["15"] = "thread-14"` (a pre-restart delegated
+    // child) kept naming the post-restart MAIN conversation, which is how one conversation's name
+    // (`IT4`) ended up printed on another conversation's row.
+    //
+    // READERS MUST FALL BACK TO THE BARE ID (see `invocationThreadOf` / `liveThreadLabel` /
+    // ./turn-projector.ts `conversationLabelOf`): every key rule degrades to the bare id, so a
+    // document written before this change — no epoch anywhere — resolves byte-identically to
+    // today. Nothing migrates, and the persisted `Record<string,string>` shape is unchanged
+    // (./persistence.ts `readStringMap` accepts a NUL inside a key).
     invocationThreads: Map<string, string>;
     // C4: conversations whose stored transcript could NOT be read, keyed by thread
     // id. Populated by tolerant restore (one broken thread cannot drop a whole
@@ -905,6 +1002,95 @@ export type SessionStoreOptions = {
 const INTERRUPTED_MESSAGE =
     'The previous run was interrupted by a server restart; it was not replayed. Review the recorded events before continuing.';
 
+// ---------------------------------------------------------------------------
+// F1 (2026-11-17): AUTO-RECOVERY OF A NETWORK-DROPED THREAD
+// ---------------------------------------------------------------------------
+//
+// THE RULE, stated exactly (the store is the only place that decides it):
+//
+//   A persistent conversation's consecutive NETWORK-CLASS failure streak is raised when
+//   the turn that owns its run settles `error` AND the conversation's runtime record
+//   carries a network-class stop reason, and cleared by the next turn that settles `done`.
+//   When the streak is RAISED and is still STRICTLY BELOW the session's ceiling
+//   (`Session.networkResumeLimit`, default `DEFAULT_NETWORK_RESUME_LIMIT` = 10), the store
+//   calls its OWN resume path (`resumeThread`, the same one `POST
+//   .../threads/:threadId/resume` serves) for that conversation. At the ceiling it does
+//   not resume: the thread rests with its recorded stop reason and only a host action
+//   resumes it.
+//
+// HOW LONG ONE CONVERSATION'S NUMBER MAY LIVE (T-W14): the streak belongs to a conversation's
+// life, so it ends with that life. The DELETION of a conversation clears its entry (the soft
+// delete is a retirement), a REVIVAL of the same id (a submit on the retained row —
+// `reactivateThreadRow`) starts the number again at 0, and a session RESET clears the map. A
+// restore therefore drops every restored entry whose conversation the document no longer names
+// or records as retired, which is what keeps the durable map bounded across a session's life.
+// None of this moves the rule above: it decides how long a number is retained, never when it
+// rises, what it unlocks, or where the ceiling sits.
+//
+// WHAT IS NETWORK-CLASS (Contract D, producer side in ../types + src/harness.ts):
+//   - `'provider-network'` — a network/provider-transit failure. Always counts.
+//   - `'retries-exhausted'` — a NON-network exhausted ladder. Never counts.
+//   - `'api-error'` — a genuine non-network failure, so by itself it NEVER counts, EXCEPT
+//     for the legacy acceptance below.
+//   - Anything else (`timeout`? no — see the note) is not network-class.
+//
+// THE LEGACY ACCEPTANCE, and why it cannot re-trigger forever: records written BEFORE this
+// build can only say `api-error` for a provider that dropped the connection, so a stale
+// record must not strand the conversation the fix exists to heal. The store therefore
+// accepts `api-error` as network-class ONLY when BOTH hold:
+//   (a) the reason is on a conversation row that was RESTORED FROM DISK in this process
+//       (`Session.legacyNetworkReasons`, seeded at restore from the rows the document
+//       carried) — i.e. this build did not write that reason; AND
+//   (b) the conversation's streak is still 0, so the stale row buys AT MOST ONE auto-resume
+//       per conversation, ever per process.
+// The moment a run in THIS build terminalizes the conversation, its record carries the new
+// vocabulary and (a) is gone for good: from then on `api-error` means exactly what Contract
+// D says it means and never resumes anything.
+//
+// WHY `timeout` IS NOT NETWORK-CLASS: the stop reason `timeout` is "the run outlived the
+// wall-clock bound its HOST set for it" (../types `HarnessRunStopReason`), which is an
+// operator policy being enforced, not a connection dying. A provider bound that is missed
+// arrives as a provider failure class and reaches this rule as `provider-network`.
+//
+// WHY THE COUNTER LIVES IN THE SESSION RECORD: a provider that is down across a restart
+// must not buy the conversation a fresh set of ten resumes just because the streak was in
+// memory (./persistence.ts `HarnessSessionRecord.networkFailures`).
+//
+// The reason string itself is read through a widened type on purpose: `'provider-network'`
+// is being ADDED to `HarnessRunStopReason` by a parallel task, and this file must compile
+// against the name without owning the union.
+const PROVIDER_NETWORK_STOP_REASON = 'provider-network';
+// The two spellings the union already has that this rule must treat differently.
+const API_ERROR_STOP_REASON = 'api-error';
+
+// F1: the runaway guard. The durable streak is the primary bound (it rises on every failed
+// attempt, auto-resumed or not), but a row can be re-run while the streak is being reset by
+// a sibling success, so a turn also carries a live cap on how many auto-resumes the store
+// will START for that one row. It equals the ceiling, so no turn can ever loop more than the
+// operator's number, whatever else moves underneath it. In-memory by design: a restart is a
+// fresh budget, and the durable streak still decides at the session layer.
+//
+// F4: how many journal `rollback` lines one session keeps (see `Session.journalRollbacks`).
+// Bounded because the auto-recovery loop can abandon up to `ceiling` attempts per streak, and
+// the evidence a compaction re-emits must not grow the log without limit; the OLDEST lines go
+// first, since the most recent abandonment is the one an operator debugs.
+const JOURNAL_ROLLBACK_LIMIT = 64;
+
+// F4: how many abandoned-attempt records one turn keeps in the checkpoint copy
+// (`Session.rollbacks`). Same reasoning, one level down: a turn's own history of failed
+// attempts is bounded by the resume ceiling, and anything past that is older than the story.
+const TURN_ROLLBACK_LIMIT = 10;
+
+// F4: the reason recorded for an abandoned attempt when the caller has no failure text
+// (a host-initiated resume of a stopped run, whose cause is the stop reason rather than an
+// error message).
+const ROLLBACK_REASON_RESUMED = 'The attempt was rolled back so this turn could be re-run in place.';
+
+// F4: how long one abandoned-attempt reason may run in the CHECKPOINT copy. The journal line
+// carries the reason in full; the shard is re-read on every restore, so it keeps the first
+// sentence of the failure and nothing else.
+const ROLLBACK_REASON_LIMIT = 240;
+
 // An error with an HTTP status, so the request layer can stay a thin mapper.
 export class SessionError extends Error {
     constructor(
@@ -1125,8 +1311,7 @@ const copyInvalidMessages = (value: unknown): unknown => {
 // `turn.events` must not alias the object the harness keeps (or a listener
 // mutates), and the emitted frame is a third object so a caller cannot mutate the
 // stored record through the stream item either.
-const copyEvent = (event: HarnessEvent): HarnessEvent =>
-    JSON.parse(JSON.stringify(event)) as HarnessEvent;
+const copyEvent = (event: HarnessEvent): HarnessEvent => JSON.parse(JSON.stringify(event)) as HarnessEvent;
 
 // Collect the request ids of every actionRequest recorded in a restored turn
 // list, oldest first, keeping only the most recent MAX_COMPLETED_ACTIONS. After a
@@ -1311,12 +1496,40 @@ const viewDescriptorOf = (descriptor: HarnessDescriptor): HarnessDescriptor => {
 const copyTurns = (turns: readonly SessionTurn[], shareEvents = false): SessionTurn[] =>
     turns.map((turn) => copyTurn(turn, shareEvents));
 
+// F4: the journal's event lines, rebuilt from the store's LIVE rows — every turn of every
+// conversation, in ledger order, one record per event at its position index.
+//
+// WHY THE LIVE ROWS ARE THE SOURCE (and why that is safe, not lucky). The recorder writes
+// `turn.events` / `turn.eventTimes` BEFORE it appends the journal line, and a journal append is
+// best-effort (a full disk leaves the file behind, never the record). So the live rows are always
+// a SUPERSET of what the file can hold: rewriting the file from them can drop a step the disk
+// refused, and can never drop a step the store has committed. `eventTimes` is the timestamp of
+// record, because a rewrite must not restamp history as "now"; a row without one falls back to
+// its `updatedAt`, which is what the previous writer used too.
+const journalEventRecordsOf = (session: Session): JournalEventRecord[] => {
+    const records: JournalEventRecord[] = [];
+
+    for (const turn of session.turns) {
+        for (let index = 0; index < turn.events.length; index += 1) {
+            records.push({
+                type: 'event',
+                v: 1,
+                turnId: turn.id,
+                index,
+                at: turn.eventTimes?.[index] ?? turn.updatedAt,
+                event: turn.events[index]
+            });
+        }
+    }
+
+    return records;
+};
+
 // A timestamp is usable only when it is a real epoch-ms number. 0 is the projector's
 // documented "no timestamp" sentinel (../server/turn-projector.ts
 // DISPLAY_NO_TIMESTAMP), and a record without `eventTimes` must never paint a
 // duration — the same honesty rule the projector states for a stored replay (./turn-projector.ts:897).
-const finiteAt = (value: unknown): value is number =>
-    typeof value === 'number' && Number.isFinite(value) && value > 0;
+const finiteAt = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
 
 // Terminal turn statuses (./protocol.ts SessionTurnStatus). Kept local so the store,
 // the frame mirror and the projector agree on one definition.
@@ -1478,7 +1691,8 @@ const blockPayloadOf = (
         // recorded response message, and only there.
         const opening = recordedEventAt(turn, block.eventFrom);
 
-        if (opening?.type === 'done' && typeof opening.message?.content === 'string') payload.text = opening.message.content;
+        if (opening?.type === 'done' && typeof opening.message?.content === 'string')
+            payload.text = opening.message.content;
 
         return payload;
     }
@@ -1489,9 +1703,11 @@ const blockPayloadOf = (
     const opening = recordedEventAt(turn, block.eventFrom);
     const closing = recordedEventAt(turn, block.eventTo);
 
-    if (opening?.type === 'tool_call' && typeof opening.call?.arguments === 'string') payload.args = opening.call.arguments;
+    if (opening?.type === 'tool_call' && typeof opening.call?.arguments === 'string')
+        payload.args = opening.call.arguments;
 
-    const resultEvent = opening?.type === 'tool_result' ? opening : closing?.type === 'tool_result' ? closing : undefined;
+    const resultEvent =
+        opening?.type === 'tool_result' ? opening : closing?.type === 'tool_result' ? closing : undefined;
 
     if (resultEvent !== undefined && typeof resultEvent.content === 'string') payload.result = resultEvent.content;
 
@@ -1523,7 +1739,24 @@ const threadViewsOf = (threads: readonly SessionThread[]): SessionThreadView[] =
             sequence: thread.sequence,
             ...(thread.ownerThreadId === undefined ? {} : { ownerThreadId: thread.ownerThreadId }),
             ...(thread.label === undefined ? {} : { label: thread.label }),
+            // F1: the streak rides through from the roster row (`threadRoster`) rather than being
+            // re-read here — one allocation per roster, so the snapshot and the compiled view state
+            // the SAME number for a conversation. 0 is already absent upstream, and re-stating the
+            // "empty means healthy" rule here is what keeps a future caller from painting `0/10`.
+            ...(thread.networkFailures === undefined || thread.networkFailures === 0
+                ? {}
+                : { networkFailures: thread.networkFailures }),
             ...(thread.invocationId === undefined ? {} : { invocationId: thread.invocationId }),
+            // W22 (2026-11-17): the conversation's RUN token rides through from the roster row exactly like
+            // `invocationId` does, because the compact surface is the roster the browser renders — the
+            // transcript join (`../frontend/ui/thread-transcript.ts`) resolves a contested invocation id from
+            // whichever plane a document carries, so a field the raw roster publishes and the compact one
+            // strips would make the answer depend on which read the client happened to make. `threadRoster`
+            // already applied the pairing rule (the key exists only beside an `invocationId`), so re-stating
+            // it here is a guard, not a second decision, and a row with no epoch stays byte-identical.
+            ...(thread.invocationId === undefined || thread.epoch === undefined || thread.epoch.length === 0
+                ? {}
+                : { epoch: thread.epoch }),
             ...(thread.originTurnId === undefined ? {} : { originTurnId: thread.originTurnId }),
             ...(thread.originInvocationId === undefined ? {} : { originInvocationId: thread.originInvocationId }),
             ...(thread.invocationIds === undefined ? {} : { invocationIds: [...thread.invocationIds] }),
@@ -1618,9 +1851,8 @@ const submittedCount = (value: unknown): number => {
 // back to the frozen descriptor and the session model, so these are never empty.
 const commandAgentOf = (session: Session): string => {
     const harness = session.harness as Partial<Harness>;
-    const name = typeof harness.name === 'string' && harness.name.length > 0
-        ? harness.name
-        : session.definition.primary;
+    const name =
+        typeof harness.name === 'string' && harness.name.length > 0 ? harness.name : session.definition.primary;
 
     // `name` and `definition.primary` are the SAME string for every preset built by
     // the registry (HarnessPreset.primary is the entry agent), so the fallback only
@@ -1645,8 +1877,7 @@ const commandModelOf = (session: Session): string => {
 // The match is intentionally narrow; unknown validator wording falls back to 400,
 // which is still a clear client error.
 const ATTACHMENT_TOO_LARGE = /(?:exceeds|above) the .*byte|byte (?:attachment|per-turn) limit/i;
-const ATTACHMENT_MEDIA_TYPE =
-    /\.mime\b|magic signature|does not match its declared MIME|not valid for kind/i;
+const ATTACHMENT_MEDIA_TYPE = /\.mime\b|magic signature|does not match its declared MIME|not valid for kind/i;
 
 const attachmentErrorStatus = (message: string): number => {
     if (ATTACHMENT_TOO_LARGE.test(message)) return 413;
@@ -1947,7 +2178,9 @@ export class SessionStore {
                     // The sticky error ends up naming the LAST failure, the same way
                     // `persistence.lastWriteError` reports one raw failure. Every failure is
                     // still visible because each line is its own reported error.
-                    this.notePersistenceError(new Error(`An IO worker write did not complete: ${failure.kind}: ${failure.message}`));
+                    this.notePersistenceError(
+                        new Error(`An IO worker write did not complete: ${failure.kind}: ${failure.message}`)
+                    );
                 }
 
                 return summary;
@@ -2040,11 +2273,7 @@ export class SessionStore {
      * (`session:turn`, `session:thread`) and the plain subscription ids are both accepted, so the
      * counter key and the existence question address the same instance.
      */
-    streamExists(
-        resource: StreamResourceKind,
-        id: string | null,
-        ids: StreamScopeIdView = {}
-    ): boolean {
+    streamExists(resource: StreamResourceKind, id: string | null, ids: StreamScopeIdView = {}): boolean {
         // Host-wide kinds have no instance to look up: the registry/catalogue owns them, and a
         // subscription to the collection is always addressable.
         if (id === null) return true;
@@ -2172,10 +2401,7 @@ export class SessionStore {
      * the moment it is applied, so rolling it back on a disk failure would tell an operator
      * "the change failed" while their running sessions kept the value they had just been given.
      */
-    async updatePluginSettings(
-        plugin: string,
-        settings: Record<string, unknown>
-    ): Promise<HarnessPluginSettingValues> {
+    async updatePluginSettings(plugin: string, settings: Record<string, unknown>): Promise<HarnessPluginSettingValues> {
         const values = this.plugins.update(plugin, settings);
 
         await this.persistOrThrow();
@@ -2386,6 +2612,16 @@ export class SessionStore {
             labelHighWater: new Map(),
             threadLabels: new Map(),
             threadLabelHighWater: new Map(),
+            // F1: nothing has failed yet, so the streak map is empty and the ceiling is the
+            // one this session will enforce for its whole life (settings → runtime → default).
+            networkFailures: new Map(),
+            networkResumeLimit: this.networkResumeLimitOf(settings),
+            autoResumeClaims: new Map(),
+            // F1: no restored rows, so nothing qualifies for the legacy `api-error` reading.
+            legacyNetworkReasons: new Set(),
+            // F4: a fresh session has abandoned no attempt.
+            journalRollbacks: [],
+            rollbacks: new Map(),
             turnInvocations: new Map(),
             // T9/T10: nothing has run yet, so no instruction source exists yet.
             turnInstructionSources: new Map(),
@@ -2784,7 +3020,9 @@ export class SessionStore {
         try {
             host.broadcastTools(sessionId, this.authorityOf(session).toolStateNow());
         } catch (error) {
-            console.error(`[harness] a tool-switch push for session "${sessionId}" did not reach its lanes: ${messageOf(error)}`);
+            console.error(
+                `[harness] a tool-switch push for session "${sessionId}" did not reach its lanes: ${messageOf(error)}`
+            );
         }
     }
 
@@ -2892,7 +3130,8 @@ export class SessionStore {
     //     with "Thread is idle", a state that is not true while the lane is running.
     private async steerOnLane(session: Session, threadId: string, input: string): Promise<HarnessThreadSteerReceipt> {
         const host = this.host;
-        const receipt = host === undefined ? undefined : await host.steer(session.id, { kind: 'thread', threadId }, input);
+        const receipt =
+            host === undefined ? undefined : await host.steer(session.id, { kind: 'thread', threadId }, input);
 
         if (receipt === undefined) return session.harness.steerThread(threadId, input);
 
@@ -2950,9 +3189,7 @@ export class SessionStore {
             // owning thread comes from the environment, never from the request.
             const scopedThreadId =
                 threadIdOverride ??
-                (this.runContexts.getStore()?.session === session
-                    ? this.runContexts.getStore()?.threadId
-                    : undefined);
+                (this.runContexts.getStore()?.session === session ? this.runContexts.getStore()?.threadId : undefined);
 
             pending = {
                 requestId: context.requestId,
@@ -2996,10 +3233,7 @@ export class SessionStore {
 
         if (pending === undefined) {
             if (session.completedActions.includes(requestId)) {
-                throw new SessionError(
-                    409,
-                    `Action request "${requestId}" was already answered or has expired.`
-                );
+                throw new SessionError(409, `Action request "${requestId}" was already answered or has expired.`);
             }
 
             throw new SessionError(404, `Unknown action request "${requestId}".`);
@@ -3019,11 +3253,7 @@ export class SessionStore {
     // Settle one pending entry exactly once, detach its abort listener, and record
     // the id as no-longer-answerable (bounded FIFO) so a repeated/stale answer is a
     // 409 instead of a 404.
-    private finishActionRequest(
-        session: Session,
-        pending: PendingAction,
-        outcome: HarnessActionOutcome
-    ): void {
+    private finishActionRequest(session: Session, pending: PendingAction, outcome: HarnessActionOutcome): void {
         if (pending.settled) return;
 
         pending.settled = true;
@@ -3340,7 +3570,15 @@ export class SessionStore {
             definition: copyDescriptor(session.definition),
             settings: {
                 baseURL: session.settings.baseURL,
-                model: session.settings.model
+                model: session.settings.model,
+                // F1: the per-provider ceiling is written only when this session actually has
+                // one, so an untouched session keeps its exact `{baseURL, model}` record shape.
+                // It is durable because it is a provider fact the session was created with:
+                // without it, a restart would fall back to the deployment default and the
+                // conversation would auto-resume at a different rate than configured.
+                ...(session.settings.networkResumeLimit === undefined
+                    ? {}
+                    : { networkResumeLimit: session.settings.networkResumeLimit })
             },
             // T16: written only when the session actually has a title, so a document for an
             // untouched session keeps its pre-T16 shape byte for byte.
@@ -3348,9 +3586,7 @@ export class SessionStore {
             // T27: the session-scoped binding list, written only when there is one (same
             // additive rule as the title). Detached copy: the document handed to the writer is
             // never the live array.
-            ...(session.sessionAgents.length === 0
-                ? {}
-                : { sessionAgents: [...session.sessionAgents] }),
+            ...(session.sessionAgents.length === 0 ? {} : { sessionAgents: [...session.sessionAgents] }),
             status: session.status,
             createdAt: session.createdAt,
             updatedAt: session.updatedAt,
@@ -3378,12 +3614,29 @@ export class SessionStore {
             ...(session.labelHighWater.size === 0
                 ? {}
                 : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
-            ...(session.threadLabels.size === 0
-                ? {}
-                : { threadLabels: Object.fromEntries([...session.threadLabels]) }),
+            ...(session.threadLabels.size === 0 ? {} : { threadLabels: Object.fromEntries([...session.threadLabels]) }),
             ...(session.threadLabelHighWater.size === 0
                 ? {}
                 : { threadLabelHighWater: Object.fromEntries([...session.threadLabelHighWater]) }),
+            // F1: the auto-recovery streaks, written only while a conversation is actually in a
+            // streak (entries at 0 are pruned at the point of change, so the map is otherwise
+            // empty and the key absent — a healthy session's document keeps its exact shape).
+            ...(session.networkFailures.size === 0
+                ? {}
+                : { networkFailures: Object.fromEntries([...session.networkFailures]) }),
+            // F4: the abandoned attempts, keyed by turn id, written only when there is one. The
+            // arrays are detached per entry so the document handed to the writer is never the
+            // live map's own objects.
+            ...(session.rollbacks.size === 0
+                ? {}
+                : {
+                      turnRollbacks: Object.fromEntries(
+                          [...session.rollbacks].map(([turnId, entries]) => [
+                              turnId,
+                              entries.map((entry) => ({ ...entry }))
+                          ])
+                      )
+                  }),
             ...(session.turnInvocations.size === 0
                 ? {}
                 : { turnInvocations: Object.fromEntries(session.turnInvocations) }),
@@ -3414,18 +3667,14 @@ export class SessionStore {
                 ? {}
                 : {
                       invalidThreads: Object.fromEntries(
-                          [...session.invalidThreads].sort(([left], [right]) =>
-                              left.localeCompare(right)
-                          )
+                          [...session.invalidThreads].sort(([left], [right]) => left.localeCompare(right))
                       )
                   }),
             // T1.5 last mile: the plugin-diagnostic journal, written only when it is non-empty,
             // so a healthy session's `session.json` shard keeps its pre-T4 shape exactly like the
             // `invalidThreads` block above. Durable because a restart does not change the fact
             // that a plugin HAS been failing — that is the sentence an operator needs after one.
-            ...(session.pluginDiagnostics.length === 0
-                ? {}
-                : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
+            ...(session.pluginDiagnostics.length === 0 ? {} : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
             // R4 (durability, and the ONLY record of a session's own plugin settings): the
             // SESSION's override map, written only when this session has changed anything, so a
             // session nobody configured keeps its exact pre-R4 `session.json` shape — the same
@@ -3732,7 +3981,8 @@ export class SessionStore {
     // a stated placeholder rather than dropped.
     private notePluginDiagnostic(session: Session | undefined, event: HarnessDiagnosticEvent): void {
         const owner = typeof event.owner === 'string' ? event.owner : '';
-        const message = typeof event.message === 'string' && event.message.trim().length > 0 ? event.message : 'no message';
+        const message =
+            typeof event.message === 'string' && event.message.trim().length > 0 ? event.message : 'no message';
         const diagnostic: SessionPluginDiagnostic = {
             at: Date.now(),
             kind: event.kind,
@@ -3894,8 +4144,7 @@ export class SessionStore {
         if (persisted !== undefined) {
             // Addressable threads of the (already neutralised) snapshot.
             const threads = new Map<string, { messages?: unknown }>();
-            const entries = core.threads as unknown as
-                { id?: unknown; messages?: unknown }[] | undefined;
+            const entries = core.threads as unknown as { id?: unknown; messages?: unknown }[] | undefined;
 
             if (Array.isArray(entries)) {
                 for (const entry of entries) {
@@ -3908,9 +4157,7 @@ export class SessionStore {
 
             // Agent-keyed DEFAULT conversations (C8-m3), read raw off the same
             // (unvalidated) persisted snapshot the thread list above came from.
-            const agents = core.agents as unknown as
-                | Record<string, { messages?: unknown }>
-                | undefined;
+            const agents = core.agents as unknown as Record<string, { messages?: unknown }> | undefined;
 
             for (const [id, entry] of Object.entries(persisted)) {
                 if (restored.has(id)) continue;
@@ -3968,11 +4215,7 @@ export class SessionStore {
     //
     // The snapshot is COPIED rather than mutated: `record.core` is the parsed document and a
     // frame that needed no pruning is restored exactly as it arrived (the lane rule again).
-    private pruneStaleEnabledTools(
-        core: HarnessSnapshot,
-        harness: Harness,
-        sessionId: string
-    ): HarnessSnapshot {
+    private pruneStaleEnabledTools(core: HarnessSnapshot, harness: Harness, sessionId: string): HarnessSnapshot {
         // Defensive `??`s: `discovery`/`createdTools` are required by the snapshot TYPE, and
         // `discovery.withheld` is OPTIONAL by design (../types/index.ts:3791), but a
         // hand-edited `session.json` shard reaches here after only the document-level shape check
@@ -3985,9 +4228,7 @@ export class SessionStore {
         if (enabled.length === 0 && withheld.length === 0) return core;
 
         const recreated = new Set((core.createdTools ?? []).map((created) => created.name));
-        const dropped = new Set(
-            enabled.filter((name) => !recreated.has(name) && !harness.isToolSwitchable(name))
-        );
+        const dropped = new Set(enabled.filter((name) => !recreated.has(name) && !harness.isToolSwitchable(name)));
         // THE WITHHELD PRUNE (T6), the same tolerance one level down: a name the conversation
         // switched off that THIS build no longer registers is dropped silently. It is not worth a
         // diagnostic because it asserts nothing dangerous — "do not show the agents a tool we do
@@ -4004,9 +4245,7 @@ export class SessionStore {
         // decision runs, and `restore()` puts it there.
         const droppedWithheld = new Set(
             withheld.filter(
-                (name) =>
-                    !recreated.has(name) &&
-                    (harness.tools as Record<string, unknown>)[name] === undefined
+                (name) => !recreated.has(name) && (harness.tools as Record<string, unknown>)[name] === undefined
             )
         );
 
@@ -4028,9 +4267,7 @@ export class SessionStore {
                 // Field-preserving: a document that carried `withheld` keeps carrying it (minus
                 // the names this build cannot hold), and one that never did is left exactly as it
                 // parsed, so the byte shape of every pre-T6 record is untouched.
-                ...(withheld.length === 0
-                    ? {}
-                    : { withheld: withheld.filter((name) => !droppedWithheld.has(name)) })
+                ...(withheld.length === 0 ? {} : { withheld: withheld.filter((name) => !droppedWithheld.has(name)) })
             }
         };
     }
@@ -4098,7 +4335,16 @@ export class SessionStore {
             // foreign endpoint resumes unauthenticated (by design).
             const settings = mergeSettings(this.defaults, {
                 baseURL: record.settings.baseURL,
-                model: record.settings.model
+                model: record.settings.model,
+                // F1: the conversation's OWN ceiling travels back with it. The whole reason the
+                // setting is durable is that a restart must not change how often this conversation
+                // is auto-resumed, and `networkResumeLimitOf` reads the explicit layer first — so
+                // dropping the key here would let the deployment variable win on the second boot
+                // (an operator's 2 silently becomes the environment's 7, and a dead provider gets
+                // five more attempts per streak than configured).
+                ...(record.settings.networkResumeLimit === undefined
+                    ? {}
+                    : { networkResumeLimit: record.settings.networkResumeLimit })
             });
 
             // T25: explicit arrow, not `map(copyTurn)`. `copyTurn` grew the `shareEvents`
@@ -4218,8 +4464,7 @@ export class SessionStore {
                 // Old documents have no high-water mark: derive it from the highest
                 // recorded index so a restored session never reuses an index.
                 turnSequence:
-                    record.threadSequence ??
-                    turns.reduce((highest, turn) => Math.max(highest, turn.index + 1), 0),
+                    record.threadSequence ?? turns.reduce((highest, turn) => Math.max(highest, turn.index + 1), 0),
                 // Seeds/invocation joins are restored for turns that still exist;
                 // a stale id (from a hand-edited file) is dropped rather than
                 // resurrecting a record nobody can address.
@@ -4235,6 +4480,37 @@ export class SessionStore {
                 // none and the store derives them deterministically on demand.
                 threadLabels: new Map(Object.entries(record.threadLabels ?? {})),
                 threadLabelHighWater: new Map(Object.entries(record.threadLabelHighWater ?? {})),
+                // F1: the streaks come back EXACTLY as they were committed (the loader already
+                // validated them as counts), which is what stops a provider that is still down
+                // from buying this conversation a fresh set of resumes. THIS filter is only the
+                // shape half — a non-positive count or a blank key is dropped, because only a
+                // streak in progress is worth carrying. WHETHER THE CONVERSATION STILL EXISTS is
+                // not answerable here: this literal runs before the core is repaired/capped and
+                // before the retirement ledger is hydrated, and both are what define "still
+                // exists". That prune is `pruneRestoredNetworkStreaks`, called below once the row
+                // set is final (T-W14).
+                networkFailures: new Map(
+                    Object.entries(record.networkFailures ?? {}).filter(
+                        ([threadId, streak]) => streak > 0 && threadId.trim().length > 0
+                    )
+                ),
+                // F1: the ceiling is re-resolved from the SAME precedence, with the session's
+                // persisted per-provider override as the explicit layer, so a restart cannot
+                // quietly change how often this conversation is auto-resumed.
+                networkResumeLimit: this.networkResumeLimitOf(settings),
+                autoResumeClaims: new Map(),
+                // F1: seeded below, once the runtime roster exists, from the stop reasons THIS
+                // document carried (see `seedLegacyNetworkReasons`).
+                legacyNetworkReasons: new Set(),
+                // F4: loaded from the journal by `mergeJournal` during `restoreProjections`
+                // (the file is the store for the full tails); the checkpoint copy is restored
+                // from the shard here, filtered to the turns that survived.
+                journalRollbacks: [],
+                rollbacks: new Map(
+                    Object.entries(record.turnRollbacks ?? {}).filter(([turnId]) =>
+                        turns.some((turn) => turn.id === turnId)
+                    )
+                ),
                 turnInvocations: new Map(
                     Object.entries(record.turnInvocations ?? {}).filter(([turnId]) =>
                         turns.some((turn) => turn.id === turnId)
@@ -4377,6 +4653,13 @@ export class SessionStore {
                 session.inactiveThreads.set(thread.id, thread.inactiveAt);
             }
 
+            // F1/T-W14: the streak map is keyed by CONVERSATION, so it is pruned against the same row
+            // set the ledger above was hydrated from — after `capThreadRecords` (a row the retirement
+            // cap dropped has no conversation left to count for) and before the harness is restored.
+            // This is the only point in the restore where "does this conversation still exist, and is
+            // it retired?" has one answer: the rows are final, the cap has run, and the ledger is full.
+            this.pruneRestoredNetworkStreaks(session);
+
             harness.restore(capped);
 
             // Merge what the document recorded as unreadable (C4). A thread that is
@@ -4433,6 +4716,10 @@ export class SessionStore {
             // records the model map above) as this session's committed state.
             session.core = harness.snapshot();
             this.sessions.set(session.id, session);
+
+            // F1: the stale-vocabulary allowance is decided HERE, from the rows this document
+            // carried, before any run of this build can write a reason of its own.
+            this.seedLegacyNetworkReasons(session);
 
             // R4: merge the durable per-step log into the checkpointed turns and fold
             // the compiled display state ONCE here (not per request). A legacy
@@ -4578,11 +4865,11 @@ export class SessionStore {
         }
     }
 
-    // Every invocation this server observed running in ONE persistent conversation,
-    // oldest first, for the roster's `invocationIds` join (R3).
+    // Every invocation this server observed running in ONE persistent conversation, oldest
+    // first, for the roster's `invocationIds` join (R3).
     //
     // Source of truth is `session.invocationThreads`, written when a run's `start`
-    // frame names its invocation (noteInvocationThread, line ~3920) and persisted
+    // frame names its invocation (noteInvocationThread, ~11:340) and persisted
     // with the session, so the ORIGINAL delegated run and every later resume are all
     // present — including after a restart. Only this session's map is read, and only
     // entries mapped to THIS thread are kept, so a sibling's or another session's
@@ -4592,6 +4879,15 @@ export class SessionStore {
     // are folded in when the map does not already name them: a legacy document whose
     // map is empty/absent then still reports what its runtime record knows. The result
     // is deduplicated, because a resume observed twice must not appear twice.
+    //
+    // R19 (2026-11-17): the map is keyed by INVOCATION RUN (`id\0epoch`), and this is the
+    // WIRE boundary — `SessionThread.invocationIds` stays a list of BARE invocation ids,
+    // because a client joins it onto `TurnSection.invocationId`, which carries no epoch
+    // (./protocol.ts `invocationIdOfRunKey`). Two runs of ONE conversation therefore still
+    // list as two ids, and — the part the recycled-id collision used to hide — a conversation
+    // that ran in two processes now lists the id each process minted instead of only the one
+    // that wrote the shared key first. Deduplication is on the bare id, so a resumed run
+    // observed twice cannot appear twice.
     private invocationIdsOf(
         session: Session,
         record: HarnessThreadRecord,
@@ -4609,8 +4905,8 @@ export class SessionStore {
 
         // Map iteration order is observation order, so the card's ORIGINAL run comes
         // before the continuations that advanced the single `invocationId` slot.
-        for (const [invocationId, threadId] of session.invocationThreads) {
-            if (threadId === record.id) push(invocationId);
+        for (const [runKey, threadId] of session.invocationThreads) {
+            if (threadId === record.id) push(invocationIdOfRunKey(runKey));
         }
 
         push(record.invocationId);
@@ -4678,8 +4974,7 @@ export class SessionStore {
                 }
             }
 
-            const originInvocationId =
-                first === undefined ? undefined : session.turnInvocations.get(first.id);
+            const originInvocationId = first === undefined ? undefined : session.turnInvocations.get(first.id);
 
             // R3: the FULL invocation roster of this conversation, not just the
             // latest one. A delegated child's card was created by its ORIGINAL run
@@ -4696,15 +4991,31 @@ export class SessionStore {
             const connectedThreadIds = [
                 ...new Set(
                     references
-                        .map((reference) =>
-                            session.turns.find((turn) => turn.id === reference.turnId)
-                        )
+                        .map((reference) => session.turns.find((turn) => turn.id === reference.turnId))
                         .map((turn) => turn?.threadId)
                         .filter((threadId): threadId is string => threadId !== undefined)
                 )
             ].filter((threadId) => threadId !== record.id);
 
-            return {
+            // W22 (2026-11-17) — THE EPOCH HALF OF THIS ROW IS NOW DECLARED, NOT ACCIDENTAL.
+            // `{ ...record }` has always copied `HarnessThreadRecord.epoch` onto the roster row
+            // (`../harness.ts` `threadRecordCopy` is a shallow copy of the live record, and the run-start
+            // stamp writes `epoch` in the SAME statement as `invocationId`), so the roster JSON already
+            // emitted the key while `SessionThread` refused to name it — the note at ../types/index.ts
+            // `HarnessThreadRecord.epoch` used to record that as a decision. W22 reverses it on purpose: the
+            // client transcript join needs the fact (../frontend/ui/thread-transcript.ts), and a field a wire
+            // emits without declaring is a field no contract can protect.
+            //
+            // THE RULE, in one line: the key is PRESENT exactly when this record pairs an invocation id with
+            // the process that minted it, and the value is the BARE token — never `id\0epoch`, because
+            // ./protocol.ts `invocationIdOfRunKey` keeps the composite private and a client that splits a
+            // reported id on `\0` would then be reading a key that was never minted.
+            const epoch =
+                record.invocationId === undefined || typeof record.epoch !== 'string' || record.epoch.length === 0
+                    ? undefined
+                    : record.epoch;
+
+            const row: SessionThread = {
                 ...record,
                 // The DISPLAY name is the session's conversation label, never the
                 // runtime's optional free-text label and never the global creation
@@ -4718,10 +5029,41 @@ export class SessionStore {
                 ...(invocationIds.length === 0 ? {} : { invocationIds }),
                 ...(references.length === 0 ? {} : { references }),
                 ...(connectedThreadIds.length === 0 ? {} : { connectedThreadIds }),
+                // F1: this conversation's consecutive network failures. Per-row because the strip
+                // that paints a halted conversation is the place that has to say "3/10, retrying"
+                // versus "resting at the ceiling", and the ceiling is one field away
+                // (`SessionSnapshot.networkFailureLimit`). Omitted at 0, exactly like the snapshot
+                // map, so an untouched roster keeps its existing shape.
+                ...(this.networkStreakOf(session, record.id) === 0
+                    ? {}
+                    : { networkFailures: this.networkStreakOf(session, record.id) }),
                 // Always present (possibly empty): a focused UI can render "no
                 // messages yet" without a second request.
                 messages: session.harness.threadMessages(record.id)
             };
+
+            // W22 (2026-11-17) — THE ROSTER'S EPOCH, now a stated rule instead of a side effect of the
+            // spread. `{ ...record }` has always copied `HarnessThreadRecord.epoch` onto this row, and the
+            // type never declared it (`../types/index.ts:3229` used to promise "no roster row reports it" —
+            // W22 reverses that decision on purpose, because the client transcript join needs the fact; see
+            // ./protocol.ts `SessionThread.epoch`). Normalising here is what makes the wire shape mean one
+            // thing: the key survives exactly when the record pairs it with the invocation id that process
+            // minted, which is the invariant the writers keep (`../harness.ts` stamps the pair in one
+            // statement) and the one ./core/sessions.epoch-discrimination.test.ts pins after a restart.
+            //
+            // Consequences, all deliberate: a conversation that never ran emits NO `epoch` key, a row
+            // restored from a pre-epoch document emits NO `epoch` key, so every legacy roster projects
+            // byte-identically; the value is the BARE token, never `id\0epoch` (./protocol.ts
+            // `invocationIdOfRunKey` is the strip the id fields use, and the composite must stay private);
+            // and the model-facing page keeps its own strip (`../harness.ts` `modelThreadRosterOf`), so the
+            // model contract is untouched while the host/UI plane gains the discriminator.
+            if (epoch === undefined) {
+                delete row.epoch;
+            } else {
+                row.epoch = epoch;
+            }
+
+            return row;
         });
     }
 
@@ -4743,16 +5085,18 @@ export class SessionStore {
         return [...session.invalidThreads]
             .filter(([id]) => !this.isThreadInactive(session, id))
             .sort(([left], [right]) => left.localeCompare(right))
-            .map(([id, entry]): SessionInvalidThread => ({
-                id,
-                ...(entry.label === undefined ? {} : { label: entry.label }),
-                ...(entry.agent === undefined ? {} : { agent: entry.agent }),
-                error: entry.error,
-                // Verbatim, never normalised: this is the text the operator has to fix.
-                // C8-m7: copied, so a snapshot consumer (the SSE frame, `store.get()`)
-                // cannot mutate the stored raw value through the object it was handed.
-                messages: copyInvalidMessages(entry.messages)
-            }));
+            .map(
+                ([id, entry]): SessionInvalidThread => ({
+                    id,
+                    ...(entry.label === undefined ? {} : { label: entry.label }),
+                    ...(entry.agent === undefined ? {} : { agent: entry.agent }),
+                    error: entry.error,
+                    // Verbatim, never normalised: this is the text the operator has to fix.
+                    // C8-m7: copied, so a snapshot consumer (the SSE frame, `store.get()`)
+                    // cannot mutate the stored raw value through the object it was handed.
+                    messages: copyInvalidMessages(entry.messages)
+                })
+            );
     }
 
     // True when the conversation `threadId` is soft-deleted (R2). Read from the DURABLE row,
@@ -4772,9 +5116,33 @@ export class SessionStore {
         // ledger, loaded into memory that has.
         if (session.inactiveThreads.has(threadId)) return true;
 
-        return (session.core.threads ?? []).some(
-            (thread) => thread.id === threadId && thread.inactive === true
-        );
+        return (session.core.threads ?? []).some((thread) => thread.id === threadId && thread.inactive === true);
+    }
+
+    // F7 (2026-11-17): EVERY soft-deleted conversation id this session retains, sorted. Same two
+    // sources as `isThreadInactive` (and the same two the REST layer reads in ./api-reads.ts
+    // `retiredThreadIdsOf`): the durable `Session.inactiveThreads` ledger, unioned with the
+    // `inactive: true` marks on the retained rows of `session.core`. The union is not paranoia —
+    // the ledger is the store's own knowledge and survives a `core` re-derive, while the rows are
+    // the only mark a document written before the ledger existed carries (./sessions.ts
+    // `isThreadInactive` states the order and why a row alone cannot answer it).
+    //
+    // WHY IT IS A PROJECTION AND NOT JUST THE LEDGER: a client needs "which conversations are
+    // gone", and a ledger that missed one hydration would under-report — an under-reported
+    // deletion is the exact bug this field exists to fix, so the projection takes the WIDE answer
+    // while the roster filter keeps its narrow one.
+    //
+    // It does NOT replace the roster filter (./sessions.ts `threadRoster`, ./api.ts
+    // `threadRecordsOf`): those rows stay OUT of `threads`/`threadViews`, so every gate that
+    // treats the roster as "the conversations this session can run" is untouched.
+    private inactiveThreadIdsOf(session: Session): string[] {
+        const ids = new Set<string>(session.inactiveThreads.keys());
+
+        for (const thread of session.core.threads ?? []) {
+            if (thread.inactive === true) ids.add(thread.id);
+        }
+
+        return [...ids].sort((left, right) => left.localeCompare(right));
     }
 
     // R2 — stamp the retention ledger onto a core that is about to become a document (see
@@ -4817,9 +5185,8 @@ export class SessionStore {
             };
         };
 
-        const rewritten = threads.map(
-            (thread) =>
-                session.inactiveThreads.has(thread.id) && thread.inactive !== true ? stamp(thread) : thread
+        const rewritten = threads.map((thread) =>
+            session.inactiveThreads.has(thread.id) && thread.inactive !== true ? stamp(thread) : thread
         );
         const relabelled = rewritten.some((thread, index) => thread !== threads[index]);
 
@@ -4886,9 +5253,27 @@ export class SessionStore {
         // happens during it.
         session.inactiveThreads.delete(threadId);
 
+        // F1/T-W14: a revived conversation starts its auto-recovery life again at zero. The clear
+        // lives HERE, not at each door, because EVERY revival passes through this method: a submit
+        // on the retained id (`enqueue`, which calls this at :10015-ish) and any resume, whose
+        // requeued row is run by `executeTurn` — and `executeTurn` calls this immediately before
+        // `harness.sendThreadInput` (see its note at :8992). Skipping it hands the revived
+        // conversation the number its RETIRED life left behind: with the ceiling at 3 and an
+        // inherited 3, `raiseNetworkStreak` saturates at the ceiling on the FIRST fresh failure and
+        // `autoResumeAfterNetworkFailure`'s `streak >= limit` test then refuses a resume this
+        // conversation has not earned. The streak map is conversation-lifetime state (see
+        // `Session.networkFailures`), and a revival is the start of a new one.
+        //
+        // The runaway guard still holds: `Session.autoResumeClaims` is keyed by TURN id, is not
+        // touched here, and is capped at the ceiling, so the row this revival re-runs still cannot
+        // be auto-resumed more than `limit` times in this process whatever the streak says.
+        this.clearNetworkStreak(session, threadId);
+
         // The reactivation is a state change an interrupted process must not lose, so it is
         // persisted (best-effort, as every other live-state change here). Only the rare
-        // reactivation reaches this line, so ordinary turns pay nothing.
+        // reactivation reaches this line, so ordinary turns pay nothing — `clearNetworkStreak`
+        // returns without touching the map when there is no entry, so an ordinary revival (the
+        // common case: nothing was failing) pays for that too.
         this.persistBestEffort();
     }
 
@@ -4943,6 +5328,9 @@ export class SessionStore {
         const threads = this.threadRoster(session);
         // C4/R2: computed once so the gate and the value cannot disagree.
         const invalidThreads = this.invalidThreadViews(session);
+        // F7: computed once, like the roster and the unreadable set above, so the gate and the
+        // value cannot disagree.
+        const inactiveThreads = this.inactiveThreadIdsOf(session);
         // Pending backlog across every lane plus the legacy queue (F1). The active
         // turn is never counted.
         const pending = this.pendingCount(session);
@@ -4974,13 +5362,17 @@ export class SessionStore {
             // serialises the same way (deterministic tests and SSE repaints), and
             // WITHOUT any soft-deleted conversation (R2 — `invalidThreadViews`).
             ...(invalidThreads.length === 0 ? {} : { invalidThreads }),
+            // F7 (2026-11-17): the soft-deleted conversation ids, omitted when the session never
+            // deleted one (the additive rule `invalidThreads` immediately above follows). This is
+            // the deletion EVIDENCE a client that never watched the delete has to have — on a
+            // reload the roster simply stops naming the id, and an omission is not a marker
+            // (./protocol.ts `SessionSnapshot.inactiveThreads` for the full rule).
+            ...(inactiveThreads.length === 0 ? {} : { inactiveThreads }),
             // T1.5 last mile: the plugin-diagnostic journal (oldest first, capped), omitted when
             // the session has never reported one — the same additive rule as `invalidThreads`
             // immediately above, so a healthy session's snapshot stays byte-identical to the
             // shape every existing client reads.
-            ...(session.pluginDiagnostics.length === 0
-                ? {}
-                : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
+            ...(session.pluginDiagnostics.length === 0 ? {} : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
             ...(session.labelSeeds.size === 0
                 ? {}
                 : {
@@ -4993,6 +5385,38 @@ export class SessionStore {
             ...(session.labelHighWater.size === 0
                 ? {}
                 : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
+            // F1 (2026-11-17): the consecutive network failures per conversation, plus the
+            // ceiling they are measured against, so a client can paint "n/10" from ONE read.
+            //
+            // Omitted entirely while nothing is failing — `clearNetworkStreak` DELETES the entry
+            // rather than writing 0 — so a healthy session's snapshot keeps the exact byte shape
+            // every existing client reads, and the presence of the field is itself the signal that
+            // a conversation has a failed attempt behind it. The ceiling travels with the counts
+            // because it is not a constant: `HARNESS_PROVIDER_NETWORK_RESUME_LIMIT` moves it per
+            // deployment and `settings.networkResumeLimit` moves it per provider, so a UI that
+            // hard-coded 10 would lie the first time an operator changes either.
+            ...(session.networkFailures.size === 0
+                ? {}
+                : {
+                      networkFailures: Object.fromEntries([...session.networkFailures]),
+                      networkFailureLimit: session.networkResumeLimit
+                  }),
+            // F4 (2026-11-17): what the in-place resumes in this session abandoned, keyed by turn
+            // id. The FULL dropped tails live in the journal (`Session.journalRollbacks`); this is
+            // the bounded checkpoint summary — boundary, count, reason, and every dropped `error`
+            // frame — which is the copy that survives `ioExecution: 'worker'` and the copy a surface
+            // can render without another route. Copied per record so a snapshot consumer cannot
+            // mutate the store's own history through the object it was handed.
+            ...(session.rollbacks.size === 0
+                ? {}
+                : {
+                      turnRollbacks: Object.fromEntries(
+                          [...session.rollbacks].map(([turnId, records]) => [
+                              turnId,
+                              records.map((record) => ({ ...record }))
+                          ])
+                      )
+                  }),
             harnessDefinition: copyDescriptor(session.definition),
             discoveredTools: [...session.harness.discoveredTools],
             ...(session.lastError !== undefined ? { lastError: session.lastError } : {})
@@ -5022,22 +5446,45 @@ export class SessionStore {
     // own block projection (labels are the store's, so the fold must not re-mint them).
     private displayContext(session: Session): DisplayProjectContext {
         // What the store had already allocated when this fold was built. Every entry is
-        // keyed by INVOCATION id (the fold's only key space), and it covers all three of
-        // the store's joins: a delegated conversation's run, a turn's root run, and a
-        // host conversation's own latest run (see `invocationThreadLabels`).
+        // keyed by INVOCATION RUN (the fold's key space — `id\0epoch`, or the bare id when the
+        // record names no epoch; see ./protocol.ts `invocationRunKeyOf`), and it covers all three
+        // of the store's joins: a delegated conversation's run, a turn's root run, and a host
+        // conversation's own latest run (see `labelJoinsOf`).
         const knownLabels = new Map<string, string>();
 
         // R8/T14: ADOPT persisted conversation labels before anything mints one.
-        // `invocationThreadLabels` allocates for a thread whose name is not recorded,
+        // `labelJoinsOf` allocates for a thread whose name is not recorded,
         // and a restored document adopts its surviving names on the first roster read
         // (see `ensureThreadLabels` → `adoptPersistedLabels`). Building the fold
         // context without that adoption would consume the ordinal a restored `RR3`
         // still owns and hand the survivor `RR4`.
         this.ensureThreadLabels(session);
 
-        for (const [invocationId, label] of Object.entries(this.invocationThreadLabels(session))) {
-            knownLabels.set(invocationId, label);
+        for (const [runKey, label] of Object.entries(this.labelJoinsOf(session))) {
+            knownLabels.set(runKey, label);
         }
+
+        // R19: one resolution for BOTH halves of the live view. A caller asks with a run key;
+        // an exact hit wins, and anything else — a legacy (epoch-less) row, a row whose run the
+        // store never joined, a record written before the epoch field existed — falls back to the
+        // BARE invocation id, which is exactly what this file resolved before the join was scoped.
+        // `labelOf` is therefore the single legacy door, and it is closed only for a run the map
+        // already answers under its own epoch.
+        const resolveLabel = (runKey: string): string | undefined => {
+            const eager = knownLabels.get(runKey);
+
+            if (eager !== undefined) return eager;
+
+            const bare = invocationIdOfRunKey(runKey);
+
+            if (bare !== runKey) {
+                const legacy = knownLabels.get(bare);
+
+                if (legacy !== undefined) return legacy;
+            }
+
+            return this.liveThreadLabel(session, runKey);
+        };
 
         // R18/T20: the label join is a LIVE view, exactly like `invocationThreadIds`
         // below, and for the same reason — a projector is built ONCE per turn
@@ -5072,15 +5519,14 @@ export class SessionStore {
             get size(): number {
                 return knownLabels.size;
             },
-            get: (invocationId: string): string | undefined =>
-                knownLabels.get(invocationId) ?? this.liveThreadLabel(session, invocationId),
-            has: (invocationId: string): boolean =>
-                knownLabels.has(invocationId) || this.liveThreadLabel(session, invocationId) !== undefined,
+            get: (runKey: string): string | undefined => resolveLabel(runKey),
+            has: (runKey: string): boolean => resolveLabel(runKey) !== undefined,
             forEach: (
                 callback: (value: string, key: string, map: ReadonlyMap<string, string>) => void,
                 thisArg?: unknown
             ): void => {
-                for (const [invocationId, label] of knownLabels) callback.call(thisArg, label, invocationId, threadLabels);
+                for (const [invocationId, label] of knownLabels)
+                    callback.call(thisArg, label, invocationId, threadLabels);
             },
             // The iterator members are deliberately left unannotated: the emitted lib
             // types them as `MapIterator<…>` (which carries `Symbol.dispose`), and writing
@@ -5091,35 +5537,78 @@ export class SessionStore {
             [Symbol.iterator]: () => knownLabels.entries()
         };
 
+        // R18/T18: the invocation → persistent conversation join, handed to the fold
+        // as a LIVE view over the store's own map — deliberately NOT a snapshot copy.
+        //
+        // WHY LIVE: a projector is created ONCE per turn and cached (`projections`,
+        // line ~548), while this map keeps growing during the run — a delegated
+        // child's entry is written at ITS OWN `start` frame (line ~5484), long after
+        // the root's first event built this context. A copied map would therefore be
+        // frozen at turn start, every delegated child of a live turn would be folded
+        // without a conversation id, and the fold would have to guess one. Reading
+        // through the live instance is also what makes a cold replay produce the
+        // value at the SAME point: restore re-folds with the fully loaded map
+        // (`foldProjections` → `displayContext`), so live and replay agree exactly.
+        //
+        // R19 — WHY A VIEW AND NOT THE RAW MAP: the map is keyed by INVOCATION RUN
+        // (`id\0epoch` / bare id, ./protocol.ts), while the fold asks with the run key of the
+        // frame it is folding. This wrapper is where the exact-then-BARE resolution lives, so
+        // the projector never has to know the key rule and a record with no epoch anywhere
+        // still resolves through its bare-id keys exactly as it did before the join was
+        // scoped. `get`/`has` read through the live map on every call; the enumerable half is
+        // the live map itself, which is the honest answer for `size`/iteration and is
+        // documented here because a future reader must know iteration sees RUN keys, not ids.
+        //
+        // WHY SAFE TO SHARE: `invocationThreads` is only ever mutated IN PLACE
+        // (`set`/`delete`/`clear`; a purge deletes, a restart rebuilds the Session and
+        // its projection cache together, line ~2298/2320) and never reassigned, so a
+        // cached projector can never be left holding a detached map. If a future
+        // restore ever replaces the field instead of filling it in place — the rule
+        // `restoreCounterMap` (:7357) documents for the label maps — the
+        // projector cache must be rebuilt in the same step.
+        //
+        // The fold reads it as a `ReadonlyMap`: the join is the store's authority
+        // (the roster's `SessionThreadView.invocationIds`, ./protocol.ts:591, is the
+        // same map projected per thread), so the projector adopts it verbatim and
+        // mints nothing of its own.
+        const threadIds: ReadonlyMap<string, string> = {
+            get size(): number {
+                return session.invocationThreads.size;
+            },
+            get: (runKey: string): string | undefined => {
+                const exact = session.invocationThreads.get(runKey);
+
+                if (exact !== undefined) return exact;
+
+                const bare = invocationIdOfRunKey(runKey);
+
+                return bare === runKey ? undefined : session.invocationThreads.get(bare);
+            },
+            has: (runKey: string): boolean => {
+                if (session.invocationThreads.has(runKey)) return true;
+
+                return session.invocationThreads.has(invocationIdOfRunKey(runKey));
+            },
+            forEach: (
+                callback: (value: string, key: string, map: ReadonlyMap<string, string>) => void,
+                thisArg?: unknown
+            ): void => {
+                for (const [runKey, threadId] of session.invocationThreads)
+                    callback.call(thisArg, threadId, runKey, threadIds);
+            },
+            // Deliberately unannotated: the emitted lib types these as `MapIterator<…>` (which
+            // carries `Symbol.dispose`), and writing `IterableIterator<…>` here would narrow the
+            // interface and fail `tsc` — the same caveat as the `threadLabels` view above.
+            keys: () => session.invocationThreads.keys(),
+            values: () => session.invocationThreads.values(),
+            entries: () => session.invocationThreads.entries(),
+            [Symbol.iterator]: () => session.invocationThreads.entries()
+        };
+
         return {
             primary: session.definition.primary,
             threadLabels,
-            // R18/T18: the invocation → persistent conversation join, handed to the fold
-            // as the LIVE map instance — deliberately NOT a snapshot copy.
-            //
-            // WHY LIVE: a projector is created ONCE per turn and cached (`projections`,
-            // line ~548), while this map keeps growing during the run — a delegated
-            // child's entry is written at ITS OWN `start` frame (line ~5484), long after
-            // the root's first event built this context. A copied map would therefore be
-            // frozen at turn start, every delegated child of a live turn would be folded
-            // without a conversation id, and the fold would have to guess one. Reading
-            // through the live instance is also what makes a cold replay produce the
-            // value at the SAME point: restore re-folds with the fully loaded map
-            // (`foldProjections` → `displayContext`), so live and replay agree exactly.
-            //
-            // WHY SAFE TO SHARE: `invocationThreads` is only ever mutated IN PLACE
-            // (`set`/`delete`/`clear`; a purge deletes, a restart rebuilds the Session and
-            // its projection cache together, line ~2298/2320) and never reassigned, so a
-            // cached projector can never be left holding a detached map. If a future
-            // restore ever replaces the field instead of filling it in place — the rule
-            // `restoreCounterMap` (:7357) documents for the label maps — the
-            // projector cache must be rebuilt in the same step.
-            //
-            // The fold reads it as a `ReadonlyMap`: the join is the store's authority
-            // (the roster's `SessionThreadView.invocationIds`, ./protocol.ts:591, is the
-            // same map projected per thread), so the projector adopts it verbatim and
-            // mints nothing of its own.
-            invocationThreadIds: session.invocationThreads,
+            invocationThreadIds: threadIds,
             expiredRequestIds: new Set(session.completedActions),
             // The callback is handed the LIVE turn record the projector holds, so the
             // cast is exact (see `DisplayTurnInput`, ../shared/turn-display.ts).
@@ -5129,8 +5618,7 @@ export class SessionStore {
             // segment — the fold never substitutes today's catalogue text for evidence
             // the record does not hold (a legacy document therefore has no system
             // segment, honestly, instead of a fabricated count).
-            instructionSourcesOf: (turn) =>
-                session.turnInstructionSources.get((turn as unknown as SessionTurn).id)
+            instructionSourcesOf: (turn) => session.turnInstructionSources.get((turn as unknown as SessionTurn).id)
         };
     }
 
@@ -5230,6 +5718,10 @@ export class SessionStore {
         // C4/R2: the same filtered set `snapshot()` shows (deleted conversations are hidden,
         // never erased) — one helper, so the two surfaces cannot state different sets.
         const invalidThreads = this.invalidThreadViews(session);
+        // F7: the soft-deleted ids, computed once for the same reason `snapshot()` computes them
+        // once (./protocol.ts `SessionView.inactiveThreads` for why the fact cannot ride on the
+        // roster). Both session headers carry it, exactly like `pluginDiagnostics` above.
+        const inactiveThreads = this.inactiveThreadIdsOf(session);
 
         return {
             id: session.id,
@@ -5253,10 +5745,14 @@ export class SessionStore {
             ...(threads.length === 0 ? {} : { threadViews: threadViewsOf(threads) }),
             // T1.5 last mile: the plugin-diagnostic journal, on the COMPILED view too (see
             // `SessionView.pluginDiagnostics` for why both headers carry it).
-            ...(session.pluginDiagnostics.length === 0
-                ? {}
-                : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
+            ...(session.pluginDiagnostics.length === 0 ? {} : { pluginDiagnostics: this.pluginDiagnosticsOf(session) }),
             ...(invalidThreads.length === 0 ? {} : { invalidThreads }),
+            // F7 (2026-11-17): the soft-deleted conversation ids, omitted when the session never
+            // deleted one. The compiled view is the header the shell polls, and a reload is exactly
+            // the moment the board needs the marker — with only the roster it must guess between
+            // "deleted" and "never existed", and it guesses wrong (./protocol.ts
+            // `SessionView.inactiveThreads`). Same value `snapshot()` reports, from one helper.
+            ...(inactiveThreads.length === 0 ? {} : { inactiveThreads }),
             ...(session.labelSeeds.size === 0
                 ? {}
                 : {
@@ -5267,6 +5763,27 @@ export class SessionStore {
             ...(session.labelHighWater.size === 0
                 ? {}
                 : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
+            // F1/F4: the same three read-only fields `snapshot()` carries (see the notes there for
+            // why each is omitted when empty and why the ceiling travels with the counts). The
+            // compiled view is what the shell actually polls, so a streak a user can see has to be
+            // on this surface too — otherwise "the provider has failed 3 times in a row" is only
+            // answerable through `GET /sessions/:id`.
+            ...(session.networkFailures.size === 0
+                ? {}
+                : {
+                      networkFailures: Object.fromEntries([...session.networkFailures]),
+                      networkFailureLimit: session.networkResumeLimit
+                  }),
+            ...(session.rollbacks.size === 0
+                ? {}
+                : {
+                      turnRollbacks: Object.fromEntries(
+                          [...session.rollbacks].map(([turnId, records]) => [
+                              turnId,
+                              records.map((record) => ({ ...record }))
+                          ])
+                      )
+                  }),
             // Instruction text is deliberately absent here (see `viewDescriptorOf`):
             // the bar's `system` segment carries the COUNT, and the exact text is one
             // block detail away.
@@ -5432,10 +5949,7 @@ export class SessionStore {
         // A 404 says "this segment's text is not in this document", which the board shows as
         // an unavailable detail instead of an empty one.
         if (block.kind === 'user' && block.name === 'steer' && !('text' in payload)) {
-            throw new SessionError(
-                404,
-                `The text of steered segment "${blockId}" is not in this turn's record.`
-            );
+            throw new SessionError(404, `The text of steered segment "${blockId}" is not in this turn's record.`);
         }
 
         return {
@@ -5590,7 +6104,8 @@ export class SessionStore {
 
             const queuedError = this.io.journalError(session.id);
 
-            if (queuedError !== undefined) this.noteJournalError(session, `could not open the event journal: ${queuedError}`);
+            if (queuedError !== undefined)
+                this.noteJournalError(session, `could not open the event journal: ${queuedError}`);
 
             return session.journal;
         }
@@ -5607,13 +6122,7 @@ export class SessionStore {
         return journal;
     }
 
-    private journalAppend(
-        session: Session,
-        turnId: string,
-        index: number,
-        at: number,
-        event: HarnessEvent
-    ): void {
+    private journalAppend(session: Session, turnId: string, index: number, at: number, event: HarnessEvent): void {
         // A removed/disposed session must not resurrect its own log: an in-flight run
         // can still record after `remove()` deleted the session (the same rule that
         // suppresses its publishes).
@@ -5628,7 +6137,8 @@ export class SessionStore {
 
             const queuedError = this.io.journalError(session.id);
 
-            if (queuedError !== undefined) this.noteJournalError(session, `could not append to the event journal: ${queuedError}`);
+            if (queuedError !== undefined)
+                this.noteJournalError(session, `could not append to the event journal: ${queuedError}`);
 
             return;
         }
@@ -5763,17 +6273,20 @@ export class SessionStore {
         if (session.checkpointTimer !== undefined) return;
 
         session.checkpointArmedAt = Date.now();
-        session.checkpointTimer = setTimeout(() => {
-            session.checkpointTimer = undefined;
-            session.checkpointArmedAt = undefined;
+        session.checkpointTimer = setTimeout(
+            () => {
+                session.checkpointTimer = undefined;
+                session.checkpointArmedAt = undefined;
 
-            // A session that went away, a store that is restoring, and a store that is closing
-            // all refuse a write anyway (`persistBestEffort` guards the last two); say so here
-            // so the deferred commit is not attempted into a document that no longer exists.
-            if (session.disposed || this.loading || this.shuttingDown) return;
+                // A session that went away, a store that is restoring, and a store that is closing
+                // all refuse a write anyway (`persistBestEffort` guards the last two); say so here
+                // so the deferred commit is not attempted into a document that no longer exists.
+                if (session.disposed || this.loading || this.shuttingDown) return;
 
-            this.checkpoint(session, true);
-        }, Math.max(0, delayMs));
+                this.checkpoint(session, true);
+            },
+            Math.max(0, delayMs)
+        );
 
         // Same rule as the lane drain timer (see the `setTimeout(wake, remaining)` at
         // :10570): a pending checkpoint is work the process may legitimately die with,
@@ -5823,6 +6336,22 @@ export class SessionStore {
 
         this.surfaceJournalProblems(session, read.problems);
 
+        // F4 (2026-11-17): re-adopt the abandoned-attempt records the file holds.
+        //
+        // WHY THIS IS LOAD-BEARING. The journal is the only store that carries a dropped tail in
+        // full, and `compactJournal` publishes EXACTLY what `session.journalRollbacks` holds. So a
+        // restore that ignored these lines would delete every earlier abandonment from the file the
+        // first time any turn in this session is re-run — the same evidence loss F4 exists to stop,
+        // one restart later.
+        //
+        // WHAT IS DELIBERATELY NOT DONE: these records are never folded into `turn.events` (the
+        // fold below reads `read.events` only). A rolled-back attempt's frames staying OUT of the
+        // live history is the meaning of the rollback; re-projecting them would resurrect the ghost
+        // steps the in-place requeue exists to remove. Capped from the newest end with the same
+        // bound `recordRollback` enforces, so a restore cannot hand the next rewrite an unbounded
+        // payload.
+        session.journalRollbacks = read.rollbacks.slice(-JOURNAL_ROLLBACK_LIMIT);
+
         const logged = new Map<string, JournalEventRecord[]>();
 
         for (const record of read.events) {
@@ -5859,7 +6388,8 @@ export class SessionStore {
                 // A journal line is written BEFORE the document is rewritten, so on a
                 // conflict the journal is the newer byte. Compare cheaply first.
                 if (existing.at === record.at && existing.event === record.event) continue;
-                if (JSON.stringify(existing.event) === JSON.stringify(record.event) && existing.at === record.at) continue;
+                if (JSON.stringify(existing.event) === JSON.stringify(record.event) && existing.at === record.at)
+                    continue;
 
                 merged.set(record.index, { event: record.event, at: record.at });
             }
@@ -5928,9 +6458,21 @@ export class SessionStore {
     // DELETION used to compact after its purge, and a reset used to; neither does any more, because
     // neither removes a turn row — a deletion marks the conversation and keeps every turn, and a reset
     // drops the records wholesale rather than event by event. The one caller left is
-    // `requeueTurnInPlace` (both its success path and its rollback), which compacts the ONE turn it is
-    // re-announcing so its stale steps cannot be replayed onto a restart as ghost steps.
-    private compactJournal(session: Session, turnIds?: Iterable<string>): void {
+    // `requeueTurnInPlace` (both its success path and its rollback), which compacts AFTER the
+    // in-memory rollback so its stale steps cannot be replayed onto a restart as ghost steps.
+    //
+    // WHAT THE NEW FILE CONTAINS (F4 — it no longer holds only the turn being re-run). The old
+    // rewrite took a `turnIds` filter and wrote just those turns, which silently dropped every
+    // OTHER conversation's event lines (they survived only in the session shard, so a journal
+    // rebuild could no longer see them), and it ran BEFORE the rollback while the recorder had
+    // already written the abandoned attempt's frames into the live row — so it re-published the
+    // tail it was meant to remove, and a persist failure left events beyond the row's `checkpoint`
+    // boundary with nothing to explain them. It now emits:
+    //   - the live event records of EVERY turn of EVERY conversation, so no turn's history is ever
+    //     dropped by someone else's resume, and
+    //   - one `rollback` line per recorded abandoned attempt (see `recordRollback`), so the dropped
+    //     tail — including its terminal `error` frame — stays recoverable in the file.
+    private compactJournal(session: Session): void {
         // D4: which thread holds the handle decides who writes. Inline needs the session's own
         // `HarnessJournal` (and does nothing without one); worker mode has no writer handle on
         // this thread at all, so the rewrite is QUEUED for the thread that owns the fd. The
@@ -5940,26 +6482,11 @@ export class SessionStore {
 
         if (this.io === undefined && inline === undefined) return;
 
-        const wanted = turnIds === undefined ? undefined : new Set(turnIds);
-        const records: JournalEventRecord[] = [];
-
-        for (const turn of session.turns) {
-            if (wanted !== undefined && !wanted.has(turn.id)) continue;
-
-            for (let index = 0; index < turn.events.length; index += 1) {
-                records.push({
-                    type: 'event',
-                    v: 1,
-                    turnId: turn.id,
-                    index,
-                    at: turn.eventTimes?.[index] ?? turn.updatedAt,
-                    event: turn.events[index]
-                });
-            }
-        }
+        const events = journalEventRecordsOf(session);
+        const rollbacks = session.journalRollbacks;
 
         if (this.io === undefined && inline !== undefined) {
-            inline.rewrite(records);
+            inline.rewrite([...events, ...rollbacks]);
 
             const error = inline.error;
 
@@ -5968,14 +6495,157 @@ export class SessionStore {
             return;
         }
 
-        this.io?.queueJournalRewrite(session.id, records);
+        // Worker mode: the coordinator's rewrite channel carries EVENT records (that is the protocol
+        // message this package owns, ./workers/io-protocol.ts), so the abandoned tails cannot travel
+        // with them. Their evidence rides in the session shard instead — `session.rollbacks` keeps
+        // every dropped `error` frame durably — while a bounded copy of the frames themselves stays
+        // in the journal shard (`session.journalRollbacks`), which is the file the io worker will
+        // rebuild on demand. The worker's own file keeps every live event record, so the committed
+        // head of the attempt is unchanged there.
+        this.io?.queueJournalRewrite(session.id, events);
 
         // The mirror of `journal.error` for the session, read the same instant the inline path
         // would read its own handle: a rewrite that already failed is reported here, and a
         // later one arrives through `onJournalError`.
         const queuedError = this.io?.journalError(session.id);
 
-        if (queuedError !== undefined) this.noteJournalError(session, `could not rewrite the event journal: ${queuedError}`);
+        if (queuedError !== undefined)
+            this.noteJournalError(session, `could not rewrite the event journal: ${queuedError}`);
+    }
+
+    // RECORD THE ATTEMPT THAT IS ABOUT TO BE ABANDONED (F4).
+    //
+    // WHY THIS EXISTS. `requeueTurnInPlace` splices every event after the last `attempt_commit`
+    // out of the turn record, and `compactJournal` then rewrites the log from the SURVIVING
+    // records. Both were correct about the resumed row and both were destroying the evidence: the
+    // abandoned attempt's streamed steps AND its terminal `error` frame left the record and the
+    // file at the same instant, so a session that had been auto-resumed twice could no longer
+    // answer "what actually killed those runs" — that is the whole reason F1 needs the counter to
+    // be durable, and the reason a resumed thread's history was unrecoverable.
+    //
+    // WHAT IT WRITES, and why the two copies are not the same size:
+    //   - the JOURNAL (inline mode) gets the FULL dropped tail, in order, including the terminal
+    //     `error` frame, as one `rollback` line (./journal.ts `JournalRollbackRecord`). The file is
+    //     the big store; this is what makes the tail recoverable, and the next rewrite re-emits it
+    //     (see `compactJournal`) instead of erasing it.
+    //   - the CHECKPOINT (the session shard, via `sessionRecord`) gets a BOUNDED summary: the
+    //     boundary, the count, the reason, and every dropped `error` frame. Shards are re-read on
+    //     every restore, so they must stay small — the `error` frames are the part a human needs.
+    //     This copy is also the ONLY one worker mode gets, because the coordinator's rewrite
+    //     channel carries event records only (./workers/io-protocol.ts).
+    //
+    // ORDERING. Called BEFORE the splice's durability fence and BEFORE the rewrite: the line is on
+    // disk before the truncation can be observed, and `compactJournal` re-emits every record this
+    // method has registered, so the file and the list cannot disagree.
+    //
+    // WHAT A FAILURE MEANS. A refused append (journal in error state) is noted, never thrown: the
+    // resume is the user's recovery action, and it must not fail because the evidence copy could
+    // not be written. The checkpoint copy is still taken, so the summary survives.
+    private recordRollback(
+        session: Session,
+        turn: SessionTurn,
+        boundary: number,
+        droppedEvents: SessionTurnEvent[],
+        droppedTimes: number[] | undefined,
+        reason?: string
+    ): void {
+        const at = Date.now();
+
+        // WHY THE ATTEMPT DIED, in the store's own words. A turn record carries no error field
+        // (./protocol.ts `SessionTurn`): the failure IS the terminal `error` frame the recorder
+        // wrote — and that frame is sitting in the tail being dropped. So the reason is read out of
+        // the tail before it leaves; otherwise this method saves the evidence of a failure while
+        // throwing away its cause. A host-initiated resume of a run that was STOPPED (not failed)
+        // has no such frame and gets the neutral sentence.
+        let reasonText = reason;
+
+        for (let index = droppedEvents.length - 1; reasonText === undefined && index >= 0; index -= 1) {
+            const frame = droppedEvents[index];
+
+            if (frame.type === 'error') reasonText = frame.error.message;
+        }
+
+        if (reasonText === undefined) reasonText = ROLLBACK_REASON_RESUMED;
+
+        // The full tail, keyed by the index each frame held in the abandoned attempt, so a reader
+        // can place it against the committed head without guessing the order.
+        const entries: JournalRollbackEntry[] = droppedEvents.map((event, index) => ({
+            index,
+            at: droppedTimes?.[index] ?? at,
+            event
+        }));
+
+        const journal = this.io === undefined ? session.journal : undefined;
+
+        if (journal !== undefined) {
+            const appended = journal.appendRollback({
+                turnId: turn.id,
+                at,
+                boundary,
+                reason: reasonText,
+                events: entries
+            });
+
+            if (!appended) {
+                this.noteJournalError(session, 'could not record the abandoned attempt in the event journal');
+            } else {
+                session.journalRollbacks.push({
+                    type: 'rollback',
+                    v: HARNESS_JOURNAL_VERSION,
+                    turnId: turn.id,
+                    at,
+                    boundary,
+                    reason: reasonText,
+                    events: entries
+                });
+
+                // Registered so the rewrite that follows (and every rewrite after it) re-emits the
+                // line. Capped by dropping the OLDEST evidence: the newest abandoned attempts are
+                // the ones an operator is debugging. The caller's `compactJournal` — which always
+                // runs next, in the same tick — is what makes the FILE match this list; until it
+                // does, the log may hold one line more than the store remembers, and the restore
+                // ignores rollback lines entirely, so a duplicate is inert.
+                if (session.journalRollbacks.length > JOURNAL_ROLLBACK_LIMIT) {
+                    session.journalRollbacks = session.journalRollbacks.slice(-JOURNAL_ROLLBACK_LIMIT);
+                }
+            }
+        }
+
+        // The bounded checkpoint copy. Only a thread's ABANDONED attempts are recorded this way, and
+        // only the last `TURN_ROLLBACK_LIMIT` of them per turn; `error` frames are kept verbatim and
+        // every other frame is reduced to its count, because the count is all the shard needs to
+        // state how much evidence the journal is holding.
+        const errors = entries
+            .filter((entry) => entry.event.type === 'error')
+            .map((entry) => entry.event as SessionTurnEvent)
+            .slice(-TURN_ROLLBACK_LIMIT);
+
+        const summary: SessionRollbackRecord = {
+            at,
+            boundary,
+            droppedEvents: droppedEvents.length,
+            reason: reasonText.slice(0, ROLLBACK_REASON_LIMIT),
+            ...(errors.length === 0 ? {} : { errors })
+        };
+
+        const kept = [...(session.rollbacks.get(turn.id) ?? []), summary].slice(-TURN_ROLLBACK_LIMIT);
+
+        session.rollbacks.set(turn.id, kept);
+    }
+
+    // UNDO `recordRollback` after a persist failure (see `requeueTurnInPlace`'s catch). The event
+    // tail is pushed back onto the row by the caller, so the rollback this record describes did not
+    // happen — leaving the line registered would have the next rewrite publish a tail that the live
+    // record holds again, i.e. the same double-fold the fix exists to prevent. The journal's copy is
+    // dropped by the rewrite that follows (it re-emits only what is registered here); the checkpoint
+    // copy is dropped now, because `sessionRecord` is what the next persist writes.
+    private undoRollback(session: Session, turnId: string): void {
+        session.journalRollbacks = session.journalRollbacks.filter((record) => record.turnId !== turnId);
+
+        const kept = (session.rollbacks.get(turnId) ?? []).slice(0, -1);
+
+        if (kept.length === 0) session.rollbacks.delete(turnId);
+        else session.rollbacks.set(turnId, kept);
     }
 
     // PATCH /sessions/:id — retarget the model of one or more agents in THIS live
@@ -6346,9 +7016,8 @@ export class SessionStore {
 
         // An omitted `profile` binds the profile the name already spells, which is the only
         // pair the identity rule below can ever accept anyway.
-        const profile = typeof input.profile === 'string' && input.profile.trim().length > 0
-            ? input.profile.trim()
-            : name;
+        const profile =
+            typeof input.profile === 'string' && input.profile.trim().length > 0 ? input.profile.trim() : name;
 
         if (profile !== name) {
             throw new SessionError(
@@ -6412,9 +7081,7 @@ export class SessionStore {
             // sentence) treats as one agent. A profile member is caught here too — "Instruct" is
             // not a profile id, and inventing a second entry point's near-twin would be a silent
             // roster surprise rather than a new agent.
-            const clash = session.definition.agents.find(
-                (member) => member.toLowerCase() === name.toLowerCase()
-            );
+            const clash = session.definition.agents.find((member) => member.toLowerCase() === name.toLowerCase());
 
             if (clash !== undefined) {
                 throw new SessionError(
@@ -6424,13 +7091,15 @@ export class SessionStore {
             }
         }
 
-        const model = typeof input.model === 'string' && input.model.trim().length > 0
-            ? input.model.trim()
-            : session.settings.model;
+        const model =
+            typeof input.model === 'string' && input.model.trim().length > 0
+                ? input.model.trim()
+                : session.settings.model;
 
-        const instruction = typeof input.instruction === 'string' && input.instruction.trim().length > 0
-            ? input.instruction.trim()
-            : undefined;
+        const instruction =
+            typeof input.instruction === 'string' && input.instruction.trim().length > 0
+                ? input.instruction.trim()
+                : undefined;
 
         if (instruction !== undefined && instruction.length > this.maxAgentInstructionChars) {
             throw new SessionError(
@@ -6583,9 +7252,7 @@ export class SessionStore {
         // runtime's backstop below counts the RETAINED row and refuses anyway (a document naming a
         // removed agent cannot restore), so promising "delete the threads first" here would send a
         // caller around a loop that ends in the same 409.
-        const owned = session.harness
-            .threads()
-            .filter((thread) => thread.origin === 'host' && thread.agent === agent);
+        const owned = session.harness.threads().filter((thread) => thread.origin === 'host' && thread.agent === agent);
 
         if (owned.length > 0) {
             throw new SessionError(
@@ -6729,9 +7396,10 @@ export class SessionStore {
         // rebuild it (./harnesses/toolbox.ts), so the live prompt, the durable record, and the
         // next start are one string — and no guideline block is invented for an agent that has no
         // trusted profile to supply one.
-        const liveText = custom === undefined
-            ? agentInstruction(profile!, override ?? undefined)
-            : customAgentInstruction(agent, override ?? custom);
+        const liveText =
+            custom === undefined
+                ? agentInstruction(profile!, override ?? undefined)
+                : customAgentInstruction(agent, override ?? custom);
 
         const previous = this.captureBindingState(session);
 
@@ -6954,10 +7622,7 @@ export class SessionStore {
         // can still add the same label once per source, which is intended. Return
         // detached copies (the caller stores them on the turn).
         if (bound.length > MAX_AGENT_REFERENCES) {
-            throw new SessionError(
-                400,
-                `A task cannot reference more than ${MAX_AGENT_REFERENCES} result blocks.`
-            );
+            throw new SessionError(400, `A task cannot reference more than ${MAX_AGENT_REFERENCES} result blocks.`);
         }
 
         return bound.map((reference) => ({ ...reference }));
@@ -6992,9 +7657,7 @@ export class SessionStore {
             .map((turn) => {
                 const seed = session.labelSeeds.get(turn.id);
                 const threadLabel =
-                    turn.threadId === undefined
-                        ? turn.threadLabel
-                        : this.ensureThreadLabel(session, turn.threadId);
+                    turn.threadId === undefined ? turn.threadLabel : this.ensureThreadLabel(session, turn.threadId);
 
                 return {
                     id: turn.id,
@@ -7024,7 +7687,14 @@ export class SessionStore {
         }
 
         const record = this.threadsSupported(session) ? session.harness.thread(threadId) : undefined;
-        const agent = record?.agent ?? agentHint ?? session.preset.primary;
+        // F8 (2026-11-17): the code comes from the CONVERSATION, not from the session's primary
+        // agent. A live record is the authority; then the hint the caller already had; then the
+        // conversation's own durable evidence (the retained row / a shown label / an archived run),
+        // which is what a soft-deleted or restored conversation still offers; the preset's primary
+        // agent is LAST, because it is the fallback that minted `IT*` for conversations that never
+        // ran the primary agent (see `threadAgentContextOf` for the dump evidence).
+        const agent =
+            record?.agent ?? agentHint ?? this.threadAgentContextOf(session, threadId) ?? session.preset.primary;
         const label = this.mintThreadLabel(session, threadId, agentCodeOf(agent));
 
         this.mirrorThreadLabel(session, threadId, label);
@@ -7071,7 +7741,33 @@ export class SessionStore {
 
     // Mint the next ordinal of `code` for one conversation and record it.
     private mintThreadLabel(session: Session, threadId: string, code: string): string {
-        const ordinal = this.nextConversationOrdinal(session, code);
+        let ordinal = this.nextConversationOrdinal(session, code);
+
+        // F8 (2026-11-17): skip an ordinal a DIFFERENT conversation already shows.
+        //
+        // WHY THE COUNTERS ARE NOT ENOUGH. `nextConversationOrdinal` reads the two high-water maps,
+        // and a name can be live in the session WITHOUT its ordinal being in them: the runtime's own
+        // roster copy (`core.threads[].label`) carries labels the store's map never held (the
+        // operator's dump: `thread-4` shows `RH1` and `thread-5` shows `GL1` while `threadLabels` has
+        // `IT5`/`IT6 for the same ids, and the high-water knows nothing about `RH1`... only because
+        // `ensureThreadLabel` mirrored them), and `adoptPersistedLabels` deliberately DROPS a map
+        // entry when two conversations claim one name — after which the loser is re-minted from a
+        // counter that never saw the winner. Skipping is what makes the mint correct in both shapes:
+        // the text a user can already see is never handed to a second conversation.
+        //
+        // WHY IT TERMINATES. Each skip RAISES both durable counters to the colliding ordinal, so
+        // `nextConversationOrdinal` returns a strictly larger number on the next pass. The loop can
+        // therefore only walk upward, and it stops at the first ordinal nobody holds — the same
+        // "raise, never lower" discipline every other label write uses.
+        for (;;) {
+            const holder = this.threadLabelHolder(session, `${code}${ordinal}`);
+
+            if (holder === undefined || holder === threadId) break;
+
+            this.raiseThreadLabelHighWater(session, `${code}${ordinal}`);
+            ordinal = this.nextConversationOrdinal(session, code);
+        }
+
         const label = `${code}${ordinal}`;
 
         session.threadLabels.set(threadId, label);
@@ -7079,6 +7775,68 @@ export class SessionStore {
         // raiseThreadLabelHighWater), so the number is retired in the one sequence.
         this.raiseThreadLabelHighWater(session, label);
         return label;
+    }
+
+    // F8: which conversation (if any) already shows this exact text label, checked against BOTH
+    // places a name can live: the store's allocation map AND the committed roster rows (including a
+    // soft-deleted row, which `shell`/`bash` and a `#` reference can still address). Returns the
+    // FIRST holder found, or undefined when the name is free.
+    //
+    // WHY BOTH: the user-visible set is the union (that is precisely why `WE6` appeared twice in the
+    // dump's roster, once per store), so a mint is only safe against the union.
+    private threadLabelHolder(session: Session, label: string): string | undefined {
+        for (const [threadId, value] of session.threadLabels) {
+            if (value === label) return threadId;
+        }
+
+        for (const row of session.core.threads ?? []) {
+            if (row.label === label) return row.id;
+        }
+
+        return undefined;
+    }
+
+    // F8 (2026-11-17): the agent of a conversation the live roster no longer names.
+    //
+    // WHY IT EXISTS. `ensureThreadLabel` derives the two-letter CODE from the conversation's agent,
+    // and a conversation `harness.thread()` does not name — the ordinary state of a soft-deleted row
+    // (R2 retains it) and of every conversation a restored document carries — used to fall back to
+    // `session.preset.primary`. That minted the PRIMARY agent's code onto conversations that never
+    // ran it, irreversibly: the name lands in the map, on the turn records, and in every `#`
+    // reference typed afterwards. The operator's dump shows it at scale (Temp/orch-plan/report.md §1
+    // and §2: `threadLabels` reads `IT5`…`IT13` for threads whose `core.threads[].agent` is
+    // `research`, `general`, `workspace` and `reviewer`).
+    //
+    // THE EVIDENCE, strongest first:
+    //   1. the RETAINED committed row (`core.threads[].agent`) — the durable record of THIS
+    //      conversation, and exactly what the soft delete keeps;
+    //   2. the CODE of a label a turn of this conversation already showed — the family the user saw
+    //      the conversation in, and the name a typed `#WE6` has to keep resolving to;
+    //   3. the agent of an ARCHIVED run of this conversation (`core.agentResults[].agent`, joined by
+    //      `threadId`) — the runtime's own per-run record, kept for the last 64 runs;
+    //   4. nothing, and the caller's own fallback decides (a conversation with no evidence at all is
+    //      genuinely the entry agent's, which is what the roster pass guarantees for a host thread).
+    private threadAgentContextOf(session: Session, threadId: string): string | undefined {
+        const retained = (session.core.threads ?? []).find((row) => row.id === threadId);
+
+        if (retained?.agent !== undefined) return retained.agent;
+
+        for (const turn of session.turns) {
+            if (turn.threadId !== threadId) continue;
+
+            const parts = turn.threadLabel === undefined ? undefined : agentLabelParts(turn.threadLabel);
+
+            if (parts === undefined) continue;
+
+            // The code is the only part that survives here; the agent NAME is not recoverable from
+            // it, and `ensureThreadLabel` only ever needs the code (`agentCodeOf` maps a name to the
+            // same code by rule), so passing the code back through that helper is identity.
+            return parts.code;
+        }
+
+        const archived = (session.core.agentResults ?? []).find((result) => result.threadId === threadId);
+
+        return archived?.agent;
     }
 
     // T14/F1: the next ordinal of a code in the ONE canonical sequence.
@@ -7092,12 +7850,7 @@ export class SessionStore {
     // two maps are kept in sync on every mint, which is what makes that fallback
     // safe.
     private nextConversationOrdinal(session: Session, code: string): number {
-        return (
-            Math.max(
-                session.threadLabelHighWater.get(code) ?? 0,
-                session.labelHighWater.get(code) ?? 0
-            ) + 1
-        );
+        return Math.max(session.threadLabelHighWater.get(code) ?? 0, session.labelHighWater.get(code) ?? 0) + 1;
     }
 
     // Reserve one ordinal of a code in both durable counters WITHOUT binding it to
@@ -7123,10 +7876,7 @@ export class SessionStore {
         const code = parts.code;
         const used = parts.ordinal;
 
-        session.threadLabelHighWater.set(
-            code,
-            Math.max(session.threadLabelHighWater.get(code) ?? 0, used)
-        );
+        session.threadLabelHighWater.set(code, Math.max(session.threadLabelHighWater.get(code) ?? 0, used));
         session.labelHighWater.set(code, Math.max(session.labelHighWater.get(code) ?? 0, used));
     }
 
@@ -7242,9 +7992,7 @@ export class SessionStore {
 
         if (!this.threadsSupported(session)) return;
 
-        for (const record of [...session.harness.threads()].sort(
-            (left, right) => left.sequence - right.sequence
-        )) {
+        for (const record of [...session.harness.threads()].sort((left, right) => left.sequence - right.sequence)) {
             // Only INDEPENDENT (host) conversations are labelled eagerly. An
             // agent's implicit default conversation is internal plumbing: it takes a
             // number only when a turn actually runs in it, so the first user-opened
@@ -7255,24 +8003,83 @@ export class SessionStore {
         }
     }
 
-    // Invocation id → conversation label, for the shared block projection. A
+    // Invocation RUN → conversation label, for the shared block projection. A
     // delegated child's events carry its runtime invocation id; the shared
     // projector needs that id's CONVERSATION label (not a fresh per-invocation
     // number), so a repeated run in one child conversation keeps one `#` name.
+    //
+    // R19: this is the map `../shared/agent-results.ts` consumes.
+    //
+    // W19 (2026-11-17): it is keyed by RUN (`id\0epoch`, bare when the producer named no epoch) — the
+    // single view, not the bare-id map this used to hand back. The block projection reads it with the
+    // frame's own epoch because a block is created FROM A FRAME, and a frame carries
+    // `HarnessThread.epoch`. Keyed by the bare id, the projection merged the two runs of a recycled
+    // invocation into ONE result block and printed whichever conversation the join reached first —
+    // measured on the operator's document, the block for `15` wore `WE6` (the dead child's
+    // conversation) while the post-restart run wearing `15` belongs to `IT4`. The consumer falls back
+    // to the bare id, which is all a pre-epoch record holds anyway, so a legacy document's blocks keep
+    // the labels they have today.
     private invocationThreadLabels(session: Session): Record<string, string> {
+        return this.labelJoinsOf(session);
+    }
+
+    // THE join pass, in one place: every invocation this session can name, mapped to its
+    // conversation's display label, in AUTHORITY ORDER with FIRST-WRITE-WINS. ONE view comes out of the
+    // one pass, keyed by INVOCATION RUN (`id\0epoch`, or the bare id when the producer named no epoch):
+    //
+    //   - the display fold's key space (./turn-projector.ts resolves a section with the epoch its own
+    //     frames carry), and it is what stops one conversation's name being printed on another
+    //     conversation's row;
+    //   - the block projection's key space too, since W19 (../shared/agent-results.ts `blockForThread`
+    //     builds its block key off the frame's epoch). It used to consume a SECOND, bare-id map, and that
+    //     map is what merged one recycled id's two runs into one labelled block.
+    //
+    // Both consumers resolve an exact run key first and only then the bare id, so an epoch-less entry
+    // stays reachable without this pass ever having to duplicate every entry under two keys — the
+    // duplicate is what reintroduced the misattribution the run key exists to prevent.
+    //
+    // WHY FIRST-WRITE-WINS, and why the order below is the order: the three sources answer
+    // different questions, and until now the weaker ones OVERWROTE the stronger.
+    //
+    //   1. `session.invocationThreads` — the join written at the run's own `start` frame, and the
+    //      only source that carries a process epoch (exact);
+    //   2. `session.turnInvocations` — a turn's ROOT invocation id, epoch-less by construction;
+    //   3. each host thread's `record.invocationId` — that conversation's LATEST run, epoch-less.
+    //
+    // Measured on the operator's own document (Temp/orch-plan/session.json, turn 319cfc1c): source
+    // 1 said `15 → thread-14` (a pre-restart delegated child, `WE6`) and source 2 said `15` names
+    // the post-restart root run of `thread-13` (`IT4`). Both statements are TRUE, of two different
+    // runs — the id is a per-process counter — and source 2 used to erase source 1, which is how
+    // `IT4` came to label the dead child's row. Under the run key the two entries cannot collide
+    // at all; and where the record genuinely cannot tell the runs apart (no epoch anywhere), the
+    // entry written from the run's own frame keeps the authority instead of losing to a later loop.
+    //
+    // Nothing here re-numbers a conversation: `ensureThreadLabel` is still the store's single
+    // allocator (T14/F1) and it is still CALLED for every entry — including the ones whose value
+    // loses the write — so a conversation whose name is not yet recorded is allocated exactly
+    // when it always was, and the label high-water is raised identically.
+    private labelJoinsOf(session: Session): Record<string, string> {
         const labels: Record<string, string> = {};
 
         if (!this.threadsSupported(session)) return labels;
 
-        for (const [invocationId, threadId] of session.invocationThreads) {
-            labels[invocationId] = this.ensureThreadLabel(session, threadId);
+        // The one writer, first-write-wins, so a label that is already resolved from a more precise
+        // source can never be re-pointed at another conversation.
+        const bind = (runKey: string, threadId: string, agentHint?: string): void => {
+            const label = this.ensureThreadLabel(session, threadId, agentHint);
+
+            if (labels[runKey] === undefined) labels[runKey] = label;
+        };
+
+        for (const [runKey, threadId] of session.invocationThreads) {
+            bind(runKey, threadId);
         }
 
         for (const [turnId, invocationId] of session.turnInvocations) {
             const turn = session.turns.find((candidate) => candidate.id === turnId);
             if (turn?.threadId === undefined) continue;
 
-            labels[invocationId] = this.ensureThreadLabel(session, turn.threadId);
+            bind(invocationId, turn.threadId);
         }
 
         for (const record of session.harness.threads()) {
@@ -7286,15 +8093,26 @@ export class SessionStore {
             // its blocks are labelled by the shared allocator instead.
             if (record.origin !== 'host') continue;
 
-            labels[record.invocationId] = this.ensureThreadLabel(session, record.id, record.agent);
+            // W19 (2026-11-17): bound by the record's OWN RUN, not by the bare id. The record states
+            // "`invocationId` was the latest run of THIS conversation", and `record.epoch` (written in
+            // the same statement as the id, ../types) says which process minted it — so that is the key
+            // the statement belongs on. Bound bare, a conversation restored from a ledger generation that
+            // has ENDED claims its dead id for the live run that re-minted it: the same misattribution
+            // `noteInvocationThread` refuses at write time (~:11563), arriving by the read side, and
+            // first-write-wins then locks the dead conversation's name onto a live row.
+            //
+            // A record with NO epoch (every conversation restored from a pre-change document, and every
+            // host runtime that stamps no epoch) still binds bare, exactly as before, so a legacy
+            // document's rows keep the names they have today.
+            bind(invocationRunKeyOf(record.invocationId, record.epoch), record.id, record.agent);
         }
 
         return labels;
     }
 
-    // R18/T20: resolve the conversation label of ONE invocation at LOOKUP time, for the
+    // R18/T20: resolve the conversation label of ONE invocation RUN at LOOKUP time, for the
     // live fold (see `displayContext`). This is the same join the eager
-    // `invocationThreadLabels` map is built from — invocation → conversation
+    // `labelJoinsOf` map is built from — invocation run → conversation
     // (`session.invocationThreads`) → conversation label (`session.threadLabels`) — read
     // through the store's own allocator, so nothing here numbers a conversation
     // differently: `ensureThreadLabel` returns the recorded name when there is one and is
@@ -7307,10 +8125,20 @@ export class SessionStore {
     // recorder, and it produces exactly the value the next cold replay would read from
     // disk. A branch invocation is never in the join map, so a branch row still resolves
     // nothing (R18: the fold mints no identity the record does not justify).
-    private liveThreadLabel(session: Session, invocationId: string): string | undefined {
+    //
+    // R19: the argument is a RUN KEY, and the lookup is exact-then-bare: a run the map holds
+    // under its own epoch resolves there, and anything else falls back to the BARE id — which is
+    // both the legacy key (a record written before the epoch field) and the pre-change answer.
+    // The fold performs the same two-step for its eager map (./turn-projector.ts
+    // `conversationLabelOf`), so live ≡ replay for a recycled id rather than for an absent one.
+    private liveThreadLabel(session: Session, runKey: string): string | undefined {
         if (!this.threadsSupported(session)) return undefined;
 
-        const threadId = session.invocationThreads.get(invocationId);
+        const bare = invocationIdOfRunKey(runKey);
+
+        const threadId =
+            session.invocationThreads.get(runKey) ??
+            (runKey === bare ? undefined : session.invocationThreads.get(bare));
 
         if (threadId === undefined) return undefined;
 
@@ -7359,6 +8187,94 @@ export class SessionStore {
         for (const [key, value] of copy) target.set(key, value);
     }
 
+    // F8 (2026-11-17): undo ONE unpublished submit's label allocation, DELTA ONLY.
+    //
+    // WHAT WAS WRONG. The enqueue rollback called `restoreCounterMap` — clear the live map, replay
+    // the snapshot — which is only equivalent to an undo when nothing else touched those maps
+    // between the snapshot and the catch. It awaits a durable WRITE, and the store is per-LANE
+    // concurrent (see the lane note in `enqueue`): a sibling lane's run mints `WE9` for a delegated
+    // child inside that window (the recorder allocates in the same step it records the join,
+    // `noteInvocationThread`), and the clear then took that name back although the child
+    // conversation, its turn rows and its `#WE9` references were all still live. The next mint
+    // handed `WE9` to a DIFFERENT conversation — the duplicate-label defect class (R8, R18/T20,
+    // T14/F1-F3) the rollback itself was supposed to close.
+    //
+    // WHAT THIS DOES INSTEAD:
+    //   1. release the name THIS submit minted, and only while the map still holds our exact
+    //      (thread → label) pair, so an unrelated rollback can never erase a sibling's entry;
+    //   2. compare-and-lower each durable counter: it moves only when it is STILL sitting exactly
+    //      where our mint left it (nobody else raised it in the window), and never below the
+    //      highest ordinal genuinely still allocated to that code, with the pre-submit value as the
+    //      floor. Retiring the ordinal the user never saw (T14/F3) is preserved; a sibling's raise
+    //      is not;
+    //   3. leave every entry a sibling added exactly where the sibling put it — nothing is cleared.
+    //
+    // WHY A STALE-HIGH COUNTER IS THE SAFE FAILURE. Skipping the lower when the value is not ours
+    // can retire one ordinal the user never saw; re-minting a number a live conversation already
+    // shows is the opposite kind of error, and this file has always chosen the former.
+    private undoSubmitLabels(
+        session: Session,
+        threadId: string | undefined,
+        label: string | undefined,
+        previousThreadLabels: ReadonlyMap<string, string>,
+        previousThreadHighWater: ReadonlyMap<string, number>,
+        previousBlockHighWater: ReadonlyMap<string, number>
+    ): void {
+        // Nothing was minted: a legacy `/messages` submit (no conversation), or a continuation that
+        // reused the name its conversation already owned. The maps need no change either way.
+        if (label === undefined || threadId === undefined) return;
+
+        const parts = agentLabelParts(label);
+
+        if (parts === undefined) return;
+        if (previousThreadLabels.get(threadId) === parts.label) return;
+
+        // (1) Our name, and only ours. A sibling that re-took the entry (this thread's label was
+        // re-allocated after us) is left alone.
+        if (session.threadLabels.get(threadId) === parts.label) session.threadLabels.delete(threadId);
+
+        const code = parts.code;
+        const ordinal = parts.ordinal;
+
+        // `AgentLabelParts` types these optional even though every label the parser ACCEPTS carries
+        // both (../shared/agent-results.ts:205 builds them from the same grammar check), so this
+        // guard satisfies the type; it is not a case that can happen.
+        if (code === undefined || ordinal === undefined) return;
+
+        // The highest ordinal of THIS code that a live conversation really shows, after our entry is
+        // gone. This is the floor a counter may never drop under: a number someone else is wearing
+        // is allocated, whatever the counters say.
+        let allocated = 0;
+
+        for (const value of session.threadLabels.values()) {
+            const held = agentLabelParts(value);
+
+            if (held === undefined || held.code !== code) continue;
+
+            const heldOrdinal = held.ordinal ?? 0;
+
+            if (heldOrdinal <= allocated) continue;
+
+            allocated = heldOrdinal;
+        }
+
+        const lowerOne = (counter: Map<string, number>, previous: ReadonlyMap<string, number>) => {
+            const before = previous.get(code) ?? 0;
+            const current = counter.get(code) ?? 0;
+
+            // CAS: the counter is ours to move only while it still equals what our mint wrote.
+            if (current !== Math.max(before, ordinal)) return;
+
+            const floor = Math.max(before, allocated);
+
+            if (floor === 0) counter.delete(code);
+            else if (floor < current) counter.set(code, floor);
+        };
+
+        lowerOne(session.threadLabelHighWater, previousThreadHighWater);
+        lowerOne(session.labelHighWater, previousBlockHighWater);
+    }
+
     // T14/F1: reserve the one ordinal a legacy `/messages` block will show.
     //
     // A legacy run is a single fresh block with no conversation record, so nothing
@@ -7384,17 +8300,11 @@ export class SessionStore {
 
     // Bind one explicit reference against the session record. Returns the exact
     // normalised reference to store. See normalizeReferences for the status rules.
-    private bindReference(
-        session: Session,
-        turnIndex: number,
-        reference: AgentResultReference
-    ): AgentResultReference {        const target = session.turns.find((turn) => turn.id === reference.turnId);
+    private bindReference(session: Session, turnIndex: number, reference: AgentResultReference): AgentResultReference {
+        const target = session.turns.find((turn) => turn.id === reference.turnId);
 
         if (target === undefined) {
-            throw new SessionError(
-                400,
-                `Referenced turn "${reference.turnId}" does not exist in this session.`
-            );
+            throw new SessionError(400, `Referenced turn "${reference.turnId}" does not exist in this session.`);
         }
 
         // A reference is always BACKWARD: this also makes a queued-target wait
@@ -7445,10 +8355,7 @@ export class SessionStore {
         }
 
         if (block.content === undefined) {
-            throw new SessionError(
-                400,
-                `Block "#${reference.label}" has no completed result content to reference.`
-            );
+            throw new SessionError(400, `Block "#${reference.label}" has no completed result content to reference.`);
         }
 
         return {
@@ -7467,11 +8374,7 @@ export class SessionStore {
     //     onto this turn: the user still gets an answer that says what is missing.
     // `signal` is this turn's abort signal, forwarded to the park below so a stop
     // aimed at THIS turn releases it from a wait that will never be satisfied.
-    private async expandReferences(
-        session: Session,
-        turn: SessionTurn,
-        signal?: AbortSignal
-    ): Promise<string> {
+    private async expandReferences(session: Session, turn: SessionTurn, signal?: AbortSignal): Promise<string> {
         return this.composeReferences(session, turn.prompt, turn.references, signal, turn.strippedReferences);
     }
 
@@ -7649,9 +8552,7 @@ export class SessionStore {
     private async waitForTurnTerminal(session: Session, turn: SessionTurn, signal?: AbortSignal): Promise<void> {
         while (
             !session.disposed &&
-            (turn.status === 'queued' ||
-                turn.status === 'running' ||
-                session.deletingTurnIds.has(turn.id))
+            (turn.status === 'queued' || turn.status === 'running' || session.deletingTurnIds.has(turn.id))
         ) {
             if (signal?.aborted === true) throw new Error(REFERENCE_WAIT_CANCELLED_MESSAGE);
 
@@ -7732,21 +8633,13 @@ export class SessionStore {
         // and expanded at EXECUTION (see expandReferences) after it completes.
         // The prospective index is the monotonic high-water mark (not the array
         // length), so a deletion never lets a new turn sort before a survivor.
-        const boundReferences = this.normalizeReferences(
-            session,
-            session.turnSequence,
-            input,
-            references
-        );
+        const boundReferences = this.normalizeReferences(session, session.turnSequence, input, references);
 
         // Pending only. The active turn is not in a queue, so one task per lane can
         // run while this many wait; the cap spans every lane so spreading work over
         // threads cannot bypass the backlog bound.
         if (this.pendingCount(session) >= MAX_PENDING_TASKS) {
-            throw new SessionError(
-                429,
-                `A session cannot queue more than ${MAX_PENDING_TASKS} pending tasks.`
-            );
+            throw new SessionError(429, `A session cannot queue more than ${MAX_PENDING_TASKS} pending tasks.`);
         }
 
         // STEERING (R5/F3): a submit addressed to a RUNNING thread lands at its next
@@ -7760,13 +8653,7 @@ export class SessionStore {
             // Awaited because the lane's steering answer is a frame round-trip (T12): the
             // receipt, not the POST, decides whether this submit steered or became a
             // continuation.
-            const steered = await this.steerIntoThread(
-                session,
-                wantedThread,
-                input,
-                validated,
-                boundReferences
-            );
+            const steered = await this.steerIntoThread(session, wantedThread, input, validated, boundReferences);
             if (steered !== undefined) return steered;
         }
 
@@ -7799,15 +8686,12 @@ export class SessionStore {
         let createdThreadId: string | undefined;
         const targetThread =
             wantedThread ??
-            (this.threadsSupported(session)
-                ? (createdThreadId = this.createSubmitThread(session))
-                : undefined);
+            (this.threadsSupported(session) ? (createdThreadId = this.createSubmitThread(session)) : undefined);
 
         // R8: bind the conversation's display name at CREATION. A continuation
         // (same thread) reuses the existing label; a new standalone thread consumed
         // exactly one ordinal when it was opened above.
-        const targetLabel =
-            targetThread === undefined ? undefined : this.ensureThreadLabel(session, targetThread);
+        const targetLabel = targetThread === undefined ? undefined : this.ensureThreadLabel(session, targetThread);
 
         // `status: 'queued'` and no `startedAt`: this record is complete and
         // renderable before any execution, which is what lets a reload show the
@@ -7846,8 +8730,7 @@ export class SessionStore {
         // plain submits are concurrent instead of serialized through the legacy
         // queue (the legacy queue survives only for a harness handle without the
         // thread API). Within one lane the pump stays strictly FIFO.
-        const lane =
-            targetThread === undefined ? undefined : this.laneOf(session, targetThread);
+        const lane = targetThread === undefined ? undefined : this.laneOf(session, targetThread);
         (lane?.queue ?? session.queue).push(turn);
         session.updatedAt = now;
 
@@ -7880,9 +8763,21 @@ export class SessionStore {
             // thread. Leaving them behind would retire an ordinal the user never saw
             // and the next accepted submit would be numbered past it (RR5 instead of
             // the expected RR4).
-            this.restoreCounterMap(session.threadLabels, previousThreadLabels);
-            this.restoreCounterMap(session.threadLabelHighWater, previousThreadLabelHighWater);
-            this.restoreCounterMap(session.labelHighWater, previousLabelHighWater);
+            //
+            // F8: the rollback is now a DELTA undo, not a map replace. This await is a
+            // window, and sibling lanes mint labels inside it (a delegated child's name is
+            // allocated by the recorder mid-run), so the old clear-and-replay took back names
+            // that other, still-live conversations were wearing. `undoSubmitLabels` releases
+            // only this submit's (thread → label) pair and compare-lowers only a counter still
+            // sitting where this submit left it.
+            this.undoSubmitLabels(
+                session,
+                targetThread,
+                targetLabel,
+                previousThreadLabels,
+                previousThreadLabelHighWater,
+                previousLabelHighWater
+            );
 
             // The new thread was created for this submit only; a failed write must
             // not leave an empty conversation behind.
@@ -8136,12 +9031,12 @@ export class SessionStore {
             // and the shared operations it performs route to the authority. A command that
             // mutates (e.g. /tools enable) therefore lands canonically, exactly as inline.
             result = this.workerExecution
-                ? (await this.lanes().invoke({
+                ? ((await this.lanes().invoke({
                       sessionKey: session.id,
                       authority: this.authorityOf(session),
                       request: { op: 'execute:command', line: input },
                       blueprint: this.blueprintFor(session)
-                  })) as HarnessCommandResult
+                  })) as HarnessCommandResult)
                 : await session.harness.executeCommand(input);
         } catch (error) {
             // Total, on purpose. `executeCommand` THROWS for an unknown name
@@ -8372,12 +9267,8 @@ export class SessionStore {
             // reached. A parent turn owning a running CHILD records the child
             // id; a normal steer into the owner's own thread omits the field
             // (keeping the pre-T12b wire shape for root conversations).
-            ...(owning.threadId !== undefined && owning.threadId !== threadId
-                ? { threadId }
-                : {}),
-            ...(references.length === 0
-                ? {}
-                : { references: references.map((reference) => ({ ...reference })) })
+            ...(owning.threadId !== undefined && owning.threadId !== threadId ? { threadId } : {}),
+            ...(references.length === 0 ? {} : { references: references.map((reference) => ({ ...reference })) })
         };
 
         owning.steers = [...(owning.steers ?? []), submit].slice(-MAX_STEER_RECORDS) as SessionTurn['steers'];
@@ -8501,10 +9392,7 @@ export class SessionStore {
         const message = messageOf(error);
 
         if (/already has \d+ independent threads|delete a terminal one/i.test(message)) {
-            return new SessionError(
-                429,
-                `${context}: ${message}`
-            );
+            return new SessionError(429, `${context}: ${message}`);
         }
 
         return new SessionError(400, `${context}: ${message}`);
@@ -8550,9 +9438,7 @@ export class SessionStore {
                         head,
                         undefined,
                         undefined,
-                        head.threadId === undefined
-                            ? { freshBlock: true }
-                            : { threadId: head.threadId }
+                        head.threadId === undefined ? { freshBlock: true } : { threadId: head.threadId }
                     );
                 } catch (error) {
                     // executeTurn absorbs harness failures itself; this is the
@@ -8939,8 +9825,7 @@ export class SessionStore {
         // legacy session flag is set, or when its own controller aborted. A lane
         // classification must never inherit a sibling's cancel.
         const wasCancelled = (): boolean =>
-            (lane === undefined ? session.cancelled : lane.stopRequested) ||
-            controller.signal.aborted;
+            (lane === undefined ? session.cancelled : lane.stopRequested) || controller.signal.aborted;
 
         let failure: string | undefined;
 
@@ -8969,9 +9854,7 @@ export class SessionStore {
         const writeLegacy = (item: SessionStreamItem): Promise<void> => {
             const write = legacyEmit;
 
-            const written: Promise<void> = legacyChain.then(() =>
-                write === undefined ? undefined : write(item)
-            );
+            const written: Promise<void> = legacyChain.then(() => (write === undefined ? undefined : write(item)));
 
             legacyChain = written.then(
                 () => undefined,
@@ -9073,13 +9956,18 @@ export class SessionStore {
                 // The START frame of a root host run or a delegated child names the
                 // invocation; the runtime roster maps it to the conversation. Branch
                 // frames are transcript-ephemeral and deliberately skipped.
+                //
+                // R19: the frame's `epoch` rides along so the entry is keyed to THIS RUN
+                // (../types/index.ts:3042 `HarnessThread.epoch`, optional by contract). An
+                // epoch-less frame writes the bare-id key it always wrote, and a document
+                // full of those resolves exactly as it did before this change.
                 if (
                     record.type === 'start' &&
                     record.thread !== undefined &&
                     record.thread.kind === undefined &&
                     record.thread.branchId === undefined
                 ) {
-                    this.noteInvocationThread(session, record.thread.id);
+                    this.noteInvocationThread(session, record.thread.id, record.thread.epoch);
                 }
 
                 // T10: freeze every agent's instruction source the moment its first
@@ -9315,9 +10203,7 @@ export class SessionStore {
                     throw new Error(`The run answered, but the lane's state was not accepted: ${commitFault}`);
                 }
             } else if (threadId === undefined) {
-                await this.runContexts.run({ session, turn, record }, () =>
-                    session.harness(runPrompt, options)
-                );
+                await this.runContexts.run({ session, turn, record }, () => session.harness(runPrompt, options));
             } else {
                 // R2/AC4: an explicit host input IS the spec's reactivation. A conversation
                 // that was deleted (soft: `inactive`, hidden from every roster but retained
@@ -9416,6 +10302,14 @@ export class SessionStore {
             this.releaseDrain(session);
         }
 
+        // F1: the DURABLE streak moves here, BEFORE the terminal checkpoint a moment below, so
+        // the number that goes to disk is the number this run decided. A run that reached its
+        // answer clears its conversation's network-failure streak; a run that errored on a
+        // NETWORK-class cause raises it. The auto-resume decision itself is taken at the very
+        // end of this method (see `autoResumeAfterNetworkFailure`), after the row is published
+        // and settled.
+        this.observeTerminalTurn(session, threadId, turn);
+
         // One terminal upsert replaces the running row for every watcher, whatever
         // the outcome. Its events array is the complete record (a client can also
         // rely on the event frames it already applied).
@@ -9446,6 +10340,13 @@ export class SessionStore {
 
         this.publish(session, { type: 'turn', turn: copyTurn(turn) });
         this.settle(turn, session);
+
+        // F1: the auto-recovery attempt, LAST: the row is published, settled, and durable, so a
+        // resume that re-queues it is a new accepted attempt of a terminal row rather than a
+        // race with the one still being announced. Synchronous up to the requeue's first await,
+        // so the lane still holds work when this returns and a `waitForIdle()` caller never
+        // sees an idle window between a network failure and its retry.
+        this.autoResumeAfterNetworkFailure(session, threadId, turn);
 
         // Legacy terminal frame: `failed` for an error/cancel, `snapshot` on
         // success. Both carry the complete session, so the last frame a response
@@ -9761,6 +10662,269 @@ export class SessionStore {
         return { cancelled, session: this.snapshot(session) };
     }
 
+    // -----------------------------------------------------------------------
+    // F1 (2026-11-17): the auto-recovery bookkeeping
+    // -----------------------------------------------------------------------
+    //
+    // The full rule — what counts, what resets, when the store resumes and when it stops —
+    // is written once, next to `INTERRUPTED_MESSAGE` at the top of this file. These methods
+    // only implement the parts of it, in the order the terminal path needs them.
+
+    // The ceiling one session enforces, resolved once and stored (see
+    // `Session.networkResumeLimit`): the per-provider `settings.networkResumeLimit` beats the
+    // deployment runtime's `networkResumeLimit` (`HARNESS_PROVIDER_NETWORK_RESUME_LIMIT`),
+    // which beats `DEFAULT_NETWORK_RESUME_LIMIT` (10). A persisted value outside the accepted
+    // range is CLAMPED rather than refused: the settings surface already refused it with a 400
+    // on the way in, so an out-of-range number in a document is a hand edit, and a session the
+    // operator can still run beats a session that fails to load.
+    private networkResumeLimitOf(settings: RunnerSettings): number {
+        const explicit = settings.networkResumeLimit;
+
+        if (explicit !== undefined) {
+            const clamped = Math.min(Math.max(Math.trunc(explicit), 0), NETWORK_RESUME_LIMIT_MAX);
+
+            return clamped;
+        }
+
+        // The runtime value is optional on the type (only an operator who SET the variable
+        // has it), so the shipped default is applied here rather than in the loader — which
+        // keeps every existing runtime configuration object byte-identical.
+        const runtime = this.runtime.networkResumeLimit;
+
+        if (runtime === undefined) return DEFAULT_NETWORK_RESUME_LIMIT;
+
+        return Math.min(Math.max(Math.trunc(runtime), 0), NETWORK_RESUME_LIMIT_MAX);
+    }
+
+    // Why the LAST RUN of one conversation stopped, in the runtime's own vocabulary.
+    //
+    // The live record is the authority: the runtime clears `stopReason` when a run concludes
+    // and writes the cause on every exit that did not conclude
+    // (../harness.ts `applyNonConcludedTerminal`), so this is the machine-readable fact rather
+    // than a re-derivation from the error text. A conversation `thread()` does not name (a
+    // soft-deleted row) falls back to the retained committed row, which carries the same
+    // field. Absent means "concluded or never ran" — never guess.
+    private threadStopReason(session: Session, threadId: string): string | undefined {
+        const harness = session.harness as Partial<Harness>;
+
+        if (typeof harness.thread === 'function') {
+            const reason = harness.thread(threadId)?.stopReason;
+
+            if (reason !== undefined) return reason;
+        }
+
+        const row = (session.core.threads ?? []).find((thread) => thread.id === threadId) as
+            | { stopReason?: unknown }
+            | undefined;
+
+        return typeof row?.stopReason === 'string' ? row.stopReason : undefined;
+    }
+
+    // THE network-class test, in one place (the vocabulary note at the top of this file
+    // states why each spelling lands where it does).
+    //
+    // `'provider-network'` is compared through a widened string on purpose: the name is being
+    // ADDED to `HarnessRunStopReason` by a parallel task, and this file must compile against
+    // the name without owning the union.
+    private isNetworkClassFailure(session: Session, threadId: string, reason: string | undefined): boolean {
+        if (reason === undefined) return false;
+
+        if (reason === PROVIDER_NETWORK_STOP_REASON) return true;
+
+        // Contract D: `'api-error'` is a genuine NON-network failure and `'retries-exhausted'`
+        // is a non-network exhausted ladder — neither resumes anything, unless the legacy
+        // acceptance below applies.
+        if (reason !== API_ERROR_STOP_REASON) return false;
+
+        // LEGACY ACCEPTANCE. (a) the reason was carried in from disk rather than written by
+        // this build, and (b) the conversation has not already spent its one shot. Both are
+        // required, and consuming (a) on use is what makes it impossible for pre-existing
+        // records to keep re-triggering.
+        if (!session.legacyNetworkReasons.has(threadId)) return false;
+
+        return (session.networkFailures.get(threadId) ?? 0) === 0;
+    }
+
+    // F1: seed the one-shot stale-vocabulary allowance for a RESTORED session.
+    //
+    // WHY IT EXISTS. `'api-error'` predates this build's network vocabulary. The evidence dump for
+    // the operator's store (Temp/orch-plan/report.md, session a4a6f913) shows the mismatch
+    // directly: `thread-1` and `thread-9` are restored idle with `stopReason: "api-error"`, while
+    // the error prose of those same rows reads `provider-timeout: the provider delivered … chunk(s)
+    // … and then went silent` — i.e. a stream that died mid-body, written before the runtime had a
+    // word for it. Contract D says that spelling is NON-network, and it stays the rule.
+    //
+    // WHY NOT A PLAIN REFUSAL. A refusal would judge every pre-existing record by a vocabulary its
+    // writer never had. So the store grants ONE exception per conversation, only for a reason that
+    // came off disk, and `isNetworkClassFailure` is the only reader. Consuming it (and the durable
+    // streak rising with it) is what bounds it: the exception cannot be spent twice in a row, and a
+    // restart that re-seeds it still sees the restored streak, which blocks a second raise.
+    //
+    // WHY IT IS SEEDED AT RESTORE AND NOWHERE ELSE: only rows THIS document carried qualify. A
+    // reason a run of THIS build writes is judged by Contract D alone — that is the difference
+    // between a legacy allowance and a permanent reclassification of `'api-error'`.
+    private seedLegacyNetworkReasons(session: Session): void {
+        for (const row of session.core.threads ?? []) {
+            // The SAME accessor the live rule uses, so the live roster and the committed row cannot
+            // disagree about which reason a conversation carries.
+            if (this.threadStopReason(session, row.id) !== API_ERROR_STOP_REASON) continue;
+
+            session.legacyNetworkReasons.add(row.id);
+        }
+    }
+
+    // F1: THE STREAK PRUNE AT RESTORE (T-W14) — the map's bounded-life half.
+    //
+    // WHY IT EXISTS. `Session.networkFailures` gains an entry whenever a run dies of a network
+    // failure and is only ever removed by an answer, a reset, or (now) a deletion. A document
+    // written by a build without the deletion rule keeps the entry of a conversation that is
+    // retired for good, and a hand-edited or long-lived document can carry ids the record stopped
+    // naming (the 256-record retention cap `capThreadRecords` drops old retired rows, and their
+    // transcripts with them). Nothing else in the restore reads that map, so an orphan is
+    // invisible: it is projected onto the snapshot as a number for a conversation no roster lists,
+    // it rides into every later document, and the map only ever grows.
+    //
+    // WHY THESE TWO TESTS AND NO OTHER. An entry survives exactly when its conversation is still a
+    // conversation this session can run:
+    //   - the capped document names a row for the id (`isThreadInactive`'s own reading of "the row
+    //     is what makes it a persisted conversation"; an absent row means the runtime never
+    //     persisted it, which for this map means an id nobody can address), AND
+    //   - that conversation is NOT retired (ledger ∪ marked row — the same wide answer
+    //     `inactiveThreadIdsOf` gives the snapshot, so the prune cannot disagree with the deletion
+    //     evidence the same reload publishes).
+    // A LIVE conversation's streak is therefore untouched, byte for byte, which is what keeps the
+    // durability half of F1 (a provider still down across a restart must not buy a fresh set of
+    // resumes) exactly as ./network-resume.test.ts pins it.
+    //
+    // WHY IT IS SAFE TO DROP A RETIRED ENTRY. A retired conversation cannot run, so its number can
+    // only ever be spent by a REVIVAL — and a revival (`reactivateThreadRow`) resets it anyway. The
+    // prune and the revival rule are the same decision read from two sides.
+    private pruneRestoredNetworkStreaks(session: Session): void {
+        for (const threadId of [...session.networkFailures.keys()]) {
+            if (this.isThreadInactive(session, threadId)) {
+                session.networkFailures.delete(threadId);
+                continue;
+            }
+
+            const known = (session.core.threads ?? []).some((thread) => thread.id === threadId);
+
+            if (!known) session.networkFailures.delete(threadId);
+        }
+    }
+
+    // The streak as a client sees it ("n/10"); 0 when the conversation is healthy.
+    private networkStreakOf(session: Session, threadId: string): number {
+        return session.networkFailures.get(threadId) ?? 0;
+    }
+
+    // Raise one conversation's streak, saturating at its ceiling. The ceiling is the only
+    // reading that matters, and a number that kept climbing past it would make the "n/10"
+    // surface lie about what is in control.
+    private raiseNetworkStreak(session: Session, threadId: string): number {
+        const next = Math.min(this.networkStreakOf(session, threadId) + 1, session.networkResumeLimit);
+
+        session.networkFailures.set(threadId, next);
+
+        return next;
+    }
+
+    // Clear one conversation's streak. THE THREE CALLING EVENTS, and only these (the rule block at
+    // the top of this file states why each one ends the number):
+    //   1. `observeTerminalTurn` — the run reached its answer (`done`);
+    //   2. `markDeletedThread` — the conversation was retired, so the number retires with it, and
+    //      `reactivateThreadRow` — a revival starts a conversation's F1 life from scratch;
+    //   3. `reset()` — the whole session's ledger is dropped, map included.
+    // It DELETES the entry rather than writing 0, which is what keeps an untouched session's
+    // `networkFailures` field absent on every surface (./persistence.ts keeps an absent field
+    // absent, ./protocol.ts documents it as optional).
+    private clearNetworkStreak(session: Session, threadId: string): void {
+        if (!session.networkFailures.has(threadId)) return;
+
+        session.networkFailures.delete(threadId);
+    }
+
+    // STREAK BOOKKEEPING for one settled turn. Called from `executeTurn` BEFORE the terminal
+    // checkpoint, so the number a resume or a restart reads is the one this run decided.
+    //
+    // `done` clears; `error` on a network-class reason raises; anything else (notably
+    // `cancelled`, which is a stop by intent) touches nothing — a cancel is neither evidence
+    // that the network recovered nor a failure to count against it.
+    private observeTerminalTurn(session: Session, threadId: string | undefined, turn: SessionTurn): void {
+        // A legacy `/messages` turn has no conversation, so there is no streak to move and no
+        // conversation to auto-resume (the resume route is a THREAD route).
+        if (threadId === undefined) return;
+
+        if (turn.status === 'done') {
+            this.clearNetworkStreak(session, threadId);
+            // A run that answered rewrote the record's reason, so the stale-vocabulary
+            // allowance is gone whether or not it was used.
+            session.legacyNetworkReasons.delete(threadId);
+
+            return;
+        }
+
+        if (turn.status !== 'error') return;
+
+        // The ceiling is the whole feature: `0` means the operator turned auto-recovery off, and
+        // then there is nothing to track and nothing to report.
+        if (session.networkResumeLimit === 0) return;
+
+        if (!this.isNetworkClassFailure(session, threadId, this.threadStopReason(session, threadId))) return;
+
+        // Consumed. A second stale reason from the same conversation is a reason THIS build
+        // wrote, and Contract D settles what it means.
+        session.legacyNetworkReasons.delete(threadId);
+        this.raiseNetworkStreak(session, threadId);
+    }
+
+    // THE AUTO-RESUME itself — the store calling its OWN resume path, which is what keeps the
+    // recovery honest: the same status gates, the same in-place requeue, the same lane pump,
+    // the same durability fence and the same journal handling as `POST …/threads/:threadId/
+    // resume`. `requeueTurnInPlace` writes the `rollback` line for the attempt it abandons
+    // (F4), so the auto-resume is itself recorded and replayable, and the resumed run appends
+    // its steps under the turn's ordinary indices.
+    //
+    // Called at the very END of `executeTurn`, synchronously up to the requeue's first await,
+    // so `lane.queue` holds the row again before this method returns — which is what makes a
+    // `waitForIdle()` caller see one continuous run of work instead of an idle window between
+    // the failure and the retry.
+    //
+    // WHAT NEVER REACHES A RESUME:
+    //   - a cancel/abort (the row settled `cancelled`, and `observeTerminalTurn` never raised
+    //     the streak, so the `streak === 0` guard below refuses);
+    //   - a manual stop (`user-stopped` is not network-class, same guard);
+    //   - the ceiling (a conversation at `n === limit` rests with its recorded reason);
+    //   - a disposed session, a store that is shutting down, or one that is still restoring
+    //     (a restart must not spend provider time by itself);
+    //   - the per-row runaway cap (`Session.autoResumeClaims`).
+    private autoResumeAfterNetworkFailure(session: Session, threadId: string | undefined, turn: SessionTurn): void {
+        if (threadId === undefined || turn.status !== 'error') return;
+        if (session.disposed || this.shuttingDown || this.loading) return;
+
+        const limit = session.networkResumeLimit;
+
+        if (limit === 0) return;
+
+        const streak = this.networkStreakOf(session, threadId);
+
+        // `streak === 0` is the "this failure was not network-class" test; `streak >= limit` is
+        // the ceiling. Strictly BELOW, per the rule at the top of this file.
+        if (streak === 0 || streak >= limit) return;
+
+        const claims = session.autoResumeClaims.get(turn.id) ?? 0;
+
+        if (claims >= limit) return;
+
+        session.autoResumeClaims.set(turn.id, claims + 1);
+
+        // Fire-and-forget, and DELIBERATELY silent on refusal: every refusal this can get is a
+        // state guard the store already states correctly (a run in flight, nothing recorded to
+        // replay, the answer already reached, or a revive already claimed), and the conversation
+        // keeps its `stopReason` plus its streak, which is the honest explanation of why it is
+        // resting. Retrying a refusal would only re-run the same guard.
+        void this.resumeThread(session.id, threadId).catch(() => undefined);
+    }
+
     // RESUME ONE HALTED THREAD (R1 rev2, POST /sessions/:id/threads/:threadId/resume).
     //
     // WHY IT EXISTS. `cancelThread` leaves the conversation `stopped` and marks the run it
@@ -9871,9 +11035,7 @@ export class SessionStore {
         // live handle does not name the conversation.
         const retired =
             record === undefined
-                ? (session.core.threads ?? []).find(
-                      (thread) => thread.id === threadId && thread.inactive === true
-                  )
+                ? (session.core.threads ?? []).find((thread) => thread.id === threadId && thread.inactive === true)
                 : undefined;
 
         if (record === undefined && retired === undefined) {
@@ -10010,11 +11172,7 @@ export class SessionStore {
     //     truncated record whose log still holds the dropped indices would resurrect every
     //     event of the aborted attempt on the next start, complete with its stale stop error.
     // Both are the same helpers a thread deletion already uses for the same reason.
-    private async requeueTurnInPlace(
-        session: Session,
-        turn: SessionTurn,
-        lane: ThreadLane
-    ): Promise<EnqueuedTask> {
+    private async requeueTurnInPlace(session: Session, turn: SessionTurn, lane: ThreadLane): Promise<EnqueuedTask> {
         const now = Date.now();
 
         // ROLL THE ABORTED ATTEMPT OUT OF THE RECORD. `attempt_commit` is the runtime's own
@@ -10034,6 +11192,15 @@ export class SessionStore {
         // exactly as it was. `eventTimes` stays parallel to `events` in both directions.
         const droppedEvents = turn.events.splice(boundary + 1);
         const droppedTimes = turn.eventTimes === undefined ? undefined : turn.eventTimes.splice(boundary + 1);
+
+        // F4 (2026-11-17): WRITE THE ABANDONED ATTEMPT DOWN BEFORE FORGETTING IT. Everything after
+        // `boundary` is now out of the record, and `compactJournal` (below) rebuilds the log from
+        // what is left — which used to mean the attempt's steps AND its terminal `error` frame were
+        // gone from both stores the instant a resume ran. The record this call takes is what makes
+        // the truncation recoverable; see `recordRollback` for the two copies it writes and their
+        // bounds. It runs BEFORE the persist fence so the evidence is on disk no matter how the
+        // checkpoint itself lands, and the catch below takes it back if the requeue is rolled back.
+        this.recordRollback(session, turn, boundary, droppedEvents, droppedTimes);
 
         // BACK TO THE PRE-EXECUTION SHAPE. `startedAt` is cleared because `executeTurn`
         // restamps it when the resumed run opens (./sessions.ts:7526) and a queued record must
@@ -10084,9 +11251,7 @@ export class SessionStore {
         const previousSessionStatus = session.status;
         const previousSessionLastError = session.lastError;
         const clearsRestartNote =
-            session.lastError === INTERRUPTED_MESSAGE &&
-            !this.laneActive(session) &&
-            !session.legacyRunning;
+            session.lastError === INTERRUPTED_MESSAGE && !this.laneActive(session) && !session.legacyRunning;
 
         if (clearsRestartNote) {
             session.lastError = undefined;
@@ -10124,7 +11289,7 @@ export class SessionStore {
         // method's own `publish` -> `mirrorView`, a poll, a reload) cold-folds the truncated
         // record instead of serving the settled one. See the header for the journal rule.
         this.forgetProjections(session, [turn.id]);
-        this.compactJournal(session, [turn.id]);
+        this.compactJournal(session);
 
         // DURABILITY BEFORE THE RESPONSE (the same fence `enqueue` and the turn-start
         // transition use, ./sessions.ts:7552): a requeued row the disk does not know about is
@@ -10166,7 +11331,14 @@ export class SessionStore {
                 session.lastError = previousSessionLastError;
             }
 
-            this.compactJournal(session, [turn.id]);
+            // F4: the abandoned-attempt record goes back with the tail it described. The events are
+            // on the row again, so a rewrite that also carried the rollback line would publish the
+            // same steps twice — once as live history, once as evidence of a truncation that did
+            // not happen. `undoRollback` drops both copies (journal list + checkpoint summary); the
+            // rewrite below is what takes the line out of the file.
+            this.undoRollback(session, turn.id);
+
+            this.compactJournal(session);
 
             throw error;
         }
@@ -10234,12 +11406,7 @@ export class SessionStore {
     // work; if one arrives between the lane opening this turn and this call, the run simply appends
     // its prompt as it always did. Failing a resume because an optimisation could not be applied is
     // worse than the duplicate it prevents.
-    private releaseRecordedRootInput(
-        session: Session,
-        threadId: string,
-        prompt: string,
-        turn: SessionTurn
-    ): void {
+    private releaseRecordedRootInput(session: Session, threadId: string, prompt: string, turn: SessionTurn): void {
         const harness = session.harness as Partial<Harness>;
 
         if (typeof harness.threadMessages !== 'function' || typeof harness.setThreadMessages !== 'function') {
@@ -10277,10 +11444,7 @@ export class SessionStore {
         if (recordedHasAttachments !== replayHasAttachments) return;
 
         try {
-            harness.setThreadMessages(
-                threadId,
-                transcript.slice(0, transcript.length - 1)
-            );
+            harness.setThreadMessages(threadId, transcript.slice(0, transcript.length - 1));
         } catch {
             // See the header: the historical re-append is the fallback.
         }
@@ -10306,18 +11470,58 @@ export class SessionStore {
         return false;
     }
 
-    // Record invocation → persistent conversation for the F6 purge. The runtime sets
-    // the thread record's `invocationId` before the run emits `start`, so a lookup at
-    // that moment is exact; an invocation already mapped is left alone (ids are
-    // unique and never reused).
-    private noteInvocationThread(session: Session, invocationId: string): void {
+    // Record invocation-RUN → persistent conversation for the F6 purge and the R19 label/roster
+    // joins. The runtime sets the thread record's `invocationId` before the run emits `start`, so
+    // a lookup at that moment is exact; an invocation already mapped IN THIS PROCESS is left
+    // alone, because the epoch-scoped key makes "already mapped" mean the same RUN, not merely the
+    // same recycled journal id.
+    //
+    // R19 (2026-11-17) — the key is `invocationRunKeyOf(invocationId, epoch)` (./protocol.ts):
+    //   - a frame that names its process (`HarnessThread.epoch`, ../types/index.ts:3042) binds
+    //     THAT RUN, so a post-restart run wearing an id a dead conversation used gets its own
+    //     entry instead of being swallowed by the older one;
+    //   - a frame that names nothing (every record written before the epoch field, and a
+    //     hand-written reporter) binds the BARE id exactly as before, which is what a reader's
+    //     bare-id fallback resolves — so pre-change documents keep resolving unchanged.
+    //
+    // WHY THE ROSTER SCAN STAYS: a delegated child's conversation is the runtime record whose slot
+    // this invocation id was just written into, and no frame carries a CONVERSATION id. The scan
+    // is therefore the only witness for a child, and it is the same witness the bare-id join used;
+    // what changed is that a stale slot from a DEAD process can no longer shadow the live one,
+    // because the two runs no longer compete for one key.
+    private noteInvocationThread(session: Session, invocationId: string, epoch?: string): void {
         if (!this.threadsSupported(session)) return;
-        if (session.invocationThreads.has(invocationId)) return;
+
+        const runKey = invocationRunKeyOf(invocationId, epoch);
+
+        if (session.invocationThreads.has(runKey)) return;
 
         for (const record of session.harness.threads()) {
             if (record.invocationId !== invocationId) continue;
 
-            session.invocationThreads.set(invocationId, record.id);
+            // V5 defect 2 (2026-11-17) — the slot must be the slot of THIS RUN. `record.invocationId`
+            // is the LATEST id that conversation ran, and the id is a per-process counter, so a record
+            // restored from a process that died can wear the same bare id the current process just
+            // minted for somebody else's run. Binding that join to the dead conversation is how the
+            // reference artifact came to name a dead child's conversation for a post-restart run
+            // (`../Temp/orch-plan/w16/fold.ts` measured `15 → thread-14` while `15` named `thread-13`).
+            //
+            // `HarnessThreadRecord.epoch` (../types/index.ts) is what makes the two distinguishable: it
+            // is written in the same statement as the record's `invocationId`, by the process that
+            // minted it. A KNOWN mismatch is a different run, so the slot is skipped and the scan keeps
+            // looking — the live record of the same bare id is later in the list, and finding it is the
+            // whole point of continuing.
+            //
+            // The one-sided cases stay PERMISSIVE, deliberately: either side naming nothing is "the
+            // producer said nothing" (a record written before the field existed, a reporter that never
+            // stamps an epoch), and refusing those would strip the join from every pre-change document
+            // — a legacy conversation would lose its label rather than gain a discriminator. That is the
+            // documented residual: an epoch-less restored record still binds a new run of the same bare
+            // id, and NOTHING on that record can tell the two apart.
+            // `src/server/sessions.epoch-discrimination.test.ts` pins both halves.
+            if (isRunEpochMismatch(record.epoch, epoch)) continue;
+
+            session.invocationThreads.set(runKey, record.id);
             // R18/T20: allocate the conversation's DISPLAY NAME in the same step that
             // records the join, through the store's existing allocator (`ensureThreadLabel`,
             // NOT a second numbering scheme). This is the earliest moment the conversation
@@ -10425,10 +11629,7 @@ export class SessionStore {
         const session = this.require(id);
 
         if (!this.transcriptSupported(session)) {
-            throw new SessionError(
-                409,
-                `This session's harness does not support replacing a thread transcript.`
-            );
+            throw new SessionError(409, `This session's harness does not support replacing a thread transcript.`);
         }
 
         const record = session.harness.thread(threadId);
@@ -10446,10 +11647,7 @@ export class SessionStore {
         // only the live state a stop cannot release (a `threadSend` revival this
         // server has no row for). See `deleteThread` / `markDeletedThread`.
         if (record.status === 'running' || session.lanes.get(threadId)?.active !== undefined) {
-            throw new SessionError(
-                409,
-                `Thread "${threadId}" is running; stop it before replacing its transcript.`
-            );
+            throw new SessionError(409, `Thread "${threadId}" is running; stop it before replacing its transcript.`);
         }
 
         // One validation attempt, using the reader the runtime itself enforces. A
@@ -10556,8 +11754,7 @@ export class SessionStore {
 
         const stillLive = (): boolean =>
             session.turns.some(
-                (turn) =>
-                    turnIds.includes(turn.id) && (turn.status === 'queued' || turn.status === 'running')
+                (turn) => turnIds.includes(turn.id) && (turn.status === 'queued' || turn.status === 'running')
             );
 
         while (!session.disposed && stillLive()) {
@@ -10719,7 +11916,10 @@ export class SessionStore {
         right: HarnessSnapshot,
         doomed: ReadonlySet<string>
     ): boolean {
-        return JSON.stringify(normalizeCoreForCompare(left, doomed)) === JSON.stringify(normalizeCoreForCompare(right, doomed));
+        return (
+            JSON.stringify(normalizeCoreForCompare(left, doomed)) ===
+            JSON.stringify(normalizeCoreForCompare(right, doomed))
+        );
     }
 
     // THE MARK (R2, primary spec: "all turns must be recorded… even deleted marks the
@@ -10878,9 +12078,7 @@ export class SessionStore {
         // counters survive, never the text they described (R6 tombstone).
         this.mergeLabelHighWater(
             session,
-            session.turns.filter(
-                (turn) => turn.threadId !== undefined && doomed.has(turn.threadId)
-            )
+            session.turns.filter((turn) => turn.threadId !== undefined && doomed.has(turn.threadId))
         );
 
         // R2: NO turn row leaves the record. The retired projection filtered the doomed
@@ -10980,6 +12178,26 @@ export class SessionStore {
         // retained, so its snapshot is retained with it.
         const instructionEntries = [...session.turnInstructionSources];
 
+        // F1/T-W14: the ONE per-conversation map a deletion DOES retire. Every entry above keys a
+        // record the retention rule protects; a streak keys nothing. It is a live count of how many
+        // consecutive runs of THIS conversation the provider dropped, and `clearNetworkStreak`'s own
+        // contract lists a deletion among the three events that end it. Leaving it behind costs:
+        //   - an orphan that survives every restart — the row is hidden from every roster while the
+        //     shard keeps publishing "n failures" for a conversation nobody lists, and the map can
+        //     only ever grow across a session's life;
+        //   - a REVIVED conversation inheriting a number it did not earn — the revival door is a
+        //     submit on the retained id (`reactivateThreadRow`), and an inherited streak sitting AT
+        //     the ceiling makes `autoResumeAfterNetworkFailure` refuse the very first resume of a
+        //     conversation that is starting over.
+        //
+        // Filtered HERE, before `previous` and `projected` are built, so the document this deletion
+        // writes is already clean: a crash right after the response cannot bring the orphan back.
+        // Iteration order is preserved by the same `[...map]` spelling `sessionRecord` uses (:3572),
+        // so for streaks disjoint from this deletion the record's bytes do not move at all. The LIVE
+        // map is cleared further below, only once the runtime mark has succeeded — a refusal or a
+        // rollback restores `previous`, streak entries included, and a conversation that was NOT
+        // deleted must keep counting exactly where it was.
+        const streakEntries = [...session.networkFailures].filter(([id]) => !doomed.has(id));
 
         const previous = this.sessionRecord(session);
 
@@ -10989,9 +12207,7 @@ export class SessionStore {
             queue: session.queue.map((turn) => turn.id).filter((turnId) => !removedIds.has(turnId)),
             core: projectedCore,
             ...(seedEntries.length === 0 ? {} : { labelSeeds: Object.fromEntries(seedEntries) }),
-            ...(invocationEntries.length === 0
-                ? {}
-                : { turnInvocations: Object.fromEntries(invocationEntries) }),
+            ...(invocationEntries.length === 0 ? {} : { turnInvocations: Object.fromEntries(invocationEntries) }),
             ...(instructionEntries.length === 0
                 ? {}
                 : {
@@ -11006,16 +12222,17 @@ export class SessionStore {
                           ])
                       )
                   }),
-            ...(highWaterEntries.length === 0
-                ? {}
-                : { labelHighWater: Object.fromEntries(highWaterEntries) }),
-            ...(threadLabelEntries.length === 0
-                ? {}
-                : { threadLabels: Object.fromEntries(threadLabelEntries) }),
+            ...(highWaterEntries.length === 0 ? {} : { labelHighWater: Object.fromEntries(highWaterEntries) }),
+            ...(threadLabelEntries.length === 0 ? {} : { threadLabels: Object.fromEntries(threadLabelEntries) }),
             ...(threadLabelHighWaterEntries.length === 0
                 ? {}
                 : { threadLabelHighWater: Object.fromEntries(threadLabelHighWaterEntries) }),
-            ...(invalidEntries.length === 0 ? {} : { invalidThreads: Object.fromEntries(invalidEntries) })
+            ...(invalidEntries.length === 0 ? {} : { invalidThreads: Object.fromEntries(invalidEntries) }),
+            // F1/T-W14: the streak map MINUS the conversations this deletion retires (see
+            // `streakEntries` above). The explicit key overrides whatever `previous` carried at the
+            // same position, so the record's key order — and therefore its bytes, for a session whose
+            // streaks are disjoint from this deletion — do not move.
+            ...(streakEntries.length === 0 ? {} : { networkFailures: Object.fromEntries(streakEntries) })
         };
 
         // Drop the stale keys from the override when they are absent in the
@@ -11027,6 +12244,11 @@ export class SessionStore {
         if (threadLabelEntries.length === 0) delete projected.threadLabels;
         if (threadLabelHighWaterEntries.length === 0) delete projected.threadLabelHighWater;
         if (invalidEntries.length === 0) delete projected.invalidThreads;
+        // F1/T-W14: `networkFailures` is additive in BOTH directions (./persistence.ts:1469 keeps an
+        // absent field absent, and ./protocol.ts declares it optional), so a map emptied by this
+        // deletion must drop the KEY rather than publish `{}` — a session that was healthy before the
+        // delete has to read byte-identically after it.
+        if (streakEntries.length === 0) delete projected.networkFailures;
 
         await this.persistOrThrow(new Map([[session.id, projected]]));
 
@@ -11077,6 +12299,20 @@ export class SessionStore {
         // R8 (unchanged by R2): the doomed conversations' DISPLAY names leave the map; the
         // per-code high-water stays, so a retired name is never minted for a new one.
         for (const id of doomed) session.threadLabels.delete(id);
+
+        // F1/T-W14: the streak leaves with the conversation, and this is the LIVE half (the durable
+        // half went with the document written above, which already omits these entries — the two
+        // cannot disagree). It sits AFTER `harness.deleteThread` on purpose: a refusal there rolls the
+        // file back to `previous` (streak entries included) and this map was never touched, so a
+        // conversation that was not deleted keeps counting exactly where it was. Same helper as the
+        // `done` path, so all three clearing events keep one writer.
+        //
+        // `session.legacyNetworkReasons` is deliberately NOT touched here. That allowance is bound by
+        // (a) a reason carried off disk and (b) streak 0, and it is CONSUMED on use (:10630), so a
+        // delete/revive cannot make a stale record re-trigger more than once per conversation per
+        // process; clearing its streak only means a revived conversation is judged by the same rule a
+        // restored one is.
+        for (const targetId of doomed) this.clearNetworkStreak(session, targetId);
 
         // Forget every lane of the deleted conversations. Its queued turns were
         // refused above (409), so the queue is empty by construction. A lane is a live
@@ -11217,6 +12453,18 @@ export class SessionStore {
         session.threadLabels.clear();
         session.threadLabelHighWater.clear();
         session.turnInvocations.clear();
+        // F1/F4: the network-failure streaks and the abandoned-attempt evidence belong to the
+        // conversation that just ended, exactly like the labels and the joins above. A reset starts
+        // a NEW conversation, so its provider relationship starts with a clean budget (and a UI
+        // showing "7/10" over an empty transcript would be reporting a history it just deleted).
+        // The rollback records go with the turns they describe: the `truncate()` below has already
+        // dropped the journal lines, so keeping the list would have the NEXT rewrite publish
+        // evidence for turn rows the record no longer holds — the ghost-step bug in a new costume.
+        session.networkFailures.clear();
+        session.legacyNetworkReasons.clear();
+        session.autoResumeClaims.clear();
+        session.rollbacks.clear();
+        session.journalRollbacks = [];
         // T10: the recorded instruction snapshots belong to the conversation that just
         // ended. The NEXT turn re-freezes them from the agent it actually runs with, so
         // a reset is also the one moment a historical `system` count is allowed to

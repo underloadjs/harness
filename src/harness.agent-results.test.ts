@@ -31,6 +31,10 @@ import type {
     HarnessStreamEvent,
     HarnessStreamRequest
 } from '@underload/harness';
+// W19 (2026-11-17): every row `snapshot()` writes now carries the LEDGER GENERATION that minted its
+// invocation id, so the exact-value pins below name the constant instead of a literal (it is random
+// per process). Same import path the epoch pins in `src/harness.threads.test.ts:33` use.
+import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
 
 const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): HarnessStream => {
     let index = 0;
@@ -876,7 +880,11 @@ describe('snapshot durability (R3)', () => {
                 kind: 'root',
                 status: 'completed',
                 content: 'root final',
-                threadId: 'agent:lead'
+                threadId: 'agent:lead',
+                // W19: the row is addressed by its RUN, so it names the ledger generation that minted
+                // `invocationId` (../types `HarnessAgentResultSnapshot.epoch`). This is the field that
+                // lets a restarted harness keep this row beside the row of the id it re-mints.
+                epoch: HARNESS_PROCESS_EPOCH
             },
             {
                 invocationId: '2',
@@ -887,7 +895,8 @@ describe('snapshot durability (R3)', () => {
                 kind: 'delegation',
                 status: 'completed',
                 content: 'helper answer',
-                threadId: 'agent:helper'
+                threadId: 'agent:helper',
+                epoch: HARNESS_PROCESS_EPOCH
             },
             {
                 invocationId: branchId,
@@ -898,7 +907,8 @@ describe('snapshot durability (R3)', () => {
                 kind: 'fork',
                 status: 'completed',
                 content: 'fork answer',
-                threadId: 'agent:lead'
+                threadId: 'agent:lead',
+                epoch: HARNESS_PROCESS_EPOCH
             }
         ]);
 
@@ -1007,7 +1017,9 @@ describe('snapshot durability (R3)', () => {
                 cancelledAtMessage: 1,
                 // The callable root belongs to the agent's DEFAULT conversation, so the row names
                 // that owner (`agent:writer`) rather than leaving it out (0033/0024).
-                threadId: 'agent:writer'
+                threadId: 'agent:writer',
+                // W19: the ledger generation that minted this row's invocation id.
+                epoch: HARNESS_PROCESS_EPOCH
             }
         ]);
 
@@ -1080,7 +1092,9 @@ describe('snapshot durability (R3)', () => {
                 content: 'late answer',
                 // A completed row may name its owner too — unlike the forensic pair, a finished
                 // turn still belongs to the conversation that ran it (0033/0024).
-                threadId: 'agent:writer'
+                threadId: 'agent:writer',
+                // W19: every persisted row names its ledger generation.
+                epoch: HARNESS_PROCESS_EPOCH
             }
         ]);
     });
@@ -1158,8 +1172,11 @@ describe('snapshot durability (R3)', () => {
             presets: false
         });
 
+        // The row came from a live snapshot, so it carries its epoch and the refusal names the RUN
+        // (W19: the uniqueness rule moved onto the run, because one document can legitimately hold
+        // the same bare id once per ledger generation).
         expect(() => target.restore(duplicate as never)).toThrow(
-            'snapshot.agentResults contains the duplicate invocationId "1".'
+            `snapshot.agentResults contains the duplicate invocationId "1" of epoch "${HARNESS_PROCESS_EPOCH}".`
         );
 
         const overBound = JSON.parse(JSON.stringify(snapshot)) as {
@@ -1886,7 +1903,9 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             error: 'operator stop',
             partialContent: 'half an answer',
             cancelledAtMessage: 2,
-            threadId
+            threadId,
+            // W19: the ledger generation of this row (../types `HarnessAgentResultSnapshot.epoch`).
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         // SURFACE 3 — the restart. JSON on purpose: this is the bytes a server writes
@@ -2032,7 +2051,9 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             partialContent: 'a partial before the crash',
             cancelledAtMessage: 3,
             // The owner travels on a failed row exactly as it does on a cancelled one.
-            threadId: thread.id
+            threadId: thread.id,
+            // W19: the ledger generation of this row.
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         const target = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
@@ -2326,7 +2347,11 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             content: '',
             error: 'The run was cancelled.',
             partialContent: 'half an answer',
-            cancelledAtMessage: 2
+            cancelledAtMessage: 2,
+            // W19: an archive that names no `epoch` belongs to THIS process's ledger generation, and
+            // the stored/returned record carries it — the key the next snapshot writes, and the one
+            // `archiveDigestOf` deliberately leaves outside the lane receipt.
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         // And the row the session reads, `/results` serves, and the next snapshot writes.
@@ -2342,7 +2367,9 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             error: 'The run was cancelled.',
             partialContent: 'half an answer',
             cancelledAtMessage: 2,
-            threadId: 'thread-9'
+            threadId: 'thread-9',
+            // W19: the persisted row names its ledger generation.
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         // Reloadable in the strictest sense: the persisted form parses and restores unchanged, which
@@ -2375,7 +2402,9 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             role: 'subagent',
             kind: 'delegation',
             status: 'completed',
-            content: 'the finished answer'
+            content: 'the finished answer',
+            // W19: even an archive that omits the field lands in THIS process's ledger generation.
+            epoch: HARNESS_PROCESS_EPOCH
         });
         expect(rowOf(source.snapshot(), '513')).toEqual({
             invocationId: '513',
@@ -2386,7 +2415,9 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             kind: 'delegation',
             status: 'completed',
             content: 'the finished answer',
-            threadId: 'thread-9'
+            threadId: 'thread-9',
+            // W19: the persisted row names its ledger generation.
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         // THE CASE THAT MATTERS: a lane child that is cancelled and then finishes. The first archive
@@ -2408,7 +2439,9 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             kind: 'delegation',
             status: 'completed',
             content: 'the finished answer',
-            threadId: 'thread-9'
+            threadId: 'thread-9',
+            // W19: the persisted row names its ledger generation.
+            epoch: HARNESS_PROCESS_EPOCH
         });
         // Still one row, and the persisted form is one the reader accepts.
         expect((staged.snapshot() as { agentResults?: unknown[] }).agentResults).toHaveLength(1);
@@ -2463,7 +2496,9 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             error: 'The run was cancelled.',
             partialContent: 'half an answer',
             cancelledAtMessage: 2,
-            threadId: 'thread-9'
+            threadId: 'thread-9',
+            // W19: the persisted row names its ledger generation.
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         // An absent pair stays absent — the pre-change payload is still a legal archive, and `''` is
@@ -2478,7 +2513,9 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             status: 'cancelled',
             content: '',
             error: 'The run was cancelled.',
-            threadId: 'thread-9'
+            threadId: 'thread-9',
+            // W19: the persisted row names its ledger generation.
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         expect(bare.record.completedOrder).toBe(2);
@@ -2492,7 +2529,9 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             status: 'cancelled',
             content: '',
             error: 'The run was cancelled.',
-            threadId: 'thread-9'
+            threadId: 'thread-9',
+            // W19: the persisted row names its ledger generation.
+            epoch: HARNESS_PROCESS_EPOCH
         });
     });
 });

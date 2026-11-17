@@ -91,15 +91,21 @@ const withoutIds = (value: unknown): unknown => {
 // for `agentResult`); like `messageId` it is identity, not content. Dropping it keeps
 // every record assertion below an exact `toEqual` over the fields this change can move
 // (`id`, `agent`, `origin`, `status`, `sequence`, `label`).
+//
+// W19 (2026-11-17) adds `epoch` to the drop list, for the reason the comment above already states: the
+// process token is written in the SAME statement as `invocationId` (`src/harness.ts` `markThreadEpoch`,
+// the pairing pinned in src/harness-thread-epoch-authority.test.ts), so the only code that can move one
+// can move the other. A pin that ignores the invocation id has to ignore its discriminator too, or it
+// would be asserting the token of whichever test file happens to run it.
 const stableRecord = (
     record: HarnessThreadRecord
-): Omit<HarnessThreadRecord, 'invocationId'> => {
-    const { invocationId: _dropped, ...stable } = record;
+): Omit<HarnessThreadRecord, 'invocationId' | 'epoch'> => {
+    const { invocationId: _dropped, epoch: _droppedEpoch, ...stable } = record;
 
     return stable;
 };
 
-const recordOf = (host: Harness, threadId: string): Omit<HarnessThreadRecord, 'invocationId'> => {
+const recordOf = (host: Harness, threadId: string): Omit<HarnessThreadRecord, 'invocationId' | 'epoch'> => {
     const record = host.thread(threadId);
 
     if (record === undefined) throw new Error(`Thread "${threadId}" is missing from the roster.`);

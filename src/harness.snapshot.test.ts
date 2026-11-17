@@ -2357,8 +2357,8 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
     // so a change to the vocabulary has to be a deliberate edit HERE as well.
     const stopReasonRefusal = (label: string): string =>
         `${label}.stopReason must be one of: caller-released, user-stopped, timeout, turn-cap,` +
-        ` budget-exhausted, api-error, retries-exhausted, parent-closed, plugin-parked` +
-        ` (or be absent).`;
+        ` budget-exhausted, api-error, retries-exhausted, provider-network, parent-closed,` +
+        ` plugin-parked (or be absent).`;
 
     // One terminal row the reader accepts verbatim: a CANCELLED root run of the only
     // configured agent, with the `error` a non-completed row requires (./core/snapshot.ts
@@ -2564,11 +2564,16 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
             'budget-exhausted': 'the run spent its budget',
             'api-error': 'the provider failed the request terminally',
             'retries-exhausted': 'every retry attempt failed',
+            // 2026-11-17 (the unrecoverable-timeout report): a provider that ran out of time
+            // or dropped the wire is its own reason, so a consumer can count network deaths
+            // without reading prose. ./core/snapshot.ts carries the same member, or a
+            // persisted document would not restore.
+            'provider-network': 'the provider ran out of time or the wire died',
             'parent-closed': 'the conversation that started the run went away',
             'plugin-parked': 'a plugin parked the conversation and the run ended'
         };
 
-        // Nine members, in the order the reader's refusal lists them. `oom` and `context` are
+        // Ten members, in the order the reader's refusal lists them. `oom` and `context` are
         // deliberately absent: a `Record` refuses a key the union does not admit, so this
         // assertion is also the statement that the set stays closed.
         expect(Object.keys(vocabulary)).toEqual([
@@ -2579,6 +2584,7 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
             'budget-exhausted',
             'api-error',
             'retries-exhausted',
+            'provider-network',
             'parent-closed',
             'plugin-parked'
         ]);

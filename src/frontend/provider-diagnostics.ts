@@ -18,10 +18,13 @@
 // Sources of the inputs (do not restate them in the UI beyond what they carry):
 //   - `retry.provider`: ../types/index.ts `HarnessProviderAttemptDiagnostics` (T6) —
 //     `errorClass`, redacted `url`, effective `port`, optional `phase`/`timeoutMs`/`errno`.
-//   - terminal provider failure: `{ type: 'error', error: { message, code } }` — the code
-//     is NOT in `HarnessErrorInfo` (../types/index.ts:830-832) yet, so it is read
-//     DEFENSIVELY here (`(error as …).code`) and the class is otherwise recovered from the
-//     server's own sentence, which names it.
+//   - terminal provider failure: `{ type: 'error', error: { message, code?, provider? } }`.
+//     Both `code` and `provider` are DECLARED members of `HarnessErrorInfo`
+//     (../types/index.ts) as of 2026-11-17, and `src/harness.ts` emits them on the terminal
+//     record, so a terminal provider failure is read from fields. The prose-regex path in
+//     `providerClassOf` / `timeoutDetailOf` survives ONLY as the historical fallback: a
+//     session persisted before those fields existed carries the sentence and nothing else,
+//     and re-opening it must render the same notice it does today.
 //   - the effective per-session endpoint: `GET /sessions/{id}` `endpoint` (../shared/
 //     harness-api.ts `SessionResource.endpoint`, mapped to the render model at
 //     ./view-api.ts:167). A session ROW page carries `base_url: ''` (./view-api.ts:232),
@@ -216,20 +219,35 @@ export const providerRetryNote = (frame: {
     return parts.join(' · ');
 };
 
-// The class of a terminal provider failure: the structured `code` when the frame carries
-// one (T6 emits it, the generated type does not yet), otherwise the class named inside
-// the server's own sentence. `undefined` = not a provider failure → generic rendering.
-const providerClassOf = (
-    error: HarnessErrorInfo & { code?: string; provider?: HarnessProviderAttemptDiagnostics }
-): string | undefined => {
+// The class of a terminal provider failure: the STRUCTURED fields the frame carries, and
+// only as a last resort the class named inside the server's own sentence.
+//
+// ORDER MATTERS, and it changed on 2026-11-17 (the unrecoverable-timeout report):
+//   1. `error.code` — now a DECLARED member of `HarnessErrorInfo` (../types/index.ts) and
+//      emitted on every terminal record whose failure is classified, so the common path
+//      reads a field instead of pattern-matching a sentence;
+//   2. `error.provider.errorClass` — the transport's diagnosis of the attempt that ended
+//      the run, published on the SAME record as the `retry` frames since that change, and
+//      the only source for a coded failure whose `code` was written by a custom transport
+//      under a different spelling;
+//   3. the message, which is the HISTORICAL fallback: a session persisted before those
+//      fields existed carries prose only, and re-opening it must still name the class.
+//
+// Only the two classes this module has wording for are returned. A `provider-rejected`,
+// `provider-aborted` or `provider-transit` failure answers `undefined` on purpose: the
+// caller then keeps the generic rendering it has always had instead of being dressed in
+// the timeout/connection layout those classes have no fields for.
+//
+// `undefined` = not a provider failure this UI can label → generic rendering.
+const providerClassOf = (error: HarnessErrorInfo): string | undefined => {
     const stated = typeof error.code === 'string' ? error.code.trim() : '';
     if (stated === PROVIDER_CONNECTION_CLASS || stated === PROVIDER_TIMEOUT_CLASS) return stated;
 
     const fromProvider = typeof error.provider?.errorClass === 'string' ? error.provider.errorClass.trim() : '';
-    if (fromProvider.length > 0) return fromProvider;
+    if (fromProvider === PROVIDER_CONNECTION_CLASS || fromProvider === PROVIDER_TIMEOUT_CLASS) return fromProvider;
 
-    // The terminal frame's message names the class verbatim (T6's contract for it), so
-    // matching it is reading the frame, not guessing at it.
+    // The terminal frame's message names the class verbatim (the coded-frame contract), so
+    // matching it is reading the frame, not guessing at it. Historical records only.
     const message = typeof error.message === 'string' ? error.message : '';
     if (message.includes(PROVIDER_TIMEOUT_CLASS)) return PROVIDER_TIMEOUT_CLASS;
     if (message.includes(PROVIDER_CONNECTION_CLASS)) return PROVIDER_CONNECTION_CLASS;
@@ -283,7 +301,7 @@ const timeoutDetailOf = (
 //   provider-connection → dialled localhost:5500 · <message> · this is the provider address, set in Endpoint & model settings
 //   provider-timeout    → response-head · bound 30.0s · <message>
 export const providerFailureOf = (
-    error: HarnessErrorInfo & { code?: string; provider?: HarnessProviderAttemptDiagnostics } | undefined
+    error: HarnessErrorInfo | undefined
 ): { label: string; text: string } | undefined => {
     if (error === undefined || error === null) return undefined;
 

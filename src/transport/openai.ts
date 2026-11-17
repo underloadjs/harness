@@ -66,6 +66,11 @@ import {
     PROVIDER_RESPONSE_HEAD_TIMEOUT_ENV,
     PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
     PROVIDER_TIMEOUT_CODE,
+    // (2026-11-17) The gateway's in-stream error vocabulary and its one translator, plus
+    // the diagnostics class of a codeless provider-transit failure (a truncated body).
+    PROVIDER_TRANSIT_CLASS,
+    providerWireFailureOf,
+    providerWireMessage,
     isTerminalProviderStatus,
     providerConnectionMessage,
     providerRejectedMessage,
@@ -1688,9 +1693,70 @@ export const openAICompatible = (
                 }
 
                 // Gateways occasionally attach a provider error to an otherwise 200
-                // stream instead of failing the request.
+                // stream instead of failing the request — and when that gateway proxies
+                // ANOTHER provider, the frame is the ONLY place its upstream's failure
+                // class appears: `{"error":{"code":"timeout","status":504,"errno":…}}`.
+                //
+                // (2026-11-17, the unrecoverable-timeout report) This used to read
+                // `error.message` and drop `code`, `param`, `status` and `errno` on the
+                // floor, so EVERY mid-stream provider failure reached `agent()` codeless:
+                // a gateway timeout spent the 1 s -> 512 s transient ladder, an upstream
+                // refusal looked transient, and no consumer could tell them apart without
+                // parsing English. `providerWireFailureOf` (./provider-timeouts.ts) is now
+                // the one translator: the code picks the retry class, and the diagnosis is
+                // published on `details` either way. An unrecognised or absent code stays
+                // CODELESS — the ladder the frame has always had — so a scripted provider
+                // error is retried exactly as src/core/agent.retry.test.ts pins it.
                 if (chunk.error) {
-                    yield { type: 'error', message: chunk.error.message ?? 'Provider reported an error' };
+                    // The producer's key set is exactly `{ message, type, code, status?,
+                    // errno?, param: null }`: `status` and `errno` are OMITTED (never sent
+                    // as `null`) when inapplicable, and BOTH producers emit that coded
+                    // envelope — the primary gateway and its behaviour-compatible copy at
+                    // repository/agentic/src/server/start-server.ts (vocabulary :294-303,
+                    // payload builder :599-669), where `code` is a REQUIRED key of
+                    // `StreamErrorPayload` (:310). An absent `code` is still handled as a
+                    // defensive/legacy INPUT shape: the translator treats absent, `null`
+                    // and `undefined` as the same answer and never tests key presence, so
+                    // such a frame — or one from a provider that names nothing — lands on
+                    // the codeless transient ladder it always did.
+                    const failure = providerWireFailureOf(chunk.error);
+                    const detail = typeof chunk.error.message === 'string' ? chunk.error.message : '';
+
+                    yield {
+                        type: 'error',
+                        ...(failure.code === undefined ? {} : { code: failure.code }),
+                        // A CODED frame leads with the code, like every other coded frame
+                        // (the code is the first token of the message, because this text is
+                        // what reaches the model, an event consumer and a log line). A
+                        // codeless frame keeps the historical sentence byte-for-byte —
+                        // including the stable `'Provider reported an error'` fallback,
+                        // which now also fires for a non-string `message` a proxy invented
+                        // (the type says string; a gateway does not always).
+                        message: redactProviderKey(
+                            failure.code === undefined
+                                ? (detail.length > 0 ? detail : 'Provider reported an error')
+                                : providerWireMessage({
+                                      code: failure.code,
+                                      url: dial.url,
+                                      detail,
+                                      ...(failure.status === undefined ? {} : { status: failure.status }),
+                                      ...(failure.param === undefined ? {} : { param: failure.param })
+                                  }),
+                            key
+                        ),
+                        // The structured half, published for EVERY class — including the
+                        // codeless one, where `errorClass` is `provider-transit`: the retry
+                        // policy stays generic while `harness.ts` still gets a machine
+                        // answer to "was this run killed by the network?" instead of a
+                        // regex over the sentence.
+                        details: {
+                            errorClass: failure.errorClass,
+                            url: dial.url,
+                            ...(dial.port === undefined ? {} : { port: dial.port }),
+                            ...(failure.phase === undefined ? {} : { phase: failure.phase }),
+                            ...(failure.errno === undefined ? {} : { errno: failure.errno })
+                        }
+                    };
                     return;
                 }
 
@@ -1756,9 +1822,20 @@ export const openAICompatible = (
             // arrived is half a response (a dropped socket, a proxy closing the body).
             // It is a FAILED request, not an empty answer: the agent retries it.
             if (!streamState.sentinel && !finishReason) {
+                // (2026-11-17) Still CODELESS — a body that closed without saying how is a
+                // transient failure and keeps the generic ladder it has always had. What it
+                // now ALSO carries is the transit diagnosis: "the socket died mid-answer" is
+                // the textbook provider-transit failure, and `harness.ts` has to answer that
+                // question from a field, not from a regex over this sentence, so the session
+                // layer can tell a network death from a refusal.
                 yield {
                     type: 'error',
-                    message: 'The model stream ended before reporting a completion.'
+                    message: 'The model stream ended before reporting a completion.',
+                    details: {
+                        errorClass: PROVIDER_TRANSIT_CLASS,
+                        url: dial.url,
+                        ...(dial.port === undefined ? {} : { port: dial.port })
+                    }
                 };
                 return;
             }

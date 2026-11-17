@@ -447,6 +447,7 @@ export const threadOf = (source: unknown): HarnessThreadInfo | undefined => {
         input?: unknown;
         kind?: unknown;
         branchId?: unknown;
+        epoch?: unknown;
     };
     if (typeof candidate.id !== 'string' || candidate.id.length === 0) return undefined;
 
@@ -472,6 +473,23 @@ export const threadOf = (source: unknown): HarnessThreadInfo | undefined => {
     if (typeof candidate.branchId === 'string' && candidate.branchId.length > 0) {
         result.branchId = candidate.branchId;
     }
+
+    // T-W10 (2026-11-17) — the per-process EPOCH that minted `id` (../../types/index.ts
+    // `HarnessThread.epoch`, stamped at every run-identity mint site by ../harness.ts
+    // `run.thread` / `threadIdentity` / `branchThreadOf`, and aliased on the REST by
+    // ../server/api-events.ts). It has to be COPIED or the browser's own fold can never see
+    // it: the tile keys one row per invocation id (../frontend/ui/turns.ts `entryFor`,
+    // `entryForMeta`, and the `.thread-row` `data-thread-id` dedupe), and the epoch is the
+    // only recorded fact that separates a run from a later run wearing the SAME id after a
+    // process restart — the same discriminator the accepted server fold reads
+    // (../server/turn-projector.ts `isEpochBoundary`). T-W15 (2026-11-17) added a SECOND
+    // consumer of this same copy, the TOOL-CARD plane (`callKeyOf` in ../frontend/ui/turns.ts:
+    // `appendTool` and `resolveTool`), because the call-id counter is per process too — drop
+    // this line and a re-minted `callId` silently loses its settled card, not just its row.
+    // Read structurally like every other optional field: absent or malformed means "the
+    // producer said nothing", and the fold then behaves exactly as it did before the field
+    // existed.
+    if (typeof candidate.epoch === 'string' && candidate.epoch.length > 0) result.epoch = candidate.epoch;
 
     return result;
 };

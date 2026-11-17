@@ -39,6 +39,12 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '../harness';
+// T-W8: every recorded `thread` payload now carries the minting process's epoch
+// (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
+// ../harness.ts). These assertions are WHOLE payloads, so the key has to be named; the
+// value is exact because every queued run here executed IN THIS PROCESS, and vitest gives
+// one module registry per test file — one epoch for the whole file.
+import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
 import type { HarnessMessage, HarnessStreamEvent } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
@@ -454,14 +460,23 @@ describe('SessionStore task queue', () => {
                 // R1-R6/T3: a root HOST-thread run carries its invocation identity
                 // on every frame (`input` on start only); the first run of a fresh
                 // harness is invocation '1'.
+                // T-W8: each payload also names the minting PROCESS (`HarnessThread.epoch`,
+                // ../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity
+                // mints in ../harness.ts). Exact here because the queued run executed in this
+                // process, and vitest gives one module registry — hence one epoch — per file.
                 events: [
                     {
                         type: 'start',
                         agent: 'gated',
                         model: 'scripted/test',
-                        thread: { id: '1', input: 'first' }
+                        thread: { id: '1', input: 'first', epoch: HARNESS_PROCESS_EPOCH }
                     },
-                    { type: 'text', agent: 'gated', delta: 'answer:first', thread: { id: '1' } },
+                    {
+                        type: 'text',
+                        agent: 'gated',
+                        delta: 'answer:first',
+                        thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
+                    },
                     {
                         type: 'done',
                         agent: 'gated',
@@ -473,7 +488,7 @@ describe('SessionStore task queue', () => {
                             model: 'scripted/test',
                             stopReason: 'stop'
                         },
-                        thread: { id: '1' }
+                        thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
                     }
                 ],
                 eventTimes: [2_000, 4_000, 4_000]
@@ -488,14 +503,20 @@ describe('SessionStore task queue', () => {
                 startedAt: 3_000,
                 updatedAt: 5_000,
                 // The second submit opened its own thread; its run is invocation '2'.
+                // T-W8: same process epoch as the first turn (one epoch per process).
                 events: [
                     {
                         type: 'start',
                         agent: 'gated',
                         model: 'scripted/test',
-                        thread: { id: '2', input: 'second' }
+                        thread: { id: '2', input: 'second', epoch: HARNESS_PROCESS_EPOCH }
                     },
-                    { type: 'text', agent: 'gated', delta: 'answer:second', thread: { id: '2' } },
+                    {
+                        type: 'text',
+                        agent: 'gated',
+                        delta: 'answer:second',
+                        thread: { id: '2', epoch: HARNESS_PROCESS_EPOCH }
+                    },
                     {
                         type: 'done',
                         agent: 'gated',
@@ -507,7 +528,7 @@ describe('SessionStore task queue', () => {
                             model: 'scripted/test',
                             stopReason: 'stop'
                         },
-                        thread: { id: '2' }
+                        thread: { id: '2', epoch: HARNESS_PROCESS_EPOCH }
                     }
                 ],
                 eventTimes: [3_000, 5_000, 5_000]
@@ -603,8 +624,9 @@ describe('SessionStore task queue', () => {
             type: 'error',
             agent: 'flaky',
             error: { message: 'provider exploded' },
-            // Host-thread root frames carry their invocation identity.
-            thread: { id: '1' }
+            // Host-thread root frames carry their invocation identity — and, since T-W8, the
+            // process that minted it (`../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`).
+            thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
         });
     });
 
@@ -1280,9 +1302,15 @@ describe('queue HTTP contract', () => {
                         type: 'start',
                         agent: 'gated',
                         model: 'scripted/test',
-                        thread: { id: '1', input: 'survivor' }
+                        // T-W8: recorded frames name the process that minted the invocation id.
+                        thread: { id: '1', input: 'survivor', epoch: HARNESS_PROCESS_EPOCH }
                     },
-                    { type: 'text', agent: 'gated', delta: 'answer:survivor', thread: { id: '1' } },
+                    {
+                        type: 'text',
+                        agent: 'gated',
+                        delta: 'answer:survivor',
+                        thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
+                    },
                     {
                         type: 'done',
                         agent: 'gated',
@@ -1294,7 +1322,7 @@ describe('queue HTTP contract', () => {
                             model: 'scripted/test',
                             stopReason: 'stop'
                         },
-                        thread: { id: '1' }
+                        thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
                     }
                 ],
                 eventTimes: [2_000, 2_000, 2_000]

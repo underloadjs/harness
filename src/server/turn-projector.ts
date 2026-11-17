@@ -99,6 +99,11 @@ import type {
     TurnSummary
 } from '../shared/turn-display';
 import type { SessionTurn } from './protocol';
+// R19 (2026-11-17): the invocation-RUN join rule, imported as a VALUE from the file that owns it
+// (../protocol.ts, beside the `invocationIds` wire contract it feeds). The store WRITES the join
+// with the same helper (../sessions.ts `noteInvocationThread`), so a section can only ever be
+// resolved by the key the recorder used, and the format is defined in exactly one place.
+import { invocationRunKeyOf } from './protocol';
 
 // The turn's own root flow. INTERNAL key only: a section's wire identity is always
 // its minted `${turnId}:${ordinal}` id, which is why a delegation placeholder can
@@ -553,6 +558,32 @@ type SectionRecord = {
     started: boolean;
     terminal: boolean;
     placeholder: boolean;
+    // T-W3/F5 — the evidence `isRunBoundary` reads. Every field here is written from the
+    // recorded frames only, so a live fold and a cold re-fold of the same events see
+    // the same values and mint the same rows (the invariant at the top of this file).
+    //
+    // `rootShaped` is the identity SHAPE this row was bound to when it was minted: true
+    // for the turn's own flow (`ROOT_KEY`, a threadless `inline:<agent>` flow, or a row
+    // minted by a frame with no parent / spawn call / kind / branch), false for an
+    // agent-spawned run. The journal's `thread.id` is an INVOCATION id and a restarted
+    // process restarts its counter, so an id is NOT unique for a turn's whole life —
+    // the shape is what tells one run from another wearing the same id.
+    rootShaped: boolean;
+    // T-W8 — the PROCESS epoch of the run this row belongs to, copied off the frame that
+    // gave the row its identity (`adoptPlaceholder`, `createChild`, and the root row's first
+    // invocation binding in `route`). ROW state, never wire state: `TurnSection` has no epoch
+    // field and the REST shape did not move.
+    //
+    // `undefined` means "unknown", not "pre-restart": an un-adopted delegation PLACEHOLDER
+    // always carries `undefined`, because it names the parent's CALL and no run owns it yet —
+    // the epoch arrives with the run's first frame. A legacy row (a record with no epoch
+    // anywhere) is `undefined` too, and `isEpochBoundary` never fires on `undefined`, which is
+    // the whole backward-compatibility rule.
+    epoch?: string;
+    // The stamp of the LAST frame routed to this row. `apply` writes it after handling
+    // the frame, so a `done`/`error` is ON the row it settled and the boundary question
+    // is only ever asked of a frame that arrives afterwards.
+    lastStamp?: number;
     // The spawning call id of a delegation placeholder. Kept so a removal (a failed
     // attempt, or a turn that ended before the child ran) un-registers the join, and
     // so ADOPTION keeps the call -> child mapping alive: the parent's `tool_result`
@@ -561,6 +592,127 @@ type SectionRecord = {
     latestInput?: number;
     cachedInput?: number;
     cachedReported: boolean;
+};
+
+// A thread record with no parent, no spawning call, no kind and no branch is the
+// turn's OWN conversation (turns.ts:4063 — the same discriminator
+// ../shared/agent-results.ts uses), never an agent-spawned child. Module-scoped
+// because the run-boundary rule below reads the SAME definition the router does.
+const isConversationRoot = (meta: NonNullable<HarnessEvent['thread']>): boolean =>
+    meta.parentId === undefined && meta.callId === undefined && meta.kind === undefined && meta.branchId === undefined;
+
+// T-W8 (2026-11-17) — THE RESTART DISCRIMINATOR, stated once so every door asks the same
+// question the same way.
+//
+// `thread.id` is the runtime's INVOCATION counter, and that counter is per PROCESS: a
+// restarted harness starts it again and a lane worker mints from its own
+// (../harness.ts:8235 `reserveIdentity` only ever RAISES a leased mark). The mint sites
+// (../harness.ts `run.thread` for a branch / a child / a host-thread run, plus the branch
+// audit frames in `branchThreadOf`) therefore stamp `HarnessThread.epoch` — the epoch of the
+// process that minted the id (`HARNESS_PROCESS_EPOCH`, ../core/agent-limits.ts; the REST
+// epoch is the same value, see ./api-events.ts).
+//
+// A boundary is decided ONLY by two KNOWN epochs that differ. An absent epoch — every turn
+// recorded before this change, and every hand-written reporter — says "this producer said
+// nothing" (../types/index.ts), and the fold then falls back to the shape and
+// post-terminal-`start` rules below, exactly as it did before. That is what keeps a session
+// recorded pre-change folding BYTE-IDENTICALLY: with no epoch on either side, nothing here
+// can move a row.
+const isEpochBoundary = (knownEpoch: string | undefined, incomingEpoch: string | undefined): boolean =>
+    knownEpoch !== undefined && incomingEpoch !== undefined && knownEpoch !== incomingEpoch;
+
+// T-W3/F5 — ONE SECTION PER RUN, EVEN WHEN THE JOURNAL REUSES AN ID.
+//
+// THE DEFECT (user-visible): the main conversation's row stopped at "thinking" while the
+// answer sat in the record, some rows printed impossible durations, and one label
+// appeared twice on the board. `thread.id` is an INVOCATION id from the runtime counter,
+// and a restarted harness process restarts that counter: in the live record three
+// delegated children ran under ids 15/16/17 before a ~19-minute process death, and after
+// the restart the turn's OWN flow and two fresh conversations were recorded under those
+// SAME ids. `route` answers a metadata frame from `byInvocation.get(meta.id)` first, so
+// every post-restart frame folded into a pre-restart child's row — its reasoning deltas
+// appended to a dead run's thinking block, and its final `done` (with the complete
+// answer) settled THAT row instead of the conversation's own flow.
+//
+// THE RULE, decided from the recorded sequence alone — every input is a field of the
+// record or of the row the record already built, so the live fold and the cold re-fold
+// still mint identical rows:
+//
+//   1. IDENTITY SHAPE. A row belongs to ONE kind of flow: the turn's own conversation (a
+//      root-shaped frame: no parent, no spawn call, no kind, no branch) or an
+//      agent-spawned run (a frame naming at least one of them). A frame whose shape
+//      disagrees with the row its id resolved to is a different run wearing a recycled
+//      id, never a continuation. This is the structural half, and it catches the live
+//      artifact even though the pre-restart children were cut off mid-run and never
+//      reached a terminal frame: an open reasoning block cannot absorb a frame that says
+//      it belongs to the conversation root.
+//
+//   2. A CLOSED RUN BOUNDARY. A row whose run has already closed (its `done`, its own
+//      `error`, a parent's settling `tool_result`, or the turn settling) can still be
+//      matched by a shape-agreeing frame — the same id reused by a like-shaped flow. It
+//      is reused only while the frames still belong to its own run:
+//        - every other recorded frame merges exactly as before (a late `tool_result`, a
+//          replayed `usage`, a duplicated terminal, a re-`start` while the row is still
+//          open), and
+//        - a NEW run begins at the frame that OPENS one — an incoming `start` — and only
+//          when that frame is stamped AFTER the frame that closed the row. Both figures
+//          are the record's own; a legacy record with no `eventTimes` (stamp `undefined`)
+//          can therefore never split a row, which is what keeps a cold fold equal to the
+//          live fold. A run recorded with no `start` frame keeps merging into the row it
+//          matched, because the record then holds no boundary to split on.
+//
+// T-W8 (2026-11-17) — RULE (0), THE EPOCH, AND WHY IT COMES FIRST. Rules (1) and (2) are
+// INFERENCES from the record, and each has a case it cannot decide: two runs of the SAME
+// shape, one of which is still open, and a spawn `callId` that a restarted runtime re-minted
+// too, are indistinguishable from the frames alone — the residual F5 left exactly there
+// (`route`, and the limit note that used to sit beside it). `HarnessThread.epoch` closes it
+// with a FACT rather than an inference: it names the process that minted the id; the runtime's
+// `snapshot()`/`restore()` deliberately carry NO epoch of their own (../core/agent-limits.ts),
+// so a restored replica is a NEW minting context rather than a re-stamped old one; and every
+// frame of one run carries the same value (`threadIdentity`, ../harness.ts), which the journal
+// copies verbatim (./journal.ts) — the recorded frames are the ONLY place the value survives a
+// restart, which is why the fold can still read it after a reload. So a KNOWN epoch that differs is a boundary on its own,
+// ahead of the shape test and ahead of the "row is still open" rule — a dead run's row cannot
+// absorb a frame from a process that never ran it, however similar the two runs look.
+//
+// It is a STRONGER test, never a louder merge: an `undefined` epoch on EITHER side (every
+// record written before this change, every un-adopted placeholder, every hand-written
+// reporter) decides nothing and falls through to rules (1)-(3), so a session recorded
+// pre-change folds byte-identically to how it folds today.
+//
+// What is deliberately NOT a boundary: a `start` while the row is still open (the retry
+// ladder re-sends frames and the row keeps its span — `bindSectionStart` is
+// first-write-wins), any frame at or before the closing stamp, any frame of the
+// turn's OWN root row while the turn runs (the root only turns terminal at `settle`,
+// after which no further event folds — a root-shaped frame is routed to the conversation's
+// own card by `route` whichever way rule (0) answers, so a resumed conversation still lands
+// on its own row across a restart), and any pair of frames where either epoch is absent.
+const isRunBoundary = (
+    known: SectionRecord,
+    meta: NonNullable<HarnessEvent['thread']>,
+    incomingType: string,
+    stamp: number | undefined
+): boolean => {
+    // (0) The two frames were minted by different PROCESSES. Nothing else about them — not the
+    //     id, not the call id, not the shape, not whether the row is still open — can make them
+    //     one run. See the rule block above; `isEpochBoundary` is the single definition.
+    if (isEpochBoundary(known.epoch, meta.epoch)) return true;
+
+    // (1) The frame describes a different KIND of flow than the row it matched: the turn's
+    //     own conversation (ROOT, or a threadless `inline:<agent>` flow) cannot absorb a
+    //     frame that names a parent / spawn call / kind / branch, and an agent-spawned
+    //     run cannot absorb a root-shaped one.
+    if (isConversationRoot(meta) !== known.rootShaped) return true;
+
+    // (2) An open row still owns its run: only a closed row can be superseded.
+    if (!known.terminal) return false;
+
+    // (3) Only a frame that opens a run can begin a new one…
+    if (incomingType !== 'start') return false;
+
+    // …and it has to be recorded after the frame that closed the old one. A row with no
+    // recorded stamp (a legacy fold) has no orderable boundary.
+    return known.lastStamp !== undefined && stamp !== undefined && stamp > known.lastStamp;
 };
 
 // A step plus its detail addressing, kept together so the op stream and the lazy
@@ -603,7 +755,141 @@ const sectionStateOf = (status: TurnRecordStatus): SectionDisplayState =>
               ? 'streaming'
               : 'open';
 
+// -----------------------------------------------------------------------------
+// W23 — a section the turn CLOSED without its own terminal frame (T-W23).
+//
+// THE DEFECT (measured on the user's own recorded run, Temp/orch-plan/w23/before.txt): three
+// delegated children were killed mid-run by a process death (a 1,141,922 ms hole at frame index
+// 17,476), never received a terminal frame, and `settle` force-closed them with the TURN's end
+// stamp and the TURN's state — so each printed a 3,844,6xx ms (~64 min) span while its own
+// recorded activity stopped 185,9xx ms after its start, and each claimed `state: 'done'`, i.e.
+// that it had finished, when it had in fact been cut off.
+//
+// THE RULE, for one row only: a row that answered with its OWN terminal frame is untouched (the
+// `done`/`error`/`branch_end`/`tool_result` sites at :3092, :3235, :3403 and :2979 already stamped
+// its real end). Everything else `settle` reaches was interrupted, and must report only what its
+// own frames recorded: its span ENDS at `record.lastStamp` — the stamp of the last frame ROUTED TO
+// THAT ROW, written by `apply` (:3436) from frame stamps only, never `Date.now()` — and its state
+// says it was cut off instead of claiming success.
+//
+// WHY `'cancelled'` IS THE STATE, and why not the alternatives (vocabulary fixed at
+// ../shared/turn-display.ts:195 `'open' | 'streaming' | 'done' | 'error' | 'cancelled'`; this uses
+// an EXISTING value, so the wire contract, the REST mirror ../shared/harness-api.ts:3275 and the
+// client's terminal-state sets ../frontend/view-state.ts:907 and ../frontend/view-detail.ts:262 are
+// all unchanged — nothing to pin, nothing to migrate on restore):
+//   - `'done'`  — the lie being fixed: the row never reached a terminal frame;
+//   - `'error'` — claims a FAILURE this record does not hold. In this projector `state: 'error'`
+//     on a section is stamped ONLY next to a recorded `error` frame and its error notice (:3235),
+//     and `abandonedStateOf` (below) reserves `error` for a CALL, which really did fail to return;
+//   - `'streaming'`/`'open'` — claim the row is still running, and `../frontend/view-state.ts:963,976`
+//     would keep its agent in the live "active agents" set after the turn closed;
+//   - `'cancelled'` — the value this codebase already uses for "ended before completing, by a
+//     control event, not by its own failure": `branch_end` with `status: 'cancelled'` (:3403) and a
+//     spawning `tool_result` with `outcome: 'cancelled'` ("A CANCELLED call is a control outcome,
+//     never an error", :2974). A run cut short by the turn closing is exactly that.
+//
+// A turn that settled `error`/`cancelled` already explains its unfinished rows with
+// `sectionStateOf` (`'error'`/`'cancelled'`, byte-identical to before) — the complaint is only about
+// a row CLAIMING SUCCESS, so that is the only mapping this changes.
+const interruptedStateOf = (status: TurnRecordStatus): SectionDisplayState =>
+    status === 'done' ? 'cancelled' : sectionStateOf(status);
+
+// The end of an interrupted row's span: its OWN last recorded activity.
+//   - no `lastStamp` (a record with no `eventTimes`, i.e. `DISPLAY_NO_TIMESTAMP`) keeps the settle
+//     stamp exactly as before, so a record with no recorded times is byte-identical;
+//   - never BEFORE the row's own `startedAt`: a journal can hand frames out of order (see the
+//     out-of-order scenario in ./turn-projector-restart.test.ts), and ../frontend/ui/time.ts
+//     `elapsedBetween` returns `undefined` for a negative span, which would hide the label the
+//     reader is used to seeing — the recorded start is the honest floor (a 0 ms span).
+const interruptedEndedAtOf = (record: SectionRecord, settledAt: number | undefined): number | undefined => {
+    const last = record.lastStamp;
+
+    if (last === undefined) return settledAt;
+
+    const started = record.section.startedAt;
+
+    return started === undefined || last >= started ? last : started;
+};
+
 const abandonedStateOf = (status: TurnRecordStatus): StepDisplayState => (status === 'cancelled' ? 'cancelled' : 'error');
+
+// -----------------------------------------------------------------------------
+// W24 — a CALL CARD the turn closed without its own result frame (T-W24).
+//
+// THE DEFECT, the half of T-W23 the row fix left behind (measured on the same recorded run,
+// Temp/orch-plan/w24/before.txt): `settle` force-closed the three DELEGATED ROWS at their own last
+// activity (rows :1/:2/:3 -> 185,9xx ms / `cancelled`), but the CARDS inside them still ended at the
+// TURN's stamp — root row `:0` printed 3 abandoned cards (widest 3,844,657 ms / 64m04s) and row `:3`
+// 2 more (widest 3,658,721 ms / 60m58s). So the row says `3m05s` while a card inside it says
+// `64m04s`, and the figure the card prints is exactly this field: the compiled card resolves with
+// `step.durationMs ?? elapsedBetween(step.startedAt, step.endedAt)` (../frontend/ui/turns.ts:8246,
+// mirrored at ../frontend/view-context.ts:1114), and an abandoned call has no `durationMs` — the
+// settle loop refuses to invent one (`settle`, "NO duration is invented for a call that never
+// reported one"), so `endedAt` alone is the span the reader sees.
+//
+// THE RULE, the row rule one plane down: a card that received its OWN terminal event is never
+// reached here at all (the loop skips anything not `state: 'running'`; the `tool_result` at :2863
+// and the `action_answer` at :3302 already stamped the real end, and both are asserted unchanged),
+// and everything `settle` does reach must report only what its OWN frames recorded.
+//
+// WHICH STAMP IS "THE CARD'S OWN LAST ACTIVITY" — the card-plane answer to `record.lastStamp`,
+// derived by enumerating EVERY write a step ever takes, and each one only from `apply`'s `stamp`
+// (never a wall-clock read):
+//   - minted by a `tool_call` (:2744-2761, `startedAt` = `stamp`), a result-only legacy `tool_result`
+//     (:2923-2940, `startedAt` AND `endedAt` = `stamp`, so it is already terminal), or an
+//     `action_request` (:3261-3283, `startedAt` = `stamp`);
+//   - written again ONLY by `setStep`, which has exactly two call sites — the settling
+//     `tool_result` (:2863) and the answering `action_answer` (:3302). Both stamp `endedAt` and move
+//     the card out of `running` in the same patch, so a card that is STILL running at `settle` has
+//     been written by exactly ONE frame: the one that minted it.
+//   - nothing else touches a card: `usage`/`pending` paint the section's PENDING line and its own
+//     `pendingCalls` map (:1740-1766), `retry` removes whole attempts, and `openCalls` membership is
+//     bookkeeping, not display.
+// So for a running card the LAST card-plane stamp IS `startedAt` — the same figure `record.lastStamp`
+// is built from (:3436 writes that one from the identical `stamp` argument), one plane down. Measured
+// on the recorded run: all 5 abandoned cards carry `card.startedAt == eventTimes[tool_call index]`
+// (Temp/orch-plan/w24/before.txt, the `open=` witness column), which is the record confirming it.
+//
+// WHY THE SPAN LANDS ON 0 ms AND THAT IS THE HONEST FIGURE: a card the record never gave an end for
+// has no recorded activity after its own opening frame, so its span is 0 ms — the same floor the
+// accepted row rule states (`interruptedEndedAtOf` clamps at `startedAt`;
+// ./turn-projector-settle-interrupted.test.ts:459 pins `'0ms'` for exactly that case). The
+// alternatives are all worse: `settledAt` is the restart-sized lie; ABSENT `endedAt` makes the card
+// tick from `startedAt` to NOW in the compiled renderer (../frontend/ui/turns.ts:8238-8246 says so
+// verbatim), which is the same absurdity with a moving number.
+//
+// The STATE is deliberately NOT touched: `abandonedStateOf` calls this call one that failed to
+// return, and the record agrees (the record holds no result frame for it at all — the fold's own
+// witness for abandonment). The complaint is the duration, so the duration is the only field moved.
+//
+// T-W25 — THE SAME RULE ONE PLANE DOWN AGAIN, for the CONTEXT-BAR SEGMENT of the same call. This
+// helper is reused (not duplicated) at the segment patch below, and that is sound because a call
+// this loop reaches has ONE opening frame feeding BOTH planes: the `tool_call` at :2806 writes
+// `step.startedAt` (:2831) and the segment's `at` (:2857) from the SAME `stamp` argument in the SAME
+// frame, and nothing between there and `settle` touches either field (the only other writers are the
+// `tool_result`, which moves the card out of `running` and stamps the segment's `endedAt`/
+// `durationMs`, and `action_answer`, whose `action` card mints no segment at all). So
+// `segment.at === step.startedAt` is an identity for exactly the segments this loop reaches, the
+// figure the segment ends at is the card's figure, the span lands on 0 ms in both, and the clamp at
+// the recorded start — the segment's OWN start, being the same number — makes a negative span
+// impossible, which matters here because `contextBlockDurationOf` (../frontend/view-context.ts:339-346)
+// returns `undefined` for one and a reader would lose the duration label entirely.
+const abandonedEndedAtOf = (entry: StepRecord, settledAt: number | undefined): number | undefined => {
+    // The last frame that ever wrote to this card (proof above: today, the mint frame).
+    const last = entry.step.startedAt;
+
+    // No stamp anywhere — a record with no `eventTimes`, i.e. `DISPLAY_NO_TIMESTAMP` — keeps the
+    // settle stamp exactly as before, so an un-timed record folds byte-identically.
+    if (last === undefined) return settledAt;
+
+    // The recorded start is the floor, exactly as in `interruptedEndedAtOf`: `elapsedBetween`
+    // (../frontend/ui/time.ts) refuses a negative span, and an `undefined` span is what makes the
+    // card tick to NOW. The two reads are the same field today, so this is a no-op that keeps
+    // holding if a frame ever starts extending a running card's stamp.
+    const started = entry.step.startedAt;
+
+    return started === undefined || last >= started ? last : started;
+};
 
 const TURN_STATE_OF: Record<TurnRecordStatus, 'queued' | 'streaming' | 'done' | 'error' | 'cancelled'> = {
     queued: 'queued',
@@ -771,7 +1057,25 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     // The bracket (`turn.usage`, folded turn-wide by ../sessions.ts `addUsage` ~1064) is
     // unchanged accounting and keeps folding children.
     let rootLatestInput: number | undefined;
-    let lastError: string | undefined;
+    // T-W3/F6 — the recorded FAILURE TEXTS, split by which flow recorded them. The one
+    // figure a turn's header shows (`summaryOf`'s `detail`) used to read a single
+    // `lastError` that ANY `error` frame wrote and NOTHING cleared: the `retry` handler
+    // deliberately leaves it alone, `settle()` never resets it, a resumed turn reuses the
+    // cached projector (../sessions.ts) and a cold `refoldTurn` re-folds the same frames,
+    // so one recorded error outranked everything the run did afterwards. On the live
+    // record the printed line was a delegated lane's provider failure recorded AFTER the
+    // main flow's final `done` — a completed turn reading as a failed one.
+    //
+    // Two figures, one per kind of flow, because the honest answer differs:
+    //   - `rootError` — the turn's OWN flow recorded a failure (the interrupted-resume
+    //     contract: the stop's own text is the row's status line, and a run that resumed
+    //     and is still going has an unresolved failure of its OWN);
+    //   - `laneError` — some other flow did (a delegated conversation, a lane, a branch).
+    //     That text is the ROW's fact and it stays in the body as its own `error` notice;
+    //     it is only ever a fallback for the header when the turn actually ended failed and
+    //     the turn's own flow recorded nothing.
+    let rootError: string | undefined;
+    let laneError: string | undefined;
     let settledStatus: TurnRecordStatus | undefined;
     let settledAt: number | undefined;
     // The timestamp of the event being folded (undefined for a record with no
@@ -833,6 +1137,13 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             placeholder,
             started: !placeholder,
             terminal: false,
+            // F5: the identity SHAPE this row starts out bound to. A ROOT row and a
+            // threadless `inline:<agent>` flow (`inlineKey`) both describe a flow that
+            // carries NO thread metadata, so a metadata frame that lands on one of them
+            // only belongs there while it is root-shaped too; a row minted from thread
+            // metadata re-stamps this from its own frame (`adoptPlaceholder`,
+            // `createChild`).
+            rootShaped: key === ROOT_KEY || key.startsWith('inline:'),
             pendingCalls: new Map(),
             cachedReported: false,
             section: {
@@ -863,8 +1174,17 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         return record;
     };
 
-    const conversationLabelOf = (invocationId: string | undefined): string | undefined =>
-        invocationId === undefined ? undefined : context.threadLabels?.get(invocationId);
+    const conversationLabelOf = (
+        invocationId: string | undefined,
+        epoch: string | undefined
+    ): string | undefined =>
+        // R19: the store's `threadLabels` view is keyed by INVOCATION RUN, and its `get` already
+        // falls back to the BARE id (../sessions.ts `resolveLabel`), so one lookup with the run key
+        // resolves both a post-restart run of a recycled id and a record that carries no epoch at
+        // all. The key rule is `invocationRunKeyOf` (../protocol.ts) — identical to the client
+        // fold's `runKeyOf` (../frontend/ui/turns.ts:1649), so both halves of the product name one
+        // run the same way.
+        invocationId === undefined ? undefined : context.threadLabels?.get(invocationRunKeyOf(invocationId, epoch));
 
     // R18/T18: the PERSISTENT conversation one invocation ran in. The store owns this
     // join (../sessions.ts `Session.invocationThreads`, handed in as
@@ -873,8 +1193,20 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     // (../sessions.ts records it immediately BEFORE `projector.apply`). The fold reads
     // it and mints nothing: `undefined` means "no recorded join", and the section then
     // omits `threadId` exactly as a pre-T18 record does.
-    const conversationThreadIdOf = (invocationId: string | undefined): string | undefined =>
-        invocationId === undefined ? undefined : context.invocationThreadIds?.get(invocationId);
+    //
+    // R19: same RUN-key rule as `conversationLabelOf`, and the same bare-id fallback — it lives in
+    // the store's live view (../sessions.ts `displayContext` → `threadIds`), which is the single
+    // place that knows the key format. Without the scope, a post-restart run wearing a dead
+    // conversation's journal id would be folded with the DEAD conversation's identity, which is
+    // what the operator's board showed (a pre-restart child row labelled with the main
+    // conversation's name).
+    const conversationThreadIdOf = (
+        invocationId: string | undefined,
+        epoch: string | undefined
+    ): string | undefined =>
+        invocationId === undefined
+            ? undefined
+            : context.invocationThreadIds?.get(invocationRunKeyOf(invocationId, epoch));
 
     // R9 (user-reported: "Time for subagent/delegates is missing completely"): the row's
     // elapsed label reads the section's START, and the fold never wrote one. `endedAt`
@@ -933,10 +1265,20 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     };
 
     const removeSection = (record: SectionRecord, ops: TurnDisplayOp[]): void => {
-        byKey.delete(record.key);
+        // F5: same identity rule for every map — a key may already resolve to the row
+        // that took this one's identity over, and dropping THAT entry would unregister
+        // the live row while its dead twin went away.
+        if (byKey.get(record.key) === record) byKey.delete(record.key);
         if (record.spawnCallId !== undefined && byCall.get(record.spawnCallId) === record) byCall.delete(record.spawnCallId);
-        if (record.section.invocationId !== undefined) byInvocation.delete(record.section.invocationId);
-        if (record.section.branchId !== undefined) byBranch.delete(record.section.branchId);
+        // F5: an identity map may already point at the row that TOOK OVER this one's id
+        // (a run that began under a recycled journal id re-registers it, and a reclaimed
+        // id points at the turn's own flow), so an entry is only dropped when it still
+        // names the row being removed. Deleting unconditionally would unregister the live
+        // row's join while its dead twin went away.
+        if (record.section.invocationId !== undefined && byInvocation.get(record.section.invocationId) === record)
+            byInvocation.delete(record.section.invocationId);
+        if (record.section.branchId !== undefined && byBranch.get(record.section.branchId) === record)
+            byBranch.delete(record.section.branchId);
 
         const index = sections.indexOf(record);
         if (index >= 0) sections.splice(index, 1);
@@ -965,10 +1307,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
     // A thread record with no parent, no spawning call, no kind and no branch is the
     // turn's OWN conversation (turns.ts:4063 — the same discriminator
-    // ../shared/agent-results.ts uses), never an agent-spawned child.
-    const isConversationRoot = (meta: NonNullable<HarnessEvent['thread']>): boolean =>
-        meta.parentId === undefined && meta.callId === undefined && meta.kind === undefined && meta.branchId === undefined;
-
+    // ../shared/agent-results.ts uses), never an agent-spawned child. It lives at module
+    // scope now (see the declaration above `createTurnProjector`) because the
+    // run-boundary rule `isRunBoundary` reads the same predicate.
     const adoptPlaceholder = (record: SectionRecord, meta: NonNullable<HarnessEvent['thread']>, ops: TurnDisplayOp[]): void => {
         byKey.delete(record.key);
         record.key = meta.id;
@@ -980,16 +1321,26 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
         if (!record.terminal) record.section.state = 'streaming';
         record.section.invocationId = meta.id;
+        // T-W8: the frame that gives a queued placeholder its invocation identity also says
+        // WHICH PROCESS that invocation was minted in, so this is where the row's epoch is
+        // born (a placeholder owns none before it — see the note in `route`).
+        record.epoch = meta.epoch;
         if (meta.branchId !== undefined) record.section.branchId = meta.branchId;
         byInvocation.set(meta.id, record);
+        // F5: the frame that gives a queued placeholder its identity also decides which
+        // KIND of flow this row is (`isConversationRoot`), which is what the run-boundary
+        // rule compares a later frame against. A delegation placeholder is always adopted
+        // by a frame that names its spawn `callId`, so this is `false` in practice — and
+        // it stays the frame's own statement rather than an assumption.
+        record.rootShaped = isConversationRoot(meta);
 
-        const label = conversationLabelOf(meta.id);
+        const label = conversationLabelOf(meta.id, meta.epoch);
         // R18/T18: an adopted placeholder IS a delegated conversation (its spawn frame
         // named the parent's `delegate` call), so the join is looked up on the invocation
         // id this frame carries. A row that already names a conversation keeps it — the
         // `branch_start` frame's own `threadId` is direct evidence, this join is only a
         // fallback — and a row with no join stays exactly as it was before.
-        const threadId = record.section.threadId ?? conversationThreadIdOf(meta.id);
+        const threadId = record.section.threadId ?? conversationThreadIdOf(meta.id, meta.epoch);
 
         if (threadId !== undefined) record.section.threadId = threadId;
 
@@ -1021,12 +1372,24 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     ): SectionRecord => {
         const record = newSection(meta.id, agent, meta.parentId, false);
 
+        // F5: a lane whose frames carry NO parent / spawn call / kind / branch IS a
+        // root-shaped flow even though this row is nested (the runtime records some
+        // delegated lanes that way), so the shape comes off the frame the row was minted
+        // from, never from the row's position in the tree.
+        record.rootShaped = isConversationRoot(meta);
+
+        // T-W8: a row minted from a metadata frame owns that frame's process epoch from birth
+        // — this is the row a RECYCLED id mints after a restart, and the epoch it carries is
+        // what stops the next frame of the same recycled id (same call id, same shape) from
+        // folding back into it.
+        record.epoch = meta.epoch;
+
         byInvocation.set(meta.id, record);
         if (meta.callId !== undefined) byCall.set(meta.callId, record);
         if (meta.branchId !== undefined) byBranch.set(meta.branchId, record);
         if (options.branchId !== undefined) byBranch.set(options.branchId, record);
 
-        const label = conversationLabelOf(meta.id);
+        const label = conversationLabelOf(meta.id, meta.epoch);
 
         record.section.role = options.role ?? 'subagent';
         record.section.invocationId = meta.id;
@@ -1036,7 +1399,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // otherwise the store's invocation → conversation join is adopted verbatim, so a
         // delegated child is born addressable instead of indistinguishable from its
         // parent's flow. `undefined` omits the field on the wire, as before.
-        record.section.threadId = options.threadId ?? conversationThreadIdOf(meta.id);
+        record.section.threadId = options.threadId ?? conversationThreadIdOf(meta.id, meta.epoch);
         record.section.agentLabel = label ?? '';
         record.section.threadLabel = label;
         record.section.state = options.state ?? 'streaming';
@@ -1099,7 +1462,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
             if (invocationId === undefined) continue;
 
-            const threadId = join.get(invocationId);
+            // R19: the row's OWN process epoch (`record.epoch`, bound when the row took its
+            // invocation id — `rootSection`/`adoptPlaceholder`/`createChild`) scopes the lookup, so
+            // a late-learned join entry for a recycled id cannot be attached to a dead row. A row
+            // that knows no epoch asks with the bare id and gets exactly the pre-change answer;
+            // the bare-id fallback for an epoch-carrying row lives in the store's view.
+            const threadId = join.get(invocationRunKeyOf(invocationId, record.epoch));
 
             if (threadId === undefined) continue;
 
@@ -1112,7 +1480,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
         if (meta !== undefined) {
             const known = byInvocation.get(meta.id) ?? byKey.get(meta.id);
-            if (known !== undefined) return known;
+
+            // F5: a match only holds while it still describes the SAME run. The journal
+            // recycles `thread.id` when the process restarts (a restarted runtime
+            // restarts its invocation counter), so this is the one place a recycled id can
+            // be told apart from the run it used to name — see `isRunBoundary`.
+            if (known !== undefined && !isRunBoundary(known, meta, event.type, lastAppliedStamp)) return known;
 
             if (isConversationRoot(meta)) {
                 const root = byKey.get(ROOT_KEY);
@@ -1121,13 +1494,41 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     const created = rootSection(event.agent);
 
                     created.section.invocationId = meta.id;
-                    created.section.agentLabel = turn.threadLabel ?? conversationLabelOf(meta.id) ?? '';
-                    created.section.threadLabel = conversationLabelOf(meta.id) ?? turn.threadLabel;
+                    // T-W8: the row's process identity is bound with its invocation id, at
+                    // every one of the three places a row gets one (here, `adoptPlaceholder`,
+                    // `createChild`). A ROOT-shaped frame IS a run — a host conversation's own
+                    // turn carries `{id, input}` (../harness.ts) — so this row has an epoch
+                    // whenever the record says which process wrote it.
+                    created.epoch = meta.epoch;
+                    // R19: both joins are resolved with THIS frame's epoch — the root row of a
+                    // turn is the conversation's own run, and after a restart the same journal id
+                    // can name a run of a different conversation. `turn.threadLabel` /
+                    // `turn.threadId` remain the record's direct statement and still win for the
+                    // root, so an ambiguous id can never rename the conversation here.
+                    created.section.agentLabel = turn.threadLabel ?? conversationLabelOf(meta.id, meta.epoch) ?? '';
+                    created.section.threadLabel = conversationLabelOf(meta.id, meta.epoch) ?? turn.threadLabel;
                     created.section.threadId = turn.threadId;
                     byInvocation.set(meta.id, created);
                     openSection(created, ops);
 
                     return created;
+                }
+
+                // F5: the boundary above refused the stale row this id used to name, and a
+                // root-shaped frame IS the turn's own conversation, so the recycled id is
+                // re-pointed at the live row BEFORE anything else resolves against it. Two
+                // joins, both load-bearing: the frames that follow (and the answer they
+                // carry) have to land on the conversation's own card, and the children this
+                // run spawns name their parent BY this id (the parent lookup in
+                // `newSection`), so a dead row must not keep answering it. The WIRE
+                // identity is untouched — `section.invocationId` keeps the id the row was
+                // minted with — which is what keeps an expanded/anchored card from being
+                // lost mid-run (the rule at the top of this file). A frame that still falls
+                // past this branch (a different agent) re-binds the id again, to its own
+                // new row, through `createChild`.
+                if (known !== undefined && known !== root) {
+                    if (byKey.get(meta.id) === known) byKey.delete(meta.id);
+                    byInvocation.set(meta.id, root);
                 }
 
                 // Same agent, no parent: another frame of the host-thread run.
@@ -1138,13 +1539,55 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                         patchSection(root, { invocationId: meta.id }, ops);
                     }
 
+                    // T-W8: a root row minted THREADLESS (a legacy run, or the entry agent's
+                    // threadless stream at the bottom of `route`) has no epoch to compare
+                    // against, and the first frame that NAMES an invocation supplies it —
+                    // first evidence wins, so a later process can never rewrite it. This is
+                    // what lets a CHILD-shaped frame wearing this conversation's id split off
+                    // (rule (0)) instead of folding into the conversation's own card.
+                    if (root.epoch === undefined) root.epoch = meta.epoch;
+
                     return root;
                 }
+            } else if (known !== undefined && meta.callId !== undefined) {
+                // F5: a boundary refused the row this (recycled) journal id named, but a
+                // frame that names its spawn `callId` still owns a row under THAT identity
+                // — a call id is unique per call WITHIN the process that minted it, which is
+                // exactly the assumption the epoch gate below tests. This is the
+                // delegated run whose journal id another flow has taken over: it keeps
+                // streaming into its own row instead of minting one per frame. A row that
+                // is still an un-adopted PLACEHOLDER is not that run (the adoption below is
+                // its first frame), so the placeholder case keeps falling through.
+                //
+                // T-W8 (2026-11-17) CLOSED THE HONEST LIMIT this branch used to report, and it
+                // did so by asking the one question the record can actually answer. A CALL id
+                // is per-call, but the counter that mints it is per PROCESS like the invocation
+                // counter, so a restarted runtime re-mints call ids too — and the persisted
+                // lines settle nothing either way (Temp/orch-plan/events.jsonl, 160 081 rows of
+                // the resumed live turn, carry ONLY the journal's `thread.id`: ids 14..20 reused
+                // across the restart, no `callId`/`conversationId` at all). The join now reads
+                // the process identity instead of trusting the id: if the row this call names
+                // and this frame name TWO DIFFERENT EPOCHS, the call id was re-minted by the new
+                // process and cannot point at a row the old process owns, so the post-restart
+                // child falls through and mints a row of its own. Two epochs that agree, or
+                // either side absent (every record written before this change), keep the join
+                // exactly as F5 left it — see `isEpochBoundary`.
+                const claimed = byCall.get(meta.callId);
+
+                if (claimed !== undefined && !claimed.placeholder && !isEpochBoundary(claimed.epoch, meta.epoch))
+                    return claimed;
             }
 
             if (meta.callId !== undefined) {
                 const placeholder = byCall.get(meta.callId);
 
+                // T-W8: the epoch deliberately does NOT gate ADOPTION. An un-adopted placeholder
+                // is not a run — it is the row the parent's `delegate` CALL opened (the step
+                // lives on the parent's row, and one recorded call is one segment) — so its
+                // `epoch` is `undefined` by construction and `isEpochBoundary` cannot fire here.
+                // The frame that adopts the placeholder writes the row's epoch
+                // (`adoptPlaceholder`), so from that frame on the row answers to exactly one
+                // process, and a later process wearing the same call id splits instead.
                 if (placeholder !== undefined && placeholder.placeholder) {
                     adoptPlaceholder(placeholder, meta, ops);
 
@@ -2193,7 +2636,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
                 record.started = true;
                 if (record.section.agentLabel.length === 0) {
-                    const label = conversationLabelOf(record.section.invocationId);
+                    // R19: the row's own epoch scopes the join read, same rule as `syncThreadIds`
+                    // and the same fallback (a row that names no epoch resolves on the bare id).
+                    const label = conversationLabelOf(record.section.invocationId, record.epoch);
 
                     record.section.agentLabel = label ?? (record.key === ROOT_KEY ? turn.threadLabel ?? '' : '');
                     if (record.section.agentLabel.length > 0 && record.key === ROOT_KEY) {
@@ -2786,7 +3231,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 //     renderer (../frontend/ui/turns.ts:7840) and `error` is the tone the
                 //     provider rendering is gated on (../frontend/ui/turns.ts:7858); see
                 //     `providerRetryNoticeText` above for the full evidence;
-                //   - NO `lastError` and NO section patch: the run is still working, so the
+                //   - NO error text (`rootError` / `laneError`) and NO section patch: the
+                //     run is still working, so the
                 //     turn stays `streaming` and the turn's real failure (if the budget runs
                 //     out) is still the terminal `error` frame's own notice (:2715);
                 //   - the node is minted AFTER `discardAttempt`, and `noticeNode` is not
@@ -2852,7 +3298,13 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 // printed beside it — which is what keeps a terminal error from being
                 // mistaken for, or replacing, the meaningful evidence.
                 closeWriters(record);
-                lastError = previewText(message, DISPLAY_ERROR_CHARS);
+                // F6: the text is filed by WHICH FLOW failed — the turn's own (the root
+                // section, `turn.threadId`) or one of the flows running inside it. Both
+                // still mint their own `error` notice below, on their own row, so nothing
+                // is lost by not letting either one take over the turn's header: see the
+                // `summaryOf` precedence for what the header is allowed to read.
+                if (record.key === ROOT_KEY) rootError = previewText(message, DISPLAY_ERROR_CHARS);
+                else laneError = previewText(message, DISPLAY_ERROR_CHARS);
                 noticeNode(record, 'error', message, `n${index}`, stamp, undefined, ops);
 
                 // A child that reported its own failure is terminal; the root's state
@@ -2958,9 +3410,20 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
                 if (branch === undefined || typeof branch.branchId !== 'string' || branch.branchId.length === 0) break;
 
+                // T-W8: a branch id (`branch-N`) is minted from a per-process counter exactly
+                // like an invocation id, so the same recycled-name collision F5 fixed for runs
+                // exists here too. The row's process identity comes off the FRAME
+                // (`event.thread`, stamped by `branchThreadOf`), not off the summary: the
+                // `meta` below is synthesized from `event.branch`, which names no epoch, so an
+                // epoch taken from there would always be `undefined` and rule (0) would never
+                // fire for a branch row.
+                const branchEpoch = event.thread?.epoch;
+                // A row from another process is a dead branch wearing a recycled id, not this
+                // branch (`isEpochBoundary` stays silent when either side is unknown, so every
+                // record written before this change reuses its row exactly as before).
                 const existing = byBranch.get(branch.branchId) ?? byKey.get(branch.branchId);
 
-                if (existing !== undefined) {
+                if (existing !== undefined && !isEpochBoundary(existing.epoch, branchEpoch)) {
                     existing.placeholder = false;
                     existing.started = true;
 
@@ -2988,7 +3451,10 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     ...(branch.sourceThreadId === undefined ? {} : { parentId: branch.sourceThreadId }),
                     ...(branch.callId === undefined ? {} : { callId: branch.callId }),
                     branchId: branch.branchId,
-                    kind: branch.kind
+                    kind: branch.kind,
+                    // The frame's epoch, so `createChild` binds the new row to the process that
+                    // minted this branch id (see the note above).
+                    ...(branchEpoch === undefined ? {} : { epoch: branchEpoch })
                 } as NonNullable<HarnessEvent['thread']>;
 
                 createChild(meta, branch.agent, ops, {
@@ -3038,6 +3504,15 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // attempt can hand the tail back to the block before it. Runs after every op this
         // event produced, so a client never sees a designation that names a node it has
         // not received yet, and a section whose stamp did not move costs no op at all.
+        //
+        // F5 first: this is the row's own record of "the last frame that reached me", the
+        // figure `isRunBoundary` compares the NEXT frame against. Written AFTER the frame
+        // was handled, because a `done`/`error` belongs to the row it settled — the
+        // boundary question is only ever asked of a frame that arrives afterwards. A frame
+        // with no recorded stamp (a legacy fold, `DISPLAY_NO_TIMESTAMP`) writes nothing, so
+        // an un-timed record can never gain a boundary it did not have.
+        if (stamp !== undefined) record.lastStamp = stamp;
+
         syncTails(ops);
 
         return ops;
@@ -3126,7 +3601,35 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 continue;
             }
 
-            patchSection(record, { state: sectionStateOf(status), ...(settledAt === undefined ? {} : { endedAt: settledAt }) }, ops);
+            // T-W23 — THE ROOT IS THE ONE ROW `settle` DOES NOT FORCE-CLOSE. For every other row
+            // `settle` is a force-close: the turn ended over it, and its own end must come from its
+            // own frames (see `interruptedStateOf`/`interruptedEndedAtOf` above). For the turn's own
+            // card, `settle` IS its terminal frame by design — the root never mints one of its own,
+            // because a `done` closes one AGENT turn and "the root keeps streaming until the turn
+            // settles" (see :3086 and the note at :686: a root-shaped frame is always routed back to
+            // the conversation's own card, across a restart too). So the root's end is the turn's
+            // end, and its state is the turn's state — the same pair the turn tile prints straight
+            // off `TurnSummary.startedAt`/`updatedAt` (../frontend/ui/turns.ts:9347-9354), which is
+            // why truncating the root row would only make the section disagree with the tile.
+            //
+            // Measured on the recorded run (Temp/orch-plan/w23/before.txt): the root's 3,993,309 ms
+            // (~66 min) span is LEGITIMATE and stays. The conversation genuinely spans that wall
+            // time — it ran pre-restart, resumed post-restart on this same row, answered at
+            // 1794867200207, and then waited on recorded pending delegated work (three never-returned
+            // `delegate` calls, abandoned at settle) until the last lane's `error` frame closed the
+            // turn at 1794867558009. Waiting on its own recorded pending work is being alive; a
+            // child whose own frames stopped 19 minutes earlier is not.
+            const interrupted = record.key !== ROOT_KEY;
+            const endedAt = interrupted ? interruptedEndedAtOf(record, settledAt) : settledAt;
+
+            patchSection(
+                record,
+                {
+                    state: interrupted ? interruptedStateOf(status) : sectionStateOf(status),
+                    ...(endedAt === undefined ? {} : { endedAt })
+                },
+                ops
+            );
         }
 
         for (const entry of [...steps.values()]) {
@@ -3135,9 +3638,15 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             const owner = sectionOfEntry(entry);
             if (owner === undefined) continue;
 
+            // T-W24 — the card's own end, not the turn's (see `abandonedEndedAtOf` above: a card this
+            // loop reaches has been written by exactly one frame, the one that minted it). The settle
+            // stamp survives only as the fallback for a record with NO stamps at all, which is what
+            // keeps a legacy fold byte-identical.
+            const endedAt = abandonedEndedAtOf(entry, settledAt);
+
             const patch: Partial<DisplayStep> = {
                 state: abandonedStateOf(status),
-                ...(settledAt === undefined ? {} : { endedAt: settledAt }),
+                ...(endedAt === undefined ? {} : { endedAt }),
                 ...(entry.step.preview === undefined || entry.step.preview.length === 0
                     ? {
                           preview: previewText(
@@ -3156,15 +3665,30 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             Object.assign(entry.step, patch);
             ops.push({ op: 'step:set', turnId: turn.id, sectionId: owner.section.id, step: copyValue(entry.step) });
 
-            // The segment follows the row: the state it ended in and the time the turn
-            // closed. NO duration is invented for a call that never reported one, and
-            // its `chars` stays the argument bytes it really recorded.
+            // The segment follows the row: the state it ended in, and T-W25 — the SAME end the card
+            // above it was just given, i.e. `endedAt`, the last frame that ever wrote to this call
+            // (see `abandonedEndedAtOf`, whose T-W25 note proves `segment.at === step.startedAt` for
+            // exactly the segments this loop reaches, so the bar segment and the card it belongs to
+            // can no longer print two different spans). One computation feeds both planes on purpose:
+            // the pre-fix code stamped `settledAt` here, and the reader got the row's `3m05s`, the
+            // card's `0ms`, AND a `64m04s` context-bar segment for the same call, because
+            // `contextBlockDurationOf` (../frontend/view-context.ts:339-346) falls back to
+            // `endedAt - at` when the record has no measured `durationMs` (and `settle` invents none).
+            // The two fallbacks are the card's, unchanged: no stamp anywhere ⇒ leave the previous value
+            // (the settle stamp, i.e. a legacy record folds byte-identically), and the segment's own
+            // `at` is the floor, so the span can never go negative and lose its label.
+            //
+            // WHAT THIS DOES NOT TOUCH: the segment's CONTENT and redaction semantics (`chars`,
+            // `argsChars`, `included`, and `eventTo`, which is derived from real events and is
+            // load-bearing for the detail reads) — only the abandoned segment's END. A segment that
+            // received its own `tool_result` never enters this loop (`state !== 'running'` above), so
+            // its recorded settle time and measured `durationMs` are untouched by construction.
             patchBlock(
                 owner,
                 entry.blockId,
                 {
                     state: abandonedStateOf(status),
-                    ...(settledAt === undefined ? {} : { endedAt: settledAt })
+                    ...(endedAt === undefined ? {} : { endedAt })
                 },
                 ops
             );
@@ -3295,11 +3819,34 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         }
 
         const rootModel = byKey.get(ROOT_KEY)?.section.model;
-        // The settled status line: a recorded failure text wins, a DONE turn shows the
-        // model that answered (the tile's `merge(turn, model)` detail line), and a
-        // cancelled turn with no message shows NOTHING rather than the model of a run
-        // that never answered.
-        const detail = lastError ?? (status === 'done' ? rootModel : undefined);
+        // T-W3/F6 — THE SETTLED STATUS LINE, in one precedence order, every input a
+        // recorded figure (so the live fold and a cold re-fold of the same events answer
+        // the same thing — the invariant at the top of this file):
+        //
+        //   1. A turn that settled `done` shows THE MODEL THAT ANSWERED, never an error
+        //      text. A recorded `error` frame is a superseded fact once the answer landed:
+        //      on the live record a provider failure recorded first, then a resume, then
+        //      the completed answer, printed as a failed turn forever, because the error
+        //      text outranked the status and nothing ever cleared it (a resumed turn
+        //      reuses the cached projector, and a cold re-fold re-folds the same frames —
+        //      ../sessions.ts). `undefined` when the root flow never named a model stays
+        //      absent: no detail, rather than a stand-in.
+        //   2. A turn that settled `error` shows ITS OWN failure — the root flow's
+        //      recorded text — and only when the root flow recorded nothing does a
+        //      delegated flow's error answer. The turn really did end failed, so naming
+        //      the one recorded failure is the best evidence available; the child's own
+        //      row still prints its own notice either way, and a child's error can no
+        //      longer masquerade as the conversation's outcome on a turn that completed.
+        //   3. Any other status (a live run, or a cancelled turn) shows ONLY the root
+        //      flow's own recorded failure: an interrupted-resume turn still answers with
+        //      the stop's text, while a failure inside one lane is that lane's business —
+        //      it stays in the body, in the row where the reader can act on it.
+        const detail =
+            status === 'done'
+                ? rootModel
+                : status === 'error'
+                  ? rootError ?? laneError
+                  : rootError;
         const attachments = attachmentSummaries();
         const steers = steerSummaries();
         const visibleSections = sections.filter((record) => !record.placeholder).length;

@@ -2445,11 +2445,13 @@ paths:
       description: >-
         A page of conversation rows in creation order (the record's monotonic per-session sequence, which a
         later write never renumbers): identity, owning agent, origin, status, label, the parent thread for a
-        delegated child, reference edges, and transcript SIGNALS only (`message_count`, `chars`,
-        `has_transcript`). Only INDEPENDENT conversations are rows: an agent's default `agent:<name>`
-        conversation is implicit and is never listed, even though the row schema carries that origin for the
-        stream projections that do use it. Rows carry NO messages, NO tool results, NO invocation roster, and
-        NO `preview` - a long transcript costs nothing in this list, and the last-entry preview the
+        delegated child, reference edges, this conversation's invocation identity (`invocation_id`,
+        `invocation_ids`) with the process that minted it (`epoch`), and transcript SIGNALS only
+        (`message_count`, `chars`, `has_transcript`). Only INDEPENDENT conversations are rows: an agent's
+        default `agent:<name>` conversation is implicit and is never listed, even though the row schema
+        carries that origin for the stream projections that do use it. Rows carry NO messages, NO tool
+        results, NO turn roster, and NO `preview` - a long transcript costs nothing in this list, and the
+        last-entry preview the
         `ThreadSummary` schema declares is projected ONLY into a stream `thread.upsert` row, bounded at 160
         characters there. A conversation whose stored
         transcript this build could not read is a row with `transcript_state: unreadable` plus the refusal
@@ -5734,6 +5736,28 @@ components:
                 the failure kinds are additionally printed on the server log.
               items:
                 $ref: '#/components/schemas/SessionPluginDiagnostic'
+            inactive_thread_ids:
+              type: array
+              uniqueItems: true
+              items:
+                type: string
+              description: >-
+                Ids of the conversations this session SOFT-DELETED - the rows a
+                `DELETE /sessions/{id}/threads/{thread_id}` retired (`inactive: true`) and RETAINED.
+                ABSENT when the session never deleted one, so every pre-existing client reads the same
+                resource it reads today.
+                WHY THIS EXISTS: the roster (`GET /sessions/{id}/threads`) HIDES those rows, and so does
+                the turns page, which is the right listing rule for a client that WATCHED the delete -
+                but after a RELOAD the client never saw it, and a roster that stopped naming an id is not
+                evidence: it cannot be told apart from a conversation that never existed. Widening the
+                roster is the wrong remedy, because that filter is the single place every roster comes
+                from and the gate several routes lean on (a retired conversation would start counting in
+                `thread_count`, answering the default-conversation resolution, and passing the
+                "the roster names it" checks). So the deletion fact travels BESIDE the roster, and the
+                roster keeps meaning exactly "the conversations this session can still run".
+                Same source the turns page hides deleted rows with - the session's durable retirement
+                ledger, unioned with the `inactive: true` marks on the retained runtime rows - sorted by
+                id so a repaint is byte-stable. Ids named here are intentionally NOT in `threads`.
     SessionResponse:
       type: object
       description: Envelope of a session read, create, or patch.
@@ -7475,12 +7499,16 @@ components:
     ThreadSummary:
       type: object
       description: >-
-        One conversation as a roster row: identity, ownership, lifecycle, and transcript SIGNALS. The committed
+        One conversation as a roster row: identity, ownership, lifecycle, the invocation identity of its
+        latest run, and transcript SIGNALS. The committed
         transcript - every tool result verbatim, each bounded at 262,144 bytes (256 KiB) of model-facing text -
         is deliberately absent, which is what makes a 256-conversation roster a bounded read. `message_count` and
         `has_transcript` say whether a transcript read is worth asking for. This is also the shape a stream
         `thread.upsert` row carries, and it is the ONLY place `preview` appears: a REST roster row and a REST
         create/identified read never send it.
+        `invocation_id`/`invocation_ids` + `epoch` are the OTHER exception to "no invocation roster here": the
+        row names its runs WITHOUT naming any turn, which is what lets a client join a recorded frame to the
+        conversation that ran it (see the two fields below for the rule).
       required: [id, agent, origin, status, sequence, transcript_state, message_count, has_transcript]
       additionalProperties: false
       properties:
@@ -7513,6 +7541,61 @@ components:
         label:
           type: string
           description: The stable agent-prefixed conversation label (`RR2`, `IT1`), drawn from one per-code sequence.
+        # W26 (2026-11-17) — THE ID HALF OF THE PAIR `epoch` ALREADY DESCRIBES. W22 published the PROCESS on this
+        # row while the row itself stayed id-free by the R1 compact-roster decision, which left the token
+        # unpairable: `src/frontend/view-shell.ts` `getRawSession` builds the transcript dialog's roster rows from
+        # THIS page, so an export read carried a process with no invocation id beside it and the
+        # invocation -> conversation join could still not key a contested id. These two fields close that gap.
+        # Values are BARE invocation ids, never the composite `id\0epoch` (`src/shared/run-identity.ts`; the strip
+        # is `invocationIdOfRunKey`, applied by `src/server/api-reads.ts`), and BOTH keys are omitted when the
+        # conversation recorded nothing, so a conversation that never ran projects exactly as it did before.
+        invocation_id:
+          type: string
+          description: >-
+            The invocation identity of this conversation's LATEST recorded run — the id of the run the process
+            named in `epoch` minted, which is why the two keys are emitted as ONE fact. It is a BARE invocation
+            id: it joins the invocation ids recorded inside turn events, and a client that needs the store's RUN
+            key composes `id + U+0000 + epoch` itself (the composite never crosses this wire). `epoch` travels
+            with it and NEVER ahead of it, so a row that names a process always names the id that process minted.
+            ABSENT when the conversation has never run, and for a conversation whose record carries no
+            invocation id (one restored from a document that dropped it) — the row simply has no run to name.
+        invocation_ids:
+          type: array
+          maxItems: 64
+          description: >-
+            Every invocation id recorded as running in this conversation, oldest first, at most 64 of them,
+            deduplicated by BARE id — one conversation that ran in two processes can hold the SAME id once under
+            each epoch, so both the cap and the uniqueness rule are stated on the id, never on the run key. The
+            sources are the store's persisted invocation join plus the conversation's own record slot, which
+            makes this list read at least as wide as the durable join: a conversation whose join entry was
+            cleared (a reset drops them) still names the run its own record carries. Like the full thread
+            resource it keeps the OLDEST 64 and stops, so on a conversation with more recorded work than that the
+            NEWEST ids are the ones missing — which is why `invocation_id` (the latest) is carried separately and
+            stays correct whatever this list dropped. ABSENT when nothing was recorded (a conversation that never
+            ran), rather than answering `[]`.
+          items:
+            type: string
+        # W22 (2026-11-17) — the host/UI roster plane gains the run discriminator the store already
+        # records (`src/types/index.ts` `HarnessThreadRecord.epoch`). Additive and optional: a
+        # conversation with no recorded epoch emits NO key, so every roster row of every document
+        # written before this field projects byte-identically.
+        epoch:
+          type: string
+          description: >-
+            The PROCESS that minted the invocation id in `invocation_id` - the ledger generation this
+            conversation's LATEST run belongs to. It exists because an invocation id is a per-process counter:
+            a restarted harness mints `15` again for a DIFFERENT conversation, so an id alone never says which
+            run it names, and this token is the only fact on a roster row that can.
+            ABSENT means "the record names no process" - a conversation that never ran, or one restored from a
+            document written before the field existed - and a reader must treat that as "the producer said
+            nothing", never as a mismatch.
+            It is a BARE token and NEVER the composite join key: `invocation_id` and `invocation_ids` stay bare
+            invocation ids, and a client that keys a run composes `id + U+0000 + epoch` itself. It travels with
+            `invocation_id` and never ahead of it, so a row with an `epoch` always names an invocation id too.
+            HOST/UI ONLY: the model-facing `threadList` page strips it (the model has no epoch parameter and
+            could never send one back), and the turn/display plane never carries it. What it is FOR is the
+            invocation -> conversation join: when two conversations report the same recycled id, the row whose
+            `epoch` equals the epoch on the frame is the conversation that ran that frame.
         transcript_state:
           type: string
           enum: [ok, unreadable]

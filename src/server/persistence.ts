@@ -168,7 +168,14 @@ import type {
     HarnessMessage,
     HarnessSnapshot
 } from '../harness';
-import type { HarnessDescriptor, SessionPluginDiagnostic, SessionStatus, SessionTurn } from './protocol';
+import type {
+    HarnessDescriptor,
+    SessionPluginDiagnostic,
+    SessionRollbackRecord,
+    SessionStatus,
+    SessionTurn,
+    SessionTurnEvent
+} from './protocol';
 import { PLUGIN_DIAGNOSTIC_LIMIT } from './protocol';
 // The v2 per-session directory IS the journal's own, and session ids are addressed the
 // same way by both writers (./journal.ts:253 joins the raw id with no sanitiser, so
@@ -289,6 +296,13 @@ export type HarnessPresetRecord = {
 export type HarnessSessionSettingsRecord = {
     baseURL: string;
     model: string;
+    // F1 (2026-11-17): the session's OWN auto-resume ceiling, when one was set per provider
+    // (`RunnerSettings.networkResumeLimit`). It is durable because the setting is a provider
+    // fact the session was created with: without it a restart would silently fall back to
+    // the deployment default and a conversation would start resuming more (or less) often
+    // than the operator configured. Optional in both directions — a document from before this
+    // build has no key and loads unchanged — and the API key is still never stored.
+    networkResumeLimit?: number;
 };
 
 // C4: one persisted unreadable transcript (see `HarnessSessionRecord.invalidThreads`).
@@ -351,6 +365,22 @@ export type HarnessSessionRecord = {
     // per-code high-water that keeps a deleted conversation's name retired.
     threadLabels?: Record<string, string>;
     threadLabelHighWater?: Record<string, number>;
+    // F1 (2026-11-17, ADDITIVE): the DURABLE consecutive network-class failure streak of each
+    // conversation, keyed by thread id. Persisted because the requirement is that a thread's
+    // auto-recovery budget survives the restart that killed the run: a provider that is down
+    // when the process dies must not buy the conversation ten fresh resumes just because the
+    // counter lived in memory. Written only when non-empty (the additive rule every other map
+    // here follows), so a session that never had a network failure keeps its exact document
+    // shape, and entries at 0 are pruned by the writer rather than stored.
+    networkFailures?: Record<string, number>;
+    // F4 (2026-11-17, ADDITIVE): the abandoned attempts of each turn, keyed by turn id (see
+    // ./protocol `SessionRollbackRecord`). This is the checkpoint-side copy of the evidence a
+    // resume splices out of `turns[].events`; the per-step journal carries the same event as a
+    // `rollback` LINE when the coordinator owns the journal handle (./journal.ts
+    // `JournalRollbackRecord`), and this copy is what survives in `ioExecution: 'worker'`,
+    // where the rewrite frame can only carry event records (./workers/io-protocol.ts
+    // `IoJournalRewriteRecord`). Written only when there is one.
+    turnRollbacks?: Record<string, SessionRollbackRecord[]>;
     // Invocation id recorded by each THREAD turn's root run, keyed by turn id.
     // This is the join the snapshot roster exposes as originInvocationId; it lives
     // beside the turns so a restart keeps the mapping.
@@ -1081,6 +1111,85 @@ const readStringMap = (value: unknown, label: string): Record<string, string> =>
     return mapped;
 };
 
+// Optional `turnId -> abandoned attempts` map (F4, see `HarnessSessionRecord.turnRollbacks`).
+//
+// VALIDATED FIELD BY FIELD, and `errors` entries validated but never REPAIRED: the whole
+// point of this record is that it states what a broken attempt actually reported, so a
+// hand-edited or half-written entry that cannot be trusted is a load failure (like every
+// other corrupt field here), not something to silently drop. An event payload is kept
+// OPAQUE (an object with a string `type`) because the harness owns that vocabulary; the
+// loader's job is only to refuse a non-object, which would render as a phantom step.
+const readRollbacks = (value: unknown, label: string): Record<string, SessionRollbackRecord[]> => {
+    const record = requireRecord(value, label);
+    const mapped: Record<string, SessionRollbackRecord[]> = {};
+
+    for (const [turnId, entry] of Object.entries(record)) {
+        const itemLabel = `${label}.${turnId}`;
+
+        if (turnId.trim().length === 0) {
+            throw new TypeError(`${label} has a blank turn id key.`);
+        }
+
+        if (!Array.isArray(entry)) {
+            throw new TypeError(`${itemLabel} must be a list of rollback records.`);
+        }
+
+        mapped[turnId] = entry.map((raw, index) => {
+            const entryLabel = `${itemLabel}[${index}]`;
+            const rollback = requireRecord(raw, entryLabel);
+            const at = requireNumber(rollback.at, `${entryLabel}.at`);
+            const boundary = requireNumber(rollback.boundary, `${entryLabel}.boundary`);
+            const droppedEvents = requireNumber(rollback.droppedEvents, `${entryLabel}.droppedEvents`);
+
+            if (!Number.isFinite(at) || at < 0) {
+                throw new TypeError(`${entryLabel}.at must be a non-negative timestamp.`);
+            }
+            // -1 is the honest "the attempt committed nothing" boundary.
+            if (!Number.isInteger(boundary) || boundary < -1) {
+                throw new TypeError(`${entryLabel}.boundary must be an integer >= -1.`);
+            }
+            if (!Number.isInteger(droppedEvents) || droppedEvents < 0) {
+                throw new TypeError(`${entryLabel}.droppedEvents must be a non-negative integer.`);
+            }
+
+            if (rollback.reason !== undefined && typeof rollback.reason !== 'string') {
+                throw new TypeError(`${entryLabel}.reason must be a string when present.`);
+            }
+
+            if (rollback.errors === undefined) {
+                return {
+                    at,
+                    boundary,
+                    droppedEvents,
+                    ...(rollback.reason === undefined ? {} : { reason: rollback.reason as string })
+                };
+            }
+
+            if (!Array.isArray(rollback.errors)) {
+                throw new TypeError(`${entryLabel}.errors must be a list of recorded events.`);
+            }
+
+            return {
+                at,
+                boundary,
+                droppedEvents,
+                ...(rollback.reason === undefined ? {} : { reason: rollback.reason as string }),
+                errors: rollback.errors.map((event, eventIndex) => {
+                    const payload = requireRecord(event, `${entryLabel}.errors[${eventIndex}]`);
+
+                    if (typeof payload.type !== 'string') {
+                        throw new TypeError(`${entryLabel}.errors[${eventIndex}].type must be a string.`);
+                    }
+
+                    return payload as unknown as SessionTurnEvent;
+                })
+            };
+        });
+    }
+
+    return mapped;
+};
+
 // Optional `turnId -> instruction snapshots` map (T9/T10, see `HarnessSessionRecord
 // .turnInstructionSources`). Validated entry by entry rather than passed through: the
 // fold COUNTS these strings to produce the context bar's `system` segment, so a
@@ -1224,6 +1333,25 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         throw new TypeError(`${label}.settings must not contain an API key.`);
     }
 
+    // F1: the session's own auto-resume ceiling, validated as a count (a non-negative safe
+    // integer; `0` is a real value — "never auto-resume" — so only an absent key means
+    // "inherit the deployment default"). The UPPER bound belongs to the settings surface
+    // (`mergeSettings`/`resolveNetworkResumeLimit` quote it to the caller as a 400); a stored
+    // number above it is a hand edit, and the store clamps at the point of use rather than
+    // refusing a session the operator can still run.
+    const settingsResumeLimit =
+        settings.networkResumeLimit === undefined
+            ? undefined
+            : (() => {
+                  const value = requireNumber(settings.networkResumeLimit, `${label}.settings.networkResumeLimit`);
+
+                  if (!Number.isSafeInteger(value) || value < 0) {
+                      throw new TypeError(`${label}.settings.networkResumeLimit must be a non-negative integer.`);
+                  }
+
+                  return value;
+              })();
+
     const turns = (() => {
         if (!Array.isArray(record.turns)) throw new TypeError(`${label}.turns must be an array.`);
         return record.turns.map((turn, index) => readTurn(turn, `${label}.turns[${index}]`));
@@ -1332,6 +1460,24 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         record.threadLabelHighWater === undefined
             ? undefined
             : readCounterMap(record.threadLabelHighWater, `${label}.threadLabelHighWater`);
+
+    // F1: the auto-recovery streaks. Re-read with the SAME counter validator the label maps
+    // use (a non-negative integer per key), because an entry that is not a count would make
+    // the store resume on a value it cannot compare against the ceiling. An absent field
+    // stays absent: every document from before this build loads with no streaks, which is
+    // exactly the state "no conversation is in a failure loop".
+    const networkFailures =
+        record.networkFailures === undefined
+            ? undefined
+            : readCounterMap(record.networkFailures, `${label}.networkFailures`);
+
+    // F4: the abandoned attempts (see `readRollbacks`). Validated rather than passed through,
+    // because this map is the only place the terminal `error` frame of a rolled-back attempt
+    // survives in worker mode — a corrupt entry must fail the load, not render as nothing.
+    const turnRollbacks =
+        record.turnRollbacks === undefined
+            ? undefined
+            : readRollbacks(record.turnRollbacks, `${label}.turnRollbacks`);
 
     // C4: unreadable transcripts (see `HarnessSessionRecord.invalidThreads`).
     // OPTIONAL in every direction: an absent field stays absent through a round
@@ -1515,7 +1661,10 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         definition: readDescriptor(record.definition, `${label}.definition`),
         settings: {
             baseURL: requireString(settings.baseURL, `${label}.settings.baseURL`),
-            model: requireString(settings.model, `${label}.settings.model`)
+            model: requireString(settings.model, `${label}.settings.model`),
+            // F1: preserved ONLY when the document carries it, so a load + save of an
+            // untouched session keeps the exact `{baseURL, model}` object it always wrote.
+            ...(settingsResumeLimit === undefined ? {} : { networkResumeLimit: settingsResumeLimit })
         },
         status: status as SessionStatus,
         createdAt: requireNumber(record.createdAt, `${label}.createdAt`),
@@ -1531,6 +1680,10 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         ...(labelHighWater === undefined ? {} : { labelHighWater }),
         ...(threadLabels === undefined ? {} : { threadLabels }),
         ...(threadLabelHighWater === undefined ? {} : { threadLabelHighWater }),
+        // F1/F4: written back only when the document carried them (additive in both
+        // directions — a pre-F1 document stays byte-identical through a load + save).
+        ...(networkFailures === undefined ? {} : { networkFailures }),
+        ...(turnRollbacks === undefined ? {} : { turnRollbacks }),
         ...(turnInvocations === undefined ? {} : { turnInvocations }),
         ...(turnInstructionSources === undefined ? {} : { turnInstructionSources }),
         ...(invocationThreads === undefined ? {} : { invocationThreads }),

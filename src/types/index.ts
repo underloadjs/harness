@@ -695,9 +695,12 @@ export type AgentConfiguration = {
     // always is.
     structured?: Record<string, unknown>;
     // Model-request retry policy (R1). Omit for the default: one initial attempt
-    // plus ten retries with 1s..512s doubling waits. `false` = one attempt only.
-    // Retries re-send ONLY the current model request; tools and the run are never
-    // replayed.
+    // plus ten retries with doubling waits (1s, 2s, ... 32s, then a 60 s ceiling for the
+    // rest). `false` = one attempt only, for EVERY failure class — the short
+    // `provider-connection` (3 attempts) and `provider-timeout` (4 attempts) ladders the
+    // built-in transport triggers own their own counts and ignore a NON-ZERO
+    // `maxRetries`, but zero means "never re-send" for them too. Retries re-send ONLY the
+    // current model request; tools and the run are never replayed.
     retry?: HarnessRetryConfiguration;
     // (issue 0004) The pre-request context floor for this agent, in tokens: the
     // largest estimate this agent is allowed to SEND. Before a request leaves,
@@ -827,30 +830,59 @@ export type AgentRequestCommit = {
 
 // Serialisable error shape. Events cross CLI/RPC boundaries, so failures travel
 // as data rather than as Error instances.
+//
+// `code` is the machine name of the failure class (`context-overflow`,
+// `provider-timeout`, `stale-record`, …), present exactly when the throwing
+// `HarnessError` carried one — `util/errors.ts` `toErrorInfo` has emitted it beside
+// the message for a long time; the TYPE only ever declared `message`, which is why
+// every consumer that wanted the class read it defensively or re-derived it from the
+// prose with a regex. Naming it here is what lets `src/frontend/provider-diagnostics.ts`
+// and the session layer branch on a field.
+//
+// `provider` is the transport's diagnosis of the FAILED ATTEMPT that ended the run —
+// the same `HarnessProviderAttemptDiagnostics` block the `retry` event carries — and it
+// is present only when the transport diagnosed one. Before this, those fields existed
+// ONLY on `retry`, so a failure that was terminal BY DESIGN (a provider timeout that
+// never got a retry frame, or a ladder that ended with no further retry emitted) had no
+// machine-readable shape at all and the UI reconstructed class, endpoint and bound from
+// the sentence. Absent for every unclassified failure, so a historical record and an
+// ordinary run keep the `{ message, code? }` payload they always had.
 export type HarnessErrorInfo = {
     message: string;
+    code?: string;
+    provider?: HarnessProviderAttemptDiagnostics;
 };
 
 // (T6) What the transport knows about ONE failed provider attempt that a UI cannot
-// recover from prose. Emitted on the `retry` event as `provider`, and absent for
-// every failure the transport did not classify (an HTTP 4xx, a malformed frame), so
-// an ordinary run keeps the event shape it always had.
+// recover from prose. Emitted on the `retry` event as `provider`, and — since
+// 2026-11-17 — on a terminal `error` event as `error.provider` (the diagnosis of the
+// attempt that ended the run), and absent for every failure the transport did not
+// classify (an HTTP 4xx body, a malformed frame), so an ordinary run keeps the shape it
+// always had.
 //
-// `errorClass` is the transport's machine code — one of `provider-timeout` (a bound
-// expired; the agent does not re-send) or `provider-connection` (nothing answered the
-// dial; the agent spends a short, capped ladder) — and it is the same value as
-// `error.code` on the frame, spelled here so a consumer reads the diagnostics block
-// as one unit. `url` is the DIALLED endpoint, already redacted: origin and path with
-// no userinfo, query or fragment, so an API key can never be printed by a status
-// bar that renders it.
+// `errorClass` is the transport's machine class — `provider-timeout` (a bound expired),
+// `provider-connection` (nothing answered the dial), `provider-rejected` (a deterministic
+// refusal), `provider-aborted` (a cancel reported by the provider, not by our signal) or
+// the DIAGNOSTICS-ONLY `provider-transit` (the bytes died in transit and there is no
+// retry code to publish — a gateway error frame with an unknown/absent code, or a body
+// that closed without reporting a completion). For a coded failure it is the same value
+// as `error.code`, spelled here so a consumer reads the diagnostics block as one unit;
+// `provider-transit` deliberately has no `code`, because a code promises a retry policy
+// and that class keeps the generic one. `url` is the DIALLED endpoint, already redacted:
+// origin and path with no userinfo, query or fragment, so an API key can never be printed
+// by a status bar that renders it.
 export type HarnessProviderAttemptDiagnostics = {
     errorClass: string;
     url: string;
     // The effective port of the dial (the explicit port, else the scheme default).
     port?: number;
-    // For `provider-timeout`: which bound expired.
+    // For `provider-timeout`: which bound expired. `stream-chunk` also covers a gateway
+    // that REPORTED a timeout on an open stream (`transport/provider-timeouts.ts`
+    // `providerWireFailureOf`), where no local bound expired at all.
     phase?: 'response-head' | 'first-token' | 'stream-chunk';
-    // For `provider-timeout`: the bound that expired, in milliseconds.
+    // For `provider-timeout`: the bound that expired, in milliseconds. Absent when the
+    // provider REPORTED the timeout — the number is the gateway's, and inventing one
+    // here would be the UI quoting a bound that never existed.
     timeoutMs?: number;
     // For `provider-connection`: the errno the platform reported, when it named one.
     errno?: string;
@@ -2961,12 +2993,17 @@ export type DownloadResult = {
 //     events keep their historical shape (no `thread`);
 //   - `id` is stable for the whole invocation and unique within the owning
 //     SessionTurn (the run sequence is monotonic), so two sequential
-//     delegations to the SAME agent get different ids;
+//     delegations to the SAME agent get different ids — WITHIN ONE PROCESS. The
+//     counter restarts with the process (and a lane worker has its own), which is
+//     what `epoch` below exists to make visible (T-W8);
 //   - `parentId` is omitted for a direct child of the root and set to the
 //     parent invocation's thread id for anything deeper;
 //   - `callId` is the parent tool call that spawned this run;
 //   - `input` (the child prompt, for a row title/body) appears on the `start`
-//     event only; later events carry the identity fields alone.
+//     event only; later events carry the identity fields alone;
+//   - `epoch` (T-W8) names the PROCESS that minted `id` and rides every frame of
+//     the run, `start` included; it is OPTIONAL, because every turn recorded
+//     before 2026-11-17 has none and a reader must never require one.
 export type HarnessThread = {
     id: string;
     parentId?: string;
@@ -2984,6 +3021,25 @@ export type HarnessThread = {
     // branch events and `harness.branch(id)` use; a thread does not invent a
     // second naming scheme.
     branchId?: string;
+    // T-W8 (2026-11-17) — the per-process EPOCH that minted `id`
+    // (`HARNESS_PROCESS_EPOCH`, ../core/agent-limits.ts), stamped at the same site
+    // (`../harness.ts` `run.thread` / `threadIdentity` / `branchThreadOf`).
+    //
+    // WHY IT EXISTS: `id` is the runtime's INVOCATION counter, and that counter is per
+    // process — a restarted harness begins it again, and a lane worker mints from its own
+    // (../harness.ts:8235 `reserveIdentity` only ever RAISES the mark it leases). So the same
+    // `id` names a DIFFERENT run after a restart, and when the spawn `callId` is recycled as
+    // well the recorded frames hold nothing that separates the two runs (the residual case
+    // F5 reported at ../server/turn-projector.ts `route`). The epoch is that discriminator:
+    // equal ids with different epochs are two runs, always.
+    //
+    // OPTIONAL BY CONTRACT, and it stays that way: every turn recorded before this change
+    // carries no epoch, so a reader must treat an absent field as "this producer said nothing"
+    // and fall back to the shape / post-terminal-`start` rules, never as a mismatch. It is a
+    // PAYLOAD-level field — the journal persists event records verbatim (./journal.ts only
+    // requires `event.type`) and the store's `copyEvent` is a JSON round trip, so no line
+    // schema and no snapshot version moved.
+    epoch?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -3053,6 +3109,27 @@ export type HarnessRunStopReason =
     // `api-error` because retries WERE available and every one of them failed, which is a
     // fact a caller can act on (retry elsewhere) that a first-attempt failure is not.
     | 'retries-exhausted'
+    // The run died on a NETWORK / provider-transit failure, and the harness can NAME that
+    // class from a structured field rather than from the error's prose. Emitted by
+    // `classifyRunStopReason` (src/harness.ts) when the failure that ended the run is a
+    // `provider-timeout` (a bound expired, or the provider reported a timeout on the
+    // stream), a `provider-connection` (nothing answered the dial), or a CODELESS
+    // provider-transit failure whose retry ladder was exhausted — a gateway error frame
+    // with an unknown/absent code, or a body that closed mid-answer, each diagnosed by the
+    // transport as `provider-transit`.
+    //
+    // WHY IT EXISTS SEPARATELY FROM `retries-exhausted`: the session layer has to answer
+    // "is this conversation interrupted because the endpoint is unhealthy, or because the
+    // request itself was refused?" in order to count consecutive network failures against
+    // a threshold and auto-recover the thread. `retries-exhausted` says attempts ran out
+    // (a refusal, a 5xx body, a malformed frame all get there too) and `api-error` says
+    // even less; neither can be branched on safely. Same run, same records, one more
+    // honest field.
+    //
+    // The restart policy is UNCHANGED by this member: a run that stops this way is still
+    // marked interrupted and never replayed automatically — the difference is only that a
+    // caller can now tell WHY without parsing the message.
+    | 'provider-network'
     // The conversation that started this run went away (its thread was deleted or its own
     // run ended first), so the child had nobody left to answer.
     | 'parent-closed'
@@ -3130,6 +3207,61 @@ export type HarnessThreadRecord = {
     // persistent record to the `HarnessThread.id` carried by its events and to
     // `agentResult`. Absent until the thread has run once.
     invocationId?: string;
+    // W19 (2026-11-17) — the PROCESS that minted `invocationId`, and therefore the RUN that id names
+    // (`../shared/run-identity.ts`; the value is `../core/agent-limits.ts` `HARNESS_PROCESS_EPOCH` of
+    // the process that wrote it, the same one `HarnessThread.epoch` rides on that run's frames).
+    //
+    // WHY IT EXISTS. `invocationId` alone cannot say which run it names — the counter restarts with
+    // the process — and this record is the store's ONLY witness for a delegated child's conversation
+    // (`../server/sessions.ts noteInvocationThread` scans it, because no frame carries a CONVERSATION
+    // id). A record restored from a dead process therefore used to bind a NEW epoch-keyed join to the
+    // DEAD conversation that last wrote the id. With the epoch here, a restored record and a fresh run
+    // that disagree about the process can be told apart, and the stale slot stops winning.
+    //
+    // IT TRAVELS WITH `invocationId`, NEVER AHEAD OF IT. Both writers set the pair in the same
+    // statement (`src/harness.ts`: the run-start stamp, and `setThreadStatus` when it is handed an
+    // invocation id), so an epoch can never describe an id it did not mint. Absent means either "this
+    // conversation has never run" (no `invocationId` either) or "the id was written by a build that
+    // predates this field" — a restored pre-change record — and a reader must treat that as "the
+    // producer said nothing", never as a mismatch (the `isRunEpochMismatch` rule).
+    //
+    // ADDITIVE: `HarnessThreadSnapshot.epoch` below is optional, so a pre-change document validates,
+    // restores with its exact prior meaning, and keeps restoring under the bare id.
+    //
+    // W22 (2026-11-17) REVERSES THE NEXT SENTENCE OF THE ORIGINAL NOTE — say it precisely, because the
+    // reversal is a DECISION and not an oversight. It used to read "It is NOT a wire field: no
+    // `SessionThread` / roster row reports it, so nothing a client reads changes", and that was already only
+    // true of the TYPE: `../server/sessions.ts` `threadRoster` spreads the record, so the token reached the
+    // roster JSON undeclared. The host/UI roster plane now DECLARES it — `SessionThread.epoch` /
+    // `SessionThreadView.epoch` (../server/protocol.ts) and `ThreadSummary.epoch`
+    // (../server/harness.swagger.yaml -> ../shared/harness-api.ts) — because the client transcript join
+    // (../frontend/ui/thread-transcript.ts) cannot resolve a contested recycled invocation id between two
+    // otherwise-identical claimants without it (W19's residual, pinned as F3 and D2).
+    //
+    // W26 (2026-11-17) WIDENED THAT DECLARED PLANE ONE STEP FURTHER, and the enumeration above is incomplete
+    // without it: the epoch alone is a process with no id beside it on the REST/WS roster PAGE. `ThreadSummary`
+    // now declares the ID half too — `invocation_id` (the latest run) and `invocation_ids` (every run recorded
+    // for this conversation, bare, capped at 64) beside `epoch` — produced by `../server/api-reads.ts`
+    // `threadRowOf` / `rosterInvocationIdsOf` and carried on `thread.upsert` frames by the same shape
+    // (../shared/harness-stream.ts `WsUpdateThreadUpsert.thread`). The store planes already named the ids
+    // (`SessionThread.invocationIds` / `SessionThreadView.invocationIds`), which is exactly why the join worked
+    // on one read and not another before W26. This is a widening of the SAME plane W22 declared, not a third
+    // one: the values stay BARE (never `id\0epoch`), the pair is still one fact, and `epoch` still travels with
+    // `invocation_id` and never ahead of it.
+    //
+    // What the reversal did NOT widen: the MODEL-facing page still strips the key
+    // (../harness.ts `modelThreadRosterOf`, so the `threadList` contract the model reads is byte-identical
+    // and the model is never handed a token its own schema has no parameter for), the turn/display plane
+    // never carries it (`TurnSection`/`TurnSummary`, ../server/turn-projector.ts), and no wire field carries
+    // the COMPOSITE — every reported id stays bare, and `../shared/run-identity.ts` `invocationIdOfRunKey`
+    // remains the only strip.
+    //
+    // THIS IS NOT THE FORBIDDEN DOCUMENT EPOCH. `../core/agent-limits.ts` states that `snapshot()` /
+    // `restore()` carry NO epoch of their own, and that rule still holds: nothing here claims an epoch
+    // for the document or for the replica reading it (a restored replica is a NEW minting context). The
+    // value below names the process that minted the id sitting in the SAME row — a fact about that row's
+    // history, which is exactly the fact a reader cannot re-derive after a restart.
+    epoch?: string;
     // DISPLAY LANE — this conversation's CURRENT lane, the number a run's recorded
     // events are stamped with (../server/protocol.ts `SessionTurnEvent.lane`, and
     // ../shared/turn-display.ts `ContextBlock.lane` inherits it).
@@ -3686,6 +3818,27 @@ export type HarnessAgentResultSnapshot = {
     // rejected at the load boundary. Legal on a completed result, unlike the forensic pair: a
     // finished turn still belongs to its thread.
     threadId?: string;
+    // W19 (2026-11-17) — THE LEDGER GENERATION this row belongs to: the process epoch that minted
+    // `invocationId` (`../core/agent-limits.ts` `HARNESS_PROCESS_EPOCH`, the same value
+    // `HarnessThread.epoch` rides on a frame). It is a bare epoch STRING, never the composite run
+    // key, and it is the only fact that tells two rows with the SAME `invocationId` apart: the id is a
+    // per-process counter, so after a restart one document can legitimately hold `15` twice, once per
+    // process, and neither row is the other's replacement.
+    //
+    // WHY IT IS PERSISTED AT ALL: `restore()` re-keyed every row by the bare id, so the first restart
+    // after this fix kept both rows in memory (different run keys) while the SECOND restart collapsed
+    // them again — the durable ledger would re-lose the older archive on the next save/load cycle.
+    // Writing the epoch here is what makes the repair survive more than one generation.
+    //
+    // OPTIONAL AND ADDITIVE, AND THE ONLY THING THAT DECIDES THE RESTORE KEY: a row written before
+    // this field has no epoch, restores under its BARE id exactly as it does today (no re-keying, no
+    // migration, no version bump — the discipline stated in this file's header), and it keeps
+    // resolving by that bare key for every later reader, because the read order is always "the
+    // current process's run, then the bare id". `../core/snapshot.ts` accepts and validates the key
+    // (it must, or a row carrying it would refuse to load) and moves the duplicate-id check onto the
+    // RUN rather than the id — the same rule stated by the writer and by the reader, so a document
+    // cannot claim one run twice.
+    epoch?: string;
 };
 
 // T5 lane-worker seam: ONE terminal invocation the coordinator archives on behalf of a
@@ -3745,6 +3898,18 @@ export type HarnessInvocationArchiveInput = {
     // `completed` status — mutual exclusion, so a row that later completes never keeps a cause
     // that no longer describes it (src/harness.ts validates and applies both rules).
     stopReason?: HarnessRunStopReason;
+    // W19 (2026-11-17): the process epoch that MINTED `invocationId`, so the canonical ledger can key
+    // the row by its RUN (`../shared/run-identity.ts`). Two facts make the seam need it: a lane worker
+    // mints ids from its OWN counter (`reserveIdentity` only raises a leased mark) while the parent
+    // process keeps minting from its own, so a lane row and a coordinator row can name the same bare
+    // id for two different runs — exactly as two process generations can.
+    //
+    // ABSENT means "name the CURRENT process's ledger generation", which is today's behaviour byte for
+    // byte: a lane row and a coordinator row OF ONE GENERATION still address the same slot, so no
+    // existing same-process pairing starts holding two rows where it had one. A caller that knows the
+    // minting epoch (a lane replaying a leased id) may name it, and the value round-trips into the
+    // persisted row (`HarnessAgentResultSnapshot.epoch`) so a restart rebuilds the same key.
+    epoch?: string;
 };
 
 // T5 lane-worker seam: reserve identity high-water marks in one harness (see
@@ -3777,6 +3942,17 @@ export type HarnessThreadSnapshot = {
     ownerThreadId?: string;
     label?: string;
     invocationId?: string;
+    // W19 (2026-11-17): the process epoch that minted `invocationId` (see
+    // `HarnessThreadRecord.epoch` above — the live half, and the reason the pair exists). OPTIONAL and
+    // additive: a document written before this field validates and restores with its exact prior
+    // meaning, so `version` stays 2 (the discipline stated in this file's header and on
+    // `HarnessSnapshot.agentResults`).
+    //
+    // It is written under the SAME condition as `invocationId` itself — present only when the record
+    // names an invocation that has already reached a terminal state — because an epoch without an id
+    // would describe no run, and a restored record whose id was dropped must not keep an epoch that
+    // outlives it. `../core/snapshot.ts` validates it as a non-empty string.
+    epoch?: string;
     // The conversation's DISPLAY LANE (see `HarnessThreadRecord.contextLane`). Optional
     // and additive: a document written before lanes exist has no key and restores to lane
     // 0, and a lane of 0 is never written, so every pre-lane record keeps its exact shape.

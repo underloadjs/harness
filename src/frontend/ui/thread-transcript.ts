@@ -109,6 +109,11 @@ import type {
 import type { ThreadTranscriptPayload } from '../view-model';
 import { UNKNOWN_THREAD_LABEL, invalidThreadsOf, threadNameOf, turnThreadIdOf } from './threads';
 import type { InvalidThreadRecord, SessionThreadEntry } from './threads';
+// The store's own run-key rule, shared by the server's attribution map and this fold. W22 uses it to
+// rebuild `id\0epoch` from the two BARE fields the roster publishes, so the composite never travels on a
+// wire and the browser resolves a contested id exactly the way the server attributed it
+// (../../server/protocol.ts `SessionThread.epoch`).
+import { invocationRunKeyOf } from '../../shared/run-identity';
 // The app's one payload viewer (line numbers + soft wrap + byte-exact text). It lives in
 // ./tools.ts next to the tool panes it was built for; see `readContent` below for why this
 // surface needs the `tool-code` class rather than its own.
@@ -173,12 +178,11 @@ export type ThreadTranscriptJson = {
 // (not the UI chrome) so a copied payload carries the disclosure with it.
 export const THREAD_TRANSCRIPT_LIMITATIONS: readonly string[] = [
     'No raw provider HTTP request/response bodies, headers, retries or network logs are recorded by this harness; only the events and usage values in this document exist.',
-    'messages is the thread\'s committed transcript; while a thread is running, its newest messages may not be committed yet.',
+    "messages is the thread's committed transcript; while a thread is running, its newest messages may not be committed yet.",
     'session.lastError is session-scoped and may describe a failure that did not run in this thread.'
 ];
 
-const isObjectLike = (value: unknown): value is Record<string, unknown> =>
-    typeof value === 'object' && value !== null;
+const isObjectLike = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
 
 // The raw roster is server data. A malformed entry is ignored rather than
 // rendered as a fake thread; the dialog then reports that the thread is absent.
@@ -194,8 +198,7 @@ const rawThreadsOf = (snapshot: SessionSnapshot): SessionThread[] => {
 
 // Display name for a raw thread. `threadNameOf` consumes only label/agent/
 // sequence, which are identical on the raw and normalized shapes.
-const threadName = (thread: SessionThread): string =>
-    threadNameOf(thread as unknown as SessionThreadEntry);
+const threadName = (thread: SessionThread): string => threadNameOf(thread as unknown as SessionThreadEntry);
 
 // Every invocation id the roster knows for one thread: the full historical map
 // plus both single slots (a server that predates `invocationIds` still names its
@@ -214,7 +217,19 @@ const invocationIdsOf = (thread: SessionThread): string[] => {
     return ids;
 };
 
-const eventThreadOf = (event: HarnessEvent): { id: string; parentId?: string } | undefined => {
+// W22 (2026-11-17) — the RUN half of a roster row: the process that minted the invocation id the row
+// names (`../../server/protocol.ts` `SessionThread.epoch`; the pairing rule lives there and in
+// ./sessions.ts `threadRoster`). Read structurally, exactly like `invocationIdsOf` reads its ids: this fold
+// consumes server data, and a roster from a build that predates the field — or a conversation that never
+// ran — reports nothing, which must fold EXACTLY as it did before the field existed rather than as an
+// empty-string epoch that matches nothing.
+const threadEpochOf = (thread: SessionThread): string | undefined => {
+    const value = (thread as { epoch?: unknown }).epoch;
+
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+};
+
+const eventThreadOf = (event: HarnessEvent): { id: string; parentId?: string; epoch?: string } | undefined => {
     const source = event as { thread?: unknown };
     if (!isObjectLike(source.thread)) return undefined;
 
@@ -222,9 +237,17 @@ const eventThreadOf = (event: HarnessEvent): { id: string; parentId?: string } |
     if (typeof id !== 'string' || id.length === 0) return undefined;
 
     const parentId = source.thread.parentId;
+    // W19 (2026-11-17): the PROCESS epoch rides every frame that carries a thread identity
+    // (`HarnessThread.epoch`, ../../types/index.ts, copied onto every frame by `threadIdentity` in
+    // ../../harness.ts). It is the only fact on the frame that says WHICH run a bare invocation id names,
+    // and the attribution below needs exactly that. Absent is the legacy form — every frame recorded
+    // before the field existed — and a reader must treat it as "the producer said nothing".
+    const epoch = source.thread.epoch;
+
     return {
         id,
-        ...(typeof parentId === 'string' && parentId.length > 0 ? { parentId } : {})
+        ...(typeof parentId === 'string' && parentId.length > 0 ? { parentId } : {}),
+        ...(typeof epoch === 'string' && epoch.length > 0 ? { epoch } : {})
     };
 };
 
@@ -277,7 +300,15 @@ export const buildThreadTranscriptJson = (
 
     // invocation -> attributed persistent thread. Roster-provided mappings come
     // first so an exact persistent identity wins over a parent-chain inference.
+    //
+    // W19 (2026-11-17) — this map is the LEGACY door, not the whole join. An invocation id is a
+    // per-process counter (`../../shared/run-identity.ts`), so two roster rows can legitimately report
+    // the SAME bare id: the conversation that ran it before a restart and the one the restarted process
+    // minted it for afterwards. First-wins on the bare id then attributes one conversation's frames to
+    // the other — inside an inspection surface whose whole job is naming where a frame came from. The
+    // claimants below are what makes that collision visible instead of absorbed by map order.
     const invocationThreads = new Map<string, string>();
+
     for (const [relatedId] of relatedThreads) {
         const relatedThread = threads.find((candidate) => candidate.id === relatedId);
         if (relatedThread === undefined) continue;
@@ -286,12 +317,184 @@ export const buildThreadTranscriptJson = (
         }
     }
 
+    // Every conversation that reports a bare id, in roster order, across the WHOLE roster — not just
+    // this transcript's subtree. That is deliberate: the conversation a recycled id misleads THIS
+    // transcript about is usually a SIBLING outside it (the pre-restart child and the post-restart
+    // child of one root are each other's collision), and only by naming both can the join say "that
+    // frame is not ours". `length > 1` is the collision.
+    const claimantsOf = new Map<string, string[]>();
+
+    for (const row of threads) {
+        for (const invocationId of invocationIdsOf(row)) {
+            const claims = claimantsOf.get(invocationId);
+
+            if (claims === undefined) claimantsOf.set(invocationId, [row.id]);
+            else if (!claims.includes(row.id)) claims.push(row.id);
+        }
+    }
+
+    // W22 (2026-11-17) — THE RECORDED RUN KEY, which is why a contested id is no longer resolved by
+    // inference alone. `HarnessThreadRecord.epoch` (../../types/index.ts) is the minting process of
+    // exactly the invocation id in the same row, and `invocationRunKeyOf(id, epoch)`
+    // (../../shared/run-identity.ts) is the store's own attribution key — the run key is derived, never
+    // transmitted, so the roster wire carries the two halves as separate fields and the browser rebuilds
+    // the key with the store's rule (`../../server/protocol.ts` documents the pairing;
+    // `invocationIdOfRunKey` is the strip).
+    //
+    // Both maps hold only RECORDED facts, and each map holds exactly what the row states:
+    //   - `recordedRuns` keys the CURRENT pair (`invocationId` + that row's epoch). It is the strongest
+    //     evidence in this fold — a recorded run, not an inference — and deliberately does NOT pair the
+    //     row's earlier `invocationIds` with its current epoch: a resumed conversation ran those ids in
+    //     ANOTHER process, so calling that pairing "recorded" would be inventing a fact;
+    //   - `rowEpochs` records the weaker, still-recorded fact "conversation C ran in process E" (the
+    //     pairing rule guarantees an epoch only ever travels with an id). It is ONE of the two sources of
+    //     process evidence in door 2 below — unioned with the frame fingerprint, never preferred over it —
+    //     and a row reporting nothing (every document recorded before the field existed, and every
+    //     conversation that never ran) is simply absent.
+    //
+    // Both maps are built unconditionally over the whole roster: they are two passes over rows the loop
+    // above already walked, and reading them below costs nothing when no id is contested.
+    const recordedRuns = new Map<string, string[]>();
+    const rowEpochs = new Map<string, string>();
+
+    for (const row of threads) {
+        const epoch = threadEpochOf(row);
+
+        if (epoch === undefined) continue;
+
+        rowEpochs.set(row.id, epoch);
+
+        const invocationId = row.invocationId;
+
+        if (typeof invocationId !== 'string' || invocationId.length === 0) continue;
+
+        const runKey = invocationRunKeyOf(invocationId, epoch);
+        const runs = recordedRuns.get(runKey);
+
+        if (runs === undefined) recordedRuns.set(runKey, [row.id]);
+        else if (!runs.includes(row.id)) runs.push(row.id);
+    }
+
+    // THE EPOCH FINGERPRINT (W19). A frame that carries `thread.epoch` says which process minted the
+    // invocation id it names. The recorded run key above closes a contested id when the ROSTER states the
+    // run; this fingerprint closes it when only the FRAMES do (a roster row that names its runs without an
+    // `epoch`). Both are process evidence and door 2 below unions them — see that block for why neither
+    // source may decide alone.
+    //
+    // The pass is conditional on purpose — it runs ONLY when at least one id is contested — and a frame
+    // can only join a fingerprint through an id NOBODY ELSE reports (a contested id proves nothing about
+    // the very thing being resolved). With no epoch anywhere — a legacy roster AND legacy frames — every
+    // map here stays empty and every lookup degenerates to the bare-id map, which is byte-for-byte what
+    // this join produced before the field existed. The residual is pinned in ./thread-transcript-run-join.test.ts:
+    // claimants nothing in the document can tell apart keep the roster's first-wins answer, because
+    // nothing on the wire could.
+    const epochOwners = new Map<string, Set<string>>();
+
+    if (claimantsOf.size > 0) {
+        let contested = false;
+        for (const claims of claimantsOf.values()) {
+            if (claims.length > 1) {
+                contested = true;
+                break;
+            }
+        }
+
+        if (contested) {
+            for (const turn of allTurns) {
+                for (const event of Array.isArray(turn.events) ? turn.events : []) {
+                    const identity = eventThreadOf(event);
+
+                    if (identity === undefined || identity.epoch === undefined) continue;
+
+                    const claims = claimantsOf.get(identity.id);
+
+                    if (claims === undefined || claims.length !== 1) continue;
+
+                    const owners = epochOwners.get(identity.epoch);
+
+                    if (owners === undefined) epochOwners.set(identity.epoch, new Set(claims));
+                    else owners.add(claims[0] as string);
+                }
+            }
+        }
+    }
+
+    // The attribution cache: the roster's bare-id map up front, plus the descendant invocations this scan
+    // resolves below. Declared BEFORE the resolver because the resolver closes over it — and it is the
+    // legacy door every lookup falls back through.
+    const attributed = new Map(invocationThreads);
+
+    // One attribution for a frame identity, three possible answers:
+    //   - a conversation id: the RUN this frame belongs to, when the record can name one. A contested id
+    //     whose run resolves to exactly one claimant resolves to THAT conversation — which is the fix, and
+    //     it may be a claimant the roster listed second;
+    //   - `undefined`: nothing resolves, so the roster's first-wins bare-id answer stands. That covers
+    //     the legacy document (no epoch on the roster AND no epoch on the frames), an epoch nobody in this
+    //     snapshot ran in, and the two claimants of one process (normal, and not a collision at all);
+    //   - `FOREIGN`: the frame resolves cleanly to a conversation OUTSIDE this transcript, so it is not
+    //     this conversation's frame and does not belong in its document at all. This is the sibling
+    //     case — the post-restart child's frames must not be pulled into the pre-restart child's
+    //     transcript just because both rows report `15`.
+    const FOREIGN = Symbol('invocation run belongs to another conversation');
+
+    // A resolved claimant is this transcript's to SHOW only when it sits inside the delegation subtree;
+    // one outside it is another conversation's frame and the caller must drop the record, not relabel it
+    // (the `threadId` it would print belongs to a card this document does not own).
+    const ownedAnswerOf = (match: string): string | typeof FOREIGN => (relatedThreads.has(match) ? match : FOREIGN);
+
+    // The join, strongest evidence first. W22 put the RECORDED run in front of the W19 inference: a
+    // document whose roster rows carry `epoch` needs no guess at all, and the guess stays for the
+    // documents that were written before the field existed. Every door is tried ONLY when the bare id is
+    // contested, so an uncontested id (the overwhelmingly common case) keeps the answer the roster gives
+    // and a legacy document reaches nothing but the legacy door.
+    const attributedThreadOf = ({ id, epoch }: { id: string; epoch?: string }): string | typeof FOREIGN | undefined => {
+        const claims = claimantsOf.get(id);
+
+        // Nothing contested, or a frame that names no process to discriminate with: the roster's order —
+        // the bare-id map, extended below by the descendant chain — is the whole answer.
+        if (claims === undefined || claims.length < 2 || epoch === undefined) {
+            return attributed.get(id);
+        }
+
+        // DOOR 1 — THE RECORDED RUN KEY. The frame names the run `id@epoch`, and the roster states which
+        // conversation recorded exactly that pair (`recordedRuns`). This is the store's own attribution
+        // key rebuilt from the two bare wire fields, so the answer is a recorded fact, not an inference.
+        const runs = recordedRuns.get(invocationRunKeyOf(id, epoch));
+
+        if (runs !== undefined && runs.length === 1) return ownedAnswerOf(runs[0] as string);
+
+        // DOOR 2 — THE PROCESS EVIDENCE, from both sources the document offers, UNIONED:
+        //   - the W19 fingerprint (`epochOwners`): the claimant demonstrably ran in that process, because a
+        //     frame carrying an invocation id NO other row reports appeared in it;
+        //   - the row's own `epoch` (`rowEpochs`, W22): the process of that claimant's LATEST recorded run.
+        //
+        // UNION, not a hierarchy, because neither source is exhaustive on its own: a row states ONE process
+        // even though a conversation may have run in several (a pre-restart child that ran again after the
+        // restart reports the newer process, and its frames in the older one would then be missed), while a
+        // fingerprint sees only the processes its claimant's frames happen to reveal. A single candidate
+        // therefore proves ownership; two candidates mean the document genuinely cannot tell, and guessing
+        // would attribute a frame on an inference the record does not support.
+        const candidates = claims.filter(
+            (claim) => epochOwners.get(epoch)?.has(claim) === true || rowEpochs.get(claim) === epoch
+        );
+
+        if (candidates.length === 1) return ownedAnswerOf(candidates[0] as string);
+
+        // More than one candidate ran in that process — the normal case for two conversations of one
+        // generation. This transcript's own row is then the answer it may claim; anything else is a
+        // genuine ambiguity and falls through to the roster's first-wins order.
+        const ours = candidates.filter((claim) => relatedThreads.has(claim));
+
+        if (ours.length === 1) return ours[0] as string;
+
+        return attributed.get(id);
+    };
+
     // Related events are scanned ONLY in turns owned by a different thread: the
     // target's own turns already contain their events verbatim in `turns`. Events
     // are attributed by (1) the roster's invocation map, or (2) a `thread.parentId`
     // chain that reaches an already-attributed invocation (descendants recorded
     // without their own roster entry).
-    const attributed = new Map(invocationThreads);
     const relatedEvents: ThreadTranscriptRelatedEvent[] = [];
 
     for (const turn of allTurns) {
@@ -305,17 +508,32 @@ export const buildThreadTranscriptJson = (
             const identity = eventThreadOf(event);
             if (identity === undefined) continue;
 
-            let attributedThread = attributed.get(identity.id);
+            let attributedThread = attributedThreadOf(identity);
+
             if (attributedThread === undefined && identity.parentId !== undefined) {
                 // Descendants by parentId: the parent chain is the runtime's
                 // authoritative invocation lineage, independent of roster timing.
-                const parentThread = attributed.get(identity.parentId);
-                if (parentThread !== undefined) {
+                // W19: the parent is resolved with the CHILD's epoch, exactly like
+                // `../frontend/ui/turns.ts` `parentKeyOf` reasons — a parent and its child
+                // were minted by the same process, so the child's epoch names the parent's
+                // run key. A parent chain still resolves when nothing fingerprints it.
+                const parentThread = attributedThreadOf({ id: identity.parentId, epoch: identity.epoch });
+
+                // A frame whose parent belongs to another conversation's run is foreign too: the
+                // lineage is the authority, and it says this frame is not this transcript's.
+                if (parentThread === FOREIGN) attributedThread = FOREIGN;
+                else if (parentThread !== undefined) {
                     attributedThread = parentThread;
-                    attributed.set(identity.id, parentThread);
+
+                    // The descendant cache is keyed by the bare id, so it may only be written by a frame
+                    // that has nothing to discriminate WITH (no epoch) — that is the legacy path and it
+                    // caches exactly what it cached before. An epoch-carrying frame does not poison the
+                    // bare slot: the next frame of the same recycled id may belong to another process, and
+                    // re-resolving it is the whole point.
+                    if (identity.epoch === undefined) attributed.set(identity.id, parentThread);
                 }
             }
-            if (attributedThread === undefined) continue;
+            if (attributedThread === undefined || attributedThread === FOREIGN) continue;
 
             const eventTime = times[eventIndex];
             relatedEvents.push({
@@ -410,8 +628,7 @@ const el = <K extends keyof HTMLElementTagNameMap>(
     return node;
 };
 
-const messageOf = (error: unknown): string =>
-    error instanceof Error ? error.message : String(error);
+const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 // Pretty JSON of a stored value that is NOT a readable transcript. The editor must
 // always hold something the reader can repair, and what Save sends back is exactly
@@ -439,10 +656,7 @@ export const threadTranscriptEditorRaw = (thread: SessionThread | undefined): st
 // The C4 invalid roster entry for one thread, read STRUCTURALLY: the field is
 // additive, so an older snapshot simply has none and every pre-C5 behaviour is
 // byte-identical.
-const invalidThreadOf = (
-    snapshot: SessionSnapshot,
-    threadId: string
-): InvalidThreadRecord | undefined =>
+const invalidThreadOf = (snapshot: SessionSnapshot, threadId: string): InvalidThreadRecord | undefined =>
     invalidThreadsOf(snapshot).find((record) => record.id === threadId);
 
 // Header identity for either surface. The raw roster wins; a conversation named ONLY
@@ -456,11 +670,7 @@ type TranscriptIdentity = {
     status: string;
 };
 
-const identityOf = (
-    snapshot: SessionSnapshot,
-    threadId: string,
-    invalid?: InvalidThreadRecord
-): TranscriptIdentity => {
+const identityOf = (snapshot: SessionSnapshot, threadId: string, invalid?: InvalidThreadRecord): TranscriptIdentity => {
     const thread = rawThreadsOf(snapshot).find((candidate) => candidate.id === threadId);
     if (thread !== undefined) {
         return { threadId, name: threadName(thread), agent: thread.agent, status: thread.status };
@@ -493,8 +703,7 @@ const editorAuthorityOf = (
     return { ...identity, raw: invalidTranscriptRaw(invalid.messages), error: invalid.error };
 };
 
-const dialogTitle = (identity: TranscriptIdentity): string =>
-    `Transcript · ${identity.name} · ${identity.agent}`;
+const dialogTitle = (identity: TranscriptIdentity): string => `Transcript · ${identity.name} · ${identity.agent}`;
 
 // The editor's header line: which conversation this text belongs to, whether it is
 // live, and that what follows is EDITABLE (the document view says `JSON snapshot`).
@@ -512,7 +721,7 @@ const editorMeta = (identity: TranscriptIdentity): string =>
 // shared modal already reads the adopted content top-to-bottom, and a stacked second
 // transcript would otherwise duplicate the id.
 export const THREAD_TRANSCRIPT_SAVE_NOTE =
-    'Save replaces only this thread\'s transcript messages. Turns and events are session history and are never changed.';
+    "Save replaces only this thread's transcript messages. Turns and events are session history and are never changed.";
 
 // The shared modal has NO actions API, so a dialog's own buttons live in the adopted
 // content node — the same precedent as the board's conversation action bar, the one-press
@@ -600,12 +809,7 @@ const metaRow = (text: string, copy: () => string): HTMLParagraphElement => {
 //     made this box scroll sideways instead of wrapping.
 export const THREAD_TRANSCRIPT_JSON_CLASS = 'thread-transcript-json';
 
-const readContent = (input: {
-    name: string;
-    meta: string;
-    json: string;
-    onEdit?: () => void;
-}): HTMLElement => {
+const readContent = (input: { name: string; meta: string; json: string; onEdit?: () => void }): HTMLElement => {
     const host = el('div', 'thread-transcript');
 
     const json = createPayloadViewer(input.json, 'json', THREAD_TRANSCRIPT_JSON_CLASS);
@@ -619,7 +823,10 @@ const readContent = (input: {
     // copy icon and before the Edit control. `:focus-visible` in styles.css paints the
     // ring only for keyboard focus, and the aria-label above is what the box announces.
     json.tabIndex = 0;
-    host.append(metaRow(input.meta, () => documentCopyText(json)), json);
+    host.append(
+        metaRow(input.meta, () => documentCopyText(json)),
+        json
+    );
 
     if (input.onEdit !== undefined) {
         const edit = actionButton('thread-transcript-edit', 'Edit transcript');
@@ -634,10 +841,7 @@ const readContent = (input: {
 // Render the exact document as inert text. `onEdit` adds the Edit affordance, so the
 // dialog's read surface is one click away from the editor; omitted, the builder is the
 // historical read-only surface (no dead control).
-export const threadTranscriptContent = (
-    transcript: ThreadTranscriptJson,
-    onEdit?: () => void
-): HTMLElement => {
+export const threadTranscriptContent = (transcript: ThreadTranscriptJson, onEdit?: () => void): HTMLElement => {
     const name = threadName(transcript.thread);
     const turnCount = transcript.turns.length;
 
@@ -736,13 +940,7 @@ const editorContent = (state: TranscriptState): HTMLElement => {
     });
     copy.append(el('span', 'action-label', 'Copy'));
 
-    host.append(
-        meta,
-        error,
-        note,
-        editor,
-        transcriptActions('thread-transcript-edit-actions', save, cancel, copy)
-    );
+    host.append(meta, error, note, editor, transcriptActions('thread-transcript-edit-actions', save, cancel, copy));
 
     // Paint the initial error/Save state directly: `state.handle` does not exist yet
     // (this runs while the dialog is being built), so the panel cannot be queried.
@@ -958,9 +1156,7 @@ const applySavedPayload = (state: TranscriptState, payload: ThreadTranscriptPayl
             state.baseline = invalid.raw;
             state.rawPending = undefined;
 
-            const pending = state.handle.element.querySelector<HTMLTextAreaElement>(
-                '.thread-transcript-editor'
-            );
+            const pending = state.handle.element.querySelector<HTMLTextAreaElement>('.thread-transcript-editor');
             if (pending !== null) pending.value = invalid.raw;
         }
 
@@ -1148,10 +1344,7 @@ const rebasePendingRaw = (state: TranscriptState, invalid?: InvalidThreadRecord)
 // session id is ignored (the board closes/moves on session switches explicitly).
 // While the editor is open its TEXT is never replaced: only the identity line, the
 // banner and the Save affordance follow the newer snapshot.
-export const refreshOpenThreadTranscript = (
-    snapshot: SessionSnapshot,
-    scope: object
-): ThreadTranscriptRefresh => {
+export const refreshOpenThreadTranscript = (snapshot: SessionSnapshot, scope: object): ThreadTranscriptRefresh => {
     const state = activeTranscript;
     if (state === undefined || state.scope !== scope || !state.handle.isOpen) return 'ignored';
 
@@ -1207,10 +1400,7 @@ export const refreshOpenThreadTranscript = (
 // Close the tracked transcript when it belongs to this scope (and, optionally,
 // one of the doomed thread ids). `undefined` ids means "close any transcript of
 // this board", used by the session switch/teardown path.
-export const closeThreadTranscript = (
-    scope: object,
-    threadIds?: readonly string[]
-): boolean => {
+export const closeThreadTranscript = (scope: object, threadIds?: readonly string[]): boolean => {
     if (activeTranscript === undefined || activeTranscript.scope !== scope) return false;
     if (threadIds !== undefined && !threadIds.includes(activeTranscript.threadId)) return false;
 

@@ -17,7 +17,7 @@ export {
     CONTEXT_OVERFLOW_CODE,
     PROVIDER_REQUEST_BODY_CODE
 } from './openai';
-// (T6) The two provider failure classes and their bounds. The codes are what
+// (T6) The provider failure classes and their bounds. The codes are what
 // ../core/agent.ts switches on for its retry policy; the defaults and variable names
 // are the operator-facing contract (`.env.example` quotes the same names).
 export {
@@ -26,6 +26,23 @@ export {
     // (T8, AC3) The third provider failure class: a deterministic refusal. Exported so
     // ../core/agent.ts can keep it out of the ladder on the same switch as the others.
     PROVIDER_REJECTED_CODE,
+    // (2026-11-17) The fourth class: the gateway's own in-stream `aborted` answer, i.e.
+    // a cancel that did not come from our signal. Also exported is the DIAGNOSTICS-only
+    // class of a codeless provider-transit failure, which carries no retry code and is
+    // therefore not a `PROVIDER_*_CODE` — see ./provider-timeouts.ts.
+    PROVIDER_ABORTED_CODE,
+    PROVIDER_TRANSIT_CLASS,
+    // The gateway's in-stream error vocabulary (the wire half) and the ONE translator
+    // from it to the codes above. Exported so a host on a custom transport can classify
+    // the same frames the built-in one does instead of re-deriving the table.
+    PROVIDER_WIRE_ABORTED,
+    PROVIDER_WIRE_CONNECTION,
+    PROVIDER_WIRE_DECODE,
+    PROVIDER_WIRE_TIMEOUT,
+    PROVIDER_WIRE_UNKNOWN,
+    PROVIDER_WIRE_UPSTREAM_STATUS,
+    providerWireFailureOf,
+    providerWireMessage,
     DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
     DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
     DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS,
@@ -35,8 +52,12 @@ export {
     PROVIDER_TIMEOUT_MAX_MS,
     resolveProviderTimeout,
     providerURLOf,
-    connectionFailureOf
+    connectionFailureOf,
+    // The single shape-checking reader of a transport's structured `details`. Both
+    // ../core/agent.ts (`retry.provider`) and ../harness.ts (the terminal `error`
+    // record) read diagnostics through this one function.
+    providerDiagnosticsOf
 } from './provider-timeouts';
-export type { ProviderConnectionFailure, ProviderTimeoutPhase } from './provider-timeouts';
+export type { ProviderConnectionFailure, ProviderTimeoutPhase, ProviderWireFailure } from './provider-timeouts';
 export { listModels, ModelListError } from './models';
 export type { ModelListConfiguration, ModelListErrorKind } from './models';

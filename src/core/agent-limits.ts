@@ -113,6 +113,12 @@ export const DELEGATE_MAX_TURNS_MAX = 64;
 // transient one: a minute of patience is proportionate, eight minutes of backoff is
 // not, and the answer the user needs is "nothing is listening on 6660".
 //
+// (2026-11-17) That 1023 s figure is now HISTORY for EVERY class, not just the dead
+// dial: the transient ladder's waits are capped by `RETRY_MAX_DELAY_MS` below, so the
+// same exhausted ladder costs at most 1+2+4+8+16+32+60+60+60+60 = 303 s (~5.05 min) of
+// pure waiting. The attempt COUNT is untouched — a host that configured `maxRetries: 10`
+// still gets eleven chances — only the last four sleeps got shorter.
+//
 // So this class gets its own short, capped ladder: 1 initial attempt plus 2 retries,
 // with waits of 250 ms and 500 ms. The waiting totals 750 ms, so the whole failure is
 // bounded by 750 ms plus the three dial attempts themselves — under a second for a
@@ -131,3 +137,146 @@ export const PROVIDER_CONNECTION_MAX_RETRIES = 2;
 // seconds by design — long enough to outlast a restarting provider process, short
 // enough that the terminal answer arrives in seconds.
 export const PROVIDER_CONNECTION_RETRY_BASE_DELAY_MS = 250;
+
+// ---------------------------------------------------------------------------
+// The ceiling on EVERY ladder, and the timeout ladder (2026-11-17, the
+// unrecoverable-timeout report).
+//
+// THE UNBOUNDED DOUBLING IS THE DEFECT. `retryDelayOf` used to be exactly
+// `baseDelayMs * 2 ** (attempt - 1)`, with no cap and no wall clock, so an exhausted
+// transient ladder slept 1 s … 512 s and waited 1023 s (~17 min) before the operator
+// saw anything — the journal of run a4a6f913 shows `delayMs` climbing to 512000 and a
+// 513815 ms gap between two events. A backoff that long cannot be "patience": nobody
+// retries a rate limit that was already gone seventeen minutes ago, and a wedged
+// gateway is not un-wedged by the seventh sleep. So every ladder now has a hard
+// per-delay ceiling; the COUNT of attempts is whatever the policy says.
+//
+// 60 s is the ceiling for the generic transient ladder because that is the order of
+// magnitude a real `Retry-After` / provider-restart wait is, and because the ladder
+// still totals ~5 min for the default eleven attempts — enough to ride out a rolling
+// deployment, short enough that a dead endpoint answers in a coffee break, not an
+// afternoon.
+//
+// NO JITTER, DELIBERATELY. A jittered backoff spreads a thundering herd across many
+// clients; a harness run is ONE client re-sending ONE request, and an unpredictable
+// `delayMs` makes the published retry frame — and every test that pins it — a guess.
+// A host that wants jitter has a `retry.baseDelayMs` it can vary per agent.
+// ---------------------------------------------------------------------------
+
+// The hard ceiling on ONE wait of the generic transient ladder, whatever the doubling
+// would produce. `retry.maxRetries` and `retry.baseDelayMs` are still honoured; only
+// the exponential tail is flattened.
+export const RETRY_MAX_DELAY_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// The `provider-timeout` ladder (2026-11-17).
+//
+// A missed provider time bound used to be TERMINAL on the attempt that tripped it: one
+// request, no `retry` frame, and a conversation permanently marked interrupted because
+// a gateway went silent 120 s into a stream. That is the "who thread stopped without
+// retry" report, and the fix is not the unbounded generic ladder — re-sending into a
+// slow provider must not buy seventeen more minutes. It is its own SHORT, CAPPED ladder:
+//
+//   1 initial attempt + 3 retries  = 4 attempts. "At least several" from the report,
+//                                    and the same 4-chance shape the connection class
+//                                    already ships (1 + 2 for a dead dial, which is
+//                                    cheaper because nothing is even listening).
+//   2 s, 4 s, 8 s                  = 14 s of waiting in total. A wedged gateway clears
+//                                    on the scale of seconds (a queue drains, a model
+//                                    finishes loading), and each attempt may itself run
+//                                    for minutes, so the waits stay small.
+//   30 s per-delay ceiling          = the same flattening as `RETRY_MAX_DELAY_MS`,
+//                                    sized lower because this ladder has fewer attempts
+//                                    to spend and each attempt is already slow. It only
+//                                    bites if a host widens the ladder past 4 attempts.
+//   900 000 ms ladder deadline     = the wall clock over the WHOLE sequence, measured
+//                                    from the first attempt, INCLUDING the time each
+//                                    attempt consumed. It is sized from the shipped
+//                                    defaults: four attempts at the 120 s stream bound
+//                                    plus 14 s of backoff is ~494 s, so the default
+//                                    configuration still gets all four tries. What it
+//                                    refuses is the pathological shape — a host that
+//                                    raised `HARNESS_PROVIDER_*_TIMEOUT_MS` to minutes,
+//                                    or set a bound so large that each "timeout" is
+//                                    itself an afternoon — where "retry several times"
+//                                    would otherwise mean "hang for an hour".
+//
+// `retry.maxRetries` does NOT stretch this ladder (the same rule the connection class
+// follows): widening the transient ladder says "my provider blips", not "give a
+// provider that already missed a five-minute bound eleven chances".
+// ---------------------------------------------------------------------------
+
+// Retries AFTER the initial attempt for a `provider-timeout` failure.
+export const PROVIDER_TIMEOUT_MAX_RETRIES = 3;
+
+// The base of that ladder's doubling waits: 2 s, then 4 s, then 8 s.
+export const PROVIDER_TIMEOUT_RETRY_BASE_DELAY_MS = 2_000;
+
+// The hard ceiling on ONE wait of that ladder.
+export const PROVIDER_TIMEOUT_RETRY_MAX_DELAY_MS = 30_000;
+
+// The wall clock the whole `provider-timeout` sequence may consume, from the start of
+// its first attempt. Once the NEXT wait would cross it, the ladder stops and the last
+// attempt's own error is the answer.
+export const PROVIDER_TIMEOUT_RETRY_DEADLINE_MS = 900_000;
+
+// ---------------------------------------------------------------------------
+// Run identity: the per-process EPOCH (T-W8, 2026-11-17).
+//
+// THE DEFECT this closes (F5's residual, reported at
+// ../server/turn-projector.ts `route`): a run's journal identity is the runtime
+// INVOCATION id — `runSequence` counted up per harness (../harness.ts:8263, `const id =
+// ++runSequence` at :13659, stamped as `run.thread` at :13748/:13753/:13759). A restarted
+// process starts that counter again, and a lane WORKER mints from its own counter
+// (../harness.ts:8235, `reserveIdentity` only ever RAISES it at :8239), so the same
+// `thread.id` names a different run after a restart. The turn projector already splits on
+// the frame's identity SHAPE and on a post-terminal `start` (../server/turn-projector.ts
+// `isRunBoundary`), but two runs of the same shape whose spawn `callId` is ALSO recycled
+// are unseparable from the recorded lines: verified across all 160 081 lines of the live
+// store's `events.jsonl`, the persisted frames carry no restart discriminator at all.
+//
+// THE RULE: stamp the id with the identity of the PROCESS that minted it. Two frames agree
+// on a run only while they agree on the epoch; different epochs mean two runs, whatever
+// their ids say. Same `thread.id`, same `callId`, different epoch ⇒ a new section.
+//
+// Why a PROCESS and not a harness instance: the restart is the event this must detect, and
+// one process hosts one counter universe per harness — so the process is the boundary where
+// ids can be recycled. It also separates a LANE WORKER from its parent process for free: a
+// lane is a real `node:worker_threads` worker with its own module registry (../server/
+// workers/lane-host.ts), so the lane's run ids carry the LANE's epoch, never the
+// coordinator's. `snapshot()`/`restore()` deliberately do NOT carry the epoch — a restored
+// replica is a NEW minting context, which is exactly the case the discriminator must catch.
+//
+// Format and mint follow the in-repo precedent `HARNESS_RUNTIME_EPOCH` (../server/
+// api-events.ts), which now ALIASES this constant: one opaque per-process string, minted
+// once at module load, shared by the REST cursors/headers and the run identity, so a frame
+// and a cursor naming the same epoch name the same process. It lives HERE (a dependency-free
+// leaf both the runtime and the server may value-import) rather than in the runtime file
+// because ../harness.ts may not import the server tree, and it stays OPTIONAL on the wire: a
+// document written before this change carries no epoch, and a reader must never require one.
+// ---------------------------------------------------------------------------
+
+// A runtime without `crypto.getRandomValues` (an old node, a stripped worker) still needs an
+// epoch, so fall back to `Math.random`. Uniqueness PER PROCESS is the only requirement, and
+// the process is the epoch's whole universe.
+const randomEpochSuffix = (): string => {
+    const randomSource = globalThis.crypto;
+
+    if (randomSource !== undefined && typeof randomSource.getRandomValues === 'function') {
+        const bytes = new Uint8Array(6);
+
+        randomSource.getRandomValues(bytes);
+
+        return [...bytes].map((byte) => byte.toString(36).padStart(2, '0')).join('');
+    }
+
+    return Math.random().toString(36).slice(2, 14).padEnd(12, '0');
+};
+
+/**
+ * The one epoch of THIS process: minted at module load, never re-minted, and stamped onto
+ * every run's thread identity (`HarnessThread.epoch`) so a restarted process can never be
+ * mistaken for the run that used to hold an id. Opaque — the only legal question about it is
+ * "is this the same epoch as that one?".
+ */
+export const HARNESS_PROCESS_EPOCH: string = `${Date.now().toString(36)}-${randomEpochSuffix()}`;

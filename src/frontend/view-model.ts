@@ -57,6 +57,28 @@ export type ThreadRow = {
     invocationId?: string;
     invocationIds?: string[];
     invocationIdsTruncated?: boolean;
+    // W22 (2026-11-17) — `ThreadSummary.epoch`, renamed at the boundary like every other field here: the
+    // PROCESS that minted `invocationId`, i.e. the ledger generation this conversation's latest run belongs
+    // to (../server/harness.swagger.yaml, ../types `HarnessThreadRecord.epoch`).
+    //
+    // WHY A RENDER MODEL NEEDS AN IDENTITY TOKEN. Nothing draws it. `ui/thread-transcript.ts` is the consumer:
+    // the document it builds joins a recorded frame's invocation id onto the conversation that ran it, and a
+    // per-process counter means two conversations can report the SAME id after a restart. The frame names its
+    // process; the row that names the same process is the conversation that ran that frame. Without this
+    // field the join can only fall back to roster order — the residual W19 pinned as F3/D2.
+    //
+    // OPTIONAL BY CONTRACT: a row whose record names no process emits no key (a conversation that never ran,
+    // or one restored from a pre-epoch document), and the value is the BARE token — never `id\0epoch`, which
+    // stays a private join key (../shared/run-identity.ts).
+    //
+    // W26 (2026-11-17) — WHICH ROWS ACTUALLY CARRY THE PAIR. `invocation_id`/`invocation_ids` are now
+    // `ThreadSummary` properties (../server/harness.swagger.yaml, ../server/api-reads.ts `threadRowOf`), so
+    // `invocationId`/`invocationIds` above are no longer exclusive to the identified read `/threads/{id}`: a
+    // roster PAGE row carries them too, and so does every document composed from one —
+    // `view-shell.ts` `getRawSession` (the transcript dialog and the export). That is what makes `epoch`
+    // usable there at all: the token is only a discriminator next to the id it minted, and the fold
+    // (`ui/thread-transcript.ts` `attributedThreadOf`, door 1) composes the run key from the two.
+    epoch?: string;
     references?: ThreadResourceReferences;
     connectedThreadIds?: string[];
     transcriptRevision?: number;
@@ -119,6 +141,18 @@ export type SessionView = {
     discoveredTools?: string[];
     threadViews?: ThreadRow[];
     invalidThreads?: InvalidThreadRow[];
+    // F7 (T-W6): the conversations this session SOFT-DELETED, by id — the wire's
+    // `SessionResource.inactive_thread_ids` (../shared/harness-api.ts:1460) renamed at the
+    // boundary, the twin of `SessionView.inactiveThreads` in ../server/protocol.ts:964. Omitted
+    // when the session never retired one (the additive rule every optional header field follows).
+    //
+    // WHY IT RIDES THE HEADER AND NOT THE ROSTER: `threadViews` deliberately HIDES a retired
+    // conversation (../server/api.ts:4834, ../server/sessions.ts `threadRoster`), which is the right
+    // listing rule for a client that WATCHED the delete but not for a RELOAD — there, "the roster
+    // stopped naming this id" is indistinguishable from "it never existed". The list is therefore the
+    // only POSITIVE deletion evidence a fresh page can get; ./ui/threads.ts `sessionThreadsOf` joins it
+    // onto the roster as the deleted marker and the turn board suppresses those conversations' rows.
+    inactiveThreads?: string[];
     // Loaded turn window, in recorded (ascending) order.
     turns: TurnSummary[];
     // Paging state of that window: `olderCursor` is the cursor for the NEXT OLDER

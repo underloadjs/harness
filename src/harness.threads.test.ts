@@ -16,6 +16,10 @@
 //   R4  Runtime behaviour is unchanged: a cancelled tree emits no child frames (no
 //       late thread can land in the next session), and root events keep the exact
 //       pre-thread shape (no `thread` key at all).
+//   R5  T-W8: every mint also stamps `epoch`, the id of the PROCESS that minted the
+//       invocation (./core/agent-limits.ts `HARNESS_PROCESS_EPOCH`), so a recycled id from a
+//       restarted runtime can never be mistaken for the run it used to name
+//       (./server/turn-projector.ts `isEpochBoundary`).
 //
 // Clock policy: fake timers own the clock, so launch-relative elapsed/duration
 // figures are exact 0s and no real waiting happens.
@@ -23,6 +27,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
 import type { HarnessEvent, HarnessStream, HarnessStreamEvent } from '@underload/harness';
+// T-W8: the WHOLE-payload assertions below name the process epoch. It is asserted against the
+// constant (never a literal — it is random BY DESIGN), and it is exact because vitest gives one
+// module registry per test file, so this file has exactly one epoch.
+import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
 
 // One scripted frame list per request; the last list is reused when a run asks for
 // more requests than were scripted.
@@ -173,18 +181,24 @@ describe('invocation identity (T3 UI threads)', () => {
         ]);
 
         // The start frames are the only events that carry the prompt.
+        // T-W8: each payload also names the PROCESS that minted the invocation id
+        // (`HarnessThread.epoch`, minted in ./core/agent-limits.ts `HARNESS_PROCESS_EPOCH` and
+        // stamped at the run-identity mints in ./harness.ts). Both children are stamped with the
+        // SAME epoch — one process minted both — which is what lets ./server/turn-projector.ts
+        // fold them as one process's runs and split only across a restart. Exact, because vitest
+        // gives one module registry per test file, so the file has exactly one epoch.
         expect(events.filter((event) => event.type === 'start' && event.agent === 'helper')).toEqual([
             {
                 type: 'start',
                 agent: 'helper',
                 model: 'merge/ds4-flash',
-                thread: { id: '2', callId: 'c1', input: 'first task' }
+                thread: { id: '2', callId: 'c1', input: 'first task', epoch: HARNESS_PROCESS_EPOCH }
             },
             {
                 type: 'start',
                 agent: 'helper',
                 model: 'merge/ds4-flash',
-                thread: { id: '3', callId: 'c2', input: 'second task' }
+                thread: { id: '3', callId: 'c2', input: 'second task', epoch: HARNESS_PROCESS_EPOCH }
             }
         ]);
 
@@ -233,12 +247,13 @@ describe('invocation identity (T3 UI threads)', () => {
             'lead:done:-'
         ]);
 
-        // A later frame keeps the identity fields but never repeats `input`.
+        // A later frame keeps the identity fields but never repeats `input` — and keeps the
+        // epoch of the process that minted them (see the note on the `start` frames above).
         expect(events.find((event) => event.agent === 'helper' && event.type === 'text')).toEqual({
             type: 'text',
             agent: 'helper',
             delta: 'inner facts',
-            thread: { id: '2', callId: 'c9' }
+            thread: { id: '2', callId: 'c9', epoch: HARNESS_PROCESS_EPOCH }
         });
     });
 
@@ -295,7 +310,9 @@ describe('invocation identity (T3 UI threads)', () => {
         expect(events.find((event) => event.agent === 'helper' && event.type === 'done')).toEqual({
             type: 'done',
             agent: 'helper',
-            thread: { id: '2', callId: 'c1' },
+            // T-W8: a PAUSED child keeps naming the same run identity — same invocation id, same
+            // spawn call, same process epoch — across the pause and the tool that resumes it.
+            thread: { id: '2', callId: 'c1', epoch: HARNESS_PROCESS_EPOCH },
             message: {
                 role: 'assistant',
                 content: 'child finished',

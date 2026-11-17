@@ -39,6 +39,18 @@ export type RunnerSettings = {
     firstTokenTimeoutMs?: number;
     // Bound BETWEEN consecutive reads of an open body, in ms (`0` = off).
     streamChunkTimeoutMs?: number;
+    // F1 (2026-11-17): how many CONSECUTIVE network-class failures one conversation
+    // tolerates before the server stops AUTO-RESUMING it. Same discipline as the three time
+    // bounds above: optional and additive, absent means "no opinion" (the deployment's
+    // `HARNESS_PROVIDER_NETWORK_RESUME_LIMIT`, then the shipped default of 10 — see
+    // `DEFAULT_NETWORK_RESUME_LIMIT` in ../config.ts), `0` means "never auto-resume", and the
+    // value is validated by `mergeSettings` so a bad one answers 400 rather than being
+    // coerced into an off-by-default feature.
+    //
+    // It is a PROVIDER field because it bounds what a flaky provider costs: a deployment
+    // whose gateway drops connections every few minutes can raise the ceiling for that one
+    // provider, and a deployment that wants failures to stay visible can turn the loop off.
+    networkResumeLimit?: number;
 };
 
 // Persistence observer the server may attach at construction (R3a/R3b). Optional

@@ -256,6 +256,17 @@
 // bottom of this file.
 
 import { HarnessError, isInstanceOf, toErrorInfo } from './util';
+// (2026-11-17, the unrecoverable-timeout report) The provider failure vocabulary, read
+// directly rather than through the re-export at the bottom of this file: `classifyRunStopReason`
+// switches on the two network CLASSES to answer `provider-network` for the session layer,
+// and the terminal `error` record publishes the SAME `provider` diagnostics block the
+// agent's `retry` frames do — through the SAME reader, so the two can never disagree.
+import {
+    PROVIDER_CONNECTION_CODE,
+    PROVIDER_TIMEOUT_CODE,
+    PROVIDER_TRANSIT_CLASS,
+    providerDiagnosticsOf
+} from './transport';
 import {
     agent as createAgent,
     tool as defineTool,
@@ -420,6 +431,19 @@ import { readSnapshotInteger, readSnapshotString } from './core/snapshot-validat
 // never mint a row the next snapshot refuses. core/snapshot.ts:96-98 states this rule explicitly:
 // every other validating boundary imports the table instead of re-spelling the nine members.
 import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from './core/snapshot';
+// T-W8 — the per-process EPOCH stamped onto run identity. Direct module import of a
+// dependency-free leaf, the same convention as the core helpers above: the runtime may not
+// import the server tree, and `server/api-events.ts` aliases THIS constant, so the epoch a
+// REST cursor carries and the epoch a recorded frame carries name the same process.
+import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
+// W19 (2026-11-17) — the invocation-RUN key, the same rule `./server/protocol.ts` publishes. Direct
+// module import of a dependency-free leaf, the same convention as `./shared/attachments` below and
+// the core helpers above: the result ledger (`invocationRecords`), the durable rows it projects, and
+// the store's joins must all key one run the same way, and this file may not import `./server/*`.
+// Without a run key, a restarted harness re-mints `15` and `registerInvocation` OVERWRITES the
+// restored row of the run that legitimately owned `15` — the pre-restart answer disappears from
+// `agentResult`, from `/results`, and from the next snapshot.
+import { invocationRunKeyOf } from './shared/run-identity';
 // IT19 R1 — the RETENTION repair. A run that ends without concluding now keeps its committed
 // turns, so the tail can end on an assistant turn whose tool calls were never answered; this is
 // the pass that makes such a tail pairable again, plus the marker naming a synthesized result so
@@ -688,6 +712,25 @@ const runStopCauseOf = (cause: unknown): HarnessRunStopReason | undefined => {
     return (cause as { [RUN_STOP_CAUSE]?: HarnessRunStopReason })[RUN_STOP_CAUSE];
 };
 
+// (2026-11-17, the unrecoverable-timeout report) The machine code of a failed run, read
+// the same total way `core/agent.ts` reads it: `instanceof` goes through `isInstanceOf`
+// because a hostile thrown value may make it throw, and a code that is not a non-empty
+// string is absence. `classifyRunStopReason` needs it to tell a NETWORK death from a
+// refusal without parsing the sentence, which is exactly what the session layer's
+// consecutive-failure counter is built on.
+const runFailureCodeOf = (error: unknown): string | undefined => {
+    try {
+        if (!isInstanceOf(error, HarnessError)) return undefined;
+
+        const code = error.code;
+
+        return typeof code === 'string' && code.length > 0 ? code : undefined;
+    } catch {
+        // Reporting an error must never throw another one.
+        return undefined;
+    }
+};
+
 // IT19 R5 — WHICH STOPS MAY BE RESUMED BY AN AGENT.
 //
 // `HarnessThreadStatus` documents `stopped` as "no new run is started for it and AGENTS may not
@@ -714,6 +757,12 @@ const RESUMMABLE_RUN_STOP_REASONS: readonly HarnessRunStopReason[] = [
     'budget-exhausted',
     'api-error',
     'retries-exhausted',
+    // (2026-11-17) A NETWORK death is the same shape as `api-error`/`retries-exhausted`
+    // for this question: the run was cut short by something that was nobody's instruction
+    // to halt, its turns are retained, and a peer's message is a legitimate way to put it
+    // back to work. Note that this is about a PEER'S `threadSend`, not about auto-recovery:
+    // the run itself is still marked interrupted and never replayed on its own.
+    'provider-network',
     'parent-closed'
 ];
 
@@ -3867,7 +3916,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         delegate: (caller, parameters, run, runDepth, callerSignal, selfCallId, selfScope) =>
             delegateFor(caller, parameters, run, runDepth, callerSignal, selfCallId, selfScope),
         threadSend: (caller, threadId, parameters) => threadSendFor(caller, threadId, parameters),
-        threadList: (threadId) => threadRoster(threadId),
+        threadList: (threadId) => modelThreadRosterOf(threadRoster(threadId)),
         // B5 (2026-11-13): the model-facing release. A threadless caller is the host view
         // and deletes anything terminal; a caller WITH a thread only reaches its own
         // descendants (`threadDeleteFor`).
@@ -4004,12 +4053,125 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // writes it inside its `else` branch and both snapshot projections omit it there.
         // Absent on a non-concluded row means "this row was written before the field existed".
         stopReason?: HarnessRunStopReason;
+        // W19 (2026-11-17) — the LEDGER GENERATION that owns this row: the process epoch that minted
+        // `invocationId` (`./core/agent-limits.ts` `HARNESS_PROCESS_EPOCH`, the value
+        // `HarnessThread.epoch` rides on that run's frames). It is what the ledger key is built from
+        // (`invocationRunKeyOf`), so two runs of one RECYCLED id — the dead one a restore brought back
+        // and the live one this process just minted — occupy two rows instead of the newer one
+        // silently replacing the older.
+        //
+        // Present on every row this process WRITES (a run's own epoch, or the archiving lane's), and
+        // ABSENT only on a row restored from a document that predates the persisted field — which is
+        // exactly the row that must keep living under its BARE id, so an epoch-less document resolves
+        // byte-identically to how it resolves today.
+        epoch?: string;
     };
 
+    // THE LEDGER KEY (W19, 2026-11-17). `invocationRecords` is keyed by invocation RUN —
+    // `id\0epoch`, or the bare id when no epoch is known — not by the bare id. Everything the ledger
+    // reports stays bare: `record.invocationId` is the bare id, the snapshot projection writes the bare
+    // id (plus the new optional `epoch` key), `agentManage` and `agentResult` name the bare id, and
+    // `purgeThread`'s receipts list bare ids. Only the ADDRESS changes.
+    //
+    // WHY: `invocationId` comes from `runSequence`, a PER-PROCESS counter that restore only ever
+    // RAISES, and a lane worker mints from its own counter (`reserveIdentity`). So after a restart the
+    // same bare id names a NEW run while the restored row of the OLD run is still in the ledger. Keyed
+    // by the bare id, `registerInvocation` overwrote that row (`:4078`), `archiveInvocation` reported
+    // it as `replaced` (`:8146`), and `restore` collapsed two persisted rows into one (`:14571`) —
+    // three ways for a real answer to be dropped without a word.
     const invocationRecords = new Map<string, AgentInvocationRecord>();
     let invocationCompletionSequence = 0;
 
     const invocationIdOf = (run: RunState): string => run.thread?.id ?? String(run.id);
+
+    // The epoch of a run executing HERE. A run always mints its identity in the process that owns it
+    // (the three `run.thread` stamps below all pass `HARNESS_PROCESS_EPOCH`), so a thread that already
+    // names an epoch can only be naming THIS process's — a restored record's epoch never reaches a live
+    // run, because a restored thread has no run attached. Reading it off the thread rather than
+    // re-reading the constant keeps the two identity halves (`invocationId`, `epoch`) coming from the
+    // same mint, exactly like `threadIdentity` does for the frames.
+    const invocationEpochOf = (run: RunState): string => run.thread?.epoch ?? HARNESS_PROCESS_EPOCH;
+
+    // The address of ONE run's row, for a writer or for a lookup that already knows the run.
+    const invocationRunKeyOfRun = (run: RunState): string =>
+        invocationRunKeyOf(invocationIdOf(run), invocationEpochOf(run));
+
+    // The address a record was stored under. Derived, never cached: `invocationId` and `epoch` are set
+    // once, at insertion, and never mutated afterwards, so the derived key cannot drift from the slot.
+    const agentRecordRunKey = (record: AgentInvocationRecord): string =>
+        invocationRunKeyOf(record.invocationId, record.epoch);
+
+    // THE BARE-ID READER. Every caller that holds only the bare id a model typed, or a carrier wrote,
+    // resolves it here. The order is the whole rule, and it is the same "exact run first, then the
+    // legacy form" order the store's joins use (`../server/sessions.ts displayContext`,
+    // `../frontend/ui/turns.ts resolveRunEntry`):
+    //
+    //   1. THIS process's run of that id — the row a run started after the last restart owns. A
+    //      post-restart query can therefore never be served the pre-restart answer, which is the
+    //      headline defect;
+    //   2. the epoch-less row, i.e. a record written before the field existed. This is the legacy door,
+    //      and the only one an epoch-less document ever uses, so such a document resolves exactly as
+    //      it does today (step 1 simply misses: a legacy document holds only bare keys);
+    //   3. otherwise the NEWEST row of that id from another ledger generation — which is what keeps a
+    //      pre-restart result addressable by the id the caller was given after this build's own document
+    //      has been restored (its rows carry an epoch, so neither 1 nor 2 can hit). `sequence` is the
+    //      harness's monotonic run id, RAISED by every restore from the persisted high-water mark, so
+    //      "largest sequence" is the newest run the ledger can prove; `completedOrder` breaks a tie.
+    //
+    // The scan in (3) only runs when a bare id matches MORE THAN one epoch-qualified row and none of
+    // them is this process's, on a map bounded by `AGENT_RESULT_RETENTION` (64).
+    const invocationRecordOfInvocationId = (invocationId: string): AgentInvocationRecord | undefined => {
+        const current = invocationRecords.get(invocationRunKeyOf(invocationId, HARNESS_PROCESS_EPOCH));
+
+        if (current !== undefined) return current;
+
+        const legacy = invocationRecords.get(invocationId);
+
+        if (legacy !== undefined) return legacy;
+
+        let newest: AgentInvocationRecord | undefined;
+
+        for (const record of invocationRecords.values()) {
+            if (record.invocationId !== invocationId) continue;
+
+            if (
+                newest === undefined ||
+                record.sequence > newest.sequence ||
+                (record.sequence === newest.sequence && record.completedOrder > newest.completedOrder)
+            ) {
+                newest = record;
+            }
+        }
+
+        return newest;
+    };
+
+    // The same preference, narrowed to one AGENT — the second half of what `agentResult` is addressed
+    // by (`{agent, invocationId}`, and the agent scope is what stops a caller probing a sibling). A
+    // recycled id can name two runs of two different agents, so the run the id resolves to now is not
+    // always the row the caller means; this is the door to the other generation's row of the agent that
+    // was actually asked about. Ordering inside the scan follows the ledger's own ordering rule: newest
+    // run first (`sequence` is monotonic and RAISED by every restore).
+    const invocationRecordOfInvocationIdForAgent = (
+        invocationId: string,
+        agent: string
+    ): AgentInvocationRecord | undefined => {
+        let newest: AgentInvocationRecord | undefined;
+
+        for (const record of invocationRecords.values()) {
+            if (record.invocationId !== invocationId || record.agent !== agent) continue;
+
+            if (
+                newest === undefined ||
+                record.sequence > newest.sequence ||
+                (record.sequence === newest.sequence && record.completedOrder > newest.completedOrder)
+            ) {
+                newest = record;
+            }
+        }
+
+        return newest;
+    };
 
     const invocationKindOf = (run: RunState): AgentInvocationKind => {
         if (run.branch !== undefined) return run.branch.kind;
@@ -4028,13 +4190,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             .sort((left, right) => left.sequence - right.sequence)
             .slice(0, overflow);
 
-        for (const record of removable) invocationRecords.delete(record.invocationId);
+        for (const record of removable) invocationRecords.delete(agentRecordRunKey(record));
     };
 
     const registerInvocation = (run: RunState): void => {
         const invocationId = invocationIdOf(run);
+        // W19: the row is stored under its RUN. A recycled id therefore ADDS a row instead of replacing
+        // the restored row of the run that owned the id before the restart — which is the whole fix,
+        // and it is bounded: `pruneInvocationRecords` caps the ledger at `AGENT_RESULT_RETENTION` rows
+        // either way, so one run still costs exactly one row.
+        const runKey = invocationRunKeyOfRun(run);
 
-        invocationRecords.set(invocationId, {
+        invocationRecords.set(runKey, {
             invocationId,
             sequence: run.id,
             agent: run.agent.name,
@@ -4043,6 +4210,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             status: 'running',
             content: '',
             completedOrder: 0,
+            // W19: the ledger generation this row belongs to, taken from the run's own identity so the
+            // pair (`invocationId`, `epoch`) is one mint (`invocationEpochOf`). The row is addressed by
+            // the run key built from exactly these two fields, and the snapshot projection writes this
+            // value so a restart rebuilds the same address.
+            epoch: invocationEpochOf(run),
             // DEFECT M1: the start stamp, REUSED from the run instead of re-reading the clock.
             // `RunState.startedAt` is stamped once when the run object is built (~:13624), so
             // the live `ageMs` and the terminal `durationMs` measure from the SAME instant and
@@ -4072,7 +4244,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         run: RunState,
         outcome: { message?: HarnessAssistantMessage; error?: unknown }
     ): void => {
-        const record = invocationRecords.get(invocationIdOf(run));
+        // W19: addressed by RUN. The transition must land on the row THIS run wrote, never on a
+        // restored row that happens to wear the same recycled id — which is what a bare-id `get` would
+        // have done: the pre-restart archive would be flipped to `completed` with this run's answer.
+        const record = invocationRecords.get(invocationRunKeyOfRun(run));
         if (record === undefined) return;
 
         record.completedOrder = ++invocationCompletionSequence;
@@ -4368,7 +4543,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             let record: AgentInvocationRecord | undefined;
 
             if (requestedId !== undefined) {
-                const candidate = invocationRecords.get(requestedId);
+                // W19 (2026-11-17): resolved by RUN with the ledger's fixed preference (this process's
+                // run of that id, then the epoch-less legacy row, then the newest row of another
+                // generation), so a post-restart query for a RECYCLED id is served the run that
+                // legitimately owns the id now — never the dead run's answer.
+                let candidate = invocationRecordOfInvocationId(requestedId);
+
+                // The id is only half of what this reader was asked for: the CALLER also named the
+                // agent, and a recycled id can belong to two agents at once (the pre-restart child of
+                // one, the post-restart root of another). Falling back to the other generation's row of
+                // THAT agent is what keeps the older answer reachable: `agentManage` lists both rows, so
+                // a row that could not be addressed by the only name it has would be archived but
+                // unreadable. The refusal below still fires when NO row of that id belongs to that
+                // agent, so the scoped rule ("you cannot probe a sibling's result through the wrong
+                // name") is exactly as strong as it was.
+                if (candidate !== undefined && candidate.agent !== name) {
+                    candidate = invocationRecordOfInvocationIdForAgent(requestedId, name);
+                }
 
                 // An id belonging to another agent is reported as unavailable for
                 // THIS agent: the lookup is scoped, so a caller cannot probe
@@ -4725,13 +4916,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         trace: DelegateCallTrace
     ): HarnessDelegationResult | undefined => {
         const invocationId = trace.identity.invocationId;
-        // `invocationRecords` is keyed by EXACTLY the value the child wrote into the carrier
-        // (`registerInvocation` uses the same `invocationIdOf(run)`), so an entry found here IS
+        // `invocationRecords` is ADDRESSED by the run key `registerInvocation` derives from exactly the
+        // value the child wrote into the carrier (`invocationIdOf(run)` + this process's epoch), and the
+        // bare carrier id is resolved through `invocationRecordOfInvocationId`, so an entry found here IS
         // this call's child and cannot be a foreign run. The pair-addressed fallback covers a
         // host-supplied `run` closure that ignored the carrier; it matches only the
         // (`parentScope`, `parentCallId`) the child stamped itself.
         const record =
-            (invocationId === undefined ? undefined : invocationRecords.get(invocationId)) ??
+            // W19: the id in the carrier is BARE (it is the value the child wrote, and the carrier
+            // contract publishes bare ids), so the ledger resolves it through the standard preference —
+            // this process's run of that id first. The pair-addressed fallback is unchanged.
+            (invocationId === undefined
+                ? undefined
+                : invocationRecordOfInvocationId(invocationId)) ??
             delegatedRecordOf(trace.scope, trace.callId);
 
         if (record === undefined) return undefined;
@@ -4975,7 +5172,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // fallible; a carrier always wins.
         const newInvocationOf = (): AgentInvocationRecord | undefined => {
             if (carried.invocationId !== undefined) {
-                const record = invocationRecords.get(carried.invocationId);
+                const record = invocationRecordOfInvocationId(carried.invocationId);
 
                 // Verification: the entry must still carry the id the run wrote, and must
                 // belong to the agent this delegation started. An entry under a stale id
@@ -5954,6 +6151,31 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 .map((state) => threadRecordCopy(state.record))
         };
     };
+
+    // The roster as the MODEL sees it (W19, 2026-11-17; the plane rule restated by W22): the same rows, and
+    // the same BARE ids it has always published, minus `epoch`. That token is the minting-process
+    // discriminator (`../types/index.ts` `HarnessThreadRecord.epoch`, written beside the `invocationId` by
+    // the run that mints it): every plane that resolves a run reads it from the durable record — the ledger
+    // (`./harness.ts` `invocationRecordOfInvocationId`), the block projection
+    // (`./shared/agent-results.ts`), the roster scan in `./server/sessions.ts` `noteInvocationThread`, and
+    // since W22 the HOST/UI roster too (`SessionThread.epoch` / `ThreadSummary.epoch`, which is what lets the
+    // browser's transcript join tell two recycled ids apart).
+    //
+    // THE MODEL PLANE KEEPS THE STRIP. W22 widened the host/UI plane and deliberately left this one alone:
+    // the `threadList` schema has no epoch parameter, so a model could never send the token back, and
+    // dropping it here keeps the contract in front of the model byte-identical to the pre-W19 page — the
+    // proof is `./harness.invocation-run-key.test.ts` / `./tools/runtime/threadList.tool.ts`. `handle.threads()`
+    // and `api.threads.list` (the host and plugin surfaces, and the store's own scan) keep the full record.
+    const modelThreadRosterOf = (roster: HarnessThreadRoster): HarnessThreadRoster => ({
+        ...roster,
+        threads: roster.threads.map((row) => {
+            const bare = { ...row };
+
+            delete bare.epoch;
+
+            return bare;
+        })
+    });
 
     // Cross-thread chat + roster are CONDITIONAL core tools (core/metadata.ts):
     // a session with one conversation per agent pays no context for them, and the
@@ -7907,6 +8129,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
 
             target.record.invocationId = invocationId;
+            // W19: same pair rule as the run-start stamp above — an epoch may only ever describe the id
+            // that sits next to it. This seam is the AUTHORITY mirror write (`./server/workers/lane-host
+            // .ts` hands the invocation id the lane leased), and it runs in the realm that minted that
+            // id, so THIS module's `HARNESS_PROCESS_EPOCH` is the process the id names. A thread whose
+            // status moves without an id keeps the epoch it already had, which still describes the id it
+            // still carries.
+            target.record.epoch = HARNESS_PROCESS_EPOCH;
         }
 
         target.record.status = status;
@@ -8102,7 +8331,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const stopReason = isHarnessRunStopReason(input.stopReason) ? input.stopReason : undefined;
 
-        const replaced = invocationRecords.has(invocationId);
+        // W19 (2026-11-17) — THE LEDGER GENERATION this archived row belongs to, and therefore the
+        // address it is stored under (`invocationRunKeyOf`). Two independent facts make the seam need
+        // one: a lane worker mints ids from its OWN counter while the coordinator keeps minting from its
+        // own, and the ledger may already hold a row of this bare id from a PROCESS GENERATION that
+        // ended. Absent is the legacy form and keeps today's addressing byte for byte: the row is keyed
+        // by THIS process's generation, so a lane row and a coordinator row of one generation still
+        // address the same slot and no same-process pairing starts holding two rows where it had one.
+        //
+        // A supplied value is REFUSED when it is not a non-empty string — the rule every other field of
+        // this seam follows (issue 0020 lists coercion as a defect), and an epoch that quietly became
+        // `""` would re-key the row into somebody else's slot.
+        const archivedEpoch =
+            input.epoch === undefined
+                ? HARNESS_PROCESS_EPOCH
+                : readSnapshotString(input.epoch, `Invocation "${invocationId}".epoch`, { min: 1 });
+
+        const runKey = invocationRunKeyOf(invocationId, archivedEpoch);
+
+        // W19: `replaced` is reported on the RUN, which is the slot this call actually writes. A
+        // restored row of the SAME bare id from a dead generation is no longer "replaced" — it keeps its
+        // own row — and the receipt the lane commits stays honest about which run stopped existing.
+        const replaced = invocationRecords.has(runKey);
+
         const completedOrder =
             input.completedOrder === undefined
                 ? ++invocationCompletionSequence
@@ -8113,6 +8364,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const archived: AgentInvocationRecord = {
             invocationId,
+            // W19: the generation, stored so the projection writes it and the NEXT restore rebuilds this
+            // same address instead of collapsing the row back onto a bare id.
+            epoch: archivedEpoch,
             sequence: input.sequence,
             agent: input.agent,
             role: input.role,
@@ -8140,7 +8394,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ...(input.threadId === undefined ? {} : { threadId: input.threadId })
         };
 
-        invocationRecords.set(invocationId, archived);
+        invocationRecords.set(runKey, archived);
 
         pruneInvocationRecords();
 
@@ -8169,7 +8423,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // IT19 R3: carried exactly as stored, for the digest reason stated above — once the
                 // archive digest covers `stopReason`, a returned object that omitted it would put
                 // the coordinator and the lane permanently out of agreement.
-                ...(archived.stopReason === undefined ? {} : { stopReason: archived.stopReason })
+                ...(archived.stopReason === undefined ? {} : { stopReason: archived.stopReason }),
+                // W19: the ledger generation travels with the row the LANE COMMITS, so the worker's
+                // receipt names the same address the canonical ledger stored the row under, and a
+                // restore rebuilds that address from the persisted key. `archiveDigestOf`
+                // (./workers/lane-commit.ts) projects an EXPLICIT field list, so this key is outside
+                // the digest on both sides — adding it cannot put the two halves out of agreement.
+                ...(archived.epoch === undefined ? {} : { epoch: archived.epoch })
             },
             replaced
         };
@@ -8641,6 +8901,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Identity fields for a frame AFTER `start`: the thread id plus its lineage
     // anchors. `input` is deliberately dropped so a long child prompt travels once
     // (on `start`) instead of on every delta, tool result, and done frame.
+    //
+    // T-W8: `epoch` rides EVERY frame of the run, not just `start`, for exactly the reason
+    // `kind`/`branchId` do (N6, below) — the reader has to be able to tell a run apart at
+    // ANY frame. A restarted process re-mints invocation ids (and a lane worker mints from
+    // its own counter), so an id alone cannot say WHICH run a frame belongs to; the epoch is
+    // the process that minted it. It is copied from the run's own thread, never re-read from
+    // the module constant, so a frame can never claim an epoch other than the one its run was
+    // born with.
     const threadIdentity = (thread: HarnessThread): HarnessThread => {
         const identity: HarnessThread = { id: thread.id };
         if (thread.parentId !== undefined) identity.parentId = thread.parentId;
@@ -8650,6 +8918,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // under the same branch. `input` still travels on `start` only.
         if (thread.kind !== undefined) identity.kind = thread.kind;
         if (thread.branchId !== undefined) identity.branchId = thread.branchId;
+        if (thread.epoch !== undefined) identity.epoch = thread.epoch;
         return identity;
     };
 
@@ -9303,7 +9572,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const failedPartial =
                 failedBranchId === undefined
                     ? undefined
-                    : invocationRecords.get(failedBranchId)?.partialContent;
+                    : invocationRecordOfInvocationId(failedBranchId)?.partialContent;
             const preview =
                 failedPartial === undefined || failedPartial.trim().length === 0
                     ? undefined
@@ -9570,9 +9839,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // The child record a debt points at, at payment time. Value first, pair as fallback — the
     // rule `releasedDelegateResultOf` documents: the id the child wrote is exact, and the pair
-    // covers a host-supplied `run` closure that ignored the identity carrier.
+    // covers a host-supplied `run` closure that ignored the identity carrier. W19: the value is a BARE
+    // id, so it resolves through the ledger's preference (this process's run of that id, then the
+    // epoch-less row, then the newest row of an older generation) — a debt recorded before a restart is
+    // still paid from the row that carries the child's answer.
     const owedRecordOf = (debt: OwedDelivery): AgentInvocationRecord | undefined =>
-        invocationRecords.get(debt.invocationId) ?? owedChildRecordOf(debt.scope, debt.callId);
+        invocationRecordOfInvocationId(debt.invocationId) ??
+        owedChildRecordOf(debt.scope, debt.callId);
 
     // The account one debt owes its caller, in the shape the live delivery WOULD have inserted.
     // `undefined` means "nothing to report": the record was purged or evicted, or the child is
@@ -10294,6 +10567,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // `branch_start`, `branch_end`, and every frame of the branch run therefore
     // group under one id/kind/branchId. `parentId` names the REQUester thread when
     // it has one, which is how a nested fork stays indented.
+    //
+    // T-W8: the epoch is stamped here as well, because a branch id (`branch-N`) is minted
+    // from a per-process counter exactly like an invocation id, and these audit frames
+    // BYPASS `emit` (they are written straight to `progress`), so nothing else would put the
+    // process identity on them. Same process, same value the branch run's own frames carry,
+    // so a branch row never sees two epochs for one run.
     const branchThreadOf = (
         branchId: string,
         kind: 'fork' | 'autoanswer',
@@ -10303,7 +10582,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const thread: HarnessThread = {
             id: branchId,
             kind,
-            branchId
+            branchId,
+            epoch: HARNESS_PROCESS_EPOCH
         };
         if (parentRun.thread !== undefined) thread.parentId = parentRun.thread.id;
         thread.callId = callId;
@@ -12595,6 +12875,39 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //                           least once — see `RunState.sawRetryFrame`).
     //   anything else          → `api-error`.
     //
+    // THE NETWORK OVERRIDE, stated verbatim because the session layer branches on it
+    // (2026-11-17, Contract D of the unrecoverable-timeout work). It is checked AFTER the
+    // abort/stamp rules above — an abort is an ACTOR, a network failure is a CAUSE, and an
+    // aborted run's cause is the actor that stopped it — and BEFORE the exhausted-ladder
+    // rule, and it answers `provider-network` when, and only when, ONE of these holds:
+    //
+    //   1. the failure's machine code is `provider-timeout` (a bound expired, or the
+    //      provider reported a timeout on the stream) or `provider-connection` (nothing
+    //      answered the dial) — these are network-class BY CLASS, whether or not a retry
+    //      was spent, which is the whole point: the reported defect died with ZERO retry
+    //      frames and would otherwise have persisted as `api-error`;
+    //   2. the failure is CODELESS and the transport diagnosed the dying bytes as
+    //      `provider-transit` (a gateway error frame with an unknown/absent code, or a
+    //      body that closed before reporting a completion) — a network death WHETHER OR NOT
+    //      a retry was spent.
+    //
+    // RULE 2 USED TO ALSO REQUIRE `run.sawRetryFrame`, and that requirement was the reported
+    // residual defect (2026-11-17, accepted explicitly): a codeless transit frame that kills the
+    // FIRST attempt left `api-error` with no streak and no auto-resume, because the classifier
+    // demanded a spent retry frame as proof the endpoint is unhealthy. The proof was never the
+    // ladder — the transport's own `provider-transit` diagnosis is the evidence, and it says the
+    // bytes died in the wire, not in the request. A transit death that spent zero retries now
+    // raises the consecutive-failure streak and auto-resumes like any other network class.
+    //
+    // WHAT STILL ISOLATES A NON-NETWORK FAILURE, so `api-error` keeps its meaning for everything
+    // that is not the wire dying: the failure must be CODELESS (a `provider-rejected` 401 answers
+    // about the request), AND it must carry the transport's `provider-transit` diagnosis (an HTTP
+    // 5xx body or a malformed frame carries no such class). `retries-exhausted` therefore still
+    // covers every NON-network exhausted ladder (an HTTP 4xx/5xx body, a malformed frame, a
+    // schema/validation throw), a user stop / turn cap / plugin park stays an ACTOR, and the
+    // run-level wall-clock `'timeout'` stays non-network by accepted design. The restart policy is
+    // untouched: such a run is marked interrupted and never replayed on its own at startup.
+    //
     // The two ORDER-SENSITIVE choices, stated because they are the ones a reader will question:
     //   - a stamp on the reason outranks the record's status. A host that stops a thread AND a
     //     wall clock that expires in the same tick cannot both be right, and the reason that actually
@@ -12632,6 +12945,31 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
 
             return 'caller-released';
+        }
+
+        // NETWORK-CLASS FAILURE (Contract D, see the block above). Read from the machine
+        // code FIRST, because a custom transport may name `provider-timeout` without
+        // carrying the transport's `details` block at all.
+        const code = runFailureCodeOf(error);
+
+        if (code === PROVIDER_TIMEOUT_CODE || code === PROVIDER_CONNECTION_CODE) return 'provider-network';
+
+        // The codeless half of the same class: the transport diagnosed the bytes as dying
+        // in transit (`details.errorClass === PROVIDER_TRANSIT_CLASS`). `providerDiagnosticsOf`
+        // is the SAME shape-checking reader the `retry` frame uses
+        // (transport/provider-timeouts.ts), so a field a UI may render and a field this
+        // classifier trusts cannot disagree.
+        //
+        // NO `run.sawRetryFrame` GATE (2026-11-17, accepted): the diagnosis IS the evidence, so
+        // a transit failure that killed the first attempt with zero retries spent counts as a
+        // network death, raises the store's consecutive-failure streak and auto-resumes. A
+        // codeless failure WITHOUT the transit class (an HTTP 5xx body, a malformed frame) still
+        // falls through to `retries-exhausted` / `api-error` below, unchanged.
+        if (
+            code === undefined &&
+            providerDiagnosticsOf(error)?.errorClass === PROVIDER_TRANSIT_CLASS
+        ) {
+            return 'provider-network';
         }
 
         return run.sawRetryFrame ? 'retries-exhausted' : 'api-error';
@@ -13081,7 +13419,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             notifyRunStateChange(run, 'agent_message', { agent: brain.name });
 
             const info = toErrorInfo(error);
-            await emitError(run, info);
+
+            // (2026-11-17, the unrecoverable-timeout report) The transport's diagnosis
+            // rides onto the TERMINAL record, not only onto `retry` frames. Until now a
+            // failure that was terminal BY DESIGN — a `provider-timeout` whose bounded
+            // ladder ended, or a refusal that never retried at all — reached a UI, a
+            // journal row and the session layer as a sentence, which is why
+            // frontend/provider-diagnostics.ts had to regex the class, the endpoint and
+            // the bound back out of it. Same reader, same shape as `retry.provider`, so a
+            // consumer has ONE field to read on both frames; an unclassified failure still
+            // carries no `provider` key at all and every historical payload is unchanged.
+            const provider = providerDiagnosticsOf(error);
+
+            await emitError(run, provider === undefined ? info : { ...info, provider });
 
             // Safe classification: a hostile Proxy thrown through a tool path may
             // make `instanceof` itself throw. The total formatter produced `info`
@@ -13239,7 +13589,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // envelope still reads it as the fallback for a ledger entry a `purgeThread` has removed.
         try {
             identity.status =
-                invocationRecords.get(invocationIdOf(run))?.status ??
+                invocationRecords.get(invocationRunKeyOfRun(run))?.status ??
                 (outcome.message !== undefined
                     ? 'completed'
                     : run.aborted || run.signal?.aborted === true
@@ -13643,19 +13993,32 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // N6 BRANCH THREADS: id is the branch id, so `branch_start`,
             // `harness.branch(id)`, and EVERY frame of the branch share one naming
             // scheme; kind/branchId ride along on every event (threadIdentity).
+            //
+            // T-W8 — EVERY mint below stamps `epoch: HARNESS_PROCESS_EPOCH`, the id of THIS
+            // process. `id` is `runSequence` from a counter that restarts with the process,
+            // and a lane worker mints from its OWN counter (see `reserveIdentity`, which only
+            // ever RAISES a leased mark), so an invocation id is unique only inside one
+            // process — and a lane's ids collide with the parent process's ids by design.
+            // The epoch is what makes those two id spaces separable in the RECORD: it cannot
+            // be restored or forged, because it is not persisted anywhere (`snapshot()` /
+            // `restore()` carry the counters, never the epoch), so a post-restart frame names
+            // the NEW process and can never be bound to a row a pre-restart run owns. Root
+            // runs are untouched: they still emit no `thread` at all, and a reader must treat
+            // an absent epoch as "this producer said nothing" (../types/index.ts).
             if (branchRun !== undefined) {
                 const metadata = branchRun.metadata;
                 const thread: HarnessThread = {
                     id: metadata.branchId,
                     input,
                     kind: branchRun.autoAnswer ? 'autoanswer' : 'fork',
-                    branchId: metadata.branchId
+                    branchId: metadata.branchId,
+                    epoch: HARNESS_PROCESS_EPOCH
                 };
                 if (parent?.thread !== undefined) thread.parentId = parent.thread.id;
                 if (callId !== undefined) thread.callId = callId;
                 run.thread = thread;
             } else if (parent !== undefined) {
-                const thread: HarnessThread = { id: String(id), input };
+                const thread: HarnessThread = { id: String(id), input, epoch: HARNESS_PROCESS_EPOCH };
                 if (parent.thread !== undefined) thread.parentId = parent.thread.id;
                 if (callId !== undefined) thread.callId = callId;
                 run.thread = thread;
@@ -13664,7 +14027,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // is still a separate conversation that a client must be able to
                 // group, so it carries the ordinary invocation identity (no parent
                 // and no spawning call). Root events keep their historical shape.
-                run.thread = { id: String(id), input };
+                //
+                // T-W8: the epoch rides this mint too, and it is the load-bearing one for
+                // the F5 residual. A host conversation's own run is ROOT-SHAPED (no parent /
+                // call / kind / branch), so the shape test cannot separate the run a turn
+                // started with from the run a restarted process continues it with — and the
+                // two can carry the SAME recycled invocation id (the live artifact recorded
+                // the resumed conversation under a dead child's id). The epoch is the only
+                // fact on the frame that says which process wrote it.
+                run.thread = { id: String(id), input, epoch: HARNESS_PROCESS_EPOCH };
             }
 
             // R2: publish the run on its thread AFTER the invocation id exists, so
@@ -13681,6 +14052,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // dormant-stopped and RESUMED (a resumable cause) or idle.
                 delete resolvedThread.record.stopReason;
                 resolvedThread.record.invocationId = String(id);
+                // W19 (2026-11-17): the epoch travels with the id it just minted, so the record always
+                // says WHICH PROCESS that id names (`../shared/run-identity.ts`,
+                // `../types/index.ts` `HarnessThreadRecord.epoch`). Without the pair, the store's only
+                // witness for a conversation — this record — cannot tell a run it started itself from a
+                // restored row of a dead process that last wore the same recycled id, and
+                // `../server/sessions.ts noteInvocationThread` binds the new run's join to the dead
+                // conversation. Stamped from the same `HARNESS_PROCESS_EPOCH` the run's frames carry
+                // (the three `run.thread` mints above), so record and frames can never disagree.
+                resolvedThread.record.epoch = HARNESS_PROCESS_EPOCH;
                 resolvedThread.controller = threadController;
                 resolvedThread.run = run;
 
@@ -14050,7 +14430,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // src/harness.ts:12277 — a branch whose parent had none, or a brain outside the
                 // registry): a default-thread root run DOES own one, `agent:<name>`, so the row
                 // says so and the cascade matches it after the reload like every other one.
-                ...(record.threadId === undefined ? {} : { threadId: record.threadId })
+                ...(record.threadId === undefined ? {} : { threadId: record.threadId }),
+                // W19 (2026-11-17): the LEDGER GENERATION, written exactly when the live record knows
+                // it. Two rows of one document can carry the SAME `invocationId` — a run of a recycled
+                // id from before the restart and the run that re-minted it afterwards — and without this
+                // key the reader has nothing to tell them apart: `restore()` would key them by the bare
+                // id, the later row would overwrite the earlier one, and the older archive would be gone
+                // for good on the next save. `core/snapshot.ts` accepts the key as optional (and moved
+                // its duplicate check onto the RUN), so a pre-feature row still loads and still restores
+                // under its bare id.
+                ...(record.epoch === undefined ? {} : { epoch: record.epoch })
             }));
 
         // R2: persist HOST threads only. An agent's default conversation is its
@@ -14076,6 +14465,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(state.record.invocationId === undefined || state.record.status === 'running'
                     ? {}
                     : { invocationId: state.record.invocationId }),
+                // W19 (2026-11-17): the epoch that minted the id above, under the SAME condition — an
+                // epoch with no id would describe no run, and a dropped id must not leave an epoch
+                // behind it (`restore -> snapshot` stays idempotent). It is what lets
+                // `../server/sessions.ts noteInvocationThread` refuse a stale restored slot after the
+                // next restart instead of binding a fresh run to a dead conversation; a document written
+                // before the field carries neither key and restores exactly as it does today.
+                ...(state.record.invocationId === undefined ||
+                state.record.status === 'running' ||
+                state.record.epoch === undefined
+                    ? {}
+                    : { epoch: state.record.epoch }),
                 // DISPLAY LANE (C1). Written ONLY when it is non-zero: absence already
                 // means lane 0, so a session that never compacted (and every snapshot
                 // written before lanes existed) keeps its exact document shape.
@@ -14420,8 +14820,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // (`agentResult`), which is the guarantee issue 0019 AC5 accepts for this window.
         owedDeliveries.clear();
         for (const result of restoredResults) {
-            invocationRecords.set(result.invocationId, {
+            // W19 (2026-11-17): the row is re-seated under its RUN, not its bare id. A row that names a
+            // generation keys `id\0epoch`; a row that predates the field keys the BARE id exactly as this
+            // loop always keyed it, which is the whole legacy guarantee — no re-keying on load, no
+            // migration, and an epoch-less document rebuilds the identical ledger (the duplicate rule
+            // `core/snapshot.ts` enforces on the run is what stops two rows claiming one address).
+            //
+            // WHY THIS MATTERS HERE: the projection sorts newest-last, so a bare-key collision used to
+            // resolve as "the newest row wins" — i.e. the archive of a run from a dead process was
+            // dropped IN SILENCE on every reload once that process re-minted the id.
+            invocationRecords.set(invocationRunKeyOf(result.invocationId, result.epoch), {
                 invocationId: result.invocationId,
+                // Rebuilt with the row, only when the document carries it: the restored record then has
+                // exactly the shape a live one has, and the ledger address it lives under is derivable
+                // from its own fields (`agentRecordRunKey`).
+                ...(result.epoch === undefined ? {} : { epoch: result.epoch }),
                 sequence: result.sequence,
                 completedOrder: result.completedOrder,
                 agent: result.agent,
@@ -14534,6 +14947,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     ...(entry.invocationId === undefined
                         ? {}
                         : { invocationId: entry.invocationId }),
+                    // W19 (2026-11-17): the minting epoch comes back with the id it describes, so a
+                    // conversation restored from a dead process still SAYS it is dead — and the store's
+                    // join recorder (`../server/sessions.ts noteInvocationThread`) can refuse its stale
+                    // slot when a run of a RECYCLED id arrives naming a different process. A row without
+                    // the key restores with no epoch, which every reader treats as "the producer said
+                    // nothing" — the legacy form, unchanged.
+                    ...(entry.epoch === undefined ? {} : { epoch: entry.epoch }),
                     // DISPLAY LANE (C1): the persisted lane comes back exactly as written,
                     // so a conversation that compacted twice still paints two rows after a
                     // restart, and its NEXT compaction bumps 2 -> 3 rather than restarting
@@ -15918,6 +16338,15 @@ export {
     PROVIDER_CONNECTION_CODE,
     PROVIDER_REJECTED_CODE,
     PROVIDER_TIMEOUT_CODE,
+    // (2026-11-17) `provider-aborted` — the gateway's own in-stream cancel answer, the
+    // fourth member of the "re-sending cannot help" family — and `provider-transit`, the
+    // DIAGNOSTICS-only class of a codeless network failure (it is a `details.errorClass`
+    // value and a `run.stopReason` discriminator, never an `error.code`). A host on a
+    // custom transport reads the same vocabulary the built-in one writes, and the session
+    // layer branches on the transit class instead of matching English.
+    PROVIDER_ABORTED_CODE,
+    PROVIDER_TRANSIT_CLASS,
+    providerWireFailureOf,
     DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
     DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
     DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS,

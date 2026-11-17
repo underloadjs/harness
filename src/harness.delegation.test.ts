@@ -42,6 +42,11 @@ import type {
     HarnessStreamEvent,
     HarnessStreamRequest
 } from '@underload/harness';
+// T-W8: the one WHOLE-event assertion below (the child's `wakeup`) names the process epoch that
+// every run-identity mint now stamps (./core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped in
+// ./harness.ts). Asserted against the constant, not a literal — it is random by design — and it
+// is exact because vitest gives one module registry per test file.
+import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
 // src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
@@ -2982,7 +2987,13 @@ describe('liveness wake covers a delegated child (policy 2026-11-09 T8)', () => 
                 // Attributed to the CHILD's run, not the parent's: thread '2' is the
                 // researcher's conversation and `callId: 'c1'` records that the
                 // delegation call is what started it.
-                thread: { id: '2', callId: 'c1' }
+                // T-W8: and `epoch` names the process that minted that id
+                // (./core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity
+                // mints in ./harness.ts) — the SAME epoch as the parent's frames, because one
+                // process ran the whole tree. Asserted against the constant, never a literal:
+                // the value is random by design, and exact within one test file (one module
+                // registry per file).
+                thread: { id: '2', callId: 'c1', epoch: HARNESS_PROCESS_EPOCH }
             }
         ]);
 

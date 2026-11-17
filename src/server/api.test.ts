@@ -53,6 +53,12 @@ import {
 } from './harnesses';
 import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
 import { agent, harness } from '../harness';
+// T-W8: every recorded `thread` payload now carries the minting process's epoch
+// (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
+// ../harness.ts). These assertions are WHOLE payloads, so the key has to be named; the
+// value is exact because every frame here is recorded IN THIS PROCESS (no lane worker),
+// and vitest gives one module registry per test file — one epoch for the whole file.
+import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 // The shared policy lines of the trusted catalogue (src/agents/guidelines.ts). Profile-specific
 // sentences are hardcoded below; these are IMPORTED so the arrays asserted here can never
@@ -2721,9 +2727,24 @@ describe('task submit and recorded history', () => {
         // Each `usage` EVENT is one request's own figures (the scripted numbers the old file
         // asserted off the SSE frames): 48/18/66, then 96/22/118, then 148/64/212.
         expect(state.events.filter((row) => row.event.type === 'usage').map((row) => row.event)).toEqual([
-            { type: 'usage', agent: 'general', usage: { input: 48, output: 18, total: 66, cached: 0 }, thread: { id: '1' } },
-            { type: 'usage', agent: 'general', usage: { input: 96, output: 22, total: 118, cached: 48 }, thread: { id: '1' } },
-            { type: 'usage', agent: 'general', usage: { input: 148, output: 64, total: 212, cached: 120 }, thread: { id: '1' } }
+            {
+                type: 'usage',
+                agent: 'general',
+                usage: { input: 48, output: 18, total: 66, cached: 0 },
+                thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
+            },
+            {
+                type: 'usage',
+                agent: 'general',
+                usage: { input: 96, output: 22, total: 118, cached: 48 },
+                thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
+            },
+            {
+                type: 'usage',
+                agent: 'general',
+                usage: { input: 148, output: 64, total: 212, cached: 120 },
+                thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
+            }
         ]);
 
         // The scripted loop's discovery call, verbatim: the dispatcher must not reshape content.
@@ -2954,7 +2975,9 @@ describe('task submit and recorded history', () => {
                 type: 'tool_call',
                 agent: 'general',
                 call: { id: 'call_tool_request_1', name: 'toolRequest', arguments: '{"tags":["time"]}' },
-                thread: { id: '1' }
+                // T-W8: the recorded thread payload names the process that minted the id (see
+                // the import above); the REST read serves the journal line verbatim.
+                thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
             }
         });
         expect(step.result.index).toBe(toolResultIndex);

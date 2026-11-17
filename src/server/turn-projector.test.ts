@@ -16,6 +16,7 @@
 //   - ./api-views.test.ts         — the wire privacy rules on top of it
 
 import { describe, expect, it } from 'vitest';
+import { elapsedBetween } from '../frontend/ui/time';
 import type { HarnessEvent } from '../harness';
 import { DISPLAY_ARGS_PREVIEW_CHARS, DISPLAY_PANELS_PER_STEP, DISPLAY_PREVIEW_CHARS } from '../shared/turn-display';
 import type {
@@ -371,28 +372,45 @@ describe('section timing (R9)', () => {
         expect(patches.filter((patch) => patch.startedAt !== undefined)).toHaveLength(1);
     });
 
-    it('ends an unfinished section at the settle stamp while keeping its recorded start', () => {
+    it('ends a force-closed section at its OWN last stamp, keeps its recorded start, and stops claiming success', () => {
         const result = fold(DELEGATION.slice(0, 4));
         const settled = result.settle('done');
 
-        // `fold`'s settle is stamped 5_000. The settle frame closes the span and touches
-        // NOTHING else: the start stays the RECORDED one, so a settle can never
-        // re-baseline a run it can only bring to an end.
+        // T-W23. `fold`'s settle is stamped 5_000, but this child was cut off at index 3
+        // (1_030) — the turn's end stamp is NOT its end. The settle frame closes the span at the
+        // row's LAST RECORDED FRAME and marks it `cancelled`, the value this codebase already uses
+        // for a run ended before completing by a control event rather than by its own failure; and
+        // it touches NOTHING else: the start stays the RECORDED one, so a settle can never
+        // re-baseline a run it can only bring to an end. See ./turn-projector.ts
+        // `interruptedStateOf` / `interruptedEndedAtOf`.
         expect(
             settled.filter(
-                (op) =>
+                (op): op is Extract<TurnDisplayOp, { op: 'section:set' }> =>
                     op.op === 'section:set' &&
                     op.sectionId === 'turn-1:1' &&
-                    op.patch.endedAt === 5_000 &&
+                    op.patch.endedAt === 1_030 &&
                     op.patch.startedAt === undefined
             )
-        ).toHaveLength(1);
+        ).toEqual([{ op: 'section:set', turnId: 'turn-1', sectionId: 'turn-1:1', patch: { state: 'cancelled', endedAt: 1_030 } }]);
 
         const sections = result.display().sections;
 
         expect([sections[0].startedAt, sections[0].endedAt]).toEqual([1_000, 5_000]);
-        expect([sections[1].startedAt, sections[1].endedAt]).toEqual([1_020, 5_000]);
+        expect([sections[1].startedAt, sections[1].endedAt]).toEqual([1_020, 1_030]);
+        expect(sections[1].state).toBe('cancelled');
+        // The label the reader now gets: 10 ms of real run, not the 4.0s the pre-fix span printed.
+        expect(elapsedBetween(sections[1].startedAt, sections[1].endedAt)).toBe(10);
+        expect(formatDuration(1_030 - 1_020)).toBe('10ms');
         expect(formatDuration(5_000 - 1_020)).toBe('4.0s');
+
+        // The row's whole span lifecycle on the wire — apply batches plus the terminal settle batch:
+        // open with no end, streamed with no end, closed ONCE with its OWN end. The pre-fix stream
+        // emitted a fourth value here, 5_000 — a span the killed run never lived (64m04s on the
+        // user's recorded run, where the real one was 3m05s).
+        const spanLifecycle = patchesFor([...result.ops, settled], 'turn-1:1').map((patch) => patch.endedAt);
+
+        expect(spanLifecycle).toEqual([undefined, undefined, 1_030]);
+        expect(spanLifecycle.includes(5_000)).toBe(false);
     });
 
     it('writes no timing at all for a record with no event times', () => {
@@ -1153,7 +1171,13 @@ describe('labels, blocks and turn closure', () => {
         expect(abandoned).toMatchObject({
             state: 'cancelled',
             preview: 'the turn was cancelled before this call returned',
-            endedAt: 5_000
+            // T-W24 — THIS PIN MOVED, deliberately (it was `endedAt: 5_000`, the settle stamp). That
+            // pre-fix value is the defect this change removes: a call whose own recorded activity
+            // stopped at 1_020 (event 2 of `timeOf`, the `tool_call` frame that minted it) must not
+            // print a span to the turn's end. The state and the preview above are untouched; only the
+            // clock moved, to the card's own last stamp (./turn-projector.ts `abandonedEndedAtOf`,
+            // measured on the user's run in Temp/orch-plan/w24/before.txt vs after.txt).
+            endedAt: 1_020
         });
 
         // `settle` is idempotent: a repeat emits only the row itself.
@@ -1686,6 +1710,16 @@ describe('context bar (R6/R8)', () => {
 
         // Default CONTEXT: no instruction evidence, so the bar is the prompt segment
         // and this call — index 1 is the segment under test.
+        //
+        // T-W25 — THIS PIN MOVED, deliberately (it was `endedAt: 5_000`, the SETTLE stamp). The
+        // segment of a call that never returned now ends at the call's OWN last recorded frame, the
+        // same figure the card above it and the accepted card rule use (`abandonedEndedAtOf`,
+        // ./turn-projector.ts): 1_010, i.e. its own `at`, i.e. a 0 ms span. Pre-fix this field made
+        // the context bar print a 3,990 ms span (`4.0s`, and `64m04s` on the recorded run) for a call
+        // whose row said `3m05s` and whose card said `0ms`. Everything else in this object is the
+        // pre-fix value, which is the point: only the END moved — `chars`/`argsChars`/`inPrompt`/
+        // `eventTo` (content and redaction) are untouched. The full rule, its fallbacks and the
+        // live ≡ replay parity are pinned in ./turn-projector-abandoned-segment.test.ts.
         expect(result.display().sections[0].context?.[1]).toEqual({
             kind: 'tool',
             id: '0-tool-1',
@@ -1693,7 +1727,7 @@ describe('context bar (R6/R8)', () => {
             sectionId: 'turn-1:0',
             name: 'read',
             at: 1_010,
-            endedAt: 5_000,
+            endedAt: 1_010,
             chars: 7,
             argsChars: 7,
             inPrompt: true,

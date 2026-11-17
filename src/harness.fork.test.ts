@@ -28,6 +28,11 @@ import { agent, harness, tool } from '@underload/harness';
 // its own module (the same internal-import convention src/harness.snapshot.test.ts
 // uses for `./core/task`), never retyped.
 import { BRANCH_PENDING_PLACEHOLDER } from './core/branch';
+// T-W8: the branch thread payload is asserted WHOLE above, so it names the minting process too
+// (./core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the branch mint in ./harness.ts
+// `branchThreadOf`). The constant, never a literal — the value is random by design — and exact
+// within one file, because vitest gives one module registry per test file.
+import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
 import type {
     Agent,
     Harness,
@@ -367,7 +372,12 @@ describe('threadFork runtime', () => {
             parentId: records[0].branchId,
             callId: 'inner',
             kind: 'fork',
-            branchId: records[1].branchId
+            branchId: records[1].branchId,
+            // T-W8: a branch is a RUN, and its id comes from the same per-process counters as an
+            // invocation id, so the branch mint is stamped too (../harness.ts `branchThreadOf`).
+            // The epoch is this process's because the fork executed here; a lane worker's branch
+            // frames carry the LANE's own epoch (./workers/lane-worker-correctness.test.ts).
+            epoch: HARNESS_PROCESS_EPOCH
         });
     });
 

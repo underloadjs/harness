@@ -108,7 +108,7 @@ const call = (
         pathname,
         mount: MOUNT,
         searchParams,
-        readBody: async <T,>() => body as T
+        readBody: async <T>() => body as T
     } as HarnessApiRequest);
 
 /** The JSON arm of a result, asserted as such (a stream arm is a contract violation here). */
@@ -227,18 +227,20 @@ describe('canonical REST contract', () => {
         // A row is identity + counters. THE point of the route: no turn, thread, transcript,
         // definition, or event data appears in it.
         for (const row of page.body.items) {
-            expect(Object.keys(row).sort()).toEqual([
-                'created_at',
-                'harness',
-                'id',
-                'model',
-                'queue_depth?',
-                'revision',
-                'status',
-                'thread_count',
-                'turn_count',
-                'updated_at'
-            ].filter((key) => key !== 'queue_depth?'));
+            expect(Object.keys(row).sort()).toEqual(
+                [
+                    'created_at',
+                    'harness',
+                    'id',
+                    'model',
+                    'queue_depth?',
+                    'revision',
+                    'status',
+                    'thread_count',
+                    'turn_count',
+                    'updated_at'
+                ].filter((key) => key !== 'queue_depth?')
+            );
             expect(row.status).toBe('idle');
             expect(row.turn_count).toBe(1);
             // A threaded submit opens its own conversation, so a session that ran one task
@@ -324,11 +326,15 @@ describe('canonical REST contract', () => {
         expect(badLimit.status).toBe(400);
         expect(badLimit.body.error.message).toContain('"limit"');
 
-        const bigLimit = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${ids[0]}/turns`, {}, `?limit=${HARNESS_PAGE_LIMIT.max + 1}`));
+        const bigLimit = jsonOf(
+            await call(api, 'GET', `${MOUNT}/sessions/${ids[0]}/turns`, {}, `?limit=${HARNESS_PAGE_LIMIT.max + 1}`)
+        );
 
         expect(bigLimit.status).toBe(400);
 
-        const badCursor = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${ids[0]}/turns`, {}, '?cursor=not-a-cursor'));
+        const badCursor = jsonOf(
+            await call(api, 'GET', `${MOUNT}/sessions/${ids[0]}/turns`, {}, '?cursor=not-a-cursor')
+        );
 
         expect(badCursor.status).toBe(400);
         expect(badCursor.body.error.message).toContain('"cursor"');
@@ -341,13 +347,17 @@ describe('canonical REST contract', () => {
 
         expect(created.body.session.title).toBe('Rail row');
 
-        const receipt = jsonOf(await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/tasks`, { input: '  plan the thing  ' }));
+        const receipt = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/tasks`, { input: '  plan the thing  ' })
+        );
 
         expect(receipt.status).toBe(202);
         // The required figure set, exactly. `queue_position` is optional and present only
         // while the submit still sits behind other work (this scripted pump starts at once),
         // so it is asserted by type when present rather than pinned to a race.
-        const receiptKeys = Object.keys(receipt.body).filter((key) => key !== 'queue_position').sort();
+        const receiptKeys = Object.keys(receipt.body)
+            .filter((key) => key !== 'queue_position')
+            .sort();
 
         expect(receiptKeys).toEqual([
             'accepted_at',
@@ -396,7 +406,7 @@ describe('canonical REST contract', () => {
                 method: 'GET',
                 pathname: '/api/sessions',
                 mount: '/api',
-                readBody: async <T,>() => ({}) as T
+                readBody: async <T>() => ({}) as T
             } as HarnessApiRequest)
         );
 
@@ -405,7 +415,9 @@ describe('canonical REST contract', () => {
 
         expect(jsonOf(await call(api, 'GET', `${MOUNT}/presets`)).status).toBe(404);
         expect(jsonOf(await call(api, 'GET', `${MOUNT}/tools/bootstrap`)).status).toBe(404);
-        expect(jsonOf(await call(api, 'POST', `${MOUNT}/sessions/${ids[0]}/messages`, { input: 'hi' })).status).toBe(404);
+        expect(jsonOf(await call(api, 'POST', `${MOUNT}/sessions/${ids[0]}/messages`, { input: 'hi' })).status).toBe(
+            404
+        );
 
         // A known path with an undeclared method is 405, not 404.
         const wrongMethod = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions`));
@@ -466,14 +478,18 @@ describe('canonical REST contract', () => {
         expect(roster.body.total).toBe(1);
         expect(roster.body.agents[0]).toMatchObject({ agent_id: 'worker', role: 'primary', origin: 'definition' });
 
-        const patched = jsonOf(await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/worker`, { model: 'scripted/next' }));
+        const patched = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/worker`, { model: 'scripted/next' })
+        );
 
         expect(patched.status).toBe(200);
         expect(patched.body.agent.model).toBe('scripted/next');
 
         // A tool that executed and FAILED is 200 `ok:false`; a call the server cannot make is
         // an HTTP status. `shell` is catalogue-searchable and unconfigured here by name.
-        const unknownTool = jsonOf(await call(api, 'POST', `${MOUNT}/tools/no-such-tool/executions`, { parameters: {} }));
+        const unknownTool = jsonOf(
+            await call(api, 'POST', `${MOUNT}/tools/no-such-tool/executions`, { parameters: {} })
+        );
 
         expect(unknownTool.status).toBe(404);
 
@@ -532,7 +548,9 @@ describe('canonical REST contract', () => {
     it('pages harnesses, agents, and tools as summaries with the identified reads one hop away', async () => {
         const { api, registry } = createContext();
 
-        const harnesses = jsonOf(await call(api, 'GET', `${MOUNT}/harnesses`, {}, `?limit=${HARNESS_PAGE_LIMIT.default}`));
+        const harnesses = jsonOf(
+            await call(api, 'GET', `${MOUNT}/harnesses`, {}, `?limit=${HARNESS_PAGE_LIMIT.default}`)
+        );
 
         expect(harnesses.status).toBe(200);
         expect(harnesses.body.items).toHaveLength(1);
@@ -695,8 +713,20 @@ describe('canonical REST contract', () => {
             // after one run: it is the size signal that tells a client whether the lazy
             // transcript read is worth asking for.
             'chars',
+            // W22 (2026-11-17): the run discriminator, emitted exactly when the conversation's record
+            // pairs an invocation id with the process that minted it (`./api-reads.ts` `threadRowOf`).
+            // This fixture has run, so the key is here; a conversation that never ran, and every row
+            // restored from a pre-epoch document, emits NO `epoch` key at all.
+            'epoch',
             'has_transcript',
             'id',
+            // W26 (2026-11-17): the ID half of that pair. W22 put the process on this row while the row
+            // still named no invocation id, which left the token unpairable for the client that builds its
+            // transcript roster out of THIS page (`../frontend/view-shell.ts` `getRawSession`); the row now
+            // names the run the process minted. Both keys are omitted for a conversation that never ran —
+            // the exact pins, with key ORDER, are in ./api-thread-roster-invocation-ids.test.ts.
+            'invocation_id',
+            'invocation_ids',
             'label',
             'message_count',
             'origin',
@@ -723,7 +753,13 @@ describe('canonical REST contract', () => {
         expect(meta.body.transcript.message_count).toBe(3);
 
         const messages = jsonOf(
-            await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/threads/${threadId}/transcript/messages`, {}, '?limit=2')
+            await call(
+                api,
+                'GET',
+                `${MOUNT}/sessions/${sessionId}/threads/${threadId}/transcript/messages`,
+                {},
+                '?limit=2'
+            )
         );
 
         expect(messages.status).toBe(200);
@@ -769,10 +805,18 @@ describe('canonical REST contract', () => {
 
         // The identified sub-reads a click needs: a step that does not exist is a 400 (a step
         // id is a recorded ordinal), and an unknown attachment/step/block are honest 404s.
-        expect(jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/turns/${turnId}/steps/999`)).status).toBe(404);
-        expect(jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/turns/${turnId}/steps/not-a-number`)).status).toBe(400);
-        expect(jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/turns/${turnId}/blocks/nope`)).status).toBe(404);
-        expect(jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/turns/${turnId}/attachments/nope`)).status).toBe(404);
+        expect(jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/turns/${turnId}/steps/999`)).status).toBe(
+            404
+        );
+        expect(
+            jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/turns/${turnId}/steps/not-a-number`)).status
+        ).toBe(400);
+        expect(
+            jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/turns/${turnId}/blocks/nope`)).status
+        ).toBe(404);
+        expect(
+            jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/turns/${turnId}/attachments/nope`)).status
+        ).toBe(404);
 
         // The actions list is live-only and bounded by the pending-action budget.
         const actions = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/actions`));
@@ -785,7 +829,14 @@ describe('canonical REST contract', () => {
         const tools = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/tools`, {}, '?limit=3'));
 
         expect(tools.status).toBe(200);
-        expect(Object.keys(tools.body).sort()).toEqual(['budget', 'items', 'limit', 'next_cursor', 'observed_at', 'revision']);
+        expect(Object.keys(tools.body).sort()).toEqual([
+            'budget',
+            'items',
+            'limit',
+            'next_cursor',
+            'observed_at',
+            'revision'
+        ]);
         expect(tools.body.budget).toEqual({ used: 0, limit: HARNESS_SERVICE_LIMITS.created_tools });
         // A row states the live session facts; the argument schema, the source TEXT, and any
         // tool result never ride it. `source_revision` rides only for a row with an installed
@@ -853,7 +904,9 @@ describe('canonical REST contract', () => {
         // Execution inside the session: a call that fails is 200 `ok:false`, and a name the
         // session does not register is a 404.
         const executed = jsonOf(
-            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/tools/canonEcho/executions`, { parameters: { text: 'hi' } })
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/tools/canonEcho/executions`, {
+                parameters: { text: 'hi' }
+            })
         );
 
         expect(executed.status).toBe(200);
@@ -863,7 +916,10 @@ describe('canonical REST contract', () => {
         expect(typeof executed.body.duration_ms).toBe('number');
         expect(typeof executed.body.duration_ms).toBe('number');
 
-        expect(jsonOf(await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/tools/nope/executions`, { parameters: {} })).status).toBe(404);
+        expect(
+            jsonOf(await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/tools/nope/executions`, { parameters: {} }))
+                .status
+        ).toBe(404);
 
         // A lifecycle guard is a refusal, never a silent success: deleting the conversation
         // that OWNS the only turn is allowed, and deleting the default lane is a 400.
@@ -886,7 +942,9 @@ describe('canonical REST contract', () => {
         expect(api.events.baseline('session', 'abc').link).toBe(`${MOUNT}/sessions/abc`);
         expect(api.events.baseline('turns', 'abc').link).toBe(`${MOUNT}/sessions/abc/turns?limit=25`);
         expect(api.events.baseline('turn', 'abc:turn-1').link).toBe(`${MOUNT}/sessions/abc/turns/turn-1`);
-        expect(api.events.baseline('transcript', 'abc:thr-1').link).toBe(`${MOUNT}/sessions/abc/threads/thr-1/transcript`);
+        expect(api.events.baseline('transcript', 'abc:thr-1').link).toBe(
+            `${MOUNT}/sessions/abc/threads/thr-1/transcript`
+        );
         expect(api.events.baseline('harnesses').id).toBeNull();
         expect(api.events.revisions([{ resource: 'config', id: null }])).toEqual([
             { resource: 'config', id: null, revision: 0, epoch: api.events.epoch }

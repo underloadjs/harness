@@ -9,12 +9,18 @@
 //   - ./config.ts     — implementation
 //   - ./api.ts        — maps SettingsError to 400
 //   - ./credentials.test.ts — server-key containment over real HTTP
+//   - ./sessions.ts   — consumes the merged `networkResumeLimit` / the runtime ceiling for the
+//     auto-resume streak (the runtime consequence of the ceiling is pinned in
+//     ./network-resume.test.ts; this file pins the NUMBERS and the grammar)
 
 import { describe, expect, it } from 'vitest';
 import {
+    DEFAULT_NETWORK_RESUME_LIMIT,
     DEFAULT_RUNTIME_CONFIGURATION,
     DEFAULT_THREAD_EXECUTION,
     MAX_LANE_WORKERS_LIMIT,
+    NETWORK_RESUME_LIMIT_ENV,
+    NETWORK_RESUME_LIMIT_MAX,
     WORKER_HANDSHAKE_MS_MAX,
     WORKER_IDLE_MS_MAX,
     isSameProvider,
@@ -22,6 +28,7 @@ import {
     mergeSettings,
     normalizeProviderURL,
     parseThreadExecutionMode,
+    resolveNetworkResumeLimit,
     resolveRuntimeConfiguration,
     ServerRuntimeError,
     SettingsError
@@ -283,6 +290,106 @@ describe('server runtime configuration', () => {
         expect(() => resolveRuntimeConfiguration(loaded, { workerHandshakeMs: 999 })).toThrowError(
             new ServerRuntimeError('workerHandshakeMs must be an integer between 1000 and 600000.')
         );
+    });
+});
+
+describe('provider network-resume ceiling (F1 / T-W9)', () => {
+    // The ceiling on CONSECUTIVE network-class failures one conversation tolerates before the
+    // server stops auto-resuming it (./sessions.ts `autoResumeAfterNetworkFailure`). The
+    // shipped number is part of the accepted requirement — it mirrors the per-request retry
+    // ladder's default (../core/agent-limits.ts `DEFAULT_MAX_RETRIES`), because the operator who
+    // asked for this counted provider attempts, not thread resumes.
+    const RANGE = 'an integer between 0 and 1000 (0 turns auto-resume off)';
+    const VARIABLE = 'HARNESS_PROVIDER_NETWORK_RESUME_LIMIT';
+
+    it('ships 10 as the default, 1000 as the ceiling, and names the variable', () => {
+        expect(DEFAULT_NETWORK_RESUME_LIMIT).toBe(10);
+        expect(NETWORK_RESUME_LIMIT_MAX).toBe(1_000);
+        expect(NETWORK_RESUME_LIMIT_ENV).toBe(VARIABLE);
+        // Nothing else changes about the shipped runtime object when the variable is unset: the
+        // ceiling resolves at the point of use, so an existing deployment's reported runtime is
+        // byte-identical to what every consumer already reads.
+        expect(loadRuntimeConfiguration({})).not.toHaveProperty('networkResumeLimit');
+        expect(resolveRuntimeConfiguration({}, {})).not.toHaveProperty('networkResumeLimit');
+    });
+
+    it('resolves precedence explicit ⇒ environment ⇒ shipped default, with 0 as a real answer', () => {
+        // No layers at all ⇒ the literal 10.
+        expect(resolveNetworkResumeLimit({ env: {} })).toBe(10);
+        // The operator's variable outranks the shipped default.
+        expect(resolveNetworkResumeLimit({ env: { [VARIABLE]: '3' } })).toBe(3);
+        // Surrounding whitespace is tolerated, like every other variable here.
+        expect(resolveNetworkResumeLimit({ env: { [VARIABLE]: '  7  ' } })).toBe(7);
+        // An explicitly passed ceiling outranks the variable, and `0` is a real answer
+        // ("never auto-resume"), NOT "unset" — the same rule the provider time bounds use.
+        expect(resolveNetworkResumeLimit({ explicit: 0, env: { [VARIABLE]: '5' } })).toBe(0);
+        expect(resolveNetworkResumeLimit({ explicit: 12, env: { [VARIABLE]: '5' } })).toBe(12);
+        // A caller may supply its own floor (the harness's per-provider default), and the
+        // boundaries of the accepted range are accepted.
+        expect(resolveNetworkResumeLimit({ env: {}, fallback: 4 })).toBe(4);
+        expect(resolveNetworkResumeLimit({ env: { [VARIABLE]: '0' } })).toBe(0);
+        expect(resolveNetworkResumeLimit({ env: { [VARIABLE]: String(NETWORK_RESUME_LIMIT_MAX) } })).toBe(
+            1_000
+        );
+        // A blank variable means "not set", not 0 — the distinction that keeps an unset
+        // deployment on the shipped 10 rather than silently switching recovery off.
+        expect(resolveNetworkResumeLimit({ env: { [VARIABLE]: '   ' } })).toBe(10);
+    });
+
+    it('refuses an environment value that is not plain digits, naming the variable and the range', () => {
+        const cases: [string, string][] = [
+            ['10x', JSON.stringify('10x')],
+            ['-1', JSON.stringify('-1')],
+            ['1e3', JSON.stringify('1e3')],
+            ['10.5', JSON.stringify('10.5')],
+            // Over the ceiling is a mis-set variable, caught at startup rather than at the
+            // first incident, and a thread resume is a WHOLE run.
+            [String(NETWORK_RESUME_LIMIT_MAX + 1), JSON.stringify(String(NETWORK_RESUME_LIMIT_MAX + 1))]
+        ];
+
+        for (const [value, quoted] of cases) {
+            // The parser itself…
+            expect(() => resolveNetworkResumeLimit({ env: { [VARIABLE]: value } })).toThrowError(
+                new ServerRuntimeError(`${VARIABLE} must be ${RANGE}; received ${quoted}.`)
+            );
+            // …and the startup read, which must abort with the SAME sentence rather than
+            // coercing the typo to 0 (= auto-recovery off).
+            expect(() => loadRuntimeConfiguration({ [VARIABLE]: value })).toThrowError(
+                new ServerRuntimeError(`${VARIABLE} must be ${RANGE}; received ${quoted}.`)
+            );
+        }
+    });
+
+    it('refuses a per-provider ceiling outside the range with a field-naming 400', () => {
+        expect(() => resolveNetworkResumeLimit({ explicit: NETWORK_RESUME_LIMIT_MAX + 1, env: {} })).toThrowError(
+            new SettingsError(
+                '`networkResumeLimit` must be ' +
+                    `${RANGE}; received ${NETWORK_RESUME_LIMIT_MAX + 1}. ` +
+                    `It is the consecutive network failures one conversation tolerates before the server stops resuming it (the ${VARIABLE} default).`
+            )
+        );
+        expect(() => resolveNetworkResumeLimit({ explicit: 2.5, env: {} })).toThrowError(SettingsError);
+    });
+
+    it('carries the ceiling through the settings merge, additively', () => {
+        // Absent at BOTH layers ⇒ the key is absent entirely, so an untouched session still
+        // returns exactly `{ baseURL, model, apiKey }`.
+        expect(mergeSettings(DEFAULTS, {})).toEqual({
+            baseURL: 'http://provider.test/v1',
+            apiKey: 'server-key',
+            model: 'server-model'
+        });
+        // The server default comes through…
+        expect(mergeSettings({ ...DEFAULTS, networkResumeLimit: 3 }, {}).networkResumeLimit).toBe(3);
+        // …and this session's explicit field beats it, including `0` = off.
+        expect(
+            mergeSettings({ ...DEFAULTS, networkResumeLimit: 3 }, { networkResumeLimit: 1 }).networkResumeLimit
+        ).toBe(1);
+        expect(mergeSettings({ ...DEFAULTS, networkResumeLimit: 3 }, { networkResumeLimit: 0 }).networkResumeLimit).toBe(
+            0
+        );
+        // A bad client value is a 400 naming the field, like the length caps above.
+        expect(() => mergeSettings(DEFAULTS, { networkResumeLimit: -1 })).toThrowError(SettingsError);
     });
 });
 

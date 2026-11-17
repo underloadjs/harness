@@ -35,6 +35,13 @@
 //   SessionSnapshot.invalidThreads?: SessionInvalidThread[]   // C4/C5, additive
 //       = Array<{ id; label?; agent?; error: string; messages: unknown }>
 //       (src/server/protocol.ts; aliased below as `InvalidThreadRecord`)
+//   SessionSnapshot.inactiveThreads?: string[]               // F7/T-W6, additive
+//       = the ids of the SOFT-DELETED conversations the store RETAINS. Absent when the session never
+//       deleted one. It is a sibling of the roster, never a row inside it: `threadRoster`
+//       (src/server/sessions.ts:4893) hides those rows, so this list is the deletion's only trace for
+//       a client that did not watch it (src/server/protocol.ts:774; the display twin
+//       `SessionView.inactiveThreads` :964, the REST twin `SessionResource.inactive_thread_ids`
+//       ../shared/harness-api.ts:1460, forwarded by ./view-api.ts `sessionViewOf`).
 //   SessionTurn.threadId?: string          // the turn's persistent thread
 //   SubmitTaskRequest.threadId?: string    // absent = create a NEW thread
 //   POST   /sessions/:id/threads/:threadId/cancel -> { cancelled, thread_id, session_id, status, dropped_queued_tasks, revision }
@@ -104,6 +111,24 @@ export type SessionThreadEntry = {
     // Bounded last-message preview (`SessionThreadView.preview`), so a roster-only child shows
     // something before its transcript is read.
     preview?: string;
+    // T-W3/T-W6 F7: the server's SOFT-DELETE verdict for this conversation, in the ONE spelling the
+    // board consumes (`turns.ts` `deletedThreadIdsOf`/`isConversationDeleted`). Two sources set it, and
+    // they are deliberately different shapes because the two facts are different:
+    //   1. MEMBERSHIP in the session header's retired list (`SessionView.inactiveThreads`,
+    //      ../server/protocol.ts:964 / `SessionResource.inactive_thread_ids`,
+    //      ../shared/harness-api.ts:1460) — THE LIVE PATH. The store retires a conversation by marking
+    //      its row `inactive`/`inactiveAt` and RETAINING it (`SessionStore.deleteThread` →
+    //      `markDeletedThread`, src/server/sessions.ts), while every roster projection HIDES that row
+    //      (`threadRoster`, src/server/sessions.ts:4893, mirrored by ../server/api.ts `threadRecordsOf`
+    //      :4834). So on today's wire a retired id is NEVER a roster row: the deletion travels beside
+    //      the roster, and `sessionThreadsOf` below turns membership into one of these entries.
+    //   2. The `inactive` marker ON the row, read structurally below — the shape a roster that
+    //      FORWARDS the retired row ships (the raw/export document, a hand-built one, a server whose
+    //      roster projection does not filter). Kept because it is a real payload spelling and the
+    //      cheapest read of the store's own word when the roster does carry the row.
+    // Absent = the server said nothing about this conversation, which is NEVER a deletion signal on its
+    // own (see `rosterDeletionsOf` for what is).
+    deleted?: boolean;
     // C5: this thread's stored transcript value cannot be read as
     // `HarnessMessage[]`. The record is the raw `SessionSnapshot.invalidThreads`
     // entry (error + the unreadable value verbatim), joined onto the roster so the
@@ -163,6 +188,36 @@ export const invalidThreadsOf = (session: unknown): InvalidThreadRecord[] => {
     }
 
     return records;
+};
+
+// T-W6/F7 — the session header's RETIRED-CONVERSATION list, read structurally like every other
+// document field (the sibling of `invalidThreadsOf` above). Source of truth on the wire:
+// `SessionSnapshot.inactiveThreads` / `SessionView.inactiveThreads` (../server/protocol.ts:774/:964)
+// and the REST twin `SessionResource.inactive_thread_ids` (../shared/harness-api.ts:1460), which
+// ./view-api.ts `sessionViewOf` renames onto the render model.
+//
+// WHY THE HEADER CARRIES IT AT ALL. The store RETAINS a soft-deleted row (`SessionStore.deleteThread`
+// → `markDeletedThread`) and hides it from EVERY roster projection, so a roster that stopped naming an
+// id cannot be told apart from a conversation that never existed. This list is therefore the only
+// POSITIVE deletion evidence a RELOAD can get, and `sessionThreadsOf` turns membership into the marker
+// the board acts on.
+//
+// Absent (a payload that predates F7), not an array, or empty all answer `[]` — "the server named no
+// deletions" — which hides nothing. Only non-empty strings are kept, deduplicated in server order; the
+// server sorts by id (../server/sessions.ts `inactiveThreadIdsOf`) and the client never re-sorts.
+export const inactiveThreadIdsOf = (session: unknown): string[] => {
+    if (!isObjectLike(session)) return [];
+
+    const value = session.inactiveThreads;
+    if (!Array.isArray(value)) return [];
+
+    const ids: string[] = [];
+    for (const entry of value) {
+        const id = nonEmptyString(entry);
+        if (id !== undefined && !ids.includes(id)) ids.push(id);
+    }
+
+    return ids;
 };
 
 // The wire may carry extra fields (`origin`, `references`); the UI ignores them.
@@ -269,7 +324,21 @@ export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
                 ? { messageCount: entry.messageCount }
                 : {}),
             ...(typeof entry.hasTranscript === 'boolean' ? { hasTranscript: entry.hasTranscript } : {}),
-            ...(nonEmptyString(entry.preview) === undefined ? {} : { preview: nonEmptyString(entry.preview) as string })
+            ...(nonEmptyString(entry.preview) === undefined ? {} : { preview: nonEmptyString(entry.preview) as string }),
+            // F7 (T-W3, restated by T-W6): the ROW-level half of the soft-delete verdict. Read only
+            // when the wire SAYS it — an absent or malformed `inactive` is "the server did not report a
+            // deletion", which is not the same fact as `inactive: false` and must not hide a row.
+            //
+            // Kept deliberately, and NOT the live path: today every roster projection filters the marked
+            // row out (src/server/sessions.ts `threadRoster` :4893, ../server/api.ts `threadRecordsOf`
+            // :4834), so on a current server the deletion arrives as MEMBERSHIP in the header's retired
+            // list instead (joined below, and the reason the positive ledger path works on a reload).
+            // This read stays because `sessionThreadsOf` also serves documents that FORWARD the retired
+            // row — the raw roster of an export read, an embedder's or a test's hand-built snapshot, a
+            // server whose roster projection does not filter — and there the marker on the row is the
+            // store's own word with no header list beside it. Both spellings land in the ONE field the
+            // board consumes (`deleted`), so the ledger stays a single membership check.
+            ...(entry.inactive === true ? { deleted: true } : {})
         });
     }
 
@@ -303,6 +372,51 @@ export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
         });
     }
 
+    // T-W6/F7 — join the header's RETIRED-CONVERSATION list (see `inactiveThreadIdsOf` for the wire
+    // field and why the deletion cannot ride the roster). Membership is POSITIVE evidence of deletion:
+    // no baseline comparison, no previous roster, no ordering assumptions — which is exactly what a
+    // RELOAD needs, because that board never watched the delete happen.
+    //
+    // THE PRECEDENCE, stated once (and it is the revival rule):
+    //   1. A row the ROSTER NAMES keeps whatever verdict ITS OWN row carries. A resume clears the
+    //      store's ledger key AND the row marker in the same call (`reactivateThreadRow`,
+    //      src/server/sessions.ts:5140-5163), so a roster row is the server's NEWER word and the
+    //      retired list is only the retention ledger it has not caught up with yet. Marking such a row
+    //      deleted here would hide a resumed conversation forever: `revivedThreadIdsOf` retracts an id
+    //      the roster names WITHOUT the marker, and a stamp added here is indistinguishable from one
+    //      the row itself brought.
+    //   2. An id NOTHING on the roster names gets a synthesized entry (`seen` is the roster's own id
+    //      set from the loop above, so an entry built from the C5 invalid roster is not a roster row
+    //      and does get the stamp). It is a HONEST PARTIAL like the C5 entry: an agent, a status, a
+    //      label and invocation ids are not knowable from a bare id, and nothing needs them — the
+    //      entry exists only to carry the marker into `deletedThreadIdsOf`, while the row it hides
+    //      comes from the compiled display tree, which names the thread itself
+    //      (ui/turns.ts `paintCompiledSection` → `learnedThreads`). Its label is the explicit unknown
+    //      token, so a retired id consumes NO per-agent ordinal and cannot renumber a live
+    //      conversation's name.
+    const retiredIds = inactiveThreadIdsOf(session);
+    for (const id of retiredIds) {
+        const existing = threads.find((entry) => entry.id === id);
+
+        if (existing === undefined) {
+            threads.push({
+                id,
+                agent: '',
+                origin: 'host',
+                status: 'idle',
+                sequence: threads.length + 1,
+                // `UNKNOWN_THREAD_LABEL` is this module's declared token for "identity not known"
+                // (declared below; this runs after module init, so the const is already bound).
+                label: UNKNOWN_THREAD_LABEL,
+                deleted: true
+            });
+            continue;
+        }
+
+        if (seen.has(id) || existing.deleted === true) continue;
+        existing.deleted = true;
+    }
+
     // Creation order is the server's `sequence`, not the array order: a restored or
     // re-serialized roster must not reshuffle the strip. Ties keep input order.
     const ordered = threads.sort((left, right) => left.sequence - right.sequence);
@@ -320,6 +434,103 @@ export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
         return { ...entry, label: `${code}${ordinal}` };
     });
 };
+
+// T-W3 + T-W6/F7 — WHICH CONVERSATIONS THE ROSTER REPORTS AS GONE.
+//
+// WHY A PAIR OF ROSTERS, NOT ONE. A roster alone cannot answer "gone": it would read "never existed"
+// and "deleted" the same way. So the board compares the roster it is replacing with the one it is
+// installing, and the sync is PURE, so the board's DOM pass and a test ask the identical question.
+//
+// THE ROSTER THIS BUILD GETS ALREADY CARRIES THE ANSWER. `sessionThreadsOf` above joins the session
+// header's retired list onto the roster as `SessionThreadEntry.deleted`, so the evidence below is drawn
+// from ONE input the shell hands the board — and the ledger functions stay the single place the verdict
+// is computed.
+//
+// Evidence, in order:
+//   1. POSITIVE — membership in the session header's retired list
+//      (`SessionView.inactiveThreads`, ../server/protocol.ts:964, forwarded from
+//      `SessionResource.inactive_thread_ids` by ./view-api.ts `sessionViewOf`). THE LIVE PATH, and the
+//      one that works on a RELOAD: the store RETAINS a soft-deleted row and every roster projection
+//      hides it (`threadRoster`, src/server/sessions.ts:4893, ../server/api.ts:4834), so an id named
+//      there is deleted even on a FIRST roster — no baseline, no previous frame, no comparison.
+//   2. POSITIVE — a row the roster itself still ships and stamps `inactive`
+//      (`SessionStore.deleteThread` → `markDeletedThread` writes the marker; a roster that FORWARDS the
+//      retired row — the raw/export document, a hand-built one — states the same fact this way).
+//   3. REMOVAL — an id a NON-EMPTY roster named and the next one no longer names. A non-empty roster
+//      enumerates every live HOST conversation, so an id it drops was deleted — the same evidence the
+//      board already accepts for its invocation→thread join cache (ui/turns.ts `forgetRemovedThreads`).
+//      With (1) in place this is the FALLBACK, not the only path: it still carries a deletion on a
+//      payload whose server has no retired list at all, and it re-asserts the same verdict when a later
+//      document happens to omit the list (a roster-only frame cannot make the conversation reappear).
+//
+// What is deliberately NOT evidence: absence from an EMPTY roster (a payload without the list, or a
+// first bind — the board legitimately renders placeholder rows for a conversation it was never told
+// about, see ui/turns.ts `T?` and the projector's `adoptPlaceholder` sections), and a conversation the
+// next roster names again WITHOUT a marker — a resume puts the row back and clears the retired list in
+// the same store call (`reactivateThreadRow`, src/server/sessions.ts:5140-5163), so the verdict is
+// re-derived from the newest roster, never remembered past the server's word.
+const rosterIdsOf = (entries: readonly SessionThreadEntry[]): Set<string> =>
+    new Set(entries.map((entry) => entry.id));
+
+/**
+ * The ids this roster reports as deleted, in roster order: an entry carrying the server's soft-delete
+ * marker. Both wire spellings end up as one of these entries (`sessionThreadsOf` turns MEMBERSHIP in
+ * the header's retired list into an entry marked `deleted`, and forwards a row that stamps `inactive`
+ * itself), so the board never has to know which one it is looking at.
+ */
+export const deletedThreadIdsOf = (entries: readonly SessionThreadEntry[]): string[] =>
+    entries.filter((entry) => entry.deleted === true).map((entry) => entry.id);
+
+/**
+ * The conversations the NEW roster reports gone, given the roster the board is replacing (`previous`).
+ * Ids only — the board owns what that means for its rows, and it ACCUMULATES this answer: the server's
+ * roster filter reports a deletion on one frame and merely omits the id afterwards, and a header list
+ * keeps naming it for as long as the row is retained.
+ *
+ * The POSITIVE evidence (a marked entry, whatever put the mark there) is collected BEFORE the
+ * `next.length > 0` gate on purpose, so it holds on a FIRST roster — that is the reload case. Only the
+ * REMOVAL join needs a previous roster to compare against.
+ */
+export const rosterDeletionsOf = (
+    previous: readonly SessionThreadEntry[],
+    next: readonly SessionThreadEntry[]
+): string[] => {
+    const removed = new Set(deletedThreadIdsOf(next));
+
+    if (next.length > 0) {
+        const named = rosterIdsOf(next);
+
+        for (const id of rosterIdsOf(previous)) {
+            if (!named.has(id)) removed.add(id);
+        }
+
+        // A conversation the new roster names WITHOUT the marker is live: a delete that was undone (or
+        // a resume) retracts a verdict this frame just drew. This is also the guard that keeps the
+        // removal join from outliving the server's word — an id the roster ships live again is on
+        // `named` AND off the marker list, so whatever this frame concluded about it is dropped.
+        for (const entry of next) {
+            if (entry.deleted !== true) removed.delete(entry.id);
+        }
+    }
+
+    return [...removed];
+};
+
+/**
+ * Of the ids the board already concluded were deleted, the ones the NEW roster names again as LIVE. A
+ * resumed conversation is addressable again, so its rows come back — the ledger is re-derived from the
+ * roster, never remembered past the server's word.
+ *
+ * This is the REVIVAL half of the retired-list join: the store clears the ledger key and the row marker
+ * when a host resumes a conversation (src/server/sessions.ts `reactivateThreadRow`), so the next
+ * document both NAMES the row in the roster and stops marking it, and `sessionThreadsOf` stamps nothing.
+ * An id the retired list still names while the roster ships it live is the same case one frame early
+ * (the roster wins, `sessionThreadsOf` rule 1) and revives here too.
+ */
+export const revivedThreadIdsOf = (
+    entries: readonly SessionThreadEntry[],
+    known: ReadonlySet<string>
+): string[] => entries.filter((entry) => entry.deleted !== true && known.has(entry.id)).map((entry) => entry.id);
 
 // Read one turn's PERSISTENT thread id structurally. `SessionTurn.threadId` is
 // additive: a pre-thread record (and every legacy fixture) omits it, which means

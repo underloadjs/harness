@@ -29,6 +29,12 @@ import type {
     HarnessStreamRequest,
     HarnessUsage
 } from '@underload/harness';
+// T-W8: the delegated child's WHOLE-payload assertions below name the process epoch that every
+// run-identity mint now stamps (./core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the
+// mints in ./harness.ts). Asserted against the constant rather than a literal — the value is
+// random by design — and exact within one test file, because vitest gives one module registry
+// per file.
+import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
 // src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
@@ -1660,18 +1666,22 @@ describe('usage reporting', () => {
                 // T3 thread identity: the helper is a direct child of the root run,
                 // so it carries its invocation id and the spawning call, but no
                 // parentId and no `input` (that travels on `start` only).
-                thread: { id: '2', callId: 'c1' }
+                // T-W8: and the process that minted them — the lead's own, since the delegated
+                // child runs in the harness that launched the call (./harness.ts `threadIdentity`
+                // stamps `HARNESS_PROCESS_EPOCH` at every mint).
+                thread: { id: '2', callId: 'c1', epoch: HARNESS_PROCESS_EPOCH }
             },
             { type: 'usage', agent: 'lead', usage: leadAnswer }
         ]);
 
         // The child's start frame is the one event that also carries the prompt, so
-        // a UI can title the row; every later frame keeps just the identity.
+        // a UI can title the row; every later frame keeps just the identity — and every one of
+        // them keeps the epoch of the process that minted the id (T-W8, ./core/agent-limits.ts).
         expect(events.find((event) => event.type === 'start' && event.agent === 'helper')).toEqual({
             type: 'start',
             agent: 'helper',
             model: 'merge/ds4-flash',
-            thread: { id: '2', callId: 'c1', input: 'find it' }
+            thread: { id: '2', callId: 'c1', input: 'find it', epoch: HARNESS_PROCESS_EPOCH }
         });
     });
 });

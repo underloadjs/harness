@@ -150,9 +150,11 @@ describe('the terminal provider failure (AC3)', () => {
     });
 
     it('recovers the class and the host:port from the server sentence alone', () => {
-        // `HarnessErrorInfo` still types only `message` (../types/index.ts:830-832), so the
-        // terminal frame may carry nothing else. The message names both facts (T6), and the
-        // host:port is echoed, never inferred from a default.
+        // The HISTORICAL shape: a session persisted before 2026-11-17 stored a terminal
+        // record with nothing but `message` (`code` and `provider` joined `HarnessErrorInfo`
+        // with the unrecoverable-timeout fix), and re-opening it must still name the class.
+        // The message names both facts (T6), and the host:port is echoed, never inferred
+        // from a default. NEW records take the structured path above.
         expect(
             providerFailureOf({
                 message:
@@ -200,6 +202,55 @@ describe('the terminal provider failure (AC3)', () => {
         expect(providerFailureOf({ message: 'submit rejected' })).toBeUndefined();
         expect(providerFailureOf({ message: 'HTTP 400: bad request', code: 'bad-request' })).toBeUndefined();
         expect(providerFailureOf(undefined)).toBeUndefined();
+    });
+
+    it('answers undefined for the classes this UI has no wording for, even when they are structured', () => {
+        // 2026-11-17 (the unrecoverable-timeout report) put `code` and `provider` on EVERY
+        // terminal record, so a refused request, a provider-side cancel and a dying stream
+        // now arrive classified. They still answer `undefined`: this module's two layouts are
+        // "nothing answered the port" and "a bound expired", and dressing a 401 refusal in
+        // either one would tell the reader the provider is down when it is their request.
+        expect(
+            providerFailureOf({
+                message: 'provider-rejected: the provider answered with HTTP 401 and refused the request.',
+                code: 'provider-rejected'
+            })
+        ).toBeUndefined();
+
+        expect(
+            providerFailureOf({
+                message: 'provider-aborted: the request was cancelled before it completed.',
+                code: 'provider-aborted',
+                provider: { errorClass: 'provider-aborted', url: STUCK_URL, port: 5500 }
+            })
+        ).toBeUndefined();
+
+        // The transit class: no `code` at all (a defensive/legacy input shape — neither
+        // gateway writer sends a codeless frame any more), and a 408/429/5xx
+        // `upstream_status` is deliberately codeless; diagnosis only.
+        expect(
+            providerFailureOf({
+                message: 'Upstream stream terminated',
+                provider: { errorClass: 'provider-transit', url: STUCK_URL, port: 5500 }
+            })
+        ).toBeUndefined();
+    });
+
+    it('reads a structured terminal record before its prose, and never lets prose win', () => {
+        // The order the module documents: `code`, then `provider.errorClass`, then the
+        // sentence. A record whose fields and sentence disagree is served by the fields —
+        // the producer's prose is endpoint-specific on purpose, so it is a fallback, not a
+        // classifier.
+        expect(
+            providerFailureOf({
+                message: 'Upstream stream terminated',
+                code: 'provider-timeout',
+                provider: { errorClass: 'provider-timeout', url: STUCK_URL, port: 5500, phase: 'stream-chunk', timeoutMs: 120_000 }
+            })
+        ).toEqual({
+            label: 'provider-timeout',
+            text: 'stream-chunk · bound 2m00s · Upstream stream terminated'
+        });
     });
 });
 

@@ -87,7 +87,14 @@ import type {
 // it is erased at build time (the same convention `readTranscript` follows with its inline
 // `import('./view-model')` annotation).
 import type { ThreadTranscriptPayload } from './view-model';
-import { pendingSectionsOf, projectDisplay, projectNode, projectRow, projectSection, projectStep } from './display-project';
+import {
+    pendingSectionsOf,
+    projectDisplay,
+    projectNode,
+    projectRow,
+    projectSection,
+    projectStep
+} from './display-project';
 import {
     cancelSession,
     cancelSessionThread,
@@ -133,7 +140,15 @@ import type { HarnessDescriptor } from '../server/protocol';
 
 // Re-exported so the shell and the `ui/` renderers import the render model from the
 // facade that produces it, and there is one place to look for its shape.
-export type { InvalidThreadRow, RawTurnDocument, SessionView, SessionViewSummary, ThreadRow, ThreadTranscriptPayload, TurnRowView } from './view-model';
+export type {
+    InvalidThreadRow,
+    RawTurnDocument,
+    SessionView,
+    SessionViewSummary,
+    ThreadRow,
+    ThreadTranscriptPayload,
+    TurnRowView
+} from './view-model';
 
 // The page sizes this UI asks for, each inside `HARNESS_PAGE_LIMIT` (default 25,
 // max 100). They are deliberate: 25 rows is the conversation surface a reader can
@@ -173,6 +188,18 @@ export const sessionViewOf = (session: SessionResource): SessionView => ({
     // filled by the rows page, so nothing here can smuggle history back in.
     turnCount: session.turn_count,
     threadCount: session.thread_count,
+    // F7 (T-W6): the SOFT-DELETED conversation ids, the one deletion fact the roster cannot carry.
+    // `inactive_thread_ids` (../shared/harness-api.ts:1460, ../server/api-reads.ts `sessionResourceOf`)
+    // lists the rows a `threadDelete` retired (`inactive: true`) and RETAINED, and it is deliberately
+    // BESIDE the roster: `GET .../threads` filters those rows out (../server/api.ts:4834,
+    // ../server/sessions.ts `threadRoster`), so on a reload the client never saw the delete and an id
+    // the roster stopped naming proves nothing. Forwarded as its own field — copied so the render
+    // model never aliases the wire row, and OMITTED when absent or empty (a session that never deleted
+    // one keeps the exact header it had before F7), which is why the board draws no verdict for it.
+    // The join into the roster happens once, in ./ui/threads.ts `sessionThreadsOf`.
+    ...(Array.isArray(session.inactive_thread_ids) && session.inactive_thread_ids.length > 0
+        ? { inactiveThreads: [...session.inactive_thread_ids] }
+        : {}),
     turns: [],
     displays: {}
 });
@@ -250,6 +277,22 @@ export const threadRowOf = (row: ThreadSummary | ThreadResource): ThreadRow => {
         sequence: row.sequence,
         ...(row.owner_thread_id === undefined ? {} : { ownerThreadId: row.owner_thread_id }),
         ...(row.label === undefined ? {} : { label: row.label }),
+        // W22 (2026-11-17) / W26 (2026-11-17): the run token rides on the PAGE row as well as the identified
+        // read (`epoch` is a `ThreadSummary` property, so a roster list, a `thread.upsert` frame row and
+        // `/threads/{id}` all carry it), and it must survive this rename: `view-shell.ts` `getRawSession`
+        // composes the transcript dialog's roster rows straight out of `threadRowOf`, so a field dropped here
+        // never reaches `ui/thread-transcript.ts`. Copied only when present, exactly like the optional fields
+        // beside it — a legacy row keeps its prior shape.
+        //
+        // WHAT W26 CHANGED HERE: `ThreadSummary` now publishes `invocation_id`/`invocation_ids` beside `epoch`
+        // (../server/harness.swagger.yaml, ../server/api-reads.ts `threadRowOf`), so the rename below already
+        // carries them for a PAGE row too — the `identified.*` reads are not resource-only in practice, they
+        // answer whatever the wire sent. That is the point: on an export read the fold used to receive a
+        // process token with no id beside it (nothing to key), and now receives the same triple the snapshot
+        // and compact-view planes publish (`../server/protocol.ts` `SessionThread.invocationIds` /
+        // `SessionThreadView.invocationIds`), so the contested-id answer no longer depends on which read the
+        // client made.
+        ...(row.epoch === undefined ? {} : { epoch: row.epoch }),
         transcriptState: row.transcript_state,
         ...(row.transcript_error === undefined ? {} : { transcriptError: row.transcript_error }),
         messageCount: row.message_count,
@@ -257,14 +300,20 @@ export const threadRowOf = (row: ThreadSummary | ThreadResource): ThreadRow => {
         hasTranscript: row.has_transcript,
         ...(row.preview === undefined ? {} : { preview: row.preview }),
         ...(identified.origin_turn_id === undefined ? {} : { originTurnId: identified.origin_turn_id }),
-        ...(identified.origin_invocation_id === undefined ? {} : { originInvocationId: identified.origin_invocation_id }),
+        ...(identified.origin_invocation_id === undefined
+            ? {}
+            : { originInvocationId: identified.origin_invocation_id }),
         ...(identified.invocation_id === undefined ? {} : { invocationId: identified.invocation_id }),
         ...(identified.invocation_ids === undefined ? {} : { invocationIds: identified.invocation_ids }),
         ...(identified.invocation_ids_truncated === undefined
             ? {}
             : { invocationIdsTruncated: identified.invocation_ids_truncated }),
-        ...(identified.references === undefined ? {} : { references: identified.references as ThreadRow['references'] }),
-        ...(identified.connected_thread_ids === undefined ? {} : { connectedThreadIds: identified.connected_thread_ids }),
+        ...(identified.references === undefined
+            ? {}
+            : { references: identified.references as ThreadRow['references'] }),
+        ...(identified.connected_thread_ids === undefined
+            ? {}
+            : { connectedThreadIds: identified.connected_thread_ids }),
         ...(identified.transcript_revision === undefined ? {} : { transcriptRevision: identified.transcript_revision }),
         ...(identified.transcript_bytes === undefined ? {} : { transcriptBytes: identified.transcript_bytes }),
         ...(identified.revision === undefined ? {} : { revision: identified.revision })
@@ -295,8 +344,7 @@ export const turnRowOf = (row: WireTurnSummary): TurnRowView => projectRow(row);
 // ascending, and the contract says `desc` cursors walk OLDER, which is what
 // "load older" is. The window is therefore `[oldest … newest]` with the cursor
 // pointing further back.
-export const ascRows = (page: Page<WireTurnSummary>): TurnRowView[] =>
-    [...page.items].reverse().map(projectRow);
+export const ascRows = (page: Page<WireTurnSummary>): TurnRowView[] => [...page.items].reverse().map(projectRow);
 
 // ONE turn's compact row, re-read through the rows page. This is the bounded answer to
 // "the receipt named a turn but cannot describe it": a `TaskReceipt` is a closed DTO
@@ -329,9 +377,7 @@ export const rowFromReceipt = (receipt: TaskReceipt, draft: string): TurnRowView
         promptIsPreview: draft.length > preview.length,
         status: receipt.status,
         state: receipt.status === 'queued' ? 'queued' : 'streaming',
-        ...(receipt.thread_id === undefined || receipt.thread_id.length === 0
-            ? {}
-            : { threadId: receipt.thread_id }),
+        ...(receipt.thread_id === undefined || receipt.thread_id.length === 0 ? {} : { threadId: receipt.thread_id }),
         updatedAt: receipt.accepted_at,
         sectionCount: 0,
         stepCount: 0,
@@ -364,8 +410,12 @@ export const openSession = async (sessionId: string, options: OpenSessionOptions
     const [session, turnsPage, rosterPage, actions] = await Promise.all([
         getSession(sessionId),
         listTurns(sessionId, { limit, order: 'desc' }),
-        options.includeRoster === false ? Promise.resolve(undefined) : listThreads(sessionId, { limit: ROSTER_PAGE_LIMIT }),
-        options.includeActions === false ? Promise.resolve(undefined) : listPendingActions(sessionId).catch(() => undefined)
+        options.includeRoster === false
+            ? Promise.resolve(undefined)
+            : listThreads(sessionId, { limit: ROSTER_PAGE_LIMIT }),
+        options.includeActions === false
+            ? Promise.resolve(undefined)
+            : listPendingActions(sessionId).catch(() => undefined)
     ]);
 
     const view = sessionViewOf(session);
@@ -391,9 +441,7 @@ export const openSession = async (sessionId: string, options: OpenSessionOptions
     const tail = bounded === 0 ? [] : view.turns.slice(-bounded);
 
     if (tail.length > 0) {
-        const trees = await Promise.allSettled(
-            tail.map((row) => getTurnDisplaySafely(sessionId, row.id))
-        );
+        const trees = await Promise.allSettled(tail.map((row) => getTurnDisplaySafely(sessionId, row.id)));
 
         trees.forEach((tree, index) => {
             if (tree.status === 'fulfilled' && tree.value !== undefined) view.displays[tail[index].id] = tree.value;
@@ -495,7 +543,7 @@ export const projectOp = (
     frameTurnId?: string
 ): TurnDisplayOp | undefined => {
     const wire = op as Record<string, unknown>;
-    const turnId = typeof wire.turnId === 'string' ? wire.turnId : frameTurnId ?? '';
+    const turnId = typeof wire.turnId === 'string' ? wire.turnId : (frameTurnId ?? '');
     const sectionId = typeof wire.sectionId === 'string' ? wire.sectionId : undefined;
 
     switch (op.op) {
@@ -661,9 +709,7 @@ export const projectOp = (
 export const projectOps = (ops: readonly TurnDisplayOp[] | undefined, frameTurnId?: string): TurnDisplayOp[] => {
     if (!Array.isArray(ops)) return [];
 
-    return ops
-        .map((op) => projectOp(op, frameTurnId))
-        .filter((op): op is TurnDisplayOp => op !== undefined);
+    return ops.map((op) => projectOp(op, frameTurnId)).filter((op): op is TurnDisplayOp => op !== undefined);
 };
 
 // ---------------------------------------------------------------------------
@@ -1300,8 +1346,7 @@ export const stopThread = (sessionId: string, threadId: string) => cancelSession
 // T4/R2: the resume transport. A stopped thread answers a `TaskReceipt` (the same shape a
 // submit answers), so the caller reconciles the roster the SAME way a stop does and lets
 // the stream's `turn.upsert` frame paint the continuation turn.
-export const resumeThread = (sessionId: string, threadId: string) =>
-    resumeSessionThread(sessionId, threadId);
+export const resumeThread = (sessionId: string, threadId: string) => resumeSessionThread(sessionId, threadId);
 
 export const removeThread = (sessionId: string, threadId: string) => deleteSessionThread(sessionId, threadId);
 
@@ -1334,7 +1379,10 @@ export const receiptLink = (receipt: TaskReceipt, which: keyof TaskReceipt['link
 // The metadata head and the editable document, composed into the editor's payload.
 // Two bounded reads (a metadata head and one JSON text) rather than a message walk,
 // because editing replaces the document and must see the bytes exactly as stored.
-export const readTranscript = async (sessionId: string, threadId: string): Promise<import('./view-model').ThreadTranscriptPayload> => {
+export const readTranscript = async (
+    sessionId: string,
+    threadId: string
+): Promise<import('./view-model').ThreadTranscriptPayload> => {
     const [metadata, document] = await Promise.all([
         getTranscriptMetadata(sessionId, threadId).catch<TranscriptMetadata | undefined>(() => undefined),
         getTranscriptDocument(sessionId, threadId).catch<TranscriptDocumentResponse | undefined>(() => undefined)
@@ -1399,10 +1447,7 @@ export const writeTranscript = (sessionId: string, threadId: string, messages: u
 // turn, each page bounded. Opt-in and explicit (the export dialog), and it composes
 // the pages a document needs instead of asking the server for an aggregate it no
 // longer publishes.
-export const readRawTurns = async (
-    sessionId: string,
-    turnIds: readonly string[]
-): Promise<RawTurnDocument[]> => {
+export const readRawTurns = async (sessionId: string, turnIds: readonly string[]): Promise<RawTurnDocument[]> => {
     const unique = [...new Set(turnIds)];
     const documents: RawTurnDocument[] = [];
 

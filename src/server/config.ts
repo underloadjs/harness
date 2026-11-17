@@ -98,6 +98,18 @@ export type ServerRuntimeConfiguration = {
     // ./workers/io-client.ts (`resolveIoWorkerEntry`). Same loading as the lane entry: the
     // runner imports whatever path is resolved.
     ioEntry?: string;
+    // F1 (2026-11-17): how many CONSECUTIVE network-class run failures one conversation may
+    // accumulate before the server stops auto-resuming it (see
+    // `DEFAULT_NETWORK_RESUME_LIMIT` above for the rule and `resolveNetworkResumeLimit` for
+    // the grammar).
+    //
+    // OPTIONAL on the type so no existing host option object or worker-mode test fixture
+    // changes shape; ALWAYS present from `loadRuntimeConfiguration` when the operator set
+    // `HARNESS_PROVIDER_NETWORK_RESUME_LIMIT`, and otherwise the store resolves
+    // `DEFAULT_NETWORK_RESUME_LIMIT` itself. A per-provider
+    // `settings.networkResumeLimit` outranks this, exactly as the three provider time bounds
+    // outrank their variables.
+    networkResumeLimit?: number;
 };
 
 // (T6) The three provider time bounds in force for this process. They are a
@@ -118,6 +130,100 @@ export const DEFAULT_PROVIDER_TIMEOUT_CONFIGURATION: ProviderTimeoutConfiguratio
     responseHeadMs: DEFAULT_PROVIDER_RESPONSE_HEAD_TIMEOUT_MS,
     firstTokenMs: DEFAULT_PROVIDER_FIRST_TOKEN_TIMEOUT_MS,
     streamChunkMs: DEFAULT_PROVIDER_STREAM_CHUNK_TIMEOUT_MS
+};
+
+// ---------------------------------------------------------------------------
+// F1 (2026-11-17): the AUTO-RECOVERY ceiling
+// ---------------------------------------------------------------------------
+//
+// WHY A CEILING AT ALL. "The thread must continue and auto-recover in every scenario"
+// is the requirement, and an unbounded auto-resume is not recovery — it is a loop that
+// spends provider time forever against a provider that is simply down. The store
+// therefore keeps a DURABLE per-conversation streak of consecutive network-class run
+// failures (./sessions.ts `Session.networkFailures`) and auto-resumes while the streak is
+// BELOW this ceiling; at the ceiling the conversation rests with its recorded stop reason
+// and only a host action resumes it. One answered run clears the streak.
+//
+// THE DEFAULT IS 10 — the same figure the per-request retry ladder publishes
+// (`DEFAULT_MAX_RETRIES`, ../core/agent-limits.ts) — because the operator who asked for
+// this counted ten provider attempts, not ten thread resumes.
+//
+// `0` means "never auto-resume": the honest spelling of "turn the feature off", mirroring
+// the `0` = off rule of the three provider bounds above, and NOT "resume once" (which
+// would make `0` mean `1` and leave no way to say off).
+export const DEFAULT_NETWORK_RESUME_LIMIT = 10;
+
+// The operator-facing variable, exported so the message that refuses a bad value and the
+// `.env.example` entry cannot drift apart. It carries the `HARNESS_PROVIDER_` prefix for
+// the same reason the three bounds above do: the number bounds a PROVIDER condition, and an
+// operator looking for "what controls what my provider failures cost" finds it in one place.
+export const NETWORK_RESUME_LIMIT_ENV = 'HARNESS_PROVIDER_NETWORK_RESUME_LIMIT';
+
+// A thread resume is a whole run, not a backoff step, so a streak in the thousands is a
+// mis-set variable, not a tuning choice. The ceiling exists to catch that at startup.
+export const NETWORK_RESUME_LIMIT_MAX = 1_000;
+
+// Resolve ONE ceiling, with the SAME grammar and precedence `resolveProviderTimeout`
+// documents: the explicit provider/session field, then the environment variable, then the
+// shipped default. Digits only, nothing coerced, and the refusal names the variable — a
+// deployment whose `HARNESS_PROVIDER_NETWORK_RESUME_LIMIT=10x` silently became 10 (or 0)
+// would change how a whole class of incidents resolves.
+//
+// It deliberately does NOT reuse `resolveProviderTimeout` (../transport/provider-timeouts):
+// that parser's range and error text are about MILLISECONDS, and this is a COUNT.
+export const resolveNetworkResumeLimit = (input: {
+    // The provider/session-scoped setting, when a host supplied one.
+    explicit?: number;
+    // The environment variable this ceiling answers to (also quoted in the error).
+    variable?: string;
+    // The shipped default. `DEFAULT_NETWORK_RESUME_LIMIT` is what every caller uses today.
+    fallback?: number;
+    // Test seam: an explicit environment instead of `process.env`.
+    env?: Record<string, string | undefined>;
+} = {}): number => {
+    const variable = input.variable ?? NETWORK_RESUME_LIMIT_ENV;
+    const fallback = input.fallback ?? DEFAULT_NETWORK_RESUME_LIMIT;
+    const range = `an integer between 0 and ${NETWORK_RESUME_LIMIT_MAX} (0 turns auto-resume off)`;
+
+    const explicit = input.explicit;
+
+    if (explicit !== undefined) {
+        if (
+            !Number.isSafeInteger(explicit) ||
+            explicit < 0 ||
+            explicit > NETWORK_RESUME_LIMIT_MAX
+        ) {
+            throw new SettingsError(
+                `\`networkResumeLimit\` must be ${range}; received ${String(explicit)}. ` +
+                    `It is the consecutive network failures one conversation tolerates before the server stops resuming it (the ${variable} default).`
+            );
+        }
+
+        return explicit;
+    }
+
+    // Read defensively: this module is reachable from a browser bundle where `process`
+    // does not exist, and only a dynamic index is safe there.
+    const env =
+        input.env ??
+        (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    const raw = env?.[variable];
+
+    if (raw === undefined || raw.trim().length === 0) return fallback;
+
+    const trimmed = raw.trim();
+
+    if (!/^\d+$/.test(trimmed)) {
+        throw new ServerRuntimeError(`${variable} must be ${range}; received ${JSON.stringify(raw)}.`);
+    }
+
+    const parsed = Number(trimmed);
+
+    if (!Number.isSafeInteger(parsed) || parsed > NETWORK_RESUME_LIMIT_MAX) {
+        throw new ServerRuntimeError(`${variable} must be ${range}; received ${JSON.stringify(raw)}.`);
+    }
+
+    return parsed;
 };
 
 // Read the three bounds from an environment. Idempotent and side-effect free, like
@@ -384,6 +490,16 @@ export const loadRuntimeConfiguration = (env: NodeJS.ProcessEnv = process.env): 
     // so `startHarnessServer().runtime` says exactly which entry a worker-mode store uses.
     const ioEntry = env.HARNESS_IO_WORKER_ENTRY?.trim() ?? '';
 
+    // F1: the auto-resume ceiling is read ONLY when the operator actually set the variable,
+    // and then validated (a bad value aborts startup naming it). Leaving the key absent
+    // otherwise keeps every existing runtime object byte-identical — the store resolves
+    // `DEFAULT_NETWORK_RESUME_LIMIT` at the point of use — and matches how `workerEntry`
+    // above treats "not set".
+    const networkResumeLimit =
+        env[NETWORK_RESUME_LIMIT_ENV] === undefined || env[NETWORK_RESUME_LIMIT_ENV]?.trim().length === 0
+            ? undefined
+            : resolveNetworkResumeLimit({ env });
+
     return {
         threadExecution,
         ioExecution,
@@ -391,7 +507,8 @@ export const loadRuntimeConfiguration = (env: NodeJS.ProcessEnv = process.env): 
         maxLaneWorkers,
         workerHandshakeMs,
         ...(entry.length > 0 ? { workerEntry: entry } : {}),
-        ...(ioEntry.length > 0 ? { ioEntry } : {})
+        ...(ioEntry.length > 0 ? { ioEntry } : {}),
+        ...(networkResumeLimit === undefined ? {} : { networkResumeLimit })
     };
 };
 
@@ -456,7 +573,19 @@ export const resolveRuntimeConfiguration = (
         maxLaneWorkers,
         workerHandshakeMs,
         ...(entry.length > 0 ? { workerEntry: entry } : loaded.workerEntry === undefined ? {} : { workerEntry: loaded.workerEntry }),
-        ...(ioEntry.length > 0 ? { ioEntry } : loaded.ioEntry === undefined ? {} : { ioEntry: loaded.ioEntry })
+        ...(ioEntry.length > 0 ? { ioEntry } : loaded.ioEntry === undefined ? {} : { ioEntry: loaded.ioEntry }),
+        // F1: explicit host option wins, then what the environment supplied, and "neither"
+        // stays ABSENT (the store's own default is the last resort, not this function's job —
+        // `resolveNetworkResumeLimit` is what applies it at the point of use).
+        ...(input.networkResumeLimit === undefined
+            ? loaded.networkResumeLimit === undefined
+              ? {}
+              : { networkResumeLimit: loaded.networkResumeLimit }
+            : {
+                  networkResumeLimit: resolveNetworkResumeLimit({
+                      explicit: input.networkResumeLimit
+                  })
+              })
     };
 };
 
@@ -540,6 +669,22 @@ export const mergeSettings = (
 
     const streamChunkTimeoutMs = mergedTimeout(input?.streamChunkTimeoutMs, defaults.streamChunkTimeoutMs, 'streamChunkTimeoutMs');
 
+    // F1: the auto-resume ceiling, merged with the SAME precedence (this session's field
+    // beats the server default, and an absent pair stays absent so the deployment variable
+    // and the shipped default still resolve downstream — `resolveNetworkResumeLimit` in this
+    // file). A bad value is a 400 naming the field, like every other settings bound here,
+    // and NOTHING is coerced: `0` is a real answer ("never auto-resume"), so silently
+    // mapping a typo to 0 would switch the recovery feature off behind the operator's back.
+    const requestedResumeLimit = input?.networkResumeLimit;
+    const serverResumeLimit = defaults.networkResumeLimit;
+
+    const networkResumeLimit =
+        requestedResumeLimit === undefined && serverResumeLimit === undefined
+            ? undefined
+            : resolveNetworkResumeLimit({
+                  explicit: requestedResumeLimit ?? serverResumeLimit
+              });
+
     // Validate before returning: both the model listing and session creation use
     // the result, so one cap here covers every provider request path.
     if (baseURL.length > MAX_BASE_URL_LENGTH) {
@@ -575,6 +720,9 @@ export const mergeSettings = (
         apiKey,
         ...(responseHeadTimeoutMs === undefined ? {} : { responseHeadTimeoutMs }),
         ...(firstTokenTimeoutMs === undefined ? {} : { firstTokenTimeoutMs }),
-        ...(streamChunkTimeoutMs === undefined ? {} : { streamChunkTimeoutMs })
+        ...(streamChunkTimeoutMs === undefined ? {} : { streamChunkTimeoutMs }),
+        // F1: same conditional spread — an untouched session returns exactly the settings
+        // object it always did, with no `networkResumeLimit` key at all.
+        ...(networkResumeLimit === undefined ? {} : { networkResumeLimit })
     };
 };

@@ -42,6 +42,11 @@
 //   - ../shared/harness-stream.ts  — StreamResourceKind, WsRevisionRecord, WsResourceLink, WsUpdateKind
 //   - ./api.ts                     — the only REST caller (createHarnessApi owns one hub)
 
+// T-W8: the per-process epoch is minted in the dependency-free core leaf so the RUNTIME can
+// stamp the same value onto run identity (../core/agent-limits.ts, and ../types/index.ts
+// `HarnessThread.epoch`). Importing the leaf — not `../core` — keeps this module's load cost
+// at one const and no cycle.
+import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
 import { HARNESS_API_ROOT } from '../shared/harness-api';
 import type {
     StreamResourceKind,
@@ -62,25 +67,17 @@ import type {
 // Format: base36 timestamp + random suffix. It is OPAQUE to clients (the contract only
 // requires a string that changes on restart), and keeping it short matters because it
 // rides every cursor and header.
-const randomEpochSuffix = (): string => {
-    const crypto = globalThis.crypto;
-
-    // A runtime without `crypto.getRandomValues` (an old node, a stripped worker) still
-    // needs an epoch, so fall back to Math.random. Uniqueness per PROCESS is the only
-    // requirement, and the process is the epoch's whole universe.
-    if (crypto !== undefined && typeof crypto.getRandomValues === 'function') {
-        const bytes = new Uint8Array(6);
-
-        crypto.getRandomValues(bytes);
-
-        return [...bytes].map((byte) => byte.toString(36).padStart(2, '0')).join('');
-    }
-
-    return Math.random().toString(36).slice(2, 14).padEnd(12, '0');
-};
-
+//
+// T-W8 (2026-11-17): the MINT moved to `HARNESS_PROCESS_EPOCH` (../core/agent-limits.ts) and
+// this constant is now an alias of it — the semantics are byte-for-byte what they were (one
+// opaque per-process string, minted at module load, compared only for equality), and the
+// duplication is what had to go: the RUNTIME now stamps that same value onto every run's
+// thread identity (`HarnessThread.epoch`, ../types/index.ts), so the epoch in a REST cursor
+// and the epoch on a recorded frame name the SAME process. A dependency-free core leaf is
+// the only place both sides may import: ../harness.ts cannot reach the server tree, and the
+// server reaches the runtime daily.
 /** The opaque per-process epoch reported by the root document, health, headers, and cursors. */
-export const HARNESS_RUNTIME_EPOCH: string = `${Date.now().toString(36)}-${randomEpochSuffix()}`;
+export const HARNESS_RUNTIME_EPOCH: string = HARNESS_PROCESS_EPOCH;
 
 /** True when a cursor/caller epoch is this process's epoch (the only legal comparison). */
 export const isCurrentEpoch = (epoch: unknown): boolean => typeof epoch === 'string' && epoch === HARNESS_RUNTIME_EPOCH;

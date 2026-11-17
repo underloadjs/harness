@@ -39,6 +39,11 @@
 
 import { HarnessError } from '../util';
 import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
+// The invocation-RUN key (../shared/run-identity.ts): the one key rule the agent-result reader
+// states its duplicate check on, so a document that legitimately holds the SAME bare invocation id
+// under two process epochs is not refused, while one that claims a single RUN twice still is. Leaf
+// import, same convention as ../shared/attachments above and ./message-id below.
+import { invocationRunKeyOf } from '../shared/run-identity';
 // Stable transcript addresses (context T1.3): the reader-side id rule — carry an id that
 // is already there, backfill one that is not. A leaf (types-only) import, like the
 // `./agent-limits` leaf below.
@@ -95,7 +100,7 @@ export const HARNESS_SNAPSHOT_VERSION = 2 as const;
 // next to the union would not reach them anyway — while this module is where an untrusted
 // document actually meets the vocabulary. Anything that validates a stop reason at another
 // boundary (src/harness.ts, src/server/**, src/tools/**) imports this table rather than
-// re-spelling the nine members.
+// re-spelling the union's members.
 //
 // Order is the refusal message's order, so a rejection reads like the union declaration.
 export const HARNESS_RUN_STOP_REASONS: readonly HarnessRunStopReason[] = [
@@ -106,6 +111,11 @@ export const HARNESS_RUN_STOP_REASONS: readonly HarnessRunStopReason[] = [
     'budget-exhausted',
     'api-error',
     'retries-exhausted',
+    // (2026-11-17) The network/provider-transit class (`types` `HarnessRunStopReason`,
+    // produced by `classifyRunStopReason`). A document that carries it must RESTORE, not
+    // reject: this table is the reader half of the union, so a new member has to join it
+    // in the same change that adds the producer.
+    'provider-network',
     'parent-closed',
     'plugin-parked'
 ];
@@ -182,7 +192,15 @@ const readAgentResults = (
                 // `HarnessRunStopReason`). Without it the only surviving answer is the English
                 // `error` text, which pushes every consumer back to string-matching a message
                 // the harness wrote for someone else.
-                'stopReason'
+                'stopReason',
+                // W19 (2026-11-17): the LEDGER GENERATION of the row — the process epoch that minted
+                // `invocationId` (../types `HarnessAgentResultSnapshot.epoch`). The key had to join
+                // this whitelist the moment `snapshot()` started writing it: `readSnapshotKeys` is
+                // exact-key (./snapshot-validation.ts), so a row carrying an unlisted key would make
+                // the WHOLE document unrestorable rather than merely losing one field. It is also what
+                // `restore()` rebuilds the ledger key from, which is the difference between fixing the
+                // recycled-id collapse for one restart and fixing it for every restart.
+                'epoch'
             ],
             entryLabel,
             // Issue 0033: the two forensic keys join `error` as MAY-BE-ABSENT, which is
@@ -195,12 +213,27 @@ const readAgentResults = (
             // not a defect — while an old file that simply never carried the key stays valid.
             // `stopReason` joins it for the same reason a COMPLETED row never carries one: it
             // concluded, so there is nothing left to explain.
-            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason']
+            //
+            // W19: `epoch` joins the same list for the same reason — a row written before the field
+            // existed (EVERY document on disk today) is still valid, restores under its BARE
+            // invocation id with its exact prior meaning, and is never re-keyed on load. A current row
+            // that carries it is read, not dropped. No version bump.
+            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason', 'epoch']
         );
 
         const invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
             min: 1
         });
+        // W19 (2026-11-17): the row's LEDGER GENERATION, read BEFORE the duplicate rule below because
+        // that rule is now stated on the RUN. A non-empty string only: `HARNESS_PROCESS_EPOCH` is
+        // opaque and the only legal question about it is equality (../core/agent-limits.ts), so there
+        // is no vocabulary to enforce and no length to promise; a blank value is refused because a
+        // blank epoch names no process and would silently collapse two runs again. Absent is the
+        // legacy form and means "key this row by its bare id".
+        const epoch =
+            record.epoch === undefined
+                ? undefined
+                : readSnapshotString(record.epoch, `${entryLabel}.epoch`, { min: 1 });
         const sequence = readSnapshotInteger(record.sequence, `${entryLabel}.sequence`, { min: 1 });
         const completedOrder = readSnapshotInteger(
             record.completedOrder,
@@ -235,9 +268,22 @@ const readAgentResults = (
             );
         }
 
-        if (ids.has(invocationId)) {
+        // W19 (2026-11-17) — the uniqueness rule is stated on the RUN, not on the bare id, and the
+        // wording is kept byte-identical when no epoch is involved (a legacy document's failure text is
+        // pinned by restart tests, and the rule for it has not moved: no epoch, one id, one row).
+        //
+        // WHY: the id is a per-process counter, so ONE document can legitimately carry `15` twice —
+        // once per ledger generation — and neither row is the other's replacement. Refusing that pair
+        // is what would make the durable fix impossible: the ledger would have to keep clobbering the
+        // older archive to stay loadable. A row that claims the SAME run twice is still refused, which
+        // is what stops a hand-edited document from addressing one run's answer twice.
+        const runKey = invocationRunKeyOf(invocationId, epoch);
+
+        if (ids.has(runKey)) {
             throw new HarnessError(
-                `${label} contains the duplicate invocationId "${invocationId}".`
+                epoch === undefined
+                    ? `${label} contains the duplicate invocationId "${invocationId}".`
+                    : `${label} contains the duplicate invocationId "${invocationId}" of epoch "${epoch}".`
             );
         }
         if (sequences.has(sequence)) {
@@ -249,7 +295,7 @@ const readAgentResults = (
             );
         }
 
-        ids.add(invocationId);
+        ids.add(runKey);
         sequences.add(sequence);
         completionOrders.add(completedOrder);
 
@@ -326,6 +372,12 @@ const readAgentResults = (
                 min: 1
             });
         }
+
+        // W19: the ledger generation, emitted ONLY when the row carries one — so a legacy row's
+        // restored shape is byte-identical to what this reader already produced, and the KEY that
+        // `restore()` writes into the live ledger degenerates to the bare invocation id exactly as it
+        // does today (../harness.ts `restore`, ../shared/run-identity.ts).
+        if (epoch !== undefined) result.epoch = epoch;
 
         // C-A — WHY the run stopped, the third forensic field of a run that did not finish.
         //
@@ -844,6 +896,14 @@ const readThreads = (
                 'stopReason',
                 'inactive',
                 'inactiveAt',
+                // W19 (2026-11-17): the process epoch that minted this row's `invocationId`
+                // (../types `HarnessThreadSnapshot.epoch`). Listed here for the same reason the three
+                // above are: an unlisted key is REFUSED outright, so writing the field in
+                // ../harness.ts without whitelisting it here would have made every document this build
+                // produces unrestorable. It is the discriminator ../server/sessions.ts
+                // `noteInvocationThread` needs so a restored record from a dead process cannot bind a
+                // new run's join to the dead conversation.
+                'epoch',
                 'messages'
             ],
             entryLabel,
@@ -851,7 +911,19 @@ const readThreads = (
             // mechanism (file header): a document written before them — and every existing
             // fixture — stays valid and restores with its exact prior meaning, while a current
             // document that carries them is READ, not dropped. No version bump.
-            ['ownerThreadId', 'label', 'invocationId', 'contextLane', 'stopReason', 'inactive', 'inactiveAt']
+            [
+                'ownerThreadId',
+                'label',
+                'invocationId',
+                'contextLane',
+                'stopReason',
+                'inactive',
+                'inactiveAt',
+                // W19: `epoch` joins the same list for the same reason — a pre-change row (every
+                // document on disk today) stays valid and restores with no epoch, which every reader
+                // treats as "the producer said nothing", never as a mismatch.
+                'epoch'
+            ]
         );
 
         const id = readSnapshotString(record.id, `${entryLabel}.id`, { min: 1 });
@@ -923,6 +995,22 @@ const readThreads = (
             thread.invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
                 min: 1
             });
+        }
+
+        // W19 (2026-11-17): the epoch that minted `invocationId`, read under the same "never blank on a
+        // row that carries one" rule as every other identity key. It is refused (not dropped) when it
+        // arrives WITHOUT an `invocationId`: the pair is one fact — "the run this id names belongs to
+        // that process" — and an epoch describing no id would be re-dropped by the next projection, so
+        // `restore -> snapshot` would stop being idempotent. Absence on EITHER side is the legacy form
+        // and restores with its exact prior meaning.
+        if (record.epoch !== undefined) {
+            if (thread.invocationId === undefined) {
+                throw new HarnessError(
+                    `${entryLabel}.epoch requires an invocationId to identify a run (or must be absent).`
+                );
+            }
+
+            thread.epoch = readSnapshotString(record.epoch, `${entryLabel}.epoch`, { min: 1 });
         }
 
         // DISPLAY LANE (C1). OPTIONAL: a document written before lanes exist restores to

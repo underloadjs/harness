@@ -88,6 +88,11 @@ import { HARNESS_SERVICE_LIMITS } from '../shared/harness-api';
 import type { RecordEntry, RecordFieldDefinition, RecordStoreChange } from '../types';
 import { previewText } from './turn-projector';
 import type { SessionRecord, ThreadLaneInfo } from './sessions';
+// R19: the roster's invocation joins are keyed by INVOCATION RUN (`id\0epoch` / bare id) inside
+// the store, and this file is where they become the wire's bare ids. Value import, because the
+// rule is code, not a type — and it lives in ./protocol.ts next to the `invocationIds` field it
+// defines (../sessions.ts `invocationIdsOf` strips with the same helper).
+import { invocationIdOfRunKey } from './protocol';
 import type { CatalogueEntry, HarnessPreset } from './harnesses/types';
 import type { ToolCatalogue } from './harnesses';
 import { CORE_TOOL_NAMES } from './harnesses/toolbox';
@@ -176,7 +181,11 @@ export type ReadContext = {
 // ---------------------------------------------------------------------------
 
 /** Key-free endpoint view: the contract never leaks a credential, only its presence. */
-export const providerDefaultsOf = (settings: { baseURL: string; model: string; apiKey?: string }): ProviderDefaults => ({
+export const providerDefaultsOf = (settings: {
+    baseURL: string;
+    model: string;
+    apiKey?: string;
+}): ProviderDefaults => ({
     base_url: settings.baseURL,
     model: settings.model,
     has_api_key: typeof settings.apiKey === 'string' && settings.apiKey.trim().length > 0
@@ -188,9 +197,7 @@ export const runtimeSettingsOf = (runtime: ServerRuntimeConfiguration): RuntimeS
     worker_idle_ms: runtime.workerIdleMs,
     max_lane_workers: runtime.maxLaneWorkers,
     worker_handshake_ms: runtime.workerHandshakeMs,
-    ...(runtime.workerEntry === undefined
-        ? {}
-        : { worker_entry_configured: runtime.workerEntry.trim().length > 0 })
+    ...(runtime.workerEntry === undefined ? {} : { worker_entry_configured: runtime.workerEntry.trim().length > 0 })
 });
 
 /** Total pending work: the legacy queue plus every lane backlog (same rule as the store). */
@@ -307,9 +314,7 @@ export const retiredThreadIdsOf = (record: SessionRecord): Set<string> => {
  *    (c) a turn of a live host conversation;
  *    (d) a turn whose `threadId` names an id the record has no row for (a foreign id is a
  *        gap in the ledger, not a deletion — the filter invents no stricter rule). */
-export const discoverableTurnFilterOf = (
-    record: SessionRecord
-): ((turn: { threadId?: string | null }) => boolean) => {
+export const discoverableTurnFilterOf = (record: SessionRecord): ((turn: { threadId?: string | null }) => boolean) => {
     const retired = retiredThreadIdsOf(record);
 
     // The overwhelmingly common case is a session that never deleted anything: an empty set
@@ -340,9 +345,7 @@ const hostThreads = (record: SessionRecord) =>
 
 /** The turn a conversation's run belongs to (the same join the store's roster uses). */
 const owningTurnOf = (record: SessionRecord, threadId?: string) =>
-    threadId === undefined
-        ? undefined
-        : record.turns.find((turn) => turn.threadId === threadId);
+    threadId === undefined ? undefined : record.turns.find((turn) => turn.threadId === threadId);
 
 // ---------------------------------------------------------------------------
 // Sessions
@@ -380,30 +383,51 @@ export const sessionSummaryOf = (record: SessionRecord, context: ReadContext): S
  * the created-tool/pending-action counts, and where turns execute. The heavy children
  * (turns, threads, transcripts, definition, events) stay on their own routes.
  */
-export const sessionResourceOf = (record: SessionRecord, context: ReadContext): SessionResource => ({
-    ...sessionSummaryOf(record, context),
-    definition_revision: context.hub.getRevision('definition', record.id),
-    agent_models: agentModelsOf(record),
-    endpoint: providerDefaultsOf(record.settings as { baseURL: string; model: string; apiKey?: string }),
-    runtime_execution: context.runtime.threadExecution,
-    pending_action_count: record.pendingActions.size,
-    created_tool_count: createdToolNames(record).length,
-    created_tool_limit: context.createdToolLimit,
-    // T1.5's last mile (ADDITIVE, and ABSENT when empty): the plugin diagnostics this session
-    // reported — a hook that threw or timed out, an unparseable decision, or a plugin's own
-    // `policy` report — each naming its OWNING plugin. This is the surface that makes "the
-    // compactor is broken" answerable from the identified session read instead of only from the
-    // server's stderr. Emitted only when there IS a journal, so every pre-T4 row keeps its exact
-    // key set (the `queue_depth` rule above, and `src/server/sessions.ts`
-    // `Session.pluginDiagnostics` for the cap and the durability rule).
-    //
-    // Verbatim camelCase inside, like every other domain payload on this contract
-    // (`HarnessMessage`, the display subtree): these are the library's diagnostic fields plus the
-    // receive timestamp, copied so a consumer cannot mutate the stored journal.
-    ...(record.pluginDiagnostics.length === 0
-        ? {}
-        : { plugin_diagnostics: record.pluginDiagnostics.map((entry) => ({ ...entry })) })
-});
+export const sessionResourceOf = (record: SessionRecord, context: ReadContext): SessionResource => {
+    // F7 (2026-11-17): computed once, so the gate and the value cannot disagree.
+    const retired = [...retiredThreadIdsOf(record)].sort((left, right) => left.localeCompare(right));
+
+    return {
+        ...sessionSummaryOf(record, context),
+        definition_revision: context.hub.getRevision('definition', record.id),
+        agent_models: agentModelsOf(record),
+        endpoint: providerDefaultsOf(record.settings as { baseURL: string; model: string; apiKey?: string }),
+        runtime_execution: context.runtime.threadExecution,
+        pending_action_count: record.pendingActions.size,
+        created_tool_count: createdToolNames(record).length,
+        created_tool_limit: context.createdToolLimit,
+        // T1.5's last mile (ADDITIVE, and ABSENT when empty): the plugin diagnostics this session
+        // reported — a hook that threw or timed out, an unparseable decision, or a plugin's own
+        // `policy` report — each naming its OWNING plugin. This is the surface that makes "the
+        // compactor is broken" answerable from the identified session read instead of only from the
+        // server's stderr. Emitted only when there IS a journal, so every pre-T4 row keeps its exact
+        // key set (the `queue_depth` rule above, and `src/server/sessions.ts`
+        // `Session.pluginDiagnostics` for the cap and the durability rule).
+        //
+        // Verbatim camelCase inside, like every other domain payload on this contract
+        // (`HarnessMessage`, the display subtree): these are the library's diagnostic fields plus the
+        // receive timestamp, copied so a consumer cannot mutate the stored journal.
+        ...(record.pluginDiagnostics.length === 0
+            ? {}
+            : { plugin_diagnostics: record.pluginDiagnostics.map((entry) => ({ ...entry })) }),
+        // F7 (2026-11-17, ADDITIVE and ABSENT when empty): the ids of this session's SOFT-DELETED
+        // conversations. The roster (`GET /sessions/:id/threads`, ./api.ts `threadRecordsOf`) HIDES
+        // those rows by design, and the turns page hides their turn rows (`retiredThreadIdsOf` IS
+        // that filter's predicate) — so on a RELOAD a client that never watched the delete holds no
+        // marker at all, and "the roster stopped naming this id" is not evidence: it is
+        // indistinguishable from a conversation that never existed, which is why the board renders a
+        // retired conversation's sections again after a page reload. The roster filter is the single
+        // place every roster comes from and the gate several routes lean on, so the deletion fact
+        // travels BESIDE it instead of widening it.
+        //
+        // Same source the turns page hides with (`retiredThreadIdsOf`: the durable
+        // `Session.inactiveThreads` ledger union the `inactive: true` marks on the retained rows),
+        // sorted so a repaint is byte-stable. The in-process twins are
+        // `SessionSnapshot.inactiveThreads` / `SessionView.inactiveThreads` (./protocol.ts), filled
+        // by `SessionStore` from those same two sources.
+        ...(retired.length === 0 ? {} : { inactive_thread_ids: retired })
+    };
+};
 
 /** The live per-agent model map, read from the running brains (never a snapshot copy). */
 export const agentModelsOf = (record: SessionRecord): Record<string, string> => {
@@ -558,7 +582,11 @@ export const turnResourceOf = (
                           : { thread_id: steer.threadId }),
                       ...(steer.references === undefined || steer.references.length === 0
                           ? {}
-                          : { references: steer.references.map((reference: AgentResultReference) => ({ ...reference })) })
+                          : {
+                                references: steer.references.map((reference: AgentResultReference) => ({
+                                    ...reference
+                                }))
+                            })
                   }))
               }),
         revision: context.hub.getRevision('turn', turnKey(record.id, turn.id))
@@ -673,6 +701,9 @@ export const threadRowOf = (
     const unreadable = invalid !== undefined;
     const entries = messages ?? [];
     const preview = opts.withPreview === true ? lastEntryPreview(entries) : undefined;
+    // W26: the conversation's recorded invocation ids, resolved once for this row (see
+    // `rosterInvocationIdsOf` below for the source rule and the cap).
+    const invocationIds = rosterInvocationIdsOf(record, thread);
 
     return {
         id: thread.id,
@@ -682,6 +713,50 @@ export const threadRowOf = (
         sequence: thread.sequence,
         ...(thread.ownerThreadId === undefined ? {} : { owner_thread_id: thread.ownerThreadId }),
         ...(label === undefined ? {} : { label }),
+        // W26 (2026-11-17) — THE ID HALF OF THE PAIR `epoch` DESCRIBES, now on this row.
+        //
+        // WHY IT HAD TO COME: W22 published the PROCESS (`epoch`) on this plane while the row itself stayed
+        // id-free by the R1 compact-roster decision, and that left the token unpairable exactly where it is
+        // needed. `../frontend/view-shell.ts` `getRawSession` (the transcript dialog and the JSON export,
+        // called from `../frontend/main.ts` on the explicit export action) builds its roster rows from THIS
+        // page, so on that path `epoch` arrived as a process with no invocation id beside it and the
+        // invocation -> conversation join still could not key a contested id
+        // (`../frontend/ui/thread-transcript.ts` `attributedThreadOf`, door 1). The discriminator worked only
+        // on the planes that already publish ids — `./protocol.ts` `SessionThread.invocationIds` and
+        // `SessionThreadView.invocationIds` — which made the answer depend on which read the client made.
+        //
+        // THE EMIT RULE, in one line: `invocation_id` appears exactly when this conversation's record names a
+        // run, `invocation_ids` exactly when anything was recorded for it, and `epoch` exactly when the record
+        // pairs that id with the process that minted it. A conversation that never ran therefore names NONE of
+        // the three; a document whose runs predate the epoch field gains the two id keys and stays epoch-free.
+        // Never `[]`, never an empty string — a key that exists here always carries a value worth reading.
+        //
+        // THE VALUES ARE BARE, NEVER THE RUN KEY. The persisted join map is keyed by `id\0epoch` (R19), and
+        // `invocationIdOfRunKey` strips it at this boundary exactly as `uniqueInvocationIds` has always done
+        // for the full resource below, so a reported id can be sent straight back to the transcript routes
+        // (`./api-mutations.ts` `parseTranscriptInvocationId`) and no composite leaks to a client
+        // (`../shared/run-identity.ts` keeps the composite private).
+        ...(thread.invocationId === undefined || thread.invocationId.length === 0
+            ? {}
+            : { invocation_id: thread.invocationId }),
+        ...(invocationIds.length === 0 ? {} : { invocation_ids: invocationIds }),
+        // W22 (2026-11-17) — the conversation's RUN discriminator, on the host/UI roster plane
+        // (`./harness.swagger.yaml` `ThreadSummary.epoch`). Emitted under exactly ONE condition: the runtime
+        // record pairs an invocation id with the process that minted it (`../types/index.ts`
+        // `HarnessThreadRecord.epoch`, which travels with `invocationId` and never ahead of it). A
+        // conversation that never ran, and every conversation restored from a document written before the
+        // field, therefore emits NO key — a legacy roster row projects byte-identically.
+        //
+        // WHAT THE TOKEN MEANS ON THIS ROW: "the process this conversation's LATEST recorded run executed
+        // in" — i.e. the process that minted the `invocation_id` right above it. The two keys are ONE fact,
+        // and that is what lets the browser rebuild `invocationRunKeyOf(invocation_id, epoch)`
+        // (`../shared/run-identity.ts`) from two bare wire fields instead of guessing between two claimants
+        // of a recycled id. The value is the BARE token, never `id\0epoch` — the run key is derived, and is
+        // not a wire value anywhere. The field is host/UI-only — the model-facing `threadList` page strips it
+        // (`../harness.ts` `modelThreadRosterOf`) and the turn/display plane never carries it.
+        ...(thread.invocationId === undefined || typeof thread.epoch !== 'string' || thread.epoch.length === 0
+            ? {}
+            : { epoch: thread.epoch }),
         transcript_state: unreadable ? 'unreadable' : 'ok',
         ...(unreadable ? { transcript_error: invalid.error } : {}),
         message_count: unreadable ? 0 : entries.length,
@@ -689,6 +764,40 @@ export const threadRowOf = (
         has_transcript: unreadable ? false : entries.length > 0,
         ...(preview === undefined ? {} : { preview })
     };
+};
+
+// Every BARE invocation id this conversation recorded, oldest first, capped at `MAX_ROSTER_INVOCATIONS`.
+//
+// THE SOURCE RULE, stated because the two sources are not interchangeable:
+//   1. the store's persisted invocation join (`record.invocationThreads`, keyed by RUN so a recycled id is
+//      not shared by two generations — `../shared/run-identity.ts`, written by `./sessions.ts`
+//      `noteInvocationThread`). Iteration order is OBSERVATION order, so the card's original run comes
+//      before the continuations that advanced the record's single slot;
+//   2. the runtime record's OWN slot (`HarnessThreadRecord.invocationId`, the id of its latest run, and the
+//      half `epoch` is paired with). It is appended only when the join does not already name it, because a
+//      conversation can legitimately hold a run its durable join never names: a reset CLEARS the map
+//      (`../sessions.ts:12473`), and the roster scan that writes the join is one-sided when the record
+//      carries no epoch — the residual `./sessions.epoch-discrimination.test.ts` D2 pins, where the live
+//      child's own record is the only thing that can identify its run.
+//
+// This is the roster-row twin of the store's own rule (`../sessions.ts` `invocationIdsOf`, which widens
+// `SessionThread.invocationIds` the same way) and of `uniqueInvocationIds` below, from which it takes the
+// bare-id strip, the dedup and the cap. Widening matters here and only here: the transcript join reads this
+// list to find the CLAIMANTS of an id, so a row that omits the run its own record carries makes a contested
+// id invisible on the export plane.
+const rosterInvocationIdsOf = (record: SessionRecord, thread: { id: string; invocationId?: string }): string[] => {
+    const ids = uniqueInvocationIds(record, thread.id, undefined);
+
+    if (
+        typeof thread.invocationId === 'string' &&
+        thread.invocationId.length > 0 &&
+        ids.length < MAX_ROSTER_INVOCATIONS &&
+        !ids.includes(thread.invocationId)
+    ) {
+        ids.push(thread.invocationId);
+    }
+
+    return ids;
 };
 
 /** A bounded tail of the last transcript entry (never the whole transcript). */
@@ -719,6 +828,15 @@ export const threadResourceOf = (
     const turn = owningTurnOf(record, row.id);
     const invocationIds = uniqueInvocationIds(record, row.id, turn);
 
+    // W26 (2026-11-17) — the row this resource is built ON now seeds `invocation_id`/`invocation_ids`
+    // (`threadRowOf` above), so the two writes below are OVERWRITES, not insertions: the keys keep the
+    // position the row gave them (JSON key order follows first insertion) and the resource's rule wins the
+    // value. That is deliberate and it is narrow: the resource keeps the JOIN-derived answer — `latestInvocationId`
+    // and the map-only list, unchanged since R19 and pinned by ./threads.test.ts — and those agree with the
+    // row's record-slot answer on every document whose join names the conversation, which is every document a
+    // normal run writes. The two can differ only where the durable join does not name the run the record
+    // carries (a reset cleared the map, or the one-sided roster scan of the D2 residual), and there the
+    // resource simply keeps whatever the row stated.
     return {
         ...row,
         session_id: record.id,
@@ -738,9 +856,7 @@ export const threadResourceOf = (
             ? {}
             : { connected_thread_ids: connectedThreadsOf(record, row.id) }),
         transcript_revision: context.hub.getRevision('transcript', threadKey(record.id, row.id)),
-        ...(opts.transcriptBytes === undefined
-            ? {}
-            : { transcript_bytes: opts.transcriptBytes }),
+        ...(opts.transcriptBytes === undefined ? {} : { transcript_bytes: opts.transcriptBytes }),
         revision: context.hub.getRevision('thread', threadKey(record.id, row.id))
     };
 };
@@ -748,13 +864,26 @@ export const threadResourceOf = (
 /** Cap on the invocation ids one roster row reports (bounded wire, same rule as the store). */
 export const MAX_ROSTER_INVOCATIONS = 64;
 
+// R19 (2026-11-17): the persisted `invocationThreads` map is keyed by INVOCATION RUN
+// (`id\0epoch`, or the bare id for a document written before the epoch field existed) — see
+// ./protocol.ts `invocationRunKeyOf`. These readers sit at the WIRE boundary, so every id they
+// report goes through `invocationIdOfRunKey`: `invocation_ids`/`invocation_id` stay bare
+// invocation ids, because a client joins them onto `TurnSection.invocationId`, which carries no
+// epoch. A legacy document holds bare keys only and comes back unchanged, byte for byte.
+const invocationIdOfEntry = (runKey: string): string => invocationIdOfRunKey(runKey);
+
 /** Every invocation id recorded in this conversation, oldest first, capped. */
 const uniqueInvocationIds = (record: SessionRecord, threadId: string, turn: { id: string } | undefined): string[] => {
     const ids: string[] = [];
     const seen = new Set<string>();
 
-    for (const [invocationId, mapped] of record.invocationThreads) {
+    for (const [runKey, mapped] of record.invocationThreads) {
         if (mapped !== threadId) continue;
+
+        // One conversation that ran in two processes can hold the SAME bare id twice — once under
+        // each epoch — so the cap and the uniqueness rule are both stated on the id, not the key.
+        const invocationId = invocationIdOfEntry(runKey);
+
         if (seen.has(invocationId)) continue;
 
         seen.add(invocationId);
@@ -770,8 +899,10 @@ const uniqueInvocationIds = (record: SessionRecord, threadId: string, turn: { id
 const latestInvocationId = (record: SessionRecord, threadId: string): string | undefined => {
     let latest: string | undefined;
 
-    for (const [invocationId, mapped] of record.invocationThreads) {
-        if (mapped === threadId) latest = invocationId;
+    for (const [runKey, mapped] of record.invocationThreads) {
+        // Map order is observation order, so the last matching entry is the newest run this
+        // document recorded — including a run of the same conversation in a later process.
+        if (mapped === threadId) latest = invocationIdOfEntry(runKey);
     }
 
     return latest;
@@ -829,7 +960,9 @@ export const transcriptMetadataOf = (
         bytes: Buffer.byteLength(JSON.stringify(messages), 'utf8'),
         revision: context.hub.getRevision('transcript', threadKey(record.id, threadId)),
         role_counts: roleCounts,
-        ...(invalid === undefined ? {} : { unreadable_reason: invalid.error, stored_type: storedTypeOf(invalid.messages) })
+        ...(invalid === undefined
+            ? {}
+            : { unreadable_reason: invalid.error, stored_type: storedTypeOf(invalid.messages) })
     };
 };
 
@@ -1230,11 +1363,7 @@ const liveToolDescription = (record: SessionRecord, name: string): string | unde
 };
 
 /** One session tool's detail row: the summary plus the schema and the execution gate. */
-export const sessionToolDetailOf = (
-    record: SessionRecord,
-    name: string,
-    context: ReadContext
-): SessionToolDetail => {
+export const sessionToolDetailOf = (record: SessionRecord, name: string, context: ReadContext): SessionToolDetail => {
     const rows = sessionToolRowsOf(record, context);
     const row = rows.find((candidate) => candidate.name === name);
 
@@ -1312,10 +1441,7 @@ export const toolExecutionScopeOf = (name: string): ToolExecutionScope => ({
 });
 
 /** The installed source revision of one session tool (the editor's payload). */
-export const sessionToolSourceOf = (
-    record: SessionRecord,
-    name: string
-): SessionToolSourceResponse | undefined => {
+export const sessionToolSourceOf = (record: SessionRecord, name: string): SessionToolSourceResponse | undefined => {
     const source = record.harness.toolSource(name);
 
     if (source === undefined) return undefined;
@@ -1423,8 +1549,8 @@ export const sessionAgentRowsOf = (record: SessionRecord, context: ReadContext):
                     ? {}
                     : { has_instruction_override: true }
                 : source === 'harness' || source === 'session'
-                    ? { has_instruction_override: true }
-                    : {}),
+                  ? { has_instruction_override: true }
+                  : {}),
             ...(brain === undefined ? {} : { guidelines_count: brain.instructions.length }),
             editable: true,
             // The entry agent cannot be detached: every session needs an entry point. R6: neither
@@ -1516,17 +1642,13 @@ export const harnessDefinitionOf = (
 ): HarnessDefinition => ({
     ...harnessCardOf(preset, hub, registeredTools),
     core_tools: [...coreTools],
-    ...(Object.keys(preset.agentModels ?? {}).length === 0
-        ? {}
-        : { agent_models: { ...preset.agentModels } }),
+    ...(Object.keys(preset.agentModels ?? {}).length === 0 ? {} : { agent_models: { ...preset.agentModels } }),
     // R2: the per-agent display colors, emitted under the same non-empty rule as
     // `agent_models`, so an uncolored definition keeps its exact pre-R2 shape. This is
     // the field the UI paints swatches from (`HarnessDescriptor.agentColors` in the
     // internal model, `agent_colors` on the wire); a member it omits is uncolored and
     // the host applies its own derivation.
-    ...(Object.keys(preset.agentColors ?? {}).length === 0
-        ? {}
-        : { agent_colors: { ...preset.agentColors } }),
+    ...(Object.keys(preset.agentColors ?? {}).length === 0 ? {} : { agent_colors: { ...preset.agentColors } }),
     instruction_summary: summary
 });
 
@@ -1577,7 +1699,7 @@ export const instructionTextOf = (
 
     if (profile === undefined && typeof override !== 'string') return undefined;
 
-    const instruction = typeof override === 'string' ? override : profile?.instruction ?? '';
+    const instruction = typeof override === 'string' ? override : (profile?.instruction ?? '');
     const harnessOverride = typeof override === 'string';
 
     return {
@@ -1586,8 +1708,8 @@ export const instructionTextOf = (
         source: harnessOverride
             ? 'harness'
             : state?.overridesOf(agent).instruction !== undefined
-                ? 'global'
-                : 'catalogue',
+              ? 'global'
+              : 'catalogue',
         instruction,
         guidelines: [...(profile?.guidelines ?? [])],
         chars: instruction.length
@@ -1661,10 +1783,7 @@ export const toolDetailOf = (
  * because that is the field a prompt editor highlights; `has_global_override` is any stated
  * field, because that is what makes a "restore the shipped profile" affordance meaningful.
  */
-export const agentSummaryOf = (
-    profile: TrustedAgentProfile,
-    state?: AgentState
-): AgentSummary => {
+export const agentSummaryOf = (profile: TrustedAgentProfile, state?: AgentState): AgentSummary => {
     const overrides = state?.overridesOf(profile.name) ?? {};
 
     return {
@@ -1783,9 +1902,7 @@ export const sessionDefinitionOf = (
                       // removes the `effectiveInstruction === undefined` hole the ladder below has
                       // for it.
                       if (Object.prototype.hasOwnProperty.call(customs, agent)) {
-                          const live = brains[agent] === undefined
-                              ? undefined
-                              : brains[agent]!.instructions.join('\n');
+                          const live = brains[agent] === undefined ? undefined : brains[agent]!.instructions.join('\n');
 
                           return {
                               agent,
@@ -1809,12 +1926,11 @@ export const sessionDefinitionOf = (
                           source: harnessOverride
                               ? 'harness'
                               : globalInstruction !== undefined
-                                  ? 'global'
-                                  : 'catalogue',
+                                ? 'global'
+                                : 'catalogue',
                           overridden: harnessOverride,
                           chars:
-                              (definition.agentInstructions ?? {})[agent]?.length ??
-                              (effectiveInstruction ?? '').length
+                              (definition.agentInstructions ?? {})[agent]?.length ?? (effectiveInstruction ?? '').length
                       };
                   })
               }),

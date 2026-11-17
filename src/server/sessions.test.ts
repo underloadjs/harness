@@ -11,6 +11,12 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '../harness';
+// T-W8: every recorded `thread` payload now carries the minting process's epoch
+// (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
+// ../harness.ts). These assertions are WHOLE payloads, so the key has to be named; the
+// value is exact because every frame here was recorded IN THIS PROCESS (the delegated
+// child runs inline), and vitest gives one module registry per file — one epoch per file.
+import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
 import type { HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessUsage } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
@@ -743,7 +749,10 @@ describe('SessionStore turns', () => {
                 model: 'scripted/test',
                 // T3 thread identity: direct child of the root, so no parentId; the
                 // prompt travels on this frame only.
-                thread: { id: '2', callId: 'call_1', input: 'find it' }
+                // T-W8: and the frame names the PROCESS that minted this invocation id
+                // (`HarnessThread.epoch`, ../core/agent-limits.ts `HARNESS_PROCESS_EPOCH` —
+                // one epoch per process, and the delegated child runs in this one).
+                thread: { id: '2', callId: 'call_1', input: 'find it', epoch: HARNESS_PROCESS_EPOCH }
             },
             // R3/F1: the lead's tool-calling request committed its answer. It gets no
             // `done` (the harness emits `done` only for a tool-free response), so this
@@ -754,7 +763,7 @@ describe('SessionStore turns', () => {
                 type: 'text',
                 agent: 'helper',
                 delta: 'helper answer',
-                thread: { id: '2', callId: 'call_1' }
+                thread: { id: '2', callId: 'call_1', epoch: HARNESS_PROCESS_EPOCH }
             },
             // Only the helper's stream reports usage here: the lead's two requests
             // have no `usage` on their `done` frames, so they emit no usage event.
@@ -762,12 +771,12 @@ describe('SessionStore turns', () => {
                 type: 'usage',
                 agent: 'helper',
                 usage: { input: 3, output: 2, total: 5 },
-                thread: { id: '2', callId: 'call_1' }
+                thread: { id: '2', callId: 'call_1', epoch: HARNESS_PROCESS_EPOCH }
             },
             {
                 type: 'done',
                 agent: 'helper',
-                thread: { id: '2', callId: 'call_1' },
+                thread: { id: '2', callId: 'call_1', epoch: HARNESS_PROCESS_EPOCH },
                 message: {
                     role: 'assistant',
                     content: 'helper answer',

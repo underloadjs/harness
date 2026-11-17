@@ -31,7 +31,16 @@
 //     harness.ts, which never sees a retry as a new turn.
 //
 // Policy: one initial attempt plus `maxRetries` (default 10) retries, with a
-// doubling wait of `baseDelayMs * 2 ** (n - 1)` (default 1s, 2s, ... 512s).
+// doubling wait of `min(baseDelayMs * 2 ** (n - 1), RETRY_MAX_DELAY_MS)` (default
+// 1s, 2s, ... 32s, then 60s for the rest of the ladder). The cap is not decoration
+// (2026-11-17, the unrecoverable-timeout report): uncapped doubling made an exhausted
+// ladder cost 1023 s (~17 min) of pure sleeping, which nobody reads as patience.
+// Two failure classes own their OWN short ladders — `provider-connection` (3 attempts,
+// 250 ms/500 ms) and `provider-timeout` (4 attempts, 2 s/4 s/8 s, capped at 30 s and
+// bounded by a 900 s wall clock) — and ignore a NON-ZERO `maxRetries`, because widening
+// the transient ladder says "my provider blips", not "dial my dead port eleven times".
+// `maxRetries: 0` is the exception and the rule: it is a hard opt-out for every class,
+// so `retry: false` still means exactly one attempt (../types/index.ts documents it).
 // Success ends the sequence; when the final retry fails, the ORIGINAL error of
 // that attempt is rethrown/yielded unchanged, so a caller keeps the real cause.
 // Cancellation is never an error to retry: an aborted signal (in flight or
@@ -81,20 +90,39 @@ import {
     CONTEXT_OVERFLOW_CODE,
     MAX_RESPONSE_SCHEMA_NAME_CHARS,
     openAICompatible,
-    // (T6) The two provider failure CLASSES the transport names, so the retry policy
+    // (T6) The provider failure CLASSES the transport names, so the retry policy
     // below switches on a machine code exactly like `context-overflow` does — never on
-    // English. `provider-timeout` is terminal; `provider-connection` gets the short
-    // ladder from ./agent-limits.ts.
+    // English. `provider-connection` gets the short ladder from ./agent-limits.ts;
+    // `provider-timeout` used to be terminal and now gets its own bounded one (see
+    // `PROVIDER_TIMEOUT_MAX_ATTEMPTS` below).
     // (T8, AC3) `provider-rejected` is the third class: a deterministic HTTP refusal
     // (400/401/403/404) is terminal for the same reason a missed bound is — the next
     // attempt re-sends the request the provider already refused.
+    // (2026-11-17) `provider-aborted` is the fourth: the gateway's own in-stream
+    // `aborted` answer, i.e. a cancel that did NOT come from our signal. Re-sending a
+    // request the caller no longer wants is wrong, so it is terminal like a refusal.
+    // `provider-timeout` is the one class in this group that IS retried now — its own
+    // bounded ladder, below.
+    PROVIDER_ABORTED_CODE,
     PROVIDER_CONNECTION_CODE,
     PROVIDER_REJECTED_CODE,
-    PROVIDER_TIMEOUT_CODE
+    PROVIDER_TIMEOUT_CODE,
+    // The one shape-checking reader of the transport's structured `details`, shared with
+    // ../harness.ts so a `retry` frame and the terminal `error` record publish the same
+    // diagnostics block from the same rules.
+    providerDiagnosticsOf
 } from '../transport';
-// (T6) The short ladder a dead dial gets, kept in the same leaf as every other run
+// The ladder each provider failure class gets, kept in the same leaf as every other run
 // bound (the declared contract AND the runtime values).
-import { PROVIDER_CONNECTION_MAX_RETRIES, PROVIDER_CONNECTION_RETRY_BASE_DELAY_MS } from './agent-limits';
+import {
+    PROVIDER_CONNECTION_MAX_RETRIES,
+    PROVIDER_CONNECTION_RETRY_BASE_DELAY_MS,
+    PROVIDER_TIMEOUT_MAX_RETRIES,
+    PROVIDER_TIMEOUT_RETRY_BASE_DELAY_MS,
+    PROVIDER_TIMEOUT_RETRY_DEADLINE_MS,
+    PROVIDER_TIMEOUT_RETRY_MAX_DELAY_MS,
+    RETRY_MAX_DELAY_MS
+} from './agent-limits';
 import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
 import {
     agentBranchOf,
@@ -556,9 +584,14 @@ const resolveRetryPolicy = (configuration: HarnessRetryConfiguration | undefined
     return { maxRetries, baseDelayMs };
 };
 
-// The wait before retry `attempt` (1-based): 1000, 2000, 4000 ... by default.
+// The wait before retry `attempt` (1-based): 1000, 2000, 4000 ... 32000, then 60000 for
+// every later retry. The ceiling is what `RETRY_MAX_DELAY_MS` is for (../core/agent-limits.ts):
+// the doubling decides how FAST the waits grow, the ceiling decides how LONG the run may
+// sleep for one of them. An uncapped ladder slept 512 s on its last wait and 1023 s in
+// total — longer than most provider outages — so the tail is now flat and the published
+// `delayMs` stays honest (no jitter: a host that wants it varies `retry.baseDelayMs`).
 const retryDelayOf = (policy: RetryPolicy, attempt: number): number =>
-    policy.baseDelayMs * 2 ** (attempt - 1);
+    Math.min(policy.baseDelayMs * 2 ** (attempt - 1), RETRY_MAX_DELAY_MS);
 
 // ---------------------------------------------------------------------------
 // Provider failure classes (T6)
@@ -574,52 +607,39 @@ const PROVIDER_CONNECTION_MAX_ATTEMPTS = PROVIDER_CONNECTION_MAX_RETRIES + 1;
 const providerConnectionDelayOf = (attempt: number): number =>
     PROVIDER_CONNECTION_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
 
-// Lift the transport's structured diagnostics off a failed attempt's error.
+// Total attempts for the provider-timeout ladder (the initial one plus its 3 retries).
+// Like the connection ladder, `retry.maxRetries` does NOT stretch it: widening the
+// transient ladder says "my provider blips", not "give a provider that already missed a
+// five-minute bound eleven more chances". The whole shape (4 attempts, 2 s/4 s/8 s, a
+// 30 s per-delay ceiling, a 900 s ladder deadline) is justified in ../core/agent-limits.ts.
+const PROVIDER_TIMEOUT_MAX_ATTEMPTS = PROVIDER_TIMEOUT_MAX_RETRIES + 1;
+
+// The wait before retry `attempt` (1-based) of the timeout ladder: 2000, 4000, 8000 by
+// default, never above `PROVIDER_TIMEOUT_RETRY_MAX_DELAY_MS`.
 //
-// The transport puts them on the error FRAME (`details`, see ../types), the frame
-// loop below puts them on the thrown `HarnessError`, and this is the one place that
-// decides whether they are SHAPE-ABLE: a custom transport may put anything in
-// `details`, so every field is checked before it rides onto a published event.
-// Anything unrecognised yields `undefined`, and the `retry` event keeps the exact
-// shape it had before T6.
-type ProviderAttemptDiagnostics = {
-    errorClass: string;
-    url: string;
-    port?: number;
-    phase?: 'response-head' | 'first-token' | 'stream-chunk';
-    timeoutMs?: number;
-    errno?: string;
-};
+// `retry.baseDelayMs` RAISES this ladder's base but never lowers it: a host that
+// configured 20 s waits for its transient failures means "my provider needs longer
+// between dials", and that intent applies a fortiori to a provider that just missed a
+// time bound — while the ceiling still flattens the tail, so a 20 s base yields
+// 20 s, 30 s, 30 s and not 20 s, 40 s, 80 s. The shipped default (1 s) is below the
+// ladder's own 2 s floor, so the documented 2 s / 4 s / 8 s ladder is what runs unless a
+// host asks for more.
+const providerTimeoutDelayOf = (policy: RetryPolicy, attempt: number): number =>
+    Math.min(
+        Math.max(policy.baseDelayMs, PROVIDER_TIMEOUT_RETRY_BASE_DELAY_MS) * 2 ** (attempt - 1),
+        PROVIDER_TIMEOUT_RETRY_MAX_DELAY_MS
+    );
 
-const providerDiagnosticsOf = (error: unknown): ProviderAttemptDiagnostics | undefined => {
-    try {
-        if (!isInstanceOf(error, HarnessError)) return undefined;
-
-        const details = error.details;
-
-        if (typeof details !== 'object' || details === null) return undefined;
-
-        const record = details as Record<string, unknown>;
-
-        if (typeof record.errorClass !== 'string' || typeof record.url !== 'string') return undefined;
-
-        return {
-            errorClass: record.errorClass,
-            // Already redacted by the transport (origin + path, no userinfo/query), so
-            // a UI can render it without risking an echoed credential.
-            url: record.url,
-            ...(typeof record.port === 'number' ? { port: record.port } : {}),
-            ...(record.phase === 'response-head' || record.phase === 'first-token' || record.phase === 'stream-chunk'
-                ? { phase: record.phase }
-                : {}),
-            ...(typeof record.timeoutMs === 'number' ? { timeoutMs: record.timeoutMs } : {}),
-            ...(typeof record.errno === 'string' ? { errno: record.errno } : {})
-        };
-    } catch {
-        // Diagnostics are never worth a second failure on an error path.
-        return undefined;
-    }
-};
+// The wall clock ONE `provider-timeout` ladder may consume. Captured at the top of
+// `attemptWithRetries` (the first attempt's start) and compared against
+// `PROVIDER_TIMEOUT_RETRY_DEADLINE_MS` before another attempt is scheduled. It bounds
+// the PROVIDER's time too, not just our sleeps, because that is the number the operator
+// experiences: four dials into a gateway whose bound is minutes must not become an hour.
+//
+// `Date.now()` rather than an injected clock: the ladder is the only consumer, the value
+// only ever gates a decision (it is never published), and every test that drives it runs
+// under faked timers, which move `Date.now()` with the same clock as the backoff timers.
+const providerTimeoutDeadlineOf = (): number => Date.now() + PROVIDER_TIMEOUT_RETRY_DEADLINE_MS;
 
 // ---------------------------------------------------------------------------
 // Pre-request context floor (issue 0004)
@@ -1170,10 +1190,18 @@ const createAgent = (
         // (reported by the success boundary below); a final failure rethrows the
         // original error of the last attempt (R1: useful original error, not a
         // wrapper).
+        //
+        // ONE DEADLINE PER REQUEST, CAPTURED BEFORE THE FIRST DIAL (2026-11-17). It is
+        // taken here rather than per attempt on purpose: the `provider-timeout` ladder
+        // bounds the WAIT THE CALLER EXPERIENCES for one model request — every attempt's
+        // provider time plus our backoffs — and a budget re-read per attempt would never
+        // expire. A later request in the same run (the next turn) owns a fresh budget.
         const attemptWithRetries = async function* (): AsyncGenerator<
             AgentStreamEvent,
             { outcome: AttemptOutcome; attempt: number }
         > {
+            const timeoutDeadlineAt = providerTimeoutDeadlineOf();
+
             for (let attempt = 1; ; attempt++) {
                 // ABORT BOUNDARY (R2): never start another attempt for a cancelled
                 // request, and never wait out a backoff for one.
@@ -1202,17 +1230,6 @@ const createAgent = (
 
                     const code = isInstanceOf(error, HarnessError) ? error.code : undefined;
 
-                    // A TIMEOUT IS NOT A TRANSIENT FAILURE EITHER (T6, AC1). A provider
-                    // that missed a five-minute head or first-token bound, or went
-                    // silent for two minutes mid-stream, has already consumed the whole
-                    // patience budget the ladder exists to buy; re-sending into the same
-                    // wedge would pay ANOTHER bound on top, which is how a stalled
-                    // gateway would take 30 minutes to say nothing. So the attempt that
-                    // tripped a bound is TERMINAL, and the error (already naming the
-                    // endpoint, the phase and the variable to raise) is what the caller
-                    // sees. `provider.*TimeoutMs` = 0 remains the escape hatch for a
-                    // legitimately slower provider: with no bound there is no
-                    // `provider-timeout`, and the pre-T6 behaviour is back exactly.
                     // A DETERMINISTIC REFUSAL IS NOT A TRANSIENT FAILURE EITHER (T8,
                     // AC3). `provider-rejected` is the transport's name for an HTTP
                     // 400/401/403/404 answer (transport/openai.ts): the provider is up
@@ -1224,7 +1241,16 @@ const createAgent = (
                     // them) and keep the ladder, as does every codeless frame — so an
                     // unclassified 4xx or a scripted provider error is still retried
                     // exactly as src/core/agent.retry.test.ts pins it.
-                    if (code === PROVIDER_TIMEOUT_CODE || code === PROVIDER_REJECTED_CODE) throw error;
+                    //
+                    // A PROVIDER-REPORTED CANCEL IS IN THE SAME FAMILY (2026-11-17).
+                    // `provider-aborted` is the gateway's own in-stream `aborted` answer
+                    // (transport/openai.ts `providerWireFailureOf`): the request was
+                    // cancelled before it completed, so re-sending it buys an answer
+                    // nobody is waiting for. A LOCAL stop never lands here — the
+                    // `isAbortError` short-circuit above already caught it, so a user
+                    // stop keeps its historical identity and this branch only ever sees
+                    // a cancel that came from the provider side.
+                    if (code === PROVIDER_REJECTED_CODE || code === PROVIDER_ABORTED_CODE) throw error;
 
                     // A DEAD DIAL IS NOT A TRANSIENT FAILURE EITHER (T6, AC2). A refused
                     // connection, an unresolvable host, or a reset before the first byte
@@ -1234,15 +1260,71 @@ const createAgent = (
                     // instead of the 1 s -> 512 s one, then fails terminally with a
                     // message that names the dialled host:port. 17.05 minutes became
                     // under a second for a localhost refusal.
+                    //
+                    // A TIMEOUT IS NOT TERMINAL EITHER (T6, AC1 — as corrected by the
+                    // unrecoverable-timeout report, 2026-11-17). It used to join the two
+                    // terminal classes above: one attempt, zero `retry` frames, and a
+                    // conversation marked interrupted forever because a gateway went
+                    // silent 120 s into a stream. The reasoning behind that ("a provider
+                    // that missed a five-minute bound is not repaired by an instant
+                    // re-send") was right about the LADDER and wrong about the
+                    // CONCLUSION — what it rules out is the 1 s -> 512 s transient
+                    // ladder, not retrying. A wedged gateway usually un-wedges, so the
+                    // class now gets its own short, bounded one:
+                    //
+                    //   4 attempts (1 + 3), waits 2 s / 4 s / 8 s capped at 30 s, and a
+                    //   900 s wall-clock deadline over the whole sequence, INCLUDING the
+                    //   provider time each attempt spent. Worst case with the shipped
+                    //   defaults: 4 × the 120 s stream bound + 14 s of backoff ≈ 494 s.
+                    //   `provider.*TimeoutMs` = 0 remains the escape hatch for a
+                    //   legitimately slower provider: with no bound there is no
+                    //   `provider-timeout` and no ladder at all.
+                    //
+                    // WHY THE DEADLINE AND NOT JUST AN ATTEMPT COUNT: the count bounds
+                    // HOW MANY times a pathological endpoint is dialled, the deadline
+                    // bounds HOW LONG the caller waits. A host that raised the bounds to
+                    // minutes (or a gateway whose own upstream takes ten minutes) is the
+                    // case only the deadline catches — four dials of ten minutes each
+                    // would otherwise be an hour of spinner.
                     const connection = code === PROVIDER_CONNECTION_CODE;
-                    const attemptsForClass = connection ? PROVIDER_CONNECTION_MAX_ATTEMPTS : maxAttempts;
+                    const timeout = code === PROVIDER_TIMEOUT_CODE;
+
+                    // `retry: false` / `retry.maxRetries: 0` IS A HARD OPT-OUT, for every
+                    // class (2026-11-17). The two class ladders deliberately ignore a
+                    // NON-ZERO `maxRetries` — widening the transient ladder says "my provider
+                    // blips", not "dial my dead port eleven times" — but ZERO is a different
+                    // statement: the published contract (../types/index.ts, `retry`: "`false` =
+                    // one attempt only") promises a caller that it will not see a second
+                    // request at all. A host passes it exactly when a re-send is unwanted
+                    // rather than merely bounded: the server's scripted fixtures, a caller
+                    // driving a non-idempotent endpoint, or a test that wants the failure on
+                    // its own clock instead of the backoff's. Without this gate a
+                    // `provider-timeout` spent 4 dials and 14 s under `retry: false`.
+                    if (retryPolicy.maxRetries === 0) throw error;
+
+                    const attemptsForClass = connection
+                        ? PROVIDER_CONNECTION_MAX_ATTEMPTS
+                        : timeout
+                          ? PROVIDER_TIMEOUT_MAX_ATTEMPTS
+                          : maxAttempts;
 
                     // Out of retries for THIS class: the last attempt's own error is the answer.
                     if (attempt >= attemptsForClass) throw error;
 
                     const delayMs = connection
                         ? providerConnectionDelayOf(attempt)
-                        : retryDelayOf(retryPolicy, attempt);
+                        : timeout
+                          ? providerTimeoutDelayOf(retryPolicy, attempt)
+                          : retryDelayOf(retryPolicy, attempt);
+
+                    // THE TIMEOUT LADDER'S DEADLINE. Checked BEFORE the frame is emitted
+                    // and before the wait starts, so a ladder that has run out of wall
+                    // clock neither promises a retry nor sleeps for it: the caller gets
+                    // the last attempt's own error, exactly like an exhausted attempt
+                    // budget. Only the timeout class is deadline-bounded — the connection
+                    // ladder totals 750 ms of waiting, and the transient ladder is
+                    // bounded by its own attempt count times the 60 s ceiling.
+                    if (timeout && Date.now() + delayMs > timeoutDeadlineAt) throw error;
 
                     // Tell the consumer this attempt failed and what comes next. The
                     // event precedes the wait, so a UI can show the backoff while it

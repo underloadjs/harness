@@ -39,6 +39,12 @@
 //   - ../frontend/ui/turns.ts      — the block projection this mirrors
 
 import type { HarnessEvent } from '../harness';
+// The invocation-RUN key (W19, 2026-11-17). A block is ONE invocation RUN: the id the runtime stamps on
+// `thread.id` is a per-process counter, so two runs in one recorded turn can legitimately share it, and a
+// block keyed by the bare id merges them and labels the pair with one conversation's name. The key rule is
+// the store's own (`../server/sessions.ts` builds the label join with it), and this module is isomorphic,
+// so the leaf import below is the only form all three layers can share.
+import { invocationRunKeyOf } from './run-identity';
 
 // One reference a client submits with a task (or the server derives from a typed
 // `#LABEL`). `threadId` omitted means the ROOT block of `turnId`; a nested block
@@ -105,6 +111,12 @@ export type AgentResultTurn = {
     // blocks. A delegated child's events carry an invocation id; a reference must
     // name the CHILD CONVERSATION (`RR5`), not a fresh per-run number. Optional
     // because a legacy record carries no roster join.
+    //
+    // W19 (2026-11-17): the map is keyed by INVOCATION RUN (`id\0epoch`, or the bare id when the record
+    // names no epoch) — ../server/sessions.ts `invocationThreadLabels` hands out exactly that view, the
+    // same key space the display fold uses. A consumer resolves the frame's own run key first and only
+    // then the bare id, so a pre-epoch entry stays reachable while two runs of one recycled id can no
+    // longer claim each other's label.
     threadLabels?: Readonly<Record<string, string>>;
 };
 
@@ -451,13 +463,33 @@ const blocksOfTurn = (
         const thread = event.thread;
         if (thread === undefined) throw new Error('unreachable: event has no thread');
 
-        const known = byThread.get(thread.id);
+        // W19 (2026-11-17) — A BLOCK IS ONE RUN, so it is keyed by the run, not by the bare
+        // invocation id. The id is a per-process counter (`../shared/run-identity.ts`), and this record
+        // can hold two runs wearing it: a child that died before the restart, and the run a restarted
+        // process minted the id for afterwards. Keyed by `thread.id`, both folded into ONE block, and the
+        // block printed the label of whichever entry the store's join reached first — measured on the
+        // operator's document, the block for `15` showed `WE6` (the dead child's conversation) while the
+        // post-restart run wearing `15` belongs to `IT4`.
+        //
+        // The one-sided case merges, never splits, exactly like `../server/turn-projector.ts`
+        // `isEpochBoundary` and `../frontend/ui/turns.ts` `runKeyOf` state it: a frame that names no
+        // epoch has nothing to discriminate WITH, so it keeps the block the epoch-less frames of the same
+        // record already opened. Two KNOWN epochs are the only thing that separates two runs, and a run
+        // whose early frames predate the field continues in the block those frames opened.
+        const runKey = invocationRunKeyOf(thread.id, thread.epoch);
+        const known = byThread.get(runKey) ?? (runKey === thread.id ? undefined : byThread.get(thread.id));
+
         if (known !== undefined) return known;
 
         // Adopt a delegation placeholder created by the spawning tool call. The
         // placeholder was visible as `call:<callId>`; after adoption its CURRENT
         // identity is the runtime id, while the call key stays an alias.
-        const conversationLabel = turn.threadLabels?.[thread.id];
+        //
+        // W19: the conversation label resolves through the SAME run key, with the same bare fallback —
+        // `turn.threadLabels` is keyed by run (../server/sessions.ts `invocationThreadLabels`), and the
+        // fallback is the door a pre-epoch join entry is reached through.
+        const conversationLabel =
+            turn.threadLabels?.[runKey] ?? (runKey === thread.id ? undefined : turn.threadLabels?.[thread.id]);
 
         const placeholder = thread.callId === undefined ? undefined : byCall.get(thread.callId);
         if (placeholder !== undefined && placeholder.runtimeThreadId === undefined) {
@@ -466,14 +498,14 @@ const blocksOfTurn = (
             // R8: the child's CONVERSATION label replaces the provisional
             // per-invocation number the spawning call minted.
             if (conversationLabel !== undefined) placeholder.label = conversationLabel;
-            byThread.set(thread.id, placeholder);
+            byThread.set(runKey, placeholder);
             placeholder.started = true;
             return placeholder;
         }
 
         const block = createBlock(event.agent, thread.id, thread.callId, [], conversationLabel);
         block.runtimeThreadId = thread.id;
-        byThread.set(thread.id, block);
+        byThread.set(runKey, block);
         return block;
     };
 

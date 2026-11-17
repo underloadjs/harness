@@ -1010,7 +1010,22 @@ describe('openAICompatible', () => {
 
         const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
 
-        expect(events).toEqual([{ type: 'error', message: 'model overloaded' }]);
+        // (2026-11-17) A frame with NO `code` — a defensive/legacy INPUT shape, since both
+        // gateway writers now emit a coded envelope (`code` is required in each producer's
+        // frame type) — keeps its message byte-for-byte and the codeless transient ladder,
+        // and now also carries the transit diagnosis so a UI and the session layer can name
+        // the class without parsing the sentence.
+        expect(events).toEqual([
+            {
+                type: 'error',
+                message: 'model overloaded',
+                details: {
+                    errorClass: 'provider-transit',
+                    url: 'http://x/v1/chat/completions',
+                    port: 80
+                }
+            }
+        ]);
     });
 
     it('reports a malformed frame instead of emitting half a response', async () => {
@@ -1065,7 +1080,19 @@ describe('openAICompatible', () => {
 
         expect(events).toEqual([
             { type: 'text', delta: 'half' },
-            { type: 'error', message: 'The model stream ended before reporting a completion.' }
+            // (2026-11-17) The message and the codeless ladder are unchanged; what joins
+            // them is the transit diagnosis, because "the body closed mid-answer" is the
+            // textbook provider-transit death and `harness.ts` now classifies the run from
+            // that field instead of from this sentence.
+            {
+                type: 'error',
+                message: 'The model stream ended before reporting a completion.',
+                details: {
+                    errorClass: 'provider-transit',
+                    url: 'http://x/v1/chat/completions',
+                    port: 80
+                }
+            }
         ]);
     });
 

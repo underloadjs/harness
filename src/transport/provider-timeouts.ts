@@ -16,12 +16,18 @@
 //      common cause of the hang, and it is a configuration condition, not a
 //      transient blip — yet it burned one initial attempt plus ten retries, i.e.
 //      1+2+4+…+512 s = 1023 s (~17.05 min) of pure backoff before the user saw
-//      anything.
+//      anything. THAT ARITHMETIC IS HISTORY TWICE OVER: the connection class got its
+//      own 750 ms ladder (T6, AC2), and the transient ladder's waits are now CAPPED at
+//      `RETRY_MAX_DELAY_MS` (60 s, ../core/agent-limits.ts), so the same exhausted
+//      transient ladder costs at most 1+2+4+8+16+32+60+60+60+60 = 303 s (~5.05 min)
+//      instead of 1023 s.
 //
 // This module holds the THREE bounds, their defaults, their environment variables,
-// the message each one produces, and the classifier that tells the agent which
-// retry policy a fetch failure deserves. It is a LEAF (only ../util) on purpose:
-// `../server/config.ts` and `./openai.ts` both need the same facts and must not
+// the message each one produces, the classifier that tells the agent which
+// retry policy a fetch failure deserves, and the gateway's mid-stream error
+// vocabulary (see `providerWireFailureOf`). It is a LEAF (only ../util, plus a
+// type-only import of ../types) on purpose: `../server/config.ts` and `./openai.ts`
+// both need the same facts and must not
 // grow an import edge to each other, and a browser bundle that pulls the transport
 // must not pay for the server layer.
 //
@@ -66,15 +72,30 @@
 //   - ../server/config.ts      — startup validation + the reported runtime
 //   - ../.env.example          — the operator-facing copy of these names
 
-import { HarnessError } from '../util';
+import { HarnessError, isInstanceOf } from '../util';
+// The published shape of ONE provider attempt's diagnostics (`retry.provider`). The
+// transport BUILDS this object and `providerDiagnosticsOf` below validates it off a
+// thrown error, so the leaf that owns the vocabulary also owns the shape — and
+// ../core/agent.ts and ../harness.ts both read it through that one function.
+import type { HarnessProviderAttemptDiagnostics } from '../types';
 
 // The ONE machine name for "the provider had the request and ran out of time". It
 // follows the `HarnessError` code convention (../util/errors.ts): the code is also
 // the FIRST TOKEN of the message, because `harness.ts` renders a thrown error as
 // `Tool "…" failed: <message>` and only the message reaches the model, an event
-// consumer and a log line. `agent()` keeps it out of the exponential ladder — a
-// provider that missed a five-minute bound is not repaired by an instant re-send,
-// and the user has already waited minutes.
+// consumer and a log line.
+//
+// IT IS NOT TERMINAL ANY MORE (2026-11-17, the unrecoverable-timeout report). It used
+// to be — "a provider that missed a five-minute bound is not repaired by an instant
+// re-send" — and that read as "the thread stopped without retry" to the operator whose
+// gateway went silent 120 s into a stream: ONE attempt, zero `retry` frames, and a
+// permanently interrupted conversation. A missed bound is a provider that is slow or
+// wedged RIGHT NOW, and the wedge usually clears, so the class now gets its own
+// BOUNDED ladder (1 + 3 attempts, 2 s/4 s/8 s waits capped at 30 s, under a ladder-wide
+// wall-clock deadline — `PROVIDER_TIMEOUT_*` in ../core/agent-limits.ts). What stays
+// true from the original reasoning is the SHAPE of that ladder: it never touches the
+// 1 s -> 512 s transient ladder, because re-sending into a slow provider must not buy
+// seventeen more minutes of waiting.
 export const PROVIDER_TIMEOUT_CODE = 'provider-timeout';
 
 // The ONE machine name for "nothing answered the dial" (a refused connection, an
@@ -83,6 +104,15 @@ export const PROVIDER_TIMEOUT_CODE = 'provider-timeout';
 // single-digit-second waits and then fails terminally, instead of spending 17
 // minutes of backoff on a deployment that is never going to answer.
 export const PROVIDER_CONNECTION_CODE = 'provider-connection';
+
+// The ONE machine name for "this request was cancelled, and not by the provider
+// failing" (2026-11-17). It is the internal half of the gateway's in-stream
+// `aborted` wire code (see `providerWireFailureOf` below), and it is the only
+// provider-reported class `agent()` refuses to retry BESIDES `provider-rejected`:
+// a cancelled request that is re-sent is a request the caller no longer wants.
+// A LOCAL stop never reaches this class — the caller's own `AbortSignal` short-circuits
+// first (../core/agent.ts R2), so the abort keeps its historical identity byte-for-byte.
+export const PROVIDER_ABORTED_CODE = 'provider-aborted';
 
 // The ONE machine name for "the provider answered and REFUSED the request" (T8, AC3).
 // It sits beside `provider-timeout` and `provider-connection` in the same terminal
@@ -387,6 +417,304 @@ export const connectionFailureOf = (
 // they have always had, so the change is exactly the four statuses above.
 export const isTerminalProviderStatus = (status: number): boolean =>
     status === 400 || status === 401 || status === 403 || status === 404;
+
+// ---------------------------------------------------------------------------
+// The gateway's mid-stream error vocabulary (2026-11-17, unrecoverable-timeout report)
+// ---------------------------------------------------------------------------
+//
+// A gateway that proxies another provider does not fail the HTTP request when ITS
+// upstream dies: it answers 200, streams a while, and attaches an error object to one
+// SSE frame (`{"error":{"code":"timeout","status":504,…}}`). Until now the transport
+// read only `error.message` from that frame and threw the rest away, so the failure
+// reached `agent()` CODELESS and walked the generic transient ladder (or, for a
+// `provider-timeout`, none at all). The machine code was on the wire and we dropped it.
+//
+// THE VOCABULARY IS THE GATEWAY'S, NOT OURS. These six spellings are the contract the
+// provider side emits — `packages/underload/service/src/server/start.ts`
+// `classifyStreamError` / `buildStreamErrorPayload`, written to the SSE frame by
+// `:860-873` — and `providerWireFailureOf` is the one place that translates it into OUR
+// codes, so a gateway change lands in one function. Unknown spellings are NOT an error —
+// they are the codeless case, i.e. today's behaviour, which keeps the ladder and can
+// never fail a request the old code accepted.
+//
+// THE PRODUCER'S KEY SET IS EXACT: `{ error: { message, type, code, status?, errno?,
+// param: null } }`. `status` and `errno` are ABSENT (not `null`) when inapplicable, and
+// `param` is always `null` unless the provider named a field — so this reader treats
+// "absent", `null` and `undefined` as the same answer (absence) and NEVER tests whether
+// a key `in` the frame exists. BOTH producers emit that coded envelope: the primary
+// gateway above, and its behaviour-compatible copy at
+// `repository/agentic/src/server/start-server.ts` (vocabulary :294-303, payload builder
+// :599-669), where `code` is a REQUIRED key of `StreamErrorPayload` (:310). A frame with
+// NO `code` is therefore a defensive/legacy INPUT shape rather than a live producer —
+// the no-code branch below is still a supported input (pinned by
+// src/transport/openai.provider-wire-codes.test.ts `keeps a frame with NO code at all`),
+// so it is kept on purpose and never "fixed" away.
+//
+// NOTHING HERE READS THE MESSAGE. Classification comes from `code`, with `status` and
+// `errno` as secondary inputs, because the producer's prose is endpoint-specific (the
+// private relay names `upstream <origin+pathname>`, other endpoints name
+// `endpoint <folder>`) and the `unknown` class keeps the byte-identical legacy sentence
+// `Upstream stream terminated`. The message is forwarded verbatim for a codeless frame
+// and quoted for a coded one; it is never a classifier.
+//
+//   wire `timeout`        → `provider-timeout`      (the bounded timeout ladder)
+//   wire `connection`     → `provider-connection`   (the short 3-attempt dial ladder)
+//   wire `aborted`        → `provider-aborted`      (never retried: a cancel is not a blip)
+//   wire `upstream_status`→ classified by `status` through `isTerminalProviderStatus`:
+//                          a refusal status (400/401/403/404) is `provider-rejected`
+//                          (terminal), anything else — including a frame with no usable
+//                          status, which cannot be classified — is the codeless class.
+//   wire `decode` /
+//       `unknown` /
+//       no code at all    → codeless, the generic transient ladder. UNCHANGED on purpose:
+//                          a body we could not decode or a provider that names nothing is
+//                          exactly the case the exponential ladder exists for.
+//
+// `decode` is deliberately NOT terminal: a provider that fails to decode ITS upstream's
+// reply is an upstream that will probably answer properly on the next dial, and the
+// status field is not the request's fault either way.
+//
+// THREE PRODUCER QUIRKS THIS CONSUMER MUST TOLERATE (they are deliberate and pinned by
+// the producer's own tests, so they are absorbed here, never "fixed" upstream):
+//   - an upstream 408 / 429 / 5xx — including a 504 the gateway itself would call a
+//     timeout — arrives as `upstream_status` with the status attached, NOT as `timeout`.
+//     The routing therefore sends 408/429/5xx to the codeless transient ladder through
+//     `isTerminalProviderStatus` (a refusal must be OUR request's fault, and an upstream
+//     504 is not), and only 400/401/403/404 become the terminal `provider-rejected`.
+//   - `ECONNRESET` is reported as `connection` whether it landed before the first chunk
+//     or after a hundred; only the message says which. Both get the short 3-attempt dial
+//     ladder. That is a slight widening for the mid-stream case (it used to walk the
+//     transient ladder), and it is the right answer: a reset is a dead socket either way,
+//     and the short ladder still retries.
+//   - `ETIMEDOUT` comes through as `timeout`, not as an errno-carrying `connection`, so
+//     the timeout class must not assume "a local bound expired" — it means "the provider
+//     side ran out of time", which is exactly why `details.timeoutMs` is omitted there
+//     (no local bound expired, so there is no bound to quote).
+export const PROVIDER_WIRE_TIMEOUT = 'timeout';
+export const PROVIDER_WIRE_CONNECTION = 'connection';
+export const PROVIDER_WIRE_ABORTED = 'aborted';
+export const PROVIDER_WIRE_UPSTREAM_STATUS = 'upstream_status';
+export const PROVIDER_WIRE_DECODE = 'decode';
+export const PROVIDER_WIRE_UNKNOWN = 'unknown';
+
+// The diagnostics class of a provider failure that the transport recognised as "the
+// bytes died in transit" but that carries NO retry code (the codeless wire cases above,
+// and a body that closed without reporting a completion). It exists because the retry
+// decision and the DIAGNOSIS are different questions: the ladder stays generic, while
+// `harness.ts` `classifyRunStopReason` still has to answer "was this run killed by the
+// network?" for the session layer, and it must do that from a structured field instead
+// of re-reading English prose.
+//
+// It is a `details.errorClass` value ONLY — never a published `HarnessErrorInfo.code` —
+// because a code promises a retry policy, and this class deliberately has the generic one.
+export const PROVIDER_TRANSIT_CLASS = 'provider-transit';
+
+// What one gateway error frame means in OUR vocabulary. `code` absent = codeless
+// transient ladder; `errorClass` is always set, because the diagnosis is emitted even
+// when the retry class is generic (see `PROVIDER_TRANSIT_CLASS`).
+export type ProviderWireFailure = {
+    code?: string;
+    errorClass: string;
+    // The upstream HTTP status the gateway quotes, when the frame carried a usable one.
+    // It rides in the MESSAGE (it is actionable prose) rather than in the diagnostics
+    // block, whose shape is the frozen `HarnessProviderAttemptDiagnostics`.
+    status?: number;
+    errno?: string;
+    // The request field the provider blamed, when it named one (`param: "max_tokens"`).
+    // Quoted in the MESSAGE, because it is about OUR request; the diagnostics block keeps
+    // its frozen `HarnessProviderAttemptDiagnostics` shape.
+    param?: string;
+    // For a wire `timeout`: which timeout phase to report. An in-stream frame can only
+    // mean `stream-chunk` — the stream was open — so this is fixed, not guessed.
+    phase?: ProviderTimeoutPhase;
+};
+
+// A usable HTTP status out of whatever the frame carried: a number, or a bare three-digit
+// string (some proxies serialise it quoted). Anything else is "no status", which is an
+// INPUT shape, not a failure — the caller then cannot claim a refusal.
+const wireStatusOf = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+
+    if (typeof value === 'string' && /^\d{3}$/.test(value.trim())) return Number(value.trim());
+
+    return undefined;
+};
+
+// Translate ONE gateway error frame into our retry class + diagnostics class. TOTAL by
+// construction: it reads `unknown` defensively and never throws, because this runs on an
+// error path fed by arbitrary gateway JSON (a frame may be `null`, a string, or an object
+// whose fields are objects).
+export const providerWireFailureOf = (raw: unknown): ProviderWireFailure => {
+    // The producer's exact key set is `{ message, type, code, status?, errno?, param: null }`
+    // (`packages/underload/service/src/server/start.ts:635-703`). `status`/`errno` are
+    // OMITTED when inapplicable rather than sent as `null`, and `param` is `null` in the
+    // common case, so every field below is read as a value and absence is decided by the
+    // type test — never by `'status' in frame`, which would treat an omitted key (what
+    // BOTH gateway writers send, the copy in repository/agentic too) and a `null`
+    // differently for no reason.
+    const record = (raw ?? {}) as { code?: unknown; status?: unknown; errno?: unknown; param?: unknown };
+
+    // Case- and space-insensitive: `Timeout`, `TIMEOUT ` and `timeout` are the same
+    // gateway answer, and a spelling we fail to match silently downgrades the ladder.
+    const wire = typeof record.code === 'string' ? record.code.trim().toLowerCase() : '';
+
+    const errnoRaw = typeof record.errno === 'string' ? record.errno.trim().toUpperCase() : '';
+    const status = wireStatusOf(record.status);
+
+    const errno = errnoRaw.length > 0 ? errnoRaw : undefined;
+
+    // The OpenAI error envelope's `param` names the request field the provider blamed
+    // (`"max_tokens"`). It is only ever quoted, never classified, and a gateway that
+    // sends `null` (the common case) yields absence rather than the word "null".
+    const paramRaw = typeof record.param === 'string' ? record.param.trim() : '';
+    const param = paramRaw.length > 0 ? paramRaw : undefined;
+
+    if (wire === PROVIDER_WIRE_TIMEOUT) {
+        return {
+            code: PROVIDER_TIMEOUT_CODE,
+            errorClass: PROVIDER_TIMEOUT_CODE,
+            phase: 'stream-chunk',
+            ...(errno === undefined ? {} : { errno })
+        };
+    }
+
+    if (wire === PROVIDER_WIRE_CONNECTION) {
+        return {
+            code: PROVIDER_CONNECTION_CODE,
+            errorClass: PROVIDER_CONNECTION_CODE,
+            ...(errno === undefined ? {} : { errno })
+        };
+    }
+
+    if (wire === PROVIDER_WIRE_ABORTED) {
+        return { code: PROVIDER_ABORTED_CODE, errorClass: PROVIDER_ABORTED_CODE };
+    }
+
+    if (wire === PROVIDER_WIRE_UPSTREAM_STATUS) {
+        // Only a status we can READ can be a refusal; a frame that claims
+        // `upstream_status` without one is the codeless case, never a guess at 500.
+        //
+        // The producer routes an upstream 408 / 429 / 5xx — 504 included — HERE rather
+        // than to `timeout`, and `isTerminalProviderStatus` deliberately names only the
+        // four statuses that are about OUR request, so those land on the codeless transient
+        // ladder: an upstream that is restarting, rate limiting or timing out is fixed by
+        // TIME, which is precisely what a backoff buys.
+        if (status !== undefined && isTerminalProviderStatus(status)) {
+            return {
+                code: PROVIDER_REJECTED_CODE,
+                errorClass: PROVIDER_REJECTED_CODE,
+                status,
+                ...(param === undefined ? {} : { param })
+            };
+        }
+
+        return {
+            errorClass: PROVIDER_TRANSIT_CLASS,
+            ...(status === undefined ? {} : { status }),
+            ...(errno === undefined ? {} : { errno })
+        };
+    }
+
+    // `decode`, `unknown`, an absent code, and any future gateway spelling: codeless.
+    return {
+        errorClass: PROVIDER_TRANSIT_CLASS,
+        ...(status === undefined ? {} : { status }),
+        ...(errno === undefined ? {} : { errno })
+    };
+};
+
+// The operator-facing sentence for a CODED wire failure. Like every other coded frame it
+// leads with the code (that text is what reaches the model, an event consumer and a log
+// line), names the endpoint the frame arrived from, quotes the provider's own line, and
+// says what happens next — which is the half the old `Provider reported an error` sentence
+// hid, and the reason an operator could not tell a cancel from a refusal from a retryable
+// stall. The status is stated when the frame carried one, because `504` and `401` call for
+// completely different fixes.
+const wireAdviceOf = (code: string): string => {
+    if (code === PROVIDER_TIMEOUT_CODE) {
+        return ' The provider (or the upstream it proxies) ran out of time while the stream was open, so this ' +
+            'attempt is re-sent on a bounded retry ladder instead of ending the run.';
+    }
+
+    if (code === PROVIDER_CONNECTION_CODE) {
+        return ' Nothing answered the dial on the provider side, so this attempt is re-sent on the short ' +
+            'connection ladder.';
+    }
+
+    if (code === PROVIDER_ABORTED_CODE) {
+        return ' The request was cancelled before it completed, so it is not re-sent.';
+    }
+
+    return ' The upstream refused this request itself, so re-sending the same bytes would be refused again.';
+};
+
+export const providerWireMessage = (input: {
+    code: string;
+    url: string;
+    detail: string;
+    status?: number;
+    param?: string;
+}): string => {
+    const { code, url, detail } = input;
+
+    const statusPart = input.status === undefined ? '' : ` (HTTP ${input.status})`;
+    // The blamed field, when the provider named one: `401 … param "api_key"` and
+    // `400 … param "max_tokens"` are different fixes, and this is the only place the
+    // gateway's `param` survives.
+    const paramPart = input.param === undefined ? '' : ` The provider blamed \`${input.param}\`.`;
+    // Bounded like `providerRejectedMessage`: a proxy can answer with a whole HTML page,
+    // and this text is replayed to the model on every later request.
+    const quoted = detail.trim().length === 0 ? '' : ` The provider said: "${detail.trim().slice(0, 400)}"`;
+
+    return `${code}: the provider reported a failure on the stream from ${url}${statusPart}.${wireAdviceOf(code)}${paramPart}${quoted}`;
+};
+
+// ---------------------------------------------------------------------------
+// Diagnostics: the one reader shared by the retry frame and the terminal record
+// ---------------------------------------------------------------------------
+
+// Lift the transport's structured diagnostics off a failed attempt's error.
+//
+// The transport puts them on the error FRAME (`details`, see ../types), the frame loop
+// puts them on the thrown `HarnessError`, and this is the ONE place that decides whether
+// they are SHAPE-ABLE: a custom transport may put anything in `details`, so every field
+// is checked before it rides onto a published event. Anything unrecognised yields
+// `undefined`, so the `retry` event and the terminal `error` event keep the exact shape
+// they had before T6 for an unclassified failure.
+//
+// It lives here rather than in ../core/agent.ts because BOTH consumers need it with the
+// same rules: the agent puts it on every `retry` frame, and `harness.ts` puts it on the
+// TERMINAL `error` record, where a UI (and the session layer) would otherwise have to
+// re-derive the class from the sentence — the exact regex path this task removes.
+export const providerDiagnosticsOf = (error: unknown): HarnessProviderAttemptDiagnostics | undefined => {
+    try {
+        if (!isInstanceOf(error, HarnessError)) return undefined;
+
+        const details = error.details;
+
+        if (typeof details !== 'object' || details === null) return undefined;
+
+        const record = details as Record<string, unknown>;
+
+        if (typeof record.errorClass !== 'string' || typeof record.url !== 'string') return undefined;
+
+        return {
+            errorClass: record.errorClass,
+            // Already redacted by the transport (origin + path, no userinfo/query), so
+            // a UI can render it without risking an echoed credential.
+            url: record.url,
+            ...(typeof record.port === 'number' ? { port: record.port } : {}),
+            ...(record.phase === 'response-head' || record.phase === 'first-token' || record.phase === 'stream-chunk'
+                ? { phase: record.phase }
+                : {}),
+            ...(typeof record.timeoutMs === 'number' ? { timeoutMs: record.timeoutMs } : {}),
+            ...(typeof record.errno === 'string' ? { errno: record.errno } : {})
+        };
+    } catch {
+        // Diagnostics are never worth a second failure on an error path.
+        return undefined;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Messages

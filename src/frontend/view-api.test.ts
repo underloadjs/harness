@@ -187,6 +187,28 @@ describe('the render-model boundary', () => {
         });
     });
 
+    it('forwards `inactive_thread_ids` as the render model\'s retired-conversation list', () => {
+        // F7 (T-W6): a soft delete cannot ride the roster (../server/sessions.ts `threadRoster` :4893 and
+        // ../server/api.ts `threadRecordsOf` :4834 both hide the RETAINED row), so the metadata row
+        // carries it and this mapper is the one place the browser learns it. The list is asserted exactly
+        // — server order, no re-sort — plus the copy rule: the render model must not alias the wire
+        // array, because ./view-state.ts advances documents in place.
+        const retired = ['thread-15', 'thread-16'];
+        const view = sessionViewOf({ ...session, inactive_thread_ids: retired });
+
+        expect(view.inactiveThreads).toEqual(['thread-15', 'thread-16']);
+        expect(view.inactiveThreads).not.toBe(retired);
+
+        // Nothing else in the header moves: the whole record still equals the model this file pins above.
+        expect({ ...view, inactiveThreads: undefined }).toEqual(sessionViewOf(session));
+
+        // Absent (the fixture above) and EMPTY both mean "the session named no deletions", and both OMIT
+        // the field — never `inactiveThreads: []`, which ./ui/threads.ts would read as a verdict-bearing
+        // list. `not.toHaveProperty` is the exact assertion for the additive rule the resource documents
+        // at ../shared/harness-api.ts:1443-1459.
+        expect(sessionViewOf({ ...session, inactive_thread_ids: [] })).not.toHaveProperty('inactiveThreads');
+    });
+
     it('renames a roster row, and keeps only the fields an identified read publishes', () => {
         expect(threadRowOf(rosterRow)).toEqual({
             id: 'th a',

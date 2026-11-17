@@ -13,15 +13,34 @@
 //   - an UNCLASSIFIED frame still produces the byte-identical codeless payload: no
 //     `code` key on the event and `name === 'HarnessError'` on the rejection, so nothing
 //     about an ordinary failure moved (AC5);
-//   - the retry bookkeeping T6 pinned is untouched: a `provider-timeout` emits NO retry
-//     frame (core/agent.ts keeps it terminal, so a run that dies on a bound has never
-//     spent a retry), while a `provider-connection` emits that class's two short retries
-//     (250 ms, 500 ms) before failing terminally — the flag behind `retries-exhausted`
-//     (`run.sawRetryFrame`) is set by the `retry` FRAME, which this change never touches.
+//   - the retry bookkeeping, which changed on 2026-11-17 (the unrecoverable-timeout
+//     report — this file used to pin the opposite of it): a `provider-timeout` is NOT
+//     terminal. It walks its own bounded ladder — 4 attempts, waits 2 s / 4 s / 8 s
+//     (`core/agent-limits.ts`) — so a run that dies on a bound HAS spent retries by the
+//     time it fails. A `provider-connection` keeps that class's capped 3 attempts with its
+//     two short retries (250 ms, 500 ms). The flag behind `retries-exhausted`
+//     (`run.sawRetryFrame`) is still set by the `retry` FRAME, which none of this touches,
+//     and it is the carried `code` — not the ladder — that lets `classifyRunStopReason`
+//     (src/harness.ts) report such a death as the `provider-network` stop reason;
+//   - the terminal `error` EVENT also carries the transport's diagnosis as `error.provider`
+//     (2026-11-17, same report), so a UI, a journal row and the session layer read the
+//     class, the endpoint, the expired bound and the errno as FIELDS instead of parsing
+//     them back out of the sentence. It is an echo of the frame's own `details` —
+//     `providerDiagnosticsOf` (transport/provider-timeouts.ts) publishes only what the
+//     attempt actually reported, so a connection death carries no `phase`/`timeoutMs`
+//     (nothing answered the dial, so no bound expired) and a frame that carried no
+//     `details` at all gains no `provider` key.
+//
+// WHY ONE TEST FAKES THE CLOCK: the `provider-timeout` ladder's waits have a 2 s FLOOR by
+// design, so its three retries cost 14 s of real time — longer than this package's
+// 15 s test timeout allows for comfort. `presets: false` leaves the run no other timer, so
+// `vi.runAllTimersAsync()` drives that backoff in microseconds. The millisecond-exact ladder
+// shape is pinned in src/core/agent.provider-failures.test.ts; the connection ladder's
+// 750 ms stays on the real clock.
 //
 // Run: yarn vitest run src/harness.provider-codes.test.ts
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
     agent,
     harness,
@@ -106,45 +125,102 @@ const failingHarness = (
     return { writer, events };
 };
 
-/** Settles a failing run into its rejection, so both channels can be read. */
-const rejectionOf = async (run: Promise<unknown>): Promise<unknown> => {
-    try {
-        await run;
-    } catch (error) {
-        return error;
-    }
+// Sentinel: the run concluded instead of rejecting. A unique symbol so it can never collide
+// with a value a run could legitimately resolve to.
+const NO_REJECTION = Symbol('no-rejection');
 
-    throw new Error('Expected the run to fail, and it concluded.');
+/**
+ * Settles a failing run into its rejection, so both channels can be read.
+ *
+ * The handler is attached FIRST, before anything is awaited. `writer('go')` is already a
+ * live promise when this helper receives it, and under a faked clock its rejection lands
+ * while the pump below is still running — a rejected promise with no handler attached yet is
+ * what Node reports as an unhandled rejection, which vitest counts as a run-level error even
+ * though the test itself asserts the failure.
+ *
+ * `pump` drives that FAKED clock from outside the run: the backoff timer is armed INSIDE the
+ * agent's retry loop, so a test that fakes timers has to release each timer as the run arms
+ * it — `vi.runAllTimersAsync()` keeps draining timers created while it unwinds, which is
+ * what lets a 2 s / 4 s / 8 s ladder finish in microseconds. Without it the awaited run
+ * would sleep forever, because no real clock is running to fire the wait.
+ */
+const rejectionOf = async (run: Promise<unknown>, pump = false): Promise<unknown> => {
+    const settled: Promise<unknown> = run.then(
+        () => NO_REJECTION,
+        (error: unknown) => error
+    );
+
+    if (pump) await vi.runAllTimersAsync();
+
+    const result = await settled;
+
+    if (result === NO_REJECTION) throw new Error('Expected the run to fail, and it concluded.');
+
+    return result;
 };
 
 describe('run-level provider failures keep their machine code (T8, AC1)', () => {
-    it('keeps `provider-timeout` on the rejection and on the terminal error event, after one request', async () => {
+    it('keeps `provider-timeout` on the rejection and on the terminal error event, after that class\u2019s 4 attempts', async () => {
         const attempts = { value: 0 };
         const { writer, events } = failingHarness(TIMEOUT_FRAME, attempts);
 
-        const failure = (await rejectionOf(writer('go'))) as HarnessError;
+        // Faked clock: the class's own 2 s / 4 s / 8 s waits (see the header). The run is
+        // started INSIDE the fake-timer block, because the backoff timer is armed by the run.
+        vi.useFakeTimers();
 
-        // The caller-visible error keeps the class: `code` for a program, and `name`
-        // (HarnessError sets it to the code) for a log line.
-        expect(failure).toBeInstanceOf(HarnessError);
-        expect(failure.code).toBe(PROVIDER_TIMEOUT_CODE);
-        expect(failure.name).toBe(PROVIDER_TIMEOUT_CODE);
-        // The message is preserved verbatim, not reworded into prose around the class.
-        expect(failure.message).toBe(TIMEOUT_MESSAGE);
+        try {
+            const failure = (await rejectionOf(writer('go'), true)) as HarnessError;
 
-        // The event channel a UI and a durable record consume.
-        expect(events.filter((event) => event.type === 'error')).toEqual([
-            {
-                type: 'error',
-                agent: 'writer',
-                error: { message: TIMEOUT_MESSAGE, code: PROVIDER_TIMEOUT_CODE }
-            }
-        ]);
+            // The caller-visible error keeps the class: `code` for a program, and `name`
+            // (HarnessError sets it to the code) for a log line.
+            expect(failure).toBeInstanceOf(HarnessError);
+            expect(failure.code).toBe(PROVIDER_TIMEOUT_CODE);
+            expect(failure.name).toBe(PROVIDER_TIMEOUT_CODE);
+            // The message is preserved verbatim, not reworded into prose around the class.
+            expect(failure.message).toBe(TIMEOUT_MESSAGE);
 
-        // A missed bound is terminal: ONE request, and no `retry` frame — which is also
-        // what keeps a run that died this way out of `retries-exhausted`.
-        expect(attempts.value).toBe(1);
-        expect(events.filter((event) => event.type === 'retry')).toEqual([]);
+            // The event channel a UI and a durable record consume: the code, and the
+            // transport's diagnosis as FIELDS (`provider`), which is the whole point of the
+            // 2026-11-17 change — `phase`/`timeoutMs` name the leg that stalled and the bound
+            // that expired (300 s, the figure the sentence states), `url`/`port` the endpoint.
+            expect(events.filter((event) => event.type === 'error')).toEqual([
+                {
+                    type: 'error',
+                    agent: 'writer',
+                    error: {
+                        message: TIMEOUT_MESSAGE,
+                        code: PROVIDER_TIMEOUT_CODE,
+                        provider: {
+                            errorClass: PROVIDER_TIMEOUT_CODE,
+                            url: CHAT_URL,
+                            port: 6660,
+                            phase: 'response-head',
+                            timeoutMs: 300_000
+                        }
+                    }
+                }
+            ]);
+
+            // A missed bound is no longer terminal: FOUR requests (the initial one plus the
+            // class's three retries — the transient ladder's count does not stretch it), each
+            // failure reported as a `retry` frame with the class's own total.
+            expect(attempts.value).toBe(4);
+            expect(
+                events
+                    .filter((event) => event.type === 'retry')
+                    .map((event) =>
+                        event.type === 'retry'
+                            ? { attempt: event.attempt, maxAttempts: event.maxAttempts, delayMs: event.delayMs }
+                            : event
+                    )
+            ).toEqual([
+                { attempt: 1, maxAttempts: 4, delayMs: 2_000 },
+                { attempt: 2, maxAttempts: 4, delayMs: 4_000 },
+                { attempt: 3, maxAttempts: 4, delayMs: 8_000 }
+            ]);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it('keeps `provider-connection` after that class\u2019s capped 3 attempts, with its two short retries', async () => {
@@ -160,7 +236,21 @@ describe('run-level provider failures keep their machine code (T8, AC1)', () => 
             {
                 type: 'error',
                 agent: 'writer',
-                error: { message: CONNECTION_MESSAGE, code: PROVIDER_CONNECTION_CODE }
+                error: {
+                    message: CONNECTION_MESSAGE,
+                    code: PROVIDER_CONNECTION_CODE,
+                    // The connection diagnosis, and NOTHING MORE: no `phase` and no
+                    // `timeoutMs`, because nothing answered the dial and no local bound
+                    // expired — inventing either would be a detail the transport never had.
+                    // `errno` is the actionable fact (ECONNREFUSED = nothing is listening on
+                    // that port) and `url`/`port` the endpoint that refused it.
+                    provider: {
+                        errorClass: PROVIDER_CONNECTION_CODE,
+                        url: CHAT_URL,
+                        port: 6660,
+                        errno: 'ECONNREFUSED'
+                    }
+                }
             }
         ]);
 
@@ -201,8 +291,12 @@ describe('run-level provider failures keep their machine code (T8, AC1)', () => 
 
         const [errorEvent] = events.filter((event) => event.type === 'error');
 
+        // The AC5 guard doubles as the guard on the new `provider` field: an unclassified
+        // frame reported no diagnosis, so it gains neither a `code` nor a `provider` key —
+        // the payload is byte-identical to what every pre-change session persisted.
         expect(errorEvent).toEqual({ type: 'error', agent: 'writer', error: { message: CODELESS_MESSAGE } });
         expect((errorEvent as { error: Record<string, unknown> }).error).not.toHaveProperty('code');
+        expect((errorEvent as { error: Record<string, unknown> }).error).not.toHaveProperty('provider');
     });
 
     it('keeps `provider-rejected` end-to-end for a deterministic refusal (T8, AC3)', async () => {
@@ -224,6 +318,45 @@ describe('run-level provider failures keep their machine code (T8, AC1)', () => 
         expect(events.filter((event) => event.type === 'retry')).toEqual([]);
         expect(events.filter((event) => event.type === 'error')).toEqual([
             { type: 'error', agent: 'writer', error: { message: REJECTED_MESSAGE, code: PROVIDER_REJECTED_CODE } }
+        ]);
+    });
+
+    it('carries the refusal\u2019s own diagnosis on the terminal record, and nothing the attempt did not report', async () => {
+        // The refusal frame the built-in transport ACTUALLY writes (transport/openai.ts, via
+        // providerWireFailureOf) carries `details`, so its terminal record carries the class,
+        // the endpoint and the port — and no `phase`, `timeoutMs` or `errno`, none of which a
+        // 401 has. Together with the codeless case above, these three pins are the per-class
+        // field discipline: the payload is an echo of the attempt, never a fabrication.
+        const attempts = { value: 0 };
+        const { writer, events } = failingHarness(
+            {
+                type: 'error',
+                code: PROVIDER_REJECTED_CODE,
+                message:
+                    'provider-rejected: the provider answered with HTTP 401 and refused the request, so ' +
+                    're-sending the same bytes would be refused again.',
+                details: { errorClass: PROVIDER_REJECTED_CODE, url: CHAT_URL, port: 6660 }
+            },
+            attempts
+        );
+
+        const failure = (await rejectionOf(writer('go'))) as HarnessError;
+
+        expect(failure.code).toBe(PROVIDER_REJECTED_CODE);
+        expect(attempts.value).toBe(1);
+        expect(events.filter((event) => event.type === 'retry')).toEqual([]);
+        expect(events.filter((event) => event.type === 'error')).toEqual([
+            {
+                type: 'error',
+                agent: 'writer',
+                error: {
+                    message:
+                        'provider-rejected: the provider answered with HTTP 401 and refused the request, so ' +
+                        're-sending the same bytes would be refused again.',
+                    code: PROVIDER_REJECTED_CODE,
+                    provider: { errorClass: PROVIDER_REJECTED_CODE, url: CHAT_URL, port: 6660 }
+                }
+            }
         ]);
     });
 });

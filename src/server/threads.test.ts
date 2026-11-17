@@ -26,6 +26,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '../harness';
+// T-W8: every recorded `thread` payload now carries the minting process's epoch
+// (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
+// ../harness.ts). These assertions are WHOLE event payloads, so the key has to be named;
+// the value is exact because every run here executed IN THIS PROCESS (fixture harnesses and
+// inline delegation, no lane worker), and vitest gives one module registry per test file —
+// one epoch for the whole file, across every store restart inside it.
+import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
 import type {
     HarnessMessage,
     HarnessPluginApi,
@@ -526,19 +533,28 @@ describe('SessionStore persistent threads', () => {
                 updatedAt: 1_000,
                 // A host-thread ROOT run carries its invocation identity; the first
                 // run of a fresh harness is invocation '1' (`input` on start only).
+                // T-W8: each payload also names the minting PROCESS (`HarnessThread.epoch`,
+                // ../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`). Exact because this run
+                // executed in this process; vitest gives one module registry per test file,
+                // hence one epoch for the whole file.
                 events: [
                     {
                         type: 'start',
                         agent: 'probe',
                         model: 'scripted/test',
-                        thread: { id: '1', input: 'hello' }
+                        thread: { id: '1', input: 'hello', epoch: HARNESS_PROCESS_EPOCH }
                     },
-                    { type: 'text', agent: 'probe', delta: 'answer:hello', thread: { id: '1' } },
+                    {
+                        type: 'text',
+                        agent: 'probe',
+                        delta: 'answer:hello',
+                        thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
+                    },
                     {
                         type: 'done',
                         agent: 'probe',
                         message: answerMessage('answer:hello'),
-                        thread: { id: '1' }
+                        thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
                     }
                 ],
                 eventTimes: [1_000, 1_000, 1_000]
@@ -558,6 +574,10 @@ describe('SessionStore persistent threads', () => {
                 originTurnId: task.turn.id,
                 originInvocationId: '1',
                 invocationId: '1',
+                // W19: the epoch travels with the invocation id — it names the ledger generation that
+                // minted `invocationId`, which is how a client (and the block projection) tells two
+                // runs of one recycled id apart (../types `HarnessThreadSnapshot.epoch`).
+                epoch: HARNESS_PROCESS_EPOCH,
                 // R3: the thread's full invocation roster (oldest first), so a client
                 // can still join a HISTORICAL invocation card after the conversation
                 // advances. Derived from the persisted `invocationThreads` map.
@@ -1605,6 +1625,10 @@ describe('SessionStore thread persistence', () => {
                 originTurnId: done.turn.id,
                 originInvocationId: '1',
                 invocationId: '1',
+                // W19: the ledger generation that minted this conversation's current invocation id
+                // survives the restart beside it — a document that kept the id without the epoch
+                // would collapse back onto bare-id matching after one reboot.
+                epoch: HARNESS_PROCESS_EPOCH,
                 // R3: the historical invocation roster survives the restart, because it
                 // is derived from the persisted `invocationThreads` map.
                 invocationIds: ['1'],
@@ -2999,7 +3023,12 @@ describe('interrupted-turn resume (a stopped OR idle conversation)', () => {
             agent: 'probe',
             attempt: 1,
             maxAttempts: 11,
-            thread: { id: '1' }
+            // T-W8: the resumed attempt is a NEW RUN, but it is still a run of THIS process, and
+            // the invocation id keeps climbing across a store restart because `restore()` raises
+            // the counters from the persisted records (../harness.ts `reserveIdentity`, ~8221).
+            // So the epoch is the SAME value here: it identifies the PROCESS, and only a process
+            // restart re-mints ids — which is the case `isEpochBoundary` separates (./turn-projector.ts).
+            thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH }
         });
 
         await waitUntil(() => requests === 3);
@@ -3162,7 +3191,12 @@ describe('interrupted-turn resume (a stopped OR idle conversation)', () => {
                 type: 'start',
                 agent: 'probe',
                 model: 'scripted/test',
-                thread: { id: '3', input: 'question' }
+                // T-W8: the invocation id keeps CLIMBING across a store restart inside one
+                // process because `restore()` raises the harness counters from the persisted
+                // records (../harness.ts `reserveIdentity`, ~8221), and the epoch is the same
+                // value — the epoch identifies the PROCESS, so only a process restart re-mints
+                // ids, which is the case ./turn-projector.ts `isEpochBoundary` separates.
+                thread: { id: '3', input: 'question', epoch: HARNESS_PROCESS_EPOCH }
             }
         ]);
         expect(second.get(created.id).turns[1]!.eventTimes).toEqual([3_000]);
@@ -3520,7 +3554,18 @@ describe('delegated child threads', () => {
                 type: 'start',
                 agent: 'helper',
                 model: 'scripted/test',
-                thread: { id: '2', parentId: '1', callId: 'delegate-1', input: 'child work' }
+                // T-W8: the delegated child's frames name the process that minted the child's
+                // invocation id — the SAME process, and therefore the SAME epoch, as the parent's
+                // (the child runs in the harness that launched the call; ../harness.ts
+                // `threadIdentity` stamps every mint). The ROSTER above is untouched: the epoch is
+                // run identity on the event, never thread-label/wire state.
+                thread: {
+                    id: '2',
+                    parentId: '1',
+                    callId: 'delegate-1',
+                    input: 'child work',
+                    epoch: HARNESS_PROCESS_EPOCH
+                }
             }
         ]);
 
@@ -3783,6 +3828,9 @@ describe('delegated child threads', () => {
             cancelledAtMessage: 2,
             completedOrder: 1,
             content: '',
+            // W19: the durable row names the ledger generation that minted `invocationId: '2'`, so a
+            // restart that re-mints `2` ADDS a row instead of overwriting this one.
+            epoch: HARNESS_PROCESS_EPOCH,
             error: 'operator stop',
             invocationId: '2',
             kind: 'delegation',
@@ -3820,7 +3868,10 @@ describe('delegated child threads', () => {
             status: 'completed',
             // The completed row keeps its owner as well — a finished turn still belongs to the
             // conversation that ran it, and unlike the forensic pair this key is legal here.
-            threadId: 'thread-1'
+            threadId: 'thread-1',
+            // W19: every row this process writes names its ledger generation, completed rows
+            // included (../types `HarnessAgentResultSnapshot.epoch`).
+            epoch: HARNESS_PROCESS_EPOCH
         });
 
         store.dispose();
@@ -4106,7 +4157,10 @@ describe('delegated child threads', () => {
             type: 'start',
             agent: 'helper',
             model: 'scripted/test',
-            thread: { id: '3', input: 'continue child' }
+            // T-W8: a focused submit RESUMES the child's own conversation, so this run is
+            // ROOT-shaped (its thread names no parent and no spawn call) — and it carries this
+            // process's epoch from the mint in ../harness.ts that opens a host-thread run.
+            thread: { id: '3', input: 'continue child', epoch: HARNESS_PROCESS_EPOCH }
         });
 
         store.dispose();
@@ -4314,13 +4368,24 @@ describe('delegated child threads', () => {
             transcript(snapshot.threads![2].messages)
         );
         // The delegating turn carries both invocation ids, one per child card.
+        // T-W8: the mapped payload is asserted WHOLE, so it now names the process too — the
+        // SAME epoch on both twins, because one process minted both ids (../harness.ts
+        // `threadIdentity`). Distinguishability is still ids, never prose; the epoch only says
+        // which process minted them, which is what ./turn-projector.ts needs after a restart.
         expect(
             snapshot.turns[0].events
                 .filter((event) => event.type === 'start' && event.agent === 'helper')
-                .map((event) => (event as { thread?: { id: string; input?: string } }).thread)
+                .map(
+                    (event) =>
+                        (
+                            event as {
+                                thread?: { id: string; parentId?: string; callId?: string; input?: string; epoch?: string };
+                            }
+                        ).thread
+                )
         ).toEqual([
-            { id: '2', parentId: '1', callId: 'twin-a', input: 'twin task' },
-            { id: '3', parentId: '1', callId: 'twin-b', input: 'twin task' }
+            { id: '2', parentId: '1', callId: 'twin-a', input: 'twin task', epoch: HARNESS_PROCESS_EPOCH },
+            { id: '3', parentId: '1', callId: 'twin-b', input: 'twin task', epoch: HARNESS_PROCESS_EPOCH }
         ]);
 
         store.dispose();
@@ -5298,7 +5363,9 @@ describe('display lane (C1)', () => {
             type: 'text',
             agent: 'probe',
             delta: 'after',
-            thread: { id: '1' },
+            // T-W8: the lane stamp rides beside the run identity, and the run identity now
+            // names the minting process (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`).
+            thread: { id: '1', epoch: HARNESS_PROCESS_EPOCH },
             lane: 1
         });
         expect('lane' in turn).toBe(false);

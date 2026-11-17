@@ -584,7 +584,10 @@ describe('delegated conversation identity (R18)', () => {
         const settled = result.settle('done');
 
         expect(threadIdPatches([[...ops, ...settled]], 'turn-1:1')).toHaveLength(1);
-        expect(result.display().sections[1]).toMatchObject({ threadId: 'thread-2', state: 'done' });
+        // T-W23: this child never emitted a terminal frame of its own, so the settle that closes it
+        // reports `cancelled` at its OWN last stamp rather than inheriting the turn's `done`.
+        // The id patch this test is about is unaffected. See ./turn-projector.ts `interruptedStateOf`.
+        expect(result.display().sections[1]).toMatchObject({ threadId: 'thread-2', state: 'cancelled' });
     });
 
     it('carries a join learned after the last event on the terminal settle ops', () => {

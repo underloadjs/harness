@@ -281,6 +281,44 @@ export type SessionTurn = {
 //     only change lanes by being removed and re-minted.
 export type SessionTurnEvent = HarnessEvent & { lane?: number };
 
+// F4 (2026-11-17) — the durable trace of ONE ABANDONED ATTEMPT of a turn.
+//
+// WHY IT EXISTS. A resume re-runs an unanswered turn IN PLACE, which means splicing the
+// stopped attempt's tail out of `SessionTurn.events` (only the prefix up to the last
+// `attempt_commit` is kept) and compacting the journal so those steps cannot come back as
+// ghost steps on the next start. That was throwing the evidence away with the rollback: the
+// abandoned attempt's streamed bytes and its TERMINAL `error` frame disappeared from both
+// durable stores, which is exactly why a provider failure that was the whole story of the
+// incident could not be found in `events.jsonl` afterwards. This record is the bounded,
+// checkpoint-side copy of that evidence — the terminal `error` frames plus the shape of what
+// was dropped — so it survives in BOTH write modes (the full tail additionally rides the
+// per-step journal as a `rollback` line, ./journal.ts `JournalRollbackRecord`, when the
+// coordinator owns the journal handle).
+//
+// IT IS EVIDENCE, NOT A STEP: nothing folds it, no projector reads it, and the resumed row
+// still renders only the attempt now in flight. Recovery is the point; re-folding is not.
+//
+// ADDITIVE: absent means "this turn has never been re-run in place", so every turn recorded
+// before this build keeps its exact shape (./persistence.ts revalidates it on read).
+export type SessionRollbackRecord = {
+    // When the attempt was abandoned (server milliseconds) — the moment its tail left the
+    // record, and the timestamp the matching journal line carries.
+    at: number;
+    // The index of the LAST KEPT event, or -1 when the attempt committed nothing at all
+    // (so its whole event list was dropped). Everything strictly after this index is gone
+    // from `SessionTurn.events`.
+    boundary: number;
+    // How many events the abandoned attempt had written after that boundary.
+    droppedEvents: number;
+    // Why the attempt was abandoned, in the server's own words: the run's failure text for
+    // an errored attempt, or the resume's own reason. Bounded by the caller.
+    reason?: string;
+    // Every dropped `error` frame, verbatim (normally the one terminal provider error).
+    // This is the field that makes "which provider failure killed that attempt" answerable
+    // after the resume instead of unrecoverable.
+    errors?: SessionTurnEvent[];
+};
+
 // One archived steered submit: identity, timing, destination and the EXACT text the user
 // submitted (the same `prompt` bytes the audit ring keeps, kept for every submit instead of
 // only the last 64). `references` is intentionally absent: the archive exists to answer a
@@ -528,12 +566,48 @@ export type SessionThread = {
     // so a stale reason is not possible; and a host submit (`sendThreadInput`) revives a
     // halted conversation exactly as the resume route does.
     stopReason?: HarnessRunStopReason;
+    // F1 (2026-11-17) — how many NETWORK-CLASS failures in a ROW this conversation has
+    // suffered, and therefore how close it is to the point where the server stops
+    // auto-resuming it. The store owns the counter (./sessions.ts `networkFailures`) and the
+    // ceiling is `SessionSnapshot.networkFailureLimit`; a client renders this as "n/10" for
+    // the thread's own row.
+    //
+    // OMITTED when the streak is 0 — which is every conversation that has never had a
+    // network-class failure, and every one whose next run answered. It is READ-ONLY: a host
+    // cannot clear it; only a run that reached its answer does.
+    networkFailures?: number;
     // Creation order (monotonic per session; copied from the runtime record).
     sequence: number;
     // The persistent parent thread (a delegated child links to its caller).
     ownerThreadId?: string;
     label?: string;
     invocationId?: string;
+    // W22 (2026-11-17) — THE RUN THIS CONVERSATION'S LATEST WORK BELONGS TO: the process epoch that
+    // minted `invocationId` (`../types/index.ts` `HarnessThreadRecord.epoch`, the value
+    // `../core/agent-limits.ts` `HARNESS_PROCESS_EPOCH` stamped by the run that wrote the pair).
+    //
+    // WHY THE ROSTER NOW CARRIES IT. An invocation id is a per-process counter (`../shared/run-identity.ts`
+    // header): after a restart the same bare id legitimately names a DIFFERENT conversation, and the client
+    // transcript join (`../frontend/ui/thread-transcript.ts`) resolves a contested id by matching the epoch on
+    // a frame against the epoch of each claimant. Until this field existed the roster row named NO epoch, so
+    // two otherwise-identical claimants (same owner, one recycled id each, one per process generation) could
+    // only fall back to the roster's first-wins order — the residual W19 reported and pinned. The row's own
+    // epoch is the fact that closes it, and it is the client-side half of the store's key
+    // (`invocationRunKeyOf(record.invocationId, record.epoch)`, ../server/sessions.ts `noteInvocationThread`).
+    //
+    // THE PROJECTION RULE, exactly: the key is PRESENT when the runtime record pairs an invocation id with a
+    // process (one has run and the build that wrote the pair records epochs), and ABSENT when it does not — a
+    // conversation that never ran, or a row restored from a document written before the field. It is a BARE
+    // token, never `id\0epoch` (every id on this row stays bare; `../shared/run-identity.ts`
+    // `invocationIdOfRunKey` is the strip, and ./api-reads.ts is the precedent), and it never appears without
+    // `invocationId` beside it. Additive: a legacy conversation emits no key, so its roster row — the session
+    // snapshot, the compiled view and the REST thread read — projects byte-identically.
+    //
+    // NOT ON THESE PLANES, on purpose: the model-facing `threadList` page strips it
+    // (`../harness.ts` `modelThreadRosterOf`, so the model contract stays byte-identical and the model, which
+    // has no epoch parameter, is never handed a token it cannot send back), and the turn/display plane
+    // (`TurnSection`/`TurnSummary`, `./turn-projector.ts`) never carries it.
+    epoch?: string;
     originTurnId?: string;
     originInvocationId?: string;
     // EVERY invocation id this server observed running in the thread, oldest first.
@@ -556,6 +630,51 @@ export type SessionThread = {
     // `turns` stays the legacy projection so an existing renderer still works.
     messages: HarnessMessage[];
 };
+
+// ---------------------------------------------------------------------------
+// R19 (2026-11-17) — THE invocation-RUN key: the join rule behind
+// `SessionThread.invocationIds` and the store's `invocationThreads` map.
+//
+// WHY A RUN KEY EXISTS. An invocation id is `String(++runSequence)` from a counter that is
+// PER PROCESS (../harness.ts:8268; restore only ever RAISES it — `:8153` and `reserveIdentity`
+// at `:8235-8239`). A restarted harness therefore mints `15` again for a DIFFERENT run, and the
+// measured consequence in the operator's own store was the persisted join
+// `invocationThreads["15"] = "thread-14"` (the pre-restart child, first-write-wins) naming the
+// conversation of a post-restart run that legitimately owns id `15` (../server/sessions.ts
+// `noteInvocationThread`). A join keyed by the bare id collides BY CONSTRUCTION.
+//
+// THE DISCRIMINATOR is the process epoch that already rides every frame
+// (`HarnessThread.epoch`, ../types/index.ts:3042, minted in ../core/agent-limits.ts
+// `HARNESS_PROCESS_EPOCH`). `Session.invocationThreads` is keyed by `id + "\0" + epoch` when the
+// `start` frame names an epoch, and by the BARE id when it does not — the same rule the client
+// fold already uses (`runKeyOf`, ../frontend/ui/turns.ts:1649), so both halves of the product
+// name one run the same way.
+//
+// IT IS ADDITIVE, NOT A MIGRATION. Every key rule here degrades to the bare id, a reader falls
+// back to the bare id, and `HarnessSessionRecord.invocationThreads` keeps its exact
+// `Record<string,string>` shape (./persistence.ts `readStringMap` — a NUL inside a JSON key is
+// legal and round-trips). A document written before this change therefore resolves EXACTLY as it
+// does today: no epoch anywhere means every key is already a bare id.
+//
+// THE WIRE NEVER SEES THE COMPOSITE. `SessionThread.invocationIds` / `invocation_ids` stay bare
+// invocation ids, because a client joins them onto rows whose id is the bare one
+// (`TurnSection.invocationId`); the epoch half is stripped at the boundary by
+// `invocationIdOfRunKey`.
+// ---------------------------------------------------------------------------
+
+// The separator inside a run key. A NUL cannot occur in a runtime invocation id (the runtime
+// mints decimal counters and opaque branch ids) and is the same composite-key separator the
+// board already uses elsewhere (`turns.ts`, `sessions.ts:4936`), so a bare id can never parse as
+// someone else's run key.
+//
+// W19 (2026-11-17): the three names below MOVED to `../shared/run-identity.ts` and are re-exported
+// here unchanged. The rule itself could no longer live in the server tree: `../harness.ts` (the
+// result ledger), `../shared/agent-results.ts` (the block projection) and the browser's
+// `../frontend/ui/thread-transcript.ts` all need the SAME key builder, and none of them may import
+// `./server/*` at runtime. This file stays the published surface — every existing importer
+// (`./api-reads.ts`, `./sessions.ts`, `./turn-projector.ts`, the tests) resolves these names from
+// here and nothing changed for them.
+export { INVOCATION_RUN_KEY_SEPARATOR, invocationIdOfRunKey, invocationRunKeyOf } from '../shared/run-identity';
 
 // A conversation as the COMPACT surface sees it (R1). The field set is exactly
 // `SessionThread` minus `messages`, plus a bounded transcript signal: the roster's
@@ -582,10 +701,22 @@ export type SessionThreadView = {
     // Same rule as `SessionThread.stopReason`: present only for a run that stopped early,
     // absent when it concluded (or never ran).
     stopReason?: HarnessRunStopReason;
+    // Same rule and meaning as `SessionThread.networkFailures` (F1): the consecutive
+    // network-class failures this conversation has suffered, omitted at 0. The compact
+    // surface needs it because the strip is what paints the halted conversation, and "the
+    // server is still retrying this on its own (n/10)" is part of explaining that halt.
+    networkFailures?: number;
     sequence: number;
     ownerThreadId?: string;
     label?: string;
     invocationId?: string;
+    // W22 (2026-11-17) — the SAME epoch as `SessionThread.epoch`, forwarded onto the compact row because
+    // this is the roster shape the browser actually renders (./sessions.ts `threadViewsOf` strips
+    // `messages`, and `../frontend/ui/threads.ts` `sessionThreadsOf` reads whichever plane a document
+    // carries). Same rule, same meaning: present only when the record pairs `invocationId` with the process
+    // that minted it, a bare token, never the composite run key. Omitted when the record names no epoch, so
+    // every compact row this harness produced before the field keeps its exact prior shape.
+    epoch?: string;
     originTurnId?: string;
     originInvocationId?: string;
     invocationIds?: string[];
@@ -662,7 +793,8 @@ export const PLUGIN_DIAGNOSTIC_LIMIT = 24;
 // array for a new or reset session). It is the only source a client needs to draw
 // the transcript after a reload: list() and get() both carry it, including a turn
 // that is still running.
-export type SessionSnapshot = {    id: string;
+export type SessionSnapshot = {
+    id: string;
     harness: string;
     status: SessionStatus;
     // Number of tasks waiting in the server queue (turns with status 'queued');
@@ -698,6 +830,27 @@ export type SessionSnapshot = {    id: string;
     // transcript; this list is where the raw, broken value lives so a client can
     // show it and edit it back into something readable.
     invalidThreads?: SessionInvalidThread[];
+    // F7 (2026-11-17, ADDITIVE): the ids of this session's SOFT-DELETED conversations — the
+    // rows a `threadDelete` retired (`inactive: true`) but RETAINED. Omitted entirely when the
+    // session has never deleted one, so every existing snapshot keeps its exact shape.
+    //
+    // WHY IT HAS TO TRAVEL. The roster (`threads` above, `threadRoster`, ./sessions.ts) HIDES
+    // those conversations, which is the right listing rule for a client that WATCHED the
+    // deletion happen — but on a RELOAD the client never saw it, and "the roster does not name
+    // this id" is not evidence of anything: it cannot be told apart from "this conversation
+    // never existed". Widening the roster filter is the wrong fix — it is the single place every
+    // session-facing roster comes from (./sessions.ts `threadRoster`: `snapshot()`, `viewOf()`
+    // and `viewSummaryOf()` all call it, and ./api.ts `threadRecordsOf` mirrors it for the REST
+    // roster), and the gates built on it would widen with it: a retired conversation would start
+    // counting in the roster, answering `defaultThreadId`, and passing the "the roster names it"
+    // checks. So the deletion fact travels as its OWN field and the roster keeps meaning exactly
+    // "the conversations this session can still run".
+    //
+    // Same source of truth as the REST row and the turns page: ./api-reads.ts `retiredThreadIdsOf`
+    // — the durable `Session.inactiveThreads` ledger UNION the `inactive: true` marks on the
+    // retained runtime rows (both are restored from the shard, so this survives a reload).
+    // Sorted by thread id, like `invalidThreads` above, so a repaint is byte-stable.
+    inactiveThreads?: string[];
     // ADDITIVE (pipeline T1.5 last mile): the plugin diagnostics this session produced, oldest
     // first, capped (see `SessionPluginDiagnostic` and `PLUGIN_DIAGNOSTIC_LIMIT` in
     // ./sessions.ts). Omitted entirely when the session has never reported one, so a healthy
@@ -721,6 +874,30 @@ export type SessionSnapshot = {    id: string;
     // same per-code sequence, so the counters here also cover a conversation's
     // ordinal — a client seeding a block allocator from them never re-mints a name.
     labelHighWater?: Record<string, number>;
+    // F1 (2026-11-17) — the DURABLE consecutive network-class failure streak per
+    // conversation, keyed by thread id, omitted entirely while no conversation is in a streak
+    // (the additive rule every other map here follows). The store keeps one entry per thread,
+    // raises it when a run ends in a NETWORK-CLASS failure, and clears it the moment a run
+    // reaches its answer, so "the thread is being auto-resumed because the provider keeps
+    // dropping the connection" survives a restart instead of resetting to 0.
+    //
+    // READ-ONLY on the wire: a host cannot move it. A host that wants to stop the
+    // auto-resumes submits nothing and reads the number; a host that wants to try again
+    // POSTs .../threads/:threadId/resume, which does not clear it either (only an answer
+    // does).
+    networkFailures?: Record<string, number>;
+    // F1: the ceiling the session enforces (the number after the slash in "n/10"). Resolved
+    // once per session — a per-provider `settings.networkResumeLimit`, else the deployment's
+    // `HARNESS_PROVIDER_NETWORK_RESUME_LIMIT`, else 10 — and reported here so a client never
+    // hard-codes it. Emitted exactly when `networkFailures` is, so an untouched snapshot keeps
+    // its exact pre-F1 key set.
+    networkFailureLimit?: number;
+    // F4 (2026-11-17): the abandoned attempts each turn has had, keyed by turn id (see
+    // `SessionRollbackRecord`). Omitted while no turn has been re-run in place. This is the
+    // checkpoint-side evidence copy: what a rolled-back attempt dropped, including its
+    // terminal `error` frame, which is how "the provider died mid-stream, twice" is still
+    // answerable after the resume erased those steps from `turns[].events`.
+    turnRollbacks?: Record<string, SessionRollbackRecord[]>;
     // The configuration this session was built with, captured at creation. A
     // registry change (POST/PATCH) therefore cannot rewrite what an existing
     // session reports: the UI can always render the frozen agents/toolbox/card.
@@ -855,6 +1032,15 @@ export type SessionView = {
     // transcript-bearing roster; `/views` omits it (see `SessionThreadView`).
     threadViews?: SessionThreadView[];
     invalidThreads?: SessionInvalidThread[];
+    // F7: the soft-deleted conversation ids, THE SAME FIELD and the same rule as
+    // `SessionSnapshot.inactiveThreads` (see that entry for why the deletion fact cannot ride on
+    // the roster) — omitted when the session never deleted one. It belongs on this header too
+    // because the compiled view is what the browser polls, and a reload is exactly the moment
+    // the board needs the marker: with only the roster it must guess between "deleted" and
+    // "never existed", and it guesses wrong (the retired conversation's sections come back as
+    // placeholder rows). The REST twin is `SessionResource.inactive_thread_ids`
+    // (./api-reads.ts `sessionResourceOf`, ./api.ts `threadRecordsOf` for the roster).
+    inactiveThreads?: string[];
     // ADDITIVE, same rule as `SessionSnapshot.pluginDiagnostics`: omitted when the session has
     // never reported one. Present on BOTH session headers on purpose — a client reading the
     // compiled display view and one reading the legacy aggregate must not disagree about
@@ -865,6 +1051,15 @@ export type SessionView = {
     // `TurnSummary.blocks` — but they stay so the raw and display surfaces agree.
     labelSeeds?: Record<string, Record<string, number>>;
     labelHighWater?: Record<string, number>;
+    // F1/F4: the same three read-only fields as `SessionSnapshot.networkFailures`,
+    // `SessionSnapshot.networkFailureLimit` and `SessionSnapshot.turnRollbacks`, projected
+    // with the same omission rules. They belong on this header because the compiled view is
+    // what the browser actually polls: a strip has to be able to show "auto-resuming, 3/10"
+    // and a halted turn's tile has to be able to say what its abandoned attempt died of,
+    // without a second request.
+    networkFailures?: Record<string, number>;
+    networkFailureLimit?: number;
+    turnRollbacks?: Record<string, SessionRollbackRecord[]>;
     // T9 (wire rule, no shape change): a `/views` response STILL types this as
     // `HarnessDescriptor`, but the server OMITS `agentInstructions` from the copy it
     // sends. That map is per-agent instruction TEXT (see

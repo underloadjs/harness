@@ -107,7 +107,23 @@ historical behaviour (a subagent accumulates its conversation across calls) and
 `sendThreadInput('agent:<name>', …)` resumes exactly that history. Run events
 keep their existing invocation identity (`HarnessThread`, keyed by run id); the
 persistent thread is a separate record, joined through
-`HarnessThreadRecord.invocationId`.
+`HarnessThreadRecord.invocationId`. That join is a WITHIN-ONE-PROCESS join by nature: the run id is
+a per-process counter (a restore only ever RAISES it), so a restarted server can hand the SAME
+number to a different conversation, and a lane worker mints from its own counter while its parent is
+still running. Two published facts make that readable rather than guessable. Every run frame carries
+the epoch of the process that MINTED its id (`thread.epoch` — see the `thread`
+identity note under [Progress events](#progress-events)), and the host/UI roster row now carries the
+matching IDENTITY BLOCK: `invocation_id` (this conversation's LATEST recorded run), `invocation_ids`
+(every run recorded for it, oldest first, at most 64, deduped by bare id) and `epoch` (the process
+that minted `invocation_id`) — on `ThreadSummary`, which is what `GET …/threads` pages and what a
+`thread.upsert` stream frame carries, and as `invocationId` / `invocationIds` / `epoch` on
+`SessionThread` / `SessionThreadView`. All three are OPTIONAL and every value is BARE: the composite
+`id + U+0000 + epoch` run key stays a private join key, and a row is emitted without any of them when
+the conversation never ran (or its document predates the field), so an old roster row projects
+exactly as it did. A client that finds the same id on two rows therefore binds a recorded frame to the
+conversation whose row names the SAME process, so it never binds a roster row to
+a run a previous process recorded under the same number — and the model-facing `threadList` page keeps
+STRIPPING `epoch`, because its schema offers no epoch argument the model could send back.
 
 `createThread` opens an **independent** conversation for the same agent, backed
 by a fresh `Agent` (same instructions, seed messages, transport, and current
@@ -309,7 +325,11 @@ of its own under the invocation that spawned it: a compact thread row at depth 1
 (its own children at depth 2, and so on), placed inside the turn row but outside
 every collapsible body — collapsing a parent tile or a parent entry never hides
 it. Each entry expands independently and owns its input, streamed text, tool
-calls, status and outcome; two calls to the same agent are two entries. A
+calls, status and outcome; two calls to the same agent are two entries — and an entry belongs to
+one RUN, so rows are keyed by the invocation id together with the process epoch that minted it
+(a restarted server can hand the same number to a different run, and a one-sided comparison
+merges rather than
+splits, so only two known epochs that differ open a second entry). A
 `threadFork`/autoanswer branch reuses the same nested entry shape via its `thread`
 metadata (`kind`/`branchId`), with only a small kind tag differentiating it. A
 saved session that predates the `thread` metadata is replayed from its
@@ -516,21 +536,37 @@ request** — never a tool, never the whole run.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| attempts | 1 + 10 retries | `retry: { maxRetries }` (default `10`); `retry: false` disables retries |
-| waits | `1000 * 2 ** n` ms, n = 0..9 | 1s, 2s, 4s, … 512s (`retry: { baseDelayMs }` changes the base) |
+| attempts | 1 + 10 retries | `retry: { maxRetries }` (default `10`); `retry: false` (or `maxRetries: 0`) is a **hard opt-out for every class** — exactly one attempt, and the short class ladders below are skipped too |
+| waits | `min(1000 * 2 ** n, 60000)` ms, n = 0..9 | 1s, 2s, 4s, 8s, 16s, 32s, then **60 s flat** for the rest of the ladder (`retry: { baseDelayMs }` changes the base; there is no jitter, so a published `delayMs` is a fact). Uncapped doubling used to sleep 1023 s (~17 min) on an exhausted ladder; capped, the same eleven attempts wait at most 303 s |
+| class ladders | 3 / 4 attempts | `provider-connection` (nothing answered the dial): **3** attempts, 250 ms + 500 ms. `provider-timeout` (a bound expired, or the provider reported a timeout on the stream): **4** attempts, 2 s + 4 s + 8 s, each capped at 30 s, under a **900 s** wall-clock deadline over the whole sequence. Neither is stretched by `retry.maxRetries`, and `baseDelayMs` only ever RAISES the timeout ladder's 2 s base. `provider-rejected` (an HTTP 400/401/403/404) and `provider-aborted` (the gateway's own in-stream cancel) are terminal, as is an abort from your own signal |
 | success | first successful attempt | later retries are never made |
-| exhaustion | 11th call fails | the **last attempt's own error** is thrown / yielded |
+| exhaustion | last attempt fails | the **last attempt's own error** is thrown / yielded |
 
-Every model-call failure is retried, not just 5xx: a returned `error` frame (any
-HTTP status, a provider error attached to a `200` stream, a malformed frame, a
-truncated stream), a thrown network error, and a stream that throws mid-flight.
-**Cancellation is not retried**: an abort before an attempt, during a backoff, or
-while a request is in flight ends the request immediately.
+Every transient model-call failure is retried, not just 5xx: a returned `error` frame (any
+HTTP status, a provider error attached to a `200` stream, a malformed frame, a truncated
+stream), a thrown network error, and a stream that throws mid-flight. A gateway's mid-stream
+error frame is read STRUCTURALLY — its `code` (`timeout` / `connection` / `aborted` /
+`upstream_status` / `decode` / `unknown`), plus `status`, `errno` and `param`, pick the retry
+class through `providerWireFailureOf` (`src/transport/provider-timeouts.ts`), and an unknown or
+absent code keeps the generic transient ladder it always had. TWO producers write that frame —
+the primary gateway (`packages/underload/service/src/server/start.ts`) and a second SSE writer
+(`repository/agentic/src/server/start-server.ts`, an inlined copy pinned by its own test) —
+with the same six codes and the same wire keys, so the ladder never depends on which one is in
+front. **Cancellation is not
+retried**: an abort before an attempt, during a backoff, or while a request is in flight ends
+the request immediately — and so is a cancel the PROVIDER reported (`provider-aborted`), which
+is a request nobody is waiting for.
 
 A failed attempt's partial text, reasoning and tool calls are discarded — they are
 never committed to history, so no tool from an abandoned attempt can run. The
 `retry` event (and `AgentStreamEvent`'s `retry` frame) reports the attempt, the
-budget, the backoff and the failed attempt's error, which is what a UI/CLI renders.
+budget (the CLASS's budget — 11 transient, 3 for `provider-connection`, 4 for
+`provider-timeout`), the backoff, the failed attempt's error (`message` plus its
+machine `code`) and, for a provider-classified attempt, the `provider` diagnostics —
+redacted endpoint, effective port, which bound expired and the errno the platform
+named. A TERMINAL `error` event carries the same `code` and `provider` since
+2026-11-17, so a failure that was terminal by design no longer reaches a UI as a
+sentence to parse. That is what a UI/CLI renders.
 
 ```ts
 agent({ model: 'x', provider: { baseURL }, retry: { maxRetries: 3, baseDelayMs: 500 } });
@@ -1185,8 +1221,11 @@ in the existing snapshot v2 (`invocationId`, `sequence`, `completedOrder`, agent
 role, kind, status, content, error?), so a restart keeps every answer that already
 exists. Running invocations are omitted from a snapshot (they have no answer yet),
 old snapshots without the field restore with an empty registry, restore advances
-the run/completion/branch id counters so a later run cannot overwrite an archived
-id, and `reset()` clears the archive with the conversation.
+the run/completion/branch id counters so a later run in THAT restored harness cannot
+overwrite an id the same snapshot archived — which is a restore guarantee, not a global one:
+an invocation id is per-process (see [Progress events](#progress-events)), so treat
+`invocationId` as a handle into the harness that is answering, never as a permanent id through
+history — and `reset()` clears the archive with the conversation.
 
 ### Tool names
 
@@ -2495,20 +2534,33 @@ try {
 | `usage` | `agent`, `usage` (`input`, `output`, `total`, optional `cached`) — one per model request, tool rounds included |
 | `done` | `agent`, `message`, optional `pending` |
 | `wakeup` | `agent`, `reason: 'pending-tools'`, `pending` |
-| `retry` | `agent`, `attempt`, `maxAttempts`, `delayMs`, `error: { message }` — the failed model attempt was discarded and the same request is re-sent |
+| `retry` | `agent`, `attempt`, `maxAttempts` (the failure CLASS's budget: 11 transient, 3 for `provider-connection`, 4 for `provider-timeout`), `delayMs`, `error` (`HarnessErrorInfo` — `message`, plus `code` when classified) and optional `provider` (`HarnessProviderAttemptDiagnostics` — redacted `url`, `port`, `errorClass`, `phase`, `timeoutMs`, `errno`) — the failed model attempt was discarded and the same request is re-sent |
 | `attempt_commit` | `agent`, `attempt`, `maxAttempts` — one model request SUCCEEDED and its answer is committed. Emitted for every committed response that does NOT get a `done`: a tool-calling round (closed after its tool calls) and a text response superseded before it could be reported. Everything before it is final, so a later `retry` of a NEWER request must not discard it |
 | `action_request` | `agent`, `callId`, `request` (parsed `HarnessActionRequest`) |
 | `action_answer` | `agent`, `requestId`, `answer` (`source: 'owner' \| 'auto'`, optional `branchId`) |
 | `branch_start` | `agent`, `branch` (`HarnessBranchSummary`) |
 | `branch_end` | `agent`, `branchId`, `status: 'completed' \| 'failed' \| 'cancelled'`, optional `error` |
-| `error` | `agent`, `error: { message }` |
+| `error` | `agent`, `error` (`HarnessErrorInfo` — `message`, plus `code` and, since 2026-11-17, the transport's `provider` diagnostics of the attempt that ENDED the run; both absent for an unclassified failure, so historical records keep the `{ message }` shape) |
 
 Every event names its agent, so multi-agent runs stay readable in one stream. Every
 variant also carries an optional `thread` for a non-root invocation:
 `{ id, parentId?, callId?, input?, kind?: 'delegation' | 'fork' | 'autoanswer',
-branchId? }`. Root events and older recorded turns have none, and a branch's `id`
-is its `branchId`, so `branch_start`, `branch_end`, the branch's own frames, and
-`harness.branch(id)` share one naming scheme.
+branchId?, epoch? }`. Root events and older recorded turns have no `thread`, and a branch's
+`id` is its `branchId`, so `branch_start`, `branch_end`, the branch's own frames, and
+`harness.branch(id)` share one naming scheme. `epoch` (since 2026-11-17) is the process that
+MINTED `id`: the invocation counter restarts with the process and a lane worker mints from its
+own, so an id is unique only inside one process, and every frame of a run carries that same
+opaque string so a client can tell a recycled id from a continuing run. It is OPTIONAL — every
+turn recorded earlier has none, and an absent one decides nothing (it never means "different
+run"). The value is the same per-process epoch the REST surface reports
+(`X-Harness-Epoch`, the boot document, and the stream cursors), so a frame and a cursor naming
+one epoch name one server process. As far as the TURN goes it stays in the recorded event
+payload — no display turn record (`TurnSection` / `TurnSummary`) and no `turn.*` frame carries it
+(the browser keeps it as its own row state and stamps the row with `data-run-epoch` for inspection,
+and nothing renders it) — but the SAME token is published on the CONVERSATION planes, beside the run
+ids it discriminates: `epoch` on `SessionThread` / `SessionThreadView` and in a roster row's identity
+block, which is also what a `thread.upsert` frame carries (see the identity note under
+[Sessions, agents, and threads](#sessions-agents-and-threads)).
 
 With concurrent tools the stream needs three additive fields (all optional on an
 older record, so a client must render its pre-concurrency view when they are
@@ -2649,6 +2701,7 @@ regardless of cwd, so in a workspace checkout that is
 | `HARNESS_WORKER_IDLE_MS`, `HARNESS_MAX_LANE_WORKERS`, `HARNESS_WORKER_HANDSHAKE_MS`, `HARNESS_WORKER_ENTRY` | Server only: the lane-worker bounds and entry file for `worker` execution (same section; every value is validated, and a bad one aborts startup) |
 | `HARNESS_IO_EXECUTION` | Server only: `inline` (default) or `worker` — runs the checkpoint's shard commits (one frame per shard file) and the event journal on one IO worker thread instead of on the request loop. See [Off-loop durability](#off-loop-durability-ioexecution-worker) |
 | `HARNESS_IO_WORKER_ENTRY` | Server only: explicit IO worker entry file; unset resolves the package's own source entry (`src/server/workers/io-worker.ts`) |
+| `HARNESS_PROVIDER_NETWORK_RESUME_LIMIT` | Server only: how many CONSECUTIVE network-class failures (`stopReason: 'provider-network'`) one conversation tolerates before the server stops AUTO-RESUMING it. Default `10`, range 0–1000, `0` = auto-recovery off; digits only, and a bad value aborts startup naming the variable. A per-provider `settings.networkResumeLimit` outranks it. It bounds a PROVIDER condition, so it carries the `HARNESS_PROVIDER_` prefix like the three time bounds; it does NOT replay anything on restart |
 
 `fetch` and `download` need **no** key: `webfetch: true` registers the native
 page GET on a keyless host and declares it core (R9-R11), and `download` is an
@@ -3323,7 +3376,7 @@ were deleted rather than kept behind a flag. See
 | `POST /v1/harness/models` | Server-side `GET {base_url}/models`; returns `{ models, observed_at }` for the UI dropdown |
 | `GET /v1/harness/sessions` | Sessions as bounded summaries — paged (`limit` 25 default / 100 max, `cursor`, `status`, `harness`); turns and threads are separate routes |
 | `POST /v1/harness/sessions` | Create a session from a harness definition — `{ harness, title?, settings?, messages? }` → `201 { session }`; `messages` is the transcript the new conversation starts with (below, "Seeding a new conversation") |
-| `GET /v1/harness/sessions/:id` | One session's metadata plus its live model map and counters — still no turns, threads, transcripts or display trees |
+| `GET /v1/harness/sessions/:id` | One session's metadata plus its live model map and counters — still no turns, threads, transcripts or display trees. It DOES carry `inactive_thread_ids` (additive, absent when the session never deleted one): the ids of the conversations this route's roster HIDES because a `DELETE …/threads/:threadId` retired them. The roster omission is the listing rule, not evidence — after a reload a client cannot tell "deleted" from "never existed" — so the deletion fact travels as its own field, and the roster keeps meaning "the conversations this session can still run" |
 | `PATCH /v1/harness/sessions/:id` | Retarget models in a live session: body `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key/value, applies all-or-nothing, and is allowed while the session is running (the next request uses the new model; the current one keeps its own). See [Server and UI](#server-and-ui) |
 | `DELETE /v1/harness/sessions/:id` | Dispose a session — `{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }` |
 | `GET /v1/harness/sessions/:id/definition` | The harness definition this session froze, plus `frozen_at`, `source_revision` / `current_revision` / `current`, and `discovered_tools` — the enabled set, omitted while it is empty and therefore already populated on a session the server created (`enableAllTools`) |
@@ -3353,12 +3406,12 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/sessions/:id/plugins` | THIS conversation's plugin rows — the same catalogue, the same paging, and THIS session's `enabled`/`values`. `X-Harness-Revision` is that session's own counter: 0 until its first `PATCH`, and it never moves the template counter |
 | `GET /v1/harness/sessions/:id/plugins/:pluginId` | One row with this session's values; `404` unknown session first, then unknown plugin |
 | `PATCH /v1/harness/sessions/:id/plugins/:pluginId` | `{ settings }` → `{ plugin }`, changing one plugin **for this conversation** from its next turn. Write-anytime: no `409` path at all, because a settings value moves no registration — exactly why a session TOOL SWITCH (`enabled`-only `PATCH …/tools/:toolId`) is write-anytime too since the withheld set; the idle gate stays only on the tool writes that replace or remove an implementation (`assertIdleForToolMutation`, `src/server/api.ts`). `404` resolves before the body is read; an unknown key/type/range is a `400` that changes nothing; the write is durable before the answer |
-| `GET /v1/harness/sessions/:id/threads` | This session's conversations |
+| `GET /v1/harness/sessions/:id/threads` | A PAGE of conversation rows (`ThreadSummary`, `src/server/harness.swagger.yaml`; the same shape a `thread.upsert` stream frame carries — `src/shared/harness-stream.ts`). Besides the identity, ownership, lifecycle and transcript SIGNALS, each row now publishes an IDENTITY BLOCK: `invocation_id` (the conversation's LATEST recorded run), `invocation_ids` (every run recorded for it, oldest first, deduped by BARE id, capped at 64 — the OLDEST 64 are kept, so on a busy conversation the NEWEST are the ones missing, which is why the latest rides separately in `invocation_id`) and `epoch` (the PROCESS that minted `invocation_id`). Emitted only when the record actually names that fact (`src/server/api-reads.ts` `threadRowOf`/`rosterInvocationIdsOf`): a conversation that never ran names none of the three rather than answering `[]`, and a document predating the field gains the two id keys and stays epoch-free. Values are BARE — never the composite `id\0epoch` run key — so an id here can be posted straight back to the transcript routes, and `epoch` is what lets a client split a RECYCLED id (the invocation counter is per-process, so two conversations can report the same number after a restart) onto the conversation that really ran the frame naming that process. Soft-deleted conversations are absent from this roster; they are reported beside it, on `GET /v1/harness/sessions/:id`, as `inactive_thread_ids` |
 | `POST /v1/harness/sessions/:id/threads` | Open an additional conversation |
 | `GET /v1/harness/sessions/:id/threads/:threadId` | One conversation's metadata |
 | `DELETE /v1/harness/sessions/:id/threads/:threadId` | Delete one conversation (it stops that conversation first, then purges it) |
 | `POST /v1/harness/sessions/:id/threads/:threadId/cancel` | Stop one conversation |
-| `POST /v1/harness/sessions/:id/threads/:threadId/resume` | Re-run the interrupted turn of one halted conversation → `200` with the receipt of the REQUEUED row (same `turn_id`) |
+| `POST /v1/harness/sessions/:id/threads/:threadId/resume` | Re-run the interrupted turn of one halted conversation → `200` with the receipt of the REQUEUED row (same `turn_id`). The server calls THIS path itself when a conversation's run dies on a network-class failure (`stopReason: 'provider-network'`) and its streak is below the ceiling (see **Recovery policy on restart** under [Server and UI](#server-and-ui)) — and an auto-resume is IN PLACE, so the attempt it abandons is kept as a journal `rollback` line plus the store's `turnRollbacks` evidence (`SessionSnapshot` / `SessionView`, `src/server/protocol.ts`) rather than erased |
 | `GET /v1/harness/sessions/:id/threads/:threadId/transcript` | One transcript's state and size (`{ transcript }`: state, `message_count`, `chars`, `bytes`, `role_counts`, `revision`) |
 | `PUT /v1/harness/sessions/:id/threads/:threadId/transcript` | Replace it with a whole document — `{ messages, if_revision? }` → the write receipt (see [Editable thread transcripts](#editable-thread-transcripts)) |
 | `GET /v1/harness/sessions/:id/threads/:threadId/transcript/messages` | Page through one transcript's messages (`limit`/`cursor`, optional `role`); `total` stays the whole transcript's count |
@@ -3572,7 +3625,10 @@ Both frame vocabularies are CLOSED (`src/shared/harness-stream.ts`):
 
 The counter policy is the REST policy: cursors are opaque base64url(`epoch:sequence`),
 revisions restart at 1 per resource and are compared only WITHIN one epoch, and the epoch
-rides every REST response as `X-Harness-Epoch` beside each read's `X-Harness-Revision`.
+rides every REST response as `X-Harness-Epoch` beside each read's `X-Harness-Revision`. That
+string is the process's ONE epoch, minted at module load and never re-minted — and since
+2026-11-17 it is the SAME value stamped on every recorded run frame (`thread.epoch`), so a
+cursor and a frame naming one epoch name one server process.
 Protocol problems are `error` frames with one closed code (`invalid_payload`,
 `unknown_subscription`, `unknown_resource`, `unsupported_filter`, `late_hello`,
 `too_many_subscriptions`, `frame_too_large`, `rate_limited`, `internal`), and the whole
@@ -4379,7 +4435,7 @@ create sessions and drive tools, so use this only on a trusted network.
   "service": "noobscript-harness",
   "api_version": "v1",
   "server_time": 1762819200000,
-  "epoch": "01jfh2xz8q4t9v3w7y5kcm2p1r",
+  "epoch": "mwk24rfs-222y0t4w3p13",
   "capabilities": {
     "websocket_stream": true, "tool_execution": true, "tool_registration": true,
     "transcript_editing": true, "command_dispatch": true, "model_discovery": true,
@@ -4626,6 +4682,54 @@ Recovery policy on restart:
   operation runs twice. Pending background calls are interrupted, not resumed —
   even when their external side effects already happened — and a restored client
   sees them abandoned rather than running;
+- **A restarted process cannot be mistaken for the run it used to host (2026-11-17 —
+  identity only; the policy above is UNCHANGED and still replays nothing).** Run ids come
+  from a per-process counter, so after a restart the SAME id can name a DIFFERENT run, and a
+  lane worker mints from its own counter. Every run frame therefore carries the epoch of the
+  process that MINTED its id (`thread.epoch`, see [Progress events](#progress-events)), and
+  the transcript fold treats two known-but-different epochs as two runs before it asks
+  anything else about the frames (rule (0) of `isRunBoundary`), while a record written before
+  the epoch exists carries none and folds exactly as it did. That value is the same epoch the
+  REST surface already reports (`X-Harness-Epoch`, the boot document, health, the stream
+  cursors). As far as the TURN goes it lives in the recorded event payload only — no display
+  turn record (`TurnSection` / `TurnSummary`) and no `turn.*` frame carries it — but since W26
+  the same token rides the CONVERSATION planes beside the run ids it separates: `epoch` on
+  `SessionThread` / `SessionThreadView` and in a roster row's identity block, which a
+  `thread.upsert` frame therefore carries too — and the browser fold applies the SAME pair one
+  level DOWN, inside a row: its tool-card state is keyed `(epoch, callId)` (`callKeyOf`,
+  `src/frontend/ui/turns.ts:1668`), so a process that restarts and re-mints a call id cannot have
+  the new run's tool result thrown away as a duplicate of the dead run's settled card, which is
+  what used to leave the new card counting up forever;
+- **A network-dropped conversation is auto-resumed while its run is LIVE — and none of the
+  restart behaviour above changes (2026-11-17).** While a run is live, a conversation whose run
+  dies on the `provider-network` stop reason (a missed provider
+  time bound, a dead dial, or a codeless death the transport diagnosed as bytes dying in transit —
+  whether or not a retry was spent) is put back to work
+  by the server itself: it raises a DURABLE per-conversation streak (`networkFailures`, in the
+  session shard, so a provider still down across a restart does not buy fresh resumes) and,
+  while that streak is strictly below the session's ceiling, calls its own
+  `POST …/threads/:threadId/resume` path so the SAME turn re-runs in place. One answered run
+  clears the streak; a cancel or a manual stop counts as nothing; `retries-exhausted` and
+  `timeout` are not network causes (the first is a non-network exhausted ladder, the second is
+  the host's own wall clock). THE CLASS IS DELIBERATELY WIDER THAN "THE NETWORK DIED", and the
+  over-trigger is accepted: the transport's codeless `provider-transit` diagnosis also covers a
+  gateway frame whose code is `decode`/`unknown`/absent, an in-stream `upstream_status` carrying a
+  NON-refusal status (408 / 429 / any 5xx, 504 included — only 400/401/403/404 are refusals, because
+  a refusal has to be OUR request's fault), and a body that closed without reporting a completion.
+  Any of those raises the streak, so a merely truncated or merely upstream-throttled endpoint can
+  consume the whole ceiling before the conversation rests; the ceiling is what bounds that. An HTTP
+  4xx/5xx response BODY, a malformed frame and a schema throw carry no such class, and stay
+  `api-error` / `retries-exhausted`. The ceiling resolves in order: the per-provider
+  `settings.networkResumeLimit`, then `HARNESS_PROVIDER_NETWORK_RESUME_LIMIT` (`0` = the loop is
+  OFF), then **10**; both the streak and the ceiling are reported read-only on the snapshot and
+  the compiled view (`networkFailures` / `networkFailureLimit`, plus the per-thread count on each
+  roster row) — NOT on the bounded `GET /v1/harness/sessions/:id` read, which answers a
+  `SessionResource` and carries none of them. Two guards bound the loop — a per-turn live claim counter, and an outright refusal
+  while the store is shutting down or still restoring — so a restart never spends provider time
+  by itself, and the restored streak only COUNTS. What the re-run discards is still evidence: the
+  journal keeps a `rollback` line with the abandoned attempt's events (including its terminal
+  `error` frame) and the session shard keeps the bounded summary, so the restart policy stays
+  "mark interrupted, never replay" while the reason a thread stopped stays answerable.
 - if the snapshot stopped after an assistant tool call but before its result was
   appended, restore keeps every completed result and appends one explicit
   non-success "interrupted" tool result for each unmatched call id (in call order).
